@@ -15,11 +15,15 @@
 
 use std::path::Path;
 
+use oxideav_codec::Decoder;
+use oxideav_core::{Error, Packet, TimeBase};
 use oxideav_h265::nal::{iter_annex_b, iter_length_prefixed, NalHeader, NalUnitType};
 use oxideav_h265::pps::parse_pps;
 use oxideav_h265::sps::parse_sps;
 use oxideav_h265::vps::parse_vps;
-use oxideav_h265::{decoder::HevcDecoder, hvcc::parse_hvcc, slice::parse_slice_segment_header};
+use oxideav_h265::{
+    decoder::HevcDecoder, hvcc::parse_hvcc, slice::parse_slice_segment_header, slice::SliceType,
+};
 use oxideav_h265::{nal::extract_rbsp, CODEC_ID_STR};
 
 fn read_fixture(path: &str) -> Option<Vec<u8>> {
@@ -258,6 +262,54 @@ fn nal_header_round_trip_on_fixture() {
         let parsed = NalUnitType::from_u8(v);
         assert_eq!(parsed.as_u8(), v);
         assert!(raw.nuh_temporal_id_plus1 > 0);
+    }
+}
+
+#[test]
+fn i_slice_reaches_ctu_decode_boundary() {
+    // End-to-end test: feed an IDR I-slice packet to the decoder and prove
+    // (a) header parse got us through `byte_alignment()` with a plausible
+    //     slice_data offset + SliceQpY, and
+    // (b) `receive_frame` returns the exact `Unsupported("hevc CTU decode
+    //     not yet implemented")` error — no panic, no stub.
+    let Some(data) = read_fixture("/tmp/h265.es") else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    // The fixture is one contiguous Annex B stream: VPS, SPS, PPS, IDR slice.
+    // `send_packet` scans for start codes when no length-prefix size has been
+    // set from extradata, so a single packet is fine.
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    dec.send_packet(&pkt).expect("send packet");
+    let slice = dec.last_slice.as_ref().expect("slice header captured");
+    assert_eq!(slice.slice_type, SliceType::I, "IDR should be I slice");
+    assert!(
+        slice.is_full_i_slice,
+        "expected full I-slice extension to succeed for 1-CTU IDR"
+    );
+    assert!(
+        slice.slice_data_bit_offset > 0 && slice.slice_data_bit_offset % 8 == 0,
+        "slice_data byte-aligned offset should be a positive multiple of 8, got {}",
+        slice.slice_data_bit_offset
+    );
+    // Plausible QP range. The x265 fixture encodes with a default QP around
+    // 26-40; in any case SliceQpY must land in HEVC's legal range 0..=51.
+    assert!(
+        (0..=51).contains(&slice.slice_qp_y),
+        "SliceQpY {} out of legal range",
+        slice.slice_qp_y
+    );
+    // Now confirm the decode-call itself errors cleanly with the exact
+    // message the task requires.
+    let err = dec.receive_frame().expect_err("receive_frame must fail");
+    match err {
+        Error::Unsupported(msg) => {
+            assert_eq!(
+                msg, "hevc CTU decode not yet implemented",
+                "unsupported error message must be stable across versions"
+            );
+        }
+        other => panic!("expected Error::Unsupported, got {other:?}"),
     }
 }
 

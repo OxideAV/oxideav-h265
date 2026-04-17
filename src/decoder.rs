@@ -3,9 +3,18 @@
 //! Parses VPS / SPS / PPS / slice headers from the input stream and the
 //! `extradata` (HEVCDecoderConfigurationRecord) but **does not** decode the
 //! coded picture itself. The actual CTU pipeline — CABAC entropy decode,
-//! intra / inter prediction, transforms, loop filtering — is documented
-//! out of scope for v1; `receive_frame` returns
-//! `Error::Unsupported("HEVC CTU decode pending: §8.5/§9 (CABAC + intra/inter prediction + transforms)")`.
+//! intra / inter prediction, transforms, loop filtering — is not yet
+//! implemented; `receive_frame` returns
+//! `Error::Unsupported("hevc CTU decode not yet implemented")`.
+//!
+//! What *is* exercised end-to-end for an I-slice packet:
+//! 1. Annex B / length-prefixed NAL framing.
+//! 2. VPS / SPS / PPS capture.
+//! 3. Slice segment header parse against the active PPS/SPS pair.
+//! 4. Derivation of the byte-aligned `slice_data()` offset and the initial
+//!    `SliceQpY` (§8.6.1) — surfaced on the last-slice state so callers
+//!    and tests can verify the decoder reached the CTU-decode boundary.
+//! 5. `receive_frame` then returns the `Unsupported` error above.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -103,9 +112,7 @@ impl HevcDecoder {
                     // Slice NAL — parse the header so we surface acceptably
                     // useful state to callers, but stop short of any actual
                     // pixel decode.
-                    if let (Some(_pps_id), Some((sps, pps))) =
-                        (peek_slice_pps_id(&rbsp), self.active_sps_pps(&rbsp))
-                    {
+                    if let Some((sps, pps)) = self.active_sps_pps_for(&nal.header, &rbsp) {
                         let hdr = parse_slice_segment_header(&rbsp, &nal.header, &sps, &pps)?;
                         self.last_slice = Some(hdr);
                     }
@@ -119,30 +126,33 @@ impl HevcDecoder {
     }
 
     /// Resolve the SPS/PPS pair active for a slice whose RBSP starts with
-    /// `first_slice_segment_in_pic_flag` followed by an optional flag (for
-    /// IRAP) and then `slice_pic_parameter_set_id` as ue(v).
-    fn active_sps_pps(&self, rbsp: &[u8]) -> Option<(SeqParameterSet, PicParameterSet)> {
-        let pps_id = peek_slice_pps_id(rbsp)?;
+    /// `first_slice_segment_in_pic_flag` followed by an optional
+    /// `no_output_of_prior_pics_flag` bit (for IRAP NALs) and then
+    /// `slice_pic_parameter_set_id` as ue(v). Needs the NAL header to know
+    /// whether the extra IRAP bit is present.
+    fn active_sps_pps_for(
+        &self,
+        nal: &crate::nal::NalHeader,
+        rbsp: &[u8],
+    ) -> Option<(SeqParameterSet, PicParameterSet)> {
+        let pps_id = peek_slice_pps_id(nal, rbsp)?;
         let pps = self.pps.get(&pps_id).cloned()?;
         let sps = self.sps.get(&pps.pps_seq_parameter_set_id).cloned()?;
         Some((sps, pps))
     }
 }
 
-/// Peek the PPS id from the start of a slice segment header RBSP. Best-effort —
-/// returns `None` if the bitstream is too short or malformed.
-fn peek_slice_pps_id(rbsp: &[u8]) -> Option<u32> {
+/// Peek the PPS id from the start of a slice segment header RBSP. Reads
+/// exactly the syntax elements §7.3.6.1 specifies up to
+/// `slice_pic_parameter_set_id`. Returns `None` if the bitstream is too
+/// short or malformed.
+fn peek_slice_pps_id(nal: &crate::nal::NalHeader, rbsp: &[u8]) -> Option<u32> {
     use crate::bitreader::BitReader;
     let mut br = BitReader::new(rbsp);
-    let _first = br.u1().ok()?;
-    // For IRAP NALs an extra `no_output_of_prior_pics_flag` precedes the
-    // pps id, but we don't have the NAL header here; the worst case is that
-    // for IRAPs we'd peek the wrong ue(v). We accept that — the proper
-    // resolution happens in `process_nals`, and `peek_slice_pps_id` is also
-    // called from there with a more conservative caller. To make this
-    // peek robust, also try the IRAP layout and pick whichever yields a
-    // PPS id present in our table later. For the v1 scaffold we just
-    // return the non-IRAP reading; the surrounding code retries.
+    let _first_slice_segment_in_pic_flag = br.u1().ok()?;
+    if nal.nal_unit_type.is_irap() {
+        let _no_output_of_prior_pics_flag = br.u1().ok()?;
+    }
     br.ue().ok()
 }
 
@@ -168,9 +178,7 @@ impl Decoder for HevcDecoder {
         if self.eof {
             return Err(Error::Eof);
         }
-        Err(Error::unsupported(
-            "HEVC CTU decode pending: §8.5/§9 (CABAC + intra/inter prediction + transforms)",
-        ))
+        Err(Error::unsupported("hevc CTU decode not yet implemented"))
     }
 
     fn flush(&mut self) -> Result<()> {

@@ -52,6 +52,28 @@ pub struct SliceSegmentHeader {
     pub slice_pic_order_cnt_lsb: u32,
     pub short_term_ref_pic_set_sps_flag: bool,
     pub short_term_ref_pic_set_idx: u32,
+    /// `slice_sao_luma_flag` (only when SAO is enabled at SPS level). For
+    /// the minimal I-slice extension we only fill this for IDR slices.
+    pub slice_sao_luma_flag: bool,
+    /// `slice_sao_chroma_flag` (only when SAO is enabled and chroma is
+    /// present).
+    pub slice_sao_chroma_flag: bool,
+    /// `cabac_init_flag` (§7.4.7.1). Only signalled for P/B slices when
+    /// `cabac_init_present_flag` is set on the PPS; for I slices this is
+    /// always false.
+    pub cabac_init_flag: bool,
+    /// `slice_qp_delta` (se(v)).
+    pub slice_qp_delta: i32,
+    /// `SliceQpY` derived per §7.4.7.1: `26 + init_qp_minus26 + slice_qp_delta`.
+    pub slice_qp_y: i32,
+    /// `slice_loop_filter_across_slices_enabled_flag` (defaults from PPS).
+    pub slice_loop_filter_across_slices_enabled_flag: bool,
+    /// Bit position (in the RBSP) where the entropy payload (`slice_data()`)
+    /// starts after the final `byte_alignment()`. Valid iff `is_full_i_slice`.
+    pub slice_data_bit_offset: u64,
+    /// Set when the full I-slice extension parse succeeded. This is the flag
+    /// tests use to confirm the decoder reached the CTU-decode boundary.
+    pub is_full_i_slice: bool,
 }
 
 /// Parse a slice segment header given the active PPS+SPS and the NAL header
@@ -126,6 +148,125 @@ pub fn parse_slice_segment_header(
             // before any of the deferred fields are consulted.
         }
     }
+    // From here on we attempt the I-slice-only extension: SAO flags,
+    // slice_qp_delta, and byte_alignment(). If the slice is an IDR I slice
+    // under the shapes the v1 scaffold can handle, we fill in the derived
+    // fields. Otherwise `is_full_i_slice` stays false and CTU decode will
+    // still refuse with `Unsupported`.
+    let mut slice_sao_luma_flag = false;
+    let mut slice_sao_chroma_flag = false;
+    let cabac_init_flag = false;
+    let mut slice_qp_delta: i32 = 0;
+    let mut slice_loop_filter_across_slices_enabled_flag =
+        pps.pps_loop_filter_across_slices_enabled_flag;
+    let mut slice_data_bit_offset: u64 = 0;
+    let mut is_full_i_slice = false;
+
+    let is_idr = matches!(
+        nal.nal_unit_type,
+        NalUnitType::IdrWRadl | NalUnitType::IdrNLp
+    );
+
+    if !dependent_slice_segment_flag
+        && slice_type == SliceType::I
+        && is_idr
+        && !sps.separate_colour_plane_flag
+    {
+        // Path for the narrow but common case: IDR I slice, 4:2:0 / 4:2:2 /
+        // 4:4:4 (without separate colour planes), no slice-header extension,
+        // no PPS-level chroma offsets. Anything we can't handle becomes an
+        // early exit with is_full_i_slice=false.
+        if sps.sample_adaptive_offset_enabled_flag {
+            slice_sao_luma_flag = br.u1()? == 1;
+            let chroma_array_type = if sps.separate_colour_plane_flag {
+                0
+            } else {
+                sps.chroma_format_idc
+            };
+            if chroma_array_type != 0 {
+                slice_sao_chroma_flag = br.u1()? == 1;
+            }
+        }
+        // I-slice skips the inter-prediction and weighted-pred sections.
+        slice_qp_delta = br.se()?;
+        if pps.pps_slice_chroma_qp_offsets_present_flag {
+            let _slice_cb_qp_offset = br.se()?;
+            let _slice_cr_qp_offset = br.se()?;
+        }
+        let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
+        if pps.deblocking_filter_override_enabled_flag {
+            let override_flag = br.u1()? == 1;
+            if override_flag {
+                slice_deblocking_filter_disabled_flag = br.u1()? == 1;
+                if !slice_deblocking_filter_disabled_flag {
+                    let _slice_beta_offset_div2 = br.se()?;
+                    let _slice_tc_offset_div2 = br.se()?;
+                }
+            }
+        }
+        if pps.pps_loop_filter_across_slices_enabled_flag
+            && (slice_sao_luma_flag
+                || slice_sao_chroma_flag
+                || !slice_deblocking_filter_disabled_flag)
+        {
+            slice_loop_filter_across_slices_enabled_flag = br.u1()? == 1;
+        }
+        if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
+            let num_entry_point_offsets = br.ue()?;
+            if num_entry_point_offsets > 0 {
+                // Entry-point offsets are present; parsing these accurately
+                // requires the minus-1-plus-1 bit width dance and they are
+                // only needed for multi-tile / wavefront decode. Treat as
+                // unsupported for the I-slice extension.
+                //
+                // Return the headers we have so far without the full
+                // extension set.
+                return Ok(SliceSegmentHeader {
+                    first_slice_segment_in_pic_flag,
+                    no_output_of_prior_pics_flag,
+                    slice_pic_parameter_set_id,
+                    dependent_slice_segment_flag,
+                    slice_segment_address,
+                    slice_type,
+                    pic_output_flag,
+                    colour_plane_id,
+                    slice_pic_order_cnt_lsb,
+                    short_term_ref_pic_set_sps_flag,
+                    short_term_ref_pic_set_idx,
+                    slice_sao_luma_flag,
+                    slice_sao_chroma_flag,
+                    cabac_init_flag,
+                    slice_qp_delta,
+                    slice_qp_y: 26 + pps.init_qp_minus26 + slice_qp_delta,
+                    slice_loop_filter_across_slices_enabled_flag,
+                    slice_data_bit_offset: 0,
+                    is_full_i_slice: false,
+                });
+            }
+        }
+        if pps.slice_segment_header_extension_present_flag {
+            let ext_len = br.ue()?;
+            for _ in 0..ext_len {
+                br.skip(8)?;
+            }
+        }
+        // byte_alignment(): one '1' bit followed by zero bits to the next byte.
+        let stop = br.u1()?;
+        if stop != 1 {
+            return Err(Error::invalid(
+                "h265 slice: byte_alignment() expected stop bit = 1",
+            ));
+        }
+        // Align to byte.
+        let pos_before_align = br.bit_position();
+        let pad = (8 - (pos_before_align % 8)) % 8;
+        if pad > 0 {
+            br.skip(pad as u32)?;
+        }
+        slice_data_bit_offset = br.bit_position();
+        is_full_i_slice = true;
+    }
+
     Ok(SliceSegmentHeader {
         first_slice_segment_in_pic_flag,
         no_output_of_prior_pics_flag,
@@ -138,6 +279,14 @@ pub fn parse_slice_segment_header(
         slice_pic_order_cnt_lsb,
         short_term_ref_pic_set_sps_flag,
         short_term_ref_pic_set_idx,
+        slice_sao_luma_flag,
+        slice_sao_chroma_flag,
+        cabac_init_flag,
+        slice_qp_delta,
+        slice_qp_y: 26 + pps.init_qp_minus26 + slice_qp_delta,
+        slice_loop_filter_across_slices_enabled_flag,
+        slice_data_bit_offset,
+        is_full_i_slice,
     })
 }
 

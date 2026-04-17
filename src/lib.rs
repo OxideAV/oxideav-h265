@@ -32,13 +32,17 @@
 //!   parsing, emulation-prevention removal.
 //! * [`ptl`] — `profile_tier_level()` (§7.3.3) shared by VPS/SPS.
 //! * [`vps`], [`sps`], [`pps`] — parameter-set parsers.
-//! * [`slice`] — slice segment header.
+//! * [`slice`] — slice segment header, including the IDR I-slice
+//!   extension (SAO flags, slice_qp_delta, byte-aligned `slice_data()`
+//!   offset, `SliceQpY` derivation).
+//! * [`cabac`] — CABAC per-context initialisation kernel (§9.3.4.2.1).
 //! * [`hvcc`] — HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3).
 //! * [`decoder`] — registry factory and `HevcDecoder` (parse-only).
 
 #![allow(clippy::too_many_arguments)]
 
 pub mod bitreader;
+pub mod cabac;
 pub mod decoder;
 pub mod hvcc;
 pub mod nal;
