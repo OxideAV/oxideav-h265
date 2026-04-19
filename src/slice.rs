@@ -510,7 +510,8 @@ fn partial_header(
         cabac_init_flag: false,
         slice_qp_delta: 0,
         slice_qp_y: 26 + pps.init_qp_minus26,
-        slice_loop_filter_across_slices_enabled_flag: pps.pps_loop_filter_across_slices_enabled_flag,
+        slice_loop_filter_across_slices_enabled_flag: pps
+            .pps_loop_filter_across_slices_enabled_flag,
         slice_data_bit_offset: 0,
         is_full_i_slice: false,
         is_full_p_slice: false,

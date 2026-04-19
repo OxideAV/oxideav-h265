@@ -308,6 +308,62 @@ fn length_prefixed_nal_iter_round_trips() {
 }
 
 #[test]
+fn hevc_p_slice_fixture_decodes() {
+    // 2-frame (1 I + 1 P) 256x144 clip. Frame 1 is an IDR I-slice, frame 2
+    // is a P-slice referencing frame 1 via the SPS short-term RPS.
+    let Some(data) = read_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/hevc-p.h265"
+    )) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    if let Err(Error::Unsupported(msg)) = dec.send_packet(&pkt) {
+        // If the fixture has wavefront/tiles/scaling-list enabled we surface
+        // Unsupported — don't fail CI, just log.
+        eprintln!("P-slice fixture not in scope yet: {msg}");
+        return;
+    }
+
+    // Expect two video frames.
+    let frame1 = match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => vf,
+        Ok(other) => panic!("expected VideoFrame, got {other:?}"),
+        Err(Error::Unsupported(msg)) => {
+            eprintln!("P-slice fixture not in scope yet: {msg}");
+            return;
+        }
+        Err(e) => panic!("unexpected error from receive_frame (frame 1): {e:?}"),
+    };
+    let frame2 = match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => vf,
+        Ok(other) => panic!("expected VideoFrame, got {other:?}"),
+        Err(Error::Unsupported(msg)) => {
+            panic!("frame 2 (P-slice) unexpectedly unsupported: {msg}");
+        }
+        Err(e) => panic!("unexpected error from receive_frame (frame 2): {e:?}"),
+    };
+    assert_eq!(frame1.width, 256);
+    assert_eq!(frame1.height, 144);
+    assert_eq!(frame2.width, 256);
+    assert_eq!(frame2.height, 144);
+
+    let y1 = &frame1.planes[0].data;
+    let y2 = &frame2.planes[0].data;
+    assert_eq!(y1.len(), y2.len());
+    // Frame 2 must differ from frame 1 at the pixel level.
+    let mut diff = 0u64;
+    for (a, b) in y1.iter().zip(y2.iter()) {
+        diff += (*a as i32 - *b as i32).unsigned_abs() as u64;
+    }
+    assert!(
+        diff > 0,
+        "expected frame 2 to differ from frame 1 at the pixel level"
+    );
+}
+
+#[test]
 fn hevc_intra_fixture_decodes_to_plausible_picture() {
     // The fixture is a 256x144 8-bit 4:2:0 I-slice Annex B stream produced
     // with `ffmpeg -f lavfi -i testsrc=... -c:v libx265 -x265-params

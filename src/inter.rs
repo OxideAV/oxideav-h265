@@ -19,6 +19,8 @@
 //! full weighted-pred are out of scope for the P-slice landing — callers
 //! should continue to surface `Unsupported` for those features.
 
+#![allow(clippy::needless_range_loop)]
+
 use oxideav_core::Error;
 use oxideav_core::Result;
 

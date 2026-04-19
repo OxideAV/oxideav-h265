@@ -17,18 +17,25 @@
 use oxideav_core::{Error, Result};
 
 use crate::cabac::{
-    init_row, CabacEngine, CtxState, InitType, CBF_CB_CR_INIT_VALUES, CBF_LUMA_INIT_VALUES,
-    CODED_SUB_BLOCK_FLAG_INIT_VALUES, COEFF_ABS_GT1_INIT_VALUES, COEFF_ABS_GT2_INIT_VALUES,
-    CU_QP_DELTA_ABS_INIT_VALUES, CU_TRANSQUANT_BYPASS_FLAG_INIT_VALUES,
+    init_row, CabacEngine, CtxState, InitType, ABS_MVD_GREATER_FLAGS_INIT_VALUES,
+    CBF_CB_CR_INIT_VALUES, CBF_LUMA_INIT_VALUES, CODED_SUB_BLOCK_FLAG_INIT_VALUES,
+    COEFF_ABS_GT1_INIT_VALUES, COEFF_ABS_GT2_INIT_VALUES, CU_QP_DELTA_ABS_INIT_VALUES,
+    CU_SKIP_FLAG_INIT_VALUES, CU_TRANSQUANT_BYPASS_FLAG_INIT_VALUES, INTER_PRED_IDC_INIT_VALUES,
     INTRA_CHROMA_PRED_MODE_INIT_VALUES, LAST_SIG_COEFF_X_PREFIX_INIT_VALUES,
-    LAST_SIG_COEFF_Y_PREFIX_INIT_VALUES, PART_MODE_INIT_VALUES,
-    PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES, SAO_MERGE_FLAG_INIT_VALUES, SAO_TYPE_IDX_INIT_VALUES,
-    SIG_COEFF_FLAG_INIT_VALUES, SPLIT_CU_FLAG_INIT_VALUES, SPLIT_TRANSFORM_FLAG_INIT_VALUES,
+    LAST_SIG_COEFF_Y_PREFIX_INIT_VALUES, MERGE_FLAG_INIT_VALUES, MERGE_IDX_INIT_VALUES,
+    MVP_LX_FLAG_INIT_VALUES, PART_MODE_INIT_VALUES, PRED_MODE_FLAG_INIT_VALUES,
+    PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES, REF_IDX_INIT_VALUES, RQT_ROOT_CBF_INIT_VALUES,
+    SAO_MERGE_FLAG_INIT_VALUES, SAO_TYPE_IDX_INIT_VALUES, SIG_COEFF_FLAG_INIT_VALUES,
+    SPLIT_CU_FLAG_INIT_VALUES, SPLIT_TRANSFORM_FLAG_INIT_VALUES,
+};
+use crate::inter::{
+    build_amvp_list, build_merge_list, chroma_mc, luma_mc, InterState, MotionVector, PbMotion,
+    RefPicture,
 };
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
 use crate::scan::{scan_4x4, scan_idx_for_intra};
-use crate::slice::SliceSegmentHeader;
+use crate::slice::{SliceSegmentHeader, SliceType};
 use crate::sps::SeqParameterSet;
 use crate::transform::{dequantize_flat, inverse_transform_2d};
 
@@ -46,8 +53,10 @@ pub struct Picture {
     pub intra_luma_mode: Vec<u8>,
     pub intra_width_4: usize,
     pub intra_height_4: usize,
-    /// Per-4x4 block "is intra" flag (always true in an I slice).
+    /// Per-4x4 block "is intra" flag (false when the CU is inter-coded).
     pub is_intra: Vec<bool>,
+    /// Per-4×4 block motion-field grid for inter neighbour lookups.
+    pub inter: InterState,
 }
 
 impl Picture {
@@ -70,6 +79,7 @@ impl Picture {
             intra_width_4: iw4,
             intra_height_4: ih4,
             is_intra: vec![true; iw4 * ih4],
+            inter: InterState::new(width, height),
         }
     }
 }
@@ -80,14 +90,35 @@ pub struct CtuContext<'a> {
     pub pps: &'a PicParameterSet,
     pub slice: &'a SliceSegmentHeader,
     pub init_type: InitType,
+    /// Reference picture list L0 (owned POCs) plus the reference picture
+    /// lookup callback. Empty for I slices.
+    pub ref_list_l0: &'a [RefPicture],
+}
+
+impl<'a> CtuContext<'a> {
+    pub fn is_inter_slice(&self) -> bool {
+        matches!(self.slice.slice_type, SliceType::P | SliceType::B)
+    }
+}
+
+/// Inter CU partition modes we support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterPart {
+    Mode2Nx2N,
+    Mode2NxN,
+    ModeNx2N,
+    ModeNxN,
 }
 
 struct Ctx {
     split_cu_flag: [CtxState; 3],
     cu_transquant_bypass_flag: [CtxState; 1],
+    cu_skip_flag: [CtxState; 3],
+    pred_mode_flag: [CtxState; 1],
     part_mode: [CtxState; 4],
     prev_intra_luma_pred_flag: [CtxState; 1],
     intra_chroma_pred_mode: [CtxState; 1],
+    rqt_root_cbf: [CtxState; 1],
     split_transform_flag: [CtxState; 3],
     cbf_luma: [CtxState; 2],
     cbf_cb_cr: [CtxState; 2],
@@ -100,6 +131,13 @@ struct Ctx {
     coded_sub_block_flag: [CtxState; 4],
     sao_merge_flag: [CtxState; 1],
     sao_type_idx: [CtxState; 1],
+    merge_flag: [CtxState; 1],
+    merge_idx: [CtxState; 1],
+    #[allow(dead_code)]
+    inter_pred_idc: [CtxState; 5],
+    ref_idx: [CtxState; 2],
+    abs_mvd_greater: [CtxState; 2],
+    mvp_lx_flag: [CtxState; 1],
 }
 
 impl Ctx {
@@ -111,6 +149,8 @@ impl Ctx {
                 init_type,
                 slice_qp_y,
             ),
+            cu_skip_flag: init_row(&CU_SKIP_FLAG_INIT_VALUES, init_type, slice_qp_y),
+            pred_mode_flag: init_row(&PRED_MODE_FLAG_INIT_VALUES, init_type, slice_qp_y),
             part_mode: init_row(&PART_MODE_INIT_VALUES, init_type, slice_qp_y),
             prev_intra_luma_pred_flag: init_row(
                 &PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES,
@@ -122,6 +162,7 @@ impl Ctx {
                 init_type,
                 slice_qp_y,
             ),
+            rqt_root_cbf: init_row(&RQT_ROOT_CBF_INIT_VALUES, init_type, slice_qp_y),
             split_transform_flag: init_row(
                 &SPLIT_TRANSFORM_FLAG_INIT_VALUES,
                 init_type,
@@ -150,6 +191,12 @@ impl Ctx {
             ),
             sao_merge_flag: init_row(&SAO_MERGE_FLAG_INIT_VALUES, init_type, slice_qp_y),
             sao_type_idx: init_row(&SAO_TYPE_IDX_INIT_VALUES, init_type, slice_qp_y),
+            merge_flag: init_row(&MERGE_FLAG_INIT_VALUES, init_type, slice_qp_y),
+            merge_idx: init_row(&MERGE_IDX_INIT_VALUES, init_type, slice_qp_y),
+            inter_pred_idc: init_row(&INTER_PRED_IDC_INIT_VALUES, init_type, slice_qp_y),
+            ref_idx: init_row(&REF_IDX_INIT_VALUES, init_type, slice_qp_y),
+            abs_mvd_greater: init_row(&ABS_MVD_GREATER_FLAGS_INIT_VALUES, init_type, slice_qp_y),
+            mvp_lx_flag: init_row(&MVP_LX_FLAG_INIT_VALUES, init_type, slice_qp_y),
         }
     }
 }
@@ -182,6 +229,12 @@ pub fn decode_slice_ctus(
     }
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
+    }
+    if matches!(cctx.slice.slice_type, SliceType::B) {
+        return Err(Error::unsupported("h265 B-slice pending"));
+    }
+    if cctx.slice.slice_type == SliceType::P && cctx.ref_list_l0.is_empty() {
+        return Err(Error::unsupported("h265 P-slice without RPL0"));
     }
 
     let ctb_log2 = cctx.sps.log2_min_luma_coding_block_size_minus3
@@ -384,30 +437,282 @@ impl<'a> Walker<'a> {
         y0: u32,
         log2_cb: u32,
     ) -> Result<()> {
-        let _cb_size = 1u32 << log2_cb;
-        // cu_transquant_bypass_flag (only if enabled).
+        let cb_size = 1u32 << log2_cb;
+        // cu_skip_flag (P/B only).
+        let mut is_skip = false;
+        if matches!(self.cctx.slice.slice_type, SliceType::P | SliceType::B) {
+            let ctx_inc = self.skip_ctx_inc(x0, y0);
+            let skip = engine.decode_bin(&mut ctx.cu_skip_flag[ctx_inc]);
+            is_skip = skip == 1;
+        }
+        if is_skip {
+            // Skip CU: infer merge_flag = 1, one 2Nx2N PB. Decode merge_idx
+            // only if max_num_merge_cand > 1.
+            let merge_idx = if self.cctx.slice.max_num_merge_cand > 1 {
+                decode_merge_idx(engine, ctx, self.cctx.slice.max_num_merge_cand)
+            } else {
+                0
+            };
+            self.perform_merge(x0, y0, cb_size, cb_size, merge_idx)?;
+            return Ok(());
+        }
         if self.cctx.pps.transquant_bypass_enabled_flag {
-            let _bypass = engine.decode_bin(&mut ctx.cu_transquant_bypass_flag[0]);
-            if _bypass == 1 {
+            let bypass = engine.decode_bin(&mut ctx.cu_transquant_bypass_flag[0]);
+            if bypass == 1 {
                 return Err(Error::unsupported("h265 transquant_bypass pending"));
             }
         }
-        // For I-slice: pred_mode is inferred INTRA; skip flag is not read.
-        // part_mode: `part_mode` is only signalled for the smallest CU size in
-        // an intra slice (NxN or 2Nx2N). For log2_cb > min_cb_log2, implicit 2Nx2N.
-        let mut part_mode_is_nxn = false;
-        if log2_cb == self.min_cb_log2 {
-            let part_mode_bit = engine.decode_bin(&mut ctx.part_mode[0]);
-            part_mode_is_nxn = part_mode_bit == 0;
-        }
-        if part_mode_is_nxn {
-            // NxN partitioning inside an intra CU = 4 separate intra PUs.
-            // We handle it identically to 2Nx2N by decoding 4 prev_intra flags
-            // and applying per-PU prediction at TU level.
-            self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, true)
+
+        // pred_mode_flag: for P/B slices, 0 = INTER, 1 = INTRA. For I slice,
+        // inferred INTRA.
+        let is_inter = if matches!(self.cctx.slice.slice_type, SliceType::P | SliceType::B) {
+            let pmf = engine.decode_bin(&mut ctx.pred_mode_flag[0]);
+            pmf == 0
         } else {
-            self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, false)
+            false
+        };
+
+        if is_inter {
+            // part_mode for inter (§7.3.8.5, Table 7-10). AMP not supported.
+            let b0 = engine.decode_bin(&mut ctx.part_mode[0]);
+            let part_mode = if b0 == 1 {
+                InterPart::Mode2Nx2N
+            } else {
+                let b1 = engine.decode_bin(&mut ctx.part_mode[1]);
+                let at_min = log2_cb == self.min_cb_log2;
+                let log2_gt_3 = log2_cb > 3;
+                if at_min && log2_gt_3 {
+                    if b1 == 1 {
+                        InterPart::Mode2NxN
+                    } else {
+                        let b2 = engine.decode_bin(&mut ctx.part_mode[2]);
+                        if b2 == 1 {
+                            InterPart::ModeNx2N
+                        } else {
+                            InterPart::ModeNxN
+                        }
+                    }
+                } else if b1 == 1 {
+                    InterPart::Mode2NxN
+                } else {
+                    InterPart::ModeNx2N
+                }
+            };
+            self.decode_inter_cu(engine, ctx, x0, y0, log2_cb, part_mode)
+        } else {
+            // For I-slice & intra-in-P: pred_mode is INTRA. part_mode only
+            // signalled for the smallest CU size.
+            let mut part_mode_is_nxn = false;
+            if log2_cb == self.min_cb_log2 {
+                let part_mode_bit = engine.decode_bin(&mut ctx.part_mode[0]);
+                part_mode_is_nxn = part_mode_bit == 0;
+            }
+            // Tag the CU as intra so neighbour derivation for inter PBs is
+            // correct.
+            self.pic
+                .inter
+                .set_rect(x0, y0, cb_size, cb_size, PbMotion::intra());
+            if part_mode_is_nxn {
+                self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, true)
+            } else {
+                self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, false)
+            }
         }
+    }
+
+    fn skip_ctx_inc(&self, x0: u32, y0: u32) -> usize {
+        // ctxInc = (L.skip ? 1 : 0) + (A.skip ? 1 : 0) — we don't track the
+        // skip-flag per PB, so approximate by "neighbour inside pic".
+        let left = if x0 == 0 {
+            0
+        } else {
+            let bx = ((x0 - 1) >> 2) as usize;
+            let by = (y0 >> 2) as usize;
+            self.pic
+                .inter
+                .get(bx, by)
+                .map(|p| !p.is_intra && p.valid)
+                .unwrap_or(false) as usize
+        };
+        let above = if y0 == 0 {
+            0
+        } else {
+            let bx = (x0 >> 2) as usize;
+            let by = ((y0 - 1) >> 2) as usize;
+            self.pic
+                .inter
+                .get(bx, by)
+                .map(|p| !p.is_intra && p.valid)
+                .unwrap_or(false) as usize
+        };
+        (left + above).min(2)
+    }
+
+    /// Perform a merge-mode prediction at the given PB: look up the merge
+    /// candidate, run motion compensation, store pixels into the picture.
+    fn perform_merge(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        n_pb_w: u32,
+        n_pb_h: u32,
+        merge_idx: u32,
+    ) -> Result<()> {
+        let cands = build_merge_list(
+            &self.pic.inter,
+            x0,
+            y0,
+            n_pb_w,
+            n_pb_h,
+            self.cctx.slice.max_num_merge_cand,
+        );
+        let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
+        let ref_idx = sel.ref_idx_l0.max(0) as usize;
+        let ref_pic = self
+            .cctx
+            .ref_list_l0
+            .get(ref_idx)
+            .ok_or_else(|| Error::invalid("h265 merge: ref_idx out of list"))?;
+        let pb = PbMotion::inter(sel.ref_idx_l0, sel.mv_l0);
+        self.motion_compensate_pb(x0, y0, n_pb_w, n_pb_h, pb, ref_pic)?;
+        Ok(())
+    }
+
+    fn motion_compensate_pb(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        pb: PbMotion,
+        ref_pic: &RefPicture,
+    ) -> Result<()> {
+        let mut out = vec![0u8; (w * h) as usize];
+        luma_mc(
+            ref_pic, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l0, &mut out,
+        )?;
+        // Write luma.
+        self.write_rect(x0, y0, w as usize, h as usize, &out, true, false);
+        // Chroma blocks are half resolution in 4:2:0.
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        let mut cb_out = vec![0u8; cw * ch];
+        let mut cr_out = vec![0u8; cw * ch];
+        chroma_mc(
+            ref_pic,
+            (x0 / 2) as i32,
+            (y0 / 2) as i32,
+            cw as i32,
+            ch as i32,
+            pb.mv_l0,
+            &mut cb_out,
+            0,
+        )?;
+        chroma_mc(
+            ref_pic,
+            (x0 / 2) as i32,
+            (y0 / 2) as i32,
+            cw as i32,
+            ch as i32,
+            pb.mv_l0,
+            &mut cr_out,
+            1,
+        )?;
+        self.write_rect(x0 / 2, y0 / 2, cw, ch, &cb_out, false, false);
+        self.write_rect(x0 / 2, y0 / 2, cw, ch, &cr_out, false, true);
+        self.pic.inter.set_rect(x0, y0, w, h, pb);
+        Ok(())
+    }
+
+    fn decode_inter_cu(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x0: u32,
+        y0: u32,
+        log2_cb: u32,
+        part_mode: InterPart,
+    ) -> Result<()> {
+        let cb_size = 1u32 << log2_cb;
+        let pbs: Vec<(u32, u32, u32, u32)> = match part_mode {
+            InterPart::Mode2Nx2N => vec![(x0, y0, cb_size, cb_size)],
+            InterPart::Mode2NxN => vec![
+                (x0, y0, cb_size, cb_size / 2),
+                (x0, y0 + cb_size / 2, cb_size, cb_size / 2),
+            ],
+            InterPart::ModeNx2N => vec![
+                (x0, y0, cb_size / 2, cb_size),
+                (x0 + cb_size / 2, y0, cb_size / 2, cb_size),
+            ],
+            InterPart::ModeNxN => vec![
+                (x0, y0, cb_size / 2, cb_size / 2),
+                (x0 + cb_size / 2, y0, cb_size / 2, cb_size / 2),
+                (x0, y0 + cb_size / 2, cb_size / 2, cb_size / 2),
+                (x0 + cb_size / 2, y0 + cb_size / 2, cb_size / 2, cb_size / 2),
+            ],
+        };
+        for (px, py, pw, ph) in &pbs {
+            self.decode_prediction_unit(engine, ctx, *px, *py, *pw, *ph)?;
+        }
+
+        // rqt_root_cbf: whether a transform tree follows.
+        let rqt = engine.decode_bin(&mut ctx.rqt_root_cbf[0]);
+        if rqt == 0 {
+            return Ok(());
+        }
+        self.transform_tree_inter(engine, ctx, x0, y0, log2_cb, 0)
+    }
+
+    fn decode_prediction_unit(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        let merge_flag = engine.decode_bin(&mut ctx.merge_flag[0]) == 1;
+        let (ref_idx_l0, mv_l0) = if merge_flag {
+            let merge_idx = if self.cctx.slice.max_num_merge_cand > 1 {
+                decode_merge_idx(engine, ctx, self.cctx.slice.max_num_merge_cand)
+            } else {
+                0
+            };
+            let cands = build_merge_list(
+                &self.pic.inter,
+                x,
+                y,
+                w,
+                h,
+                self.cctx.slice.max_num_merge_cand,
+            );
+            let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
+            (sel.ref_idx_l0, sel.mv_l0)
+        } else {
+            let ref_idx_l0 = if self.cctx.slice.num_ref_idx_l0_active_minus1 > 0 {
+                decode_ref_idx(
+                    engine,
+                    ctx,
+                    self.cctx.slice.num_ref_idx_l0_active_minus1 + 1,
+                )
+            } else {
+                0
+            };
+            let mvd = decode_mvd(engine, ctx)?;
+            let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
+            let amvp = build_amvp_list(&self.pic.inter, x, y, w, h);
+            let mvp = amvp[mvp_flag as usize];
+            let mv = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
+            (ref_idx_l0 as i8, mv)
+        };
+        let ref_pic = self
+            .cctx
+            .ref_list_l0
+            .get(ref_idx_l0 as usize)
+            .ok_or_else(|| Error::invalid("h265 inter: ref_idx out of list"))?;
+        let pb = PbMotion::inter(ref_idx_l0, mv_l0);
+        self.motion_compensate_pb(x, y, w, h, pb, ref_pic)
     }
 
     fn decode_intra_prediction_and_transforms(
@@ -588,6 +893,193 @@ impl<'a> Walker<'a> {
             34
         } else {
             chosen
+        }
+    }
+
+    /// Inter-slice transform-tree decode. The MC predictor has already been
+    /// written into the picture; we decode residuals and add them on top.
+    fn transform_tree_inter(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x0: u32,
+        y0: u32,
+        log2_tb: u32,
+        tr_depth: u32,
+    ) -> Result<()> {
+        let max_tb_log2 = self.max_tb_log2;
+        let min_tb_log2 = self.min_tb_log2;
+        let must_split = log2_tb > max_tb_log2;
+        let can_split = log2_tb > min_tb_log2;
+        let split = if must_split {
+            1
+        } else if !can_split {
+            0
+        } else {
+            let ctx_inc = (5 - log2_tb) as usize;
+            let ctx_inc = ctx_inc.min(2);
+            engine.decode_bin(&mut ctx.split_transform_flag[ctx_inc])
+        };
+        if split == 1 {
+            let sub = 1u32 << (log2_tb - 1);
+            self.transform_tree_inter(engine, ctx, x0, y0, log2_tb - 1, tr_depth + 1)?;
+            self.transform_tree_inter(engine, ctx, x0 + sub, y0, log2_tb - 1, tr_depth + 1)?;
+            self.transform_tree_inter(engine, ctx, x0, y0 + sub, log2_tb - 1, tr_depth + 1)?;
+            self.transform_tree_inter(engine, ctx, x0 + sub, y0 + sub, log2_tb - 1, tr_depth + 1)?;
+            return Ok(());
+        }
+
+        let mut cbf_cb = 0u32;
+        let mut cbf_cr = 0u32;
+        let chroma_log2 = if log2_tb == self.min_tb_log2 {
+            0
+        } else {
+            log2_tb - 1
+        };
+        let chroma_present = chroma_log2 >= 2;
+        let cbf_ctx_inc = tr_depth.min(1) as usize;
+        if chroma_present {
+            cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+        }
+        let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
+        let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
+        let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag {
+            let mut prefix = 0u32;
+            let max_prefix = 5;
+            while prefix < max_prefix && engine.decode_bin(&mut ctx.cu_qp_delta_abs[0]) == 1 {
+                prefix += 1;
+            }
+            let mut k = 0u32;
+            let mut abs = prefix;
+            if prefix >= 5 {
+                while engine.decode_bypass() == 1 {
+                    k += 1;
+                    if k > 32 {
+                        return Err(Error::invalid("h265 cu_qp_delta suffix overflow"));
+                    }
+                }
+                let mut suf = 0u32;
+                for _ in 0..k {
+                    suf = (suf << 1) | engine.decode_bypass();
+                }
+                abs += suf;
+                abs += (1 << k) - 1;
+            }
+            let delta = if abs != 0 {
+                let sign = engine.decode_bypass();
+                if sign == 1 {
+                    -(abs as i32)
+                } else {
+                    abs as i32
+                }
+            } else {
+                0
+            };
+            *self.cu_qp_y = (*self.cu_qp_y + delta).rem_euclid(52);
+        }
+        if cbf_luma != 0 {
+            self.add_residual_plane(engine, ctx, x0, y0, log2_tb, true)?;
+        }
+        if chroma_present {
+            let cx = x0 / 2;
+            let cy = y0 / 2;
+            if cbf_cb != 0 {
+                self.add_residual_plane(engine, ctx, cx, cy, chroma_log2, false)?;
+            }
+            if cbf_cr != 0 {
+                self.add_residual_plane_cr(engine, ctx, cx, cy, chroma_log2)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_residual_plane(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x0: u32,
+        y0: u32,
+        log2_tb: u32,
+        is_luma: bool,
+    ) -> Result<()> {
+        let n = 1usize << log2_tb;
+        let mut levels = vec![0i32; n * n];
+        // For inter residual: scan_idx is always diagonal (scan_idx=0).
+        self.residual_coding(
+            engine,
+            ctx,
+            &mut levels,
+            log2_tb,
+            /*pred_mode*/ 0,
+            is_luma,
+        )?;
+        let qp = self.get_qp(is_luma);
+        let mut deq = vec![0i32; n * n];
+        dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+        let mut res = vec![0i32; n * n];
+        // Inter TU: DCT only (no DST-VII even at 4×4).
+        inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        self.add_to_plane(x0, y0, n, &res, is_luma, false);
+        Ok(())
+    }
+
+    fn add_residual_plane_cr(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x0: u32,
+        y0: u32,
+        log2_tb: u32,
+    ) -> Result<()> {
+        let n = 1usize << log2_tb;
+        let mut levels = vec![0i32; n * n];
+        self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
+        let qp = self.get_qp(false);
+        let mut deq = vec![0i32; n * n];
+        dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+        let mut res = vec![0i32; n * n];
+        inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        self.add_to_plane(x0, y0, n, &res, false, true);
+        Ok(())
+    }
+
+    fn add_to_plane(&mut self, x: u32, y: u32, n: usize, res: &[i32], is_luma: bool, is_cr: bool) {
+        let (stride, plane, pic_w, pic_h) = if is_luma {
+            (
+                self.pic.luma_stride,
+                &mut self.pic.luma,
+                self.pic.width as usize,
+                self.pic.height as usize,
+            )
+        } else if is_cr {
+            (
+                self.pic.chroma_stride,
+                &mut self.pic.cr,
+                (self.pic.width as usize) / 2,
+                (self.pic.height as usize) / 2,
+            )
+        } else {
+            (
+                self.pic.chroma_stride,
+                &mut self.pic.cb,
+                (self.pic.width as usize) / 2,
+                (self.pic.height as usize) / 2,
+            )
+        };
+        let x0 = x as usize;
+        let y0 = y as usize;
+        for dy in 0..n {
+            for dx in 0..n {
+                let xx = x0 + dx;
+                let yy = y0 + dy;
+                if xx < pic_w && yy < pic_h {
+                    let idx = yy * stride + xx;
+                    let v = plane[idx] as i32 + res[dy * n + dx];
+                    plane[idx] = v.clamp(0, 255) as u8;
+                }
+            }
         }
     }
 
@@ -940,6 +1432,51 @@ impl<'a> Walker<'a> {
         build_ref_samples(&samples, &avail, n)
     }
 
+    fn write_rect(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: usize,
+        h: usize,
+        block: &[u8],
+        is_luma: bool,
+        is_cr: bool,
+    ) {
+        let (stride, plane, pic_w, pic_h) = if is_luma {
+            (
+                self.pic.luma_stride,
+                &mut self.pic.luma,
+                self.pic.width as usize,
+                self.pic.height as usize,
+            )
+        } else if is_cr {
+            (
+                self.pic.chroma_stride,
+                &mut self.pic.cr,
+                (self.pic.width as usize) / 2,
+                (self.pic.height as usize) / 2,
+            )
+        } else {
+            (
+                self.pic.chroma_stride,
+                &mut self.pic.cb,
+                (self.pic.width as usize) / 2,
+                (self.pic.height as usize) / 2,
+            )
+        };
+        let x0 = x as usize;
+        let y0 = y as usize;
+        for dy in 0..h {
+            for dx in 0..w {
+                let xx = x0 + dx;
+                let yy = y0 + dy;
+                if xx < pic_w && yy < pic_h {
+                    plane[yy * stride + xx] = block[dy * w + dx];
+                }
+            }
+        }
+    }
+
     fn write_block(&mut self, x: u32, y: u32, n: usize, block: &[u8], is_luma: bool, is_cr: bool) {
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
@@ -1227,6 +1764,112 @@ impl<'a> Walker<'a> {
 
 fn last_sig_ctx_base(_log2_tb: u32, _is_luma: bool) -> (usize, usize) {
     (0, 0)
+}
+
+/// Truncated-rice merge_idx decode (§9.3.4.2.10). Values 0..MaxNumMergeCand-1.
+fn decode_merge_idx(engine: &mut CabacEngine<'_>, ctx: &mut Ctx, max: u32) -> u32 {
+    if max <= 1 {
+        return 0;
+    }
+    // First bin: context-coded with merge_idx[0].
+    let b0 = engine.decode_bin(&mut ctx.merge_idx[0]);
+    if b0 == 0 {
+        return 0;
+    }
+    // Remaining bins: bypass, unary up to max-1.
+    let mut v = 1u32;
+    while v < max - 1 {
+        let b = engine.decode_bypass();
+        if b == 0 {
+            break;
+        }
+        v += 1;
+    }
+    v
+}
+
+/// ref_idx truncated-rice decode (§9.3.4.2.11). `num_refs` is the list size.
+fn decode_ref_idx(engine: &mut CabacEngine<'_>, ctx: &mut Ctx, num_refs: u32) -> u32 {
+    if num_refs <= 1 {
+        return 0;
+    }
+    // First bin: ctx 0. Second bin (if needed): ctx 1. Remaining: bypass.
+    let b0 = engine.decode_bin(&mut ctx.ref_idx[0]);
+    if b0 == 0 {
+        return 0;
+    }
+    if num_refs == 2 {
+        return 1;
+    }
+    let b1 = engine.decode_bin(&mut ctx.ref_idx[1]);
+    if b1 == 0 {
+        return 1;
+    }
+    let mut v = 2u32;
+    while v < num_refs - 1 {
+        let b = engine.decode_bypass();
+        if b == 0 {
+            break;
+        }
+        v += 1;
+    }
+    v
+}
+
+/// Parse one `mvd_coding()` (§7.3.8.9) for L0 and return the signed MVD.
+fn decode_mvd(engine: &mut CabacEngine<'_>, ctx: &mut Ctx) -> Result<MotionVector> {
+    let gt0_x = engine.decode_bin(&mut ctx.abs_mvd_greater[0]);
+    let gt0_y = engine.decode_bin(&mut ctx.abs_mvd_greater[0]);
+    let mut abs_x: i32 = 0;
+    let mut abs_y: i32 = 0;
+    let mut gt1_x = 0u32;
+    let mut gt1_y = 0u32;
+    if gt0_x == 1 {
+        gt1_x = engine.decode_bin(&mut ctx.abs_mvd_greater[1]);
+    }
+    if gt0_y == 1 {
+        gt1_y = engine.decode_bin(&mut ctx.abs_mvd_greater[1]);
+    }
+    if gt0_x == 1 {
+        abs_x = 1 + gt1_x as i32;
+        if gt1_x == 1 {
+            let rem = decode_eg1(engine)?;
+            abs_x += rem as i32;
+        }
+        let sign = engine.decode_bypass();
+        if sign == 1 {
+            abs_x = -abs_x;
+        }
+    }
+    if gt0_y == 1 {
+        abs_y = 1 + gt1_y as i32;
+        if gt1_y == 1 {
+            let rem = decode_eg1(engine)?;
+            abs_y += rem as i32;
+        }
+        let sign = engine.decode_bypass();
+        if sign == 1 {
+            abs_y = -abs_y;
+        }
+    }
+    Ok(MotionVector::new(abs_x, abs_y))
+}
+
+/// First-order Exp-Golomb (EG1) bypass-coded decode per §9.3.4.3.4.
+fn decode_eg1(engine: &mut CabacEngine<'_>) -> Result<u32> {
+    let mut k = 1u32;
+    while engine.decode_bypass() == 1 {
+        k += 1;
+        if k > 32 {
+            return Err(Error::invalid("h265 eg1 prefix overflow"));
+        }
+    }
+    // Read k bits of suffix.
+    let mut suf = 0u32;
+    for _ in 0..k {
+        suf = (suf << 1) | engine.decode_bypass();
+    }
+    Ok(suf + (1u32 << k) - 2)
 }
 
 /// §9.3.4.2.3 last_sig_coeff prefix context increment.
