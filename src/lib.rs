@@ -7,30 +7,38 @@
 //! * **VPS / SPS / PPS parsers** — every field needed to validate stream
 //!   shape (resolution, chroma format, bit depth, CTU size, tiles /
 //!   wavefront flags, …) is decoded.
-//! * **Slice segment header parser** — reaches `byte_alignment()` for IDR
-//!   I-slice packets under the current decode shape.
+//! * **Slice segment header parser** — full I-slice and P-slice extension
+//!   parses (inline RPS, num_ref_idx, max_num_merge_cand, cabac_init_flag,
+//!   slice_qp_delta, SAO flags, …).
 //! * **HEVCDecoderConfigurationRecord (`hvcC`) parser** — used by the MP4
 //!   demuxer to populate `extradata`.
-//! * **CABAC** — full arithmetic engine and I-slice context tables.
+//! * **CABAC** — full arithmetic engine, I-slice and inter context tables.
 //! * **Coding-tree walker** — CTU → CU → PU → TU with intra-mode decode,
-//!   residual coding (sig_coeff / greater1 / greater2 / signs / rice tail),
-//!   inverse transform, flat dequantisation, and reconstruction.
+//!   inter prediction (merge / AMVP / MVD / ref_idx), residual coding
+//!   (sig_coeff / greater1 / greater2 / signs / rice tail), inverse
+//!   transform, flat dequantisation, and reconstruction.
 //! * **Intra prediction** — all 35 modes (planar, DC, 33 angular), MDIS
 //!   filter, strong-intra-smoothing at 32×32.
+//! * **Inter prediction** — 8-tap luma / 4-tap chroma sub-pel MC,
+//!   spatial merge + AMVP, DPB keyed by POC.
 //!
 //! ## Restricted to
 //!
 //! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
 //! * Single-tile, wavefront-off, no transform-skip, no scaling lists,
 //!   no PCM CUs.
-//! * **I-slices only** — P / B inter prediction returns
-//!   `Error::Unsupported("h265 inter slice pending")`.
+//! * **I-slice and P-slice** — B slices return
+//!   `Error::Unsupported("h265 B-slice decode pending")`. Inter PB shapes
+//!   are limited to 2Nx2N / 2NxN / Nx2N / NxN (no AMP).
 //!
 //! ## Out of scope
 //!
 //! * **Deblocking filter** (§8.7.2) — reconstructed frames carry visible
 //!   block-edge artefacts.
 //! * **SAO** (§8.7.3) — parsed but not applied.
+//! * **Temporal MVP** / long-term refs — parsed but not used.
+//! * **Weighted prediction** — parsed (walked past) but unit weights are
+//!   used during MC.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 //! * **Encoder** — write side is not in scope.
 //!
@@ -41,9 +49,11 @@
 //!   parsing, emulation-prevention removal.
 //! * [`ptl`] — `profile_tier_level()` (§7.3.3) shared by VPS/SPS.
 //! * [`vps`], [`sps`], [`pps`] — parameter-set parsers.
-//! * [`slice`] — slice segment header and `SliceQpY` derivation.
-//! * [`cabac`] — arithmetic engine and I-slice context-init tables.
+//! * [`slice`] — slice segment header (I + P extension) and `SliceQpY`
+//!   derivation.
+//! * [`cabac`] — arithmetic engine, I-slice and inter context-init tables.
 //! * [`intra_pred`] — 35-mode intra prediction + MDIS reference filter.
+//! * [`inter`] — DPB, merge list, AMVP, 8-tap luma / 4-tap chroma MC.
 //! * [`transform`] — DST-VII 4×4 and DCT-II 4 / 8 / 16 / 32, plus flat
 //!   dequantisation.
 //! * [`scan`] — 4×4 sub-block scan tables (diagonal / horizontal /

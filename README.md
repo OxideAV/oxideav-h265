@@ -33,10 +33,11 @@ oxideav-h265 = "0.0"
 
 ## Decode support
 
-**I-slice, 8-bit 4:2:0 only.** For packets that contain an IDR I
-slice within the supported shape, `receive_frame` returns a
+**I-slice and P-slice, 8-bit 4:2:0.** Both keyframe (IDR) and
+P-slice packets decode end-to-end; `receive_frame` returns a
 `VideoFrame` in `PixelFormat::Yuv420P` with the conformance-window
-crop already applied.
+crop already applied. P slices look up references in a small DPB
+keyed by picture order count.
 
 ### Pipeline (§9.3 / §8.4 / §8.6)
 
@@ -72,12 +73,42 @@ crop already applied.
 * **Reconstruction** — `clip1Y(pred + residual)` into the 8-bit picture
   buffer.
 
+### Inter decode (§8.5, P-slice only)
+
+* **Reference picture list** — RPL0 is built from the current slice's
+  short-term RPS (resolved against the SPS RPS list or an inline one)
+  by looking up each delta-POC entry in the DPB.
+* **Prediction unit syntax** — `merge_flag`, `merge_idx`, `ref_idx_l0`
+  (truncated rice), `mvd_coding()` (two greater-flag bins + EG1
+  remainder), and `mvp_l0_flag`. `inter_pred_idc` is implied as L0
+  for P slices.
+* **Partition modes** — 2Nx2N, 2NxN, Nx2N, and NxN at minimum CB size.
+  Asymmetric motion partitions (AMP) are out of scope.
+* **Merge list** (§8.5.3.1.2) — spatial candidates A1 / B1 / B0 / A0 /
+  B2 with HEVC pruning; zero-MV fillers. Temporal merge is not yet
+  supported.
+* **AMVP** (§8.5.3.1.6) — spatial-only MV predictor pair with
+  deduplication; temporal predictor is not included.
+* **Motion compensation** — 8-tap luma and 4-tap chroma sub-pel
+  interpolation (§8.5.3.2.2 / §8.5.3.2.3) with the 16-phase filter
+  tables; full 2-D separable filter with 8-bit sample clipping.
+* **Residual-on-MC** — inter TUs share the CABAC residual decoder
+  used for intra and are added to the MC prediction (clipped to
+  8-bit). 4×4 inter luma uses DCT-II (not DST-VII).
+
 ### Not yet implemented
 
-* **P / B slice inter prediction** — `receive_frame` returns
-  `Error::Unsupported("h265 inter slice pending")` as soon as a
-  non-I slice is seen. No DPB, no motion compensation, no weighted
-  prediction, no merge / AMVP candidate lists.
+* **B-slice inter prediction** — `receive_frame` returns
+  `Error::Unsupported("h265 B-slice decode pending")` as soon as a
+  B slice is seen. No bi-prediction, no temporal MV.
+* **Weighted prediction** — the `pred_weight_table()` is parsed (walked
+  past) but unit weights are used during MC.
+* **Asymmetric motion partitions (AMP)** — rejected with
+  `Error::Unsupported`.
+* **List modification** — `ref_pic_list_modification()` is rejected.
+* **Temporal MVP / TMVP** — the slice-level flag is parsed but the
+  collocated MV is not consulted for merge / AMVP derivation.
+* **Long-term reference pictures** — rejected.
 * **Deblocking filter** (§8.7.2) — not yet applied. The reconstructed
   picture therefore carries visible block-edge artefacts; downstream
   consumers that need a post-filtered frame need to apply an external
@@ -133,7 +164,7 @@ for nal in iter_annex_b(bytes) {
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-## Test fixture
+## Test fixtures
 
 `tests/fixtures/hevc-intra.h265` is a 256×144 single IDR Annex B
 stream generated with:
@@ -145,12 +176,24 @@ ffmpeg -f lavfi -i "testsrc=size=256x144:rate=24:duration=0.04" \
     -pix_fmt yuv420p -f hevc tests/fixtures/hevc-intra.h265
 ```
 
-The wavefront / multithreading flags are disabled so the resulting
-stream stays within the v1 single-tile decode scope. The integration
-test
+`tests/fixtures/hevc-p.h265` is the matching P-slice fixture — a
+256×144 two-frame (1 I + 1 P) clip:
+
+```sh
+ffmpeg -f lavfi -i "testsrc=size=256x144:rate=24:duration=0.083" \
+    -pix_fmt yuv420p -c:v libx265 \
+    -x265-params "keyint=2:bframes=0:no-sao=1:no-scenecut=1:no-open-gop=1:wpp=0:pmode=0:pme=0:frame-threads=1:no-tmvp=1:no-amp=1:no-rect=1:no-weightp=1:max-merge=1" \
+    -f hevc tests/fixtures/hevc-p.h265
+```
+
+The `no-amp` / `no-rect` / `max-merge=1` flags keep the encoder
+within the partition shapes and motion-vector fan-out that this
+decoder currently supports; the wavefront / multithreading flags
+avoid tiles and WPP. The integration tests
 [`hevc_intra_fixture_decodes_to_plausible_picture`](tests/reference_clip.rs)
-asserts the reconstructed luma plane has a mean in `32..=224` and
-more than 20 distinct sample values.
+and [`hevc_p_slice_fixture_decodes`](tests/reference_clip.rs) assert
+that the I frame is plausibly coloured and that the P frame decodes
+to pixels distinct from the I frame.
 
 ## License
 

@@ -3,10 +3,11 @@
 //! Ties the parameter-set and slice-header parsers to the CTU pipeline and
 //! exposes an `oxideav_codec::Decoder` implementation. Scope:
 //!
-//! * **I slice, 8-bit 4:2:0** — full pixel decode. Reconstructed luma and
-//!   chroma are emitted as a `VideoFrame` (pixel format `Yuv420P`).
-//! * **Everything else** — returns `Error::Unsupported("h265 inter slice
-//!   pending")` (for P/B slices) or a specific unsupported message
+//! * **I slice / P slice, 8-bit 4:2:0** — full pixel decode. Reconstructed
+//!   luma and chroma are emitted as a `VideoFrame` (pixel format
+//!   `Yuv420P`). P slices pull references from a small DPB keyed by POC.
+//! * **Everything else** — returns `Error::Unsupported("h265 B-slice
+//!   decode pending")` (for B slices) or a specific unsupported message
 //!   surfacing the feature that is not yet implemented.
 
 use std::collections::HashMap;
