@@ -48,6 +48,39 @@ pub struct SeqParameterSet {
     pub sps_temporal_mvp_enabled_flag: bool,
     pub strong_intra_smoothing_enabled_flag: bool,
     pub vui_parameters_present_flag: bool,
+    /// Parsed short-term RPS entries (§7.4.8). Each entry records the POC
+    /// deltas (negative first, positive after) and the per-entry
+    /// `used_by_curr_pic_flag`. Needed for slice-level reference picture list
+    /// construction at inter-slice decode time.
+    pub short_term_ref_pic_sets: Vec<ShortTermRps>,
+}
+
+/// A parsed short-term reference picture set (§7.4.8).
+#[derive(Clone, Debug, Default)]
+pub struct ShortTermRps {
+    /// POC deltas relative to the current picture for the "before" set
+    /// (historically negative).
+    pub delta_poc_s0: Vec<i32>,
+    /// POC deltas for the "after" set (positive).
+    pub delta_poc_s1: Vec<i32>,
+    /// `used_by_curr_pic` flags for the s0 entries.
+    pub used_by_curr_pic_s0: Vec<bool>,
+    /// `used_by_curr_pic` flags for the s1 entries.
+    pub used_by_curr_pic_s1: Vec<bool>,
+}
+
+impl ShortTermRps {
+    pub fn num_negative_pics(&self) -> usize {
+        self.delta_poc_s0.len()
+    }
+
+    pub fn num_positive_pics(&self) -> usize {
+        self.delta_poc_s1.len()
+    }
+
+    pub fn num_delta_pocs(&self) -> usize {
+        self.num_negative_pics() + self.num_positive_pics()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,28 +256,16 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
             "h265 SPS: num_short_term_ref_pic_sets out of range ({num_short_term_ref_pic_sets})"
         )));
     }
-    // Skip every short-term RPS body.
-    let mut num_neg_pics_per_rps: Vec<u32> =
-        Vec::with_capacity(num_short_term_ref_pic_sets as usize);
-    let mut num_pos_pics_per_rps: Vec<u32> =
+    let mut short_term_ref_pic_sets: Vec<ShortTermRps> =
         Vec::with_capacity(num_short_term_ref_pic_sets as usize);
     for st_rps_idx in 0..num_short_term_ref_pic_sets {
-        skip_st_ref_pic_set(
+        let rps = parse_st_ref_pic_set(
             &mut br,
             st_rps_idx,
             num_short_term_ref_pic_sets,
-            &num_neg_pics_per_rps,
-            &num_pos_pics_per_rps,
+            &short_term_ref_pic_sets,
         )?;
-        // We don't currently track exact NumDeltaPocs; the "use_delta_flag /
-        // inter_ref_pic_set_prediction_flag" path is still consumed because
-        // its bit-width ends up the same per RPS. To keep this honest we
-        // intentionally only walk past the flag-style bodies — the inter-
-        // prediction path is rare in IDR-heavy streams and is documented as
-        // a v1 caveat.
-        // For scaffold purposes record zeros to keep downstream code happy.
-        num_neg_pics_per_rps.push(0);
-        num_pos_pics_per_rps.push(0);
+        short_term_ref_pic_sets.push(rps);
     }
 
     let long_term_ref_pics_present_flag = br.u1()? == 1;
@@ -303,19 +324,19 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         sps_temporal_mvp_enabled_flag,
         strong_intra_smoothing_enabled_flag,
         vui_parameters_present_flag,
+        short_term_ref_pic_sets,
     })
 }
 
-/// Walk past one `st_ref_pic_set( stRpsIdx )` (§7.3.7). Computes
-/// NumDeltaPocs[stRpsIdx] in passing and records it in the caller's
-/// `num_*_pics_per_rps` vectors via the values it returns.
-fn skip_st_ref_pic_set(
+/// Parse one `st_ref_pic_set( stRpsIdx )` (§7.4.8). Fills in absolute POC
+/// deltas and `used_by_curr_pic` flags. Handles both the explicit form and
+/// the inter-RPS-prediction form (references an earlier RPS + a delta_rps).
+pub fn parse_st_ref_pic_set(
     br: &mut BitReader<'_>,
     st_rps_idx: u32,
     num_short_term_ref_pic_sets: u32,
-    num_neg_pics_per_rps: &[u32],
-    num_pos_pics_per_rps: &[u32],
-) -> Result<()> {
+    prior: &[ShortTermRps],
+) -> Result<ShortTermRps> {
     let inter_ref_pic_set_prediction_flag = if st_rps_idx != 0 {
         br.u1()? == 1
     } else {
@@ -327,25 +348,83 @@ fn skip_st_ref_pic_set(
         } else {
             0
         };
-        // delta_rps_sign + abs_delta_rps_minus1
-        br.skip(1)?;
-        let _ = br.ue()?;
+        let delta_rps_sign = br.u1()? == 1;
+        let abs_delta_rps_minus1 = br.ue()?;
+        let delta_rps = if delta_rps_sign {
+            -((abs_delta_rps_minus1 as i32) + 1)
+        } else {
+            (abs_delta_rps_minus1 as i32) + 1
+        };
         let ref_rps_idx = (st_rps_idx as i64) - 1 - delta_idx_minus1 as i64;
-        if ref_rps_idx < 0 || (ref_rps_idx as usize) >= num_neg_pics_per_rps.len() {
+        if ref_rps_idx < 0 || (ref_rps_idx as usize) >= prior.len() {
             return Err(Error::invalid(format!(
                 "h265 SPS RPS: invalid ref_rps_idx {ref_rps_idx}"
             )));
         }
-        let nb_pocs =
-            num_neg_pics_per_rps[ref_rps_idx as usize] + num_pos_pics_per_rps[ref_rps_idx as usize];
-        // For each j in 0..=nb_pocs: used_by_curr_pic_flag[j], then if false,
-        //   use_delta_flag[j].
-        for _ in 0..=nb_pocs {
-            let used = br.u1()? == 1;
-            if !used {
-                br.skip(1)?;
+        let r = &prior[ref_rps_idx as usize];
+        let num_delta_pocs = r.num_delta_pocs();
+        // For each j in 0..=NumDeltaPocs(ref): used_by_curr_pic_flag[j]; if
+        // not used, optional use_delta_flag[j] (default 1).
+        let mut used_by_curr = vec![false; num_delta_pocs + 1];
+        let mut use_delta = vec![true; num_delta_pocs + 1];
+        for j in 0..=num_delta_pocs {
+            used_by_curr[j] = br.u1()? == 1;
+            if !used_by_curr[j] {
+                use_delta[j] = br.u1()? == 1;
             }
         }
+        // Build up the s0/s1 per §7.4.8 equations.
+        let mut s0_deltas: Vec<i32> = Vec::new();
+        let mut s0_used: Vec<bool> = Vec::new();
+        let mut s1_deltas: Vec<i32> = Vec::new();
+        let mut s1_used: Vec<bool> = Vec::new();
+        // Case 1: iterate negative pics of the reference in reverse plus the
+        // "self" entry at index num_delta_pocs (representing the reference
+        // picture itself at delta 0).
+        let num_neg = r.num_negative_pics();
+        let num_pos = r.num_positive_pics();
+        for i in (0..num_neg).rev() {
+            let d = r.delta_poc_s0[i] + delta_rps;
+            if d < 0 && use_delta[i] {
+                s0_deltas.push(d);
+                s0_used.push(used_by_curr[i]);
+            }
+        }
+        if delta_rps < 0 && use_delta[num_delta_pocs] {
+            s0_deltas.push(delta_rps);
+            s0_used.push(used_by_curr[num_delta_pocs]);
+        }
+        for i in 0..num_pos {
+            let d = r.delta_poc_s1[i] + delta_rps;
+            if d < 0 && use_delta[num_neg + i] {
+                s0_deltas.push(d);
+                s0_used.push(used_by_curr[num_neg + i]);
+            }
+        }
+        for i in (0..num_pos).rev() {
+            let d = r.delta_poc_s1[i] + delta_rps;
+            if d > 0 && use_delta[num_neg + i] {
+                s1_deltas.push(d);
+                s1_used.push(used_by_curr[num_neg + i]);
+            }
+        }
+        if delta_rps > 0 && use_delta[num_delta_pocs] {
+            s1_deltas.push(delta_rps);
+            s1_used.push(used_by_curr[num_delta_pocs]);
+        }
+        for i in 0..num_neg {
+            let d = r.delta_poc_s0[i] + delta_rps;
+            if d > 0 && use_delta[i] {
+                s1_deltas.push(d);
+                s1_used.push(used_by_curr[i]);
+            }
+        }
+        Ok(ShortTermRps {
+            delta_poc_s0: s0_deltas,
+            delta_poc_s1: s1_deltas,
+            used_by_curr_pic_s0: s0_used,
+            used_by_curr_pic_s1: s1_used,
+        })
     } else {
         let num_negative_pics = br.ue()?;
         let num_positive_pics = br.ue()?;
@@ -354,16 +433,33 @@ fn skip_st_ref_pic_set(
                 "h265 SPS RPS: num_*_pics out of range ({num_negative_pics}/{num_positive_pics})"
             )));
         }
+        let mut delta_poc_s0 = Vec::with_capacity(num_negative_pics as usize);
+        let mut used_by_curr_pic_s0 = Vec::with_capacity(num_negative_pics as usize);
+        let mut prev: i32 = 0;
         for _ in 0..num_negative_pics {
-            let _ = br.ue()?; // delta_poc_s0_minus1[i]
-            br.skip(1)?; // used_by_curr_pic_s0_flag[i]
+            let delta_poc_s0_minus1 = br.ue()? as i32;
+            let d = prev - (delta_poc_s0_minus1 + 1);
+            prev = d;
+            delta_poc_s0.push(d);
+            used_by_curr_pic_s0.push(br.u1()? == 1);
         }
+        let mut delta_poc_s1 = Vec::with_capacity(num_positive_pics as usize);
+        let mut used_by_curr_pic_s1 = Vec::with_capacity(num_positive_pics as usize);
+        let mut prev: i32 = 0;
         for _ in 0..num_positive_pics {
-            let _ = br.ue()?; // delta_poc_s1_minus1[i]
-            br.skip(1)?; // used_by_curr_pic_s1_flag[i]
+            let delta_poc_s1_minus1 = br.ue()? as i32;
+            let d = prev + (delta_poc_s1_minus1 + 1);
+            prev = d;
+            delta_poc_s1.push(d);
+            used_by_curr_pic_s1.push(br.u1()? == 1);
         }
+        Ok(ShortTermRps {
+            delta_poc_s0,
+            delta_poc_s1,
+            used_by_curr_pic_s0,
+            used_by_curr_pic_s1,
+        })
     }
-    Ok(())
 }
 
 /// Walk past a `scaling_list_data()` block (§7.3.4). We read syntax for
