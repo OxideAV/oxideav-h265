@@ -15,6 +15,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::inter::WeightedPred;
 use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::PicParameterSet;
 use crate::sps::{parse_st_ref_pic_set, SeqParameterSet, ShortTermRps};
@@ -76,6 +77,15 @@ pub struct SliceSegmentHeader {
     pub is_full_i_slice: bool,
     /// Set when the full P-slice extension parse succeeded (inter decode).
     pub is_full_p_slice: bool,
+    /// Set when the full B-slice extension parse succeeded (inter decode).
+    pub is_full_b_slice: bool,
+    /// `collocated_ref_idx` (§7.4.7.1). Only meaningful when
+    /// `slice_temporal_mvp_enabled_flag` is true. 0 when absent.
+    pub collocated_ref_idx: u32,
+    /// Parsed `pred_weight_table()` when weighted prediction is enabled
+    /// (P-slice with `pps.weighted_pred_flag` or B-slice with
+    /// `pps.weighted_bipred_flag`).
+    pub weighted_pred: Option<WeightedPred>,
     /// Resolved short-term RPS for the current picture, if any.
     pub current_rps: Option<ShortTermRps>,
     /// `num_ref_idx_l0_active_minus1` (defaults from PPS). Slices may
@@ -233,6 +243,9 @@ pub fn parse_slice_segment_header(
     let mut slice_data_bit_offset: u64 = 0;
     let mut is_full_i_slice = false;
     let mut is_full_p_slice = false;
+    let mut is_full_b_slice = false;
+    let mut collocated_ref_idx: u32 = 0;
+    let mut weighted_pred: Option<WeightedPred> = None;
 
     // Only attempt the full parse for single-segment slices (not dependent).
     if !dependent_slice_segment_flag && !sps.separate_colour_plane_flag {
@@ -290,22 +303,19 @@ pub fn parse_slice_segment_header(
                     && num_ref_idx_l0_active_minus1 > 0)
                     || (!collocated_from_l0_flag && num_ref_idx_l1_active_minus1 > 0);
                 if needs_collocated {
-                    let _collocated_ref_idx = br.ue()?;
+                    collocated_ref_idx = br.ue()?;
                 }
             }
             if (pps.weighted_pred_flag && slice_type == SliceType::P)
                 || (pps.weighted_bipred_flag && slice_type == SliceType::B)
             {
-                // Walk past pred_weight_table without storing — single-ref
-                // weighted prediction path that we currently treat as
-                // out-of-scope (the MC pipeline uses unit weights).
-                skip_pred_weight_table(
+                weighted_pred = Some(parse_pred_weight_table(
                     &mut br,
                     sps,
                     slice_type,
                     num_ref_idx_l0_active_minus1,
                     num_ref_idx_l1_active_minus1,
-                )?;
+                )?);
             }
             five_minus_max_num_merge_cand = br.ue()?;
             if five_minus_max_num_merge_cand > 4 {
@@ -385,8 +395,7 @@ pub fn parse_slice_segment_header(
             SliceType::I if is_idr => is_full_i_slice = true,
             SliceType::I => is_full_i_slice = true,
             SliceType::P => is_full_p_slice = true,
-            // B slice is out of scope.
-            SliceType::B => {}
+            SliceType::B => is_full_b_slice = true,
         }
     }
 
@@ -411,6 +420,9 @@ pub fn parse_slice_segment_header(
         slice_data_bit_offset,
         is_full_i_slice,
         is_full_p_slice,
+        is_full_b_slice,
+        collocated_ref_idx,
+        weighted_pred,
         current_rps,
         num_ref_idx_l0_active_minus1,
         num_ref_idx_l1_active_minus1,
@@ -424,26 +436,30 @@ pub fn parse_slice_segment_header(
     })
 }
 
-/// Skip a `pred_weight_table()` body (§7.4.7.3) — we consume but don't
-/// expose the weights yet. Returns `Err` if the chroma-format query is
-/// inconsistent.
-fn skip_pred_weight_table(
+/// Parse a `pred_weight_table()` body (§7.4.7.3) into a [`WeightedPred`].
+/// Weights are stored as spec-signed values; the MC pipeline consumes
+/// them via [`WeightedPred::luma_weight_l0`] & friends.
+fn parse_pred_weight_table(
     br: &mut BitReader<'_>,
     sps: &SeqParameterSet,
     slice_type: SliceType,
     num_ref_idx_l0_active_minus1: u32,
     num_ref_idx_l1_active_minus1: u32,
-) -> Result<()> {
-    let _luma_log2_weight_denom = br.ue()?;
+) -> Result<WeightedPred> {
+    let luma_denom = br.ue()?;
     let chroma_array_type = if sps.separate_colour_plane_flag {
         0
     } else {
         sps.chroma_format_idc
     };
+    let mut chroma_denom: u32 = 0;
     if chroma_array_type != 0 {
-        let _delta_chroma_log2_weight_denom = br.se()?;
+        let delta = br.se()?;
+        chroma_denom = (luma_denom as i32 + delta).max(0) as u32;
     }
-    let consume = |br: &mut BitReader<'_>, count: u32| -> Result<()> {
+    type LumaList = Vec<(bool, i32, i32)>;
+    type ChromaList = Vec<[(bool, i32, i32); 2]>;
+    let parse_list = |br: &mut BitReader<'_>, count: u32| -> Result<(LumaList, ChromaList)> {
         let mut luma_flags = vec![false; count as usize];
         for f in luma_flags.iter_mut() {
             *f = br.u1()? == 1;
@@ -454,25 +470,40 @@ fn skip_pred_weight_table(
                 *f = br.u1()? == 1;
             }
         }
+        let mut lumas: LumaList = vec![(false, 1 << luma_denom, 0); count as usize];
+        let mut chromas: ChromaList = vec![[(false, 1 << chroma_denom, 0); 2]; count as usize];
         for i in 0..count as usize {
             if luma_flags[i] {
-                let _delta_luma_weight = br.se()?;
-                let _luma_offset = br.se()?;
+                let delta_w = br.se()?;
+                let w = (1i32 << luma_denom) + delta_w;
+                let o = br.se()?;
+                lumas[i] = (true, w, o);
             }
             if chroma_array_type != 0 && chroma_flags[i] {
-                for _ in 0..2 {
-                    let _delta_chroma_weight = br.se()?;
-                    let _delta_chroma_offset = br.se()?;
+                for slot in chromas[i].iter_mut() {
+                    let delta_w = br.se()?;
+                    let w = (1i32 << chroma_denom) + delta_w;
+                    let delta_o = br.se()?;
+                    *slot = (true, w, delta_o);
                 }
             }
         }
-        Ok(())
+        Ok((lumas, chromas))
     };
-    consume(br, num_ref_idx_l0_active_minus1 + 1)?;
-    if slice_type == SliceType::B {
-        consume(br, num_ref_idx_l1_active_minus1 + 1)?;
-    }
-    Ok(())
+    let (l0_luma, l0_chroma) = parse_list(br, num_ref_idx_l0_active_minus1 + 1)?;
+    let (l1_luma, l1_chroma) = if slice_type == SliceType::B {
+        parse_list(br, num_ref_idx_l1_active_minus1 + 1)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(WeightedPred {
+        luma_denom,
+        chroma_denom,
+        l0_luma,
+        l0_chroma,
+        l1_luma,
+        l1_chroma,
+    })
 }
 
 /// Build a `SliceSegmentHeader` for the "abort extension parse" path with
@@ -515,6 +546,9 @@ fn partial_header(
         slice_data_bit_offset: 0,
         is_full_i_slice: false,
         is_full_p_slice: false,
+        is_full_b_slice: false,
+        collocated_ref_idx: 0,
+        weighted_pred: None,
         current_rps,
         num_ref_idx_l0_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
         num_ref_idx_l1_active_minus1: pps.num_ref_idx_l1_default_active_minus1,

@@ -3,11 +3,12 @@
 //! Ties the parameter-set and slice-header parsers to the CTU pipeline and
 //! exposes an `oxideav_codec::Decoder` implementation. Scope:
 //!
-//! * **I slice / P slice, 8-bit 4:2:0** — full pixel decode. Reconstructed
+//! * **I, P, and B slices, 8-bit 4:2:0** — full pixel decode. Reconstructed
 //!   luma and chroma are emitted as a `VideoFrame` (pixel format
-//!   `Yuv420P`). P slices pull references from a small DPB keyed by POC.
-//! * **Everything else** — returns `Error::Unsupported("h265 B-slice
-//!   decode pending")` (for B slices) or a specific unsupported message
+//!   `Yuv420P`). Inter slices pull references from a small DPB keyed by
+//!   POC. B slices expose both L0 and L1 lists; the CTU walker combines
+//!   two MC predictors for bi-prediction.
+//! * **Everything else** — returns a specific `Error::Unsupported` message
 //!   surfacing the feature that is not yet implemented.
 
 use std::collections::HashMap;
@@ -129,7 +130,9 @@ impl HevcDecoder {
                                 }
                                 Err(e) => return Err(e),
                             }
-                        } else if hdr.is_full_p_slice && hdr.slice_type == SliceType::P {
+                        } else if (hdr.is_full_p_slice && hdr.slice_type == SliceType::P)
+                            || (hdr.is_full_b_slice && hdr.slice_type == SliceType::B)
+                        {
                             match self.decode_inter_slice(&rbsp, &hdr, &sps, &pps) {
                                 Ok(frame) => self.pending.push_back(frame),
                                 Err(Error::Unsupported(msg)) => {
@@ -164,6 +167,9 @@ impl HevcDecoder {
             slice: hdr,
             init_type: InitType::I,
             ref_list_l0: &empty,
+            ref_list_l1: &empty,
+            collocated_ref: None,
+            weighted_pred: None,
         };
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
@@ -182,23 +188,41 @@ impl HevcDecoder {
     ) -> Result<VideoFrame> {
         let width = sps.pic_width_in_luma_samples;
         let height = sps.pic_height_in_luma_samples;
-        // Build RPL0 from the active RPS.
         let current_poc = self.derive_poc(sps, hdr, false);
-        let rpl0 = self.build_rpl0(hdr, current_poc);
+        let (rpl0, rpl1) = self.build_ref_pic_lists(hdr, current_poc);
         if rpl0.is_empty() {
             return Err(Error::unsupported(
                 "h265 inter slice: no reference pictures",
             ));
         }
+        if hdr.slice_type == SliceType::B && rpl1.is_empty() {
+            return Err(Error::unsupported("h265 B slice: no L1 reference pictures"));
+        }
+
+        // Select the collocated reference picture for TMVP, if enabled.
+        let collocated_ref = if hdr.slice_temporal_mvp_enabled_flag {
+            let list = if hdr.collocated_from_l0_flag || hdr.slice_type == SliceType::P {
+                &rpl0
+            } else {
+                &rpl1
+            };
+            list.get(hdr.collocated_ref_idx as usize)
+        } else {
+            None
+        };
 
         let mut pic = Picture::new(width, height);
-        let init_type = crate::cabac::InitType::for_slice(false, false, hdr.cabac_init_flag);
+        let is_b = hdr.slice_type == SliceType::B;
+        let init_type = crate::cabac::InitType::for_slice(false, is_b, hdr.cabac_init_flag);
         let cctx = CtuContext {
             sps,
             pps,
             slice: hdr,
             init_type,
             ref_list_l0: &rpl0,
+            ref_list_l1: &rpl1,
+            collocated_ref,
+            weighted_pred: hdr.weighted_pred.as_ref(),
         };
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
@@ -207,38 +231,58 @@ impl HevcDecoder {
         Ok(self.emit_frame(&pic, sps))
     }
 
-    fn build_rpl0(&self, hdr: &SliceSegmentHeader, current_poc: i32) -> Vec<RefPicture> {
+    fn build_ref_pic_lists(
+        &self,
+        hdr: &SliceSegmentHeader,
+        current_poc: i32,
+    ) -> (Vec<RefPicture>, Vec<RefPicture>) {
         let Some(rps) = hdr.current_rps.as_ref() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        let mut out = Vec::new();
-        // Negative-POC entries first (closer in display order), then positive.
+        // §8.3.2: RefPicSetStCurrBefore (negative deltas) and
+        // RefPicSetStCurrAfter (positive deltas), used to build RPL0 and
+        // RPL1 (default initialisation §8.3.4).
+        let mut st_curr_before: Vec<RefPicture> = Vec::new();
         for (i, delta) in rps.delta_poc_s0.iter().enumerate() {
             if !rps.used_by_curr_pic_s0.get(i).copied().unwrap_or(false) {
                 continue;
             }
             let target = current_poc + delta;
             if let Some(p) = self.dpb.get_by_poc(target) {
-                out.push(p.clone());
+                st_curr_before.push(p.clone());
             }
         }
+        let mut st_curr_after: Vec<RefPicture> = Vec::new();
         for (i, delta) in rps.delta_poc_s1.iter().enumerate() {
             if !rps.used_by_curr_pic_s1.get(i).copied().unwrap_or(false) {
                 continue;
             }
             let target = current_poc + delta;
             if let Some(p) = self.dpb.get_by_poc(target) {
-                out.push(p.clone());
+                st_curr_after.push(p.clone());
             }
         }
-        // If the slice requests a larger num_ref_idx_l0_active than we
-        // resolved, leave as-is — out-of-range ref_idx will trip a clean
-        // error at CTU walk time.
-        let active = (hdr.num_ref_idx_l0_active_minus1 + 1) as usize;
-        if out.len() > active {
-            out.truncate(active);
+
+        // RPL0: before-first, then after, then long-term (not supported).
+        let mut rpl0: Vec<RefPicture> = Vec::new();
+        rpl0.extend(st_curr_before.iter().cloned());
+        rpl0.extend(st_curr_after.iter().cloned());
+        let active0 = (hdr.num_ref_idx_l0_active_minus1 + 1) as usize;
+        if rpl0.len() > active0 {
+            rpl0.truncate(active0);
         }
-        out
+
+        // RPL1: after-first, then before, then long-term (not supported).
+        let mut rpl1: Vec<RefPicture> = Vec::new();
+        if hdr.slice_type == SliceType::B {
+            rpl1.extend(st_curr_after.iter().cloned());
+            rpl1.extend(st_curr_before.iter().cloned());
+            let active1 = (hdr.num_ref_idx_l1_active_minus1 + 1) as usize;
+            if rpl1.len() > active1 {
+                rpl1.truncate(active1);
+            }
+        }
+        (rpl0, rpl1)
     }
 
     fn derive_poc(&mut self, sps: &SeqParameterSet, hdr: &SliceSegmentHeader, is_idr: bool) -> i32 {
@@ -274,6 +318,7 @@ impl HevcDecoder {
             cr: pic.cr.clone(),
             luma_stride: pic.luma_stride,
             chroma_stride: pic.chroma_stride,
+            inter: pic.inter.clone(),
         });
     }
 
@@ -363,13 +408,8 @@ impl Decoder for HevcDecoder {
         if self.eof {
             return Err(Error::Eof);
         }
-        // Distinguish between "slice already parsed but decode not attempted"
-        // (e.g. B slice) versus "no slice yet".
         if let Some(s) = &self.last_slice {
-            if s.slice_type == SliceType::B {
-                return Err(Error::unsupported("h265 B-slice decode pending"));
-            }
-            if !s.is_full_i_slice && !s.is_full_p_slice {
+            if !s.is_full_i_slice && !s.is_full_p_slice && !s.is_full_b_slice {
                 return Err(Error::unsupported(
                     "h265 slice shape not yet supported (tiles/wavefront/extension)",
                 ));

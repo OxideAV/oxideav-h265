@@ -29,8 +29,9 @@ use crate::cabac::{
     SPLIT_CU_FLAG_INIT_VALUES, SPLIT_TRANSFORM_FLAG_INIT_VALUES,
 };
 use crate::inter::{
-    build_amvp_list, build_merge_list, chroma_mc, luma_mc, InterState, MotionVector, PbMotion,
-    RefPicture,
+    build_amvp_list, build_merge_list, chroma_mc, chroma_mc_bi_combine, chroma_mc_hp, luma_mc,
+    luma_mc_bi_combine, luma_mc_bi_weighted, luma_mc_hp, InterState, MergeCand, MotionVector,
+    PbMotion, RefPicture, WeightedPred,
 };
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
@@ -90,14 +91,26 @@ pub struct CtuContext<'a> {
     pub pps: &'a PicParameterSet,
     pub slice: &'a SliceSegmentHeader,
     pub init_type: InitType,
-    /// Reference picture list L0 (owned POCs) plus the reference picture
-    /// lookup callback. Empty for I slices.
+    /// Reference picture list L0. Empty for I slices.
     pub ref_list_l0: &'a [RefPicture],
+    /// Reference picture list L1. Empty for I and P slices.
+    pub ref_list_l1: &'a [RefPicture],
+    /// Collocated reference picture for TMVP lookups, selected from either
+    /// L0 or L1 based on `collocated_from_l0_flag` + `collocated_ref_idx`.
+    /// `None` when TMVP is disabled or no collocated ref is available.
+    pub collocated_ref: Option<&'a RefPicture>,
+    /// Weighted bi-prediction table, when signalled by
+    /// `pred_weight_table()` for the slice.
+    pub weighted_pred: Option<&'a WeightedPred>,
 }
 
 impl<'a> CtuContext<'a> {
     pub fn is_inter_slice(&self) -> bool {
         matches!(self.slice.slice_type, SliceType::P | SliceType::B)
+    }
+
+    pub fn is_b_slice(&self) -> bool {
+        matches!(self.slice.slice_type, SliceType::B)
     }
 }
 
@@ -230,11 +243,13 @@ pub fn decode_slice_ctus(
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
     }
-    if matches!(cctx.slice.slice_type, SliceType::B) {
-        return Err(Error::unsupported("h265 B-slice pending"));
-    }
     if cctx.slice.slice_type == SliceType::P && cctx.ref_list_l0.is_empty() {
         return Err(Error::unsupported("h265 P-slice without RPL0"));
+    }
+    if cctx.slice.slice_type == SliceType::B
+        && (cctx.ref_list_l0.is_empty() || cctx.ref_list_l1.is_empty())
+    {
+        return Err(Error::unsupported("h265 B-slice without both RPL0 + RPL1"));
     }
 
     let ctb_log2 = cctx.sps.log2_min_luma_coding_block_size_minus3
@@ -558,6 +573,7 @@ impl<'a> Walker<'a> {
         n_pb_h: u32,
         merge_idx: u32,
     ) -> Result<()> {
+        let tmvp = self.tmvp_merge_cand(x0, y0, n_pb_w, n_pb_h);
         let cands = build_merge_list(
             &self.pic.inter,
             x0,
@@ -565,19 +581,17 @@ impl<'a> Walker<'a> {
             n_pb_w,
             n_pb_h,
             self.cctx.slice.max_num_merge_cand,
+            self.cctx.is_b_slice(),
+            tmvp,
         );
         let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
-        let ref_idx = sel.ref_idx_l0.max(0) as usize;
-        let ref_pic = self
-            .cctx
-            .ref_list_l0
-            .get(ref_idx)
-            .ok_or_else(|| Error::invalid("h265 merge: ref_idx out of list"))?;
-        let pb = PbMotion::inter(sel.ref_idx_l0, sel.mv_l0);
-        self.motion_compensate_pb(x0, y0, n_pb_w, n_pb_h, pb, ref_pic)?;
+        let pb = sel.to_pb();
+        self.motion_compensate_pb(x0, y0, n_pb_w, n_pb_h, pb)?;
         Ok(())
     }
 
+    /// Run motion compensation for a prediction block and write the result
+    /// into the picture. Supports L0 uni-pred, L1 uni-pred, and bi-pred.
     fn motion_compensate_pb(
         &mut self,
         x0: u32,
@@ -585,43 +599,201 @@ impl<'a> Walker<'a> {
         w: u32,
         h: u32,
         pb: PbMotion,
-        ref_pic: &RefPicture,
     ) -> Result<()> {
-        let mut out = vec![0u8; (w * h) as usize];
-        luma_mc(
-            ref_pic, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l0, &mut out,
-        )?;
-        // Write luma.
-        self.write_rect(x0, y0, w as usize, h as usize, &out, true, false);
-        // Chroma blocks are half resolution in 4:2:0.
+        let wz = w as usize;
+        let hz = h as usize;
         let cw = (w / 2) as usize;
         let ch = (h / 2) as usize;
+
+        let ref0 = if pb.pred_l0 {
+            let idx = pb.ref_idx_l0.max(0) as usize;
+            self.cctx
+                .ref_list_l0
+                .get(idx)
+                .ok_or_else(|| Error::invalid("h265 inter: L0 ref_idx out of range"))?
+        } else {
+            &self.cctx.ref_list_l0[0]
+        };
+        let ref1_opt = if pb.pred_l1 {
+            let idx = pb.ref_idx_l1.max(0) as usize;
+            Some(
+                self.cctx
+                    .ref_list_l1
+                    .get(idx)
+                    .ok_or_else(|| Error::invalid("h265 inter: L1 ref_idx out of range"))?,
+            )
+        } else {
+            None
+        };
+
+        let mut luma_out = vec![0u8; wz * hz];
         let mut cb_out = vec![0u8; cw * ch];
         let mut cr_out = vec![0u8; cw * ch];
-        chroma_mc(
-            ref_pic,
-            (x0 / 2) as i32,
-            (y0 / 2) as i32,
-            cw as i32,
-            ch as i32,
-            pb.mv_l0,
-            &mut cb_out,
-            0,
-        )?;
-        chroma_mc(
-            ref_pic,
-            (x0 / 2) as i32,
-            (y0 / 2) as i32,
-            cw as i32,
-            ch as i32,
-            pb.mv_l0,
-            &mut cr_out,
-            1,
-        )?;
+
+        let is_bi = pb.pred_l0 && pb.pred_l1;
+        let weighted = self.cctx.weighted_pred;
+
+        if !is_bi {
+            // Uni-prediction.
+            let (ref_pic, mv) = if pb.pred_l0 {
+                (ref0, pb.mv_l0)
+            } else {
+                let r =
+                    ref1_opt.ok_or_else(|| Error::invalid("h265 inter: uni-L1 without L1 ref"))?;
+                (r, pb.mv_l1)
+            };
+            luma_mc(
+                ref_pic,
+                x0 as i32,
+                y0 as i32,
+                w as i32,
+                h as i32,
+                mv,
+                &mut luma_out,
+            )?;
+            chroma_mc(
+                ref_pic,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                mv,
+                &mut cb_out,
+                0,
+            )?;
+            chroma_mc(
+                ref_pic,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                mv,
+                &mut cr_out,
+                1,
+            )?;
+        } else {
+            let ref_l1 =
+                ref1_opt.ok_or_else(|| Error::invalid("h265 inter: bi-pred without L1 ref"))?;
+            // Compute high-precision uni-pred samples from both refs and
+            // combine for bi-prediction (§8.5.3.3.3 / §8.5.3.3.4).
+            let mut a_l = vec![0i32; wz * hz];
+            let mut b_l = vec![0i32; wz * hz];
+            luma_mc_hp(
+                ref0, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l0, &mut a_l,
+            )?;
+            luma_mc_hp(
+                ref_l1, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l1, &mut b_l,
+            )?;
+            let mut a_cb = vec![0i32; cw * ch];
+            let mut b_cb = vec![0i32; cw * ch];
+            let mut a_cr = vec![0i32; cw * ch];
+            let mut b_cr = vec![0i32; cw * ch];
+            chroma_mc_hp(
+                ref0,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                pb.mv_l0,
+                &mut a_cb,
+                0,
+            )?;
+            chroma_mc_hp(
+                ref_l1,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                pb.mv_l1,
+                &mut b_cb,
+                0,
+            )?;
+            chroma_mc_hp(
+                ref0,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                pb.mv_l0,
+                &mut a_cr,
+                1,
+            )?;
+            chroma_mc_hp(
+                ref_l1,
+                (x0 / 2) as i32,
+                (y0 / 2) as i32,
+                cw as i32,
+                ch as i32,
+                pb.mv_l1,
+                &mut b_cr,
+                1,
+            )?;
+
+            let l0_luma = weighted.and_then(|w| w.luma_weight_l0(pb.ref_idx_l0.max(0) as usize));
+            let l1_luma = weighted.and_then(|w| w.luma_weight_l1(pb.ref_idx_l1.max(0) as usize));
+            if let (Some(w_table), Some((w0, o0)), Some((w1, o1))) = (weighted, l0_luma, l1_luma) {
+                luma_mc_bi_weighted(
+                    &a_l,
+                    &b_l,
+                    &mut luma_out,
+                    w0,
+                    o0,
+                    w1,
+                    o1,
+                    w_table.luma_denom + 1,
+                );
+            } else {
+                luma_mc_bi_combine(&a_l, &b_l, &mut luma_out);
+            }
+
+            for comp in 0..2 {
+                let (a, b, out) = match comp {
+                    0 => (&a_cb, &b_cb, &mut cb_out),
+                    _ => (&a_cr, &b_cr, &mut cr_out),
+                };
+                let l0_c = weighted
+                    .and_then(|w| w.chroma_weight_l0(pb.ref_idx_l0.max(0) as usize, comp as usize));
+                let l1_c = weighted
+                    .and_then(|w| w.chroma_weight_l1(pb.ref_idx_l1.max(0) as usize, comp as usize));
+                if let (Some(w_table), Some((w0, o0)), Some((w1, o1))) = (weighted, l0_c, l1_c) {
+                    luma_mc_bi_weighted(a, b, out, w0, o0, w1, o1, w_table.chroma_denom + 1);
+                } else {
+                    chroma_mc_bi_combine(a, b, out);
+                }
+            }
+        }
+
+        self.write_rect(x0, y0, wz, hz, &luma_out, true, false);
         self.write_rect(x0 / 2, y0 / 2, cw, ch, &cb_out, false, false);
         self.write_rect(x0 / 2, y0 / 2, cw, ch, &cr_out, false, true);
         self.pic.inter.set_rect(x0, y0, w, h, pb);
         Ok(())
+    }
+
+    /// Look up the collocated PB motion from the slice's configured
+    /// collocated reference picture and convert it to a merge candidate.
+    /// Returns `None` when TMVP is disabled or the collocated block is
+    /// intra.
+    fn tmvp_merge_cand(&self, x0: u32, y0: u32, w: u32, h: u32) -> Option<MergeCand> {
+        if !self.cctx.slice.slice_temporal_mvp_enabled_flag {
+            return None;
+        }
+        let coll = self.cctx.collocated_ref?;
+        // §8.5.3.2.9: pick the collocated PB at the bottom-right of the
+        // current PB, falling back to its centre when unavailable.
+        let pic_w = self.cctx.sps.pic_width_in_luma_samples;
+        let pic_h = self.cctx.sps.pic_height_in_luma_samples;
+        let br_x = x0 + w;
+        let br_y = y0 + h;
+        if br_x < pic_w && br_y < pic_h {
+            if let Some(pb) = coll.collocated_motion(br_x, br_y) {
+                return Some(MergeCand::from_pb_into_ref0(pb));
+            }
+        }
+        let cx = x0 + w / 2;
+        let cy = y0 + h / 2;
+        let pb = coll.collocated_motion(cx, cy)?;
+        Some(MergeCand::from_pb_into_ref0(pb))
     }
 
     fn decode_inter_cu(
@@ -673,12 +845,13 @@ impl<'a> Walker<'a> {
         h: u32,
     ) -> Result<()> {
         let merge_flag = engine.decode_bin(&mut ctx.merge_flag[0]) == 1;
-        let (ref_idx_l0, mv_l0) = if merge_flag {
+        let pb = if merge_flag {
             let merge_idx = if self.cctx.slice.max_num_merge_cand > 1 {
                 decode_merge_idx(engine, ctx, self.cctx.slice.max_num_merge_cand)
             } else {
                 0
             };
+            let tmvp = self.tmvp_merge_cand(x, y, w, h);
             let cands = build_merge_list(
                 &self.pic.inter,
                 x,
@@ -686,33 +859,151 @@ impl<'a> Walker<'a> {
                 w,
                 h,
                 self.cctx.slice.max_num_merge_cand,
+                self.cctx.is_b_slice(),
+                tmvp,
             );
             let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
-            (sel.ref_idx_l0, sel.mv_l0)
+            sel.to_pb()
         } else {
-            let ref_idx_l0 = if self.cctx.slice.num_ref_idx_l0_active_minus1 > 0 {
-                decode_ref_idx(
-                    engine,
-                    ctx,
-                    self.cctx.slice.num_ref_idx_l0_active_minus1 + 1,
-                )
+            // §7.3.8.6: inter_pred_idc = 0 (L0), 1 (L1), 2 (BI). Only signalled
+            // for B slices; for P slices L0 is implied.
+            let (use_l0, use_l1) = if self.cctx.is_b_slice() {
+                // inter_pred_idc: bin 0 with context (nPbW + nPbH == 12 uses
+                // ctx 4); when bin 0 == 1 bin 1 chooses L0 vs L1. When the
+                // PB is <8 samples in either dim, only L0/L1 is allowed.
+                let nb_eq_8 = (w + h) == 12;
+                let bin0_ctx = if nb_eq_8 { 4 } else { 0 };
+                let small = w + h == 12; // 8×4 / 4×8 partitions: no bi-pred.
+                if small {
+                    let uni = engine.decode_bin(&mut ctx.inter_pred_idc[bin0_ctx]);
+                    if uni == 0 {
+                        (true, false)
+                    } else {
+                        (false, true)
+                    }
+                } else {
+                    let bi = engine.decode_bin(&mut ctx.inter_pred_idc[bin0_ctx]);
+                    if bi == 1 {
+                        (true, true)
+                    } else {
+                        let bin1 = engine.decode_bin(&mut ctx.inter_pred_idc[4]);
+                        if bin1 == 0 {
+                            (true, false)
+                        } else {
+                            (false, true)
+                        }
+                    }
+                }
             } else {
-                0
+                (true, false)
             };
-            let mvd = decode_mvd(engine, ctx)?;
-            let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
-            let amvp = build_amvp_list(&self.pic.inter, x, y, w, h);
-            let mvp = amvp[mvp_flag as usize];
-            let mv = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
-            (ref_idx_l0 as i8, mv)
+
+            let mut mv_l0 = MotionVector::default();
+            let mut mv_l1 = MotionVector::default();
+            let mut ref_idx_l0 = 0i8;
+            let mut ref_idx_l1 = 0i8;
+
+            if use_l0 {
+                let ri = if self.cctx.slice.num_ref_idx_l0_active_minus1 > 0 {
+                    decode_ref_idx(
+                        engine,
+                        ctx,
+                        self.cctx.slice.num_ref_idx_l0_active_minus1 + 1,
+                    )
+                } else {
+                    0
+                };
+                let mvd = decode_mvd(engine, ctx)?;
+                let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
+                let tmvp_mv = self.tmvp_amvp_mv(x, y, w, h, true);
+                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, true, tmvp_mv);
+                let mvp = amvp[mvp_flag as usize];
+                ref_idx_l0 = ri as i8;
+                mv_l0 = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
+            }
+            if use_l1 {
+                let ri = if self.cctx.slice.num_ref_idx_l1_active_minus1 > 0 {
+                    decode_ref_idx(
+                        engine,
+                        ctx,
+                        self.cctx.slice.num_ref_idx_l1_active_minus1 + 1,
+                    )
+                } else {
+                    0
+                };
+                // `mvd_l1_zero_flag` lets the encoder suppress the L1 MVD
+                // encoding when bi-pred (§7.4.7.1). We still need to honour
+                // that: read MVD normally otherwise, else zero.
+                let mvd = if self.cctx.slice.mvd_l1_zero_flag && use_l0 {
+                    MotionVector::default()
+                } else {
+                    decode_mvd(engine, ctx)?
+                };
+                let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
+                let tmvp_mv = self.tmvp_amvp_mv(x, y, w, h, false);
+                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, false, tmvp_mv);
+                let mvp = amvp[mvp_flag as usize];
+                ref_idx_l1 = ri as i8;
+                mv_l1 = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
+            }
+
+            PbMotion {
+                valid: true,
+                is_intra: false,
+                pred_l0: use_l0,
+                pred_l1: use_l1,
+                ref_idx_l0,
+                ref_idx_l1,
+                mv_l0,
+                mv_l1,
+            }
         };
-        let ref_pic = self
-            .cctx
-            .ref_list_l0
-            .get(ref_idx_l0 as usize)
-            .ok_or_else(|| Error::invalid("h265 inter: ref_idx out of list"))?;
-        let pb = PbMotion::inter(ref_idx_l0, mv_l0);
-        self.motion_compensate_pb(x, y, w, h, pb, ref_pic)
+        self.motion_compensate_pb(x, y, w, h, pb)
+    }
+
+    /// Look up an AMVP temporal motion vector (§8.5.3.2.9). Returns the
+    /// collocated PB's MV for the requested list, or `None` when TMVP is
+    /// off / unavailable.
+    fn tmvp_amvp_mv(
+        &self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        want_l0: bool,
+    ) -> Option<MotionVector> {
+        if !self.cctx.slice.slice_temporal_mvp_enabled_flag {
+            return None;
+        }
+        let coll = self.cctx.collocated_ref?;
+        let pic_w = self.cctx.sps.pic_width_in_luma_samples;
+        let pic_h = self.cctx.sps.pic_height_in_luma_samples;
+        let br_x = x0 + w;
+        let br_y = y0 + h;
+        let pick = |pb: PbMotion| -> Option<MotionVector> {
+            if want_l0 && pb.pred_l0 {
+                Some(pb.mv_l0)
+            } else if !want_l0 && pb.pred_l1 {
+                Some(pb.mv_l1)
+            } else if pb.pred_l0 {
+                Some(pb.mv_l0)
+            } else if pb.pred_l1 {
+                Some(pb.mv_l1)
+            } else {
+                None
+            }
+        };
+        if br_x < pic_w && br_y < pic_h {
+            if let Some(pb) = coll.collocated_motion(br_x, br_y) {
+                if let Some(mv) = pick(pb) {
+                    return Some(mv);
+                }
+            }
+        }
+        let cx = x0 + w / 2;
+        let cy = y0 + h / 2;
+        let pb = coll.collocated_motion(cx, cy)?;
+        pick(pb)
     }
 
     fn decode_intra_prediction_and_transforms(
