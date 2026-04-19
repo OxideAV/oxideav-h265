@@ -1,0 +1,462 @@
+//! HEVC intra prediction (§8.4.4.2).
+//!
+//! Covers reference sample derivation and substitution (§8.4.4.2.2 /
+//! §8.4.4.2.3), the optional MDIS low-pass reference filter
+//! (§8.4.4.2.3), and the 35 prediction modes:
+//!
+//! * mode 0 — **PLANAR** (§8.4.4.2.5)
+//! * mode 1 — **DC** (§8.4.4.2.6)
+//! * modes 2..=34 — **33 angular** predictions (§8.4.4.2.6)
+//!
+//! Operates on a square luma or chroma block of size `n×n` where
+//! `n ∈ {4, 8, 16, 32}` (luma) or `{4, 8, 16, 16}` (chroma in 4:2:0 —
+//! chroma TB caps at 16). Samples are 8-bit unsigned.
+
+/// Clip to an 8-bit sample range.
+#[inline]
+fn clip_u8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+/// §8.4.4.2.6 Table 8-4: mapping from intra prediction mode (2..=34) to
+/// `intraPredModeC` compatible angle parameters.
+///
+/// For angular mode `m` (2..=34), `intra_pred_angle[m]` gives the
+/// displacement (in 1/32 sample units) per reference-sample row / column.
+#[rustfmt::skip]
+pub const INTRA_PRED_ANGLE: [i32; 35] = [
+    0, 0,
+    32, 26, 21, 17, 13,  9,  5,  2,
+     0, -2, -5, -9, -13, -17, -21, -26,
+    -32, -26, -21, -17, -13, -9, -5, -2,
+     0,  2,  5,  9, 13, 17, 21, 26,
+    32,
+];
+
+/// `invAngle` for modes 11..=25 — used to project the left-side reference
+/// samples into the top reference row (§8.4.4.2.6).
+#[rustfmt::skip]
+pub const INV_ANGLE: [i32; 35] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    -4096, -1638, -910, -630, -482, -390, -315,
+    -256,
+    -315, -390, -482, -630, -910, -1638, -4096,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Assemble the reference sample vector used by intra prediction.
+///
+/// Layout (§8.4.4.2.2): returns a 1-D vector of length `4*n + 1` whose
+/// indices correspond to:
+///
+/// ```text
+///   idx 0            -> top-left corner sample
+///   idx 1..=2n       -> top row, left to right: p[0,-1] .. p[2n-1,-1]
+///   idx 2n+1..=4n    -> left column, top to bottom: p[-1,0] .. p[-1,2n-1]
+/// ```
+///
+/// `available[i]` tells whether reference sample `i` is available (i.e.,
+/// inside the already-decoded region of the picture). If none are
+/// available, the entire vector is filled with the neutral value
+/// `1 << (bit_depth - 1)` = 128 for 8-bit.
+///
+/// When at least one sample is available the spec's substitution rule runs:
+/// scan from `idx 4n` downward and upward, replacing unavailable samples
+/// with the closest available neighbour.
+pub fn build_ref_samples(samples: &[u8], available: &[bool], n: usize) -> Vec<u8> {
+    let len = 4 * n + 1;
+    debug_assert_eq!(samples.len(), len);
+    debug_assert_eq!(available.len(), len);
+
+    let any = available.iter().any(|&a| a);
+    let mut out = vec![128u8; len];
+    if !any {
+        return out;
+    }
+    // Start from the first available position; the substitution rule in
+    // §8.4.4.2.3 walks from index 0 to 4n, replacing the initial
+    // unavailable prefix with the first available sample, and then each
+    // subsequent unavailable with its immediate predecessor.
+    let mut first_available = 0;
+    while first_available < len && !available[first_available] {
+        first_available += 1;
+    }
+    let seed = samples[first_available];
+    for i in 0..len {
+        if i < first_available {
+            out[i] = seed;
+        } else if available[i] {
+            out[i] = samples[i];
+        } else {
+            out[i] = out[i - 1];
+        }
+    }
+    out
+}
+
+/// Apply the reference-sample smoothing filter of §8.4.4.2.3.
+/// `filter_mode` selects between the 3-tap `[1 2 1]/4` filter (0) and the
+/// strong-intra-smoothing bilinear path (1).
+pub fn filter_ref_samples(refs: &mut [u8], n: usize, strong: bool) {
+    let len = 4 * n + 1;
+    debug_assert_eq!(refs.len(), len);
+
+    if strong {
+        // Bilinear between the three anchors: p[-1,-1], p[2n-1,-1], p[-1,2n-1].
+        let tl = refs[0] as i32;
+        let top_right = refs[2 * n] as i32;
+        let bot_left = refs[4 * n] as i32;
+        let shift = n.ilog2() + 1;
+        // Top row: i in 1..2n interpolates tl→top_right.
+        let tn = n as i32;
+        for (i, slot) in refs.iter_mut().enumerate().take(2 * n).skip(1) {
+            let w = i as i32;
+            let val = ((2 * tn - w) * tl + w * top_right + tn) >> shift;
+            *slot = clip_u8(val);
+        }
+        refs[2 * n] = top_right as u8;
+        // Left column: indices 2n+1 .. 4n.
+        for i in 1..(2 * n) {
+            let w = i as i32;
+            let val = ((2 * tn - w) * tl + w * bot_left + tn) >> shift;
+            refs[2 * n + i] = clip_u8(val);
+        }
+        refs[4 * n] = bot_left as u8;
+    } else {
+        // `[1 2 1]/4` 3-tap filter across the whole vector except the
+        // endpoints, which stay as-is.
+        let mut tmp = refs.to_vec();
+        for i in 1..len - 1 {
+            tmp[i] =
+                (((refs[i - 1] as u32) + 2 * refs[i] as u32 + refs[i + 1] as u32 + 2) >> 2) as u8;
+        }
+        refs.copy_from_slice(&tmp);
+    }
+}
+
+/// Decide whether the `[1 2 1]/4` filter should be applied to the
+/// reference samples of an intra-luma block (§8.4.4.2.3 Table 8-3).
+/// Returns `(apply_filter, use_strong)`.
+pub fn filter_decision(
+    log2_tb: u32,
+    intra_pred_mode: u32,
+    strong_intra_smoothing_enabled: bool,
+    refs: &[u8],
+    n: usize,
+) -> (bool, bool) {
+    // §8.4.4.2.3: for sizes <= 4 (log2_tb == 2), no filtering.
+    if log2_tb <= 2 {
+        return (false, false);
+    }
+    // Determine `filterFlag` per Table 8-3.
+    // Angular modes with minDistVerHor >= threshold get filtered;
+    // mode 1 (DC) and mode 0 (planar), log2_tb > 2 — planar always filters
+    // for sizes >= 8; DC never filters.
+    //
+    // The threshold is 7 for 8x8, 1 for 16x16, 0 for 32x32.
+    if intra_pred_mode == 1 {
+        return (false, false); // DC never
+    }
+    let threshold: i32 = match log2_tb {
+        3 => 7,
+        4 => 1,
+        5 => 0,
+        _ => 0,
+    };
+    let m = intra_pred_mode as i32;
+    let dist = (m - 26).abs().min((m - 10).abs());
+    let apply = if intra_pred_mode == 0 {
+        // Planar filtering enabled iff log2_tb > 2 (i.e. size >= 8).
+        true
+    } else {
+        // Angular: filter when minDistVerHor > threshold.
+        dist > threshold
+    };
+    if !apply {
+        return (false, false);
+    }
+    // Strong filter applies only at 32x32 (log2_tb == 5) with strong-intra-
+    // smoothing enabled and when the corner deviations are small enough.
+    let mut strong = false;
+    if strong_intra_smoothing_enabled && log2_tb == 5 {
+        let bit_depth = 8i32;
+        let th = 1i32 << (bit_depth - 5);
+        let tl = refs[0] as i32;
+        let top_right = refs[2 * n] as i32;
+        let bot_left = refs[4 * n] as i32;
+        let bot_mid = refs[3 * n] as i32;
+        let top_mid = refs[n] as i32;
+        let top_ok = (tl + top_right - 2 * top_mid).abs() < th;
+        let left_ok = (tl + bot_left - 2 * bot_mid).abs() < th;
+        if top_ok && left_ok {
+            strong = true;
+        }
+    }
+    (true, strong)
+}
+
+/// Apply PLANAR prediction (mode 0) to fill an `n×n` block.
+///
+/// `refs` uses the layout documented on [`build_ref_samples`]. The output
+/// buffer is written row-major; `dst_stride` is the number of samples per
+/// row in `dst` (can be larger than `n` if writing into a bigger picture
+/// plane).
+pub fn predict_planar(refs: &[u8], n: usize, dst: &mut [u8], dst_stride: usize) {
+    debug_assert_eq!(refs.len(), 4 * n + 1);
+    let log2_n = n.ilog2() as i32;
+    for y in 0..n {
+        for x in 0..n {
+            let top = refs[1 + x] as i32; // p[x, -1]
+            let left = refs[2 * n + 1 + y] as i32; // p[-1, y]
+            let tr = refs[1 + 2 * n - 1] as i32; // p[n-1, -1] — but we want p[n, -1]=top_right corner mirror ? see spec.
+            let bl = refs[4 * n] as i32; // p[-1, n-1] mirror.
+                                         // Spec §8.4.4.2.5:
+                                         //   predSamples[x][y] = ((nT - 1 - x) * p[-1, y] + (x+1)*p[nT, -1]
+                                         //                       + (nT - 1 - y) * p[x, -1] + (y+1)*p[-1, nT]
+                                         //                       + nT) >> (log2(nT)+1)
+                                         // p[nT,-1] is refs[1 + n] (top row slot at x=n), p[-1,nT]=refs[2n+1+n]
+            let p_top_r = refs[1 + n] as i32; // p[nT, -1]
+            let p_bot_l = refs[2 * n + 1 + n] as i32; // p[-1, nT]
+            let _ = tr;
+            let _ = bl;
+            let v = ((n as i32 - 1 - x as i32) * left
+                + (x as i32 + 1) * p_top_r
+                + (n as i32 - 1 - y as i32) * top
+                + (y as i32 + 1) * p_bot_l
+                + n as i32)
+                >> (log2_n + 1);
+            dst[y * dst_stride + x] = clip_u8(v);
+        }
+    }
+}
+
+/// Apply DC prediction (mode 1) to fill an `n×n` block.
+pub fn predict_dc(refs: &[u8], n: usize, dst: &mut [u8], dst_stride: usize, luma: bool) {
+    let mut sum: u32 = 0;
+    for x in 0..n {
+        sum += refs[1 + x] as u32;
+    }
+    for y in 0..n {
+        sum += refs[2 * n + 1 + y] as u32;
+    }
+    let dc = ((sum + n as u32) / (2 * n as u32)) as i32;
+    // Fill interior.
+    for y in 0..n {
+        for x in 0..n {
+            dst[y * dst_stride + x] = dc as u8;
+        }
+    }
+    // §8.4.4.2.6 DC edge filtering — only for luma AND n < 32.
+    if luma && n < 32 {
+        let tl = refs[0] as i32;
+        let top0 = refs[1] as i32;
+        let left0 = refs[2 * n + 1] as i32;
+        dst[0] = clip_u8((top0 + left0 + 2 * dc + 2) >> 2);
+        for x in 1..n {
+            let top = refs[1 + x] as i32;
+            dst[x] = clip_u8((top + 3 * dc + 2) >> 2);
+        }
+        for y in 1..n {
+            let left = refs[2 * n + 1 + y] as i32;
+            dst[y * dst_stride] = clip_u8((left + 3 * dc + 2) >> 2);
+        }
+        let _ = tl;
+    }
+}
+
+/// Apply an angular prediction (mode ∈ 2..=34) to fill an `n×n` block.
+pub fn predict_angular(
+    refs: &[u8],
+    n: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    mode: u32,
+    luma: bool,
+) {
+    debug_assert!((2..=34).contains(&mode));
+    let mode_is_vertical = mode >= 18;
+    let intra_pred_angle = INTRA_PRED_ANGLE[mode as usize];
+    let inv_angle = INV_ANGLE[mode as usize];
+
+    // Build the 1-D reference array `ref1[]` per §8.4.4.2.6 eq 8-42..8-46.
+    // `ref1` indices run from -n..=2n (inclusive), so length 3n+1 if
+    // intra_pred_angle >= 0; otherwise negative indices up to -n are
+    // populated by projecting left-side refs via inv_angle.
+    //
+    // Allocate `ref_extended[idx + n]` so that logical index -n maps to 0
+    // and 2n maps to 3n.
+    let mut ref_ext = vec![0u8; 3 * n + 1];
+
+    if mode_is_vertical {
+        // ref1[x] for x in 0..=2n comes from top-row refs: refs[1..=2n] and
+        // ref_ext layout: negative-side indices 0..n (only populated for
+        // angles < 0 via the inv_angle projection below), then
+        // ref_ext[n..=n+2n] holds ref1[0..=2n] from the top row of refs.
+        ref_ext[n..n + 2 * n + 1].copy_from_slice(&refs[..2 * n + 1]);
+        if intra_pred_angle < 0 {
+            // Extend negative side by projecting left column samples.
+            let inv_angle_sum_step = inv_angle;
+            let mut inv_angle_sum: i32 = 128;
+            for i in 1..=n {
+                inv_angle_sum += inv_angle_sum_step;
+                let src_idx = (inv_angle_sum >> 8).clamp(-(n as i32), n as i32);
+                // Project into LEFT refs: refs[2n + 1 .. 4n]. The selected
+                // source is p[-1, -src_idx-1] approximation; use the left refs
+                // starting at refs[2n + 1 + (k-1)] for k >= 1.
+                // Per the spec we index left column: refs[2n + src] where src
+                // is the projected y. We use src_idx from the computation
+                // above — but we need the left-sample index `left_idx` = -src_idx - 1.
+                let li = (-src_idx - 1).clamp(0, 4 * n as i32) as usize;
+                let src = refs[2 * n + 1 + li];
+                ref_ext[n - i] = src;
+            }
+        }
+    } else {
+        // Horizontal mode: ref1[0] = top-left = refs[0],
+        // ref1[x] for x >= 1 = refs[2n + x] (left column), at x=1 we want
+        // refs[2n+1] == p[-1, 0].
+        ref_ext[n] = refs[0];
+        for i in 1..=(2 * n) {
+            ref_ext[n + i] = refs[2 * n + i];
+        }
+        if intra_pred_angle < 0 {
+            let inv_angle_sum_step = inv_angle;
+            let mut inv_angle_sum: i32 = 128;
+            for i in 1..=n {
+                inv_angle_sum += inv_angle_sum_step;
+                let src_idx = (inv_angle_sum >> 8).clamp(-(n as i32), n as i32);
+                let ti = (-src_idx - 1).clamp(0, 2 * n as i32) as usize;
+                let src = refs[1 + ti];
+                ref_ext[n - i] = src;
+            }
+        }
+    }
+
+    // Now predict.
+    //
+    // For the vertical direction (mode >= 18), we scan (x,y) normally and
+    // look up samples in `ref_ext` (which holds the top-row refs extended
+    // from the left column for negative angles). For the horizontal
+    // direction (mode < 18), the coordinate roles swap: the spec
+    // essentially mirrors the block around the diagonal and uses the left-
+    // column refs instead.
+    for y in 0..n {
+        for x in 0..n {
+            // Per §8.4.4.2.6: for vertical modes predSamples[x][y] references
+            //   ref1[x + ((y+1)*intra_pred_angle >> 5)]; for horizontal modes
+            //   it references ref1[y + ((x+1)*intra_pred_angle >> 5)].
+            let (ax, ay) = if mode_is_vertical { (x, y) } else { (y, x) };
+            let idx_i = ((ay as i32 + 1) * intra_pred_angle) >> 5;
+            let frac = ((ay as i32 + 1) * intra_pred_angle) & 31;
+            let r_idx = (ax as i32 + idx_i + 1 + n as i32) as usize;
+            let r_idx = r_idx.min(3 * n);
+            let r_a = ref_ext[r_idx] as i32;
+            let r_b = ref_ext[r_idx.saturating_add(1).min(3 * n)] as i32;
+            let v = ((32 - frac) * r_a + frac * r_b + 16) >> 5;
+            let mut pred = clip_u8(v);
+            // Post-prediction edge filter for horizontal (mode 10) /
+            // vertical (mode 26) — §8.4.4.2.6.
+            if luma && n <= 16 && (mode == 10 || mode == 26) {
+                if mode == 26 && x == 0 {
+                    let top = refs[1] as i32;
+                    let tl = refs[0] as i32;
+                    let left = refs[2 * n + 1 + y] as i32;
+                    let v2 = top + ((left - tl) >> 1);
+                    pred = clip_u8(v2);
+                }
+                if mode == 10 && y == 0 {
+                    let left = refs[2 * n + 1] as i32;
+                    let tl = refs[0] as i32;
+                    let top = refs[1 + x] as i32;
+                    let v2 = left + ((top - tl) >> 1);
+                    pred = clip_u8(v2);
+                }
+            }
+            dst[y * dst_stride + x] = pred;
+        }
+    }
+}
+
+/// Top-level entry: dispatch on `intra_pred_mode` and fill an `n×n` block.
+pub fn predict(
+    refs: &[u8],
+    n: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    intra_pred_mode: u32,
+    luma: bool,
+) {
+    match intra_pred_mode {
+        0 => predict_planar(refs, n, dst, dst_stride),
+        1 => predict_dc(refs, n, dst, dst_stride, luma),
+        _ => predict_angular(refs, n, dst, dst_stride, intra_pred_mode, luma),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planar_flat() {
+        // Uniform refs → uniform prediction.
+        let n = 4;
+        let refs = vec![128u8; 4 * n + 1];
+        let mut dst = vec![0u8; n * n];
+        predict_planar(&refs, n, &mut dst, n);
+        assert!(dst.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn dc_mean_flat_interior() {
+        let n = 8;
+        let refs = vec![100u8; 4 * n + 1];
+        let mut dst = vec![0u8; n * n];
+        predict_dc(&refs, n, &mut dst, n, false);
+        assert!(dst.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn angular_horizontal_replicates() {
+        // Mode 10 (pure horizontal) copies the left column across all rows.
+        let n = 4;
+        let mut refs = vec![0u8; 4 * n + 1];
+        for y in 0..n {
+            refs[2 * n + 1 + y] = (10 + y as u8) * 10;
+        }
+        let mut dst = vec![0u8; n * n];
+        predict_angular(&refs, n, &mut dst, n, 10, false);
+        for y in 0..n {
+            let expected = (10 + y as u8) * 10;
+            for x in 0..n {
+                assert_eq!(dst[y * n + x], expected, "row {y} col {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn angular_vertical_replicates() {
+        // Mode 26 (pure vertical) copies the top row down all columns.
+        let n = 4;
+        let mut refs = vec![0u8; 4 * n + 1];
+        for x in 0..n {
+            refs[1 + x] = (10 + x as u8) * 10;
+        }
+        let mut dst = vec![0u8; n * n];
+        predict_angular(&refs, n, &mut dst, n, 26, false);
+        for y in 0..n {
+            for x in 0..n {
+                assert_eq!(dst[y * n + x], (10 + x as u8) * 10, "row {y} col {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn build_ref_samples_fills_uniform_when_unavailable() {
+        let n = 4;
+        let samples = vec![0u8; 4 * n + 1];
+        let avail = vec![false; 4 * n + 1];
+        let out = build_ref_samples(&samples, &avail, n);
+        assert!(out.iter().all(|&v| v == 128));
+    }
+}

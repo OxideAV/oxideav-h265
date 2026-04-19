@@ -43,13 +43,17 @@
 
 pub mod bitreader;
 pub mod cabac;
+pub mod ctu;
 pub mod decoder;
 pub mod hvcc;
+pub mod intra_pred;
 pub mod nal;
 pub mod pps;
 pub mod ptl;
+pub mod scan;
 pub mod slice;
 pub mod sps;
+pub mod transform;
 pub mod vps;
 
 use oxideav_codec::{CodecInfo, CodecRegistry};

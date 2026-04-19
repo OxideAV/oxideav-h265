@@ -262,11 +262,8 @@ impl<'a> CabacEngine<'a> {
 // ---------------------------------------------------------------------------
 
 /// `split_cu_flag` (Table 9-11). Three contexts, one per depth class.
-pub const SPLIT_CU_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
-    [139, 141, 157],
-    [107, 139, 126],
-    [107, 139, 126],
-];
+pub const SPLIT_CU_FLAG_INIT_VALUES: [[u8; 3]; 3] =
+    [[139, 141, 157], [107, 139, 126], [107, 139, 126]];
 
 /// `cu_transquant_bypass_flag` (Table 9-12). One context.
 pub const CU_TRANSQUANT_BYPASS_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[154], [154], [154]];
@@ -274,7 +271,7 @@ pub const CU_TRANSQUANT_BYPASS_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[154], [154], [
 /// `cu_skip_flag` (Table 9-13). Three contexts — I-slice never signals
 /// this syntax but we keep it to avoid a separate branch in init code.
 pub const CU_SKIP_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
-    [  0,   0,   0], // I (unused)
+    [0, 0, 0], // I (unused)
     [197, 185, 201],
     [185, 106, 133],
 ];
@@ -284,11 +281,8 @@ pub const CU_SKIP_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
 pub const PRED_MODE_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[0], [149], [134]];
 
 /// `part_mode` (Table 9-16). Four contexts.
-pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] = [
-    [184,   0,   0,   0],
-    [154, 139, 154,   0],
-    [154, 139, 154,   0],
-];
+pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] =
+    [[184, 0, 0, 0], [154, 139, 154, 0], [154, 139, 154, 0]];
 
 /// `prev_intra_luma_pred_flag` (Table 9-17).
 pub const PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[184], [154], [183]];
@@ -300,17 +294,14 @@ pub const INTRA_CHROMA_PRED_MODE_INIT_VALUES: [[u8; 1]; 3] = [[184], [152], [152
 pub const RQT_ROOT_CBF_INIT_VALUES: [[u8; 1]; 3] = [[0], [79], [79]];
 
 /// `split_transform_flag` (Table 9-20). Three contexts.
-pub const SPLIT_TRANSFORM_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
-    [153, 138, 138],
-    [124, 138,  94],
-    [224, 167, 122],
-];
+pub const SPLIT_TRANSFORM_FLAG_INIT_VALUES: [[u8; 3]; 3] =
+    [[153, 138, 138], [124, 138, 94], [224, 167, 122]];
 
 /// `cbf_luma` (Table 9-21). Two contexts.
 pub const CBF_LUMA_INIT_VALUES: [[u8; 2]; 3] = [[111, 141], [153, 111], [153, 111]];
 
 /// `cbf_cb` / `cbf_cr` (Table 9-21). Two contexts.
-pub const CBF_CB_CR_INIT_VALUES: [[u8; 2]; 3] = [[ 94, 138], [149, 107], [149, 92]];
+pub const CBF_CB_CR_INIT_VALUES: [[u8; 2]; 3] = [[94, 138], [149, 107], [149, 92]];
 
 /// `cu_qp_delta_abs` (Table 9-22). Two contexts.
 pub const CU_QP_DELTA_ABS_INIT_VALUES: [[u8; 2]; 3] = [[154, 154], [154, 154], [154, 154]];
@@ -374,13 +365,13 @@ pub const COEFF_ABS_GT1_INIT_VALUES: [[u8; 24]; 3] = [
 /// `coeff_abs_level_greater2_flag` (Table 9-28). 6 contexts.
 pub const COEFF_ABS_GT2_INIT_VALUES: [[u8; 6]; 3] = [
     [138, 153, 136, 167, 152, 152],
-    [107, 167,  91, 122, 107, 167],
-    [107, 167,  91, 107, 107, 167],
+    [107, 167, 91, 122, 107, 167],
+    [107, 167, 91, 107, 107, 167],
 ];
 
 /// `coded_sub_block_flag` (Table 9-29). 4 contexts.
 pub const CODED_SUB_BLOCK_FLAG_INIT_VALUES: [[u8; 4]; 3] = [
-    [ 91, 171, 134, 141],
+    [91, 171, 134, 141],
     [121, 140, 121, 140],
     [121, 140, 121, 140],
 ];
@@ -394,7 +385,11 @@ pub const SAO_TYPE_IDX_INIT_VALUES: [[u8; 1]; 3] = [[200], [185], [160]];
 
 /// Build a vector of [`CtxState`] from an initValues row and the slice
 /// QP. Convenience wrapper that hides the per-initType indexing.
-pub fn init_row<const N: usize>(table: &[[u8; N]; 3], init_type: InitType, slice_qp_y: i32) -> [CtxState; N] {
+pub fn init_row<const N: usize>(
+    table: &[[u8; N]; 3],
+    init_type: InitType,
+    slice_qp_y: i32,
+) -> [CtxState; N] {
     let row = table[init_type as usize];
     let mut out = [CtxState::default(); N];
     for i in 0..N {
