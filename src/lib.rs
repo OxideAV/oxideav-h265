@@ -53,7 +53,7 @@ pub mod sps;
 pub mod vps;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 /// Canonical oxideav codec id for H.265 / HEVC.
 pub const CODEC_ID_STR: &str = "h265";
@@ -64,5 +64,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps, decoder::make_decoder);
+    let cid = CodecId::new(CODEC_ID_STR);
+    reg.register_decoder_impl(cid.clone(), caps, decoder::make_decoder);
+
+    // AVI FourCC claims — HEVC, H265, HVC1, HEV1, X265 (libx265), DXHE
+    // (DivX HEVC). Unambiguous.
+    for fcc in &[b"HEVC", b"H265", b"HVC1", b"HEV1", b"X265", b"DXHE"] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
