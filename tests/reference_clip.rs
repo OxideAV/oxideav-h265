@@ -364,6 +364,63 @@ fn hevc_p_slice_fixture_decodes() {
 }
 
 #[test]
+fn hevc_b_slice_fixture_decodes() {
+    // 3-frame (I + B + P) 256x144 clip. Frame 2 is a B slice referring to
+    // both L0 (the I) and L1 (the P) — bi-prediction + TMVP exercised.
+    let Some(data) = read_fixture(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/hevc-b.h265"
+    )) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    if let Err(Error::Unsupported(msg)) = dec.send_packet(&pkt) {
+        eprintln!("B-slice fixture not in scope yet: {msg}");
+        return;
+    }
+
+    let mut frames: Vec<oxideav_core::VideoFrame> = Vec::new();
+    for i in 0..3 {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(other) => panic!("expected VideoFrame at idx {i}, got {other:?}"),
+            Err(Error::Unsupported(msg)) => {
+                panic!("frame {i} unexpectedly unsupported: {msg}");
+            }
+            Err(e) => panic!("unexpected error at idx {i}: {e:?}"),
+        }
+    }
+    assert_eq!(frames.len(), 3, "expected 3 decoded frames");
+    for vf in &frames {
+        assert_eq!(vf.width, 256);
+        assert_eq!(vf.height, 144);
+    }
+    // Decode order is I, B, P — but frames come out of the pipeline in
+    // decode order (no DPB reorder buffer yet). Frame 0 is the I-slice.
+    let y_i = &frames[0].planes[0].data;
+    let y_b = &frames[1].planes[0].data;
+    let y_p = &frames[2].planes[0].data;
+
+    let diff = |a: &[u8], b: &[u8]| -> u64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as u64)
+            .sum()
+    };
+    let d_ib = diff(y_i, y_b);
+    let d_pb = diff(y_p, y_b);
+    assert!(
+        d_ib > 0,
+        "B-frame must differ from I-frame (got diff {d_ib})"
+    );
+    assert!(
+        d_pb > 0,
+        "B-frame must differ from P-frame (got diff {d_pb})"
+    );
+}
+
+#[test]
 fn hevc_intra_fixture_decodes_to_plausible_picture() {
     // The fixture is a 256x144 8-bit 4:2:0 I-slice Annex B stream produced
     // with `ffmpeg -f lavfi -i testsrc=... -c:v libx265 -x265-params
