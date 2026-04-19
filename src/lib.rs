@@ -20,25 +20,23 @@
 //! * **Intra prediction** — all 35 modes (planar, DC, 33 angular), MDIS
 //!   filter, strong-intra-smoothing at 32×32.
 //! * **Inter prediction** — 8-tap luma / 4-tap chroma sub-pel MC,
-//!   spatial merge + AMVP, DPB keyed by POC.
+//!   spatial merge + AMVP + TMVP, bi-pred averaging and weighted
+//!   bi-prediction, DPB keyed by POC.
 //!
 //! ## Restricted to
 //!
 //! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
 //! * Single-tile, wavefront-off, no transform-skip, no scaling lists,
 //!   no PCM CUs.
-//! * **I-slice and P-slice** — B slices return
-//!   `Error::Unsupported("h265 B-slice decode pending")`. Inter PB shapes
-//!   are limited to 2Nx2N / 2NxN / Nx2N / NxN (no AMP).
+//! * **I, P, and B slices.** Inter PB shapes are limited to
+//!   2Nx2N / 2NxN / Nx2N / NxN (no AMP).
 //!
 //! ## Out of scope
 //!
 //! * **Deblocking filter** (§8.7.2) — reconstructed frames carry visible
 //!   block-edge artefacts.
 //! * **SAO** (§8.7.3) — parsed but not applied.
-//! * **Temporal MVP** / long-term refs — parsed but not used.
-//! * **Weighted prediction** — parsed (walked past) but unit weights are
-//!   used during MC.
+//! * **Long-term reference pictures** — rejected.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 //! * **Encoder** — write side is not in scope.
 //!
