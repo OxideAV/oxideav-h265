@@ -17,7 +17,7 @@ use oxideav_core::{Error, Result};
 use crate::bitreader::BitReader;
 use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::PicParameterSet;
-use crate::sps::SeqParameterSet;
+use crate::sps::{parse_st_ref_pic_set, SeqParameterSet, ShortTermRps};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliceType {
@@ -69,11 +69,34 @@ pub struct SliceSegmentHeader {
     /// `slice_loop_filter_across_slices_enabled_flag` (defaults from PPS).
     pub slice_loop_filter_across_slices_enabled_flag: bool,
     /// Bit position (in the RBSP) where the entropy payload (`slice_data()`)
-    /// starts after the final `byte_alignment()`. Valid iff `is_full_i_slice`.
+    /// starts after the final `byte_alignment()`. Valid iff `is_full_i_slice`
+    /// or `is_full_p_slice`.
     pub slice_data_bit_offset: u64,
-    /// Set when the full I-slice extension parse succeeded. This is the flag
-    /// tests use to confirm the decoder reached the CTU-decode boundary.
+    /// Set when the full I-slice extension parse succeeded.
     pub is_full_i_slice: bool,
+    /// Set when the full P-slice extension parse succeeded (inter decode).
+    pub is_full_p_slice: bool,
+    /// Resolved short-term RPS for the current picture, if any.
+    pub current_rps: Option<ShortTermRps>,
+    /// `num_ref_idx_l0_active_minus1` (defaults from PPS). Slices may
+    /// override with `num_ref_idx_active_override_flag`.
+    pub num_ref_idx_l0_active_minus1: u32,
+    /// Similarly for L1.
+    pub num_ref_idx_l1_active_minus1: u32,
+    /// `mvd_l1_zero_flag` (B slice only; defaults to false).
+    pub mvd_l1_zero_flag: bool,
+    /// `collocated_from_l0_flag` (§7.4.7.1) — only when TMVP is enabled.
+    pub collocated_from_l0_flag: bool,
+    /// `five_minus_max_num_merge_cand` (§7.4.7.1) — slice-level override.
+    pub five_minus_max_num_merge_cand: u32,
+    /// `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand` (§7.4.7.1).
+    pub max_num_merge_cand: u32,
+    /// `slice_temporal_mvp_enabled_flag` — per-slice override.
+    pub slice_temporal_mvp_enabled_flag: bool,
+    /// `slice_cb_qp_offset` (defaults to 0).
+    pub slice_cb_qp_offset: i32,
+    /// `slice_cr_qp_offset` (defaults to 0).
+    pub slice_cr_qp_offset: i32,
 }
 
 /// Parse a slice segment header given the active PPS+SPS and the NAL header
@@ -117,6 +140,27 @@ pub fn parse_slice_segment_header(
     let mut slice_pic_order_cnt_lsb = 0u32;
     let mut short_term_ref_pic_set_sps_flag = false;
     let mut short_term_ref_pic_set_idx = 0u32;
+    let mut current_rps: Option<ShortTermRps> = None;
+    let mut slice_sao_luma_flag = false;
+    let mut slice_sao_chroma_flag = false;
+    let mut cabac_init_flag = false;
+    let mut slice_qp_delta: i32 = 0;
+    let mut slice_cb_qp_offset: i32 = 0;
+    let mut slice_cr_qp_offset: i32 = 0;
+    let mut slice_loop_filter_across_slices_enabled_flag =
+        pps.pps_loop_filter_across_slices_enabled_flag;
+    let mut num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+    let mut num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+    let mut mvd_l1_zero_flag = false;
+    let mut collocated_from_l0_flag = true;
+    let mut five_minus_max_num_merge_cand: u32 = 0;
+    let mut max_num_merge_cand: u32 = 5;
+    let mut slice_temporal_mvp_enabled_flag = false;
+
+    let is_idr = matches!(
+        nal.nal_unit_type,
+        NalUnitType::IdrWRadl | NalUnitType::IdrNLp
+    );
 
     if !dependent_slice_segment_flag {
         // Skip num_extra_slice_header_bits flags.
@@ -131,51 +175,67 @@ pub fn parse_slice_segment_header(
         if sps.separate_colour_plane_flag {
             colour_plane_id = br.u(2)? as u8;
         }
-        if !matches!(
-            nal.nal_unit_type,
-            NalUnitType::IdrWRadl | NalUnitType::IdrNLp
-        ) {
+        if !is_idr {
             let lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
             slice_pic_order_cnt_lsb = br.u(lsb_bits)?;
             short_term_ref_pic_set_sps_flag = br.u1()? == 1;
-            if short_term_ref_pic_set_sps_flag && sps.num_short_term_ref_pic_sets > 1 {
-                let n = ceil_log2(sps.num_short_term_ref_pic_sets);
-                short_term_ref_pic_set_idx = br.u(n)?;
+            if short_term_ref_pic_set_sps_flag {
+                if sps.num_short_term_ref_pic_sets > 1 {
+                    let n = ceil_log2(sps.num_short_term_ref_pic_sets);
+                    short_term_ref_pic_set_idx = br.u(n)?;
+                }
+                if (short_term_ref_pic_set_idx as usize) < sps.short_term_ref_pic_sets.len() {
+                    current_rps = Some(
+                        sps.short_term_ref_pic_sets[short_term_ref_pic_set_idx as usize].clone(),
+                    );
+                }
+            } else {
+                // Inline `st_ref_pic_set(num_short_term_ref_pic_sets)`.
+                let rps = parse_st_ref_pic_set(
+                    &mut br,
+                    sps.num_short_term_ref_pic_sets,
+                    sps.num_short_term_ref_pic_sets,
+                    &sps.short_term_ref_pic_sets,
+                )?;
+                current_rps = Some(rps);
             }
-            // Inline-RPS (st_ref_pic_set in the slice header) and long-term
-            // refs aren't needed for the v1 scaffold acceptance bar — we
-            // stop here. The decode-side `Unsupported` error will fire long
-            // before any of the deferred fields are consulted.
+            if sps.long_term_ref_pics_present_flag {
+                // We don't support long-term refs — bail out early if any are
+                // signalled. Parse just enough to detect.
+                let num_long_term_sps = 0u32;
+                let num_long_term_pics = br.ue()?;
+                if num_long_term_sps + num_long_term_pics > 0 {
+                    return Ok(partial_header(
+                        first_slice_segment_in_pic_flag,
+                        no_output_of_prior_pics_flag,
+                        slice_pic_parameter_set_id,
+                        dependent_slice_segment_flag,
+                        slice_segment_address,
+                        slice_type,
+                        pic_output_flag,
+                        colour_plane_id,
+                        slice_pic_order_cnt_lsb,
+                        short_term_ref_pic_set_sps_flag,
+                        short_term_ref_pic_set_idx,
+                        current_rps,
+                        pps,
+                    ));
+                }
+            }
+            if sps.sps_temporal_mvp_enabled_flag {
+                slice_temporal_mvp_enabled_flag = br.u1()? == 1;
+            }
         }
     }
-    // From here on we attempt the I-slice-only extension: SAO flags,
-    // slice_qp_delta, and byte_alignment(). If the slice is an IDR I slice
-    // under the shapes the v1 scaffold can handle, we fill in the derived
-    // fields. Otherwise `is_full_i_slice` stays false and CTU decode will
-    // still refuse with `Unsupported`.
-    let mut slice_sao_luma_flag = false;
-    let mut slice_sao_chroma_flag = false;
-    let cabac_init_flag = false;
-    let mut slice_qp_delta: i32 = 0;
-    let mut slice_loop_filter_across_slices_enabled_flag =
-        pps.pps_loop_filter_across_slices_enabled_flag;
+
+    // From here: I-slice extension is handled identically to before; P/B
+    // slices get the inter_pred section + ref_idx flags + merge candidates.
     let mut slice_data_bit_offset: u64 = 0;
     let mut is_full_i_slice = false;
+    let mut is_full_p_slice = false;
 
-    let is_idr = matches!(
-        nal.nal_unit_type,
-        NalUnitType::IdrWRadl | NalUnitType::IdrNLp
-    );
-
-    if !dependent_slice_segment_flag
-        && slice_type == SliceType::I
-        && is_idr
-        && !sps.separate_colour_plane_flag
-    {
-        // Path for the narrow but common case: IDR I slice, 4:2:0 / 4:2:2 /
-        // 4:4:4 (without separate colour planes), no slice-header extension,
-        // no PPS-level chroma offsets. Anything we can't handle becomes an
-        // early exit with is_full_i_slice=false.
+    // Only attempt the full parse for single-segment slices (not dependent).
+    if !dependent_slice_segment_flag && !sps.separate_colour_plane_flag {
         if sps.sample_adaptive_offset_enabled_flag {
             slice_sao_luma_flag = br.u1()? == 1;
             let chroma_array_type = if sps.separate_colour_plane_flag {
@@ -187,11 +247,79 @@ pub fn parse_slice_segment_header(
                 slice_sao_chroma_flag = br.u1()? == 1;
             }
         }
-        // I-slice skips the inter-prediction and weighted-pred sections.
+
+        if slice_type == SliceType::P || slice_type == SliceType::B {
+            let num_ref_idx_active_override_flag = br.u1()? == 1;
+            if num_ref_idx_active_override_flag {
+                num_ref_idx_l0_active_minus1 = br.ue()?;
+                if slice_type == SliceType::B {
+                    num_ref_idx_l1_active_minus1 = br.ue()?;
+                }
+            }
+            if pps.lists_modification_present_flag {
+                // Slice-level list modification is not currently supported —
+                // bail out of the full-parse path. The caller will surface
+                // `Unsupported` on receive_frame.
+                return Ok(partial_header(
+                    first_slice_segment_in_pic_flag,
+                    no_output_of_prior_pics_flag,
+                    slice_pic_parameter_set_id,
+                    dependent_slice_segment_flag,
+                    slice_segment_address,
+                    slice_type,
+                    pic_output_flag,
+                    colour_plane_id,
+                    slice_pic_order_cnt_lsb,
+                    short_term_ref_pic_set_sps_flag,
+                    short_term_ref_pic_set_idx,
+                    current_rps,
+                    pps,
+                ));
+            }
+            if slice_type == SliceType::B {
+                mvd_l1_zero_flag = br.u1()? == 1;
+            }
+            if pps.cabac_init_present_flag {
+                cabac_init_flag = br.u1()? == 1;
+            }
+            if slice_temporal_mvp_enabled_flag {
+                if slice_type == SliceType::B {
+                    collocated_from_l0_flag = br.u1()? == 1;
+                }
+                let needs_collocated = (collocated_from_l0_flag
+                    && num_ref_idx_l0_active_minus1 > 0)
+                    || (!collocated_from_l0_flag && num_ref_idx_l1_active_minus1 > 0);
+                if needs_collocated {
+                    let _collocated_ref_idx = br.ue()?;
+                }
+            }
+            if (pps.weighted_pred_flag && slice_type == SliceType::P)
+                || (pps.weighted_bipred_flag && slice_type == SliceType::B)
+            {
+                // Walk past pred_weight_table without storing — single-ref
+                // weighted prediction path that we currently treat as
+                // out-of-scope (the MC pipeline uses unit weights).
+                skip_pred_weight_table(
+                    &mut br,
+                    sps,
+                    slice_type,
+                    num_ref_idx_l0_active_minus1,
+                    num_ref_idx_l1_active_minus1,
+                )?;
+            }
+            five_minus_max_num_merge_cand = br.ue()?;
+            if five_minus_max_num_merge_cand > 4 {
+                return Err(Error::invalid(
+                    "h265 slice: five_minus_max_num_merge_cand out of range",
+                ));
+            }
+            max_num_merge_cand = 5 - five_minus_max_num_merge_cand;
+        }
+
         slice_qp_delta = br.se()?;
         if pps.pps_slice_chroma_qp_offsets_present_flag {
-            let _slice_cb_qp_offset = br.se()?;
-            let _slice_cr_qp_offset = br.se()?;
+            slice_cb_qp_offset = br.se()?;
+            slice_cr_qp_offset = br.se()?;
         }
         let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
         if pps.deblocking_filter_override_enabled_flag {
@@ -214,14 +342,9 @@ pub fn parse_slice_segment_header(
         if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
             let num_entry_point_offsets = br.ue()?;
             if num_entry_point_offsets > 0 {
-                // Entry-point offsets are present; parsing these accurately
-                // requires the minus-1-plus-1 bit width dance and they are
-                // only needed for multi-tile / wavefront decode. Treat as
-                // unsupported for the I-slice extension.
-                //
-                // Return the headers we have so far without the full
-                // extension set.
-                return Ok(SliceSegmentHeader {
+                // Entry-point offsets — needed only for tiles / WPP which is
+                // out of scope. Abort the extension parse.
+                return Ok(partial_header(
                     first_slice_segment_in_pic_flag,
                     no_output_of_prior_pics_flag,
                     slice_pic_parameter_set_id,
@@ -233,15 +356,9 @@ pub fn parse_slice_segment_header(
                     slice_pic_order_cnt_lsb,
                     short_term_ref_pic_set_sps_flag,
                     short_term_ref_pic_set_idx,
-                    slice_sao_luma_flag,
-                    slice_sao_chroma_flag,
-                    cabac_init_flag,
-                    slice_qp_delta,
-                    slice_qp_y: 26 + pps.init_qp_minus26 + slice_qp_delta,
-                    slice_loop_filter_across_slices_enabled_flag,
-                    slice_data_bit_offset: 0,
-                    is_full_i_slice: false,
-                });
+                    current_rps,
+                    pps,
+                ));
             }
         }
         if pps.slice_segment_header_extension_present_flag {
@@ -264,7 +381,13 @@ pub fn parse_slice_segment_header(
             br.skip(pad as u32)?;
         }
         slice_data_bit_offset = br.bit_position();
-        is_full_i_slice = true;
+        match slice_type {
+            SliceType::I if is_idr => is_full_i_slice = true,
+            SliceType::I => is_full_i_slice = true,
+            SliceType::P => is_full_p_slice = true,
+            // B slice is out of scope.
+            SliceType::B => {}
+        }
     }
 
     Ok(SliceSegmentHeader {
@@ -287,7 +410,121 @@ pub fn parse_slice_segment_header(
         slice_loop_filter_across_slices_enabled_flag,
         slice_data_bit_offset,
         is_full_i_slice,
+        is_full_p_slice,
+        current_rps,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
+        mvd_l1_zero_flag,
+        collocated_from_l0_flag,
+        five_minus_max_num_merge_cand,
+        max_num_merge_cand,
+        slice_temporal_mvp_enabled_flag,
+        slice_cb_qp_offset,
+        slice_cr_qp_offset,
     })
+}
+
+/// Skip a `pred_weight_table()` body (§7.4.7.3) — we consume but don't
+/// expose the weights yet. Returns `Err` if the chroma-format query is
+/// inconsistent.
+fn skip_pred_weight_table(
+    br: &mut BitReader<'_>,
+    sps: &SeqParameterSet,
+    slice_type: SliceType,
+    num_ref_idx_l0_active_minus1: u32,
+    num_ref_idx_l1_active_minus1: u32,
+) -> Result<()> {
+    let _luma_log2_weight_denom = br.ue()?;
+    let chroma_array_type = if sps.separate_colour_plane_flag {
+        0
+    } else {
+        sps.chroma_format_idc
+    };
+    if chroma_array_type != 0 {
+        let _delta_chroma_log2_weight_denom = br.se()?;
+    }
+    let consume = |br: &mut BitReader<'_>, count: u32| -> Result<()> {
+        let mut luma_flags = vec![false; count as usize];
+        for f in luma_flags.iter_mut() {
+            *f = br.u1()? == 1;
+        }
+        let mut chroma_flags = vec![false; count as usize];
+        if chroma_array_type != 0 {
+            for f in chroma_flags.iter_mut() {
+                *f = br.u1()? == 1;
+            }
+        }
+        for i in 0..count as usize {
+            if luma_flags[i] {
+                let _delta_luma_weight = br.se()?;
+                let _luma_offset = br.se()?;
+            }
+            if chroma_array_type != 0 && chroma_flags[i] {
+                for _ in 0..2 {
+                    let _delta_chroma_weight = br.se()?;
+                    let _delta_chroma_offset = br.se()?;
+                }
+            }
+        }
+        Ok(())
+    };
+    consume(br, num_ref_idx_l0_active_minus1 + 1)?;
+    if slice_type == SliceType::B {
+        consume(br, num_ref_idx_l1_active_minus1 + 1)?;
+    }
+    Ok(())
+}
+
+/// Build a `SliceSegmentHeader` for the "abort extension parse" path with
+/// whatever we decoded before the unsupported feature.
+#[allow(clippy::too_many_arguments)]
+fn partial_header(
+    first_slice_segment_in_pic_flag: bool,
+    no_output_of_prior_pics_flag: bool,
+    slice_pic_parameter_set_id: u32,
+    dependent_slice_segment_flag: bool,
+    slice_segment_address: u32,
+    slice_type: SliceType,
+    pic_output_flag: bool,
+    colour_plane_id: u8,
+    slice_pic_order_cnt_lsb: u32,
+    short_term_ref_pic_set_sps_flag: bool,
+    short_term_ref_pic_set_idx: u32,
+    current_rps: Option<ShortTermRps>,
+    pps: &PicParameterSet,
+) -> SliceSegmentHeader {
+    SliceSegmentHeader {
+        first_slice_segment_in_pic_flag,
+        no_output_of_prior_pics_flag,
+        slice_pic_parameter_set_id,
+        dependent_slice_segment_flag,
+        slice_segment_address,
+        slice_type,
+        pic_output_flag,
+        colour_plane_id,
+        slice_pic_order_cnt_lsb,
+        short_term_ref_pic_set_sps_flag,
+        short_term_ref_pic_set_idx,
+        slice_sao_luma_flag: false,
+        slice_sao_chroma_flag: false,
+        cabac_init_flag: false,
+        slice_qp_delta: 0,
+        slice_qp_y: 26 + pps.init_qp_minus26,
+        slice_loop_filter_across_slices_enabled_flag: pps.pps_loop_filter_across_slices_enabled_flag,
+        slice_data_bit_offset: 0,
+        is_full_i_slice: false,
+        is_full_p_slice: false,
+        current_rps,
+        num_ref_idx_l0_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
+        num_ref_idx_l1_active_minus1: pps.num_ref_idx_l1_default_active_minus1,
+        mvd_l1_zero_flag: false,
+        collocated_from_l0_flag: true,
+        five_minus_max_num_merge_cand: 0,
+        max_num_merge_cand: 5,
+        slice_temporal_mvp_enabled_flag: false,
+        slice_cb_qp_offset: 0,
+        slice_cr_qp_offset: 0,
+    }
 }
 
 /// PicWidthInCtbsY * PicHeightInCtbsY (§7.4.7.1).
