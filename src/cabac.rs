@@ -380,6 +380,30 @@ pub const CODED_SUB_BLOCK_FLAG_INIT_VALUES: [[u8; 4]; 3] = [
 /// init across initTypes.
 pub const SAO_MERGE_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[153], [153], [153]];
 
+/// `merge_flag` (Table 9-14). One context for initType=1/2; I-slice unused.
+pub const MERGE_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[0], [110], [154]];
+
+/// `merge_idx` (Table 9-14). One context.
+pub const MERGE_IDX_INIT_VALUES: [[u8; 1]; 3] = [[0], [122], [137]];
+
+/// `inter_pred_idc` (Table 9-14). Five contexts.
+pub const INTER_PRED_IDC_INIT_VALUES: [[u8; 5]; 3] = [
+    [0, 0, 0, 0, 0],
+    [95, 79, 63, 31, 31],
+    [7, 7, 5, 0, 1],
+];
+
+/// `ref_idx_l0` / `ref_idx_l1` (Table 9-14). Two contexts.
+pub const REF_IDX_INIT_VALUES: [[u8; 2]; 3] = [[0, 0], [153, 153], [153, 153]];
+
+/// `abs_mvd_greater0_flag` / `abs_mvd_greater1_flag` (Table 9-14). Two
+/// contexts (one per greater-flag type).
+pub const ABS_MVD_GREATER_FLAGS_INIT_VALUES: [[u8; 2]; 3] =
+    [[0, 0], [140, 198], [169, 198]];
+
+/// `mvp_l0_flag` / `mvp_l1_flag` (Table 9-14). One context.
+pub const MVP_LX_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[0], [168], [168]];
+
 /// `sao_type_idx_luma` / `sao_type_idx_chroma` (Table 9-32) — 1 context.
 pub const SAO_TYPE_IDX_INIT_VALUES: [[u8; 1]; 3] = [[200], [185], [160]];
 

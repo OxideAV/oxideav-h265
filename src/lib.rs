@@ -59,6 +59,7 @@ pub mod cabac;
 pub mod ctu;
 pub mod decoder;
 pub mod hvcc;
+pub mod inter;
 pub mod intra_pred;
 pub mod nal;
 pub mod pps;
