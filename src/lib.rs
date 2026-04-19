@@ -1,28 +1,37 @@
-//! Pure-Rust HEVC / H.265 (ITU-T H.265 | ISO/IEC 23008-2) bitstream parser
-//! plus a decoder scaffold.
+//! Pure-Rust HEVC / H.265 (ITU-T H.265 | ISO/IEC 23008-2) decoder.
 //!
-//! ## Scope (v1)
+//! ## Scope
 //!
 //! * **NAL unit framing** — Annex B byte-stream and length-prefixed (HVCC)
 //!   modes; emulation-prevention byte removal.
 //! * **VPS / SPS / PPS parsers** — every field needed to validate stream
 //!   shape (resolution, chroma format, bit depth, CTU size, tiles /
-//!   wavefront flags, weighted prediction flags, …) is decoded; fields
-//!   not needed by the v1 scaffold are walked past so the bit position
-//!   stays correct.
-//! * **Slice segment header parser** — first slice flag, PPS id, segment
-//!   address, slice type, POC LSB, RPS index. Reference-list modification
-//!   and weighted-prediction tables are out of scope until CABAC is wired.
-//! * **HEVCDecoderConfigurationRecord (`hvcC`) parser** — used by the
-//!   MP4 demuxer to populate `extradata`.
+//!   wavefront flags, …) is decoded.
+//! * **Slice segment header parser** — reaches `byte_alignment()` for IDR
+//!   I-slice packets under the current decode shape.
+//! * **HEVCDecoderConfigurationRecord (`hvcC`) parser** — used by the MP4
+//!   demuxer to populate `extradata`.
+//! * **CABAC** — full arithmetic engine and I-slice context tables.
+//! * **Coding-tree walker** — CTU → CU → PU → TU with intra-mode decode,
+//!   residual coding (sig_coeff / greater1 / greater2 / signs / rice tail),
+//!   inverse transform, flat dequantisation, and reconstruction.
+//! * **Intra prediction** — all 35 modes (planar, DC, 33 angular), MDIS
+//!   filter, strong-intra-smoothing at 32×32.
 //!
-//! ## Out of scope (returns `Error::Unsupported`)
+//! ## Restricted to
 //!
-//! * **CTU decoding** — `slice_data()` (§7.3.8) requires CABAC entropy
-//!   decode (§9), intra and inter prediction (§8.4 / §8.5), transforms
-//!   (§8.6), loop filtering, SAO. CABAC alone is roughly 2 KLOC; the full
-//!   pipeline is ~15 KLOC and intentionally deferred.
-//! * **Scalable / multiview / 3D extensions.**
+//! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
+//! * Single-tile, wavefront-off, no transform-skip, no scaling lists,
+//!   no PCM CUs.
+//! * **I-slices only** — P / B inter prediction returns
+//!   `Error::Unsupported("h265 inter slice pending")`.
+//!
+//! ## Out of scope
+//!
+//! * **Deblocking filter** (§8.7.2) — reconstructed frames carry visible
+//!   block-edge artefacts.
+//! * **SAO** (§8.7.3) — parsed but not applied.
+//! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 //! * **Encoder** — write side is not in scope.
 //!
 //! ## Crate layout
@@ -32,12 +41,16 @@
 //!   parsing, emulation-prevention removal.
 //! * [`ptl`] — `profile_tier_level()` (§7.3.3) shared by VPS/SPS.
 //! * [`vps`], [`sps`], [`pps`] — parameter-set parsers.
-//! * [`slice`] — slice segment header, including the IDR I-slice
-//!   extension (SAO flags, slice_qp_delta, byte-aligned `slice_data()`
-//!   offset, `SliceQpY` derivation).
-//! * [`cabac`] — CABAC per-context initialisation kernel (§9.3.4.2.1).
+//! * [`slice`] — slice segment header and `SliceQpY` derivation.
+//! * [`cabac`] — arithmetic engine and I-slice context-init tables.
+//! * [`intra_pred`] — 35-mode intra prediction + MDIS reference filter.
+//! * [`transform`] — DST-VII 4×4 and DCT-II 4 / 8 / 16 / 32, plus flat
+//!   dequantisation.
+//! * [`scan`] — 4×4 sub-block scan tables (diagonal / horizontal /
+//!   vertical) and the intra-mode → scan_idx rule.
+//! * [`ctu`] — coding-tree walker and residual-coding pipeline.
 //! * [`hvcc`] — HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3).
-//! * [`decoder`] — registry factory and `HevcDecoder` (parse-only).
+//! * [`decoder`] — registry factory and `HevcDecoder` wiring.
 
 #![allow(clippy::too_many_arguments)]
 
