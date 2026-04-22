@@ -222,12 +222,13 @@ impl<'a> CabacEngine<'a> {
     /// Decode one bypass (equiprobable) bin (§9.3.4.3.4).
     pub fn decode_bypass(&mut self) -> u32 {
         self.ivl_offset = (self.ivl_offset << 1) | self.read_bit();
-        if self.ivl_offset >= self.ivl_curr_range {
+        let v = if self.ivl_offset >= self.ivl_curr_range {
             self.ivl_offset -= self.ivl_curr_range;
             1
         } else {
             0
-        }
+        };
+        v
     }
 
     /// Decode the terminating bin (§9.3.4.3.5). Returns 1 when the
@@ -287,8 +288,8 @@ pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] =
 /// `prev_intra_luma_pred_flag` (Table 9-17).
 pub const PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[184], [154], [183]];
 
-/// `intra_chroma_pred_mode` (Table 9-18).
-pub const INTRA_CHROMA_PRED_MODE_INIT_VALUES: [[u8; 1]; 3] = [[184], [152], [152]];
+/// `intra_chroma_pred_mode` (Table 9-13). Single context.
+pub const INTRA_CHROMA_PRED_MODE_INIT_VALUES: [[u8; 1]; 3] = [[63], [152], [152]];
 
 /// `rqt_root_cbf` (Table 9-19) — I-slice doesn't read it but included.
 pub const RQT_ROOT_CBF_INIT_VALUES: [[u8; 1]; 3] = [[0], [79], [79]];
