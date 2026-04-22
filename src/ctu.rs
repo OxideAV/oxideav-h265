@@ -2335,11 +2335,16 @@ fn sig_coeff_ctx_inc(
         let sig_ctx = CTX_IDX_MAP_4X4[((cy << 2) | cx) as usize];
         return if is_luma { sig_ctx } else { 27 + sig_ctx };
     }
+    // §9.3.4.2.5 eq. 9-42: if the whole-TB DC (xC + yC == 0) is reached we
+    // return sigCtx = 0 directly — the modifier block below belongs to the
+    // "Otherwise, sigCtx is derived using previous values of coded_sub_block_flag"
+    // branch only.
     let abs_x = (sx << 2) + cx;
     let abs_y = (sy << 2) + cy;
-    let mut sig_ctx = if abs_x + abs_y == 0 {
-        0
-    } else {
+    if abs_x + abs_y == 0 {
+        return if is_luma { 0 } else { 27 };
+    }
+    let mut sig_ctx = {
         let prev_csbf = usize::from(right_coded) + (usize::from(below_coded) << 1);
         let x_p = (cx & 3) as usize;
         let y_p = (cy & 3) as usize;

@@ -255,6 +255,11 @@ fn assert_yuv420_matches(
     if actual == expected {
         return;
     }
+    if std::env::var_os("H265_DUMP_ACTUAL").is_some() {
+        let path = format!("/tmp/hevc-actual-{label}.yuv").replace(' ', "_");
+        std::fs::write(&path, actual).ok();
+        eprintln!("wrote actual output to {path}");
+    }
     let mut first_diff = None;
     let mut plane_sad = [0u64; 3];
     let mut plane_max = [0u8; 3];
@@ -779,6 +784,23 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
 
 #[test]
 #[ignore = "exact residual reconstruction still diverges from ffmpeg"]
+fn hevc_intra_gray_64_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "exact-intra-gray-64.h265",
+        "color=c=gray:size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-intra-64.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra 64 fixture");
+}
+
+#[test]
+#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_intra_fixture_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "exact-intra-gray.h265",
@@ -912,3 +934,27 @@ fn hevc_angular_intra_fixture_decodes() {
     }
 }
 
+
+#[test]
+fn dump_sps_64_for_debugging() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "exact-intra-gray-64.h265",
+        "color=c=gray:size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
+    for nal in iter_annex_b(&data) {
+        if nal.header.nal_unit_type == NalUnitType::Sps {
+            let rbsp = extract_rbsp(nal.payload());
+            let sps = parse_sps(&rbsp).expect("SPS parse");
+            eprintln!("SPS64: min_cu_log2+3={} diff_max_min={} ctu_size={} min_tb=2+{} max_tb=+{} max_trafo_intra={}",
+                sps.log2_min_luma_coding_block_size_minus3,
+                sps.log2_diff_max_min_luma_coding_block_size,
+                1u32 << (sps.log2_min_luma_coding_block_size_minus3 + 3 + sps.log2_diff_max_min_luma_coding_block_size),
+                sps.log2_min_luma_transform_block_size_minus2,
+                sps.log2_diff_max_min_luma_transform_block_size,
+                sps.max_transform_hierarchy_depth_intra);
+            return;
+        }
+    }
+}
