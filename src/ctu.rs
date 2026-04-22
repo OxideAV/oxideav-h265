@@ -134,7 +134,7 @@ struct Ctx {
     rqt_root_cbf: [CtxState; 1],
     split_transform_flag: [CtxState; 3],
     cbf_luma: [CtxState; 2],
-    cbf_cb_cr: [CtxState; 2],
+    cbf_cb_cr: [CtxState; 5],
     cu_qp_delta_abs: [CtxState; 2],
     last_sig_x_prefix: [CtxState; 18],
     last_sig_y_prefix: [CtxState; 18],
@@ -1112,7 +1112,8 @@ impl<'a> Walker<'a> {
         // mode at (x0, y0).
         let chroma_mode = self.resolve_chroma_mode(luma_modes[0], icpm);
 
-        // transform_tree: one call at CU root.
+        // transform_tree: one call at CU root. x_base/y_base and parent_cbf
+        // are unused at the root (tr_depth == 0 always decodes cbf directly).
         self.transform_tree(
             engine,
             ctx,
@@ -1120,9 +1121,14 @@ impl<'a> Walker<'a> {
             y0,
             x0,
             y0,
+            x0,
+            y0,
             log2_cb,
             log2_cb,
             0,
+            0,
+            1,
+            1,
             &luma_modes,
             chroma_mode,
             part_mode_nxn,
@@ -1245,7 +1251,7 @@ impl<'a> Walker<'a> {
             log2_tb - 1
         };
         let chroma_present = chroma_log2 >= 2;
-        let cbf_ctx_inc = tr_depth.min(1) as usize;
+        let cbf_ctx_inc = tr_depth.min(4) as usize;
         if chroma_present {
             cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
             cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
@@ -1397,70 +1403,89 @@ impl<'a> Walker<'a> {
         ctx: &mut Ctx,
         x0: u32,
         y0: u32,
+        x_base: u32,
+        y_base: u32,
         cu_x0: u32,
         cu_y0: u32,
         log2_cb: u32,
         log2_tb: u32,
         tr_depth: u32,
+        blk_idx: u32,
+        parent_cbf_cb: u32,
+        parent_cbf_cr: u32,
         luma_modes: &[u32; 4],
         chroma_mode: u32,
         part_mode_nxn: bool,
     ) -> Result<()> {
-        // Determine whether we should split (§7.4.9.9).
+        // §7.3.8.10 / §7.4.9.9 split decision (matches ffmpeg
+        // libavcodec/hevc/hevcdec.c hls_transform_tree).
         let max_tb_log2 = self.max_tb_log2;
         let min_tb_log2 = self.min_tb_log2;
-        let max_tu_size_exceeded = log2_tb > max_tb_log2;
-        let must_split = max_tu_size_exceeded || (part_mode_nxn && tr_depth == 0) || log2_tb > 5;
-        let can_split = log2_tb > min_tb_log2;
-
-        let split = if must_split {
-            1
-        } else if !can_split {
-            0
+        let max_trafo_depth = if part_mode_nxn {
+            self.cctx.sps.max_transform_hierarchy_depth_intra + 1
         } else {
-            let ctx_inc = (5 - log2_tb) as usize;
-            let ctx_inc = ctx_inc.min(2);
-            engine.decode_bin(&mut ctx.split_transform_flag[ctx_inc])
+            self.cctx.sps.max_transform_hierarchy_depth_intra
         };
+        let decode_split = log2_tb <= max_tb_log2
+            && log2_tb > min_tb_log2
+            && tr_depth < max_trafo_depth
+            && !(part_mode_nxn && tr_depth == 0);
+        let split = if decode_split {
+            let ctx_inc = ((5 - log2_tb) as usize).min(2);
+            engine.decode_bin(&mut ctx.split_transform_flag[ctx_inc])
+        } else if log2_tb > max_tb_log2 || (part_mode_nxn && tr_depth == 0) {
+            1
+        } else {
+            0
+        };
+
+        // cbf_cb / cbf_cr at every tree node with log2_tb > 2 (§7.3.8.10,
+        // 4:2:0). Gated by parent's cbf at non-root depths; inherited from
+        // parent when not decoded.
+        let mut cbf_cb = parent_cbf_cb;
+        let mut cbf_cr = parent_cbf_cr;
+        if log2_tb > 2 {
+            let cbf_ctx_inc = tr_depth.min(4) as usize;
+            if tr_depth == 0 || parent_cbf_cb == 1 {
+                cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            } else {
+                cbf_cb = 0;
+            }
+            if tr_depth == 0 || parent_cbf_cr == 1 {
+                cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            } else {
+                cbf_cr = 0;
+            }
+        }
 
         if split == 1 {
             let sub = 1u32 << (log2_tb - 1);
+            // Children's xBase/yBase is our current (x0, y0).
             self.transform_tree(
-                engine, ctx, x0, y0, cu_x0, cu_y0, log2_cb, log2_tb - 1,
-                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
+                engine, ctx, x0, y0, x0, y0, cu_x0, cu_y0,
+                log2_cb, log2_tb - 1, tr_depth + 1, 0, cbf_cb, cbf_cr,
+                luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0 + sub, y0, cu_x0, cu_y0, log2_cb, log2_tb - 1,
-                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
+                engine, ctx, x0 + sub, y0, x0, y0, cu_x0, cu_y0,
+                log2_cb, log2_tb - 1, tr_depth + 1, 1, cbf_cb, cbf_cr,
+                luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0, y0 + sub, cu_x0, cu_y0, log2_cb, log2_tb - 1,
-                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
+                engine, ctx, x0, y0 + sub, x0, y0, cu_x0, cu_y0,
+                log2_cb, log2_tb - 1, tr_depth + 1, 2, cbf_cb, cbf_cr,
+                luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0 + sub, y0 + sub, cu_x0, cu_y0, log2_cb, log2_tb - 1,
-                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
+                engine, ctx, x0 + sub, y0 + sub, x0, y0, cu_x0, cu_y0,
+                log2_cb, log2_tb - 1, tr_depth + 1, 3, cbf_cb, cbf_cr,
+                luma_modes, chroma_mode, part_mode_nxn,
             )?;
             return Ok(());
         }
 
-        // Leaf transform unit.
-        // cbf_cb / cbf_cr (signalled per TB for intra; at chroma size log2 - 1
-        // when in 4:2:0). For the root (tr_depth == 0) these are always read.
-        let mut cbf_cb = 0u32;
-        let mut cbf_cr = 0u32;
-        let chroma_log2 = if log2_tb == self.min_tb_log2 {
-            0
-        } else {
-            log2_tb - 1
-        };
-        let chroma_present = chroma_log2 >= 2;
-        let cbf_ctx_inc = tr_depth.min(1) as usize;
-        if chroma_present {
-            cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-            cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-        }
-        // cbf_luma: always present for intra leaves.
+        // Leaf transform_unit. §7.3.8.11.
+        // cbf_luma is always read for intra leaves.
         let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
         let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
@@ -1521,21 +1546,28 @@ impl<'a> Walker<'a> {
 
         self.reconstruct_plane(engine, ctx, x0, y0, log2_tb, luma_mode, true, cbf_luma != 0)?;
 
-        if chroma_present {
+        // Chroma residual placement (§7.3.8.11):
+        //   log2_tb > 2: chroma TB co-located at (x0/2, y0/2), size log2_tb-1.
+        //   log2_tb == 2 and blk_idx == 3: single chroma 4x4 at parent base
+        //     (x_base/2, y_base/2), covering all 4 luma 4x4 children.
+        if log2_tb > 2 {
             let chroma_x = x0 / 2;
             let chroma_y = y0 / 2;
+            let chroma_log2 = log2_tb - 1;
             self.reconstruct_plane(
-                engine,
-                ctx,
-                chroma_x,
-                chroma_y,
-                chroma_log2,
-                chroma_mode,
-                false,
-                cbf_cb != 0,
+                engine, ctx, chroma_x, chroma_y, chroma_log2, chroma_mode, false, cbf_cb != 0,
             )?;
             self.reconstruct_plane_cr(
                 engine, ctx, chroma_x, chroma_y, chroma_log2, chroma_mode, cbf_cr != 0,
+            )?;
+        } else if blk_idx == 3 {
+            let chroma_x = x_base / 2;
+            let chroma_y = y_base / 2;
+            self.reconstruct_plane(
+                engine, ctx, chroma_x, chroma_y, 2, chroma_mode, false, cbf_cb != 0,
+            )?;
+            self.reconstruct_plane_cr(
+                engine, ctx, chroma_x, chroma_y, 2, chroma_mode, cbf_cr != 0,
             )?;
         }
         Ok(())

@@ -300,8 +300,14 @@ pub const SPLIT_TRANSFORM_FLAG_INIT_VALUES: [[u8; 3]; 3] =
 /// `cbf_luma` (Table 9-21). Two contexts.
 pub const CBF_LUMA_INIT_VALUES: [[u8; 2]; 3] = [[111, 141], [153, 111], [153, 111]];
 
-/// `cbf_cb` / `cbf_cr` (Table 9-21). Two contexts.
-pub const CBF_CB_CR_INIT_VALUES: [[u8; 2]; 3] = [[94, 138], [149, 107], [149, 92]];
+/// `cbf_cb` / `cbf_cr` (Table 9-22). Five contexts per initType. `ctxInc ==
+/// trafoDepth` per §9.3.4.2.1. Entries 4..4 extend the range required by
+/// range-extension profiles; base-profile streams only use 0..3.
+pub const CBF_CB_CR_INIT_VALUES: [[u8; 5]; 3] = [
+    [94, 138, 182, 154, 154],
+    [149, 107, 167, 154, 154],
+    [149, 92, 167, 154, 154],
+];
 
 /// `cu_qp_delta_abs` (Table 9-22). Two contexts.
 pub const CU_QP_DELTA_ABS_INIT_VALUES: [[u8; 2]; 3] = [[154, 154], [154, 154], [154, 154]];

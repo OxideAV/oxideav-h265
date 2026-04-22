@@ -53,6 +53,17 @@ pub struct SeqParameterSet {
     /// `used_by_curr_pic_flag`. Needed for slice-level reference picture list
     /// construction at inter-slice decode time.
     pub short_term_ref_pic_sets: Vec<ShortTermRps>,
+    /// SPS range extension flags (§7.4.3.2.2). All default `false` when the
+    /// range extension is absent. Needed to gate Rext-specific CABAC paths.
+    pub transform_skip_rotation_enabled_flag: bool,
+    pub transform_skip_context_enabled_flag: bool,
+    pub implicit_rdpcm_enabled_flag: bool,
+    pub explicit_rdpcm_enabled_flag: bool,
+    pub extended_precision_processing_flag: bool,
+    pub intra_smoothing_disabled_flag: bool,
+    pub high_precision_offsets_flag: bool,
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    pub cabac_bypass_alignment_enabled_flag: bool,
 }
 
 /// A parsed short-term reference picture set (§7.4.8).
@@ -286,9 +297,41 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let strong_intra_smoothing_enabled_flag = br.u1()? == 1;
 
     let vui_parameters_present_flag = br.u1()? == 1;
-    // We deliberately stop here — VUI / sps_extension / rbsp_trailing_bits
-    // have no impact on the v1 scaffold and a full VUI parse adds another
-    // ~200 lines for marginal value.
+    if vui_parameters_present_flag {
+        skip_vui(&mut br, sps_max_sub_layers_minus1)?;
+    }
+
+    // SPS range extension flags (§7.4.3.2.2) — only parsed if the stream
+    // opted into them. Defaults are all `false` for base-profile streams.
+    let mut transform_skip_rotation_enabled_flag = false;
+    let mut transform_skip_context_enabled_flag = false;
+    let mut implicit_rdpcm_enabled_flag = false;
+    let mut explicit_rdpcm_enabled_flag = false;
+    let mut extended_precision_processing_flag = false;
+    let mut intra_smoothing_disabled_flag = false;
+    let mut high_precision_offsets_flag = false;
+    let mut persistent_rice_adaptation_enabled_flag = false;
+    let mut cabac_bypass_alignment_enabled_flag = false;
+
+    let sps_extension_present_flag = br.u1().unwrap_or(0) == 1;
+    if sps_extension_present_flag {
+        let sps_range_extension_flag = br.u1().unwrap_or(0) == 1;
+        // Skip the four reserved/other extension flags for profiles we do
+        // not yet target (multilayer / 3D / SCC / reserved).
+        let _ = br.u(4);
+        let _sps_extension_4bits = br.u(4).unwrap_or(0);
+        if sps_range_extension_flag {
+            transform_skip_rotation_enabled_flag = br.u1().unwrap_or(0) == 1;
+            transform_skip_context_enabled_flag = br.u1().unwrap_or(0) == 1;
+            implicit_rdpcm_enabled_flag = br.u1().unwrap_or(0) == 1;
+            explicit_rdpcm_enabled_flag = br.u1().unwrap_or(0) == 1;
+            extended_precision_processing_flag = br.u1().unwrap_or(0) == 1;
+            intra_smoothing_disabled_flag = br.u1().unwrap_or(0) == 1;
+            high_precision_offsets_flag = br.u1().unwrap_or(0) == 1;
+            persistent_rice_adaptation_enabled_flag = br.u1().unwrap_or(0) == 1;
+            cabac_bypass_alignment_enabled_flag = br.u1().unwrap_or(0) == 1;
+        }
+    }
 
     Ok(SeqParameterSet {
         sps_video_parameter_set_id,
@@ -325,7 +368,155 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         strong_intra_smoothing_enabled_flag,
         vui_parameters_present_flag,
         short_term_ref_pic_sets,
+        transform_skip_rotation_enabled_flag,
+        transform_skip_context_enabled_flag,
+        implicit_rdpcm_enabled_flag,
+        explicit_rdpcm_enabled_flag,
+        extended_precision_processing_flag,
+        intra_smoothing_disabled_flag,
+        high_precision_offsets_flag,
+        persistent_rice_adaptation_enabled_flag,
+        cabac_bypass_alignment_enabled_flag,
     })
+}
+
+/// Best-effort `vui_parameters()` (§E.2.1) skipper. Consumes the bits so
+/// that any `sps_extension_present_flag` that follows lands at the right
+/// offset. Returns `Err` only for obviously malformed streams.
+fn skip_vui(br: &mut BitReader<'_>, sps_max_sub_layers_minus1: u8) -> Result<()> {
+    // aspect_ratio_info_present_flag
+    if br.u1()? == 1 {
+        let aspect_ratio_idc = br.u(8)? as u32;
+        if aspect_ratio_idc == 255 {
+            br.skip(16)?; // sar_width
+            br.skip(16)?; // sar_height
+        }
+    }
+    // overscan_info_present_flag
+    if br.u1()? == 1 {
+        br.skip(1)?;
+    }
+    // video_signal_type_present_flag
+    if br.u1()? == 1 {
+        br.skip(3)?; // video_format
+        br.skip(1)?; // video_full_range_flag
+        if br.u1()? == 1 {
+            br.skip(8)?;
+            br.skip(8)?;
+            br.skip(8)?;
+        }
+    }
+    // chroma_loc_info_present_flag
+    if br.u1()? == 1 {
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+    }
+    br.skip(1)?; // neutral_chroma_indication_flag
+    br.skip(1)?; // field_seq_flag
+    br.skip(1)?; // frame_field_info_present_flag
+    if br.u1()? == 1 {
+        // default_display_window
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+    }
+    // vui_timing_info_present_flag
+    if br.u1()? == 1 {
+        br.skip(32)?; // num_units_in_tick
+        br.skip(32)?; // time_scale
+        if br.u1()? == 1 {
+            let _ = br.ue()?; // vui_num_ticks_poc_diff_one_minus1
+        }
+        // vui_hrd_parameters_present_flag
+        if br.u1()? == 1 {
+            skip_hrd_parameters(br, true, sps_max_sub_layers_minus1)?;
+        }
+    }
+    // bitstream_restriction_flag
+    if br.u1()? == 1 {
+        br.skip(1)?; // tiles_fixed_structure_flag
+        br.skip(1)?; // motion_vectors_over_pic_boundaries_flag
+        br.skip(1)?; // restricted_ref_pic_lists_flag
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+        let _ = br.ue()?;
+    }
+    Ok(())
+}
+
+fn skip_hrd_parameters(
+    br: &mut BitReader<'_>,
+    common_inf_present: bool,
+    max_num_sub_layers_minus1: u8,
+) -> Result<()> {
+    let mut nal_hrd_parameters_present_flag = false;
+    let mut vcl_hrd_parameters_present_flag = false;
+    let mut sub_pic_hrd_params_present_flag = false;
+    if common_inf_present {
+        nal_hrd_parameters_present_flag = br.u1()? == 1;
+        vcl_hrd_parameters_present_flag = br.u1()? == 1;
+        if nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag {
+            sub_pic_hrd_params_present_flag = br.u1()? == 1;
+            if sub_pic_hrd_params_present_flag {
+                br.skip(8)?; // tick_divisor_minus2
+                br.skip(5)?; // du_cpb_removal_delay_increment_length_minus1
+                br.skip(1)?; // sub_pic_cpb_params_in_pic_timing_sei_flag
+                br.skip(5)?; // dpb_output_delay_du_length_minus1
+            }
+            br.skip(4)?; // bit_rate_scale
+            br.skip(4)?; // cpb_size_scale
+            if sub_pic_hrd_params_present_flag {
+                br.skip(4)?; // cpb_size_du_scale
+            }
+            br.skip(5)?; // initial_cpb_removal_delay_length_minus1
+            br.skip(5)?; // au_cpb_removal_delay_length_minus1
+            br.skip(5)?; // dpb_output_delay_length_minus1
+        }
+    }
+    for _ in 0..=max_num_sub_layers_minus1 {
+        let fixed_pic_rate_general_flag = br.u1()? == 1;
+        let mut fixed_pic_rate_within_cvs_flag = fixed_pic_rate_general_flag;
+        if !fixed_pic_rate_general_flag {
+            fixed_pic_rate_within_cvs_flag = br.u1()? == 1;
+        }
+        let mut low_delay_hrd_flag = false;
+        let mut cpb_cnt_minus1: u32 = 0;
+        if fixed_pic_rate_within_cvs_flag {
+            let _ = br.ue()?; // elemental_duration_in_tc_minus1
+        } else {
+            low_delay_hrd_flag = br.u1()? == 1;
+        }
+        if !low_delay_hrd_flag {
+            cpb_cnt_minus1 = br.ue()?;
+        }
+        if nal_hrd_parameters_present_flag {
+            skip_sub_layer_hrd(br, cpb_cnt_minus1, sub_pic_hrd_params_present_flag)?;
+        }
+        if vcl_hrd_parameters_present_flag {
+            skip_sub_layer_hrd(br, cpb_cnt_minus1, sub_pic_hrd_params_present_flag)?;
+        }
+    }
+    Ok(())
+}
+
+fn skip_sub_layer_hrd(
+    br: &mut BitReader<'_>,
+    cpb_cnt_minus1: u32,
+    sub_pic_hrd_params_present_flag: bool,
+) -> Result<()> {
+    for _ in 0..=cpb_cnt_minus1 {
+        let _ = br.ue()?; // bit_rate_value_minus1
+        let _ = br.ue()?; // cpb_size_value_minus1
+        if sub_pic_hrd_params_present_flag {
+            let _ = br.ue()?; // cpb_size_du_value_minus1
+            let _ = br.ue()?; // bit_rate_du_value_minus1
+        }
+        br.skip(1)?; // cbr_flag
+    }
+    Ok(())
 }
 
 /// Parse one `st_ref_pic_set( stRpsIdx )` (§7.4.8). Fills in absolute POC
