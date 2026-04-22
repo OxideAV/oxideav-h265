@@ -272,9 +272,9 @@ pub const CU_TRANSQUANT_BYPASS_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[154], [154], [
 /// `cu_skip_flag` (Table 9-13). Three contexts — I-slice never signals
 /// this syntax but we keep it to avoid a separate branch in init code.
 pub const CU_SKIP_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
-    [0, 0, 0], // I (unused)
+    [154, 154, 154], // I: unused, kept at CNU per ffmpeg.
     [197, 185, 201],
-    [185, 106, 133],
+    [197, 185, 201],
 ];
 
 /// `pred_mode_flag` (Table 9-15). One context; I-slice doesn't read it
@@ -283,7 +283,7 @@ pub const PRED_MODE_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[0], [149], [134]];
 
 /// `part_mode` (Table 9-16). Four contexts.
 pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] =
-    [[184, 0, 0, 0], [154, 139, 154, 0], [154, 139, 154, 0]];
+    [[184, 154, 154, 154], [154, 139, 154, 154], [154, 139, 154, 154]];
 
 /// `prev_intra_luma_pred_flag` (Table 9-17).
 pub const PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[184], [154], [183]];
@@ -395,7 +395,7 @@ pub const MERGE_IDX_INIT_VALUES: [[u8; 1]; 3] = [[0], [122], [137]];
 
 /// `inter_pred_idc` (Table 9-14). Five contexts.
 pub const INTER_PRED_IDC_INIT_VALUES: [[u8; 5]; 3] =
-    [[0, 0, 0, 0, 0], [95, 79, 63, 31, 31], [7, 7, 5, 0, 1]];
+    [[0, 0, 0, 0, 0], [95, 79, 63, 31, 31], [95, 79, 63, 31, 31]];
 
 /// `ref_idx_l0` / `ref_idx_l1` (Table 9-14). Two contexts.
 pub const REF_IDX_INIT_VALUES: [[u8; 2]; 3] = [[0, 0], [153, 153], [153, 153]];
