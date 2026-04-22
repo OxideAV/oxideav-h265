@@ -1,19 +1,13 @@
 //! Integration tests against ffmpeg-generated HEVC clips.
 //!
-//! Fixtures expected at:
-//!   /tmp/h265_iframe.mp4   (64x64 @ 24 fps, single I frame)
-//!   /tmp/h265.es           (Annex B stream extracted from above)
-//!
-//! Generated with:
-//!   ffmpeg -y -f lavfi -i "testsrc=size=64x64:rate=24:duration=0.1" \
-//!       -pix_fmt yuv420p -c:v libx265 -profile:v main -preset:v slow \
-//!       -g 1 -x265-params log-level=error /tmp/h265_iframe.mp4
-//!   ffmpeg -y -i /tmp/h265_iframe.mp4 -c:v copy -f hevc /tmp/h265.es
-//!
-//! Tests skip cleanly (logged, not failed) when fixtures are missing so CI
-//! without ffmpeg keeps passing.
+//! Tests generate their own HEVC fixtures with local `ffmpeg` + `libx265`.
+//! Exact byte-for-byte comparisons only use streams encoded inside the
+//! decoder's current feature scope: 8-bit 4:2:0, no tiles/WPP, no SAO, and
+//! deblocking disabled.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::process::Stdio;
 
 use oxideav_codec::Decoder;
 use oxideav_core::{Error, Packet, TimeBase};
@@ -32,6 +26,290 @@ fn read_fixture(path: &str) -> Option<Vec<u8>> {
         return None;
     }
     Some(std::fs::read(path).expect("read fixture"))
+}
+
+fn fixture_path(name: &str) -> String {
+    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg("-version")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn generated_fixture_dir() -> PathBuf {
+    PathBuf::from("/tmp/oxideav-h265-fixtures")
+}
+
+fn ensure_dir(path: &Path) {
+    std::fs::create_dir_all(path).expect("create fixture directory");
+}
+
+fn run_ffmpeg(args: &[&str]) -> bool {
+    Command::new("ffmpeg")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn ensure_parser_fixtures() -> bool {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available — skipping parser fixture generation");
+        return false;
+    }
+    let mp4 = PathBuf::from("/tmp/h265_iframe.mp4");
+    let es = PathBuf::from("/tmp/h265.es");
+    if mp4.exists() && es.exists() {
+        return true;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let gen_mp4 = fixture_dir.join("parser-iframe.mp4");
+    if !gen_mp4.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=24:duration=0.1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            "main",
+            "-preset:v",
+            "slow",
+            "-g",
+            "1",
+            "-x265-params",
+            "log-level=error",
+            gen_mp4.to_str().expect("fixture path"),
+        ])
+    {
+        eprintln!("failed to generate parser MP4 fixture");
+        return false;
+    }
+    if !es.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            gen_mp4.to_str().expect("fixture path"),
+            "-c:v",
+            "copy",
+            "-f",
+            "hevc",
+            es.to_str().expect("fixture path"),
+        ])
+    {
+        eprintln!("failed to generate parser Annex B fixture");
+        return false;
+    }
+    if !mp4.exists() {
+        std::fs::copy(&gen_mp4, &mp4).expect("copy parser mp4 fixture");
+    }
+    true
+}
+
+fn ensure_generated_hevc_fixture(name: &str, lavfi: &str, fps: u32, frames: u32, gop: u32) -> Option<PathBuf> {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available — skipping generated fixture {name}");
+        return None;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let output = fixture_dir.join(name);
+    if output.exists() {
+        return Some(output);
+    }
+    let duration = format!("{}", frames as f32 / fps as f32);
+    let rate = fps.to_string();
+    let x265_params = format!(
+        "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1"
+    );
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            lavfi,
+            "-frames:v",
+            &frames.to_string(),
+            "-r",
+            &rate,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx265",
+            "-preset:v",
+            "medium",
+            "-x265-params",
+            &x265_params,
+        ])
+        .arg(&output)
+        .status()
+        .expect("run ffmpeg for generated HEVC fixture");
+    if !status.success() {
+        eprintln!("failed to generate HEVC fixture {name} (duration {duration}s)");
+        return None;
+    }
+    Some(output)
+}
+
+fn ffmpeg_decode_raw(input: &str, output: &Path, frames: Option<usize>) -> Option<Vec<u8>> {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available — skipping raw compare for {input}");
+        return None;
+    }
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i", input]);
+    if let Some(n) = frames {
+        cmd.args(["-frames:v", &n.to_string()]);
+    }
+    let status = cmd
+        .args(["-pix_fmt", "yuv420p", "-f", "rawvideo"])
+        .arg(output)
+        .status()
+        .expect("run ffmpeg");
+    if !status.success() {
+        eprintln!("ffmpeg decode failed for {input} — skipping compare");
+        return None;
+    }
+    Some(std::fs::read(output).expect("read ffmpeg raw output"))
+}
+
+fn decode_all_video_frames(data: Vec<u8>, expected_frames: usize) -> Vec<oxideav_core::VideoFrame> {
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    dec.send_packet(&pkt).expect("send packet");
+    let mut frames = Vec::with_capacity(expected_frames);
+    for i in 0..expected_frames {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(other) => panic!("expected VideoFrame {i}, got {other:?}"),
+            Err(e) => panic!("unexpected error from receive_frame {i}: {e:?}"),
+        }
+    }
+    frames
+}
+
+fn flatten_yuv420_frames(frames: &[oxideav_core::VideoFrame]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for vf in frames {
+        assert_eq!(vf.planes.len(), 3, "expected 3 planes");
+        out.extend_from_slice(&vf.planes[0].data);
+        out.extend_from_slice(&vf.planes[1].data);
+        out.extend_from_slice(&vf.planes[2].data);
+    }
+    out
+}
+
+fn assert_yuv420_matches(
+    actual: &[u8],
+    expected: &[u8],
+    width: usize,
+    height: usize,
+    frames: usize,
+    label: &str,
+) {
+    let luma = width * height;
+    let chroma = (width / 2) * (height / 2);
+    let frame_len = luma + chroma * 2;
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{label}: byte-length mismatch (actual {}, expected {})",
+        actual.len(),
+        expected.len()
+    );
+    assert_eq!(
+        actual.len(),
+        frame_len * frames,
+        "{label}: unexpected byte-length for {frames} YUV420 frame(s)"
+    );
+    if actual == expected {
+        return;
+    }
+    let mut first_diff = None;
+    let mut plane_sad = [0u64; 3];
+    let mut plane_max = [0u8; 3];
+    let mut plane_max_idx = [0usize; 3];
+    for idx in 0..actual.len() {
+        if actual[idx] != expected[idx] && first_diff.is_none() {
+            first_diff = Some(idx);
+        }
+        let within_frame = idx % frame_len;
+        let plane = if within_frame < luma {
+            0
+        } else if within_frame < luma + chroma {
+            1
+        } else {
+            2
+        };
+        let delta = actual[idx].abs_diff(expected[idx]);
+        plane_sad[plane] += delta as u64;
+        if delta > plane_max[plane] {
+            plane_max[plane] = delta;
+            plane_max_idx[plane] = idx;
+        }
+    }
+    let idx = first_diff.expect("diff index");
+    let frame_idx = idx / frame_len;
+    let within_frame = idx % frame_len;
+    let (plane_name, plane_off, plane_w) = if within_frame < luma {
+        ("Y", within_frame, width)
+    } else if within_frame < luma + chroma {
+        ("Cb", within_frame - luma, width / 2)
+    } else {
+        ("Cr", within_frame - luma - chroma, width / 2)
+    };
+    let x = plane_off % plane_w;
+    let y = plane_off / plane_w;
+    let max_pos = |plane: usize| {
+        let idx = plane_max_idx[plane] % frame_len;
+        let (plane_off, plane_w) = match plane {
+            0 => (idx, width),
+            1 => (idx - luma, width / 2),
+            _ => (idx - luma - chroma, width / 2),
+        };
+        (plane_off % plane_w, plane_off / plane_w)
+    };
+    let (max_y_x, max_y_y) = max_pos(0);
+    let (max_cb_x, max_cb_y) = max_pos(1);
+    let (max_cr_x, max_cr_y) = max_pos(2);
+    panic!(
+        "{label}: first diff at frame {frame_idx}, plane {plane_name}, x={x}, y={y}, actual={}, expected={}, SAD(Y/Cb/Cr)=({}/{}/{}), max(|diff|)({}/{}/{}), max-pos(Y/Cb/Cr)=(({},{})/({},{}))/({},{}))",
+        actual[idx],
+        expected[idx],
+        plane_sad[0],
+        plane_sad[1],
+        plane_sad[2],
+        plane_max[0],
+        plane_max[1],
+        plane_max[2],
+        max_y_x,
+        max_y_y,
+        max_cb_x,
+        max_cb_y,
+        max_cr_x,
+        max_cr_y,
+    );
 }
 
 /// Walk an MP4 box tree and find the body of the first box whose path
@@ -128,6 +406,9 @@ fn find_in_sample_entry<'a>(
 
 #[test]
 fn parse_vps_sps_pps_from_annex_b() {
+    if !ensure_parser_fixtures() {
+        return;
+    }
     let Some(data) = read_fixture("/tmp/h265.es") else {
         return;
     };
@@ -171,6 +452,9 @@ fn parse_vps_sps_pps_from_annex_b() {
 
 #[test]
 fn parse_slice_header_from_annex_b() {
+    if !ensure_parser_fixtures() {
+        return;
+    }
     let Some(data) = read_fixture("/tmp/h265.es") else {
         return;
     };
@@ -206,6 +490,9 @@ fn parse_slice_header_from_annex_b() {
 
 #[test]
 fn parse_hvcc_from_mp4_extradata() {
+    if !ensure_parser_fixtures() {
+        return;
+    }
     let Some(data) = read_fixture("/tmp/h265_iframe.mp4") else {
         return;
     };
@@ -252,6 +539,9 @@ fn parse_hvcc_from_mp4_extradata() {
 
 #[test]
 fn nal_header_round_trip_on_fixture() {
+    if !ensure_parser_fixtures() {
+        return;
+    }
     let Some(data) = read_fixture("/tmp/h265.es") else {
         return;
     };
@@ -273,6 +563,9 @@ fn i_slice_header_state() {
     // with wavefront parallel processing enabled, which lands on the
     // "tiles/wavefront/extension" unsupported path — accept either a
     // decoded frame or that specific unsupported message.
+    if !ensure_parser_fixtures() {
+        return;
+    }
     let Some(data) = read_fixture("/tmp/h265.es") else {
         return;
     };
@@ -427,9 +720,7 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
     // "keyint=1:no-open-gop=1:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1"`.
     // It is intentionally single-tile, wavefront-disabled so it lands inside
     // the v1 intra-only pixel decode scope.
-    let Some(data) = read_fixture(
-        "/home/magicaltux/projects/oxideav-wt/h265-complete/tests/fixtures/hevc-intra.h265",
-    ) else {
+    let Some(data) = read_fixture(&fixture_path("hevc-intra.h265")) else {
         return;
     };
     let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
@@ -472,4 +763,56 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
         distinct > 20,
         "expected more than 20 distinct luma values, got {distinct}",
     );
+}
+
+#[test]
+#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
+fn hevc_intra_fixture_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "exact-intra-gray.h265",
+        "color=c=gray:size=256x144:rate=1:duration=1",
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) =
+        ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-intra.ref.yuv"), Some(1))
+    else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 256, 144, 1, "intra fixture");
+}
+
+#[test]
+#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
+fn hevc_p_slice_fixture_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "exact-ip-gray.h265",
+        "color=c=gray:size=256x144:rate=2:duration=1",
+        2,
+        2,
+        2,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) =
+        ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-p.ref.yuv"), Some(2))
+    else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 2);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 256, 144, 2, "P-slice fixture");
 }

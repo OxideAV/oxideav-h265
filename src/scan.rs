@@ -79,27 +79,21 @@ pub fn scan_4x4(scan_idx: u32) -> &'static [(u8, u8); 16] {
 /// Returns 0 (diagonal), 1 (horizontal), or 2 (vertical).
 pub fn scan_idx_for_intra(log2_tb: u32, pred_mode: u32, is_luma: bool) -> u32 {
     if log2_tb != 2 && log2_tb != 3 {
-        return 0; // Only 4x4 and 8x8 use horizontal/vertical scan.
+        return 0;
     }
-    if is_luma {
-        // Luma: horizontal for modes 22..=30 (diagonal near vertical),
-        //       vertical for modes 6..=14.
-        if (6..=14).contains(&pred_mode) {
-            2
-        } else if (22..=30).contains(&pred_mode) {
-            1
-        } else {
-            0
-        }
+    // §7.4.9.11: horizontal-ish modes (6..=14) use vertical scan,
+    // vertical-ish modes (22..=30) use horizontal scan.
+    //
+    // For 4:2:0 chroma, the mode-dependent scan is only used for 4x4 TUs.
+    // 8x8 chroma remains diagonal.
+    if !is_luma && log2_tb == 3 {
+        return 0;
+    }
+    if (6..=14).contains(&pred_mode) {
+        2
+    } else if (22..=30).contains(&pred_mode) {
+        1
     } else {
-        // Chroma: same rule applied to intraPredModeC. Since we run the
-        // caller-resolved chroma prediction mode here, treat identically.
-        if (6..=14).contains(&pred_mode) {
-            2
-        } else if (22..=30).contains(&pred_mode) {
-            1
-        } else {
-            0
-        }
+        0
     }
 }

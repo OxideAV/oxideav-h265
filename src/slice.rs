@@ -69,6 +69,9 @@ pub struct SliceSegmentHeader {
     pub slice_qp_y: i32,
     /// `slice_loop_filter_across_slices_enabled_flag` (defaults from PPS).
     pub slice_loop_filter_across_slices_enabled_flag: bool,
+    /// `slice_deblocking_filter_disabled_flag` after PPS default + optional
+    /// slice override resolution.
+    pub slice_deblocking_filter_disabled_flag: bool,
     /// Bit position (in the RBSP) where the entropy payload (`slice_data()`)
     /// starts after the final `byte_alignment()`. Valid iff `is_full_i_slice`
     /// or `is_full_p_slice`.
@@ -159,6 +162,7 @@ pub fn parse_slice_segment_header(
     let mut slice_cr_qp_offset: i32 = 0;
     let mut slice_loop_filter_across_slices_enabled_flag =
         pps.pps_loop_filter_across_slices_enabled_flag;
+    let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
     let mut num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
     let mut num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
     let mut mvd_l1_zero_flag = false;
@@ -331,7 +335,6 @@ pub fn parse_slice_segment_header(
             slice_cb_qp_offset = br.se()?;
             slice_cr_qp_offset = br.se()?;
         }
-        let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
         if pps.deblocking_filter_override_enabled_flag {
             let override_flag = br.u1()? == 1;
             if override_flag {
@@ -417,6 +420,7 @@ pub fn parse_slice_segment_header(
         slice_qp_delta,
         slice_qp_y: 26 + pps.init_qp_minus26 + slice_qp_delta,
         slice_loop_filter_across_slices_enabled_flag,
+        slice_deblocking_filter_disabled_flag,
         slice_data_bit_offset,
         is_full_i_slice,
         is_full_p_slice,
@@ -543,6 +547,7 @@ fn partial_header(
         slice_qp_y: 26 + pps.init_qp_minus26,
         slice_loop_filter_across_slices_enabled_flag: pps
             .pps_loop_filter_across_slices_enabled_flag,
+        slice_deblocking_filter_disabled_flag: pps.pps_deblocking_filter_disabled_flag,
         slice_data_bit_offset: 0,
         is_full_i_slice: false,
         is_full_p_slice: false,

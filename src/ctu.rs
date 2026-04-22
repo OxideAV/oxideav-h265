@@ -138,7 +138,7 @@ struct Ctx {
     cu_qp_delta_abs: [CtxState; 2],
     last_sig_x_prefix: [CtxState; 18],
     last_sig_y_prefix: [CtxState; 18],
-    sig_coeff_flag: [CtxState; 42],
+    sig_coeff_flag: [CtxState; 44],
     coeff_abs_gt1: [CtxState; 24],
     coeff_abs_gt2: [CtxState; 6],
     coded_sub_block_flag: [CtxState; 4],
@@ -242,6 +242,12 @@ pub fn decode_slice_ctus(
     }
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
+    }
+    if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
+        return Err(Error::unsupported("h265 SAO filtering pending"));
+    }
+    if !cctx.slice.slice_deblocking_filter_disabled_flag {
+        return Err(Error::unsupported("h265 deblocking filter pending"));
     }
     if cctx.slice.slice_type == SliceType::P && cctx.ref_list_l0.is_empty() {
         return Err(Error::unsupported("h265 P-slice without RPL0"));
@@ -1103,6 +1109,8 @@ impl<'a> Walker<'a> {
             ctx,
             x0,
             y0,
+            x0,
+            y0,
             log2_cb,
             log2_cb,
             0,
@@ -1306,7 +1314,7 @@ impl<'a> Walker<'a> {
             /*pred_mode*/ 0,
             is_luma,
         )?;
-        let qp = self.get_qp(is_luma);
+        let qp = self.get_qp(is_luma, false);
         let mut deq = vec![0i32; n * n];
         dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
         let mut res = vec![0i32; n * n];
@@ -1327,7 +1335,7 @@ impl<'a> Walker<'a> {
         let n = 1usize << log2_tb;
         let mut levels = vec![0i32; n * n];
         self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
-        let qp = self.get_qp(false);
+        let qp = self.get_qp(false, true);
         let mut deq = vec![0i32; n * n];
         dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
         let mut res = vec![0i32; n * n];
@@ -1380,6 +1388,8 @@ impl<'a> Walker<'a> {
         ctx: &mut Ctx,
         x0: u32,
         y0: u32,
+        cu_x0: u32,
+        cu_y0: u32,
         log2_cb: u32,
         log2_tb: u32,
         tr_depth: u32,
@@ -1411,6 +1421,8 @@ impl<'a> Walker<'a> {
                 ctx,
                 x0,
                 y0,
+                cu_x0,
+                cu_y0,
                 log2_cb,
                 log2_tb - 1,
                 tr_depth + 1,
@@ -1423,6 +1435,8 @@ impl<'a> Walker<'a> {
                 ctx,
                 x0 + sub,
                 y0,
+                cu_x0,
+                cu_y0,
                 log2_cb,
                 log2_tb - 1,
                 tr_depth + 1,
@@ -1435,6 +1449,8 @@ impl<'a> Walker<'a> {
                 ctx,
                 x0,
                 y0 + sub,
+                cu_x0,
+                cu_y0,
                 log2_cb,
                 log2_tb - 1,
                 tr_depth + 1,
@@ -1447,6 +1463,8 @@ impl<'a> Walker<'a> {
                 ctx,
                 x0 + sub,
                 y0 + sub,
+                cu_x0,
+                cu_y0,
                 log2_cb,
                 log2_tb - 1,
                 tr_depth + 1,
@@ -1525,11 +1543,12 @@ impl<'a> Walker<'a> {
 
         // Run intra prediction + residual + reconstruct, per plane.
         let luma_mode = if part_mode_nxn {
-            // Pick the luma mode of the PU containing (x0, y0).
+            // Pick the luma mode of the PU containing this TU, relative to
+            // the root NxN intra CU.
             let sub = 1u32 << (log2_cb - 1);
-            let lx = if x0 >= (x0 & !(sub - 1)) + sub { 1 } else { 0 };
-            let ly = if y0 >= (y0 & !(sub - 1)) + sub { 1 } else { 0 };
-            luma_modes[(ly * 2 + lx) as usize]
+            let lx = ((x0 - cu_x0) >= sub) as usize;
+            let ly = ((y0 - cu_y0) >= sub) as usize;
+            luma_modes[ly * 2 + lx]
         } else {
             luma_modes[0]
         };
@@ -1567,7 +1586,7 @@ impl<'a> Walker<'a> {
     ) -> Result<()> {
         let n = 1usize << log2_tb;
         // Build reference samples.
-        let refs = self.gather_refs(x0, y0, n, is_luma, true);
+        let refs = self.gather_refs(x0, y0, n, is_luma, false, true);
         let mut refs = refs;
         // MDIS filter decision for luma.
         if is_luma {
@@ -1591,7 +1610,7 @@ impl<'a> Walker<'a> {
             let mut levels = vec![0i32; n * n];
             self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
             let mut deq = vec![0i32; n * n];
-            let qp = self.get_qp(is_luma);
+            let qp = self.get_qp(is_luma, false);
             dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
             let mut res = vec![0i32; n * n];
             let is_dst = is_luma && log2_tb == 2;
@@ -1626,7 +1645,7 @@ impl<'a> Walker<'a> {
         has_coeff: bool,
     ) -> Result<()> {
         let n = 1usize << log2_tb;
-        let refs = self.gather_refs(x0, y0, n, false, false);
+        let refs = self.gather_refs(x0, y0, n, false, true, false);
         let mut refs = refs;
         // Chroma doesn't get the MDIS filter in 4:2:0 main profile. Leave as-is.
         let _ = &mut refs;
@@ -1636,7 +1655,7 @@ impl<'a> Walker<'a> {
             let mut levels = vec![0i32; n * n];
             self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
             let mut deq = vec![0i32; n * n];
-            let qp = self.get_qp(false);
+            let qp = self.get_qp(false, true);
             dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
             let mut res = vec![0i32; n * n];
             inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
@@ -1649,16 +1668,16 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    fn get_qp(&self, is_luma: bool) -> i32 {
-        // For luma, return cu_qp_y. For chroma, apply the PPS offsets + slice
-        // offsets — simplify to cu_qp_y + pps_cb_qp_offset (we don't decode
-        // slice_cb_qp_offset in the I-slice header yet).
+    fn get_qp(&self, is_luma: bool, is_cr: bool) -> i32 {
         if is_luma {
             *self.cu_qp_y
         } else {
-            // Rough map; §8.6.1 table 8-10 for QpC conversion. Simplification:
-            // for small QP the QpC == QpY; for QpY > 30, QpC < QpY.
-            let qpy_offset = *self.cu_qp_y + self.cctx.pps.pps_cb_qp_offset;
+            let qp_offset = if is_cr {
+                self.cctx.pps.pps_cr_qp_offset + self.cctx.slice.slice_cr_qp_offset
+            } else {
+                self.cctx.pps.pps_cb_qp_offset + self.cctx.slice.slice_cb_qp_offset
+            };
+            let qpy_offset = *self.cu_qp_y + qp_offset;
             let qpy_offset = qpy_offset.clamp(-12, 57);
             qp_y_to_qp_c(qpy_offset)
         }
@@ -1670,6 +1689,7 @@ impl<'a> Walker<'a> {
         y0: u32,
         n: usize,
         is_luma: bool,
+        is_cr: bool,
         _top_left_only: bool,
     ) -> Vec<u8> {
         let len = 4 * n + 1;
@@ -1682,6 +1702,13 @@ impl<'a> Walker<'a> {
                 self.pic.width as usize,
                 self.pic.height as usize,
             )
+        } else if is_cr {
+            (
+                self.pic.chroma_stride,
+                &self.pic.cr,
+                (self.pic.width as usize) / 2,
+                (self.pic.height as usize) / 2,
+            )
         } else {
             (
                 self.pic.chroma_stride,
@@ -1690,8 +1717,6 @@ impl<'a> Walker<'a> {
                 (self.pic.height as usize) / 2,
             )
         };
-        // Note: for chroma_cr we use Cr plane via a helper variant. Here we
-        // read from Cb as a stand-in — caller handles Cr separately below.
         let x0 = x0 as usize;
         let y0 = y0 as usize;
 
@@ -1820,7 +1845,8 @@ impl<'a> Walker<'a> {
         let scan = scan_4x4(scan_idx);
 
         // last_sig_coeff_x/y_{prefix, suffix} (§9.3.4.2.7, 9.3.4.2.8).
-        let (last_x, last_y) = self.decode_last_sig_pos(engine, ctx, log2_tb, is_luma)?;
+        let (last_x, last_y) =
+            self.decode_last_sig_pos(engine, ctx, log2_tb, scan_idx, is_luma)?;
         // Translate (last_x, last_y) into the (scan_idx)-ordered 4x4 sub-block
         // grid coordinate.
         let (last_sx, last_sy) = subblock_coord(last_x, last_y);
@@ -1849,6 +1875,8 @@ impl<'a> Walker<'a> {
         // Significance map for sub-blocks (tracks coded_sub_block_flag).
         let mut sb_cbf = vec![false; num_sb * num_sb];
         sb_cbf[last_sy * num_sb + last_sx] = true; // Always set at last-sig pos.
+        let mut prev_greater1_ctx = 1u8;
+        let mut prev_greater1_flag = false;
 
         // For each sub-block in reverse scan order starting at last_sb_idx.
         for i in (0..=last_sb_idx).rev() {
@@ -1875,6 +1903,7 @@ impl<'a> Walker<'a> {
             if !coded {
                 continue;
             }
+            let infer_sb_dc_sig_coeff_flag = !is_last_sb && !is_first_sb;
             // Decode sig_coeff_flag for each position in this sub-block in
             // reverse scan order, starting at last_coef_in_sb for the first SB
             // we enter and 15 for subsequent.
@@ -1883,111 +1912,159 @@ impl<'a> Walker<'a> {
             if is_last_sb {
                 sig_flags[last_coef_in_sb] = true;
             }
-            let mut inferred_dc = false;
             for j in (0..=start).rev() {
-                if is_last_sb && j == last_coef_in_sb {
-                    continue;
-                }
-                // First sub-block: at DC (pos 0) sig_coeff_flag is inferred
-                // to 1 only if no other coeff in the sub-block is significant
-                // (and coeff != last). For simplicity we always decode it
-                // when not at last position; the reference behaviour matches
-                // as long as we do not read the bit for j=0 in a first SB
-                // when no earlier sig_flag was seen. The spec's logic boils
-                // down to: "if (xC, yC) != (0,0) OR no prior sig in this SB".
                 let (cx, cy) = scan[j];
-                let at_dc = is_first_sb && cx == 0 && cy == 0;
-                if at_dc {
-                    // Infer from whether any later position in this SB is sig.
-                    let any_later = sig_flags[j + 1..=15].iter().any(|&f| f);
-                    if any_later {
-                        sig_flags[j] = true;
-                    } else {
-                        sig_flags[j] = true;
-                        inferred_dc = true;
-                    }
+                let at_dc = cx == 0 && cy == 0;
+                if (is_last_sb && j == last_coef_in_sb) || (infer_sb_dc_sig_coeff_flag && at_dc) {
                     continue;
                 }
                 let ctx_inc = sig_coeff_ctx_inc(
-                    log2_tb, scan_idx, cx as u32, cy as u32, sx as u32, sy as u32, is_luma,
+                    log2_tb,
+                    scan_idx,
+                    cx as u32,
+                    cy as u32,
+                    sx as u32,
+                    sy as u32,
+                    sx + 1 < num_sb && sb_cbf[sy * num_sb + sx + 1],
+                    sy + 1 < num_sb && sb_cbf[(sy + 1) * num_sb + sx],
+                    is_luma,
                 );
                 let v = engine.decode_bin(&mut ctx.sig_coeff_flag[ctx_inc]);
                 sig_flags[j] = v == 1;
             }
-            let _ = inferred_dc;
-            // coeff_abs_level_greater1_flag / greater2_flag + signs + remaining.
-            // Collect positions with sig_coeff_flag=1 in the order they appear
-            // in reverse scan.
-            let mut sig_positions = Vec::with_capacity(16);
-            for j in (0..=start).rev() {
-                if sig_flags[j] {
-                    sig_positions.push(j);
+            if infer_sb_dc_sig_coeff_flag && !sig_flags[1..].iter().any(|&f| f) {
+                sig_flags[0] = true;
+            }
+            // coeff_abs_level_greater1_flag / greater2_flag / sign / remaining.
+            let mut greater1_flags = [false; 16];
+            let mut greater2_flags = [false; 16];
+            let mut first_sig_scan_pos = 16i32;
+            let mut last_sig_scan_pos = -1i32;
+            let mut num_greater1_flag = 0u32;
+            let mut last_greater1_scan_pos = -1i32;
+            let mut ctx_set = if i == 0 || !is_luma { 0u8 } else { 2u8 };
+            let mut greater1_ctx = 1u8;
+            let mut last_used_greater1_flag = false;
+            if i != last_sb_idx {
+                let mut last_greater1_ctx = prev_greater1_ctx;
+                if last_greater1_ctx > 0 {
+                    if prev_greater1_flag {
+                        last_greater1_ctx = 0;
+                    } else {
+                        last_greater1_ctx = last_greater1_ctx.saturating_add(1);
+                    }
+                }
+                if last_greater1_ctx == 0 {
+                    ctx_set = ctx_set.saturating_add(1);
+                }
+                greater1_ctx = 1;
+            }
+            for pos in (0..16).rev() {
+                if !sig_flags[pos] {
+                    continue;
+                }
+                if num_greater1_flag < 8 {
+                    let mut ctx_inc = (ctx_set as usize * 4) + usize::min(3, greater1_ctx as usize);
+                    if !is_luma {
+                        ctx_inc += 16;
+                    }
+                    let v = engine.decode_bin(&mut ctx.coeff_abs_gt1[ctx_inc]);
+                    greater1_flags[pos] = v == 1;
+                    last_used_greater1_flag = greater1_flags[pos];
+                    num_greater1_flag += 1;
+                    if greater1_flags[pos] {
+                        if last_greater1_scan_pos == -1 {
+                            last_greater1_scan_pos = pos as i32;
+                        }
+                    }
+                    if greater1_ctx > 0 {
+                        if greater1_flags[pos] {
+                            greater1_ctx = 0;
+                        } else {
+                            greater1_ctx = greater1_ctx.saturating_add(1);
+                        }
+                    }
+                }
+                if last_sig_scan_pos == -1 {
+                    last_sig_scan_pos = pos as i32;
+                }
+                first_sig_scan_pos = pos as i32;
+            }
+            prev_greater1_ctx = greater1_ctx;
+            prev_greater1_flag = last_used_greater1_flag;
+            if last_greater1_scan_pos != -1 {
+                let mut ctx_inc = ctx_set as usize;
+                if !is_luma {
+                    ctx_inc += 4;
+                }
+                greater2_flags[last_greater1_scan_pos as usize] =
+                    engine.decode_bin(&mut ctx.coeff_abs_gt2[ctx_inc]) == 1;
+            }
+            let sign_hidden = self.cctx.pps.sign_data_hiding_enabled_flag
+                && (last_sig_scan_pos - first_sig_scan_pos > 3);
+            let mut sign_flags = [false; 16];
+            for pos in (0..16).rev() {
+                if !sig_flags[pos] {
+                    continue;
+                }
+                if !sign_hidden || pos as i32 != first_sig_scan_pos {
+                    sign_flags[pos] = engine.decode_bypass() == 1;
                 }
             }
-            // Decode up to 8 greater1_flag values.
-            let mut gt1_flags = vec![false; sig_positions.len()];
-            let mut gt2_idx: Option<usize> = None;
-            let mut gt1_counter = 0u32;
-            let mut gt1_ctx_set = 0; // simplified to fixed 0 here
-            let _ = &mut gt1_ctx_set;
-            let mut gt1_budget = 8;
-            for (k, _) in sig_positions.iter().enumerate() {
-                if gt1_budget == 0 {
-                    break;
+            let mut num_sig_coeff = 0u32;
+            let mut sum_abs_level = 0u32;
+            let mut coeff_rem_seen = false;
+            let mut last_abs_level = 0u32;
+            let mut last_rice_param = 0u32;
+            for pos in (0..16).rev() {
+                if !sig_flags[pos] {
+                    continue;
                 }
-                gt1_budget -= 1;
-                let ctx_inc = 0; // simplified; full derivation requires previous-gt1 tracking.
-                let v = engine.decode_bin(&mut ctx.coeff_abs_gt1[ctx_inc]);
-                gt1_flags[k] = v == 1;
-                if v == 1 && gt2_idx.is_none() {
-                    gt2_idx = Some(k);
-                }
-                gt1_counter += v;
-            }
-            let _ = gt1_counter;
-            // coeff_abs_level_greater2_flag for at most one position.
-            let mut gt2 = false;
-            if let Some(k) = gt2_idx {
-                let ctx_inc = 0; // simplified
-                gt2 = engine.decode_bin(&mut ctx.coeff_abs_gt2[ctx_inc]) == 1;
-                let _ = k;
-            }
-            // Sign flags: one bypass bit per significant coefficient.
-            let mut signs = vec![false; sig_positions.len()];
-            for sign in signs.iter_mut() {
-                *sign = engine.decode_bypass() == 1;
-            }
-            // Remaining abs levels via TR/EG rice coding. We simplify with
-            // rice_param = 0 and a TR cMax derived from the gt1/gt2 state.
-            let mut rice_param = 0u32;
-            for (k, &pos) in sig_positions.iter().enumerate() {
-                let mut base_level: i32 = 1;
-                if gt1_flags[k] {
-                    base_level = 2;
-                }
-                if Some(k) == gt2_idx && gt2 {
-                    base_level = 3;
-                }
-                // Whether to read the remainder — spec: when k < 8 and not
-                // gt1, no remainder; when gt1 is set and k < gt2_budget, read
-                // only if gt2 is set; for k >= 8 always read.
-                let read_remainder =
-                    (k == gt2_idx.unwrap_or(usize::MAX) && gt2) || (k >= 8 && gt1_flags[k]);
-                let remainder = if read_remainder {
-                    decode_coeff_remainder(engine, rice_param)?
+                let base_level = 1u32
+                    + u32::from(greater1_flags[pos])
+                    + u32::from(greater2_flags[pos]);
+                let threshold = if num_sig_coeff < 8 {
+                    if pos as i32 == last_greater1_scan_pos {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                };
+                let remainder = if base_level == threshold {
+                    let rice_param = if coeff_rem_seen {
+                        (last_rice_param
+                            + u32::from(last_abs_level > (3 * (1u32 << last_rice_param))))
+                        .min(4)
+                    } else {
+                        0
+                    };
+                    let rem = decode_coeff_remainder(engine, rice_param)?;
+                    coeff_rem_seen = true;
+                    last_abs_level = base_level + rem;
+                    last_rice_param = rice_param;
+                    rem
                 } else {
                     0
                 };
-                let abs_val = base_level + remainder as i32;
-                let level = if signs[k] { -abs_val } else { abs_val };
+                let abs_level = base_level + remainder;
+                if sign_hidden {
+                    sum_abs_level += abs_level;
+                    if pos as i32 == first_sig_scan_pos && (sum_abs_level & 1) == 1 {
+                        sign_flags[pos] = !sign_flags[pos];
+                    }
+                }
+                let level = if sign_flags[pos] {
+                    -(abs_level as i32)
+                } else {
+                    abs_level as i32
+                };
                 let (cx, cy) = scan[pos];
                 let gx = sx * 4 + cx as usize;
                 let gy = sy * 4 + cy as usize;
                 levels[gy * n + gx] = level;
-                // Adaptive rice_param update (§9.3.4.2.9).
-                if (abs_val as u32) > (3u32 << rice_param) {
-                    rice_param = (rice_param + 1).min(4);
-                }
+                num_sig_coeff += 1;
             }
         }
         // Seed the last-sig position's coefficient value if we didn't cover it
@@ -2003,32 +2080,14 @@ impl<'a> Walker<'a> {
         engine: &mut CabacEngine<'_>,
         ctx: &mut Ctx,
         log2_tb: u32,
+        scan_idx: u32,
         is_luma: bool,
     ) -> Result<(usize, usize)> {
-        // §9.3.4.2.7.
-        let (ctx_base_x, ctx_base_y) = last_sig_ctx_base(log2_tb, is_luma);
-        let (_ctx_shift_x, _ctx_shift_y) = last_sig_ctx_shift(log2_tb);
-        let decode_prefix = |engine: &mut CabacEngine<'_>,
-                             contexts: &mut [CtxState; 18],
-                             base: usize|
-         -> Result<u32> {
-            let max_prefix = (log2_tb << 1).saturating_sub(1);
-            let mut prefix = 0u32;
-            while prefix < max_prefix {
-                let ctx_inc = base + last_sig_prefix_ctx_inc(prefix, log2_tb, is_luma);
-                if ctx_inc >= contexts.len() {
-                    return Err(Error::invalid("h265 last_sig prefix ctx overflow"));
-                }
-                let v = engine.decode_bin(&mut contexts[ctx_inc]);
-                if v == 0 {
-                    break;
-                }
-                prefix += 1;
-            }
-            Ok(prefix)
-        };
-        let prefix_x = decode_prefix(engine, &mut ctx.last_sig_x_prefix, ctx_base_x)?;
-        let prefix_y = decode_prefix(engine, &mut ctx.last_sig_y_prefix, ctx_base_y)?;
+        // §9.3.4.2.3 / §7.4.9.11.
+        let prefix_x =
+            decode_last_sig_prefix(engine, &mut ctx.last_sig_x_prefix, log2_tb, is_luma)?;
+        let prefix_y =
+            decode_last_sig_prefix(engine, &mut ctx.last_sig_y_prefix, log2_tb, is_luma)?;
         let last_x = if prefix_x > 3 {
             let k = (prefix_x - 2) >> 1;
             let mut suf = 0u32;
@@ -2049,12 +2108,12 @@ impl<'a> Walker<'a> {
         } else {
             prefix_y
         };
-        Ok((last_x as usize, last_y as usize))
+        if scan_idx == 2 {
+            Ok((last_y as usize, last_x as usize))
+        } else {
+            Ok((last_x as usize, last_y as usize))
+        }
     }
-}
-
-fn last_sig_ctx_base(_log2_tb: u32, _is_luma: bool) -> (usize, usize) {
-    (0, 0)
 }
 
 /// Truncated-rice merge_idx decode (§9.3.4.2.10). Values 0..MaxNumMergeCand-1.
@@ -2166,33 +2225,37 @@ fn decode_eg1(engine: &mut CabacEngine<'_>) -> Result<u32> {
 /// §9.3.4.2.3 last_sig_coeff prefix context increment.
 /// Returns a value in 0..18 safe for the 18-entry context array.
 fn last_sig_prefix_ctx_inc(prefix: u32, log2_tb: u32, is_luma: bool) -> usize {
-    // Clamp to table size 18.
-    let shift = if is_luma {
-        ((log2_tb + 1) >> 2).max(1)
+    let (ctx_offset, ctx_shift) = if is_luma {
+        (
+            3 * (log2_tb.saturating_sub(2)) + ((log2_tb.saturating_sub(1)) >> 2),
+            (log2_tb + 1) >> 2,
+        )
     } else {
-        (log2_tb + 1) >> 2
+        (15, log2_tb.saturating_sub(2))
     };
-    let shift = shift.max(1);
-    let base: u32 = if is_luma {
-        // Luma uses offset = (log2_tb*3 + ((log2_tb+1)>>2)) / 4 scaled...
-        // but to stay within 18 we divide the raw offset into a small
-        // tabulated set.
-        match log2_tb {
-            2 => 0,
-            3 => 3,
-            4 => 6,
-            5 => 10,
-            _ => 0,
-        }
-    } else {
-        15
-    };
-    ((base + (prefix >> shift)) as usize).min(17)
+    (ctx_offset + (prefix >> ctx_shift)) as usize
 }
 
-fn last_sig_ctx_shift(log2_tb: u32) -> (u32, u32) {
-    let sh = (log2_tb + 1) >> 2;
-    (sh, sh)
+fn decode_last_sig_prefix(
+    engine: &mut CabacEngine<'_>,
+    contexts: &mut [CtxState; 18],
+    log2_tb: u32,
+    is_luma: bool,
+) -> Result<u32> {
+    let max_prefix = (log2_tb << 1).saturating_sub(1);
+    let mut prefix = 0u32;
+    while prefix < max_prefix {
+        let ctx_inc = last_sig_prefix_ctx_inc(prefix, log2_tb, is_luma);
+        if ctx_inc >= contexts.len() {
+            return Err(Error::invalid("h265 last_sig prefix ctx overflow"));
+        }
+        let v = engine.decode_bin(&mut contexts[ctx_inc]);
+        if v == 0 {
+            break;
+        }
+        prefix += 1;
+    }
+    Ok(prefix)
 }
 
 /// Map a coefficient coordinate to the enclosing 4×4 sub-block coordinate.
@@ -2245,55 +2308,108 @@ fn subblock_scan(scan_idx: u32, log2_tb: u32) -> Vec<(u8, u8)> {
 }
 
 fn sig_coeff_ctx_inc(
-    _log2_tb: u32,
-    _scan_idx: u32,
+    log2_tb: u32,
+    scan_idx: u32,
     cx: u32,
     cy: u32,
-    _sx: u32,
-    _sy: u32,
+    sx: u32,
+    sy: u32,
+    right_coded: bool,
+    below_coded: bool,
     is_luma: bool,
 ) -> usize {
-    // Simplified derivation: map (cx, cy) within the 4x4 sub-block to one of
-    // the 12 luma / 4 chroma context bins. Using a diagonal-distance heuristic
-    // that correlates with the spec's ctxIdxMap (§9.3.4.2.5 Table 9-45).
-    let base = if is_luma { 0 } else { 27 };
-    let d = (cx + cy) as usize;
-    // Indices 0..12 for luma, 27..33 for chroma.
-    let bin = match d {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        _ => 5,
+    const CTX_IDX_MAP_4X4: [usize; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+    let abs_x = (sx << 2) + cx;
+    let abs_y = (sy << 2) + cy;
+    let mut sig_ctx = if log2_tb == 2 {
+        CTX_IDX_MAP_4X4[((cy << 2) | cx) as usize]
+    } else if abs_x + abs_y == 0 {
+        0
+    } else {
+        let prev_csbf = usize::from(right_coded) + (usize::from(below_coded) << 1);
+        let x_p = (cx & 3) as usize;
+        let y_p = (cy & 3) as usize;
+        match prev_csbf {
+            0 => {
+                if x_p + y_p == 0 {
+                    2
+                } else if x_p + y_p < 3 {
+                    1
+                } else {
+                    0
+                }
+            }
+            1 => {
+                if y_p == 0 {
+                    2
+                } else if y_p == 1 {
+                    1
+                } else {
+                    0
+                }
+            }
+            2 => {
+                if x_p == 0 {
+                    2
+                } else if x_p == 1 {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 2,
+        }
     };
-    (base + bin).min(if is_luma { 26 } else { 41 })
+    if is_luma {
+        if sx + sy > 0 {
+            sig_ctx += 3;
+        }
+        if log2_tb == 3 {
+            sig_ctx += if scan_idx == 0 { 9 } else { 15 };
+        } else {
+            sig_ctx += 21;
+        }
+    } else {
+        if log2_tb == 3 {
+            sig_ctx += 9;
+        } else {
+            sig_ctx += 12;
+        }
+    }
+    if is_luma { sig_ctx } else { 27 + sig_ctx }
 }
 
 fn decode_coeff_remainder(engine: &mut CabacEngine<'_>, rice: u32) -> Result<u32> {
-    // Truncated rice + EG0 tail.
+    let c_max = 4u32 << rice;
+    let prefix_cap = c_max >> rice; // Always 4 for coeff_abs_level_remaining.
+    let mut prefix = 0u32;
+    while prefix < prefix_cap && engine.decode_bypass() == 1 {
+        prefix += 1;
+    }
+    if prefix < prefix_cap {
+        let mut suffix = 0u32;
+        for _ in 0..rice {
+            suffix = (suffix << 1) | engine.decode_bypass();
+        }
+        Ok((prefix << rice) + suffix)
+    } else {
+        Ok(c_max + decode_egk_bypass(engine, rice + 1)?)
+    }
+}
+
+fn decode_egk_bypass(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32> {
     let mut prefix = 0u32;
     while engine.decode_bypass() == 1 {
         prefix += 1;
         if prefix > 32 {
-            return Err(Error::invalid("h265 rice prefix overflow"));
+            return Err(Error::invalid("h265 EGk prefix overflow"));
         }
     }
-    if prefix < 3 {
-        let mut suf = 0u32;
-        for _ in 0..rice {
-            suf = (suf << 1) | engine.decode_bypass();
-        }
-        Ok((prefix << rice) + suf)
-    } else {
-        let eg_prefix = prefix - 3;
-        let k = rice + eg_prefix + 1;
-        let mut suf = 0u32;
-        for _ in 0..k {
-            suf = (suf << 1) | engine.decode_bypass();
-        }
-        Ok(((1u32 << (eg_prefix + 1)) + 2) * (1u32 << rice) + suf)
+    let mut suffix = 0u32;
+    for _ in 0..(prefix + k) {
+        suffix = (suffix << 1) | engine.decode_bypass();
     }
+    Ok((((1u32 << prefix) - 1) << k) + suffix)
 }
 
 fn qp_y_to_qp_c(qp_y: i32) -> i32 {

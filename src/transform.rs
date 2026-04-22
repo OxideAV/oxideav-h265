@@ -70,15 +70,14 @@ pub const DST_MATRIX: [[i16; 4]; 4] = [
 /// as one 32-column row per basis vector).
 fn apply_transform_1d(src: &[i32], dst: &mut [i32], n: usize, shift: i32, is_dst: bool) {
     let round = 1i32 << (shift - 1);
+    let step = 1usize << (5 - n.ilog2());
     for i in 0..n {
         let mut sum: i32 = 0;
         for j in 0..n {
             let coef = if is_dst {
-                DST_MATRIX[j][i] as i32
+                DST_MATRIX[i][j] as i32
             } else {
-                // For DCT-II the standard uses the transposed matrix in the
-                // inverse direction — `TRANSFORM_MATRIX[j][i]`.
-                TRANSFORM_MATRIX[j][i] as i32
+                TRANSFORM_MATRIX[i][j * step] as i32
             };
             sum += coef * src[j];
         }
@@ -160,20 +159,18 @@ pub fn dequantize_flat(
     let q_rem = qp.rem_euclid(6) as usize;
     let scale = LEVEL_SCALE[q_rem];
 
-    // shift = bit_depth + log2_tb - 5
-    let shift = bit_depth as i32 + log2_tb as i32 - 5;
-    // Final shift: (shift - q_div) — negative means left-shift.
-    let shift_final = shift - q_div;
+    // §8.6.3 eq. (8-309): with scaling lists disabled, m[x][y] = 16 and
+    // bdShift = bitDepth + log2(nTbS) + 10 - log2TransformRange.
+    let bd_shift = bit_depth as i32 + log2_tb as i32 - 5;
 
     for i in 0..n * n {
         let lvl = coeffs_in[i];
-        let mut v = lvl * scale;
-        if shift_final > 0 {
-            let round = 1i32 << (shift_final - 1);
-            v = (v + round) >> shift_final;
-        } else {
-            v <<= -shift_final;
+        let mut v = lvl * 16 * scale;
+        if q_div > 0 {
+            v <<= q_div;
         }
+        let round = 1i32 << (bd_shift - 1);
+        v = (v + round) >> bd_shift;
         coeffs_out[i] = v.clamp(-32768, 32767);
     }
 }
