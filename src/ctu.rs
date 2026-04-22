@@ -243,9 +243,9 @@ pub fn decode_slice_ctus(
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
     }
-    if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
-        return Err(Error::unsupported("h265 SAO filtering pending"));
-    }
+    // Note: SAO syntax is parsed per-CTU (see decode_sao), but applying SAO
+    // to reconstructed samples is deferred. Streams with SAO decode without
+    // the in-loop filter effect — lower-fidelity but functional.
     if !cctx.slice.slice_deblocking_filter_disabled_flag {
         return Err(Error::unsupported("h265 deblocking filter pending"));
     }
@@ -324,9 +324,9 @@ impl<'a> Walker<'a> {
         ctx_x: u32,
         ctx_y: u32,
     ) -> Result<()> {
-        // SAO merge-left / merge-up + sao_type_idx + offsets. We parse the
-        // syntax but discard the values — applying SAO post-decode is
-        // deferred (see README).
+        // §7.3.8.3 sao() + §9.3.4.2.1 context derivation. The bits are parsed
+        // but values are discarded; actually applying SAO to reconstructed
+        // samples is pending.
         let mut merge_left = 0u32;
         let mut merge_up = 0u32;
         if ctx_x > 0 {
@@ -338,51 +338,60 @@ impl<'a> Walker<'a> {
         if merge_left == 1 || merge_up == 1 {
             return Ok(());
         }
+        // sao_offset_abs is TR with cMax = (1 << (Min(bitDepth, 10) - 5)) - 1,
+        // which is 7 for 8-bit. cRiceParam = 0 → unary up to 7 ones then stop.
+        let abs_cmax: u32 = 7;
+        // sao_type_idx is shared across Cb and Cr; Cr inherits it.
+        let mut chroma_type_idx: u32 = 0;
         for comp in 0..3 {
             if (comp == 0 && !self.cctx.slice.slice_sao_luma_flag)
                 || (comp > 0 && !self.cctx.slice.slice_sao_chroma_flag)
             {
                 continue;
             }
-            // sao_type_idx_{luma,chroma}
-            let type_idx = if comp != 2 {
+            let type_idx = if comp == 2 {
+                chroma_type_idx
+            } else {
                 let t0 = engine.decode_bin(&mut ctx.sao_type_idx[0]);
-                if t0 == 0 {
+                let t = if t0 == 0 {
                     0
+                } else if engine.decode_bypass() == 0 {
+                    1
                 } else {
-                    let t1 = engine.decode_bypass();
-                    if t1 == 0 {
-                        1
-                    } else {
-                        2
+                    2
+                };
+                if comp == 1 {
+                    chroma_type_idx = t;
+                }
+                t
+            };
+            if type_idx == 0 {
+                continue;
+            }
+            // sao_offset_abs[i] for i in 0..4 — TR, cMax = 7.
+            let mut offset_abs = [0u32; 4];
+            for o in offset_abs.iter_mut() {
+                let mut cnt = 0u32;
+                while cnt < abs_cmax && engine.decode_bypass() == 1 {
+                    cnt += 1;
+                }
+                *o = cnt;
+            }
+            if type_idx == 1 {
+                // Band offset: sign flag for each non-zero offset, then 5-bit
+                // sao_band_position.
+                for &abs in &offset_abs {
+                    if abs != 0 {
+                        let _sign = engine.decode_bypass();
                     }
+                }
+                for _ in 0..5 {
+                    let _ = engine.decode_bypass();
                 }
             } else {
-                // For cr, type_idx is inherited from cb (signalled once).
-                0
-            };
-            if type_idx != 0 {
-                // sao_offset_abs[i] for i in 0..4 (TRC bypass, max 31)
-                for _ in 0..4 {
-                    let mut cnt = 0u32;
-                    while cnt < 31 && engine.decode_bypass() == 1 {
-                        cnt += 1;
-                    }
-                    let _ = cnt;
-                }
-                if type_idx == 1 {
-                    // BO
-                    for _ in 0..4 {
-                        // sign flag
-                        let _ = engine.decode_bypass();
-                    }
-                    // sao_band_position (5 bits)
-                    for _ in 0..5 {
-                        let _ = engine.decode_bypass();
-                    }
-                }
-                if comp != 2 && type_idx == 2 {
-                    // EO: sao_eo_class 2 bits
+                // Edge offset: sao_eo_class (2 bits) only for luma + Cb; Cr
+                // inherits Cb's class.
+                if comp != 2 {
                     for _ in 0..2 {
                         let _ = engine.decode_bypass();
                     }
@@ -1417,60 +1426,20 @@ impl<'a> Walker<'a> {
         if split == 1 {
             let sub = 1u32 << (log2_tb - 1);
             self.transform_tree(
-                engine,
-                ctx,
-                x0,
-                y0,
-                cu_x0,
-                cu_y0,
-                log2_cb,
-                log2_tb - 1,
-                tr_depth + 1,
-                luma_modes,
-                chroma_mode,
-                part_mode_nxn,
+                engine, ctx, x0, y0, cu_x0, cu_y0, log2_cb, log2_tb - 1,
+                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine,
-                ctx,
-                x0 + sub,
-                y0,
-                cu_x0,
-                cu_y0,
-                log2_cb,
-                log2_tb - 1,
-                tr_depth + 1,
-                luma_modes,
-                chroma_mode,
-                part_mode_nxn,
+                engine, ctx, x0 + sub, y0, cu_x0, cu_y0, log2_cb, log2_tb - 1,
+                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine,
-                ctx,
-                x0,
-                y0 + sub,
-                cu_x0,
-                cu_y0,
-                log2_cb,
-                log2_tb - 1,
-                tr_depth + 1,
-                luma_modes,
-                chroma_mode,
-                part_mode_nxn,
+                engine, ctx, x0, y0 + sub, cu_x0, cu_y0, log2_cb, log2_tb - 1,
+                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
             )?;
             self.transform_tree(
-                engine,
-                ctx,
-                x0 + sub,
-                y0 + sub,
-                cu_x0,
-                cu_y0,
-                log2_cb,
-                log2_tb - 1,
-                tr_depth + 1,
-                luma_modes,
-                chroma_mode,
-                part_mode_nxn,
+                engine, ctx, x0 + sub, y0 + sub, cu_x0, cu_y0, log2_cb, log2_tb - 1,
+                tr_depth + 1, luma_modes, chroma_mode, part_mode_nxn,
             )?;
             return Ok(());
         }
@@ -1481,9 +1450,6 @@ impl<'a> Walker<'a> {
         let mut cbf_cb = 0u32;
         let mut cbf_cr = 0u32;
         let chroma_log2 = if log2_tb == self.min_tb_log2 {
-            // Chroma is missing at this TB level; inherit from parent — we
-            // mirror that by skipping chroma residual and using predicted.
-            // In practice for min_tb_log2 == 2, the parent TU carries chroma.
             0
         } else {
             log2_tb - 1
@@ -1556,19 +1522,21 @@ impl<'a> Walker<'a> {
         self.reconstruct_plane(engine, ctx, x0, y0, log2_tb, luma_mode, true, cbf_luma != 0)?;
 
         if chroma_present {
-            let cx = x0 / 2;
-            let cy = y0 / 2;
+            let chroma_x = x0 / 2;
+            let chroma_y = y0 / 2;
             self.reconstruct_plane(
                 engine,
                 ctx,
-                cx,
-                cy,
+                chroma_x,
+                chroma_y,
                 chroma_log2,
                 chroma_mode,
                 false,
                 cbf_cb != 0,
             )?;
-            self.reconstruct_plane_cr(engine, ctx, cx, cy, chroma_log2, chroma_mode, cbf_cr != 0)?;
+            self.reconstruct_plane_cr(
+                engine, ctx, chroma_x, chroma_y, chroma_log2, chroma_mode, cbf_cr != 0,
+            )?;
         }
         Ok(())
     }
@@ -1903,19 +1871,25 @@ impl<'a> Walker<'a> {
             if !coded {
                 continue;
             }
-            let infer_sb_dc_sig_coeff_flag = !is_last_sb && !is_first_sb;
-            // Decode sig_coeff_flag for each position in this sub-block in
-            // reverse scan order, starting at last_coef_in_sb for the first SB
-            // we enter and 15 for subsequent.
+            // Per §7.4.9.11: for a middle sub-block, start with
+            // inferSbDcSigCoeffFlag=1. Any decoded sig_coeff_flag==1 during
+            // the reverse-scan loop clears it; if it is still 1 when we reach
+            // the DC position (n==0) we skip the read and infer the DC flag
+            // to 1. First/last sub-blocks never skip DC.
             let start = if is_last_sb { last_coef_in_sb } else { 15 };
             let mut sig_flags = [false; 16];
             if is_last_sb {
                 sig_flags[last_coef_in_sb] = true;
             }
+            let middle_sb = !is_last_sb && !is_first_sb;
+            let mut infer_dc = middle_sb;
             for j in (0..=start).rev() {
+                if is_last_sb && j == last_coef_in_sb {
+                    continue;
+                }
                 let (cx, cy) = scan[j];
                 let at_dc = cx == 0 && cy == 0;
-                if (is_last_sb && j == last_coef_in_sb) || (infer_sb_dc_sig_coeff_flag && at_dc) {
+                if at_dc && infer_dc {
                     continue;
                 }
                 let ctx_inc = sig_coeff_ctx_inc(
@@ -1931,8 +1905,11 @@ impl<'a> Walker<'a> {
                 );
                 let v = engine.decode_bin(&mut ctx.sig_coeff_flag[ctx_inc]);
                 sig_flags[j] = v == 1;
+                if v == 1 {
+                    infer_dc = false;
+                }
             }
-            if infer_sb_dc_sig_coeff_flag && !sig_flags[1..].iter().any(|&f| f) {
+            if middle_sb && infer_dc {
                 sig_flags[0] = true;
             }
             // coeff_abs_level_greater1_flag / greater2_flag / sign / remaining.
@@ -2292,11 +2269,12 @@ fn subblock_scan(scan_idx: u32, log2_tb: u32) -> Vec<(u8, u8)> {
             v
         }
         _ => {
-            // Up-right diagonal.
+            // Up-right diagonal (§6.5.3): along each anti-diagonal, walk from
+            // (0, d) down to (d, 0) — y decreasing, x increasing.
             let mut v = Vec::with_capacity(sb * sb);
             for d in 0..(2 * sb - 1) {
-                for y in 0..=d {
-                    let x = d - y;
+                for x in 0..=d {
+                    let y = d - x;
                     if x < sb && y < sb {
                         v.push((x as u8, y as u8));
                     }
@@ -2319,11 +2297,15 @@ fn sig_coeff_ctx_inc(
     is_luma: bool,
 ) -> usize {
     const CTX_IDX_MAP_4X4: [usize; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+    // §9.3.4.2.5 eq. 9-41: the 4×4 branch returns ctxIdxMap[] directly and
+    // skips the subblock / size modifiers applied to the larger-TB cases.
+    if log2_tb == 2 {
+        let sig_ctx = CTX_IDX_MAP_4X4[((cy << 2) | cx) as usize];
+        return if is_luma { sig_ctx } else { 27 + sig_ctx };
+    }
     let abs_x = (sx << 2) + cx;
     let abs_y = (sy << 2) + cy;
-    let mut sig_ctx = if log2_tb == 2 {
-        CTX_IDX_MAP_4X4[((cy << 2) | cx) as usize]
-    } else if abs_x + abs_y == 0 {
+    let mut sig_ctx = if abs_x + abs_y == 0 {
         0
     } else {
         let prev_csbf = usize::from(right_coded) + (usize::from(below_coded) << 1);
@@ -2369,12 +2351,10 @@ fn sig_coeff_ctx_inc(
         } else {
             sig_ctx += 21;
         }
+    } else if log2_tb == 3 {
+        sig_ctx += 9;
     } else {
-        if log2_tb == 3 {
-            sig_ctx += 9;
-        } else {
-            sig_ctx += 12;
-        }
+        sig_ctx += 12;
     }
     if is_luma { sig_ctx } else { 27 + sig_ctx }
 }

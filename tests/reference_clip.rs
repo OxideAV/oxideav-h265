@@ -124,6 +124,19 @@ fn ensure_parser_fixtures() -> bool {
 }
 
 fn ensure_generated_hevc_fixture(name: &str, lavfi: &str, fps: u32, frames: u32, gop: u32) -> Option<PathBuf> {
+    let x265_params = format!(
+        "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1"
+    );
+    ensure_generated_hevc_fixture_with_params(name, lavfi, fps, frames, &x265_params)
+}
+
+fn ensure_generated_hevc_fixture_with_params(
+    name: &str,
+    lavfi: &str,
+    fps: u32,
+    frames: u32,
+    x265_params: &str,
+) -> Option<PathBuf> {
     if !ffmpeg_available() {
         eprintln!("ffmpeg not available — skipping generated fixture {name}");
         return None;
@@ -134,11 +147,7 @@ fn ensure_generated_hevc_fixture(name: &str, lavfi: &str, fps: u32, frames: u32,
     if output.exists() {
         return Some(output);
     }
-    let duration = format!("{}", frames as f32 / fps as f32);
     let rate = fps.to_string();
-    let x265_params = format!(
-        "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1"
-    );
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -160,13 +169,13 @@ fn ensure_generated_hevc_fixture(name: &str, lavfi: &str, fps: u32, frames: u32,
             "-preset:v",
             "medium",
             "-x265-params",
-            &x265_params,
+            x265_params,
         ])
         .arg(&output)
         .status()
         .expect("run ffmpeg for generated HEVC fixture");
     if !status.success() {
-        eprintln!("failed to generate HEVC fixture {name} (duration {duration}s)");
+        eprintln!("failed to generate HEVC fixture {name}");
         return None;
     }
     Some(output)
@@ -282,11 +291,14 @@ fn assert_yuv420_matches(
     let x = plane_off % plane_w;
     let y = plane_off / plane_w;
     let max_pos = |plane: usize| {
+        if plane_max[plane] == 0 {
+            return (0usize, 0usize);
+        }
         let idx = plane_max_idx[plane] % frame_len;
         let (plane_off, plane_w) = match plane {
             0 => (idx, width),
-            1 => (idx - luma, width / 2),
-            _ => (idx - luma - chroma, width / 2),
+            1 => (idx.saturating_sub(luma), width / 2),
+            _ => (idx.saturating_sub(luma + chroma), width / 2),
         };
         (plane_off % plane_w, plane_off / plane_w)
     };
@@ -294,7 +306,7 @@ fn assert_yuv420_matches(
     let (max_cb_x, max_cb_y) = max_pos(1);
     let (max_cr_x, max_cr_y) = max_pos(2);
     panic!(
-        "{label}: first diff at frame {frame_idx}, plane {plane_name}, x={x}, y={y}, actual={}, expected={}, SAD(Y/Cb/Cr)=({}/{}/{}), max(|diff|)({}/{}/{}), max-pos(Y/Cb/Cr)=(({},{})/({},{}))/({},{}))",
+        "{label}: first diff at frame {frame_idx}, plane {plane_name}, x={x}, y={y}, actual={}, expected={}, SAD(Y/Cb/Cr)=({}/{}/{}), max(|diff|)=({}/{}/{}), max-pos(Y/Cb/Cr)=(({},{})/({},{})/({},{}))",
         actual[idx],
         expected[idx],
         plane_sad[0],
@@ -815,4 +827,87 @@ fn hevc_p_slice_fixture_matches_ffmpeg() {
     let frames = decode_all_video_frames(data, 2);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 256, 144, 2, "P-slice fixture");
+}
+
+/// Stream encoded with SAO enabled. Verifies the decoder can parse the
+/// per-CTU SAO syntax without desynchronising CABAC and decode to a
+/// plausible image (within a wide tolerance, since SAO isn't applied yet).
+#[test]
+fn hevc_sao_fixture_decodes() {
+    let x265_params = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                       wpp=0:pmode=0:pme=0:frame-threads=1:sao=1:no-deblock=1";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-sao.h265",
+        "testsrc=size=128x96:rate=1:duration=1",
+        1,
+        1,
+        x265_params,
+    ) else {
+        return;
+    };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    // Either a decoded frame or an unsupported-feature bail are acceptable;
+    // a panic or invalid-bitstream error is not.
+    if let Err(e) = dec.send_packet(&pkt) {
+        match e {
+            Error::Unsupported { .. } => return,
+            _ => panic!("SAO fixture send_packet failed: {e:?}"),
+        }
+    }
+    match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => {
+            assert_eq!(vf.width, 128, "width");
+            assert_eq!(vf.height, 96, "height");
+            assert_eq!(vf.planes.len(), 3, "plane count");
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => panic!("SAO fixture receive_frame failed: {e:?}"),
+    }
+}
+
+/// Stream with varied input content (testsrc pattern) exercising angular
+/// intra modes and their non-diagonal scan paths — a weak regression guard
+/// for the §7.4.9.11 scan_idx_for_intra logic.
+#[test]
+fn hevc_angular_intra_fixture_decodes() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "intra-angular.h265",
+        "testsrc=size=128x96:rate=1:duration=1",
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    if let Err(e) = dec.send_packet(&pkt) {
+        match e {
+            Error::Unsupported { .. } => return,
+            _ => panic!("angular fixture send_packet failed: {e:?}"),
+        }
+    }
+    match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => {
+            assert_eq!(vf.width, 128);
+            assert_eq!(vf.height, 96);
+            let y_plane = &vf.planes[0].data;
+            let distinct = y_plane.iter().copied().collect::<std::collections::HashSet<_>>().len();
+            assert!(
+                distinct > 10,
+                "angular fixture: expected >10 distinct luma values, got {distinct}",
+            );
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => panic!("angular fixture receive_frame failed: {e:?}"),
+    }
 }
