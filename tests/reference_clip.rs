@@ -1139,3 +1139,151 @@ fn hevc_deblocked_fixture_decodes() {
     }
 }
 
+/// Stream encoded with a 2x2 tile grid (§6.3.1). Validates the slice
+/// header entry-point parsing and the per-tile CABAC re-init path in
+/// `decode_slice_ctus`. The reconstructed pixels are not byte-exact yet
+/// (cross-CTU regressions also affect tile boundaries), so we only
+/// demand the decoder either produces a plausible frame or bails with
+/// Unsupported — a panic or invalid-bitstream error fails the test.
+#[test]
+fn hevc_tiles_fixture_decodes() {
+    // 640x480 at 64-wide CTBs → 10x8 CTBs, big enough that libx265 will
+    // actually emit a 2x2 tile grid.
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:tiles=2x2";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-tiles-2x2.h265",
+        "testsrc=size=640x480:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else {
+        return;
+    };
+    // Sanity-check the slice header: the PPS should carry tile info and
+    // the first slice should carry enough entry points to cover
+    // num_tiles - 1 sub-streams.
+    let mut sps_opt: Option<_> = None;
+    let mut pps_opt: Option<oxideav_h265::pps::PicParameterSet> = None;
+    let mut tiles_checked = false;
+    for nal in iter_annex_b(&data) {
+        let rbsp = extract_rbsp(nal.payload());
+        match nal.header.nal_unit_type {
+            NalUnitType::Sps => sps_opt = Some(parse_sps(&rbsp).expect("SPS")),
+            NalUnitType::Pps => pps_opt = Some(parse_pps(&rbsp).expect("PPS")),
+            t if t.is_vcl() && sps_opt.is_some() && pps_opt.is_some() => {
+                let sps = sps_opt.as_ref().unwrap();
+                let pps = pps_opt.as_ref().unwrap();
+                if pps.tiles_enabled_flag {
+                    let hdr = parse_slice_segment_header(&rbsp, &nal.header, sps, pps)
+                        .expect("slice header");
+                    let ti = pps.tile_info.as_ref().expect("tile_info");
+                    assert!(ti.num_tiles() >= 2, "expected a multi-tile stream");
+                    assert!(
+                        hdr.entry_point_offsets.len() as u32 + 1 >= ti.num_tiles(),
+                        "entry points ({}) do not cover tiles ({})",
+                        hdr.entry_point_offsets.len(),
+                        ti.num_tiles()
+                    );
+                    tiles_checked = true;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !tiles_checked {
+        // libx265 in some builds silently ignores `tiles=NxM` and emits a
+        // single-tile stream. Nothing more we can check; the PPS/slice
+        // parse path is exercised by the unit tests.
+        return;
+    }
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    match dec.send_packet(&pkt) {
+        Ok(()) => {}
+        Err(Error::Unsupported(_)) => return,
+        Err(e) => panic!("tiles fixture send_packet failed: {e:?}"),
+    }
+    match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => {
+            assert_eq!(vf.width, 640);
+            assert_eq!(vf.height, 480);
+            assert_eq!(vf.planes.len(), 3);
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(Error::Unsupported(_)) => {}
+        Err(e) => panic!("tiles fixture receive_frame failed: {e:?}"),
+    }
+}
+
+/// Stream encoded with wavefront parallel processing (§6.3.2).
+/// Validates that `entropy_coding_sync_enabled_flag` is parsed, the
+/// slice header carries one entry point per extra CTU row, and the
+/// decoder does not panic while decoding the multi-sub-stream slice.
+#[test]
+fn hevc_wpp_fixture_decodes() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=1:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-wpp.h265",
+        "testsrc=size=256x192:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else {
+        return;
+    };
+    let mut sps_opt: Option<_> = None;
+    let mut pps_opt: Option<oxideav_h265::pps::PicParameterSet> = None;
+    let mut wpp_checked = false;
+    for nal in iter_annex_b(&data) {
+        let rbsp = extract_rbsp(nal.payload());
+        match nal.header.nal_unit_type {
+            NalUnitType::Sps => sps_opt = Some(parse_sps(&rbsp).expect("SPS")),
+            NalUnitType::Pps => pps_opt = Some(parse_pps(&rbsp).expect("PPS")),
+            t if t.is_vcl() && sps_opt.is_some() && pps_opt.is_some() => {
+                let sps = sps_opt.as_ref().unwrap();
+                let pps = pps_opt.as_ref().unwrap();
+                if pps.entropy_coding_sync_enabled_flag {
+                    let hdr = parse_slice_segment_header(&rbsp, &nal.header, sps, pps)
+                        .expect("slice header");
+                    // Expect at least one entry point (the clip is tall
+                    // enough to have more than one CTB row).
+                    assert!(
+                        hdr.num_entry_point_offsets >= 1,
+                        "expected WPP slice to have at least one entry point"
+                    );
+                    wpp_checked = true;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(wpp_checked, "fixture does not actually have WPP enabled");
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    match dec.send_packet(&pkt) {
+        Ok(()) => {}
+        Err(Error::Unsupported(_)) => return,
+        Err(e) => panic!("wpp fixture send_packet failed: {e:?}"),
+    }
+    match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => {
+            assert_eq!(vf.width, 256);
+            assert_eq!(vf.height, 192);
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(Error::Unsupported(_)) => {}
+        Err(e) => panic!("wpp fixture receive_frame failed: {e:?}"),
+    }
+}

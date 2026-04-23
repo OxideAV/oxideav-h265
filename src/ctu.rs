@@ -149,6 +149,7 @@ enum InterPart {
     ModeNxN,
 }
 
+#[derive(Clone)]
 struct Ctx {
     split_cu_flag: [CtxState; 3],
     cu_transquant_bypass_flag: [CtxState; 1],
@@ -269,9 +270,6 @@ pub fn decode_slice_ctus(
     if cctx.sps.bit_depth_y() != 8 || cctx.sps.bit_depth_c() != 8 {
         return Err(Error::unsupported("h265 only 8-bit pixel decode supported"));
     }
-    if cctx.pps.tiles_enabled_flag {
-        return Err(Error::unsupported("h265 tiles pending"));
-    }
     // Note: SAO parameters are parsed per-CTU (see decode_sao) into
     // `pic.sao_grid`; the post-decode filter (§8.7.3) runs from
     // `decoder::decode_*_slice` after deblocking. Deblocking (§8.7.2)
@@ -299,6 +297,56 @@ pub fn decode_slice_ctus(
     let pic_h = cctx.sps.pic_height_in_luma_samples;
     let ctbs_x = pic_w.div_ceil(ctb_size);
     let ctbs_y = pic_h.div_ceil(ctb_size);
+
+    // §6.5.1 tile geometry. When tiles are disabled we build a single-tile
+    // layout that spans the whole picture so the downstream CTU iteration
+    // is a single code-path.
+    let tile_plan = TilePlan::build(cctx.pps, ctbs_x, ctbs_y);
+
+    // Resolve the absolute byte offsets (within rbsp) of each sub-stream
+    // start. Sub-stream 0 starts at `slice_data_byte_off`; sub-stream i+1
+    // is `entry_point_offsets[i]` bytes later. When neither tiles nor WPP
+    // are enabled the slice is a single sub-stream.
+    let sub_stream_offsets: Vec<usize> = {
+        let mut v = Vec::with_capacity(cctx.slice.entry_point_offsets.len() + 1);
+        v.push(slice_data_byte_off);
+        for off in &cctx.slice.entry_point_offsets {
+            v.push(slice_data_byte_off + *off as usize);
+        }
+        v
+    };
+
+    // Multi-tile and multi-row-WPP both require the slice to carry the
+    // matching number of entry points. Single-tile + single-row are a
+    // single sub-stream; reject mismatches loudly — missing entry points
+    // means we cannot re-seed CABAC at the correct byte positions.
+    let multi_tile = cctx.pps.tiles_enabled_flag && tile_plan.num_tiles() > 1;
+    let multi_row_wpp = cctx.pps.entropy_coding_sync_enabled_flag && ctbs_y > 1;
+    if multi_tile && (multi_row_wpp) {
+        return Err(Error::unsupported(
+            "h265 combined tiles + WPP not supported yet",
+        ));
+    }
+    if multi_tile {
+        let needed = tile_plan.num_tiles() as usize - 1;
+        if cctx.slice.entry_point_offsets.len() < needed {
+            return Err(Error::invalid(format!(
+                "h265 slice: tiled slice missing entry points (have {}, need {})",
+                cctx.slice.entry_point_offsets.len(),
+                needed
+            )));
+        }
+    }
+    if multi_row_wpp {
+        let needed = (ctbs_y as usize).saturating_sub(1);
+        if cctx.slice.entry_point_offsets.len() < needed {
+            return Err(Error::invalid(format!(
+                "h265 slice: WPP slice missing entry points (have {}, need {})",
+                cctx.slice.entry_point_offsets.len(),
+                needed
+            )));
+        }
+    }
 
     let mut engine = CabacEngine::new(rbsp, slice_data_byte_off);
     let mut ctx = Ctx::init(cctx.slice.slice_qp_y, cctx.init_type);
@@ -337,25 +385,155 @@ pub fn decode_slice_ctus(
         scaling_list: active_scaling_list.as_ref(),
     };
 
-    for cty in 0..ctbs_y {
-        for ctx_x in 0..ctbs_x {
-            let x0 = ctx_x * ctb_size;
-            let y0 = cty * ctb_size;
-            // SAO parameters (§7.3.8.3).
-            if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
-                walker.decode_sao(&mut engine, &mut ctx, ctx_x, cty)?;
+    if multi_tile {
+        // §6.3.1: per-tile CTU raster scan. Tiles are decoded in the order
+        // they appear in the bitstream (row-major over the tile grid).
+        // For each tile after the first, re-init the CABAC engine at the
+        // matching entry point and rebuild the context table per §9.3.2.4.
+        for tile_idx in 0..tile_plan.num_tiles() as usize {
+            if tile_idx > 0 {
+                let off = sub_stream_offsets
+                    .get(tile_idx)
+                    .copied()
+                    .unwrap_or(slice_data_byte_off);
+                engine.reinit_at_byte(off);
+                ctx = Ctx::init(cctx.slice.slice_qp_y, cctx.init_type);
             }
-            walker.coding_quadtree(&mut engine, &mut ctx, x0, y0, ctb_log2, 0)?;
-            // end_of_slice_flag / end_of_slice_segment_flag (one terminating bin).
-            // We consume the bin but tolerate disagreement — a single-bit
-            // bitstream-position desync at the end doesn't invalidate the
-            // reconstructed picture, and our simplified residual_coding may
-            // land one bit off the exact spec position.
-            let _ = engine.decode_terminate();
-            let _is_last = ctx_x + 1 == ctbs_x && cty + 1 == ctbs_y;
+            let (ctb_x0, ctb_y0, cols, rows) = tile_plan.tile_bounds(tile_idx as u32);
+            for cty in ctb_y0..(ctb_y0 + rows) {
+                for ctx_x in ctb_x0..(ctb_x0 + cols) {
+                    let x0 = ctx_x * ctb_size;
+                    let y0 = cty * ctb_size;
+                    if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
+                        walker.decode_sao(&mut engine, &mut ctx, ctx_x, cty)?;
+                    }
+                    walker.coding_quadtree(&mut engine, &mut ctx, x0, y0, ctb_log2, 0)?;
+                    let _ = engine.decode_terminate();
+                }
+            }
+        }
+    } else if multi_row_wpp {
+        // §6.3.2: wavefront parallel processing. At each CTU row start
+        // (except the first), CABAC is re-initialised from a snapshot of
+        // the row-above context *after* its second CTU (column index 1)
+        // completed (§9.3.2.4). The arithmetic engine restarts at the
+        // entry-point byte position of the row.
+        let mut row_snapshot: Option<Ctx> = None;
+        for cty in 0..ctbs_y {
+            if cty > 0 {
+                let off = sub_stream_offsets
+                    .get(cty as usize)
+                    .copied()
+                    .unwrap_or(slice_data_byte_off);
+                engine.reinit_at_byte(off);
+                // §9.3.2.4: context table is inherited from the row above
+                // after its second CTU (ctbAddrInRs with horizontal index
+                // 1). When the row above is only 1 CTU wide or wasn't
+                // snapshotted, fall back to a fresh slice-level init.
+                ctx = row_snapshot
+                    .take()
+                    .unwrap_or_else(|| Ctx::init(cctx.slice.slice_qp_y, cctx.init_type));
+            }
+            for ctx_x in 0..ctbs_x {
+                let x0 = ctx_x * ctb_size;
+                let y0 = cty * ctb_size;
+                if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
+                    walker.decode_sao(&mut engine, &mut ctx, ctx_x, cty)?;
+                }
+                walker.coding_quadtree(&mut engine, &mut ctx, x0, y0, ctb_log2, 0)?;
+                let _ = engine.decode_terminate();
+                // Snapshot the context immediately after the second CTU of
+                // the current row (column index 1) finishes — that's the
+                // seed for the next row per §9.3.2.4.
+                if ctx_x == 1 && cty + 1 < ctbs_y {
+                    row_snapshot = Some(ctx.clone());
+                }
+            }
+        }
+    } else {
+        for cty in 0..ctbs_y {
+            for ctx_x in 0..ctbs_x {
+                let x0 = ctx_x * ctb_size;
+                let y0 = cty * ctb_size;
+                // SAO parameters (§7.3.8.3).
+                if cctx.slice.slice_sao_luma_flag || cctx.slice.slice_sao_chroma_flag {
+                    walker.decode_sao(&mut engine, &mut ctx, ctx_x, cty)?;
+                }
+                walker.coding_quadtree(&mut engine, &mut ctx, x0, y0, ctb_log2, 0)?;
+                // end_of_slice_flag / end_of_slice_segment_flag (one terminating bin).
+                // We consume the bin but tolerate disagreement — a single-bit
+                // bitstream-position desync at the end doesn't invalidate the
+                // reconstructed picture, and our simplified residual_coding may
+                // land one bit off the exact spec position.
+                let _ = engine.decode_terminate();
+                let _is_last = ctx_x + 1 == ctbs_x && cty + 1 == ctbs_y;
+            }
         }
     }
     Ok(())
+}
+
+/// §6.5.1 resolved tile layout. When tiles are disabled the plan carries a
+/// single tile spanning the whole picture so the CTU walker has one
+/// unified code-path.
+struct TilePlan {
+    /// Per-tile-column widths in CTBs.
+    col_widths: Vec<u32>,
+    /// Per-tile-row heights in CTBs.
+    row_heights: Vec<u32>,
+    /// Cumulative column starts in CTBs — length `col_widths.len() + 1`.
+    col_starts: Vec<u32>,
+    /// Cumulative row starts in CTBs — length `row_heights.len() + 1`.
+    row_starts: Vec<u32>,
+}
+
+impl TilePlan {
+    fn build(pps: &crate::pps::PicParameterSet, pic_w_ctb: u32, pic_h_ctb: u32) -> Self {
+        let (col_widths, row_heights) = if let Some(ti) = pps.tile_info.as_ref() {
+            (
+                ti.column_widths_ctb(pic_w_ctb),
+                ti.row_heights_ctb(pic_h_ctb),
+            )
+        } else {
+            (vec![pic_w_ctb], vec![pic_h_ctb])
+        };
+        let mut col_starts = Vec::with_capacity(col_widths.len() + 1);
+        col_starts.push(0);
+        for w in &col_widths {
+            let s = col_starts.last().copied().unwrap_or(0);
+            col_starts.push(s + w);
+        }
+        let mut row_starts = Vec::with_capacity(row_heights.len() + 1);
+        row_starts.push(0);
+        for h in &row_heights {
+            let s = row_starts.last().copied().unwrap_or(0);
+            row_starts.push(s + h);
+        }
+        Self {
+            col_widths,
+            row_heights,
+            col_starts,
+            row_starts,
+        }
+    }
+
+    fn num_tiles(&self) -> u32 {
+        (self.col_widths.len() * self.row_heights.len()) as u32
+    }
+
+    /// Given a tile index (row-major over the tile grid), return
+    /// `(ctb_x0, ctb_y0, num_cols_ctb, num_rows_ctb)`.
+    fn tile_bounds(&self, tile_idx: u32) -> (u32, u32, u32, u32) {
+        let cols = self.col_widths.len() as u32;
+        let ti_col = tile_idx % cols;
+        let ti_row = tile_idx / cols;
+        (
+            self.col_starts[ti_col as usize],
+            self.row_starts[ti_row as usize],
+            self.col_widths[ti_col as usize],
+            self.row_heights[ti_row as usize],
+        )
+    }
 }
 
 struct Walker<'a> {
