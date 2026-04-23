@@ -814,6 +814,117 @@ fn hevc_intra_testsrc_64_matches_ffmpeg() {
 }
 
 #[test]
+fn hevc_intra_testsrc2_64_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "testsrc2-64.h265",
+        "testsrc2=size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc2-64.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra testsrc2 64 fixture");
+}
+
+#[test]
+fn hevc_intra_smptebars_64_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "smptebars-64.h265",
+        "smptebars=size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-smptebars-64.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra smptebars 64 fixture");
+}
+
+#[test]
+fn hevc_intra_rgbtestsrc_64_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "rgbtestsrc-64.h265",
+        "rgbtestsrc=size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-rgbtestsrc-64.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra rgbtestsrc 64 fixture");
+}
+
+// First diff at (80, 0) inside the second 64-wide CTU row — the bug is
+// specific to reference / CABAC state crossing a CTU boundary with real
+// content (gray-only multi-CTU fixtures pass). Left ignored as a
+// progress tracker.
+#[test]
+#[ignore]
+fn hevc_intra_mandelbrot_128_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "mandelbrot-128.h265",
+        "mandelbrot=size=128x128:rate=1:end_pts=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-mandelbrot-128.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 128, 128, 1, "intra mandelbrot 128 fixture");
+}
+
+// Fails today: first diff at (64, 0), the seam of CTU (64, 0). Same
+// cross-CTU regression as the mandelbrot and 192×112 fixtures.
+#[test]
+#[ignore]
+fn hevc_intra_testsrc_128x72_matches_ffmpeg() {
+    // Non-square, non-CTU-multiple on the height axis — exercises
+    // picture-edge CTU handling for 4:2:0 with a partial last row.
+    let Some(input) = ensure_generated_hevc_fixture(
+        "testsrc-128x72.h265",
+        "testsrc=size=128x72:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-128x72.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 128, 72, 1, "intra testsrc 128x72 fixture");
+}
+
+// Fails today at (20, 64) — second CTU row. Same cross-CTU bug.
+#[test]
+#[ignore]
+fn hevc_intra_testsrc_192x112_matches_ffmpeg() {
+    // Large enough that x265 picks 32×32 (or larger) CU splits in the
+    // interior, exercising the strong-intra-smoothing decision branch
+    // (§8.4.4.2.3) and larger-TU inverse transforms.
+    let Some(input) = ensure_generated_hevc_fixture(
+        "testsrc-192x112.h265",
+        "testsrc=size=192x112:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-192x112.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 192, 112, 1, "intra testsrc 192x112 fixture");
+}
+
+#[test]
 fn hevc_intra_gray_64_qp51_matches_ffmpeg() {
     let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
                 wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:qp=51";
