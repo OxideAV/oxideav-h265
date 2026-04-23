@@ -47,6 +47,20 @@ pub struct SeqParameterSet {
     pub amp_enabled_flag: bool,
     pub sample_adaptive_offset_enabled_flag: bool,
     pub pcm_enabled_flag: bool,
+    /// `pcm_sample_bit_depth_luma_minus1 + 1` (§7.4.3.2.1 eq. 7-25). Only
+    /// valid when `pcm_enabled_flag == true`.
+    pub pcm_sample_bit_depth_luma: u32,
+    /// `pcm_sample_bit_depth_chroma_minus1 + 1` (eq. 7-26).
+    pub pcm_sample_bit_depth_chroma: u32,
+    /// `log2_min_pcm_luma_coding_block_size_minus3 + 3` (§7.4.3.2.1).
+    /// Minimum PCM CU size in luma samples (log2).
+    pub log2_min_pcm_luma_coding_block_size: u32,
+    /// `log2_min_pcm_luma_coding_block_size + log2_diff_max_min_pcm_luma`.
+    /// Maximum PCM CU size in luma samples (log2).
+    pub log2_max_pcm_luma_coding_block_size: u32,
+    /// `pcm_loop_filter_disabled_flag` — when 1, deblocking + SAO skip
+    /// PCM CUs (§7.4.3.2.1). Not yet honoured by our deblock / SAO.
+    pub pcm_loop_filter_disabled_flag: bool,
     /// Counts of short-term reference picture sets and long-term references.
     pub num_short_term_ref_pic_sets: u32,
     pub long_term_ref_pics_present_flag: bool,
@@ -263,16 +277,20 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let amp_enabled_flag = br.u1()? == 1;
     let sample_adaptive_offset_enabled_flag = br.u1()? == 1;
     let pcm_enabled_flag = br.u1()? == 1;
+    let mut pcm_sample_bit_depth_luma: u32 = 0;
+    let mut pcm_sample_bit_depth_chroma: u32 = 0;
+    let mut log2_min_pcm_luma_coding_block_size: u32 = 0;
+    let mut log2_max_pcm_luma_coding_block_size: u32 = 0;
+    let mut pcm_loop_filter_disabled_flag = false;
     if pcm_enabled_flag {
-        // pcm_sample_bit_depth_luma_minus1, pcm_sample_bit_depth_chroma_minus1
-        br.skip(4)?;
-        br.skip(4)?;
-        // log2_min_pcm_luma_coding_block_size_minus3
-        let _ = br.ue()?;
-        // log2_diff_max_min_pcm_luma_coding_block_size
-        let _ = br.ue()?;
-        // pcm_loop_filter_disabled_flag
-        br.skip(1)?;
+        pcm_sample_bit_depth_luma = br.u(4)? + 1;
+        pcm_sample_bit_depth_chroma = br.u(4)? + 1;
+        let log2_min_pcm_minus3 = br.ue()?;
+        let log2_diff_max_min_pcm = br.ue()?;
+        log2_min_pcm_luma_coding_block_size = log2_min_pcm_minus3 + 3;
+        log2_max_pcm_luma_coding_block_size =
+            log2_min_pcm_luma_coding_block_size + log2_diff_max_min_pcm;
+        pcm_loop_filter_disabled_flag = br.u1()? == 1;
     }
 
     let num_short_term_ref_pic_sets = br.ue()?;
@@ -382,6 +400,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         amp_enabled_flag,
         sample_adaptive_offset_enabled_flag,
         pcm_enabled_flag,
+        pcm_sample_bit_depth_luma,
+        pcm_sample_bit_depth_chroma,
+        log2_min_pcm_luma_coding_block_size,
+        log2_max_pcm_luma_coding_block_size,
+        pcm_loop_filter_disabled_flag,
         num_short_term_ref_pic_sets,
         long_term_ref_pics_present_flag,
         num_long_term_ref_pics_sps,

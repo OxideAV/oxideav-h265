@@ -26,7 +26,7 @@
 //! ## Restricted to
 //!
 //! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
-//! * Single-tile, wavefront-off, no transform-skip, no PCM CUs.
+//! * Single-tile, wavefront-off.
 //! * **I, P, and B slices.** Inter PB shapes are limited to
 //!   2Nx2N / 2NxN / Nx2N / NxN (no AMP).
 //!

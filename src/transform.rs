@@ -180,6 +180,23 @@ pub fn dequantize_flat(
     }
 }
 
+/// Transform-skip residual (§8.6.4.2 eq. 8-298, 8-299) — dequantised
+/// coefficients `d` are left-shifted by `tsShift = 5 + log2(nTbS)` then
+/// adjusted by `bdShift = 20 - bitDepth`. Produces the same output shape
+/// as [`inverse_transform_2d`].
+pub fn transform_skip_2d(coeffs: &[i32], out: &mut [i32], log2_tb: u32, bit_depth: u32) {
+    let n = 1usize << log2_tb;
+    debug_assert_eq!(coeffs.len(), n * n);
+    debug_assert_eq!(out.len(), n * n);
+    let ts_shift = 5i32 + log2_tb as i32;
+    let bd_shift = 20i32 - bit_depth as i32;
+    let round = 1i32 << (bd_shift - 1);
+    for i in 0..n * n {
+        let v = (coeffs[i] << ts_shift).saturating_add(round);
+        out[i] = (v >> bd_shift).clamp(-32768, 32767);
+    }
+}
+
 /// Dequantise an n×n coefficient block using a per-position scaling
 /// matrix (§8.6.3 eq. 8-309). `matrix[y * n + x]` supplies `m[x][y]`.
 /// All other parameters are identical to [`dequantize_flat`].
@@ -254,6 +271,27 @@ mod tests {
                 assert_eq!(v, v0, "non-uniform 2D-IDCT for DC-only log2={log2_tb}");
             }
         }
+    }
+
+    #[test]
+    fn transform_skip_4x4_shift_and_bdshift() {
+        // For nTbS=4, 8-bit: tsShift = 7, bdShift = 12. A flat coefficient
+        // of 32 should map to (32 << 7 + 2048) >> 12 = (4096 + 2048) >> 12
+        // = 6144 >> 12 = 1.
+        let coeffs = vec![32i32; 16];
+        let mut out = vec![0i32; 16];
+        transform_skip_2d(&coeffs, &mut out, 2, 8);
+        for &v in &out {
+            assert_eq!(v, 1);
+        }
+    }
+
+    #[test]
+    fn transform_skip_zero_input_zero_output() {
+        let coeffs = vec![0i32; 16];
+        let mut out = vec![99i32; 16];
+        transform_skip_2d(&coeffs, &mut out, 2, 8);
+        assert!(out.iter().all(|&v| v == 0));
     }
 
     #[test]

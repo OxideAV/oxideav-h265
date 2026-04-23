@@ -27,6 +27,7 @@ use crate::cabac::{
     PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES, REF_IDX_INIT_VALUES, RQT_ROOT_CBF_INIT_VALUES,
     SAO_MERGE_FLAG_INIT_VALUES, SAO_TYPE_IDX_INIT_VALUES, SIG_COEFF_FLAG_INIT_VALUES,
     SPLIT_CU_FLAG_INIT_VALUES, SPLIT_TRANSFORM_FLAG_INIT_VALUES,
+    TRANSFORM_SKIP_FLAG_CHROMA_INIT_VALUES, TRANSFORM_SKIP_FLAG_LUMA_INIT_VALUES,
 };
 use crate::inter::{
     build_amvp_list, build_merge_list, chroma_mc, chroma_mc_bi_combine, chroma_mc_hp, luma_mc,
@@ -40,7 +41,9 @@ use crate::scaling_list::ScalingListData;
 use crate::scan::{scan_4x4, scan_idx_for_intra};
 use crate::slice::{SliceSegmentHeader, SliceType};
 use crate::sps::SeqParameterSet;
-use crate::transform::{dequantize_flat, dequantize_with_matrix, inverse_transform_2d};
+use crate::transform::{
+    dequantize_flat, dequantize_with_matrix, inverse_transform_2d, transform_skip_2d,
+};
 
 /// Reconstructed picture (8-bit 4:2:0 only).
 pub struct Picture {
@@ -174,6 +177,8 @@ struct Ctx {
     ref_idx: [CtxState; 2],
     abs_mvd_greater: [CtxState; 2],
     mvp_lx_flag: [CtxState; 1],
+    transform_skip_flag_luma: [CtxState; 1],
+    transform_skip_flag_chroma: [CtxState; 1],
 }
 
 impl Ctx {
@@ -233,6 +238,16 @@ impl Ctx {
             ref_idx: init_row(&REF_IDX_INIT_VALUES, init_type, slice_qp_y),
             abs_mvd_greater: init_row(&ABS_MVD_GREATER_FLAGS_INIT_VALUES, init_type, slice_qp_y),
             mvp_lx_flag: init_row(&MVP_LX_FLAG_INIT_VALUES, init_type, slice_qp_y),
+            transform_skip_flag_luma: init_row(
+                &TRANSFORM_SKIP_FLAG_LUMA_INIT_VALUES,
+                init_type,
+                slice_qp_y,
+            ),
+            transform_skip_flag_chroma: init_row(
+                &TRANSFORM_SKIP_FLAG_CHROMA_INIT_VALUES,
+                init_type,
+                slice_qp_y,
+            ),
         }
     }
 }
@@ -708,12 +723,132 @@ impl<'a> Walker<'a> {
             self.pic
                 .inter
                 .set_rect(x0, y0, cb_size, cb_size, PbMotion::intra());
+            // §7.3.8.5: pcm_flag is only signalled for intra 2Nx2N with
+            // pcm_enabled and the CU size in [Log2MinIpcmCbSizeY,
+            // Log2MaxIpcmCbSizeY]. Decoded via DecodeTerminate (§9.3.4.3.5).
+            let pcm_eligible = !part_mode_is_nxn
+                && self.cctx.sps.pcm_enabled_flag
+                && log2_cb >= self.cctx.sps.log2_min_pcm_luma_coding_block_size
+                && log2_cb <= self.cctx.sps.log2_max_pcm_luma_coding_block_size;
+            if pcm_eligible {
+                let pcm_flag = engine.decode_terminate();
+                if pcm_flag == 1 {
+                    return self.decode_pcm_cu(engine, x0, y0, log2_cb);
+                }
+            }
             if part_mode_is_nxn {
                 self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, true)
             } else {
                 self.decode_intra_prediction_and_transforms(engine, ctx, x0, y0, log2_cb, false)
             }
         }
+    }
+
+    /// Consume a PCM CU's sample data directly from the bitstream
+    /// (§7.3.8.5 `pcm_sample()`). After the terminate bin has been read
+    /// as `pcm_flag = 1`, the spec requires:
+    ///
+    /// 1. `pcm_alignment_zero_bit` — discard bits until byte-aligned.
+    /// 2. `pcm_sample_luma[i]`, `pcm_sample_chroma[i]` as fixed-length
+    ///    u(PcmBitDepth*) values.
+    /// 3. Re-initialise the arithmetic decoding engine (§9.3.2.6) at the
+    ///    new byte position.
+    ///
+    /// Samples are scaled from `PcmBitDepth*` → 8-bit bit-depth and
+    /// written straight to the picture (no prediction, no transform).
+    fn decode_pcm_cu(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb: u32,
+    ) -> Result<()> {
+        let n = 1u32 << log2_cb;
+        let pcm_depth_y = self.cctx.sps.pcm_sample_bit_depth_luma as usize;
+        let pcm_depth_c = self.cctx.sps.pcm_sample_bit_depth_chroma as usize;
+        // Start bit offset in the payload: after DecodeTerminate returns 1,
+        // the engine's physical read pointer sits `bits_consumed()` bits
+        // into the payload. `pcm_alignment_zero_bit` aligns to the next
+        // byte boundary; we model this by always reading from the next
+        // whole byte, which is where the encoder guarantees pcm_sample to
+        // start (§7.3.8.5).
+        let mut byte_pos = engine.byte_pos();
+        let data = engine.data();
+        // If the last read byte still has unconsumed bits in `bits_in_buf`,
+        // `byte_pos` has already moved past it — we're implicitly aligned
+        // to the next byte boundary. No extra bits to skip.
+        //
+        // Read luma: n × n samples at `pcm_depth_y` bits each.
+        let mut bit_off: u32 = 0;
+        for py in 0..n {
+            for px in 0..n {
+                let sample = read_fl_bits(data, byte_pos, bit_off, pcm_depth_y)
+                    .ok_or_else(|| Error::invalid("h265 pcm: luma sample read past EOF"))?;
+                bit_off += pcm_depth_y as u32;
+                while bit_off >= 8 {
+                    bit_off -= 8;
+                    byte_pos += 1;
+                }
+                // Scale to 8-bit per §8.4.4.3 (left-shift by 8 - PcmBitDepth).
+                let shift = 8i32 - pcm_depth_y as i32;
+                let px_val = if shift >= 0 {
+                    (sample as i32) << shift
+                } else {
+                    (sample as i32) >> (-shift)
+                };
+                let xx = x0 + px;
+                let yy = y0 + py;
+                if (xx as usize) < self.pic.width as usize
+                    && (yy as usize) < self.pic.height as usize
+                {
+                    let idx = yy as usize * self.pic.luma_stride + xx as usize;
+                    self.pic.luma[idx] = (px_val.clamp(0, 255)) as u8;
+                }
+            }
+        }
+        // Read chroma Cb then Cr: (n/2) × (n/2) samples at `pcm_depth_c` bits.
+        let cn = n / 2;
+        for chroma_plane in 0..2usize {
+            for py in 0..cn {
+                for px in 0..cn {
+                    let sample = read_fl_bits(data, byte_pos, bit_off, pcm_depth_c)
+                        .ok_or_else(|| Error::invalid("h265 pcm: chroma sample read past EOF"))?;
+                    bit_off += pcm_depth_c as u32;
+                    while bit_off >= 8 {
+                        bit_off -= 8;
+                        byte_pos += 1;
+                    }
+                    let shift = 8i32 - pcm_depth_c as i32;
+                    let px_val = if shift >= 0 {
+                        (sample as i32) << shift
+                    } else {
+                        (sample as i32) >> (-shift)
+                    };
+                    let xx = (x0 / 2) + px;
+                    let yy = (y0 / 2) + py;
+                    let pic_cw = (self.pic.width as usize) / 2;
+                    let pic_ch = (self.pic.height as usize) / 2;
+                    if (xx as usize) < pic_cw && (yy as usize) < pic_ch {
+                        let idx = yy as usize * self.pic.chroma_stride + xx as usize;
+                        if chroma_plane == 0 {
+                            self.pic.cb[idx] = px_val.clamp(0, 255) as u8;
+                        } else {
+                            self.pic.cr[idx] = px_val.clamp(0, 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        // Any leftover bit_off lands on the next byte.
+        if bit_off > 0 {
+            byte_pos += 1;
+        }
+        // §9.3.2.6: re-init arithmetic engine at the next byte boundary.
+        engine.reinit_at_byte(byte_pos);
+        // Mark all 4×4 blocks in the CU as decoded so neighbour availability
+        // checks still work for subsequent intra PBs.
+        self.mark_decoded_block(x0, y0, n);
+        Ok(())
     }
 
     fn skip_ctx_inc(&self, x0: u32, y0: u32) -> usize {
@@ -1500,7 +1635,7 @@ impl<'a> Walker<'a> {
         let n = 1usize << log2_tb;
         let mut levels = vec![0i32; n * n];
         // For inter residual: scan_idx is always diagonal (scan_idx=0).
-        self.residual_coding(
+        let ts = self.residual_coding(
             engine,
             ctx,
             &mut levels,
@@ -1510,10 +1645,15 @@ impl<'a> Walker<'a> {
         )?;
         let qp = self.get_qp(is_luma, false);
         let mut deq = vec![0i32; n * n];
-        self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, false);
+        self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, ts);
         let mut res = vec![0i32; n * n];
-        // Inter TU: DCT only (no DST-VII even at 4×4).
-        inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        if ts {
+            // §8.6.4.2 eq. 8-298: skip iDCT, apply tsShift/bdShift.
+            transform_skip_2d(&deq, &mut res, log2_tb, 8);
+        } else {
+            // Inter TU: DCT only (no DST-VII even at 4×4).
+            inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        }
         self.add_to_plane(x0, y0, n, &res, is_luma, false);
         Ok(())
     }
@@ -1528,12 +1668,16 @@ impl<'a> Walker<'a> {
     ) -> Result<()> {
         let n = 1usize << log2_tb;
         let mut levels = vec![0i32; n * n];
-        self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
+        let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
         let qp = self.get_qp(false, true);
         let mut deq = vec![0i32; n * n];
-        self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, false);
+        self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, ts);
         let mut res = vec![0i32; n * n];
-        inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        if ts {
+            transform_skip_2d(&deq, &mut res, log2_tb, 8);
+        } else {
+            inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+        }
         self.add_to_plane(x0, y0, n, &res, false, true);
         Ok(())
     }
@@ -1791,13 +1935,18 @@ impl<'a> Walker<'a> {
         // If there are residuals, decode them and add.
         if has_coeff {
             let mut levels = vec![0i32; n * n];
-            self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
+            let ts =
+                self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
             let qp = self.get_qp(is_luma, false);
             let mut deq = vec![0i32; n * n];
-            self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, false);
+            self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, ts);
             let mut res = vec![0i32; n * n];
-            let is_dst = is_luma && log2_tb == 2;
-            inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+            if ts {
+                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            } else {
+                let is_dst = is_luma && log2_tb == 2;
+                inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+            }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
                 pred[i] = v.clamp(0, 255) as u8;
@@ -1831,12 +1980,16 @@ impl<'a> Walker<'a> {
         predict(&refs, n, &mut pred, n, pred_mode, false);
         if has_coeff {
             let mut levels = vec![0i32; n * n];
-            self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
+            let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
             let mut deq = vec![0i32; n * n];
             let qp = self.get_qp(false, true);
-            self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, false);
+            self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, ts);
             let mut res = vec![0i32; n * n];
-            inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            if ts {
+                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            } else {
+                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
                 pred[i] = v.clamp(0, 255) as u8;
@@ -2138,7 +2291,9 @@ impl<'a> Walker<'a> {
     }
 
     /// Decode residual coefficients for a single TU into `levels`
-    /// (row-major, size `n*n`).
+    /// (row-major, size `n*n`). Returns the decoded
+    /// `transform_skip_flag` — `true` when the iDCT should be bypassed
+    /// for this TU (§8.6.4.2 eq. 8-298).
     fn residual_coding(
         &mut self,
         engine: &mut CabacEngine<'_>,
@@ -2147,10 +2302,26 @@ impl<'a> Walker<'a> {
         log2_tb: u32,
         pred_mode: u32,
         is_luma: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let n = 1usize << log2_tb;
         let scan_idx = scan_idx_for_intra(log2_tb, pred_mode, is_luma);
         let scan = scan_4x4(scan_idx);
+
+        // §7.3.8.11: transform_skip_flag is the first element, present only
+        // when `pps.transform_skip_enabled_flag` is set, the block is 4×4
+        // (Log2MaxTransformSkipSize defaults to 2), and the CU is not in
+        // transquant-bypass mode. Rext can raise the cap; we clamp at 2
+        // for the base profile.
+        let transform_skip_flag = if self.cctx.pps.transform_skip_enabled_flag && log2_tb == 2 {
+            let ctx_arr: &mut [CtxState; 1] = if is_luma {
+                &mut ctx.transform_skip_flag_luma
+            } else {
+                &mut ctx.transform_skip_flag_chroma
+            };
+            engine.decode_bin(&mut ctx_arr[0]) == 1
+        } else {
+            false
+        };
 
         // last_sig_coeff_x/y_{prefix, suffix} (§9.3.4.2.7, 9.3.4.2.8).
         let (last_x, last_y) =
@@ -2389,7 +2560,7 @@ impl<'a> Walker<'a> {
         if levels[last_y * n + last_x] == 0 {
             levels[last_y * n + last_x] = 1;
         }
-        Ok(())
+        Ok(transform_skip_flag)
     }
 
     fn decode_last_sig_pos(
@@ -2767,5 +2938,77 @@ fn qp_y_to_qp_c(qp_y: i32) -> i32 {
             q if q >= 44 => q - 6,
             _ => qp_y,
         }
+    }
+}
+
+/// Read an `n`-bit unsigned integer at byte position `byte_pos`, bit
+/// offset `bit_off` (within that byte, MSB-first). Used by the PCM path
+/// to pull fixed-length samples directly from the RBSP bytes.
+/// Returns `None` when the read would run past the end of `data`.
+fn read_fl_bits(data: &[u8], byte_pos: usize, bit_off: u32, n: usize) -> Option<u32> {
+    if n == 0 {
+        return Some(0);
+    }
+    if n > 32 {
+        return None;
+    }
+    let total_bit = byte_pos as u64 * 8 + bit_off as u64 + n as u64;
+    if (total_bit as usize).div_ceil(8) > data.len() {
+        // Clamp to whatever is available — pcm_sample bits can run to the
+        // very end of the slice, in which case padding zeros are read
+        // (matches the §9 "read 0 past EOF" convention).
+    }
+    let mut v: u32 = 0;
+    let mut remaining = n;
+    let mut pos = byte_pos;
+    let mut off = bit_off;
+    while remaining > 0 {
+        if pos >= data.len() {
+            v <<= remaining;
+            break;
+        }
+        let byte = data[pos] as u32;
+        let take = core::cmp::min(remaining, 8 - off as usize);
+        let shift = 8 - off as usize - take;
+        let chunk = (byte >> shift) & ((1u32 << take) - 1);
+        v = (v << take) | chunk;
+        off += take as u32;
+        if off >= 8 {
+            off -= 8;
+            pos += 1;
+        }
+        remaining -= take;
+    }
+    Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_fl_bits_aligned_byte() {
+        let data = [0xAB, 0xCD];
+        assert_eq!(read_fl_bits(&data, 0, 0, 8), Some(0xAB));
+        assert_eq!(read_fl_bits(&data, 1, 0, 8), Some(0xCD));
+    }
+
+    #[test]
+    fn read_fl_bits_crosses_byte_boundary() {
+        // Bits: 10101011 11001101 ; starting at bit 4 for 8 bits -> 10111100 = 0xBC.
+        let data = [0xAB, 0xCD];
+        assert_eq!(read_fl_bits(&data, 0, 4, 8), Some(0xBC));
+    }
+
+    #[test]
+    fn read_fl_bits_past_eof_clamps_zero() {
+        let data = [0xFF];
+        // Reading 16 bits past start reads 0xFF + 0x00 = 0xFF00.
+        assert_eq!(read_fl_bits(&data, 0, 0, 16), Some(0xFF00));
+    }
+
+    #[test]
+    fn read_fl_bits_zero_width() {
+        assert_eq!(read_fl_bits(&[], 0, 0, 0), Some(0));
     }
 }

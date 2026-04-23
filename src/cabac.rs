@@ -190,6 +190,38 @@ impl<'a> CabacEngine<'a> {
         self.byte_pos
     }
 
+    /// Re-initialise the arithmetic engine at a new byte position
+    /// (§9.3.2.6). Called after a PCM CU consumes its payload: the
+    /// engine's `ivl_curr_range` and `ivl_offset` must be re-seeded
+    /// from the new byte position. Context variables are preserved
+    /// per §9.3.1.2.
+    pub fn reinit_at_byte(&mut self, byte_pos: usize) {
+        self.byte_pos = byte_pos;
+        self.bits_in_buf = 0;
+        self.bits_buf = 0;
+        self.ivl_curr_range = 510;
+        self.ivl_offset = 0;
+        for _ in 0..9 {
+            let b = self.read_bit();
+            self.ivl_offset = (self.ivl_offset << 1) | b;
+        }
+    }
+
+    /// Raw byte slice of the engine's payload — needed by the PCM path
+    /// to read `pcm_sample_luma/chroma` directly from the bitstream
+    /// without going through the arithmetic decoder.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Number of bits already drawn from the underlying bitstream into
+    /// either the arithmetic interval or the `bits_buf` cache. The PCM
+    /// path (§7.3.8.5) needs this so it can advance past
+    /// `pcm_alignment_zero_bit` without double-counting buffered bits.
+    pub fn bits_consumed(&self) -> u64 {
+        (self.byte_pos as u64) * 8 - (self.bits_in_buf as u64)
+    }
+
     /// Decode one regular (context-modelled) bin. Mutates `ctx` to advance
     /// the probability state (§9.3.4.3.2).
     pub fn decode_bin(&mut self, ctx: &mut CtxState) -> u32 {
