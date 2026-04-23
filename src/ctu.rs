@@ -35,6 +35,7 @@ use crate::inter::{
 };
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
+use crate::sao::{CtuSaoParams, SaoGrid};
 use crate::scan::{scan_4x4, scan_idx_for_intra};
 use crate::slice::{SliceSegmentHeader, SliceType};
 use crate::sps::SeqParameterSet;
@@ -70,6 +71,10 @@ pub struct Picture {
     pub qp_stride: usize,
     /// Per-4×4 block motion-field grid for inter neighbour lookups.
     pub inter: InterState,
+    /// Per-CTB SAO parameters (§7.4.9.3). Populated by the CTU walker as
+    /// it parses each `sao()` syntax element; read back by the post-decode
+    /// SAO filter (§8.7.3). `None` until the walker attaches one.
+    pub sao_grid: Option<SaoGrid>,
 }
 
 impl Picture {
@@ -97,6 +102,7 @@ impl Picture {
             qp_y: vec![0; w.div_ceil(8) * h.div_ceil(8)],
             qp_stride: w.div_ceil(8),
             inter: InterState::new(width, height),
+            sao_grid: None,
         }
     }
 }
@@ -259,11 +265,10 @@ pub fn decode_slice_ctus(
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
     }
-    // Note: SAO syntax is parsed per-CTU (see decode_sao), but applying SAO
-    // to reconstructed samples is deferred. Streams with SAO decode without
-    // the in-loop filter effect — lower-fidelity but functional. Deblocking
-    // (§8.7.2) runs from decoder::decode_*_slice after CTU reconstruction
-    // finishes, so this gate no longer rejects slices with it enabled.
+    // Note: SAO parameters are parsed per-CTU (see decode_sao) into
+    // `pic.sao_grid`; the post-decode filter (§8.7.3) runs from
+    // `decoder::decode_*_slice` after deblocking. Deblocking (§8.7.2)
+    // runs there too, before SAO.
     if cctx.slice.slice_type == SliceType::P && cctx.ref_list_l0.is_empty() {
         return Err(Error::unsupported("h265 P-slice without RPL0"));
     }
@@ -291,7 +296,12 @@ pub fn decode_slice_ctus(
     let mut engine = CabacEngine::new(rbsp, slice_data_byte_off);
     let mut ctx = Ctx::init(cctx.slice.slice_qp_y, cctx.init_type);
     let mut cu_qp_y = cctx.slice.slice_qp_y;
-    let _ = ctb_log2;
+    // Attach a per-slice SAO grid to the picture so the walker can populate
+    // per-CTB params as each `sao()` syntax element is parsed, and the
+    // post-decode filter (§8.7.3) can read them back later.
+    if cctx.sps.sample_adaptive_offset_enabled_flag {
+        pic.sao_grid = Some(SaoGrid::new(ctbs_x, ctbs_y, ctb_log2));
+    }
     let mut walker = Walker {
         pic,
         cctx,
@@ -357,26 +367,42 @@ impl<'a> Walker<'a> {
         ctx_x: u32,
         ctx_y: u32,
     ) -> Result<()> {
-        // §7.3.8.3 sao() + §9.3.4.2.1 context derivation. The bits are parsed
-        // but values are discarded; actually applying SAO to reconstructed
-        // samples is pending.
-        let mut merge_left = 0u32;
-        let mut merge_up = 0u32;
-        if ctx_x > 0 {
-            merge_left = engine.decode_bin(&mut ctx.sao_merge_flag[0]);
-        }
-        if ctx_y > 0 && merge_left == 0 {
-            merge_up = engine.decode_bin(&mut ctx.sao_merge_flag[0]);
-        }
+        // §7.3.8.3 sao() + §9.3.4.2.1 context derivation. Parses the full
+        // per-CTB SAO parameter set, storing the result in `pic.sao_grid`
+        // so the post-decode filter (§8.7.3) can apply it.
+        let merge_left = if ctx_x > 0 {
+            engine.decode_bin(&mut ctx.sao_merge_flag[0])
+        } else {
+            0
+        };
+        let merge_up = if ctx_y > 0 && merge_left == 0 {
+            engine.decode_bin(&mut ctx.sao_merge_flag[0])
+        } else {
+            0
+        };
         if merge_left == 1 || merge_up == 1 {
+            // §7.4.9.3: SaoParams for this CTB are inherited from the
+            // left / above neighbour. Copy across so the filter stage sees
+            // the merged values.
+            let Some(grid) = self.pic.sao_grid.as_mut() else {
+                return Ok(());
+            };
+            let src = if merge_left == 1 {
+                grid.get(ctx_x - 1, ctx_y).clone()
+            } else {
+                grid.get(ctx_x, ctx_y - 1).clone()
+            };
+            grid.set(ctx_x, ctx_y, src);
             return Ok(());
         }
         // sao_offset_abs is TR with cMax = (1 << (Min(bitDepth, 10) - 5)) - 1,
         // which is 7 for 8-bit. cRiceParam = 0 → unary up to 7 ones then stop.
         let abs_cmax: u32 = 7;
+        let mut params = CtuSaoParams::default();
         // sao_type_idx is shared across Cb and Cr; Cr inherits it.
         let mut chroma_type_idx: u32 = 0;
-        for comp in 0..3 {
+        let mut chroma_eo_class: u32 = 0;
+        for comp in 0..3usize {
             if (comp == 0 && !self.cctx.slice.slice_sao_luma_flag)
                 || (comp > 0 && !self.cctx.slice.slice_sao_chroma_flag)
             {
@@ -410,26 +436,61 @@ impl<'a> Walker<'a> {
                 }
                 *o = cnt;
             }
+            let mut signed = [0i8; 4];
+            let eo_class: u32;
+            let band_position: u8;
             if type_idx == 1 {
                 // Band offset: sign flag for each non-zero offset, then 5-bit
-                // sao_band_position.
-                for &abs in &offset_abs {
+                // sao_band_position. Offsets are stored with the signalled
+                // sign already applied.
+                for (i, &abs) in offset_abs.iter().enumerate() {
                     if abs != 0 {
-                        let _sign = engine.decode_bypass();
+                        let sign = engine.decode_bypass();
+                        signed[i] = if sign == 1 {
+                            -(abs as i32) as i8
+                        } else {
+                            abs as i32 as i8
+                        };
                     }
                 }
+                let mut bp: u32 = 0;
                 for _ in 0..5 {
-                    let _ = engine.decode_bypass();
+                    let b = engine.decode_bypass();
+                    bp = (bp << 1) | b;
                 }
+                eo_class = 0;
+                band_position = bp as u8;
             } else {
-                // Edge offset: sao_eo_class (2 bits) only for luma + Cb; Cr
-                // inherits Cb's class.
-                if comp != 2 {
-                    for _ in 0..2 {
-                        let _ = engine.decode_bypass();
-                    }
+                // Edge offset: signs are fixed by spec (§7.4.9.3): categories
+                // 1, 2 (local min / valley) get + offsets, categories 3, 4
+                // (local max / peak) get − offsets. The parser sees only
+                // magnitudes and applies the spec-fixed signs here.
+                for i in 0..4usize {
+                    let abs = offset_abs[i] as i32;
+                    signed[i] = if i < 2 { abs as i8 } else { -(abs) as i8 };
                 }
+                if comp != 2 {
+                    let mut ec: u32 = 0;
+                    for _ in 0..2 {
+                        let b = engine.decode_bypass();
+                        ec = (ec << 1) | b;
+                    }
+                    eo_class = ec;
+                    if comp == 1 {
+                        chroma_eo_class = ec;
+                    }
+                } else {
+                    eo_class = chroma_eo_class;
+                }
+                band_position = 0;
             }
+            params.type_idx[comp] = type_idx as u8;
+            params.eo_class[comp] = eo_class as u8;
+            params.band_position[comp] = band_position;
+            params.offsets[comp] = signed;
+        }
+        if let Some(grid) = self.pic.sao_grid.as_mut() {
+            grid.set(ctx_x, ctx_y, params);
         }
         Ok(())
     }

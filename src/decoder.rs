@@ -25,6 +25,7 @@ use crate::ctu::{decode_slice_ctus, CtuContext, Picture};
 use crate::deblock::deblock_picture;
 use crate::hvcc::parse_hvcc;
 use crate::inter::{Dpb, RefPicture};
+use crate::sao::apply_sao;
 use crate::nal::{extract_rbsp, iter_annex_b, iter_length_prefixed, NalRef, NalUnitType};
 use crate::pps::{parse_pps, PicParameterSet};
 use crate::slice::{parse_slice_segment_header, SliceSegmentHeader, SliceType};
@@ -178,6 +179,8 @@ impl HevcDecoder {
         // Apply in-loop deblocking filter (§8.7.2) to reconstructed samples
         // before the picture is stored for reference and output.
         deblock_picture(&mut pic, sps, pps, hdr);
+        // SAO (§8.7.3) runs after deblocking and before the DPB write.
+        apply_sao(&mut pic, sps, hdr);
 
         let poc = self.derive_poc(sps, hdr, is_idr);
         self.store_ref_pic(&pic, poc);
@@ -233,6 +236,7 @@ impl HevcDecoder {
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
 
         deblock_picture(&mut pic, sps, pps, hdr);
+        apply_sao(&mut pic, sps, hdr);
 
         self.store_ref_pic(&pic, current_poc);
         Ok(self.emit_frame(&pic, sps))

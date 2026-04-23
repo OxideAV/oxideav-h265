@@ -37,7 +37,9 @@
 //!   the spec's β/tC tables; boundary-strength derivation is an
 //!   approximation over the crate's per-4×4 block state (intra flag,
 //!   motion, cqt_depth) since per-TU CBFs are not yet tracked.
-//! * **SAO** (§8.7.3) — parsed but not applied.
+//! * **SAO** (§8.7.3) — edge-offset + band-offset applied after
+//!   deblocking, before the DPB write. Luma and chroma both handled;
+//!   SAO-merge (left/up) inheritance follows §7.4.9.3.
 //! * **Long-term reference pictures** — rejected.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 //! * **Encoder** — write side is not in scope.
@@ -59,6 +61,8 @@
 //! * [`scan`] — 4×4 sub-block scan tables (diagonal / horizontal /
 //!   vertical) and the intra-mode → scan_idx rule.
 //! * [`ctu`] — coding-tree walker and residual-coding pipeline.
+//! * [`sao`] — Sample Adaptive Offset filter (§8.7.3): per-CTB grid of
+//!   edge-offset + band-offset parameters, applied post-deblock.
 //! * [`hvcc`] — HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3).
 //! * [`decoder`] — registry factory and `HevcDecoder` wiring.
 
@@ -75,6 +79,7 @@ pub mod intra_pred;
 pub mod nal;
 pub mod pps;
 pub mod ptl;
+pub mod sao;
 pub mod scan;
 pub mod slice;
 pub mod sps;
