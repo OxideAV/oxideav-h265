@@ -80,6 +80,7 @@ pub mod cabac;
 pub mod ctu;
 pub mod deblock;
 pub mod decoder;
+pub mod encoder;
 pub mod hvcc;
 pub mod inter;
 pub mod intra_pred;
@@ -112,6 +113,7 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
             .tags([
                 CodecTag::fourcc(b"HEVC"),
                 CodecTag::fourcc(b"H265"),
