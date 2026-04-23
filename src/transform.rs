@@ -140,6 +140,133 @@ pub fn inverse_transform_2d(
     }
 }
 
+/// Forward 1-D transform. Mirror of [`apply_transform_1d`] but with the
+/// matrix indexed as `basis[k][j]` (basis function index on the row,
+/// sample on the column) — i.e. the transpose of the inverse path.
+fn apply_forward_1d(src: &[i32], dst: &mut [i32], n: usize, shift: i32, is_dst: bool) {
+    let round = 1i32 << (shift - 1);
+    let basis_step = 1usize << (5 - n.ilog2());
+    for k in 0..n {
+        let mut sum: i32 = 0;
+        for j in 0..n {
+            let coef = if is_dst {
+                // 4×4 DST-VII: `DST_MATRIX[k][j]` (same matrix used both
+                // ways since the spec provides only the inverse basis;
+                // the forward DST-VII is the transpose of the inverse).
+                DST_MATRIX[k][j] as i32
+            } else {
+                TRANSFORM_MATRIX[k * basis_step][j] as i32
+            };
+            sum += coef * src[j];
+        }
+        dst[k] = (sum + round) >> shift;
+    }
+}
+
+/// Forward 2-D HEVC integer transform — pair of [`inverse_transform_2d`].
+///
+/// Applies the row-pass then column-pass so that a round-trip through
+/// [`forward_transform_2d`] / `dequantize_flat` / [`inverse_transform_2d`]
+/// recovers the input up to integer quantisation error.
+///
+/// The chosen shift pair (`shift1 = log2_tb + bit_depth - 9`,
+/// `shift2 = log2_tb + 6`) matches the spec's forward-direction reference
+/// and pairs with the inverse shifts (`7`, `20 - bit_depth`) so that the
+/// combined fixed-point scaling cancels to 1.
+pub fn forward_transform_2d(
+    samples: &[i32],
+    coeffs: &mut [i32],
+    log2_tb: u32,
+    is_dst: bool,
+    bit_depth: u32,
+) {
+    let n = 1usize << log2_tb;
+    debug_assert_eq!(samples.len(), n * n);
+    debug_assert_eq!(coeffs.len(), n * n);
+
+    let shift1: i32 = log2_tb as i32 + bit_depth as i32 - 9;
+    let shift2: i32 = log2_tb as i32 + 6;
+
+    // First pass: transform each row. Read row `y` of `samples`, write row
+    // `y` of `tmp` (frequency domain along x).
+    let mut tmp = vec![0i32; n * n];
+    let mut row = vec![0i32; n];
+    let mut row_out = vec![0i32; n];
+    for y in 0..n {
+        for x in 0..n {
+            row[x] = samples[y * n + x];
+        }
+        apply_forward_1d(&row, &mut row_out, n, shift1, is_dst);
+        for x in 0..n {
+            tmp[y * n + x] = row_out[x];
+        }
+    }
+    // Second pass: transform each column of `tmp`.
+    let mut col = vec![0i32; n];
+    let mut col_out = vec![0i32; n];
+    for x in 0..n {
+        for y in 0..n {
+            col[y] = tmp[y * n + x];
+        }
+        apply_forward_1d(&col, &mut col_out, n, shift2, is_dst);
+        for y in 0..n {
+            coeffs[y * n + x] = col_out[y];
+        }
+    }
+}
+
+/// Forward quantisation that pairs with [`dequantize_flat`]. Produces a
+/// signed level such that `dequantize_flat(quantize_flat(x)) ≈ x`.
+///
+/// The inverse applies `v = (level * 16 * scale << q_div + round) >> bd_shift`
+/// where `scale = LEVEL_SCALE[q_rem]` and `bd_shift = bit_depth + log2_tb - 5`.
+/// We invert that with a round-to-nearest on the level.
+pub fn quantize_flat(
+    coeffs: &[i32],
+    levels: &mut [i32],
+    qp: i32,
+    log2_tb: u32,
+    bit_depth: u32,
+) {
+    let n = 1usize << log2_tb;
+    debug_assert_eq!(coeffs.len(), n * n);
+    debug_assert_eq!(levels.len(), n * n);
+
+    let q_div = qp / 6;
+    let q_rem = qp.rem_euclid(6) as usize;
+    let scale = LEVEL_SCALE[q_rem] as i64;
+    let bd_shift = bit_depth as i32 + log2_tb as i32 - 5;
+
+    // The dequant path computes:
+    //   v = ((level * 16 * scale) << q_div + round) >> bd_shift
+    //
+    // Solving for `level` given `v`:
+    //   level ≈ v * (1 << bd_shift) / (16 * scale * (1 << q_div))
+    //
+    // Express the denominator in an integer-friendly form. We keep a
+    // dead-zone quantiser (add ~1/3 of the step magnitude for rounding
+    // bias) so small coefficients round away to zero — mirrors what real
+    // encoders use and avoids wasting bits on noise.
+    let denom = (16i64 * scale) << q_div;
+    // Rounding offset — approximately one third of the step to bias
+    // toward zero (dead-zone quantisation).
+    let offset = denom / 3;
+    for i in 0..n * n {
+        let c = coeffs[i] as i64;
+        let num_shifted = (c.abs()) << bd_shift;
+        let level_mag = if num_shifted > offset {
+            (num_shifted - offset) / denom
+        } else {
+            0
+        };
+        levels[i] = if c < 0 {
+            -(level_mag as i32)
+        } else {
+            level_mag as i32
+        };
+    }
+}
+
 /// Dequantise an n×n coefficient block without scaling lists.
 ///
 /// * `coeffs_in` — signed level values from the bitstream.

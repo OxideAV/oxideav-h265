@@ -141,12 +141,25 @@ impl<'a> CtuContext<'a> {
 }
 
 /// Inter CU partition modes we support.
+///
+/// The four symmetric shapes (§7.4.9.5 Table 7-10) plus the four AMP shapes
+/// enabled when `amp_enabled_flag = 1`. AMP splits the CB asymmetrically
+/// into quarter + three-quarter stripes:
+///
+/// * `Mode2NxnU` — top stripe `cb/4`, bottom `3·cb/4`.
+/// * `Mode2NxnD` — top stripe `3·cb/4`, bottom `cb/4`.
+/// * `ModenLx2N` — left stripe `cb/4`, right `3·cb/4`.
+/// * `ModenRx2N` — left stripe `3·cb/4`, right `cb/4`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InterPart {
     Mode2Nx2N,
     Mode2NxN,
     ModeNx2N,
     ModeNxN,
+    Mode2NxnU,
+    Mode2NxnD,
+    ModenLx2N,
+    ModenRx2N,
 }
 
 #[derive(Clone)]
@@ -383,6 +396,7 @@ pub fn decode_slice_ctus(
         qpy_prev: cctx.slice.slice_qp_y,
         qpy_pred: cctx.slice.slice_qp_y,
         scaling_list: active_scaling_list.as_ref(),
+        cu_transquant_bypass: false,
     };
 
     if multi_tile {
@@ -560,6 +574,12 @@ struct Walker<'a> {
     /// Resolved scaling-list data (§7.4.5) for this slice, or `None` when
     /// `scaling_list_enabled_flag == 0` (in which case `m[x][y] = 16`).
     scaling_list: Option<&'a ScalingListData>,
+    /// `cu_transquant_bypass_flag` (§7.4.9.5) for the CU currently being
+    /// decoded. When set, the transform tree skips dequantisation and the
+    /// inverse transform — decoded level values are taken as the spatial-
+    /// domain residual and added directly to the predictor (§8.6.2, eq.
+    /// 8-277 with `bdShift = 0`). Reset at the start of each CU.
+    cu_transquant_bypass: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -845,11 +865,15 @@ impl<'a> Walker<'a> {
             self.perform_merge(x0, y0, cb_size, cb_size, merge_idx)?;
             return Ok(());
         }
+        // §7.4.9.5 cu_transquant_bypass_flag. When the PPS opts in, each CU
+        // carries a bypass flag; per-CU state is reset here before the
+        // transform tree consults it. When bypass is set, the transform
+        // tree copies decoded levels straight into the reconstruction
+        // (no dequant, no inverse transform, no deblock/SAO contribution).
+        self.cu_transquant_bypass = false;
         if self.cctx.pps.transquant_bypass_enabled_flag {
             let bypass = engine.decode_bin(&mut ctx.cu_transquant_bypass_flag[0]);
-            if bypass == 1 {
-                return Err(Error::unsupported("h265 transquant_bypass pending"));
-            }
+            self.cu_transquant_bypass = bypass == 1;
         }
 
         // pred_mode_flag: for P/B slices, 0 = INTER, 1 = INTRA. For I slice,
@@ -862,15 +886,23 @@ impl<'a> Walker<'a> {
         };
 
         if is_inter {
-            // part_mode for inter (§7.3.8.5, Table 7-10). AMP not supported.
+            // part_mode for inter (§7.3.8.5, Table 7-10). AMP is only
+            // available when `amp_enabled_flag == 1` and `log2_cb > minCb`.
+            // For `log2_cb == minCb` a second split level (NxN) is permitted
+            // when `log2_cb > 3`.
+            let amp = self.cctx.sps.amp_enabled_flag && log2_cb > self.min_cb_log2;
             let b0 = engine.decode_bin(&mut ctx.part_mode[0]);
             let part_mode = if b0 == 1 {
                 InterPart::Mode2Nx2N
             } else {
+                // b1 = 1 selects the horizontal family (2NxN / 2NxnU /
+                // 2NxnD); b1 = 0 selects the vertical family.
                 let b1 = engine.decode_bin(&mut ctx.part_mode[1]);
                 let at_min = log2_cb == self.min_cb_log2;
                 let log2_gt_3 = log2_cb > 3;
                 if at_min && log2_gt_3 {
+                    // At the smallest CU size (>8), NxN replaces AMP in the
+                    // third bin.
                     if b1 == 1 {
                         InterPart::Mode2NxN
                     } else {
@@ -879,6 +911,33 @@ impl<'a> Walker<'a> {
                             InterPart::ModeNx2N
                         } else {
                             InterPart::ModeNxN
+                        }
+                    }
+                } else if amp {
+                    // Horizontal or vertical AMP: the third bin is bypass-
+                    // coded (§9.3.4.2.1) — 0 distinguishes the symmetric
+                    // case, 1 triggers a fourth bypass bin for the quarter-
+                    // position selection.
+                    let is_amp = engine.decode_bypass();
+                    if b1 == 1 {
+                        if is_amp == 0 {
+                            InterPart::Mode2NxN
+                        } else {
+                            let pos = engine.decode_bypass();
+                            if pos == 0 {
+                                InterPart::Mode2NxnU
+                            } else {
+                                InterPart::Mode2NxnD
+                            }
+                        }
+                    } else if is_amp == 0 {
+                        InterPart::ModeNx2N
+                    } else {
+                        let pos = engine.decode_bypass();
+                        if pos == 0 {
+                            InterPart::ModenLx2N
+                        } else {
+                            InterPart::ModenRx2N
                         }
                     }
                 } else if b1 == 1 {
@@ -1300,6 +1359,7 @@ impl<'a> Walker<'a> {
         part_mode: InterPart,
     ) -> Result<()> {
         let cb_size = 1u32 << log2_cb;
+        let q = cb_size / 4;
         let pbs: Vec<(u32, u32, u32, u32)> = match part_mode {
             InterPart::Mode2Nx2N => vec![(x0, y0, cb_size, cb_size)],
             InterPart::Mode2NxN => vec![
@@ -1315,6 +1375,26 @@ impl<'a> Walker<'a> {
                 (x0 + cb_size / 2, y0, cb_size / 2, cb_size / 2),
                 (x0, y0 + cb_size / 2, cb_size / 2, cb_size / 2),
                 (x0 + cb_size / 2, y0 + cb_size / 2, cb_size / 2, cb_size / 2),
+            ],
+            // AMP shapes (§7.4.9.5 Table 7-10). The top/left stripe is the
+            // "quarter" (cb/4) slice; the second stripe fills the remainder
+            // (3·cb/4). "U" / "L" place the quarter stripe first;
+            // "D" / "R" place it last.
+            InterPart::Mode2NxnU => vec![
+                (x0, y0, cb_size, q),
+                (x0, y0 + q, cb_size, cb_size - q),
+            ],
+            InterPart::Mode2NxnD => vec![
+                (x0, y0, cb_size, cb_size - q),
+                (x0, y0 + cb_size - q, cb_size, q),
+            ],
+            InterPart::ModenLx2N => vec![
+                (x0, y0, q, cb_size),
+                (x0 + q, y0, cb_size - q, cb_size),
+            ],
+            InterPart::ModenRx2N => vec![
+                (x0, y0, cb_size - q, cb_size),
+                (x0 + cb_size - q, y0, q, cb_size),
             ],
         };
         for (px, py, pw, ph) in &pbs {
@@ -1821,16 +1901,20 @@ impl<'a> Walker<'a> {
             /*pred_mode*/ 0,
             is_luma,
         )?;
-        let qp = self.get_qp(is_luma, false);
-        let mut deq = vec![0i32; n * n];
-        self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, ts);
         let mut res = vec![0i32; n * n];
-        if ts {
-            // §8.6.4.2 eq. 8-298: skip iDCT, apply tsShift/bdShift.
-            transform_skip_2d(&deq, &mut res, log2_tb, 8);
+        if self.cu_transquant_bypass {
+            res.copy_from_slice(&levels);
         } else {
-            // Inter TU: DCT only (no DST-VII even at 4×4).
-            inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            let qp = self.get_qp(is_luma, false);
+            let mut deq = vec![0i32; n * n];
+            self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, ts);
+            if ts {
+                // §8.6.4.2 eq. 8-298: skip iDCT, apply tsShift/bdShift.
+                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            } else {
+                // Inter TU: DCT only (no DST-VII even at 4×4).
+                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            }
         }
         self.add_to_plane(x0, y0, n, &res, is_luma, false);
         Ok(())
@@ -1847,14 +1931,18 @@ impl<'a> Walker<'a> {
         let n = 1usize << log2_tb;
         let mut levels = vec![0i32; n * n];
         let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
-        let qp = self.get_qp(false, true);
-        let mut deq = vec![0i32; n * n];
-        self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, ts);
         let mut res = vec![0i32; n * n];
-        if ts {
-            transform_skip_2d(&deq, &mut res, log2_tb, 8);
+        if self.cu_transquant_bypass {
+            res.copy_from_slice(&levels);
         } else {
-            inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            let qp = self.get_qp(false, true);
+            let mut deq = vec![0i32; n * n];
+            self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, ts);
+            if ts {
+                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            } else {
+                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+            }
         }
         self.add_to_plane(x0, y0, n, &res, false, true);
         Ok(())
@@ -2115,15 +2203,24 @@ impl<'a> Walker<'a> {
             let mut levels = vec![0i32; n * n];
             let ts =
                 self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
-            let qp = self.get_qp(is_luma, false);
-            let mut deq = vec![0i32; n * n];
-            self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, ts);
             let mut res = vec![0i32; n * n];
-            if ts {
-                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            if self.cu_transquant_bypass {
+                // §8.6.2 bypass path: levels already represent the spatial
+                // residual. The spec applies neither dequantisation nor the
+                // inverse transform. Residuals are placed directly (scan
+                // order aside — `residual_coding` already writes in raster
+                // order) and added to the predictor.
+                res.copy_from_slice(&levels);
             } else {
-                let is_dst = is_luma && log2_tb == 2;
-                inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+                let qp = self.get_qp(is_luma, false);
+                let mut deq = vec![0i32; n * n];
+                self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, ts);
+                if ts {
+                    transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                } else {
+                    let is_dst = is_luma && log2_tb == 2;
+                    inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+                }
             }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
@@ -2159,14 +2256,18 @@ impl<'a> Walker<'a> {
         if has_coeff {
             let mut levels = vec![0i32; n * n];
             let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
-            let mut deq = vec![0i32; n * n];
-            let qp = self.get_qp(false, true);
-            self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, ts);
             let mut res = vec![0i32; n * n];
-            if ts {
-                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+            if self.cu_transquant_bypass {
+                res.copy_from_slice(&levels);
             } else {
-                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+                let mut deq = vec![0i32; n * n];
+                let qp = self.get_qp(false, true);
+                self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, ts);
+                if ts {
+                    transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                } else {
+                    inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+                }
             }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
@@ -2490,7 +2591,10 @@ impl<'a> Walker<'a> {
         // (Log2MaxTransformSkipSize defaults to 2), and the CU is not in
         // transquant-bypass mode. Rext can raise the cap; we clamp at 2
         // for the base profile.
-        let transform_skip_flag = if self.cctx.pps.transform_skip_enabled_flag && log2_tb == 2 {
+        let transform_skip_flag = if self.cctx.pps.transform_skip_enabled_flag
+            && log2_tb == 2
+            && !self.cu_transquant_bypass
+        {
             let ctx_arr: &mut [CtxState; 1] = if is_luma {
                 &mut ctx.transform_skip_flag_luma
             } else {
