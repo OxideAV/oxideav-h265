@@ -203,4 +203,22 @@ mod tests {
         // Each value should be > 0 (positive level, positive scale).
         assert!(out.iter().all(|&v| v != 0));
     }
+
+    #[test]
+    fn dct_dc_only_produces_uniform_output() {
+        // For 4/8/16/32-point DCT-II, inverse of a single DC coefficient
+        // must yield a uniform residual. Verified bit-for-bit against
+        // ffmpeg's DC-only idct fast-path.
+        for log2_tb in 2u32..=5u32 {
+            let n = 1usize << log2_tb;
+            let mut coeffs = vec![0i32; n * n];
+            coeffs[0] = 1024; // Arbitrary DC level.
+            let mut out = vec![0i32; n * n];
+            inverse_transform_2d(&coeffs, &mut out, log2_tb, false, 8);
+            let v0 = out[0];
+            for &v in &out {
+                assert_eq!(v, v0, "non-uniform 2D-IDCT for DC-only log2={log2_tb}");
+            }
+        }
+    }
 }

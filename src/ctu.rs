@@ -1653,6 +1653,16 @@ impl<'a> Walker<'a> {
             let mut res = vec![0i32; n * n];
             let is_dst = is_luma && log2_tb == 2;
             inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+            if std::env::var_os("H265_TRACE_RESIDUAL").is_some() {
+                let plane = if is_luma { "Y" } else { "C" };
+                let nonzero: Vec<(usize, usize, i32)> = (0..n * n)
+                    .filter(|&i| levels[i] != 0)
+                    .map(|i| (i % n, i / n, levels[i]))
+                    .collect();
+                eprintln!(
+                    "{plane} TU x={x0} y={y0} log2={log2_tb} qp={qp} dst={is_dst} mode={pred_mode} coefs={nonzero:?}"
+                );
+            }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
                 pred[i] = v.clamp(0, 255) as u8;
