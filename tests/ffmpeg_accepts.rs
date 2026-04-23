@@ -68,20 +68,25 @@ fn encode(frame: &VideoFrame) -> Vec<u8> {
     enc.receive_packet().unwrap().data
 }
 
-#[test]
-fn ffmpeg_decodes_our_bitstream() {
-    if !have_ffmpeg() {
-        eprintln!("[skip] ffmpeg not enabled — set FFMPEG=1 to run");
-        return;
-    }
-    let w = 64;
-    let h = 64;
+fn run_one(w: u32, h: u32) {
     let src = make_gradient_frame(w, h);
     let bytes = encode(&src);
 
     let tmp: PathBuf = std::env::temp_dir();
-    let h265_path = tmp.join(format!("oxideav_h265_enc_{}.h265", std::process::id()));
-    let yuv_path = tmp.join(format!("oxideav_h265_dec_{}.yuv", std::process::id()));
+    // Include dimensions + a nanosecond timestamp in the filename so
+    // tests running in parallel don't collide on the same temp files.
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = format!(
+        "oxideav_h265_{}_{}x{}_{ns}",
+        std::process::id(),
+        w,
+        h
+    );
+    let h265_path = tmp.join(format!("{stem}.h265"));
+    let yuv_path = tmp.join(format!("{stem}.yuv"));
     {
         let mut f = std::fs::File::create(&h265_path).unwrap();
         f.write_all(&bytes).unwrap();
@@ -126,4 +131,23 @@ fn ffmpeg_decodes_our_bitstream() {
     // Clean up.
     let _ = std::fs::remove_file(&h265_path);
     let _ = std::fs::remove_file(&yuv_path);
+}
+
+#[test]
+fn ffmpeg_decodes_our_bitstream() {
+    if !have_ffmpeg() {
+        eprintln!("[skip] ffmpeg not enabled — set FFMPEG=1 to run");
+        return;
+    }
+    run_one(64, 64);
+}
+
+#[test]
+fn ffmpeg_decodes_multi_ctu() {
+    if !have_ffmpeg() {
+        eprintln!("[skip] ffmpeg not enabled — set FFMPEG=1 to run");
+        return;
+    }
+    run_one(128, 64);
+    run_one(128, 128);
 }
