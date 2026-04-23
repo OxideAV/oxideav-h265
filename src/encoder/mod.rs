@@ -30,9 +30,9 @@
 
 pub mod bit_writer;
 pub mod cabac_writer;
-pub mod encoder;
+pub mod hevc_encoder;
 pub mod nal_writer;
 pub mod params;
 pub mod slice_writer;
 
-pub use encoder::{make_encoder, HevcEncoder};
+pub use hevc_encoder::{make_encoder, HevcEncoder};
