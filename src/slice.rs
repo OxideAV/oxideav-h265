@@ -148,6 +148,20 @@ pub struct SliceSegmentHeader {
     pub ref_pic_list_modification_flag_l1: bool,
     /// `list_entry_l1[i]` (§7.3.6.2).
     pub list_entry_l1: Vec<u32>,
+    /// `num_entry_point_offsets` (§7.3.6.3). Present only when tiles or
+    /// WPP are enabled. Zero otherwise; also zero for the single-tile /
+    /// single-CTU-row WPP degenerate cases.
+    pub num_entry_point_offsets: u32,
+    /// `offset_len_minus1` — width in bits of each `entry_point_offset`
+    /// code when `num_entry_point_offsets > 0`.
+    pub offset_len_minus1: u32,
+    /// Entry-point offsets in bytes from the end of the slice segment
+    /// header, after the final `byte_alignment()`. `entry_point_offsets[i]`
+    /// is the cumulative byte offset of the (i+1)-th sub-stream start
+    /// (tile or CTU row) — equal to
+    /// `sum(entry_point_offset_minus1[0..=i] + 1)`. Index 0 of a slice is
+    /// always at offset 0 (the slice_data_bit_offset itself).
+    pub entry_point_offsets: Vec<u64>,
 }
 
 /// Parse a slice segment header given the active PPS+SPS and the NAL header
@@ -327,6 +341,9 @@ pub fn parse_slice_segment_header(
     let mut ref_pic_list_modification_flag_l1 = false;
     let mut list_entry_l0: Vec<u32> = Vec::new();
     let mut list_entry_l1: Vec<u32> = Vec::new();
+    let mut num_entry_point_offsets: u32 = 0;
+    let mut offset_len_minus1: u32 = 0;
+    let mut entry_point_offsets: Vec<u64> = Vec::new();
 
     // Only attempt the full parse for single-segment slices (not dependent).
     if !dependent_slice_segment_flag && !sps.separate_colour_plane_flag {
@@ -437,25 +454,30 @@ pub fn parse_slice_segment_header(
             slice_loop_filter_across_slices_enabled_flag = br.u1()? == 1;
         }
         if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
-            let num_entry_point_offsets = br.ue()?;
-            if num_entry_point_offsets > 0 {
-                // Entry-point offsets — needed only for tiles / WPP which is
-                // out of scope. Abort the extension parse.
-                return Ok(partial_header(
-                    first_slice_segment_in_pic_flag,
-                    no_output_of_prior_pics_flag,
-                    slice_pic_parameter_set_id,
-                    dependent_slice_segment_flag,
-                    slice_segment_address,
-                    slice_type,
-                    pic_output_flag,
-                    colour_plane_id,
-                    slice_pic_order_cnt_lsb,
-                    short_term_ref_pic_set_sps_flag,
-                    short_term_ref_pic_set_idx,
-                    current_rps,
-                    pps,
-                ));
+            // §7.3.6.3 entry_point_offsets. Each `entry_point_offset_minus1[i]`
+            // is coded as `u(offset_len_minus1+1)`. The spec defines
+            // `entry_point_offset_minus1[i]` such that the byte distance
+            // from the start of the previous sub-stream to the start of
+            // sub-stream i+1 is `entry_point_offset_minus1[i] + 1`. We keep
+            // cumulative offsets (bytes) so the decoder can jump straight
+            // to each sub-stream's CABAC restart point.
+            let n = br.ue()?;
+            if n > 0 {
+                let ol = br.ue()?;
+                if ol > 31 {
+                    return Err(Error::invalid(format!(
+                        "h265 slice: offset_len_minus1 out of range ({ol})"
+                    )));
+                }
+                num_entry_point_offsets = n;
+                offset_len_minus1 = ol;
+                entry_point_offsets.reserve(n as usize);
+                let mut cum: u64 = 0;
+                for _ in 0..n {
+                    let raw = br.u(ol + 1)? as u64;
+                    cum += raw + 1;
+                    entry_point_offsets.push(cum);
+                }
             }
         }
         if pps.slice_segment_header_extension_present_flag {
@@ -528,6 +550,9 @@ pub fn parse_slice_segment_header(
         list_entry_l0,
         ref_pic_list_modification_flag_l1,
         list_entry_l1,
+        num_entry_point_offsets,
+        offset_len_minus1,
+        entry_point_offsets,
     })
 }
 
@@ -620,70 +645,6 @@ fn parse_pred_weight_table(
         l1_luma,
         l1_chroma,
     })
-}
-
-/// Build a `SliceSegmentHeader` for the "abort extension parse" path with
-/// whatever we decoded before the unsupported feature.
-#[allow(clippy::too_many_arguments)]
-fn partial_header(
-    first_slice_segment_in_pic_flag: bool,
-    no_output_of_prior_pics_flag: bool,
-    slice_pic_parameter_set_id: u32,
-    dependent_slice_segment_flag: bool,
-    slice_segment_address: u32,
-    slice_type: SliceType,
-    pic_output_flag: bool,
-    colour_plane_id: u8,
-    slice_pic_order_cnt_lsb: u32,
-    short_term_ref_pic_set_sps_flag: bool,
-    short_term_ref_pic_set_idx: u32,
-    current_rps: Option<ShortTermRps>,
-    pps: &PicParameterSet,
-) -> SliceSegmentHeader {
-    SliceSegmentHeader {
-        first_slice_segment_in_pic_flag,
-        no_output_of_prior_pics_flag,
-        slice_pic_parameter_set_id,
-        dependent_slice_segment_flag,
-        slice_segment_address,
-        slice_type,
-        pic_output_flag,
-        colour_plane_id,
-        slice_pic_order_cnt_lsb,
-        short_term_ref_pic_set_sps_flag,
-        short_term_ref_pic_set_idx,
-        slice_sao_luma_flag: false,
-        slice_sao_chroma_flag: false,
-        cabac_init_flag: false,
-        slice_qp_delta: 0,
-        slice_qp_y: 26 + pps.init_qp_minus26,
-        slice_loop_filter_across_slices_enabled_flag: pps
-            .pps_loop_filter_across_slices_enabled_flag,
-        slice_deblocking_filter_disabled_flag: pps.pps_deblocking_filter_disabled_flag,
-        slice_beta_offset_div2: pps.pps_beta_offset_div2,
-        slice_tc_offset_div2: pps.pps_tc_offset_div2,
-        slice_data_bit_offset: 0,
-        is_full_i_slice: false,
-        is_full_p_slice: false,
-        is_full_b_slice: false,
-        collocated_ref_idx: 0,
-        weighted_pred: None,
-        current_rps,
-        long_term_refs: Vec::new(),
-        num_ref_idx_l0_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
-        num_ref_idx_l1_active_minus1: pps.num_ref_idx_l1_default_active_minus1,
-        mvd_l1_zero_flag: false,
-        collocated_from_l0_flag: true,
-        five_minus_max_num_merge_cand: 0,
-        max_num_merge_cand: 5,
-        slice_temporal_mvp_enabled_flag: false,
-        slice_cb_qp_offset: 0,
-        slice_cr_qp_offset: 0,
-        ref_pic_list_modification_flag_l0: false,
-        list_entry_l0: Vec::new(),
-        ref_pic_list_modification_flag_l1: false,
-        list_entry_l1: Vec::new(),
-    }
 }
 
 /// PicWidthInCtbsY * PicHeightInCtbsY (§7.4.7.1).
