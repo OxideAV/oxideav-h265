@@ -815,7 +815,6 @@ fn hevc_intra_gray_64_qp51_matches_ffmpeg() {
 }
 
 #[test]
-#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_intra_gray_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "exact-intra-gray-64.h265",
@@ -832,7 +831,6 @@ fn hevc_intra_gray_64_matches_ffmpeg() {
 }
 
 #[test]
-#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_intra_fixture_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "exact-intra-gray.h265",
@@ -858,7 +856,6 @@ fn hevc_intra_fixture_matches_ffmpeg() {
 }
 
 #[test]
-#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_p_slice_fixture_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "exact-ip-gray.h265",
@@ -967,68 +964,3 @@ fn hevc_angular_intra_fixture_decodes() {
 }
 
 
-#[test]
-fn dump_sps_64_for_debugging() {
-    let Some(input) = ensure_generated_hevc_fixture(
-        "exact-intra-gray-64.h265",
-        "color=c=gray:size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
-    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
-    for nal in iter_annex_b(&data) {
-        if nal.header.nal_unit_type == NalUnitType::Sps {
-            let rbsp = extract_rbsp(nal.payload());
-            let sps = parse_sps(&rbsp).expect("SPS parse");
-            eprintln!("SPS64: min_cu_log2+3={} diff_max_min={} ctu_size={} min_tb=2+{} max_tb=+{} max_trafo_intra={}",
-                sps.log2_min_luma_coding_block_size_minus3,
-                sps.log2_diff_max_min_luma_coding_block_size,
-                1u32 << (sps.log2_min_luma_coding_block_size_minus3 + 3 + sps.log2_diff_max_min_luma_coding_block_size),
-                sps.log2_min_luma_transform_block_size_minus2,
-                sps.log2_diff_max_min_luma_transform_block_size,
-                sps.max_transform_hierarchy_depth_intra);
-            return;
-        }
-    }
-}
-
-#[test]
-#[ignore = "debug only"]
-fn dump_qgd() {
-    let Some(input) = ensure_generated_hevc_fixture(
-        "exact-intra-gray-64.h265",
-        "color=c=gray:size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
-    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
-    for nal in iter_annex_b(&data) {
-        if nal.header.nal_unit_type == NalUnitType::Pps {
-            let rbsp = extract_rbsp(nal.payload());
-            let pps = parse_pps(&rbsp).expect("PPS parse");
-            eprintln!("diff_cu_qp_delta_depth={}", pps.diff_cu_qp_delta_depth);
-            return;
-        }
-    }
-}
-
-#[test]
-#[ignore = "debug only"]
-fn dump_pps_for_debug() {
-    let Some(input) = ensure_generated_hevc_fixture(
-        "gray16.h265",
-        "color=c=gray:size=16x16:rate=1:duration=1", 1, 1, 1,
-    ) else { return; };
-    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
-    for nal in iter_annex_b(&data) {
-        if nal.header.nal_unit_type == NalUnitType::Pps {
-            let rbsp = extract_rbsp(nal.payload());
-            let pps = parse_pps(&rbsp).expect("PPS parse");
-            eprintln!("PPS: cu_qp_delta_enabled={} init_qp_minus26={} sign_data_hiding={} transform_skip={} scaling_list={}",
-                pps.cu_qp_delta_enabled_flag,
-                pps.init_qp_minus26,
-                pps.sign_data_hiding_enabled_flag,
-                pps.transform_skip_enabled_flag,
-                false);
-            return;
-        }
-    }
-}

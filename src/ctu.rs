@@ -59,6 +59,10 @@ pub struct Picture {
     /// Per-4×4 block coding-quadtree depth of the containing CU. Used for
     /// `split_cu_flag` context derivation (§9.3.4.2.2).
     pub cqt_depth: Vec<u8>,
+    /// Per-4×4 block "decoded" flag. A sample is available for intra
+    /// reference only when its containing 4×4 block has already been
+    /// reconstructed (Z-scan order per §6.4.3).
+    pub decoded_4x4: Vec<bool>,
     /// Per-4×4 block motion-field grid for inter neighbour lookups.
     pub inter: InterState,
 }
@@ -84,6 +88,7 @@ impl Picture {
             intra_height_4: ih4,
             is_intra: vec![true; iw4 * ih4],
             cqt_depth: vec![0u8; iw4 * ih4],
+            decoded_4x4: vec![false; iw4 * ih4],
             inter: InterState::new(width, height),
         }
     }
@@ -1162,6 +1167,12 @@ impl<'a> Walker<'a> {
             luma_modes[i] = mode;
             self.store_luma_mode(pu_x, pu_y, pu_size, mode as u8);
         }
+        if std::env::var_os("H265_TRACE_MODE").is_some() {
+            eprintln!(
+                "intra CU x={x0} y={y0} log2_cb={log2_cb} nxn={part_mode_nxn} modes={:?}",
+                &luma_modes[..num_pus]
+            );
+        }
 
         // intra_chroma_pred_mode (once per CU) — TR(cMax=4).
         let icpm_first = engine.decode_bin(&mut ctx.intra_chroma_pred_mode[0]);
@@ -1710,6 +1721,9 @@ impl<'a> Walker<'a> {
 
         // Write to picture.
         self.write_block(x0, y0, n, &pred, is_luma, false);
+        if is_luma {
+            self.mark_decoded_block(x0, y0, n as u32);
+        }
         Ok(())
     }
 
@@ -1798,19 +1812,36 @@ impl<'a> Walker<'a> {
         };
         let x0 = x0 as usize;
         let y0 = y0 as usize;
+        // Convert to luma-space coords for the decoded-block lookup.
+        let luma_shift = usize::from(!is_luma);
+        let is_decoded = |lx: usize, ly: usize| -> bool {
+            let bx = lx >> 2;
+            let by = ly >> 2;
+            bx < self.pic.intra_width_4
+                && by < self.pic.intra_height_4
+                && self.pic.decoded_4x4[by * self.pic.intra_width_4 + bx]
+        };
 
         // top-left corner p[-1, -1]
         if x0 > 0 && y0 > 0 {
-            samples[0] = plane[(y0 - 1) * stride + (x0 - 1)];
-            avail[0] = true;
+            let lx = (x0 - 1) << luma_shift;
+            let ly = (y0 - 1) << luma_shift;
+            if is_decoded(lx, ly) {
+                samples[0] = plane[(y0 - 1) * stride + (x0 - 1)];
+                avail[0] = true;
+            }
         }
         // top row p[0..2n-1, -1]
         if y0 > 0 {
             for i in 0..(2 * n) {
                 let xx = x0 + i;
                 if xx < pic_w {
-                    samples[1 + i] = plane[(y0 - 1) * stride + xx];
-                    avail[1 + i] = true;
+                    let lx = xx << luma_shift;
+                    let ly = (y0 - 1) << luma_shift;
+                    if is_decoded(lx, ly) {
+                        samples[1 + i] = plane[(y0 - 1) * stride + xx];
+                        avail[1 + i] = true;
+                    }
                 }
             }
         }
@@ -1819,12 +1850,35 @@ impl<'a> Walker<'a> {
             for i in 0..(2 * n) {
                 let yy = y0 + i;
                 if yy < pic_h {
-                    samples[2 * n + 1 + i] = plane[yy * stride + (x0 - 1)];
-                    avail[2 * n + 1 + i] = true;
+                    let lx = (x0 - 1) << luma_shift;
+                    let ly = yy << luma_shift;
+                    if is_decoded(lx, ly) {
+                        samples[2 * n + 1 + i] = plane[yy * stride + (x0 - 1)];
+                        avail[2 * n + 1 + i] = true;
+                    }
                 }
             }
         }
         build_ref_samples(&samples, &avail, n)
+    }
+
+    /// Mark a `size × size` region starting at `(x, y)` as reconstructed
+    /// so subsequent intra-pred reference-sample gathering can see it.
+    fn mark_decoded_block(&mut self, x: u32, y: u32, size: u32) {
+        let bx0 = (x >> 2) as usize;
+        let by0 = (y >> 2) as usize;
+        let n4 = (size >> 2).max(1) as usize;
+        let iw = self.pic.intra_width_4;
+        let ih = self.pic.intra_height_4;
+        for dy in 0..n4 {
+            for dx in 0..n4 {
+                let bx = bx0 + dx;
+                let by = by0 + dy;
+                if bx < iw && by < ih {
+                    self.pic.decoded_4x4[by * iw + bx] = true;
+                }
+            }
+        }
     }
 
     fn write_rect(
