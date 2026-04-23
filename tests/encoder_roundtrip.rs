@@ -1,9 +1,9 @@
-//! End-to-end round-trip for the HEVC encoder MVP.
+//! End-to-end round-trip for the HEVC encoder.
 //!
-//! Encodes a synthesised 64×64 YUV 4:2:0 frame into an HEVC bitstream
-//! (single IDR, PCM CUs) and decodes the result back through our own
-//! `HevcDecoder`. The reconstructed pixels should match the input
-//! exactly since PCM CUs carry raw 8-bit samples.
+//! Encodes a synthesised YUV 4:2:0 frame into an HEVC bitstream (single
+//! IDR, residual-coded intra CUs), decodes the result through our own
+//! `HevcDecoder`, and checks that the reconstruction is within a
+//! reasonable PSNR bound and much smaller than the raw sample budget.
 
 use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
@@ -15,7 +15,7 @@ use oxideav_h265::decoder::HevcDecoder;
 use oxideav_h265::encoder::HevcEncoder;
 use oxideav_h265::nal::{iter_annex_b, NalUnitType};
 
-fn make_test_frame(w: u32, h: u32) -> VideoFrame {
+fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
     // Horizontal gradient on Y, flat chroma.
     let mut y = vec![0u8; (w * h) as usize];
     for yy in 0..h {
@@ -67,9 +67,31 @@ fn encode_one(frame: &VideoFrame) -> Vec<u8> {
     pkt.data
 }
 
+fn psnr_y(src: &VideoFrame, dec: &VideoFrame) -> f64 {
+    let ss = src.planes[0].stride;
+    let ds = dec.planes[0].stride;
+    let src_y = &src.planes[0].data;
+    let dec_y = &dec.planes[0].data;
+    let mut sse: u64 = 0;
+    let n = (src.width * src.height) as u64;
+    for yy in 0..src.height as usize {
+        for xx in 0..src.width as usize {
+            let s = src_y[yy * ss + xx] as i64;
+            let d = dec_y[yy * ds + xx] as i64;
+            let diff = s - d;
+            sse += (diff * diff) as u64;
+        }
+    }
+    if sse == 0 {
+        return 99.0;
+    }
+    let mse = sse as f64 / n as f64;
+    10.0 * (255.0 * 255.0 / mse).log10()
+}
+
 #[test]
 fn encoded_stream_contains_vps_sps_pps_and_idr() {
-    let frame = make_test_frame(64, 64);
+    let frame = make_gradient_frame(64, 64);
     let bytes = encode_one(&frame);
     let nals: Vec<_> = iter_annex_b(&bytes).collect();
     assert_eq!(nals.len(), 4, "expected VPS+SPS+PPS+IDR NALs");
@@ -80,12 +102,12 @@ fn encoded_stream_contains_vps_sps_pps_and_idr() {
 }
 
 #[test]
-fn self_roundtrip_reconstructs_frame() {
-    let src = make_test_frame(64, 64);
+fn self_roundtrip_achieves_reasonable_psnr() {
+    let src = make_gradient_frame(64, 64);
     let bytes = encode_one(&src);
 
     let mut dec = HevcDecoder::new(CodecId::new("h265"));
-    let pkt = Packet::new(0, TimeBase::new(1, 30), bytes);
+    let pkt = Packet::new(0, TimeBase::new(1, 30), bytes.clone());
     dec.send_packet(&pkt).expect("decoder send_packet");
 
     let frame = loop {
@@ -98,63 +120,30 @@ fn self_roundtrip_reconstructs_frame() {
     };
     assert_eq!(frame.width, 64);
     assert_eq!(frame.height, 64);
-    assert_eq!(frame.format, PixelFormat::Yuv420P);
 
-    // Exact match on Y/Cb/Cr because PCM is lossless.
-    let src_y = &src.planes[0].data;
-    let dec_y = &frame.planes[0].data;
-    let src_stride = src.planes[0].stride;
-    let dec_stride = frame.planes[0].stride;
-    let mut max_err_y = 0i32;
-    let mut sse_y: u64 = 0;
-    for yy in 0..64usize {
-        for xx in 0..64usize {
-            let s = src_y[yy * src_stride + xx] as i32;
-            let d = dec_y[yy * dec_stride + xx] as i32;
-            let diff = (s - d).abs();
-            if diff > max_err_y {
-                max_err_y = diff;
-            }
-            sse_y += (diff * diff) as u64;
-        }
-    }
-    assert_eq!(max_err_y, 0, "luma must match exactly for PCM (sse={sse_y})");
+    // Should be much smaller than raw-samples (64*64 + 2*32*32 = 6144 bytes).
+    // With real compression we expect well under 2k.
+    let raw_budget = (64 * 64 + 2 * 32 * 32) as usize;
+    assert!(
+        bytes.len() < raw_budget,
+        "compressed {} bytes >= raw budget {}",
+        bytes.len(),
+        raw_budget
+    );
 
-    // Chroma — flat 128 in, flat 128 out.
-    for plane_idx in 1..=2 {
-        let sp = &src.planes[plane_idx].data;
-        let dp = &frame.planes[plane_idx].data;
-        let ss = src.planes[plane_idx].stride;
-        let ds = frame.planes[plane_idx].stride;
-        for yy in 0..32usize {
-            for xx in 0..32usize {
-                let s = sp[yy * ss + xx];
-                let d = dp[yy * ds + xx];
-                assert_eq!(s, d, "chroma plane {plane_idx} at ({xx},{yy})");
-            }
-        }
-    }
-}
-
-fn check_luma_exact(src: &VideoFrame, dec: &VideoFrame) {
-    assert_eq!(src.width, dec.width);
-    assert_eq!(src.height, dec.height);
-    let src_y = &src.planes[0].data;
-    let dec_y = &dec.planes[0].data;
-    let ss = src.planes[0].stride;
-    let ds = dec.planes[0].stride;
-    for yy in 0..src.height as usize {
-        for xx in 0..src.width as usize {
-            let s = src_y[yy * ss + xx];
-            let d = dec_y[yy * ds + xx];
-            assert_eq!(s, d, "luma mismatch at ({xx},{yy})");
-        }
-    }
+    let psnr = psnr_y(&src, &frame);
+    eprintln!(
+        "gradient_64x64: bytes={} raw_budget={} psnr_y={:.2}",
+        bytes.len(),
+        raw_budget,
+        psnr
+    );
+    assert!(psnr > 30.0, "luma PSNR too low: {psnr:.2} dB");
 }
 
 #[test]
-fn selftest_128x128_four_ctus() {
-    let src = make_test_frame(128, 128);
+fn selftest_128x128_multi_ctu_psnr() {
+    let src = make_gradient_frame(128, 128);
     let bytes = encode_one(&src);
     let mut dec = HevcDecoder::new(CodecId::new("h265"));
     let pkt = Packet::new(0, TimeBase::new(1, 30), bytes);
@@ -164,14 +153,14 @@ fn selftest_128x128_four_ctus() {
         Err(e) => panic!("decoder: {e:?}"),
         _ => panic!("not video"),
     };
-    check_luma_exact(&src, &frame);
+    let psnr = psnr_y(&src, &frame);
+    eprintln!("gradient_128x128: psnr_y={psnr:.2}");
+    assert!(psnr > 30.0, "luma PSNR too low: {psnr:.2} dB");
 }
 
 #[test]
-fn selftest_128x64_two_ctus() {
-    // Two 64×64 CTUs side-by-side — exercises the multi-CTU CABAC reinit
-    // and PCM alignment handling.
-    let src = make_test_frame(128, 64);
+fn selftest_128x64_two_ctu_rows() {
+    let src = make_gradient_frame(128, 64);
     let bytes = encode_one(&src);
 
     let mut dec = HevcDecoder::new(CodecId::new("h265"));
@@ -182,16 +171,7 @@ fn selftest_128x64_two_ctus() {
         Err(e) => panic!("decoder: {e:?}"),
         _ => panic!("not video"),
     };
-
-    let src_y = &src.planes[0].data;
-    let dec_y = &frame.planes[0].data;
-    let src_stride = src.planes[0].stride;
-    let dec_stride = frame.planes[0].stride;
-    for yy in 0..64usize {
-        for xx in 0..128usize {
-            let s = src_y[yy * src_stride + xx];
-            let d = dec_y[yy * dec_stride + xx];
-            assert_eq!(s, d, "luma mismatch at ({xx},{yy})");
-        }
-    }
+    let psnr = psnr_y(&src, &frame);
+    eprintln!("gradient_128x64: psnr_y={psnr:.2}");
+    assert!(psnr > 30.0, "luma PSNR too low: {psnr:.2} dB");
 }

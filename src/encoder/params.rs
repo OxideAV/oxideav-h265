@@ -1,14 +1,17 @@
-//! VPS / SPS / PPS emission for the MVP encoder.
+//! VPS / SPS / PPS emission for the lossy intra encoder.
 //!
 //! All parameter sets are fixed to the profile envelope needed by the
-//! MVP:
+//! encoder:
 //!
 //! * Main profile, level 3.0 (bounds: 720×576 @ 30 fps), Tier Main.
 //! * 8-bit 4:2:0 luma + chroma.
-//! * CTU size = 64, min CU size = 8 (log2=3), transform range 4..16.
-//! * `pcm_enabled_flag = 1`, PCM sample bit-depth = 8, PCM CU size 8..64
-//!   so a single 64×64 CTU can be emitted as PCM.
-//! * No tiles, no wavefront, no SAO, no deblock.
+//! * CTU size = 16, min CU size = 16 (log2=4) — every CTU is exactly one
+//!   16×16 coding unit, no split_cu_flag at CU root.
+//! * Transform range 4..16. `max_transform_hierarchy_depth_intra = 0` so
+//!   the 16×16 CU carries one 16×16 luma TB + one 8×8 chroma TB pair.
+//! * `pcm_enabled_flag = 0`, `scaling_list_enabled_flag = 0`,
+//!   `sample_adaptive_offset_enabled_flag = 0`.
+//! * No tiles, no wavefront, deblock enabled via PPS defaults.
 
 use crate::encoder::bit_writer::{write_rbsp_trailing_bits, BitWriter};
 use crate::nal::{NalHeader, NalUnitType};
@@ -139,14 +142,16 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(1); // max_dec_pic_buffering_minus1[0]
     bw.write_ue(0); // max_num_reorder_pics[0]
     bw.write_ue(0); // max_latency_increase_plus1[0]
-    // log2_min_luma_coding_block_size_minus3 = 0 → min CU = 8
+    // log2_min_luma_coding_block_size_minus3 = 1 → min CU = 16
+    bw.write_ue(1);
+    // log2_diff_max_min_luma_coding_block_size = 0 → max CU = 16 (CTU=16)
     bw.write_ue(0);
-    // log2_diff_max_min_luma_coding_block_size = 3 → max CU = 64
-    bw.write_ue(3);
     // log2_min_luma_transform_block_size_minus2 = 0 → min TB = 4
+    // (Chroma 8×8 TB requires TB = 8 which is min_luma_tb for intra; spec
+    // fixes chroma TB = log2_luma_tb - 1 at 4:2:0.)
     bw.write_ue(0);
-    // log2_diff_max_min_luma_transform_block_size = 3 → max TB = 32
-    bw.write_ue(3);
+    // log2_diff_max_min_luma_transform_block_size = 2 → max TB = 16
+    bw.write_ue(2);
     // max_transform_hierarchy_depth_inter = 0
     bw.write_ue(0);
     // max_transform_hierarchy_depth_intra = 0
@@ -157,18 +162,8 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_u1(0);
     // sample_adaptive_offset_enabled_flag = 0
     bw.write_u1(0);
-    // pcm_enabled_flag = 1 (we use PCM CUs)
-    bw.write_u1(1);
-    // pcm_sample_bit_depth_luma_minus1 = 7  (u4)
-    bw.write_bits(7, 4);
-    // pcm_sample_bit_depth_chroma_minus1 = 7 (u4)
-    bw.write_bits(7, 4);
-    // log2_min_pcm_luma_coding_block_size_minus3 = 0 → 8
-    bw.write_ue(0);
-    // log2_diff_max_min_pcm_luma_coding_block_size = 3 → 64
-    bw.write_ue(3);
-    // pcm_loop_filter_disabled_flag = 1
-    bw.write_u1(1);
+    // pcm_enabled_flag = 0
+    bw.write_u1(0);
     // num_short_term_ref_pic_sets = 0
     bw.write_ue(0);
     // long_term_ref_pics_present_flag = 0
@@ -234,7 +229,13 @@ pub fn build_pps_rbsp() -> Vec<u8> {
     // pps_loop_filter_across_slices_enabled_flag
     bw.write_u1(1);
     // deblocking_filter_control_present_flag
+    bw.write_u1(1);
+    // deblocking_filter_override_enabled_flag
     bw.write_u1(0);
+    // pps_deblocking_filter_disabled_flag — DISABLE deblocking entirely.
+    // Encoder's local reconstruction doesn't run deblock, so matching this
+    // on the decode side prevents a subtle drift in neighbour samples.
+    bw.write_u1(1);
     // pps_scaling_list_data_present_flag
     bw.write_u1(0);
     // lists_modification_present_flag
@@ -291,11 +292,10 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.bit_depth_luma_minus8, 0);
         assert_eq!(sps.bit_depth_chroma_minus8, 0);
-        assert!(sps.pcm_enabled_flag);
-        assert_eq!(sps.pcm_sample_bit_depth_luma, 8);
-        assert_eq!(sps.pcm_sample_bit_depth_chroma, 8);
-        assert_eq!(sps.log2_min_pcm_luma_coding_block_size, 3);
-        assert_eq!(sps.log2_max_pcm_luma_coding_block_size, 6);
+        assert!(!sps.pcm_enabled_flag);
+        // 16×16 CTU: minCB=16, maxCB=16.
+        assert_eq!(sps.log2_min_luma_coding_block_size_minus3, 1);
+        assert_eq!(sps.log2_diff_max_min_luma_coding_block_size, 0);
     }
 
     #[test]

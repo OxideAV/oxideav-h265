@@ -1,11 +1,11 @@
 //! `HevcEncoder` — wires the VPS / SPS / PPS / slice emitters into the
 //! `oxideav_codec::Encoder` trait.
 //!
-//! MVP scope:
+//! Scope:
 //!
 //! * Every frame is emitted as an IDR I-slice with a single access unit
 //!   consisting of (VPS, SPS, PPS, IDR_slice) Annex B NAL units.
-//! * Picture dimensions must be a multiple of the 64-pixel CTU size.
+//! * Picture dimensions must be a multiple of the 16-pixel CTU size.
 //! * Only 8-bit 4:2:0 (`PixelFormat::Yuv420P`).
 
 use std::collections::VecDeque;
@@ -41,15 +41,15 @@ impl HevcEncoder {
         let height = params
             .height
             .ok_or_else(|| Error::invalid("h265 encoder: missing height"))?;
-        if width % 64 != 0 || height % 64 != 0 {
+        if width % 16 != 0 || height % 16 != 0 {
             return Err(Error::unsupported(format!(
-                "h265 encoder (MVP): width and height must be multiples of 64 (got {width}x{height})"
+                "h265 encoder: width and height must be multiples of 16 (got {width}x{height})"
             )));
         }
         let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
         if pix != PixelFormat::Yuv420P {
             return Err(Error::unsupported(format!(
-                "h265 encoder (MVP): only Yuv420P is supported (got {pix:?})"
+                "h265 encoder: only Yuv420P is supported (got {pix:?})"
             )));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));

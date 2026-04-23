@@ -33,6 +33,7 @@ pub mod cabac_writer;
 pub mod hevc_encoder;
 pub mod nal_writer;
 pub mod params;
+pub mod residual_writer;
 pub mod slice_writer;
 
 pub use hevc_encoder::{make_encoder, HevcEncoder};
