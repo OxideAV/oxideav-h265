@@ -20,6 +20,23 @@ use crate::nal::{NalHeader, NalUnitType};
 use crate::pps::PicParameterSet;
 use crate::sps::{parse_st_ref_pic_set, SeqParameterSet, ShortTermRps};
 
+/// A single long-term reference picture entry resolved from either the
+/// SPS-level candidate list or the slice-level inline signalling
+/// (§7.3.6.1). The POC for the LT ref is computed as:
+///
+/// * If `delta_poc_msb_cycle_lt` is `None`, POC LSB matches on its own
+///   (the DPB is searched for a picture whose POC & (MaxPocLsb - 1) ==
+///   `poc_lsb_lt`).
+/// * Otherwise the full POC is derived as
+///   `PocLtCurr = current_poc - (delta_poc_msb_cycle * MaxPocLsb) -
+///   ((current_poc & (MaxPocLsb - 1)) - poc_lsb_lt)` (§8.3.2 eq. 8-5).
+#[derive(Clone, Copy, Debug)]
+pub struct LongTermRef {
+    pub poc_lsb_lt: u32,
+    pub used_by_curr_pic_lt_flag: bool,
+    pub delta_poc_msb_cycle_lt: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliceType {
     B,
@@ -96,6 +113,11 @@ pub struct SliceSegmentHeader {
     pub weighted_pred: Option<WeightedPred>,
     /// Resolved short-term RPS for the current picture, if any.
     pub current_rps: Option<ShortTermRps>,
+    /// Long-term reference picture entries for the current picture, in the
+    /// order they appear in the slice header (§7.3.6.1). Each entry carries
+    /// the POC LSB, the optional MSB-cycle delta, and the
+    /// `used_by_curr_pic_lt_flag`. Empty when no LT refs are signalled.
+    pub long_term_refs: Vec<LongTermRef>,
     /// `num_ref_idx_l0_active_minus1` (defaults from PPS). Slices may
     /// override with `num_ref_idx_active_override_flag`.
     pub num_ref_idx_l0_active_minus1: u32,
@@ -159,6 +181,7 @@ pub fn parse_slice_segment_header(
     let mut short_term_ref_pic_set_sps_flag = false;
     let mut short_term_ref_pic_set_idx = 0u32;
     let mut current_rps: Option<ShortTermRps> = None;
+    let mut long_term_refs: Vec<LongTermRef> = Vec::new();
     let mut slice_sao_luma_flag = false;
     let mut slice_sao_chroma_flag = false;
     let mut cabac_init_flag = false;
@@ -221,27 +244,59 @@ pub fn parse_slice_segment_header(
                 current_rps = Some(rps);
             }
             if sps.long_term_ref_pics_present_flag {
-                // We don't support long-term refs — bail out early if any are
-                // signalled. Parse just enough to detect.
-                let num_long_term_sps = 0u32;
+                // §7.3.6.1 long-term RPS entries. `num_long_term_sps`
+                // references the SPS-level candidate list; the remaining
+                // `num_long_term_pics` entries are inline.
+                let num_long_term_sps = if sps.num_long_term_ref_pics_sps > 0 {
+                    br.ue()?
+                } else {
+                    0
+                };
                 let num_long_term_pics = br.ue()?;
-                if num_long_term_sps + num_long_term_pics > 0 {
-                    return Ok(partial_header(
-                        first_slice_segment_in_pic_flag,
-                        no_output_of_prior_pics_flag,
-                        slice_pic_parameter_set_id,
-                        dependent_slice_segment_flag,
-                        slice_segment_address,
-                        slice_type,
-                        pic_output_flag,
-                        colour_plane_id,
-                        slice_pic_order_cnt_lsb,
-                        short_term_ref_pic_set_sps_flag,
-                        short_term_ref_pic_set_idx,
-                        current_rps,
-                        pps,
-                    ));
+                let total_lt = num_long_term_sps + num_long_term_pics;
+                if total_lt > sps.num_long_term_ref_pics_sps + 32 {
+                    return Err(Error::invalid(format!(
+                        "h265 slice: num_long_term_{{sps,pics}} out of range ({num_long_term_sps} + {num_long_term_pics})"
+                    )));
                 }
+                let lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
+                let lt_idx_bits = ceil_log2(sps.num_long_term_ref_pics_sps);
+                let mut lts: Vec<LongTermRef> = Vec::with_capacity(total_lt as usize);
+                for i in 0..total_lt {
+                    let (poc_lsb_lt, used_flag) = if i < num_long_term_sps {
+                        let lt_idx_sps = if sps.num_long_term_ref_pics_sps > 1 {
+                            br.u(lt_idx_bits)?
+                        } else {
+                            0
+                        };
+                        let idx = lt_idx_sps as usize;
+                        if idx >= sps.lt_ref_pic_poc_lsb_sps.len() {
+                            return Err(Error::invalid(format!(
+                                "h265 slice: lt_idx_sps {lt_idx_sps} out of range"
+                            )));
+                        }
+                        (
+                            sps.lt_ref_pic_poc_lsb_sps[idx],
+                            sps.used_by_curr_pic_lt_sps_flag[idx],
+                        )
+                    } else {
+                        let poc = br.u(lsb_bits)?;
+                        let used = br.u1()? == 1;
+                        (poc, used)
+                    };
+                    let delta_poc_msb_present_flag = br.u1()? == 1;
+                    let delta_poc_msb_cycle_lt = if delta_poc_msb_present_flag {
+                        Some(br.ue()?)
+                    } else {
+                        None
+                    };
+                    lts.push(LongTermRef {
+                        poc_lsb_lt,
+                        used_by_curr_pic_lt_flag: used_flag,
+                        delta_poc_msb_cycle_lt,
+                    });
+                }
+                long_term_refs = lts;
             }
             if sps.sps_temporal_mvp_enabled_flag {
                 slice_temporal_mvp_enabled_flag = br.u1()? == 1;
@@ -437,6 +492,7 @@ pub fn parse_slice_segment_header(
         collocated_ref_idx,
         weighted_pred,
         current_rps,
+        long_term_refs,
         num_ref_idx_l0_active_minus1,
         num_ref_idx_l1_active_minus1,
         mvd_l1_zero_flag,
@@ -566,6 +622,7 @@ fn partial_header(
         collocated_ref_idx: 0,
         weighted_pred: None,
         current_rps,
+        long_term_refs: Vec::new(),
         num_ref_idx_l0_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
         num_ref_idx_l1_active_minus1: pps.num_ref_idx_l1_default_active_minus1,
         mvd_l1_zero_flag: false,
@@ -609,5 +666,18 @@ mod tests {
         assert_eq!(ceil_log2(5), 3);
         assert_eq!(ceil_log2(8), 3);
         assert_eq!(ceil_log2(9), 4);
+    }
+
+    #[test]
+    fn long_term_ref_carries_lsb_and_flags() {
+        // Sanity: the LongTermRef struct round-trips the three spec fields.
+        let lt = LongTermRef {
+            poc_lsb_lt: 42,
+            used_by_curr_pic_lt_flag: true,
+            delta_poc_msb_cycle_lt: Some(2),
+        };
+        assert_eq!(lt.poc_lsb_lt, 42);
+        assert!(lt.used_by_curr_pic_lt_flag);
+        assert_eq!(lt.delta_poc_msb_cycle_lt, Some(2));
     }
 }

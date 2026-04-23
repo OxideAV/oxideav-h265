@@ -200,6 +200,11 @@ pub struct RefPicture {
     /// Motion-field grid for collocated-MV (TMVP) lookups. Empty when the
     /// picture was intra-only.
     pub inter: InterState,
+    /// `true` when this picture is marked as "used for long-term reference"
+    /// per §8.3.2. Long-term refs are kept in the DPB until a later slice
+    /// evicts them; short-term refs can be rotated out by the
+    /// `StRefPicSet` management each picture.
+    pub is_long_term: bool,
 }
 
 impl RefPicture {
@@ -261,14 +266,38 @@ impl Dpb {
 
     pub fn push(&mut self, pic: RefPicture) {
         if self.pics.len() >= self.capacity {
-            // Drop oldest.
-            self.pics.remove(0);
+            // Drop oldest short-term ref first; LT refs persist until a
+            // later slice explicitly demotes them (§8.3.2).
+            if let Some(pos) = self.pics.iter().position(|p| !p.is_long_term) {
+                self.pics.remove(pos);
+            } else {
+                self.pics.remove(0);
+            }
         }
         self.pics.push(pic);
     }
 
     pub fn get_by_poc(&self, poc: i32) -> Option<&RefPicture> {
         self.pics.iter().find(|p| p.poc == poc)
+    }
+
+    /// Find a DPB entry whose POC matches `poc_lsb` modulo `max_poc_lsb`
+    /// — used for long-term refs signalled without the MSB delta
+    /// (§8.3.2). Returns the first match; if `expect_long_term` is true,
+    /// the returned entry is also marked as LT.
+    pub fn find_by_poc_lsb(&self, poc_lsb: u32, max_poc_lsb: u32) -> Option<&RefPicture> {
+        let mask = (max_poc_lsb - 1) as i32;
+        self.pics
+            .iter()
+            .find(|p| (p.poc & mask) as u32 == poc_lsb)
+    }
+
+    /// Mark a DPB entry as a long-term reference by POC (§8.3.2). Used when
+    /// a slice's LT RPS references a picture still in the DPB.
+    pub fn mark_long_term_by_poc(&mut self, poc: i32) {
+        if let Some(p) = self.pics.iter_mut().find(|p| p.poc == poc) {
+            p.is_long_term = true;
+        }
     }
 }
 
@@ -920,6 +949,7 @@ mod tests {
             luma_stride: 16,
             chroma_stride: 8,
             inter: InterState::new(16, 16),
+            is_long_term: false,
         };
         let mut out = vec![0u8; 8 * 8];
         luma_mc(&pic, 4, 4, 8, 8, MotionVector::new(0, 0), &mut out).expect("luma_mc");
@@ -985,5 +1015,51 @@ mod tests {
         for v in &out {
             assert_eq!(*v, 15);
         }
+    }
+
+    fn stub_pic(poc: i32, long_term: bool) -> RefPicture {
+        RefPicture {
+            poc,
+            width: 4,
+            height: 4,
+            luma: vec![0; 16],
+            cb: vec![128; 4],
+            cr: vec![128; 4],
+            luma_stride: 4,
+            chroma_stride: 2,
+            inter: InterState::new(4, 4),
+            is_long_term: long_term,
+        }
+    }
+
+    #[test]
+    fn dpb_push_evicts_short_term_before_long_term() {
+        let mut dpb = Dpb::new(2);
+        dpb.push(stub_pic(0, true)); // LT
+        dpb.push(stub_pic(1, false)); // ST
+        // Over capacity — should drop POC 1 (short-term) not POC 0 (LT).
+        dpb.push(stub_pic(2, false));
+        assert!(dpb.get_by_poc(0).is_some(), "LT ref survived eviction");
+        assert!(dpb.get_by_poc(1).is_none(), "ST ref was evicted");
+        assert!(dpb.get_by_poc(2).is_some(), "new ref entered DPB");
+    }
+
+    #[test]
+    fn dpb_find_by_poc_lsb_matches_modulo() {
+        let mut dpb = Dpb::new(4);
+        // POC 17, max_poc_lsb = 16 → lsb = 1.
+        dpb.push(stub_pic(17, false));
+        let m = dpb.find_by_poc_lsb(1, 16);
+        assert!(m.is_some());
+        assert_eq!(m.unwrap().poc, 17);
+    }
+
+    #[test]
+    fn dpb_mark_long_term_flips_flag() {
+        let mut dpb = Dpb::new(2);
+        dpb.push(stub_pic(5, false));
+        assert!(!dpb.get_by_poc(5).unwrap().is_long_term);
+        dpb.mark_long_term_by_poc(5);
+        assert!(dpb.get_by_poc(5).unwrap().is_long_term);
     }
 }

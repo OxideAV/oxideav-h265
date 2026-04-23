@@ -41,10 +41,18 @@ pub struct SeqParameterSet {
     pub amp_enabled_flag: bool,
     pub sample_adaptive_offset_enabled_flag: bool,
     pub pcm_enabled_flag: bool,
-    /// Counts of short-term reference picture sets and long-term references
-    /// — we parse the counts but skip the bodies in v1.
+    /// Counts of short-term reference picture sets and long-term references.
     pub num_short_term_ref_pic_sets: u32,
     pub long_term_ref_pics_present_flag: bool,
+    /// `num_long_term_ref_pics_sps`. 0 when `long_term_ref_pics_present_flag`
+    /// is false.
+    pub num_long_term_ref_pics_sps: u32,
+    /// `lt_ref_pic_poc_lsb_sps[i]` (§7.4.3.2.1) — candidate LSBs that the
+    /// slice header can reference by `lt_idx_sps[i]`.
+    pub lt_ref_pic_poc_lsb_sps: Vec<u32>,
+    /// `used_by_curr_pic_lt_sps_flag[i]` — whether the SPS-level candidate
+    /// is marked as "used for reference by the current picture".
+    pub used_by_curr_pic_lt_sps_flag: Vec<bool>,
     pub sps_temporal_mvp_enabled_flag: bool,
     pub strong_intra_smoothing_enabled_flag: bool,
     pub vui_parameters_present_flag: bool,
@@ -280,17 +288,22 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     }
 
     let long_term_ref_pics_present_flag = br.u1()? == 1;
+    let mut num_long_term_ref_pics_sps: u32 = 0;
+    let mut lt_ref_pic_poc_lsb_sps: Vec<u32> = Vec::new();
+    let mut used_by_curr_pic_lt_sps_flag: Vec<bool> = Vec::new();
     if long_term_ref_pics_present_flag {
-        let num_long_term_ref_pics_sps = br.ue()?;
+        num_long_term_ref_pics_sps = br.ue()?;
         if num_long_term_ref_pics_sps > 32 {
             return Err(Error::invalid(format!(
                 "h265 SPS: num_long_term_ref_pics_sps out of range ({num_long_term_ref_pics_sps})"
             )));
         }
         let lsb_bits = log2_max_pic_order_cnt_lsb_minus4 + 4;
+        lt_ref_pic_poc_lsb_sps.reserve(num_long_term_ref_pics_sps as usize);
+        used_by_curr_pic_lt_sps_flag.reserve(num_long_term_ref_pics_sps as usize);
         for _ in 0..num_long_term_ref_pics_sps {
-            br.skip(lsb_bits)?;
-            br.skip(1)?; // used_by_curr_pic_lt_sps_flag
+            lt_ref_pic_poc_lsb_sps.push(br.u(lsb_bits)?);
+            used_by_curr_pic_lt_sps_flag.push(br.u1()? == 1);
         }
     }
     let sps_temporal_mvp_enabled_flag = br.u1()? == 1;
@@ -364,6 +377,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         pcm_enabled_flag,
         num_short_term_ref_pic_sets,
         long_term_ref_pics_present_flag,
+        num_long_term_ref_pics_sps,
+        lt_ref_pic_poc_lsb_sps,
+        used_by_curr_pic_lt_sps_flag,
         sps_temporal_mvp_enabled_flag,
         strong_intra_smoothing_enabled_flag,
         vui_parameters_present_flag,

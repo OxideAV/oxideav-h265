@@ -40,7 +40,12 @@
 //! * **SAO** (§8.7.3) — edge-offset + band-offset applied after
 //!   deblocking, before the DPB write. Luma and chroma both handled;
 //!   SAO-merge (left/up) inheritance follows §7.4.9.3.
-//! * **Long-term reference pictures** — rejected.
+//! * **Long-term reference pictures** (§8.3.2) — SPS-level candidate
+//!   list (`lt_ref_pic_poc_lsb_sps[]`, `used_by_curr_pic_lt_sps_flag[]`)
+//!   and slice-level LT RPS entries (including the optional MSB-cycle
+//!   delta) are parsed. LT refs are resolved against the DPB, marked so
+//!   they survive short-term rotations, and appended to RPL0/RPL1 after
+//!   the st_curr_* sets per §8.3.4.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 //! * **Encoder** — write side is not in scope.
 //!

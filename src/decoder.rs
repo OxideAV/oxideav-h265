@@ -197,7 +197,7 @@ impl HevcDecoder {
         let width = sps.pic_width_in_luma_samples;
         let height = sps.pic_height_in_luma_samples;
         let current_poc = self.derive_poc(sps, hdr, false);
-        let (rpl0, rpl1) = self.build_ref_pic_lists(hdr, current_poc);
+        let (rpl0, rpl1) = self.build_ref_pic_lists(sps, hdr, current_poc);
         if rpl0.is_empty() {
             return Err(Error::unsupported(
                 "h265 inter slice: no reference pictures",
@@ -243,7 +243,8 @@ impl HevcDecoder {
     }
 
     fn build_ref_pic_lists(
-        &self,
+        &mut self,
+        sps: &SeqParameterSet,
         hdr: &SliceSegmentHeader,
         current_poc: i32,
     ) -> (Vec<RefPicture>, Vec<RefPicture>) {
@@ -274,20 +275,57 @@ impl HevcDecoder {
             }
         }
 
-        // RPL0: before-first, then after, then long-term (not supported).
+        // §8.3.2 long-term reference resolution. For each slice-level LT
+        // entry with `used_by_curr_pic_lt_flag == 1`, derive the full POC
+        // from `poc_lsb_lt` (+ optional `delta_poc_msb_cycle_lt`) and look
+        // the picture up in the DPB. Matches are marked LT on the DPB so
+        // they survive later st_curr_* rotations.
+        let max_poc_lsb = 1i32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+        let cur_lsb = current_poc & (max_poc_lsb - 1);
+        let mut lt_curr: Vec<RefPicture> = Vec::new();
+        let mut lts_to_mark: Vec<i32> = Vec::new();
+        for lt in &hdr.long_term_refs {
+            if !lt.used_by_curr_pic_lt_flag {
+                continue;
+            }
+            let target_poc: Option<i32> = if let Some(cycle) = lt.delta_poc_msb_cycle_lt {
+                // eq. 8-5: PocLt = current_poc - cycle * MaxPocLsb -
+                //                  (cur_lsb - poc_lsb_lt).
+                Some(current_poc - (cycle as i32) * max_poc_lsb - (cur_lsb - lt.poc_lsb_lt as i32))
+            } else {
+                self.dpb
+                    .find_by_poc_lsb(lt.poc_lsb_lt, max_poc_lsb as u32)
+                    .map(|p| p.poc)
+            };
+            if let Some(poc) = target_poc {
+                if let Some(p) = self.dpb.get_by_poc(poc) {
+                    let mut clone = p.clone();
+                    clone.is_long_term = true;
+                    lt_curr.push(clone);
+                    lts_to_mark.push(poc);
+                }
+            }
+        }
+        for poc in lts_to_mark {
+            self.dpb.mark_long_term_by_poc(poc);
+        }
+
+        // RPL0: before-first, then after, then LT (§8.3.4 eq. 8-8).
         let mut rpl0: Vec<RefPicture> = Vec::new();
         rpl0.extend(st_curr_before.iter().cloned());
         rpl0.extend(st_curr_after.iter().cloned());
+        rpl0.extend(lt_curr.iter().cloned());
         let active0 = (hdr.num_ref_idx_l0_active_minus1 + 1) as usize;
         if rpl0.len() > active0 {
             rpl0.truncate(active0);
         }
 
-        // RPL1: after-first, then before, then long-term (not supported).
+        // RPL1: after-first, then before, then LT (§8.3.4 eq. 8-10).
         let mut rpl1: Vec<RefPicture> = Vec::new();
         if hdr.slice_type == SliceType::B {
             rpl1.extend(st_curr_after.iter().cloned());
             rpl1.extend(st_curr_before.iter().cloned());
+            rpl1.extend(lt_curr.iter().cloned());
             let active1 = (hdr.num_ref_idx_l1_active_minus1 + 1) as usize;
             if rpl1.len() > active1 {
                 rpl1.truncate(active1);
@@ -330,6 +368,10 @@ impl HevcDecoder {
             luma_stride: pic.luma_stride,
             chroma_stride: pic.chroma_stride,
             inter: pic.inter.clone(),
+            // New pictures enter as short-term refs by default; the slice
+            // header that consumes them may mark older DPB entries as LT
+            // via `mark_long_term_refs`.
+            is_long_term: false,
         });
     }
 
