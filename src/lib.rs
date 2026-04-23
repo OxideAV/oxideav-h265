@@ -46,7 +46,16 @@
 //!   they survive short-term rotations, and appended to RPL0/RPL1 after
 //!   the st_curr_* sets per §8.3.4.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
-//! * **Encoder** — write side is not in scope.
+//!
+//! ## Encoder (MVP)
+//!
+//! * **[`encoder`]** — writes a single-IDR Annex B stream (VPS + SPS + PPS
+//!   + IDR slice) using PCM CUs for lossless round-trip; 8-bit 4:2:0 Main
+//!   profile only; width/height must be multiples of 64. Not a production
+//!   encoder — no transform / quantisation / rate control — but the
+//!   bit-writer, NAL framing, parameter-set emitters, CABAC writer, and
+//!   slice header layer are all spec-accurate, and the output decodes
+//!   byte-for-byte through both our decoder and ffmpeg.
 //!
 //! ## Crate layout
 //!
