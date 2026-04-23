@@ -994,6 +994,25 @@ fn dump_sps_64_for_debugging() {
 
 #[test]
 #[ignore = "debug only"]
+fn dump_qgd() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "exact-intra-gray-64.h265",
+        "color=c=gray:size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
+    for nal in iter_annex_b(&data) {
+        if nal.header.nal_unit_type == NalUnitType::Pps {
+            let rbsp = extract_rbsp(nal.payload());
+            let pps = parse_pps(&rbsp).expect("PPS parse");
+            eprintln!("diff_cu_qp_delta_depth={}", pps.diff_cu_qp_delta_depth);
+            return;
+        }
+    }
+}
+
+#[test]
+#[ignore = "debug only"]
 fn dump_pps_for_debug() {
     let Some(input) = ensure_generated_hevc_fixture(
         "gray16.h265",

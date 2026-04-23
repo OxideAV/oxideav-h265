@@ -285,6 +285,7 @@ pub fn decode_slice_ctus(
         min_tb_log2,
         cu_qp_y: &mut cu_qp_y,
         is_cu_qp_delta_coded: false,
+        last_qg_pos: None,
     };
 
     for cty in 0..ctbs_y {
@@ -316,9 +317,12 @@ struct Walker<'a> {
     min_tb_log2: u32,
     cu_qp_y: &'a mut i32,
     /// Tracks whether `cu_qp_delta_abs` has been decoded for the current
-    /// quantisation group yet (§7.3.8.11 `IsCuQpDeltaCoded`). Reset at each
-    /// new coding_unit entry.
+    /// quantisation group yet (§7.3.8.11 `IsCuQpDeltaCoded`). Reset when
+    /// a new coding_unit enters a different QG per §8.6.1.
     is_cu_qp_delta_coded: bool,
+    /// Top-left of the QG containing the most recent CU, used to detect
+    /// QG transitions.
+    last_qg_pos: Option<(u32, u32)>,
 }
 
 impl<'a> Walker<'a> {
@@ -472,11 +476,24 @@ impl<'a> Walker<'a> {
         y0: u32,
         log2_cb: u32,
     ) -> Result<()> {
-        // §7.3.8.11: IsCuQpDeltaCoded resets at the start of each
-        // quantisation group. We approximate this by resetting per-CU,
-        // which is conservative but correct when the CU is entirely
-        // within one QG (typical for our streams).
-        self.is_cu_qp_delta_coded = false;
+        // §8.6.1: IsCuQpDeltaCoded is reset at the start of each quantisation
+        // group. QG top-left is (x0, y0) rounded down to a multiple of
+        // `1 << qg_log2`, where qg_log2 = ctb_log2 - diff_cu_qp_delta_depth.
+        let qg_log2 = self
+            .cctx
+            .sps
+            .log2_min_luma_coding_block_size_minus3
+            .saturating_add(3)
+            .saturating_add(self.cctx.sps.log2_diff_max_min_luma_coding_block_size)
+            .saturating_sub(self.cctx.pps.diff_cu_qp_delta_depth);
+        let qg_mask = (1u32 << qg_log2).saturating_sub(1);
+        let qg_x = x0 & !qg_mask;
+        let qg_y = y0 & !qg_mask;
+        let cur_qg = (qg_x, qg_y);
+        if self.last_qg_pos != Some(cur_qg) {
+            self.is_cu_qp_delta_coded = false;
+            self.last_qg_pos = Some(cur_qg);
+        }
         let cb_size = 1u32 << log2_cb;
         // cu_skip_flag (P/B only).
         let mut is_skip = false;
