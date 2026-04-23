@@ -422,6 +422,60 @@ mod tests {
     }
 
     #[test]
+    fn dct_forward_inverse_roundtrip() {
+        // A forward DCT followed by inverse DCT should recover the
+        // original residual (with small rounding error) for all supported
+        // sizes 4/8/16/32.
+        for log2_tb in 2u32..=5u32 {
+            let n = 1usize << log2_tb;
+            // Random-ish signed residual in [-64, 64].
+            let mut residual = vec![0i32; n * n];
+            for (i, v) in residual.iter_mut().enumerate() {
+                *v = (((i * 37) as i32) % 129) - 64;
+            }
+            let mut coeffs = vec![0i32; n * n];
+            forward_transform_2d(&residual, &mut coeffs, log2_tb, false, 8);
+            let mut rec = vec![0i32; n * n];
+            inverse_transform_2d(&coeffs, &mut rec, log2_tb, false, 8);
+            // The combined scaling should leave error bounded — for 4×4
+            // it's within ~2, for 32×32 it can be up to ~6. Use 8 as a
+            // loose bound that catches catastrophic scale mismatches.
+            let mut max_err = 0i32;
+            for i in 0..n * n {
+                max_err = max_err.max((residual[i] - rec[i]).abs());
+            }
+            assert!(
+                max_err <= 8,
+                "DCT roundtrip error log2_tb={log2_tb} max_err={max_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn quant_dequant_roundtrip_preserves_sign() {
+        // Quantise then dequantise — output magnitude should be in the
+        // same ballpark and sign preserved (for values bigger than the
+        // dead-zone).
+        for qp in [8i32, 22, 26, 37] {
+            let coeffs: Vec<i32> = (0..16)
+                .map(|i| if i % 2 == 0 { (i as i32 + 1) * 2000 } else { -(i as i32 + 1) * 2000 })
+                .collect();
+            let mut levels = vec![0i32; 16];
+            quantize_flat(&coeffs, &mut levels, qp, 2, 8);
+            let mut deq = vec![0i32; 16];
+            dequantize_flat(&levels, &mut deq, qp, 2, 8);
+            for i in 0..16 {
+                assert_eq!(
+                    coeffs[i].signum(),
+                    deq[i].signum(),
+                    "sign lost at qp={qp} i={i} coeff={} deq={}",
+                    coeffs[i], deq[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dst_vii_dc_matches_spec_basis() {
         // 4x4 DST-VII inverse of [DC=k, 0, ...] projects basis[0] along
         // both dimensions — the residual is not uniform (unlike DCT-II),
