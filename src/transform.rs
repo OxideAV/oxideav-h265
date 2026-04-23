@@ -221,4 +221,33 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn dst_vii_dc_matches_spec_basis() {
+        // 4x4 DST-VII inverse of [DC=k, 0, ...] projects basis[0] along
+        // both dimensions — the residual is not uniform (unlike DCT-II),
+        // but follows DST basis 0 = [29, 55, 74, 84] (spec Table 8-8).
+        // We only sanity-check that the output is nontrivial and
+        // positive-then-increasing in both directions.
+        let mut coeffs = vec![0i32; 16];
+        coeffs[0] = 1024;
+        let mut out = vec![0i32; 16];
+        inverse_transform_2d(&coeffs, &mut out, 2, true, 8);
+        // Values in row 0 should be strictly increasing (DST basis 0).
+        for x in 1..4 {
+            assert!(
+                out[x] > out[x - 1],
+                "DST-VII DC row 0 not increasing: {:?}",
+                &out[..4]
+            );
+        }
+        // Column 0 should also be strictly increasing.
+        for y in 1..4 {
+            assert!(
+                out[y * 4] > out[(y - 1) * 4],
+                "DST-VII DC col 0 not increasing: {:?}",
+                [out[0], out[4], out[8], out[12]]
+            );
+        }
+    }
 }
