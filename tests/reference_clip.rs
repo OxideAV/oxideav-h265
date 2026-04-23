@@ -1281,6 +1281,7 @@ fn hevc_wpp_fixture_decodes() {
         Ok(oxideav_core::Frame::Video(vf)) => {
             assert_eq!(vf.width, 256);
             assert_eq!(vf.height, 192);
+            assert_eq!(vf.planes.len(), 3);
         }
         Ok(other) => panic!("expected video frame, got {other:?}"),
         Err(Error::Unsupported(_)) => {}

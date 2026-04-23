@@ -74,33 +74,50 @@ pub fn build_idr_slice_rbsp(cfg: &EncoderConfig, frame: &VideoFrame) -> Vec<u8> 
         init_context(split_row[2], slice_qp_y),
     ];
 
+    // Walker structure (matches the decoder's CTU loop):
+    //
+    //   for each ctu:
+    //       coding_quadtree(...)            // split_cu_flag + pcm_flag + samples
+    //       engine.decode_terminate()        // end_of_slice_segment_flag (0/1)
+    //
+    // A PCM CU's pcm_flag terminator re-initialises the arithmetic
+    // engine at the next byte boundary (§9.3.2.6). The
+    // end_of_slice_segment_flag that follows is emitted under that
+    // re-init'd engine; for a non-last CTU it is `0`, and it shares
+    // the CABAC run with the NEXT CTU's split_cu_flag + pcm_flag.
+    //
+    // Concretely, every CABAC run emits one of:
+    //   first CTU:   split_cu=0, pcm_flag=1, flush
+    //   middle CTU:  end_of_slice=0, split_cu=0, pcm_flag=1, flush
+    //   last CTU:    end_of_slice=1, flush                     (emitted
+    //                 after the previous CTU's PCM body)
+
     for i in 0..total_ctbs {
         let ctb_x = (i % pic_w_ctb) * ctu_size;
         let ctb_y = (i / pic_w_ctb) * ctu_size;
-        let is_last = i + 1 == total_ctbs;
 
-        // CABAC run for this CTU: split_cu_flag = 0, pcm_flag terminator = 1.
         {
             let mut cabac = CabacWriter::new(&mut bw);
-            // ctxInc = 0 at the top-left (no neighbours).
-            cabac.encode_bin(&mut split_ctx[0], 0);
+            if i > 0 {
+                // Previous CTU's end_of_slice_segment_flag.
+                cabac.encode_terminate(0);
+            }
+            cabac.encode_bin(&mut split_ctx[0], 0); // split_cu_flag = 0
             cabac.encode_terminate(1); // pcm_flag = 1
             cabac.encode_flush();
         }
-        // pcm_alignment_zero_bit to next byte boundary.
-        bw.align_to_byte_zero();
-        // Raw PCM samples.
-        write_pcm_ctu_samples(&mut bw, frame, ctb_x, ctb_y, ctu_size);
 
-        // After PCM, the arithmetic engine re-inits at the new byte
-        // boundary (§9.3.2.6). For the last CTU we still need to emit
-        // the end_of_slice_flag = 1 via a fresh CabacWriter; for every
-        // other CTU the next iteration does so.
-        if is_last {
-            let mut cabac = CabacWriter::new(&mut bw);
-            cabac.encode_terminate(1); // end_of_slice_flag = 1
-            cabac.encode_flush();
-        }
+        // pcm_alignment_zero_bit → next byte boundary.
+        bw.align_to_byte_zero();
+        // Raw PCM samples for this CTU.
+        write_pcm_ctu_samples(&mut bw, frame, ctb_x, ctb_y, ctu_size);
+    }
+
+    // Final end_of_slice_segment_flag = 1 (after the last CTU's PCM body).
+    {
+        let mut cabac = CabacWriter::new(&mut bw);
+        cabac.encode_terminate(1);
+        cabac.encode_flush();
     }
 
     // slice_segment_data() rbsp_slice_segment_trailing_bits(): after the
