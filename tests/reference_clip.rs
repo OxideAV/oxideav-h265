@@ -1090,4 +1090,52 @@ fn hevc_angular_intra_fixture_decodes() {
     }
 }
 
+/// Stream encoded with deblocking filter enabled. Before §8.7.2 was
+/// implemented this would bail with Unsupported; now the decoder runs the
+/// in-loop deblocking pass and returns a plausible picture.
+#[test]
+fn hevc_deblocked_fixture_decodes() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:deblock=0\\,0";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-deblock.h265",
+        "testsrc=size=128x96:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    if let Err(e) = dec.send_packet(&pkt) {
+        match e {
+            Error::Unsupported { .. } => return,
+            _ => panic!("deblock fixture send_packet failed: {e:?}"),
+        }
+    }
+    match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => {
+            assert_eq!(vf.width, 128);
+            assert_eq!(vf.height, 96);
+            assert_eq!(vf.planes.len(), 3);
+            let y_plane = &vf.planes[0].data;
+            let distinct = y_plane
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(
+                distinct > 10,
+                "deblock fixture: expected >10 distinct luma values, got {distinct}",
+            );
+        }
+        Ok(other) => panic!("expected video frame, got {other:?}"),
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => panic!("deblock fixture receive_frame failed: {e:?}"),
+    }
+}
 

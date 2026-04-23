@@ -261,10 +261,9 @@ pub fn decode_slice_ctus(
     }
     // Note: SAO syntax is parsed per-CTU (see decode_sao), but applying SAO
     // to reconstructed samples is deferred. Streams with SAO decode without
-    // the in-loop filter effect — lower-fidelity but functional.
-    if !cctx.slice.slice_deblocking_filter_disabled_flag {
-        return Err(Error::unsupported("h265 deblocking filter pending"));
-    }
+    // the in-loop filter effect — lower-fidelity but functional. Deblocking
+    // (§8.7.2) runs from decoder::decode_*_slice after CTU reconstruction
+    // finishes, so this gate no longer rejects slices with it enabled.
     if cctx.slice.slice_type == SliceType::P && cctx.ref_list_l0.is_empty() {
         return Err(Error::unsupported("h265 P-slice without RPL0"));
     }

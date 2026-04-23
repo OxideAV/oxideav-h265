@@ -22,6 +22,7 @@ use oxideav_core::{
 
 use crate::cabac::InitType;
 use crate::ctu::{decode_slice_ctus, CtuContext, Picture};
+use crate::deblock::deblock_picture;
 use crate::hvcc::parse_hvcc;
 use crate::inter::{Dpb, RefPicture};
 use crate::nal::{extract_rbsp, iter_annex_b, iter_length_prefixed, NalRef, NalUnitType};
@@ -174,6 +175,10 @@ impl HevcDecoder {
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
 
+        // Apply in-loop deblocking filter (§8.7.2) to reconstructed samples
+        // before the picture is stored for reference and output.
+        deblock_picture(&mut pic, sps, pps, hdr);
+
         let poc = self.derive_poc(sps, hdr, is_idr);
         self.store_ref_pic(&pic, poc);
         Ok(self.emit_frame(&pic, sps))
@@ -226,6 +231,8 @@ impl HevcDecoder {
         };
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
+
+        deblock_picture(&mut pic, sps, pps, hdr);
 
         self.store_ref_pic(&pic, current_poc);
         Ok(self.emit_frame(&pic, sps))

@@ -33,8 +33,10 @@
 //!
 //! ## Out of scope
 //!
-//! * **Deblocking filter** (§8.7.2) — reconstructed frames carry visible
-//!   block-edge artefacts.
+//! * **Deblocking filter** (§8.7.2) — applied post-reconstruction with
+//!   the spec's β/tC tables; boundary-strength derivation is an
+//!   approximation over the crate's per-4×4 block state (intra flag,
+//!   motion, cqt_depth) since per-TU CBFs are not yet tracked.
 //! * **SAO** (§8.7.3) — parsed but not applied.
 //! * **Long-term reference pictures** — rejected.
 //! * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
@@ -65,6 +67,7 @@
 pub mod bitreader;
 pub mod cabac;
 pub mod ctu;
+pub mod deblock;
 pub mod decoder;
 pub mod hvcc;
 pub mod inter;

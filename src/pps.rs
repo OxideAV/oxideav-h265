@@ -36,6 +36,12 @@ pub struct PicParameterSet {
     pub deblocking_filter_control_present_flag: bool,
     pub deblocking_filter_override_enabled_flag: bool,
     pub pps_deblocking_filter_disabled_flag: bool,
+    /// `pps_beta_offset_div2` (§7.4.3.3). Added to slice override β offset
+    /// before looking up β in §8.7.2.2 Table 8-11. Range [-6, 6].
+    pub pps_beta_offset_div2: i32,
+    /// `pps_tc_offset_div2` (§7.4.3.3). Added to slice override tC offset
+    /// before looking up tC in §8.7.2.2 Table 8-11. Range [-6, 6].
+    pub pps_tc_offset_div2: i32,
     pub lists_modification_present_flag: bool,
     pub log2_parallel_merge_level_minus2: u32,
     pub slice_segment_header_extension_present_flag: bool,
@@ -96,12 +102,14 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
     let deblocking_filter_control_present_flag = br.u1()? == 1;
     let mut deblocking_filter_override_enabled_flag = false;
     let mut pps_deblocking_filter_disabled_flag = false;
+    let mut pps_beta_offset_div2: i32 = 0;
+    let mut pps_tc_offset_div2: i32 = 0;
     if deblocking_filter_control_present_flag {
         deblocking_filter_override_enabled_flag = br.u1()? == 1;
         pps_deblocking_filter_disabled_flag = br.u1()? == 1;
         if !pps_deblocking_filter_disabled_flag {
-            let _ = br.se()?; // pps_beta_offset_div2
-            let _ = br.se()?; // pps_tc_offset_div2
+            pps_beta_offset_div2 = br.se()?;
+            pps_tc_offset_div2 = br.se()?;
         }
     }
     let pps_scaling_list_data_present_flag = br.u1()? == 1;
@@ -143,6 +151,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         deblocking_filter_control_present_flag,
         deblocking_filter_override_enabled_flag,
         pps_deblocking_filter_disabled_flag,
+        pps_beta_offset_div2,
+        pps_tc_offset_div2,
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,
