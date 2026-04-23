@@ -70,14 +70,19 @@ pub const DST_MATRIX: [[i16; 4]; 4] = [
 /// as one 32-column row per basis vector).
 fn apply_transform_1d(src: &[i32], dst: &mut [i32], n: usize, shift: i32, is_dst: bool) {
     let round = 1i32 << (shift - 1);
-    let step = 1usize << (5 - n.ilog2());
+    // HEVC stores the 32×32 DCT matrix row-by-row as basis × sample
+    // (row = basis index, column = sample position). For an N-point
+    // inverse transform, the k-th basis function is row k·(32/N) and we
+    // read its value at sample position i directly from column i — no
+    // stride on the sample side — matching ffmpeg's TR_N partial butterfly.
+    let basis_step = 1usize << (5 - n.ilog2());
     for i in 0..n {
         let mut sum: i32 = 0;
         for j in 0..n {
             let coef = if is_dst {
-                DST_MATRIX[i][j] as i32
+                DST_MATRIX[j][i] as i32
             } else {
-                TRANSFORM_MATRIX[i][j * step] as i32
+                TRANSFORM_MATRIX[j * basis_step][i] as i32
             };
             sum += coef * src[j];
         }

@@ -284,6 +284,7 @@ pub fn decode_slice_ctus(
         max_tb_log2,
         min_tb_log2,
         cu_qp_y: &mut cu_qp_y,
+        is_cu_qp_delta_coded: false,
     };
 
     for cty in 0..ctbs_y {
@@ -314,6 +315,10 @@ struct Walker<'a> {
     max_tb_log2: u32,
     min_tb_log2: u32,
     cu_qp_y: &'a mut i32,
+    /// Tracks whether `cu_qp_delta_abs` has been decoded for the current
+    /// quantisation group yet (§7.3.8.11 `IsCuQpDeltaCoded`). Reset at each
+    /// new coding_unit entry.
+    is_cu_qp_delta_coded: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -467,6 +472,11 @@ impl<'a> Walker<'a> {
         y0: u32,
         log2_cb: u32,
     ) -> Result<()> {
+        // §7.3.8.11: IsCuQpDeltaCoded resets at the start of each
+        // quantisation group. We approximate this by resetting per-CU,
+        // which is conservative but correct when the CU is entirely
+        // within one QG (typical for our streams).
+        self.is_cu_qp_delta_coded = false;
         let cb_size = 1u32 << log2_cb;
         // cu_skip_flag (P/B only).
         let mut is_skip = false;
@@ -1259,15 +1269,22 @@ impl<'a> Walker<'a> {
         let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
         let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
-        if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag {
+        if has_any_coeff
+            && self.cctx.pps.cu_qp_delta_enabled_flag
+            && !self.is_cu_qp_delta_coded
+        {
             let mut prefix = 0u32;
-            let max_prefix = 5;
-            while prefix < max_prefix && engine.decode_bin(&mut ctx.cu_qp_delta_abs[0]) == 1 {
+            let max_prefix = 5u32;
+            while prefix < max_prefix {
+                let ctx_inc = if prefix == 0 { 0usize } else { 1 };
+                if engine.decode_bin(&mut ctx.cu_qp_delta_abs[ctx_inc]) == 0 {
+                    break;
+                }
                 prefix += 1;
             }
-            let mut k = 0u32;
             let mut abs = prefix;
-            if prefix >= 5 {
+            if prefix >= max_prefix {
+                let mut k = 0u32;
                 while engine.decode_bypass() == 1 {
                     k += 1;
                     if k > 32 {
@@ -1278,8 +1295,7 @@ impl<'a> Walker<'a> {
                 for _ in 0..k {
                     suf = (suf << 1) | engine.decode_bypass();
                 }
-                abs += suf;
-                abs += (1 << k) - 1;
+                abs += suf + (1 << k) - 1;
             }
             let delta = if abs != 0 {
                 let sign = engine.decode_bypass();
@@ -1292,6 +1308,7 @@ impl<'a> Walker<'a> {
                 0
             };
             *self.cu_qp_y = (*self.cu_qp_y + delta).rem_euclid(52);
+            self.is_cu_qp_delta_coded = true;
         }
         if cbf_luma != 0 {
             self.add_residual_plane(engine, ctx, x0, y0, log2_tb, true)?;
@@ -1490,22 +1507,26 @@ impl<'a> Walker<'a> {
         let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
 
-        // cu_qp_delta once per QG when at least one cbf is set.
-        if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag {
-            // Truncated rice + sign
+        // cu_qp_delta once per QG when at least one cbf is set (§7.3.8.11).
+        if has_any_coeff
+            && self.cctx.pps.cu_qp_delta_enabled_flag
+            && !self.is_cu_qp_delta_coded
+        {
+            // Prefix: TR with cMax=5, cRiceParam=0. ctxInc 0 for the first
+            // bin, 1 for every subsequent prefix bin (§9.3.4.2).
             let mut prefix = 0u32;
-            let max_prefix = 5;
-            while prefix < max_prefix && engine.decode_bin(&mut ctx.cu_qp_delta_abs[0]) == 1 {
+            let max_prefix = 5u32;
+            while prefix < max_prefix {
+                let ctx_inc = if prefix == 0 { 0usize } else { 1 };
+                if engine.decode_bin(&mut ctx.cu_qp_delta_abs[ctx_inc]) == 0 {
+                    break;
+                }
                 prefix += 1;
             }
-            let mut k = 0u32;
-            // For HEVC cu_qp_delta: prefix uses ctx 0 for first, ctx 1 for subsequent.
-            // We simplified by running ctx 0 throughout; functional effect is same
-            // probability approximation. If prefix reached max_prefix, skip suffix
-            // (unary terminates at max already).
             let mut abs = prefix;
-            if prefix >= 5 {
-                // EG0 suffix bypass — length k then k bits.
+            if prefix >= max_prefix {
+                // EG0 bypass suffix.
+                let mut k = 0u32;
                 while engine.decode_bypass() == 1 {
                     k += 1;
                     if k > 32 {
@@ -1516,8 +1537,7 @@ impl<'a> Walker<'a> {
                 for _ in 0..k {
                     suf = (suf << 1) | engine.decode_bypass();
                 }
-                abs += suf;
-                abs += (1 << k) - 1;
+                abs += suf + (1 << k) - 1;
             }
             let delta = if abs != 0 {
                 let sign = engine.decode_bypass();
@@ -1530,6 +1550,7 @@ impl<'a> Walker<'a> {
                 0
             };
             *self.cu_qp_y = (*self.cu_qp_y + delta).rem_euclid(52);
+            self.is_cu_qp_delta_coded = true;
         }
 
         // Run intra prediction + residual + reconstruct, per plane.
@@ -1609,24 +1630,26 @@ impl<'a> Walker<'a> {
         if has_coeff {
             let mut levels = vec![0i32; n * n];
             self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
-            let mut deq = vec![0i32; n * n];
             let qp = self.get_qp(is_luma, false);
+            let mut deq = vec![0i32; n * n];
             dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
             let mut res = vec![0i32; n * n];
             let is_dst = is_luma && log2_tb == 2;
-            inverse_transform_2d(&levels, &mut res, log2_tb, is_dst, 8);
-            // Note: spec applies iT on the dequantised values — we compute
-            // `inverse_transform_2d(&deq, ...)`. Correct that below.
-            let _ = deq;
-            let mut res_correct = vec![0i32; n * n];
-            let mut deq2 = vec![0i32; n * n];
-            dequantize_flat(&levels, &mut deq2, qp, log2_tb, 8);
-            inverse_transform_2d(&deq2, &mut res_correct, log2_tb, is_dst, 8);
+            inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+            if std::env::var_os("H265_TRACE_RESIDUAL").is_some() {
+                let plane = if is_luma { "Y" } else { "C" };
+                let nonzero: Vec<(usize, usize, i32)> = (0..n * n)
+                    .filter(|&i| levels[i] != 0)
+                    .map(|i| (i % n, i / n, levels[i]))
+                    .collect();
+                eprintln!(
+                    "{plane} TU (x={x0},y={y0},log2={log2_tb},qp={qp},dst={is_dst}) mode={pred_mode} nonzero-levels={nonzero:?}"
+                );
+            }
             for i in 0..n * n {
-                let v = pred[i] as i32 + res_correct[i];
+                let v = pred[i] as i32 + res[i];
                 pred[i] = v.clamp(0, 255) as u8;
             }
-            let _ = res;
         }
 
         // Write to picture.

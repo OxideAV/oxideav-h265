@@ -783,7 +783,6 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
 }
 
 #[test]
-#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_intra_gray_16_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "gray16.h265",
@@ -988,6 +987,29 @@ fn dump_sps_64_for_debugging() {
                 sps.log2_min_luma_transform_block_size_minus2,
                 sps.log2_diff_max_min_luma_transform_block_size,
                 sps.max_transform_hierarchy_depth_intra);
+            return;
+        }
+    }
+}
+
+#[test]
+#[ignore = "debug only"]
+fn dump_pps_for_debug() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "gray16.h265",
+        "color=c=gray:size=16x16:rate=1:duration=1", 1, 1, 1,
+    ) else { return; };
+    let Some(data) = read_fixture(&input.to_string_lossy()) else { return; };
+    for nal in iter_annex_b(&data) {
+        if nal.header.nal_unit_type == NalUnitType::Pps {
+            let rbsp = extract_rbsp(nal.payload());
+            let pps = parse_pps(&rbsp).expect("PPS parse");
+            eprintln!("PPS: cu_qp_delta_enabled={} init_qp_minus26={} sign_data_hiding={} transform_skip={} scaling_list={}",
+                pps.cu_qp_delta_enabled_flag,
+                pps.init_qp_minus26,
+                pps.sign_data_hiding_enabled_flag,
+                pps.transform_skip_enabled_flag,
+                false);
             return;
         }
     }
