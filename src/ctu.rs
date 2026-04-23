@@ -2466,13 +2466,20 @@ fn subblock_coord(x: usize, y: usize) -> (usize, usize) {
 }
 
 /// Generate the sub-block scan order for an n×n TB given scan_idx.
+///
+/// Per HEVC §9.3.4.2.5 / §6.5.4, the sub-block scan order tracks
+/// `scan_idx` only for 8×8 TUs (log2 == 3). For 16×16 and 32×32 TUs the
+/// sub-block scan is ALWAYS up-right diagonal, regardless of the
+/// `scan_idx` used for the coefficient scan inside each 4×4 sub-block.
 fn subblock_scan(scan_idx: u32, log2_tb: u32) -> Vec<(u8, u8)> {
     let sb = if log2_tb <= 2 {
         1
     } else {
         1usize << (log2_tb - 2)
     };
-    match scan_idx {
+    // Force diagonal sub-block scan for 16×16 / 32×32 TUs.
+    let effective_scan_idx = if log2_tb >= 4 { 0 } else { scan_idx };
+    match effective_scan_idx {
         1 => {
             // Horizontal — row-major.
             let mut v = Vec::with_capacity(sb * sb);
