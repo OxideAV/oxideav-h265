@@ -798,7 +798,6 @@ fn hevc_intra_gray_16_matches_ffmpeg() {
 }
 
 #[test]
-#[ignore = "exact residual reconstruction still diverges from ffmpeg"]
 fn hevc_intra_gray_64_qp51_matches_ffmpeg() {
     let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
                 wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:qp=51";

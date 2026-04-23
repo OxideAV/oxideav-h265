@@ -56,6 +56,9 @@ pub struct Picture {
     pub intra_height_4: usize,
     /// Per-4x4 block "is intra" flag (false when the CU is inter-coded).
     pub is_intra: Vec<bool>,
+    /// Per-4×4 block coding-quadtree depth of the containing CU. Used for
+    /// `split_cu_flag` context derivation (§9.3.4.2.2).
+    pub cqt_depth: Vec<u8>,
     /// Per-4×4 block motion-field grid for inter neighbour lookups.
     pub inter: InterState,
 }
@@ -80,6 +83,7 @@ impl Picture {
             intra_width_4: iw4,
             intra_height_4: ih4,
             is_intra: vec![true; iw4 * ih4],
+            cqt_depth: vec![0u8; iw4 * ih4],
             inter: InterState::new(width, height),
         }
     }
@@ -419,7 +423,6 @@ impl<'a> Walker<'a> {
         log2_cb: u32,
         depth: u32,
     ) -> Result<()> {
-        let _ = depth;
         let cb_size = 1u32 << log2_cb;
         let pic_w = self.cctx.sps.pic_width_in_luma_samples;
         let pic_h = self.cctx.sps.pic_height_in_luma_samples;
@@ -430,7 +433,7 @@ impl<'a> Walker<'a> {
             if at_bottom_right {
                 1
             } else {
-                let ctx_inc = self.split_cu_ctx_inc(x0, y0, log2_cb);
+                let ctx_inc = self.split_cu_ctx_inc(x0, y0, depth);
                 engine.decode_bin(&mut ctx.split_cu_flag[ctx_inc])
             }
         } else {
@@ -450,22 +453,58 @@ impl<'a> Walker<'a> {
             }
             return Ok(());
         }
+        // Record the cqt-depth covering this leaf CU so neighbours' split_cu
+        // context (§9.3.4.2.2) gets the spec-correct value.
+        let cb_size = 1u32 << log2_cb;
+        self.store_cqt_depth(x0, y0, cb_size, depth as u8);
         self.coding_unit(engine, ctx, x0, y0, log2_cb)
     }
 
-    fn split_cu_ctx_inc(&self, x0: u32, y0: u32, log2_cb: u32) -> usize {
-        // §9.3.4.2.2: ctxInc = (condL != null && L.depth > depth) + (condA != null && A.depth > depth)
-        // Without tracking neighbour depths explicitly, approximate by
-        // "neighbour is inside picture" booleans. This lands on the correct
-        // row of the split_cu_flag table in all realistic streams where
-        // neighbour depths match; streams that hit the other two rows are
-        // rare (mixed-depth quadtree boundaries) and our current scope only
-        // cares about getting sign_probability roughly right — the coder
-        // still self-corrects from the MPS/LPS updates.
-        let avail_l = x0 > 0;
-        let avail_a = y0 > 0;
-        let _ = log2_cb;
-        (avail_l as usize) + (avail_a as usize)
+    fn split_cu_ctx_inc(&self, x0: u32, y0: u32, depth: u32) -> usize {
+        // §9.3.4.2.2: ctxInc = (condL && cqtDepthL > cqtDepthCurr)
+        //                    + (condA && cqtDepthA > cqtDepthCurr).
+        let iw = self.pic.intra_width_4;
+        let ih = self.pic.intra_height_4;
+        let read_depth = |x: u32, y: u32| -> Option<u8> {
+            if x >= self.pic.width || y >= self.pic.height {
+                return None;
+            }
+            let bx = (x >> 2) as usize;
+            let by = (y >> 2) as usize;
+            if bx < iw && by < ih {
+                Some(self.pic.cqt_depth[by * iw + bx])
+            } else {
+                None
+            }
+        };
+        let l = if x0 == 0 {
+            0
+        } else {
+            usize::from(read_depth(x0 - 1, y0).is_some_and(|d| u32::from(d) > depth))
+        };
+        let a = if y0 == 0 {
+            0
+        } else {
+            usize::from(read_depth(x0, y0 - 1).is_some_and(|d| u32::from(d) > depth))
+        };
+        l + a
+    }
+
+    fn store_cqt_depth(&mut self, x: u32, y: u32, size: u32, depth: u8) {
+        let bx0 = (x >> 2) as usize;
+        let by0 = (y >> 2) as usize;
+        let n4 = (size >> 2) as usize;
+        let iw = self.pic.intra_width_4;
+        let ih = self.pic.intra_height_4;
+        for dy in 0..n4 {
+            for dx in 0..n4 {
+                let bx = bx0 + dx;
+                let by = by0 + dy;
+                if bx < iw && by < ih {
+                    self.pic.cqt_depth[by * iw + bx] = depth;
+                }
+            }
+        }
     }
 
     fn coding_unit(
