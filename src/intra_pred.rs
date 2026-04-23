@@ -68,27 +68,59 @@ pub fn build_ref_samples(samples: &[u8], available: &[bool], n: usize) -> Vec<u8
     debug_assert_eq!(samples.len(), len);
     debug_assert_eq!(available.len(), len);
 
+    // Storage order of `samples` / `available` is:
+    //   [0]         top-left corner p[-1, -1]
+    //   [1..=2n]    top row p[0..2n-1, -1]
+    //   [2n+1..=4n] left column p[-1, 0..2n-1]
+    //
+    // HEVC §8.4.4.2.2 substitutes in a different order:
+    //   1. left column BOTTOM-UP (p[-1, 2n-1] → p[-1, 0])
+    //   2. top-left corner (p[-1, -1])
+    //   3. top row LEFT-TO-RIGHT (p[0, -1] → p[2n-1, -1])
+    // Samples before the first available slot get the first available value;
+    // samples at or after that slot carry forward the most recent available
+    // value. The translation to our storage order is non-trivial because
+    // the left column is walked in reverse.
+
     let any = available.iter().any(|&a| a);
     let mut out = vec![128u8; len];
     if !any {
         return out;
     }
-    // Start from the first available position; the substitution rule in
-    // §8.4.4.2.3 walks from index 0 to 4n, replacing the initial
-    // unavailable prefix with the first available sample, and then each
-    // subsequent unavailable with its immediate predecessor.
-    let mut first_available = 0;
-    while first_available < len && !available[first_available] {
-        first_available += 1;
-    }
-    let seed = samples[first_available];
-    for i in 0..len {
-        if i < first_available {
-            out[i] = seed;
-        } else if available[i] {
-            out[i] = samples[i];
+
+    // Helper: linear index for a given "spec position" (0..=4n).
+    //   spec 0..=2n-1   → left col indices 4n, 4n-1, ..., 2n+1.
+    //   spec 2n         → top-left = index 0.
+    //   spec 2n+1..=4n  → top row indices 1, 2, ..., 2n.
+    let spec_to_linear = |s: usize| -> usize {
+        if s < 2 * n {
+            // Left col bottom-up: spec s=0 → left[2n-1] → linear 4n.
+            4 * n - s
+        } else if s == 2 * n {
+            0
         } else {
-            out[i] = out[i - 1];
+            // Top row L-R: spec s=2n+1 → top[0] → linear 1.
+            s - 2 * n
+        }
+    };
+
+    // Find first available in spec order.
+    let mut first_avail_spec = 0;
+    while first_avail_spec <= 4 * n && !available[spec_to_linear(first_avail_spec)] {
+        first_avail_spec += 1;
+    }
+    let seed = samples[spec_to_linear(first_avail_spec)];
+
+    let mut last = seed;
+    for s in 0..=(4 * n) {
+        let lin = spec_to_linear(s);
+        if s < first_avail_spec {
+            out[lin] = seed;
+        } else if available[lin] {
+            out[lin] = samples[lin];
+            last = out[lin];
+        } else {
+            out[lin] = last;
         }
     }
     out
@@ -123,13 +155,46 @@ pub fn filter_ref_samples(refs: &mut [u8], n: usize, strong: bool) {
         }
         refs[4 * n] = bot_left as u8;
     } else {
-        // `[1 2 1]/4` 3-tap filter across the whole vector except the
-        // endpoints, which stay as-is.
+        // `[1 2 1]/4` 3-tap filter per §8.4.4.2.3. The top-row and
+        // left-column segments of `refs` are geometrically disjoint, so
+        // we apply the filter separately: the far endpoints of each
+        // segment stay as-is, and the corner `refs[0]` is the shared
+        // top-left that filters from the first top-row and first
+        // left-column sample.
+        //
+        // refs layout: [0] top-left, [1..=2n] top row (left to right),
+        // [2n+1..=4n] left column (top to bottom).
         let mut tmp = refs.to_vec();
-        for i in 1..len - 1 {
-            tmp[i] =
-                (((refs[i - 1] as u32) + 2 * refs[i] as u32 + refs[i + 1] as u32 + 2) >> 2) as u8;
+        // Top-left corner (shared between top[-1] and left[-1]):
+        // (left[0] + 2*refs[0] + top[0] + 2) >> 2.
+        tmp[0] =
+            ((refs[2 * n + 1] as u32 + 2 * refs[0] as u32 + refs[1] as u32 + 2) >> 2) as u8;
+        // Top row: indices 1..=2n. Interior filter uses neighbour in-row;
+        // left neighbour of refs[1] is refs[0] (corner). Endpoint refs[2n]
+        // preserved (do not filter the 2n-1 sample, matching ffmpeg).
+        for i in 1..(2 * n) {
+            tmp[i] = ((refs[i - 1] as u32
+                + 2 * refs[i] as u32
+                + refs[i + 1] as u32
+                + 2)
+                >> 2) as u8;
         }
+        // tmp[2n] stays = refs[2n] (the farthest top sample).
+        // Left column: indices 2n+1..=4n. Neighbour of refs[2n+1] above is
+        // refs[0] (corner). Endpoint refs[4n] preserved.
+        tmp[2 * n + 1] = ((refs[0] as u32
+            + 2 * refs[2 * n + 1] as u32
+            + refs[2 * n + 2] as u32
+            + 2)
+            >> 2) as u8;
+        for i in (2 * n + 2)..(4 * n) {
+            tmp[i] = ((refs[i - 1] as u32
+                + 2 * refs[i] as u32
+                + refs[i + 1] as u32
+                + 2)
+                >> 2) as u8;
+        }
+        // tmp[4n] stays = refs[4n].
         refs.copy_from_slice(&tmp);
     }
 }

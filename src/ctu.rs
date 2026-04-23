@@ -63,6 +63,11 @@ pub struct Picture {
     /// reference only when its containing 4×4 block has already been
     /// reconstructed (Z-scan order per §6.4.3).
     pub decoded_4x4: Vec<bool>,
+    /// Per-8×8 block luma QP. Populated at the end of each QG so that the
+    /// next QG's QpY_PRED (§8.6.1) can look up the left/above neighbours.
+    /// Indexed `[(y>>3) * qp_stride + (x>>3)]`.
+    pub qp_y: Vec<i32>,
+    pub qp_stride: usize,
     /// Per-4×4 block motion-field grid for inter neighbour lookups.
     pub inter: InterState,
 }
@@ -89,6 +94,8 @@ impl Picture {
             is_intra: vec![true; iw4 * ih4],
             cqt_depth: vec![0u8; iw4 * ih4],
             decoded_4x4: vec![false; iw4 * ih4],
+            qp_y: vec![0; w.div_ceil(8) * h.div_ceil(8)],
+            qp_stride: w.div_ceil(8),
             inter: InterState::new(width, height),
         }
     }
@@ -295,6 +302,8 @@ pub fn decode_slice_ctus(
         cu_qp_y: &mut cu_qp_y,
         is_cu_qp_delta_coded: false,
         last_qg_pos: None,
+        qpy_prev: cctx.slice.slice_qp_y,
+        qpy_pred: cctx.slice.slice_qp_y,
     };
 
     for cty in 0..ctbs_y {
@@ -332,6 +341,13 @@ struct Walker<'a> {
     /// Top-left of the QG containing the most recent CU, used to detect
     /// QG transitions.
     last_qg_pos: Option<(u32, u32)>,
+    /// QP of the previously-decoded QG in coding order (§8.6.1 QpY_PREV).
+    /// Seeded with slice_qp_y and updated at each QG transition.
+    qpy_prev: i32,
+    /// Predicted QP for the current QG (§8.6.1 eq. 8-286). Recomputed on
+    /// each QG transition from the left/above neighbours in `pic.qp_y`;
+    /// the actual `cu_qp_y` is then `(qpy_pred + cu_qp_delta + 52) % 52`.
+    qpy_pred: i32,
 }
 
 impl<'a> Walker<'a> {
@@ -535,6 +551,15 @@ impl<'a> Walker<'a> {
         let qg_y = y0 & !qg_mask;
         let cur_qg = (qg_x, qg_y);
         if self.last_qg_pos != Some(cur_qg) {
+            if let Some(prev_qg) = self.last_qg_pos {
+                // Previous QG ended — persist its QP into the grid so that
+                // later QGs can read it as a neighbour (§8.6.1).
+                let qg_sz = 1u32 << qg_log2;
+                self.save_qg_qp(prev_qg.0, prev_qg.1, qg_sz, *self.cu_qp_y);
+                self.qpy_prev = *self.cu_qp_y;
+            }
+            self.qpy_pred = self.compute_qpy_pred(qg_x, qg_y);
+            *self.cu_qp_y = self.qpy_pred;
             self.is_cu_qp_delta_coded = false;
             self.last_qg_pos = Some(cur_qg);
         }
@@ -1374,7 +1399,7 @@ impl<'a> Walker<'a> {
             } else {
                 0
             };
-            *self.cu_qp_y = (*self.cu_qp_y + delta).rem_euclid(52);
+            *self.cu_qp_y = (self.qpy_pred + delta + 52).rem_euclid(52);
             self.is_cu_qp_delta_coded = true;
         }
         if cbf_luma != 0 {
@@ -1616,7 +1641,7 @@ impl<'a> Walker<'a> {
             } else {
                 0
             };
-            *self.cu_qp_y = (*self.cu_qp_y + delta).rem_euclid(52);
+            *self.cu_qp_y = (self.qpy_pred + delta + 52).rem_euclid(52);
             self.is_cu_qp_delta_coded = true;
         }
 
@@ -1703,16 +1728,6 @@ impl<'a> Walker<'a> {
             let mut res = vec![0i32; n * n];
             let is_dst = is_luma && log2_tb == 2;
             inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
-            if std::env::var_os("H265_TRACE_RESIDUAL").is_some() {
-                let plane = if is_luma { "Y" } else { "C" };
-                let nonzero: Vec<(usize, usize, i32)> = (0..n * n)
-                    .filter(|&i| levels[i] != 0)
-                    .map(|i| (i % n, i / n, levels[i]))
-                    .collect();
-                eprintln!(
-                    "{plane} TU x={x0} y={y0} log2={log2_tb} qp={qp} dst={is_dst} mode={pred_mode} coefs={nonzero:?}"
-                );
-            }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
                 pred[i] = v.clamp(0, 255) as u8;
@@ -1860,6 +1875,51 @@ impl<'a> Walker<'a> {
             }
         }
         build_ref_samples(&samples, &avail, n)
+    }
+
+    /// Persist `qp` into the 8×8 QP grid for every 8×8 block inside the QG
+    /// rooted at `(qg_x, qg_y)` so later QGs can look it up as a neighbour
+    /// (§8.6.1 QpY_A / QpY_B derivation).
+    fn save_qg_qp(&mut self, qg_x: u32, qg_y: u32, qg_size: u32, qp: i32) {
+        let stride = self.pic.qp_stride;
+        let grid_w = stride;
+        let grid_h = self.pic.qp_y.len() / stride.max(1);
+        let bx0 = (qg_x >> 3) as usize;
+        let by0 = (qg_y >> 3) as usize;
+        let n8 = (qg_size >> 3).max(1) as usize;
+        for dy in 0..n8 {
+            for dx in 0..n8 {
+                let bx = bx0 + dx;
+                let by = by0 + dy;
+                if bx < grid_w && by < grid_h {
+                    self.pic.qp_y[by * stride + bx] = qp;
+                }
+            }
+        }
+    }
+
+    /// QpY_PRED derivation per §8.6.1 eq. 8-286. Uses the left and above
+    /// 8×8 neighbour QPs if they lie in a different QG within the current
+    /// slice; otherwise falls back to `qpy_prev`. Picture-edge samples are
+    /// treated as unavailable.
+    fn compute_qpy_pred(&self, qg_x: u32, qg_y: u32) -> i32 {
+        let stride = self.pic.qp_stride;
+        let grid_w = stride;
+        let grid_h = self.pic.qp_y.len() / stride.max(1);
+        let lookup = |sx: i32, sy: i32| -> Option<i32> {
+            if sx < 0 || sy < 0 {
+                return None;
+            }
+            let bx = (sx as u32 >> 3) as usize;
+            let by = (sy as u32 >> 3) as usize;
+            if bx >= grid_w || by >= grid_h {
+                return None;
+            }
+            Some(self.pic.qp_y[by * stride + bx])
+        };
+        let qpy_a = lookup(qg_x as i32 - 1, qg_y as i32).unwrap_or(self.qpy_prev);
+        let qpy_b = lookup(qg_x as i32, qg_y as i32 - 1).unwrap_or(self.qpy_prev);
+        (qpy_a + qpy_b + 1) >> 1
     }
 
     /// Mark a `size × size` region starting at `(x, y)` as reconstructed

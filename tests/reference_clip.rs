@@ -798,6 +798,22 @@ fn hevc_intra_gray_16_matches_ffmpeg() {
 }
 
 #[test]
+fn hevc_intra_testsrc_64_matches_ffmpeg() {
+    let Some(input) = ensure_generated_hevc_fixture(
+        "testsrc-64.h265",
+        "testsrc=size=64x64:rate=1:duration=1",
+        1, 1, 1,
+    ) else { return; };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else { return; };
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-64.ref.yuv"), Some(1))
+    else { return; };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra testsrc 64 fixture");
+}
+
+#[test]
 fn hevc_intra_gray_64_qp51_matches_ffmpeg() {
     let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
                 wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:qp=51";
