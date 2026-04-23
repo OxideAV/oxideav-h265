@@ -137,6 +137,17 @@ pub struct SliceSegmentHeader {
     pub slice_cb_qp_offset: i32,
     /// `slice_cr_qp_offset` (defaults to 0).
     pub slice_cr_qp_offset: i32,
+    /// `ref_pic_list_modification_flag_l0` (§7.3.6.2). `false` when the
+    /// explicit reordering syntax is absent.
+    pub ref_pic_list_modification_flag_l0: bool,
+    /// `list_entry_l0[i]` (§7.3.6.2). Length `num_ref_idx_l0_active_minus1+1`
+    /// when `ref_pic_list_modification_flag_l0 == 1`, empty otherwise.
+    pub list_entry_l0: Vec<u32>,
+    /// `ref_pic_list_modification_flag_l1` (§7.3.6.2). `false` when the
+    /// explicit reordering syntax is absent.
+    pub ref_pic_list_modification_flag_l1: bool,
+    /// `list_entry_l1[i]` (§7.3.6.2).
+    pub list_entry_l1: Vec<u32>,
 }
 
 /// Parse a slice segment header given the active PPS+SPS and the NAL header
@@ -312,6 +323,10 @@ pub fn parse_slice_segment_header(
     let mut is_full_b_slice = false;
     let mut collocated_ref_idx: u32 = 0;
     let mut weighted_pred: Option<WeightedPred> = None;
+    let mut ref_pic_list_modification_flag_l0 = false;
+    let mut ref_pic_list_modification_flag_l1 = false;
+    let mut list_entry_l0: Vec<u32> = Vec::new();
+    let mut list_entry_l1: Vec<u32> = Vec::new();
 
     // Only attempt the full parse for single-segment slices (not dependent).
     if !dependent_slice_segment_flag && !sps.separate_colour_plane_flag {
@@ -335,25 +350,32 @@ pub fn parse_slice_segment_header(
                     num_ref_idx_l1_active_minus1 = br.ue()?;
                 }
             }
+            // `ref_pic_list_modification()` (§7.3.6.2). Present only when
+            // `lists_modification_present_flag == 1 && NumPicTotalCurr > 1`.
+            // NumPicTotalCurr counts the entries used by the current picture
+            // across st_curr_before, st_curr_after, and lt_curr (§7.4.7.2).
             if pps.lists_modification_present_flag {
-                // Slice-level list modification is not currently supported —
-                // bail out of the full-parse path. The caller will surface
-                // `Unsupported` on receive_frame.
-                return Ok(partial_header(
-                    first_slice_segment_in_pic_flag,
-                    no_output_of_prior_pics_flag,
-                    slice_pic_parameter_set_id,
-                    dependent_slice_segment_flag,
-                    slice_segment_address,
-                    slice_type,
-                    pic_output_flag,
-                    colour_plane_id,
-                    slice_pic_order_cnt_lsb,
-                    short_term_ref_pic_set_sps_flag,
-                    short_term_ref_pic_set_idx,
-                    current_rps,
-                    pps,
-                ));
+                let num_pic_total_curr =
+                    compute_num_pic_total_curr(current_rps.as_ref(), &long_term_refs);
+                if num_pic_total_curr > 1 {
+                    let bits = ceil_log2(num_pic_total_curr);
+                    ref_pic_list_modification_flag_l0 = br.u1()? == 1;
+                    if ref_pic_list_modification_flag_l0 {
+                        list_entry_l0.reserve(num_ref_idx_l0_active_minus1 as usize + 1);
+                        for _ in 0..=num_ref_idx_l0_active_minus1 {
+                            list_entry_l0.push(br.u(bits)?);
+                        }
+                    }
+                    if slice_type == SliceType::B {
+                        ref_pic_list_modification_flag_l1 = br.u1()? == 1;
+                        if ref_pic_list_modification_flag_l1 {
+                            list_entry_l1.reserve(num_ref_idx_l1_active_minus1 as usize + 1);
+                            for _ in 0..=num_ref_idx_l1_active_minus1 {
+                                list_entry_l1.push(br.u(bits)?);
+                            }
+                        }
+                    }
+                }
             }
             if slice_type == SliceType::B {
                 mvd_l1_zero_flag = br.u1()? == 1;
@@ -502,7 +524,32 @@ pub fn parse_slice_segment_header(
         slice_temporal_mvp_enabled_flag,
         slice_cb_qp_offset,
         slice_cr_qp_offset,
+        ref_pic_list_modification_flag_l0,
+        list_entry_l0,
+        ref_pic_list_modification_flag_l1,
+        list_entry_l1,
     })
+}
+
+/// §7.4.7.2: `NumPicTotalCurr = NumPocStCurrBefore + NumPocStCurrAfter +
+/// NumPocLtCurr`. Each count only includes entries with
+/// `used_by_curr_pic_*_flag == 1`. Long-term entries with
+/// `used_by_curr_pic_lt_flag == 1` also count.
+fn compute_num_pic_total_curr(
+    current_rps: Option<&ShortTermRps>,
+    long_term_refs: &[LongTermRef],
+) -> u32 {
+    let st = current_rps
+        .map(|r| {
+            r.used_by_curr_pic_s0.iter().filter(|&&u| u).count()
+                + r.used_by_curr_pic_s1.iter().filter(|&&u| u).count()
+        })
+        .unwrap_or(0);
+    let lt = long_term_refs
+        .iter()
+        .filter(|l| l.used_by_curr_pic_lt_flag)
+        .count();
+    (st + lt) as u32
 }
 
 /// Parse a `pred_weight_table()` body (§7.4.7.3) into a [`WeightedPred`].
@@ -632,6 +679,10 @@ fn partial_header(
         slice_temporal_mvp_enabled_flag: false,
         slice_cb_qp_offset: 0,
         slice_cr_qp_offset: 0,
+        ref_pic_list_modification_flag_l0: false,
+        list_entry_l0: Vec::new(),
+        ref_pic_list_modification_flag_l1: false,
+        list_entry_l1: Vec::new(),
     }
 }
 
@@ -666,6 +717,33 @@ mod tests {
         assert_eq!(ceil_log2(5), 3);
         assert_eq!(ceil_log2(8), 3);
         assert_eq!(ceil_log2(9), 4);
+    }
+
+    #[test]
+    fn num_pic_total_curr_sums_used_flags() {
+        // Four st entries, two marked "used by curr" + one LT used + one LT
+        // unused → NumPicTotalCurr = 3.
+        let rps = ShortTermRps {
+            delta_poc_s0: vec![-1, -2],
+            delta_poc_s1: vec![1, 2],
+            used_by_curr_pic_s0: vec![true, false],
+            used_by_curr_pic_s1: vec![true, false],
+        };
+        let lts = vec![
+            LongTermRef {
+                poc_lsb_lt: 0,
+                used_by_curr_pic_lt_flag: true,
+                delta_poc_msb_cycle_lt: None,
+            },
+            LongTermRef {
+                poc_lsb_lt: 1,
+                used_by_curr_pic_lt_flag: false,
+                delta_poc_msb_cycle_lt: None,
+            },
+        ];
+        assert_eq!(compute_num_pic_total_curr(Some(&rps), &lts), 3);
+        assert_eq!(compute_num_pic_total_curr(None, &[]), 0);
+        assert_eq!(compute_num_pic_total_curr(None, &lts), 1);
     }
 
     #[test]

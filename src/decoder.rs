@@ -310,26 +310,36 @@ impl HevcDecoder {
             self.dpb.mark_long_term_by_poc(poc);
         }
 
-        // RPL0: before-first, then after, then LT (§8.3.4 eq. 8-8).
-        let mut rpl0: Vec<RefPicture> = Vec::new();
-        rpl0.extend(st_curr_before.iter().cloned());
-        rpl0.extend(st_curr_after.iter().cloned());
-        rpl0.extend(lt_curr.iter().cloned());
+        // §8.3.4: build RefPicListTempX from the three curr-sets, then
+        // apply `ref_pic_list_modification()` if signalled. Absent the
+        // modification, the slice uses the first NumRefIdxActive entries
+        // of RefPicListTempX directly.
+        let mut temp0: Vec<RefPicture> = Vec::new();
+        temp0.extend(st_curr_before.iter().cloned());
+        temp0.extend(st_curr_after.iter().cloned());
+        temp0.extend(lt_curr.iter().cloned());
         let active0 = (hdr.num_ref_idx_l0_active_minus1 + 1) as usize;
-        if rpl0.len() > active0 {
-            rpl0.truncate(active0);
-        }
+        let rpl0 = apply_list_modification(
+            &temp0,
+            hdr.ref_pic_list_modification_flag_l0,
+            &hdr.list_entry_l0,
+            active0,
+        );
 
-        // RPL1: after-first, then before, then LT (§8.3.4 eq. 8-10).
+        // §8.3.4 RefPicListTemp1: after-first, before, lt.
         let mut rpl1: Vec<RefPicture> = Vec::new();
         if hdr.slice_type == SliceType::B {
-            rpl1.extend(st_curr_after.iter().cloned());
-            rpl1.extend(st_curr_before.iter().cloned());
-            rpl1.extend(lt_curr.iter().cloned());
+            let mut temp1: Vec<RefPicture> = Vec::new();
+            temp1.extend(st_curr_after.iter().cloned());
+            temp1.extend(st_curr_before.iter().cloned());
+            temp1.extend(lt_curr.iter().cloned());
             let active1 = (hdr.num_ref_idx_l1_active_minus1 + 1) as usize;
-            if rpl1.len() > active1 {
-                rpl1.truncate(active1);
-            }
+            rpl1 = apply_list_modification(
+                &temp1,
+                hdr.ref_pic_list_modification_flag_l1,
+                &hdr.list_entry_l1,
+                active1,
+            );
         }
         (rpl0, rpl1)
     }
@@ -485,4 +495,35 @@ impl Decoder for HevcDecoder {
         self.prev_poc_lsb = 0;
         Ok(())
     }
+}
+
+/// Apply §8.3.4 ref-picture-list reordering. When `mod_flag == 0` the
+/// default RefPicListTemp (the first `active` entries) is returned
+/// unchanged. When `mod_flag == 1`, each output slot `i` is filled with
+/// `temp[list_entry[i]]`. Out-of-range indices are clamped so the decoder
+/// is robust against malformed streams — the spec forbids them, but
+/// silently clamping beats an erratic panic.
+fn apply_list_modification(
+    temp: &[RefPicture],
+    mod_flag: bool,
+    list_entry: &[u32],
+    active: usize,
+) -> Vec<RefPicture> {
+    if !mod_flag {
+        let mut out = temp.to_vec();
+        if out.len() > active {
+            out.truncate(active);
+        }
+        return out;
+    }
+    if temp.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<RefPicture> = Vec::with_capacity(active);
+    for i in 0..active {
+        let idx = list_entry.get(i).copied().unwrap_or(0) as usize;
+        let idx = idx.min(temp.len() - 1);
+        out.push(temp[idx].clone());
+    }
+    out
 }
