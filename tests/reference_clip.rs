@@ -1288,3 +1288,142 @@ fn hevc_wpp_fixture_decodes() {
         Err(e) => panic!("wpp fixture receive_frame failed: {e:?}"),
     }
 }
+
+/// Main10 (yuv420p10le) fixture: verifies the SPS parser accepts
+/// `bit_depth_luma_minus8 = 2` and the decoder surfaces a clean
+/// `Error::Unsupported` rather than panicking. Full Main10 pixel decode
+/// is not yet implemented — this nails down the current scope boundary.
+#[test]
+fn main10_fixture_surfaces_clean_unsupported() {
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let out = fixture_dir.join("h265-main10-192x112-p10.hevc");
+    let main10_path = if out.exists() {
+        Some(out)
+    } else if ffmpeg_available()
+        && run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=192x112:rate=25",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1",
+            out.to_str().unwrap(),
+        ])
+    {
+        Some(out)
+    } else {
+        // Fall back to the checked-in fixture if ffmpeg can't produce one.
+        let p = PathBuf::from(fixture_path("main10.hevc"));
+        if p.exists() {
+            Some(p)
+        } else {
+            eprintln!("main10 fixture unavailable — skipping");
+            return;
+        }
+    };
+    let path = main10_path.unwrap();
+    let Some(data) = read_fixture(&path.to_string_lossy()) else {
+        return;
+    };
+    // Confirm the SPS parser correctly identifies the stream as Main10.
+    let mut sps_bit_depth = None;
+    for nal in iter_annex_b(&data) {
+        if matches!(nal.header.nal_unit_type, NalUnitType::Sps) {
+            let rbsp = extract_rbsp(nal.payload());
+            let sps = parse_sps(&rbsp).expect("parse SPS from Main10 fixture");
+            sps_bit_depth = Some(sps.bit_depth_y());
+            break;
+        }
+    }
+    assert_eq!(
+        sps_bit_depth,
+        Some(10),
+        "expected Main10 (bit_depth_y = 10) in generated fixture"
+    );
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+    match dec.send_packet(&pkt) {
+        Ok(()) => match dec.receive_frame() {
+            Err(Error::Unsupported(_)) | Err(Error::NeedMore) => {}
+            Ok(_) => {
+                // If Main10 pixel decode ever lands this branch starts
+                // exercising the happy path — mark the test as passing.
+            }
+            Err(e) => panic!("unexpected error from Main10 fixture: {e:?}"),
+        },
+        Err(Error::Unsupported(_)) => {}
+        Err(e) => panic!("unexpected error from Main10 fixture: {e:?}"),
+    }
+}
+
+/// 4:4:4 fixture: confirms the decoder surfaces a clean `Unsupported`
+/// instead of panicking for `chroma_format_idc == 3` streams.
+#[test]
+fn yuv444_fixture_surfaces_clean_unsupported() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping 4:4:4 fixture test");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let out = fixture_dir.join("h265-yuv444-192x112.hevc");
+    if !out.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=192x112:rate=25",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv444p",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1",
+            out.to_str().unwrap(),
+        ])
+    {
+        eprintln!("ffmpeg failed to produce 4:4:4 fixture — skipping");
+        return;
+    }
+    let Some(data) = read_fixture(&out.to_string_lossy()) else {
+        return;
+    };
+    let mut chroma_format = None;
+    for nal in iter_annex_b(&data) {
+        if matches!(nal.header.nal_unit_type, NalUnitType::Sps) {
+            let rbsp = extract_rbsp(nal.payload());
+            let sps = parse_sps(&rbsp).expect("parse 4:4:4 SPS");
+            chroma_format = Some(sps.chroma_format_idc);
+            break;
+        }
+    }
+    assert_eq!(chroma_format, Some(3), "expected 4:4:4 (chroma_format_idc=3)");
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+    match dec.send_packet(&pkt) {
+        Ok(()) => match dec.receive_frame() {
+            Err(Error::Unsupported(_)) | Err(Error::NeedMore) => {}
+            other => panic!("unexpected receive_frame on 4:4:4 fixture: {other:?}"),
+        },
+        Err(Error::Unsupported(_)) => {}
+        Err(e) => panic!("unexpected error from 4:4:4 fixture: {e:?}"),
+    }
+}
