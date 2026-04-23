@@ -7,6 +7,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
+use crate::scaling_list::{parse_scaling_list_data, ScalingListData};
 
 #[derive(Clone, Debug)]
 pub struct PicParameterSet {
@@ -45,6 +46,11 @@ pub struct PicParameterSet {
     pub lists_modification_present_flag: bool,
     pub log2_parallel_merge_level_minus2: u32,
     pub slice_segment_header_extension_present_flag: bool,
+    /// `pps_scaling_list_data_present_flag`.
+    pub pps_scaling_list_data_present_flag: bool,
+    /// Parsed `scaling_list_data()` from the PPS when present (§7.3.4).
+    /// Overrides any SPS-level list per §7.4.3.3.
+    pub scaling_list_data: Option<ScalingListData>,
 }
 
 /// Parse a PPS NAL RBSP payload (the bytes after the 2-byte NAL header,
@@ -113,10 +119,9 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         }
     }
     let pps_scaling_list_data_present_flag = br.u1()? == 1;
+    let mut scaling_list_data: Option<ScalingListData> = None;
     if pps_scaling_list_data_present_flag {
-        // Same skipping logic as in SPS — kept inline so the two parsers
-        // stay independent.
-        skip_scaling_list_data(&mut br)?;
+        scaling_list_data = Some(parse_scaling_list_data(&mut br)?);
     }
     let lists_modification_present_flag = br.u1()? == 1;
     let log2_parallel_merge_level_minus2 = br.ue()?;
@@ -156,31 +161,8 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<PicParameterSet> {
         lists_modification_present_flag,
         log2_parallel_merge_level_minus2,
         slice_segment_header_extension_present_flag,
+        pps_scaling_list_data_present_flag,
+        scaling_list_data,
     })
 }
 
-fn skip_scaling_list_data(br: &mut BitReader<'_>) -> Result<()> {
-    for size_id in 0..4u32 {
-        let max_matrix_id = if size_id == 3 { 2 } else { 6 };
-        let mut matrix_id = 0u32;
-        while matrix_id < max_matrix_id {
-            let scaling_list_pred_mode_flag = br.u1()? == 1;
-            if !scaling_list_pred_mode_flag {
-                let _ = br.ue()?;
-            } else {
-                let mut next_coef: i32 = 8;
-                let coef_num = core::cmp::min(64u32, 1u32 << (4 + (size_id << 1)));
-                if size_id > 1 {
-                    let dc = br.se()?;
-                    next_coef = dc + 8;
-                }
-                for _ in 0..coef_num {
-                    let d = br.se()?;
-                    next_coef = (next_coef + d + 256) & 0xFF;
-                }
-            }
-            matrix_id += if size_id == 3 { 3 } else { 1 };
-        }
-    }
-    Ok(())
-}

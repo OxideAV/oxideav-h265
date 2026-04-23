@@ -26,8 +26,7 @@
 //! ## Restricted to
 //!
 //! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
-//! * Single-tile, wavefront-off, no transform-skip, no scaling lists,
-//!   no PCM CUs.
+//! * Single-tile, wavefront-off, no transform-skip, no PCM CUs.
 //! * **I, P, and B slices.** Inter PB shapes are limited to
 //!   2Nx2N / 2NxN / Nx2N / NxN (no AMP).
 //!
@@ -68,6 +67,9 @@
 //! * [`ctu`] — coding-tree walker and residual-coding pipeline.
 //! * [`sao`] — Sample Adaptive Offset filter (§8.7.3): per-CTB grid of
 //!   edge-offset + band-offset parameters, applied post-deblock.
+//! * [`scaling_list`] — `scaling_list_data()` parser (§7.3.4), default
+//!   tables (§7.4.5 Tables 7-5 / 7-6), and ScalingFactor expansion for
+//!   dequantisation (§8.6.3 eq. 8-309 with `m[x][y] ≠ 16`).
 //! * [`hvcc`] — HEVCDecoderConfigurationRecord (ISO/IEC 14496-15 §8.3.3).
 //! * [`decoder`] — registry factory and `HevcDecoder` wiring.
 
@@ -85,6 +87,7 @@ pub mod nal;
 pub mod pps;
 pub mod ptl;
 pub mod sao;
+pub mod scaling_list;
 pub mod scan;
 pub mod slice;
 pub mod sps;

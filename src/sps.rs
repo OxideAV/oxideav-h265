@@ -10,6 +10,7 @@ use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
 use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
+use crate::scaling_list::{parse_scaling_list_data, ScalingListData};
 
 #[derive(Clone, Debug)]
 pub struct SeqParameterSet {
@@ -38,6 +39,11 @@ pub struct SeqParameterSet {
     pub max_transform_hierarchy_depth_intra: u32,
     pub scaling_list_enabled_flag: bool,
     pub sps_scaling_list_data_present_flag: bool,
+    /// Parsed `scaling_list_data()` (§7.3.4) — `Some` iff
+    /// `sps_scaling_list_data_present_flag` is set. When
+    /// `scaling_list_enabled_flag` is set but the SPS does not carry its
+    /// own data, the decoder falls back to Table 7-5 / 7-6 defaults.
+    pub scaling_list_data: Option<ScalingListData>,
     pub amp_enabled_flag: bool,
     pub sample_adaptive_offset_enabled_flag: bool,
     pub pcm_enabled_flag: bool,
@@ -241,13 +247,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
     let max_transform_hierarchy_depth_intra = br.ue()?;
 
     let scaling_list_enabled_flag = br.u1()? == 1;
+    let mut scaling_list_data: Option<ScalingListData> = None;
     let sps_scaling_list_data_present_flag = if scaling_list_enabled_flag {
         let present = br.u1()? == 1;
         if present {
-            // §7.3.4 scaling_list_data — a few hundred bits of explicit
-            // scaling matrices. v1 scaffold skips them so the bit position
-            // remains correct without keeping the values.
-            skip_scaling_list_data(&mut br)?;
+            // §7.3.4 scaling_list_data — parse the matrices fully so the
+            // dequantiser can use them per eq. 8-309 instead of flat 16s.
+            scaling_list_data = Some(parse_scaling_list_data(&mut br)?);
         }
         present
     } else {
@@ -372,6 +378,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
         max_transform_hierarchy_depth_intra,
         scaling_list_enabled_flag,
         sps_scaling_list_data_present_flag,
+        scaling_list_data,
         amp_enabled_flag,
         sample_adaptive_offset_enabled_flag,
         pcm_enabled_flag,
@@ -669,30 +676,3 @@ pub fn parse_st_ref_pic_set(
     }
 }
 
-/// Walk past a `scaling_list_data()` block (§7.3.4). We read syntax for
-/// every (sizeId, matrixId) pair without storing the matrices.
-fn skip_scaling_list_data(br: &mut BitReader<'_>) -> Result<()> {
-    for size_id in 0..4u32 {
-        let max_matrix_id = if size_id == 3 { 2 } else { 6 };
-        let mut matrix_id = 0u32;
-        while matrix_id < max_matrix_id {
-            let scaling_list_pred_mode_flag = br.u1()? == 1;
-            if !scaling_list_pred_mode_flag {
-                let _ = br.ue()?; // scaling_list_pred_matrix_id_delta
-            } else {
-                let mut next_coef: i32 = 8;
-                let coef_num = core::cmp::min(64u32, 1u32 << (4 + (size_id << 1)));
-                if size_id > 1 {
-                    let _scale = br.se()?; // scaling_list_dc_coef_minus8 (-7..247)
-                    next_coef = _scale + 8;
-                }
-                for _ in 0..coef_num {
-                    let scaling_list_delta_coef = br.se()?;
-                    next_coef = (next_coef + scaling_list_delta_coef + 256) & 0xFF;
-                }
-            }
-            matrix_id += if size_id == 3 { 3 } else { 1 };
-        }
-    }
-    Ok(())
-}

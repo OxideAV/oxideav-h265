@@ -180,6 +180,40 @@ pub fn dequantize_flat(
     }
 }
 
+/// Dequantise an n×n coefficient block using a per-position scaling
+/// matrix (§8.6.3 eq. 8-309). `matrix[y * n + x]` supplies `m[x][y]`.
+/// All other parameters are identical to [`dequantize_flat`].
+pub fn dequantize_with_matrix(
+    coeffs_in: &[i32],
+    coeffs_out: &mut [i32],
+    qp: i32,
+    log2_tb: u32,
+    bit_depth: u32,
+    matrix: &[u8],
+) {
+    let n = 1usize << log2_tb;
+    debug_assert_eq!(coeffs_in.len(), n * n);
+    debug_assert_eq!(coeffs_out.len(), n * n);
+    debug_assert_eq!(matrix.len(), n * n);
+
+    let q_div = qp / 6;
+    let q_rem = qp.rem_euclid(6) as usize;
+    let scale = LEVEL_SCALE[q_rem];
+    let bd_shift = bit_depth as i32 + log2_tb as i32 - 5;
+    let round = 1i32 << (bd_shift - 1);
+
+    for i in 0..n * n {
+        let lvl = coeffs_in[i];
+        let m = matrix[i] as i32;
+        let mut v = lvl * m * scale;
+        if q_div > 0 {
+            v <<= q_div;
+        }
+        v = (v + round) >> bd_shift;
+        coeffs_out[i] = v.clamp(-32768, 32767);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

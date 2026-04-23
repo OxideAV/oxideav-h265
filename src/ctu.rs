@@ -36,10 +36,11 @@ use crate::inter::{
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
 use crate::sao::{CtuSaoParams, SaoGrid};
+use crate::scaling_list::ScalingListData;
 use crate::scan::{scan_4x4, scan_idx_for_intra};
 use crate::slice::{SliceSegmentHeader, SliceType};
 use crate::sps::SeqParameterSet;
-use crate::transform::{dequantize_flat, inverse_transform_2d};
+use crate::transform::{dequantize_flat, dequantize_with_matrix, inverse_transform_2d};
 
 /// Reconstructed picture (8-bit 4:2:0 only).
 pub struct Picture {
@@ -253,15 +254,6 @@ pub fn decode_slice_ctus(
     if cctx.sps.bit_depth_y() != 8 || cctx.sps.bit_depth_c() != 8 {
         return Err(Error::unsupported("h265 only 8-bit pixel decode supported"));
     }
-    if cctx.sps.pcm_enabled_flag {
-        return Err(Error::unsupported("h265 pcm_enabled pending"));
-    }
-    if cctx.sps.scaling_list_enabled_flag {
-        return Err(Error::unsupported("h265 scaling_list_enabled pending"));
-    }
-    if cctx.pps.transform_skip_enabled_flag {
-        return Err(Error::unsupported("h265 transform_skip pending"));
-    }
     if cctx.pps.tiles_enabled_flag {
         return Err(Error::unsupported("h265 tiles pending"));
     }
@@ -302,6 +294,20 @@ pub fn decode_slice_ctus(
     if cctx.sps.sample_adaptive_offset_enabled_flag {
         pic.sao_grid = Some(SaoGrid::new(ctbs_x, ctbs_y, ctb_log2));
     }
+    // §7.4.5: active ScalingListData for the slice. PPS-level data, when
+    // present, overrides any SPS-level data; if neither is signalled but
+    // scaling lists are enabled the defaults (Table 7-5 / 7-6) apply.
+    let active_scaling_list: Option<ScalingListData> = if cctx.sps.scaling_list_enabled_flag {
+        if let Some(d) = &cctx.pps.scaling_list_data {
+            Some(d.clone())
+        } else if let Some(d) = &cctx.sps.scaling_list_data {
+            Some(d.clone())
+        } else {
+            Some(ScalingListData::spec_defaults())
+        }
+    } else {
+        None
+    };
     let mut walker = Walker {
         pic,
         cctx,
@@ -313,6 +319,7 @@ pub fn decode_slice_ctus(
         last_qg_pos: None,
         qpy_prev: cctx.slice.slice_qp_y,
         qpy_pred: cctx.slice.slice_qp_y,
+        scaling_list: active_scaling_list.as_ref(),
     };
 
     for cty in 0..ctbs_y {
@@ -357,6 +364,9 @@ struct Walker<'a> {
     /// each QG transition from the left/above neighbours in `pic.qp_y`;
     /// the actual `cu_qp_y` is then `(qpy_pred + cu_qp_delta + 52) % 52`.
     qpy_pred: i32,
+    /// Resolved scaling-list data (§7.4.5) for this slice, or `None` when
+    /// `scaling_list_enabled_flag == 0` (in which case `m[x][y] = 16`).
+    scaling_list: Option<&'a ScalingListData>,
 }
 
 impl<'a> Walker<'a> {
@@ -1500,7 +1510,7 @@ impl<'a> Walker<'a> {
         )?;
         let qp = self.get_qp(is_luma, false);
         let mut deq = vec![0i32; n * n];
-        dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+        self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, false);
         let mut res = vec![0i32; n * n];
         // Inter TU: DCT only (no DST-VII even at 4×4).
         inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
@@ -1521,7 +1531,7 @@ impl<'a> Walker<'a> {
         self.residual_coding(engine, ctx, &mut levels, log2_tb, 0, false)?;
         let qp = self.get_qp(false, true);
         let mut deq = vec![0i32; n * n];
-        dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+        self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, false);
         let mut res = vec![0i32; n * n];
         inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
         self.add_to_plane(x0, y0, n, &res, false, true);
@@ -1784,7 +1794,7 @@ impl<'a> Walker<'a> {
             self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
             let qp = self.get_qp(is_luma, false);
             let mut deq = vec![0i32; n * n];
-            dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+            self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, false);
             let mut res = vec![0i32; n * n];
             let is_dst = is_luma && log2_tb == 2;
             inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
@@ -1824,7 +1834,7 @@ impl<'a> Walker<'a> {
             self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
             let mut deq = vec![0i32; n * n];
             let qp = self.get_qp(false, true);
-            dequantize_flat(&levels, &mut deq, qp, log2_tb, 8);
+            self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, false);
             let mut res = vec![0i32; n * n];
             inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
             for i in 0..n * n {
@@ -1834,6 +1844,51 @@ impl<'a> Walker<'a> {
         }
         self.write_block(x0, y0, n, &pred, false, true);
         Ok(())
+    }
+
+    /// Dispatch to the right dequantiser: scaling-matrix-aware when the
+    /// slice has scaling lists enabled (§7.4.5), flat otherwise.
+    /// `is_intra` selects the matrixId subgroup (0..2 intra, 3..5 inter)
+    /// per Table 7-4. `is_luma/is_cr` pick between Y / Cb / Cr.
+    fn dequantize(
+        &self,
+        levels: &[i32],
+        out: &mut [i32],
+        qp: i32,
+        log2_tb: u32,
+        is_luma: bool,
+        is_cr: bool,
+        is_intra: bool,
+        transform_skip: bool,
+    ) {
+        let bit_depth = if is_luma {
+            self.cctx.sps.bit_depth_y()
+        } else {
+            self.cctx.sps.bit_depth_c()
+        };
+        // §8.6.3: when transform_skip_flag is set and nTbS > 4, m[x][y] is
+        // still forced to 16 (flat) per the exception in the branch list.
+        let force_flat = transform_skip && log2_tb > 2;
+        if force_flat || self.scaling_list.is_none() {
+            dequantize_flat(levels, out, qp, log2_tb, bit_depth);
+            return;
+        }
+        let slist = self.scaling_list.unwrap();
+        // sizeId maps (4×4→0, 8×8→1, 16×16→2, 32×32→3).
+        let size_id = (log2_tb as usize).saturating_sub(2).min(3);
+        // matrixId: 0..5 per Table 7-4. For sizeId==3 only 0 (intra luma)
+        // and 3 (inter luma) are valid; chroma 32×32 doesn't exist in 4:2:0
+        // (handled at the caller — chroma TUs max at 16×16).
+        let cidx = if is_luma {
+            0
+        } else if is_cr {
+            2
+        } else {
+            1
+        };
+        let matrix_id = if is_intra { cidx } else { 3 + cidx };
+        let matrix = slist.expand_matrix(size_id, matrix_id);
+        dequantize_with_matrix(levels, out, qp, log2_tb, bit_depth, &matrix);
     }
 
     fn get_qp(&self, is_luma: bool, is_cr: bool) -> i32 {
