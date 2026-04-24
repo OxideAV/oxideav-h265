@@ -152,6 +152,8 @@ impl SaoGrid {
 /// Apply SAO to the reconstructed picture's luma + chroma planes.
 /// Must be called after deblocking and before the DPB write (§8.7.3).
 pub fn apply_sao(pic: &mut Picture, sps: &SeqParameterSet, slice: &SliceSegmentHeader) {
+    let bit_depth_y = sps.bit_depth_y();
+    let bit_depth_c = sps.bit_depth_c();
     let grid = match pic.sao_grid.take() {
         Some(g) => g,
         None => return,
@@ -206,6 +208,7 @@ pub fn apply_sao(pic: &mut Picture, sps: &SeqParameterSet, slice: &SliceSegmentH
                     p.eo_class[0],
                     p.band_position[0],
                     &p.offsets[0],
+                    bit_depth_y,
                 );
             }
         }
@@ -255,6 +258,7 @@ pub fn apply_sao(pic: &mut Picture, sps: &SeqParameterSet, slice: &SliceSegmentH
                         p.eo_class[comp + 1],
                         p.band_position[comp + 1],
                         &p.offsets[comp + 1],
+                        bit_depth_c,
                     );
                 }
             }
@@ -265,8 +269,8 @@ pub fn apply_sao(pic: &mut Picture, sps: &SeqParameterSet, slice: &SliceSegmentH
 
 #[allow(clippy::too_many_arguments)]
 fn apply_ctb(
-    src: &[u8],
-    dst: &mut [u8],
+    src: &[u16],
+    dst: &mut [u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -278,12 +282,16 @@ fn apply_ctb(
     eo_class: u8,
     band_pos: u8,
     offsets: &[i8; 4],
+    bit_depth: u32,
 ) {
+    // §8.7.3.4: 32 bands regardless of bit depth, so the band shift is
+    // `bit_depth - 5`.
+    let band_shift = bit_depth.saturating_sub(5) as i32;
     if type_idx == 1 {
-        // Band offset (§8.7.3.4). For 8-bit the band index is
-        // `sample >> 3` (32 bands ≡ bitDepth - 5). Four contiguous bands
-        // starting at `band_pos` receive the four signed offsets. Samples
-        // falling outside those four bands are unchanged.
+        // Band offset (§8.7.3.4). The band index is `sample >> (bitDepth - 5)`
+        // (32 bands). Four contiguous bands starting at `band_pos` receive the
+        // four signed offsets. Samples falling outside those four bands are
+        // unchanged.
         //
         // The 4-band window wraps modulo 32 per the spec; a window
         // starting at band 30 covers bands 30, 31, 0, 1.
@@ -291,11 +299,11 @@ fn apply_ctb(
             for xx in 0..w {
                 let idx = (y0 + yy) * stride + (x0 + xx);
                 let s = src[idx] as i32;
-                let band = (s >> 3) as u8; // bitDepth - 5 = 3 for 8-bit.
+                let band = (s >> band_shift) as u8;
                 let rel = band.wrapping_sub(band_pos) & 0x1F;
                 if rel < 4 {
                     let off = offsets[rel as usize] as i32;
-                    dst[idx] = clip_u8(s + off);
+                    dst[idx] = clip_bd(s + off, bit_depth);
                 }
             }
         }
@@ -336,14 +344,15 @@ fn apply_ctb(
             // (spec signs: + + - -, already baked into the stored value
             // by the parser).
             let off = offsets[(cat - 1) as usize] as i32;
-            dst[idx] = clip_u8(c + off);
+            dst[idx] = clip_bd(c + off, bit_depth);
         }
     }
 }
 
 #[inline]
-fn clip_u8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip_bd(v: i32, bit_depth: u32) -> u16 {
+    let max = ((1i32 << bit_depth) - 1).max(0);
+    v.clamp(0, max) as u16
 }
 
 #[cfg(test)]
@@ -387,10 +396,10 @@ mod tests {
         // Tiny 4x1 CTB, band_pos=0, offsets +2, +4, +6, +8 for bands 0..3.
         // Input samples: 0 (band 0), 8 (band 1), 40 (band 5 — outside),
         // 24 (band 3 — inside).
-        let src = vec![0u8, 8, 40, 24];
+        let src = vec![0u16, 8, 40, 24];
         let mut dst = src.clone();
         let offsets = [2i8, 4, 6, 8];
-        apply_ctb(&src, &mut dst, 4, 4, 1, 0, 0, 4, 1, 1, 0, 0, &offsets);
+        apply_ctb(&src, &mut dst, 4, 4, 1, 0, 0, 4, 1, 1, 0, 0, &offsets, 8);
         assert_eq!(dst[0], 2); // band 0 → +2
         assert_eq!(dst[1], 12); // band 1 → +4
         assert_eq!(dst[2], 40); // outside → untouched
@@ -404,14 +413,14 @@ mod tests {
         // 100, so centre is cat 1 (local min). Edges are skipped (no
         // neighbour on one side).
         #[rustfmt::skip]
-        let src: Vec<u8> = vec![
+        let src: Vec<u16> = vec![
             100, 100, 100,
             100,  50, 100,
             100, 100, 100,
         ];
         let mut dst = src.clone();
         let offsets = [7i8, 0, 0, 0]; // only cat 1 active.
-        apply_ctb(&src, &mut dst, 3, 3, 3, 0, 0, 3, 3, 2, 0, 0, &offsets);
+        apply_ctb(&src, &mut dst, 3, 3, 3, 0, 0, 3, 3, 2, 0, 0, &offsets, 8);
         assert_eq!(dst[4], 57, "centre classified as cat 1 and offset by +7");
         // Corner samples have no left or right neighbour inside; they stay
         // put.

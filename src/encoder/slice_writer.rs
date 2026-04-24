@@ -239,16 +239,16 @@ impl EncoderState {
         let src_y = &src.planes[0];
         let mut best_mode = 1u32; // DC default
         let mut best_sad = u64::MAX;
-        let mut pred = vec![0u8; n * n];
+        let mut pred = vec![0u16; n * n];
         for &mode in LUMA_CANDIDATES.iter() {
             // Apply MDIS per mode.
             let mut r = refs.clone();
-            let (apply, strong) = filter_decision(log2_tb, mode, false, &r, n);
+            let (apply, strong) = filter_decision(log2_tb, mode, false, &r, n, 8);
             if apply {
-                filter_ref_samples(&mut r, n, strong);
+                filter_ref_samples(&mut r, n, strong, 8);
             }
-            predict(&r, n, &mut pred, n, mode, true);
-            let sad = sad_block(&pred, n, &src_y.data, src_y.stride, x0 as usize, y0 as usize);
+            predict(&r, n, &mut pred, n, mode, true, 8);
+            let sad = sad_block_u16(&pred, n, &src_y.data, src_y.stride, x0 as usize, y0 as usize);
             if sad < best_sad {
                 best_sad = sad;
                 best_mode = mode;
@@ -269,12 +269,13 @@ impl EncoderState {
     ) -> (Vec<i32>, Vec<u8>) {
         let n = 1usize << log2_tb;
         let mut refs = self.gather_refs_luma(x0, y0, n);
-        let (apply, strong) = filter_decision(log2_tb, mode, false, &refs, n);
+        let (apply, strong) = filter_decision(log2_tb, mode, false, &refs, n, 8);
         if apply {
-            filter_ref_samples(&mut refs, n, strong);
+            filter_ref_samples(&mut refs, n, strong, 8);
         }
-        let mut pred = vec![0u8; n * n];
-        predict(&refs, n, &mut pred, n, mode, true);
+        let mut pred16 = vec![0u16; n * n];
+        predict(&refs, n, &mut pred16, n, mode, true, 8);
+        let pred: Vec<u8> = pred16.iter().map(|&v| v as u8).collect();
 
         // Residual = src - pred.
         let src_y = &src.planes[0];
@@ -321,8 +322,9 @@ impl EncoderState {
         let n = 1usize << log2_tb;
         let refs = self.gather_refs_chroma(cx, cy, n, is_cr);
         // No MDIS for chroma in 4:2:0 Main.
-        let mut pred = vec![0u8; n * n];
-        predict(&refs, n, &mut pred, n, mode, false);
+        let mut pred16 = vec![0u16; n * n];
+        predict(&refs, n, &mut pred16, n, mode, false, 8);
+        let pred: Vec<u8> = pred16.iter().map(|&v| v as u8).collect();
         let plane = if is_cr { &src.planes[2] } else { &src.planes[1] };
         let qp = chroma_qp_for_slice();
         let mut residual = vec![0i32; n * n];
@@ -352,9 +354,9 @@ impl EncoderState {
         (levels, rec)
     }
 
-    fn gather_refs_luma(&self, x0: u32, y0: u32, n: usize) -> Vec<u8> {
+    fn gather_refs_luma(&self, x0: u32, y0: u32, n: usize) -> Vec<u16> {
         let len = 4 * n + 1;
-        let mut samples = vec![128u8; len];
+        let mut samples = vec![128u16; len];
         let mut avail = vec![false; len];
         let stride = self.y_stride;
         let plane = &self.rec_y;
@@ -368,14 +370,14 @@ impl EncoderState {
         let x0 = x0 as usize;
         let y0 = y0 as usize;
         if x0 > 0 && y0 > 0 && is_decoded(x0 - 1, y0 - 1) {
-            samples[0] = plane[(y0 - 1) * stride + (x0 - 1)];
+            samples[0] = plane[(y0 - 1) * stride + (x0 - 1)] as u16;
             avail[0] = true;
         }
         if y0 > 0 {
             for i in 0..(2 * n) {
                 let xx = x0 + i;
                 if xx < w && is_decoded(xx, y0 - 1) {
-                    samples[1 + i] = plane[(y0 - 1) * stride + xx];
+                    samples[1 + i] = plane[(y0 - 1) * stride + xx] as u16;
                     avail[1 + i] = true;
                 }
             }
@@ -384,17 +386,17 @@ impl EncoderState {
             for i in 0..(2 * n) {
                 let yy = y0 + i;
                 if yy < h && is_decoded(x0 - 1, yy) {
-                    samples[2 * n + 1 + i] = plane[yy * stride + (x0 - 1)];
+                    samples[2 * n + 1 + i] = plane[yy * stride + (x0 - 1)] as u16;
                     avail[2 * n + 1 + i] = true;
                 }
             }
         }
-        build_ref_samples(&samples, &avail, n)
+        build_ref_samples(&samples, &avail, n, 8)
     }
 
-    fn gather_refs_chroma(&self, cx: u32, cy: u32, n: usize, is_cr: bool) -> Vec<u8> {
+    fn gather_refs_chroma(&self, cx: u32, cy: u32, n: usize, is_cr: bool) -> Vec<u16> {
         let len = 4 * n + 1;
-        let mut samples = vec![128u8; len];
+        let mut samples = vec![128u16; len];
         let mut avail = vec![false; len];
         let stride = self.c_stride;
         let plane = if is_cr { &self.rec_cr } else { &self.rec_cb };
@@ -411,14 +413,14 @@ impl EncoderState {
         let cx = cx as usize;
         let cy = cy as usize;
         if cx > 0 && cy > 0 && is_decoded_c(cx - 1, cy - 1) {
-            samples[0] = plane[(cy - 1) * stride + (cx - 1)];
+            samples[0] = plane[(cy - 1) * stride + (cx - 1)] as u16;
             avail[0] = true;
         }
         if cy > 0 {
             for i in 0..(2 * n) {
                 let xx = cx + i;
                 if xx < cw && is_decoded_c(xx, cy - 1) {
-                    samples[1 + i] = plane[(cy - 1) * stride + xx];
+                    samples[1 + i] = plane[(cy - 1) * stride + xx] as u16;
                     avail[1 + i] = true;
                 }
             }
@@ -427,12 +429,12 @@ impl EncoderState {
             for i in 0..(2 * n) {
                 let yy = cy + i;
                 if yy < ch && is_decoded_c(cx - 1, yy) {
-                    samples[2 * n + 1 + i] = plane[yy * stride + (cx - 1)];
+                    samples[2 * n + 1 + i] = plane[yy * stride + (cx - 1)] as u16;
                     avail[2 * n + 1 + i] = true;
                 }
             }
         }
-        build_ref_samples(&samples, &avail, n)
+        build_ref_samples(&samples, &avail, n, 8)
     }
 
     fn derive_mpm_list(&self, x0: u32, y0: u32) -> [u32; 3] {
@@ -553,7 +555,11 @@ impl EncoderState {
 
 /// Sum-absolute-difference between an n×n prediction and a region of the
 /// source plane.
-fn sad_block(pred: &[u8], n: usize, src: &[u8], stride: usize, x0: usize, y0: usize) -> u64 {
+/// Sum-absolute-difference between an n×n prediction buffer (u16) and a
+/// region of the source plane (u8). The intra_pred module moved to u16
+/// samples when 10-bit decode landed; this helper bridges the encoder's
+/// 8-bit planes into that API.
+fn sad_block_u16(pred: &[u16], n: usize, src: &[u8], stride: usize, x0: usize, y0: usize) -> u64 {
     let mut sum = 0u64;
     for dy in 0..n {
         for dx in 0..n {

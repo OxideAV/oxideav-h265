@@ -88,8 +88,9 @@ fn clip3<T: Ord>(lo: T, hi: T, v: T) -> T {
     core::cmp::min(hi, core::cmp::max(lo, v))
 }
 
-fn clip_u8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip_bd(v: i32, bit_depth: u32) -> u16 {
+    let max = ((1i32 << bit_depth) - 1).max(0);
+    v.clamp(0, max) as u16
 }
 
 /// Run the deblocking pass on a reconstructed picture in-place.
@@ -110,13 +111,19 @@ pub fn deblock_picture(
     let height = pic.height as usize;
     let beta_offset = slice.slice_beta_offset_div2 << 1;
     let tc_offset = slice.slice_tc_offset_div2 << 1;
+    let bit_depth_y = sps.bit_depth_y();
+    let bit_depth_c = sps.bit_depth_c();
 
     // §8.7.2.4: vertical edges first across the whole picture, then
     // horizontal edges. Both run on an 8-pixel luma grid (4-pixel chroma).
-    deblock_vertical_luma(pic, width, height, beta_offset, tc_offset, slice);
-    deblock_horizontal_luma(pic, width, height, beta_offset, tc_offset, slice);
-    deblock_vertical_chroma(pic, width, height, tc_offset, slice, pps);
-    deblock_horizontal_chroma(pic, width, height, tc_offset, slice, pps);
+    // β and tC table outputs scale by `<< (BitDepth - 8)` for higher bit
+    // depths (§8.7.2.5.3 eqs. 8-294..8-296). The scaling is applied where
+    // the tables are consulted, not here, to keep the call sites below
+    // unchanged.
+    deblock_vertical_luma(pic, width, height, beta_offset, tc_offset, slice, bit_depth_y);
+    deblock_horizontal_luma(pic, width, height, beta_offset, tc_offset, slice, bit_depth_y);
+    deblock_vertical_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
+    deblock_horizontal_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
     // Suppress unused-warnings: pps only consulted for chroma QP offsets
     // in chroma paths.
     let _ = pps;
@@ -197,24 +204,27 @@ fn qp_avg(pic: &Picture, p_x: usize, p_y: usize, q_x: usize, q_y: usize) -> i32 
 }
 
 /// Derive β and tC for a luma edge segment. Returns `(beta, tc)`.
-/// §8.7.2.5.3 eqs. 8-294..8-296.
-fn luma_beta_tc(qp_avg: i32, bs: u8, beta_off: i32, tc_off: i32) -> (i32, i32) {
+/// §8.7.2.5.3 eqs. 8-294..8-296. Both values are multiplied by
+/// `1 << (bit_depth - 8)` so the thresholds track the sample magnitude
+/// at higher bit depths.
+fn luma_beta_tc(qp_avg: i32, bs: u8, beta_off: i32, tc_off: i32, bit_depth: u32) -> (i32, i32) {
     let q_beta = clip3(0, 51, qp_avg + beta_off);
     let q_tc = clip3(0, 53, qp_avg + 2 * ((bs == 2) as i32) + tc_off);
+    let scale = bit_depth.saturating_sub(8);
     (
-        BETA_TABLE[q_beta as usize] as i32,
-        TC_TABLE[q_tc as usize] as i32,
+        (BETA_TABLE[q_beta as usize] as i32) << scale,
+        (TC_TABLE[q_tc as usize] as i32) << scale,
     )
 }
 
 /// Derive tC for a chroma edge (β is unused per §8.7.2.7 for chroma).
-fn chroma_tc(qp_avg_y: i32, cb_qp_offset: i32, bs: u8, tc_off: i32) -> i32 {
+fn chroma_tc(qp_avg_y: i32, cb_qp_offset: i32, bs: u8, tc_off: i32, bit_depth: u32) -> i32 {
     // QpI → QpC via Table 8-10 (§8.6.1). Add PPS/slice chroma offset
     // first, clip to [0, 51], then map to chroma QP.
     let qp_i = clip3(0, 51, qp_avg_y + cb_qp_offset);
     let qp_c = CHROMA_QP_I2C[qp_i as usize] as i32;
     let q = clip3(0, 53, qp_c + 2 * ((bs == 2) as i32) + tc_off);
-    TC_TABLE[q as usize] as i32
+    (TC_TABLE[q as usize] as i32) << bit_depth.saturating_sub(8)
 }
 
 /// Luma vertical edges: iterate every edge that lies on the 8-pixel grid
@@ -226,6 +236,7 @@ fn deblock_vertical_luma(
     beta_off: i32,
     tc_off: i32,
     _slice: &SliceSegmentHeader,
+    bit_depth: u32,
 ) {
     let stride = pic.luma_stride;
     let mut x = 8;
@@ -239,8 +250,8 @@ fn deblock_vertical_luma(
             let bs = boundary_strength(pic, p_bx, p_by, q_bx, q_by);
             if bs > 0 {
                 let qpa = qp_avg(pic, x - 1, y, x, y);
-                let (beta, tc) = luma_beta_tc(qpa, bs, beta_off, tc_off);
-                filter_luma_vertical(&mut pic.luma, stride, x, y, beta, tc);
+                let (beta, tc) = luma_beta_tc(qpa, bs, beta_off, tc_off, bit_depth);
+                filter_luma_vertical(&mut pic.luma, stride, x, y, beta, tc, bit_depth);
             }
             y += 4;
         }
@@ -256,6 +267,7 @@ fn deblock_horizontal_luma(
     beta_off: i32,
     tc_off: i32,
     _slice: &SliceSegmentHeader,
+    bit_depth: u32,
 ) {
     let stride = pic.luma_stride;
     let mut y = 8;
@@ -269,8 +281,8 @@ fn deblock_horizontal_luma(
             let bs = boundary_strength(pic, p_bx, p_by, q_bx, q_by);
             if bs > 0 {
                 let qpa = qp_avg(pic, x, y - 1, x, y);
-                let (beta, tc) = luma_beta_tc(qpa, bs, beta_off, tc_off);
-                filter_luma_horizontal(&mut pic.luma, stride, x, y, beta, tc);
+                let (beta, tc) = luma_beta_tc(qpa, bs, beta_off, tc_off, bit_depth);
+                filter_luma_horizontal(&mut pic.luma, stride, x, y, beta, tc, bit_depth);
             }
             x += 4;
         }
@@ -281,20 +293,22 @@ fn deblock_horizontal_luma(
 /// Luma vertical filter for a 4-sample-tall edge segment at (x, y..y+4).
 /// §8.7.2.5.3 + §8.7.2.5.6 + §8.7.2.5.7.
 fn filter_luma_vertical(
-    buf: &mut [u8],
+    buf: &mut [u16],
     stride: usize,
     x: usize,
     y: usize,
     beta: i32,
     tc: i32,
+    bit_depth: u32,
 ) {
     if beta == 0 && tc == 0 {
         return;
     }
+    let clip_bd_bd = |v: i32| clip_bd(v, bit_depth);
     // Row 0 (p/q samples) and row 3 used for the strong-filter decision.
     let idx = |xx: usize, yy: usize| yy * stride + xx;
-    let p = |buf: &[u8], k: usize, row: usize| -> i32 { buf[idx(x - 1 - k, y + row)] as i32 };
-    let q = |buf: &[u8], k: usize, row: usize| -> i32 { buf[idx(x + k, y + row)] as i32 };
+    let p = |buf: &[u16], k: usize, row: usize| -> i32 { buf[idx(x - 1 - k, y + row)] as i32 };
+    let q = |buf: &[u16], k: usize, row: usize| -> i32 { buf[idx(x + k, y + row)] as i32 };
 
     // §8.7.2.5.3 eq. 8-299..8-302 — dE / dEp / dEq via rows 0 and 3.
     let dp0 = (p(buf, 2, 0) - 2 * p(buf, 1, 0) + p(buf, 0, 0)).abs();
@@ -332,12 +346,12 @@ fn filter_luma_vertical(
             let nq0 = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
             let nq1 = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2);
             let nq2 = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-            buf[idx(x - 1, y + row)] = clip_u8(np0);
-            buf[idx(x - 2, y + row)] = clip_u8(np1);
-            buf[idx(x - 3, y + row)] = clip_u8(np2);
-            buf[idx(x, y + row)] = clip_u8(nq0);
-            buf[idx(x + 1, y + row)] = clip_u8(nq1);
-            buf[idx(x + 2, y + row)] = clip_u8(nq2);
+            buf[idx(x - 1, y + row)] = clip_bd_bd(np0);
+            buf[idx(x - 2, y + row)] = clip_bd_bd(np1);
+            buf[idx(x - 3, y + row)] = clip_bd_bd(np2);
+            buf[idx(x, y + row)] = clip_bd_bd(nq0);
+            buf[idx(x + 1, y + row)] = clip_bd_bd(nq1);
+            buf[idx(x + 2, y + row)] = clip_bd_bd(nq2);
         }
     } else {
         // Normal filter (§8.7.2.5.7).
@@ -356,17 +370,17 @@ fn filter_luma_vertical(
                 continue;
             }
             let delta = clip3(-tc, tc, delta0);
-            let np0 = clip_u8(p0 + delta);
-            let nq0 = clip_u8(q0 - delta);
+            let np0 = clip_bd_bd(p0 + delta);
+            let nq0 = clip_bd_bd(q0 - delta);
             buf[idx(x - 1, y + row)] = np0;
             buf[idx(x, y + row)] = nq0;
             if dep {
                 let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
-                buf[idx(x - 2, y + row)] = clip_u8(p1 + delta_p);
+                buf[idx(x - 2, y + row)] = clip_bd_bd(p1 + delta_p);
             }
             if deq {
                 let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
-                buf[idx(x + 1, y + row)] = clip_u8(q1 + delta_q);
+                buf[idx(x + 1, y + row)] = clip_bd_bd(q1 + delta_q);
             }
         }
     }
@@ -374,19 +388,21 @@ fn filter_luma_vertical(
 
 /// Luma horizontal filter — same math with rows/cols swapped.
 fn filter_luma_horizontal(
-    buf: &mut [u8],
+    buf: &mut [u16],
     stride: usize,
     x: usize,
     y: usize,
     beta: i32,
     tc: i32,
+    bit_depth: u32,
 ) {
     if beta == 0 && tc == 0 {
         return;
     }
+    let clip_bd_bd = |v: i32| clip_bd(v, bit_depth);
     let idx = |xx: usize, yy: usize| yy * stride + xx;
-    let p = |buf: &[u8], k: usize, col: usize| -> i32 { buf[idx(x + col, y - 1 - k)] as i32 };
-    let q = |buf: &[u8], k: usize, col: usize| -> i32 { buf[idx(x + col, y + k)] as i32 };
+    let p = |buf: &[u16], k: usize, col: usize| -> i32 { buf[idx(x + col, y - 1 - k)] as i32 };
+    let q = |buf: &[u16], k: usize, col: usize| -> i32 { buf[idx(x + col, y + k)] as i32 };
 
     let dp0 = (p(buf, 2, 0) - 2 * p(buf, 1, 0) + p(buf, 0, 0)).abs();
     let dp3 = (p(buf, 2, 3) - 2 * p(buf, 1, 3) + p(buf, 0, 3)).abs();
@@ -422,12 +438,12 @@ fn filter_luma_horizontal(
             let nq0 = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
             let nq1 = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2);
             let nq2 = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
-            buf[idx(x + col, y - 1)] = clip_u8(np0);
-            buf[idx(x + col, y - 2)] = clip_u8(np1);
-            buf[idx(x + col, y - 3)] = clip_u8(np2);
-            buf[idx(x + col, y)] = clip_u8(nq0);
-            buf[idx(x + col, y + 1)] = clip_u8(nq1);
-            buf[idx(x + col, y + 2)] = clip_u8(nq2);
+            buf[idx(x + col, y - 1)] = clip_bd_bd(np0);
+            buf[idx(x + col, y - 2)] = clip_bd_bd(np1);
+            buf[idx(x + col, y - 3)] = clip_bd_bd(np2);
+            buf[idx(x + col, y)] = clip_bd_bd(nq0);
+            buf[idx(x + col, y + 1)] = clip_bd_bd(nq1);
+            buf[idx(x + col, y + 2)] = clip_bd_bd(nq2);
         }
     } else {
         let dep = (dp0 + dp3) < ((beta + (beta >> 1)) >> 3);
@@ -444,15 +460,15 @@ fn filter_luma_horizontal(
                 continue;
             }
             let delta = clip3(-tc, tc, delta0);
-            buf[idx(x + col, y - 1)] = clip_u8(p0 + delta);
-            buf[idx(x + col, y)] = clip_u8(q0 - delta);
+            buf[idx(x + col, y - 1)] = clip_bd_bd(p0 + delta);
+            buf[idx(x + col, y)] = clip_bd_bd(q0 - delta);
             if dep {
                 let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
-                buf[idx(x + col, y - 2)] = clip_u8(p1 + delta_p);
+                buf[idx(x + col, y - 2)] = clip_bd_bd(p1 + delta_p);
             }
             if deq {
                 let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
-                buf[idx(x + col, y + 1)] = clip_u8(q1 + delta_q);
+                buf[idx(x + col, y + 1)] = clip_bd_bd(q1 + delta_q);
             }
         }
     }
@@ -466,6 +482,7 @@ fn deblock_vertical_chroma(
     tc_off: i32,
     slice: &SliceSegmentHeader,
     pps: &PicParameterSet,
+    bit_depth: u32,
 ) {
     let cw = width / 2;
     let ch = height / 2;
@@ -488,10 +505,10 @@ fn deblock_vertical_chroma(
             let bs = boundary_strength(pic, p_bx, p_by, q_bx, q_by);
             if bs == 2 {
                 let qpa = qp_avg(pic, luma_x - 1, luma_y, luma_x, luma_y);
-                let tc_cb = chroma_tc(qpa, cb_off, bs, tc_off);
-                let tc_cr = chroma_tc(qpa, cr_off, bs, tc_off);
-                filter_chroma_vertical(&mut pic.cb, c_stride, xc, yc, tc_cb);
-                filter_chroma_vertical(&mut pic.cr, c_stride, xc, yc, tc_cr);
+                let tc_cb = chroma_tc(qpa, cb_off, bs, tc_off, bit_depth);
+                let tc_cr = chroma_tc(qpa, cr_off, bs, tc_off, bit_depth);
+                filter_chroma_vertical(&mut pic.cb, c_stride, xc, yc, tc_cb, bit_depth);
+                filter_chroma_vertical(&mut pic.cr, c_stride, xc, yc, tc_cr, bit_depth);
             }
             yc += 2;
         }
@@ -506,6 +523,7 @@ fn deblock_horizontal_chroma(
     tc_off: i32,
     slice: &SliceSegmentHeader,
     pps: &PicParameterSet,
+    bit_depth: u32,
 ) {
     let cw = width / 2;
     let ch = height / 2;
@@ -525,10 +543,10 @@ fn deblock_horizontal_chroma(
             let bs = boundary_strength(pic, p_bx, p_by, q_bx, q_by);
             if bs == 2 {
                 let qpa = qp_avg(pic, luma_x, luma_y - 1, luma_x, luma_y);
-                let tc_cb = chroma_tc(qpa, cb_off, bs, tc_off);
-                let tc_cr = chroma_tc(qpa, cr_off, bs, tc_off);
-                filter_chroma_horizontal(&mut pic.cb, c_stride, xc, yc, tc_cb);
-                filter_chroma_horizontal(&mut pic.cr, c_stride, xc, yc, tc_cr);
+                let tc_cb = chroma_tc(qpa, cb_off, bs, tc_off, bit_depth);
+                let tc_cr = chroma_tc(qpa, cr_off, bs, tc_off, bit_depth);
+                filter_chroma_horizontal(&mut pic.cb, c_stride, xc, yc, tc_cb, bit_depth);
+                filter_chroma_horizontal(&mut pic.cr, c_stride, xc, yc, tc_cr, bit_depth);
             }
             xc += 2;
         }
@@ -538,10 +556,18 @@ fn deblock_horizontal_chroma(
 
 /// §8.7.2.7 chroma vertical filter: 2-sample-tall edge segment, only p0/q0
 /// and p1/q1 read, only p0/q0 written.
-fn filter_chroma_vertical(buf: &mut [u8], stride: usize, x: usize, y: usize, tc: i32) {
+fn filter_chroma_vertical(
+    buf: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    tc: i32,
+    bit_depth: u32,
+) {
     if tc == 0 {
         return;
     }
+    let clip_bd_bd = |v: i32| clip_bd(v, bit_depth);
     let idx = |xx: usize, yy: usize| yy * stride + xx;
     for row in 0..2 {
         let p1 = buf[idx(x - 2, y + row)] as i32;
@@ -549,15 +575,23 @@ fn filter_chroma_vertical(buf: &mut [u8], stride: usize, x: usize, y: usize, tc:
         let q0 = buf[idx(x, y + row)] as i32;
         let q1 = buf[idx(x + 1, y + row)] as i32;
         let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
-        buf[idx(x - 1, y + row)] = clip_u8(p0 + delta);
-        buf[idx(x, y + row)] = clip_u8(q0 - delta);
+        buf[idx(x - 1, y + row)] = clip_bd_bd(p0 + delta);
+        buf[idx(x, y + row)] = clip_bd_bd(q0 - delta);
     }
 }
 
-fn filter_chroma_horizontal(buf: &mut [u8], stride: usize, x: usize, y: usize, tc: i32) {
+fn filter_chroma_horizontal(
+    buf: &mut [u16],
+    stride: usize,
+    x: usize,
+    y: usize,
+    tc: i32,
+    bit_depth: u32,
+) {
     if tc == 0 {
         return;
     }
+    let clip_bd_bd = |v: i32| clip_bd(v, bit_depth);
     let idx = |xx: usize, yy: usize| yy * stride + xx;
     for col in 0..2 {
         let p1 = buf[idx(x + col, y - 2)] as i32;
@@ -565,8 +599,8 @@ fn filter_chroma_horizontal(buf: &mut [u8], stride: usize, x: usize, y: usize, t
         let q0 = buf[idx(x + col, y)] as i32;
         let q1 = buf[idx(x + col, y + 1)] as i32;
         let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
-        buf[idx(x + col, y - 1)] = clip_u8(p0 + delta);
-        buf[idx(x + col, y)] = clip_u8(q0 - delta);
+        buf[idx(x + col, y - 1)] = clip_bd_bd(p0 + delta);
+        buf[idx(x + col, y)] = clip_bd_bd(q0 - delta);
     }
 }
 
@@ -612,14 +646,14 @@ mod tests {
         // If the signal is already smooth, the normal filter should not
         // push samples outside [p0 - tc, p0 + tc] — and in particular for
         // the flat ramp the change should be zero or tiny.
-        let mut buf = [0u8; 16 * 4];
+        let mut buf = [0u16; 16 * 4];
         for y in 0..4 {
             for x in 0..16 {
-                buf[y * 16 + x] = (x as u8).wrapping_mul(8);
+                buf[y * 16 + x] = ((x as u8).wrapping_mul(8)) as u16;
             }
         }
         let before = buf;
-        filter_luma_vertical(&mut buf, 16, 8, 0, 30, 5);
+        filter_luma_vertical(&mut buf, 16, 8, 0, 30, 5, 8);
         // Max per-sample change on a smooth ramp should be small.
         let mut max_diff = 0i32;
         for i in 0..buf.len() {
@@ -631,7 +665,7 @@ mod tests {
     #[test]
     fn luma_strong_filter_smooths_step() {
         // Flat block, step at the edge — strong filter should pull it in.
-        let mut buf = [0u8; 16 * 4];
+        let mut buf = [0u16; 16 * 4];
         for y in 0..4 {
             for x in 0..8 {
                 buf[y * 16 + x] = 100;
@@ -641,7 +675,7 @@ mod tests {
             }
         }
         let before = buf;
-        filter_luma_vertical(&mut buf, 16, 8, 0, 60, 10);
+        filter_luma_vertical(&mut buf, 16, 8, 0, 60, 10, 8);
         // Samples at the edge must have moved toward each other.
         let p0_before = before[0 * 16 + 7] as i32;
         let q0_before = before[0 * 16 + 8] as i32;
@@ -653,7 +687,7 @@ mod tests {
 
     #[test]
     fn chroma_filter_monotone_step() {
-        let mut buf = [0u8; 8 * 2];
+        let mut buf = [0u16; 8 * 2];
         for y in 0..2 {
             for x in 0..4 {
                 buf[y * 8 + x] = 60;
@@ -663,7 +697,7 @@ mod tests {
             }
         }
         let before = buf;
-        filter_chroma_vertical(&mut buf, 8, 4, 0, 5);
+        filter_chroma_vertical(&mut buf, 8, 4, 0, 5, 8);
         let p0_before = before[3] as i32;
         let q0_before = before[4] as i32;
         let p0_after = buf[3] as i32;

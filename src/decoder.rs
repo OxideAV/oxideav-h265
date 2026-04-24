@@ -390,19 +390,88 @@ impl HevcDecoder {
         let cropped_h = sps.cropped_height();
         let (cw, ch) = (cropped_w as usize, cropped_h as usize);
         let (cwc, chc) = (cw / 2, ch / 2);
+        let bit_depth_y = sps.bit_depth_y();
+        let bit_depth_c = sps.bit_depth_c();
+        // Main 10 (bit_depth_y == 10) uses `Yuv420P10Le`: two bytes per
+        // sample, little-endian, low 10 bits valid. Main 8 narrows u16→u8.
+        // Higher bit depths fall through to the 10-bit surface for now —
+        // only Main 10 is exercised in tests.
+        if bit_depth_y > 8 {
+            let bps_y = 2usize;
+            let bps_c = 2usize;
+            let y_stride = cw * bps_y;
+            let c_stride = cwc * bps_c;
+            let max_y = (1u16 << bit_depth_y) - 1;
+            let max_c = (1u16 << bit_depth_c) - 1;
+            let mut y_plane = vec![0u8; y_stride * ch];
+            let mut cb_plane = vec![0u8; c_stride * chc];
+            let mut cr_plane = vec![0u8; c_stride * chc];
+            for y in 0..ch {
+                let src = &pic.luma[y * pic.luma_stride..y * pic.luma_stride + cw];
+                let dst = &mut y_plane[y * y_stride..y * y_stride + y_stride];
+                for (i, &s) in src.iter().enumerate() {
+                    let v = s.min(max_y);
+                    dst[i * 2] = (v & 0xFF) as u8;
+                    dst[i * 2 + 1] = (v >> 8) as u8;
+                }
+            }
+            for y in 0..chc {
+                let src_cb = &pic.cb[y * pic.chroma_stride..y * pic.chroma_stride + cwc];
+                let src_cr = &pic.cr[y * pic.chroma_stride..y * pic.chroma_stride + cwc];
+                let dst_cb = &mut cb_plane[y * c_stride..y * c_stride + c_stride];
+                let dst_cr = &mut cr_plane[y * c_stride..y * c_stride + c_stride];
+                for i in 0..cwc {
+                    let vcb = src_cb[i].min(max_c);
+                    let vcr = src_cr[i].min(max_c);
+                    dst_cb[i * 2] = (vcb & 0xFF) as u8;
+                    dst_cb[i * 2 + 1] = (vcb >> 8) as u8;
+                    dst_cr[i * 2] = (vcr & 0xFF) as u8;
+                    dst_cr[i * 2 + 1] = (vcr >> 8) as u8;
+                }
+            }
+            return VideoFrame {
+                format: PixelFormat::Yuv420P10Le,
+                width: cw as u32,
+                height: ch as u32,
+                pts: self.last_pts,
+                time_base: self.last_time_base,
+                planes: vec![
+                    VideoPlane {
+                        stride: y_stride,
+                        data: y_plane,
+                    },
+                    VideoPlane {
+                        stride: c_stride,
+                        data: cb_plane,
+                    },
+                    VideoPlane {
+                        stride: c_stride,
+                        data: cr_plane,
+                    },
+                ],
+            };
+        }
         let mut y_plane = vec![0u8; cw * ch];
         let mut cb_plane = vec![0u8; cwc * chc];
         let mut cr_plane = vec![0u8; cwc * chc];
         for y in 0..ch {
-            y_plane[y * cw..(y + 1) * cw]
-                .copy_from_slice(&pic.luma[y * pic.luma_stride..y * pic.luma_stride + cw]);
+            let src = &pic.luma[y * pic.luma_stride..y * pic.luma_stride + cw];
+            let dst = &mut y_plane[y * cw..(y + 1) * cw];
+            for (i, &s) in src.iter().enumerate() {
+                dst[i] = s.min(255) as u8;
+            }
         }
         for y in 0..chc {
-            cb_plane[y * cwc..(y + 1) * cwc]
-                .copy_from_slice(&pic.cb[y * pic.chroma_stride..y * pic.chroma_stride + cwc]);
-            cr_plane[y * cwc..(y + 1) * cwc]
-                .copy_from_slice(&pic.cr[y * pic.chroma_stride..y * pic.chroma_stride + cwc]);
+            let src_cb = &pic.cb[y * pic.chroma_stride..y * pic.chroma_stride + cwc];
+            let src_cr = &pic.cr[y * pic.chroma_stride..y * pic.chroma_stride + cwc];
+            let dst_cb = &mut cb_plane[y * cwc..(y + 1) * cwc];
+            let dst_cr = &mut cr_plane[y * cwc..(y + 1) * cwc];
+            for i in 0..cwc {
+                dst_cb[i] = src_cb[i].min(255) as u8;
+                dst_cr[i] = src_cr[i].min(255) as u8;
+            }
         }
+        let _ = bit_depth_c;
         VideoFrame {
             format: PixelFormat::Yuv420P,
             width: cw as u32,

@@ -192,9 +192,9 @@ pub struct RefPicture {
     pub poc: i32,
     pub width: u32,
     pub height: u32,
-    pub luma: Vec<u8>,
-    pub cb: Vec<u8>,
-    pub cr: Vec<u8>,
+    pub luma: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
     pub luma_stride: usize,
     pub chroma_stride: usize,
     /// Motion-field grid for collocated-MV (TMVP) lookups. Empty when the
@@ -208,7 +208,7 @@ pub struct RefPicture {
 }
 
 impl RefPicture {
-    pub fn sample_luma(&self, x: i32, y: i32) -> u8 {
+    pub fn sample_luma(&self, x: i32, y: i32) -> u16 {
         let w = self.width as i32;
         let h = self.height as i32;
         let xc = x.clamp(0, w - 1) as usize;
@@ -216,7 +216,7 @@ impl RefPicture {
         self.luma[yc * self.luma_stride + xc]
     }
 
-    pub fn sample_cb(&self, x: i32, y: i32) -> u8 {
+    pub fn sample_cb(&self, x: i32, y: i32) -> u16 {
         let w = (self.width / 2) as i32;
         let h = (self.height / 2) as i32;
         let xc = x.clamp(0, w - 1) as usize;
@@ -224,7 +224,7 @@ impl RefPicture {
         self.cb[yc * self.chroma_stride + xc]
     }
 
-    pub fn sample_cr(&self, x: i32, y: i32) -> u8 {
+    pub fn sample_cr(&self, x: i32, y: i32) -> u16 {
         let w = (self.width / 2) as i32;
         let h = (self.height / 2) as i32;
         let xc = x.clamp(0, w - 1) as usize;
@@ -644,7 +644,8 @@ fn luma_h_filter_int(p: impl Fn(i32, i32) -> i32, x: i32, y: i32, fx: usize) -> 
 
 /// Perform full 2-D luma sub-pel interpolation into `out` (row-major
 /// `blk_w * blk_h`) with 1/4-pel MV `mv` applied to the reference at the
-/// block origin (x0, y0). 8-bit only.
+/// block origin (x0, y0). Currently clips to 8-bit sample range (Main
+/// profile); 10-bit inter prediction is tracked separately.
 pub fn luma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -652,7 +653,7 @@ pub fn luma_mc(
     blk_w: i32,
     blk_h: i32,
     mv: MotionVector,
-    out: &mut [u8],
+    out: &mut [u16],
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 luma_mc: output buffer too small"));
@@ -691,7 +692,7 @@ pub fn luma_mc(
                 }
                 ((s + 2048) >> 12).clamp(0, 255)
             };
-            out[(j * blk_w + i) as usize] = v as u8;
+            out[(j * blk_w + i) as usize] = v as u16;
         }
     }
     Ok(())
@@ -757,10 +758,10 @@ pub fn luma_mc_hp(
 
 /// Combine two uni-pred luma arrays produced by [`luma_mc_hp`] into a
 /// bi-predicted block (§8.5.3.3.3).
-pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u8]) {
+pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16]) {
     for i in 0..out.len() {
         let v = (a[i] + b[i] + 64) >> 7;
-        out[i] = v.clamp(0, 255) as u8;
+        out[i] = v.clamp(0, 255) as u16;
     }
 }
 
@@ -770,7 +771,7 @@ pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u8]) {
 pub fn luma_mc_bi_weighted(
     a: &[i32],
     b: &[i32],
-    out: &mut [u8],
+    out: &mut [u16],
     w0: i32,
     o0: i32,
     w1: i32,
@@ -782,7 +783,7 @@ pub fn luma_mc_bi_weighted(
     for i in 0..out.len() {
         let v = (a[i] * w0 + b[i] * w1 + ((o0 + o1 + 1) << (shift - 1)) + round) >> (shift + 1);
         // Note: `(shift - 1)` is safe since HEVC requires `log2_wd >= 1`.
-        out[i] = v.clamp(0, 255) as u8;
+        out[i] = v.clamp(0, 255) as u16;
     }
 }
 
@@ -796,7 +797,7 @@ pub fn chroma_mc(
     blk_w: i32,
     blk_h: i32,
     mv: MotionVector,
-    out: &mut [u8],
+    out: &mut [u16],
     comp: u8,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
@@ -852,7 +853,7 @@ pub fn chroma_mc(
                 }
                 ((s + 2048) >> 12).clamp(0, 255)
             };
-            out[(j * blk_w + i) as usize] = v as u8;
+            out[(j * blk_w + i) as usize] = v as u16;
         }
     }
     Ok(())
@@ -929,7 +930,7 @@ pub fn chroma_mc_hp(
 }
 
 /// Combine two uni-pred chroma arrays into a bi-predicted block.
-pub fn chroma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u8]) {
+pub fn chroma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16]) {
     luma_mc_bi_combine(a, b, out);
 }
 
@@ -943,7 +944,7 @@ mod tests {
             poc: 0,
             width: 16,
             height: 16,
-            luma: (0..(16 * 16)).map(|i| (i & 0xFF) as u8).collect(),
+            luma: (0..(16 * 16)).map(|i| (i & 0xFF) as u16).collect(),
             cb: vec![128; 8 * 8],
             cr: vec![128; 8 * 8],
             luma_stride: 16,
@@ -951,7 +952,7 @@ mod tests {
             inter: InterState::new(16, 16),
             is_long_term: false,
         };
-        let mut out = vec![0u8; 8 * 8];
+        let mut out = vec![0u16; 8 * 8];
         luma_mc(&pic, 4, 4, 8, 8, MotionVector::new(0, 0), &mut out).expect("luma_mc");
         for j in 0..8 {
             for i in 0..8 {
@@ -1010,7 +1011,7 @@ mod tests {
     fn bi_combine_is_averaging() {
         let a = vec![10i32 << 6; 16]; // shift-6 encoding of value 10
         let b = vec![20i32 << 6; 16];
-        let mut out = vec![0u8; 16];
+        let mut out = vec![0u16; 16];
         luma_mc_bi_combine(&a, &b, &mut out);
         for v in &out {
             assert_eq!(*v, 15);

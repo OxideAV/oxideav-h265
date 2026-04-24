@@ -45,13 +45,16 @@ use crate::transform::{
     dequantize_flat, dequantize_with_matrix, inverse_transform_2d, transform_skip_2d,
 };
 
-/// Reconstructed picture (8-bit 4:2:0 only).
+/// Reconstructed picture (4:2:0, bit depth 8 or 10).
+///
+/// Samples are stored as `u16` so Main and Main 10 share a single code
+/// path; callers that only care about 8-bit simply narrow on the way out.
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    pub luma: Vec<u8>,
-    pub cb: Vec<u8>,
-    pub cr: Vec<u8>,
+    pub luma: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
     pub luma_stride: usize,
     pub chroma_stride: usize,
     /// Per-4x4 block intra prediction mode (luma) for neighbour derivation.
@@ -92,9 +95,13 @@ impl Picture {
         Self {
             width,
             height,
-            luma: vec![128u8; w * h],
-            cb: vec![128u8; cw * ch],
-            cr: vec![128u8; cw * ch],
+            // 8-bit neutral grey. Callers should re-init for other bit
+            // depths if they care about the leading junk before the CTU
+            // walker has written every sample; in practice every code path
+            // that reads a sample also writes it first.
+            luma: vec![128u16; w * h],
+            cb: vec![128u16; cw * ch],
+            cr: vec![128u16; cw * ch],
             luma_stride: w,
             chroma_stride: cw,
             intra_luma_mode: vec![1u8; iw4 * ih4], // 1 = DC default (§8.4.4.2.1).
@@ -280,8 +287,29 @@ pub fn decode_slice_ctus(
     if cctx.sps.chroma_format_idc != 1 {
         return Err(Error::unsupported("h265 only 4:2:0 pixel decode supported"));
     }
-    if cctx.sps.bit_depth_y() != 8 || cctx.sps.bit_depth_c() != 8 {
-        return Err(Error::unsupported("h265 only 8-bit pixel decode supported"));
+    // 8-bit (Main) and 10-bit (Main 10) are both supported. Higher bit
+    // depths (Main 12 / Main 4:2:2 10-bit etc.) have not been validated so
+    // surface them as a clean unsupported error rather than producing
+    // garbage reconstructions.
+    if cctx.sps.bit_depth_y() > 10 || cctx.sps.bit_depth_c() > 10 {
+        return Err(Error::unsupported(
+            "h265 pixel decode limited to bit_depth <= 10",
+        ));
+    }
+    if cctx.sps.bit_depth_y() != cctx.sps.bit_depth_c() {
+        return Err(Error::unsupported(
+            "h265 pixel decode requires matching luma/chroma bit depth",
+        ));
+    }
+    // Inter motion compensation (§8.5.3.3) currently clips at 8-bit
+    // amplitude; at 10-bit the bi-pred averaging step would be biased.
+    // Refuse inter slices until the MC helpers learn `bit_depth`.
+    if cctx.sps.bit_depth_y() > 8
+        && matches!(cctx.slice.slice_type, SliceType::P | SliceType::B)
+    {
+        return Err(Error::unsupported(
+            "h265 Main 10 inter slice decode is not yet supported",
+        ));
     }
     // Note: SAO parameters are parsed per-CTU (see decode_sao) into
     // `pic.sao_grid`; the post-decode filter (§8.7.3) runs from
@@ -1003,6 +1031,10 @@ impl<'a> Walker<'a> {
         let n = 1u32 << log2_cb;
         let pcm_depth_y = self.cctx.sps.pcm_sample_bit_depth_luma as usize;
         let pcm_depth_c = self.cctx.sps.pcm_sample_bit_depth_chroma as usize;
+        let bit_depth_y = self.cctx.sps.bit_depth_y() as i32;
+        let bit_depth_c = self.cctx.sps.bit_depth_c() as i32;
+        let max_y = (1i32 << bit_depth_y) - 1;
+        let max_c = (1i32 << bit_depth_c) - 1;
         // Start bit offset in the payload: after DecodeTerminate returns 1,
         // the engine's physical read pointer sits `bits_consumed()` bits
         // into the payload. `pcm_alignment_zero_bit` aligns to the next
@@ -1026,8 +1058,9 @@ impl<'a> Walker<'a> {
                     bit_off -= 8;
                     byte_pos += 1;
                 }
-                // Scale to 8-bit per §8.4.4.3 (left-shift by 8 - PcmBitDepth).
-                let shift = 8i32 - pcm_depth_y as i32;
+                // Scale to sample bit depth per §8.4.4.3 (left-shift by
+                // BitDepth - PcmBitDepth).
+                let shift = bit_depth_y - pcm_depth_y as i32;
                 let px_val = if shift >= 0 {
                     (sample as i32) << shift
                 } else {
@@ -1039,7 +1072,7 @@ impl<'a> Walker<'a> {
                     && (yy as usize) < self.pic.height as usize
                 {
                     let idx = yy as usize * self.pic.luma_stride + xx as usize;
-                    self.pic.luma[idx] = (px_val.clamp(0, 255)) as u8;
+                    self.pic.luma[idx] = px_val.clamp(0, max_y) as u16;
                 }
             }
         }
@@ -1055,7 +1088,7 @@ impl<'a> Walker<'a> {
                         bit_off -= 8;
                         byte_pos += 1;
                     }
-                    let shift = 8i32 - pcm_depth_c as i32;
+                    let shift = bit_depth_c - pcm_depth_c as i32;
                     let px_val = if shift >= 0 {
                         (sample as i32) << shift
                     } else {
@@ -1068,9 +1101,9 @@ impl<'a> Walker<'a> {
                     if (xx as usize) < pic_cw && (yy as usize) < pic_ch {
                         let idx = yy as usize * self.pic.chroma_stride + xx as usize;
                         if chroma_plane == 0 {
-                            self.pic.cb[idx] = px_val.clamp(0, 255) as u8;
+                            self.pic.cb[idx] = px_val.clamp(0, max_c) as u16;
                         } else {
-                            self.pic.cr[idx] = px_val.clamp(0, 255) as u8;
+                            self.pic.cr[idx] = px_val.clamp(0, max_c) as u16;
                         }
                     }
                 }
@@ -1179,9 +1212,9 @@ impl<'a> Walker<'a> {
             None
         };
 
-        let mut luma_out = vec![0u8; wz * hz];
-        let mut cb_out = vec![0u8; cw * ch];
-        let mut cr_out = vec![0u8; cw * ch];
+        let mut luma_out = vec![0u16; wz * hz];
+        let mut cb_out = vec![0u16; cw * ch];
+        let mut cr_out = vec![0u16; cw * ch];
 
         let is_bi = pb.pred_l0 && pb.pred_l1;
         let weighted = self.cctx.weighted_pred;
@@ -1925,12 +1958,17 @@ impl<'a> Walker<'a> {
             let qp = self.get_qp(is_luma, false);
             let mut deq = vec![0i32; n * n];
             self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, false, ts);
+            let bit_depth = if is_luma {
+                self.cctx.sps.bit_depth_y()
+            } else {
+                self.cctx.sps.bit_depth_c()
+            };
             if ts {
                 // §8.6.4.2 eq. 8-298: skip iDCT, apply tsShift/bdShift.
-                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                transform_skip_2d(&deq, &mut res, log2_tb, bit_depth);
             } else {
                 // Inter TU: DCT only (no DST-VII even at 4×4).
-                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+                inverse_transform_2d(&deq, &mut res, log2_tb, false, bit_depth);
             }
         }
         self.add_to_plane(x0, y0, n, &res, is_luma, false);
@@ -1955,10 +1993,11 @@ impl<'a> Walker<'a> {
             let qp = self.get_qp(false, true);
             let mut deq = vec![0i32; n * n];
             self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, false, ts);
+            let bit_depth = self.cctx.sps.bit_depth_c();
             if ts {
-                transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                transform_skip_2d(&deq, &mut res, log2_tb, bit_depth);
             } else {
-                inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+                inverse_transform_2d(&deq, &mut res, log2_tb, false, bit_depth);
             }
         }
         self.add_to_plane(x0, y0, n, &res, false, true);
@@ -1966,6 +2005,12 @@ impl<'a> Walker<'a> {
     }
 
     fn add_to_plane(&mut self, x: u32, y: u32, n: usize, res: &[i32], is_luma: bool, is_cr: bool) {
+        let bit_depth = if is_luma {
+            self.cctx.sps.bit_depth_y()
+        } else {
+            self.cctx.sps.bit_depth_c()
+        };
+        let max = (1i32 << bit_depth) - 1;
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
                 self.pic.luma_stride,
@@ -1997,7 +2042,7 @@ impl<'a> Walker<'a> {
                 if xx < pic_w && yy < pic_h {
                     let idx = yy * stride + xx;
                     let v = plane[idx] as i32 + res[dy * n + dx];
-                    plane[idx] = v.clamp(0, 255) as u8;
+                    plane[idx] = v.clamp(0, max) as u16;
                 }
             }
         }
@@ -2195,6 +2240,12 @@ impl<'a> Walker<'a> {
         has_coeff: bool,
     ) -> Result<()> {
         let n = 1usize << log2_tb;
+        let bit_depth = if is_luma {
+            self.cctx.sps.bit_depth_y()
+        } else {
+            self.cctx.sps.bit_depth_c()
+        };
+        let max_val = (1i32 << bit_depth) - 1;
         // Build reference samples.
         let refs = self.gather_refs(x0, y0, n, is_luma, false, true);
         let mut refs = refs;
@@ -2206,14 +2257,15 @@ impl<'a> Walker<'a> {
                 self.cctx.sps.strong_intra_smoothing_enabled_flag,
                 &refs,
                 n,
+                bit_depth,
             );
             if apply {
-                filter_ref_samples(&mut refs, n, strong);
+                filter_ref_samples(&mut refs, n, strong, bit_depth);
             }
         }
         // Predict.
-        let mut pred = vec![0u8; n * n];
-        predict(&refs, n, &mut pred, n, pred_mode, is_luma);
+        let mut pred = vec![0u16; n * n];
+        predict(&refs, n, &mut pred, n, pred_mode, is_luma, bit_depth);
 
         // If there are residuals, decode them and add.
         if has_coeff {
@@ -2233,15 +2285,15 @@ impl<'a> Walker<'a> {
                 let mut deq = vec![0i32; n * n];
                 self.dequantize(&levels, &mut deq, qp, log2_tb, is_luma, false, true, ts);
                 if ts {
-                    transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                    transform_skip_2d(&deq, &mut res, log2_tb, bit_depth);
                 } else {
                     let is_dst = is_luma && log2_tb == 2;
-                    inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, 8);
+                    inverse_transform_2d(&deq, &mut res, log2_tb, is_dst, bit_depth);
                 }
             }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
-                pred[i] = v.clamp(0, 255) as u8;
+                pred[i] = v.clamp(0, max_val) as u16;
             }
         }
 
@@ -2264,12 +2316,14 @@ impl<'a> Walker<'a> {
         has_coeff: bool,
     ) -> Result<()> {
         let n = 1usize << log2_tb;
+        let bit_depth = self.cctx.sps.bit_depth_c();
+        let max_val = (1i32 << bit_depth) - 1;
         let refs = self.gather_refs(x0, y0, n, false, true, false);
         let mut refs = refs;
         // Chroma doesn't get the MDIS filter in 4:2:0 main profile. Leave as-is.
         let _ = &mut refs;
-        let mut pred = vec![0u8; n * n];
-        predict(&refs, n, &mut pred, n, pred_mode, false);
+        let mut pred = vec![0u16; n * n];
+        predict(&refs, n, &mut pred, n, pred_mode, false, bit_depth);
         if has_coeff {
             let mut levels = vec![0i32; n * n];
             let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, false)?;
@@ -2281,14 +2335,14 @@ impl<'a> Walker<'a> {
                 let qp = self.get_qp(false, true);
                 self.dequantize(&levels, &mut deq, qp, log2_tb, false, true, true, ts);
                 if ts {
-                    transform_skip_2d(&deq, &mut res, log2_tb, 8);
+                    transform_skip_2d(&deq, &mut res, log2_tb, bit_depth);
                 } else {
-                    inverse_transform_2d(&deq, &mut res, log2_tb, false, 8);
+                    inverse_transform_2d(&deq, &mut res, log2_tb, false, bit_depth);
                 }
             }
             for i in 0..n * n {
                 let v = pred[i] as i32 + res[i];
-                pred[i] = v.clamp(0, 255) as u8;
+                pred[i] = v.clamp(0, max_val) as u16;
             }
         }
         self.write_block(x0, y0, n, &pred, false, true);
@@ -2363,9 +2417,15 @@ impl<'a> Walker<'a> {
         is_luma: bool,
         is_cr: bool,
         _top_left_only: bool,
-    ) -> Vec<u8> {
+    ) -> Vec<u16> {
         let len = 4 * n + 1;
-        let mut samples = vec![128u8; len];
+        let bit_depth = if is_luma {
+            self.cctx.sps.bit_depth_y()
+        } else {
+            self.cctx.sps.bit_depth_c()
+        };
+        let neutral = (1u16 << (bit_depth - 1)) as u16;
+        let mut samples = vec![neutral; len];
         let mut avail = vec![false; len];
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
@@ -2438,7 +2498,7 @@ impl<'a> Walker<'a> {
                 }
             }
         }
-        build_ref_samples(&samples, &avail, n)
+        build_ref_samples(&samples, &avail, n, bit_depth)
     }
 
     /// Persist `qp` into the 8×8 QP grid for every 8×8 block inside the QG
@@ -2511,7 +2571,7 @@ impl<'a> Walker<'a> {
         y: u32,
         w: usize,
         h: usize,
-        block: &[u8],
+        block: &[u16],
         is_luma: bool,
         is_cr: bool,
     ) {
@@ -2550,7 +2610,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn write_block(&mut self, x: u32, y: u32, n: usize, block: &[u8], is_luma: bool, is_cr: bool) {
+    fn write_block(&mut self, x: u32, y: u32, n: usize, block: &[u16], is_luma: bool, is_cr: bool) {
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
                 self.pic.luma_stride,
