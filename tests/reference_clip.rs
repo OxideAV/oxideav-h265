@@ -123,7 +123,13 @@ fn ensure_parser_fixtures() -> bool {
     true
 }
 
-fn ensure_generated_hevc_fixture(name: &str, lavfi: &str, fps: u32, frames: u32, gop: u32) -> Option<PathBuf> {
+fn ensure_generated_hevc_fixture(
+    name: &str,
+    lavfi: &str,
+    fps: u32,
+    frames: u32,
+    gop: u32,
+) -> Option<PathBuf> {
     let x265_params = format!(
         "log-level=error:keyint={gop}:min-keyint={gop}:scenecut=0:bframes=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1"
     );
@@ -818,12 +824,24 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
 fn hevc_intra_gray_16_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "gray16.h265",
-        "color=c=gray:size=16x16:rate=1:duration=1", 1, 1, 1,
-    ) else { return; };
+        "color=c=gray:size=16x16:rate=1:duration=1",
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-gray16.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-gray16.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 16, 16, 1, "intra gray 16 fixture");
@@ -834,12 +852,23 @@ fn hevc_intra_testsrc_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "testsrc-64.h265",
         "testsrc=size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-64.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-testsrc-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra testsrc 64 fixture");
@@ -850,12 +879,23 @@ fn hevc_intra_testsrc2_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "testsrc2-64.h265",
         "testsrc2=size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc2-64.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-testsrc2-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra testsrc2 64 fixture");
@@ -866,12 +906,23 @@ fn hevc_intra_smptebars_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "smptebars-64.h265",
         "smptebars=size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-smptebars-64.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-smptebars-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra smptebars 64 fixture");
@@ -882,12 +933,23 @@ fn hevc_intra_rgbtestsrc_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "rgbtestsrc-64.h265",
         "rgbtestsrc=size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-rgbtestsrc-64.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-rgbtestsrc-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra rgbtestsrc 64 fixture");
@@ -903,15 +965,33 @@ fn hevc_intra_mandelbrot_128_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "mandelbrot-128.h265",
         "mandelbrot=size=128x128:rate=1:end_pts=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-mandelbrot-128.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-mandelbrot-128.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
-    assert_yuv420_matches(&actual, &expected, 128, 128, 1, "intra mandelbrot 128 fixture");
+    assert_yuv420_matches(
+        &actual,
+        &expected,
+        128,
+        128,
+        1,
+        "intra mandelbrot 128 fixture",
+    );
 }
 
 // Fails today: first diff at (64, 0), the seam of CTU (64, 0). Same
@@ -924,15 +1004,33 @@ fn hevc_intra_testsrc_128x72_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "testsrc-128x72.h265",
         "testsrc=size=128x72:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-128x72.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-testsrc-128x72.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
-    assert_yuv420_matches(&actual, &expected, 128, 72, 1, "intra testsrc 128x72 fixture");
+    assert_yuv420_matches(
+        &actual,
+        &expected,
+        128,
+        72,
+        1,
+        "intra testsrc 128x72 fixture",
+    );
 }
 
 // Fails today at (20, 64) — second CTU row. Same cross-CTU bug.
@@ -945,15 +1043,33 @@ fn hevc_intra_testsrc_192x112_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "testsrc-192x112.h265",
         "testsrc=size=192x112:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-testsrc-192x112.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-testsrc-192x112.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
-    assert_yuv420_matches(&actual, &expected, 192, 112, 1, "intra testsrc 192x112 fixture");
+    assert_yuv420_matches(
+        &actual,
+        &expected,
+        192,
+        112,
+        1,
+        "intra testsrc 192x112 fixture",
+    );
 }
 
 #[test]
@@ -962,12 +1078,24 @@ fn hevc_intra_gray_64_qp51_matches_ffmpeg() {
                 wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:qp=51";
     let Some(input) = ensure_generated_hevc_fixture_with_params(
         "exact-intra-gray-64-qp51.h265",
-        "color=c=gray:size=64x64:rate=1:duration=1", 1, 1, x265,
-    ) else { return; };
+        "color=c=gray:size=64x64:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-intra-64-qp51.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-intra-64-qp51.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra 64 qp51 fixture");
@@ -978,12 +1106,23 @@ fn hevc_intra_gray_64_matches_ffmpeg() {
     let Some(input) = ensure_generated_hevc_fixture(
         "exact-intra-gray-64.h265",
         "color=c=gray:size=64x64:rate=1:duration=1",
-        1, 1, 1,
-    ) else { return; };
+        1,
+        1,
+        1,
+    ) else {
+        return;
+    };
     let input_str = input.to_string_lossy().into_owned();
-    let Some(data) = read_fixture(&input_str) else { return; };
-    let Some(expected) = ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-intra-64.ref.yuv"), Some(1))
-    else { return; };
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-intra-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
     let frames = decode_all_video_frames(data, 1);
     let actual = flatten_yuv420_frames(&frames);
     assert_yuv420_matches(&actual, &expected, 64, 64, 1, "intra 64 fixture");
@@ -1004,9 +1143,11 @@ fn hevc_intra_fixture_matches_ffmpeg() {
     let Some(data) = read_fixture(&input_str) else {
         return;
     };
-    let Some(expected) =
-        ffmpeg_decode_raw(&input_str, &PathBuf::from("/tmp/hevc-intra.ref.yuv"), Some(1))
-    else {
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-intra.ref.yuv"),
+        Some(1),
+    ) else {
         return;
     };
     let frames = decode_all_video_frames(data, 1);
@@ -1210,7 +1351,11 @@ fn hevc_angular_intra_fixture_decodes() {
             assert_eq!(vf.width, 128);
             assert_eq!(vf.height, 96);
             let y_plane = &vf.planes[0].data;
-            let distinct = y_plane.iter().copied().collect::<std::collections::HashSet<_>>().len();
+            let distinct = y_plane
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
             assert!(
                 distinct > 10,
                 "angular fixture: expected >10 distinct luma values, got {distinct}",
@@ -1922,7 +2067,11 @@ fn yuv444_fixture_surfaces_clean_unsupported() {
             break;
         }
     }
-    assert_eq!(chroma_format, Some(3), "expected 4:4:4 (chroma_format_idc=3)");
+    assert_eq!(
+        chroma_format,
+        Some(3),
+        "expected 4:4:4 (chroma_format_idc=3)"
+    );
     let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 25), data);
     match dec.send_packet(&pkt) {

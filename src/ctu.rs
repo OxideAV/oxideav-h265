@@ -32,7 +32,7 @@ use crate::cabac::{
 use crate::inter::{
     build_amvp_list, build_merge_list, chroma_mc, chroma_mc_bi_combine, chroma_mc_hp, luma_mc,
     luma_mc_bi_combine, luma_mc_bi_weighted, luma_mc_hp, InterState, MergeCand, MotionVector,
-    PbMotion, RefPicture, WeightedPred,
+    NeighbourContext, PbMotion, RefPicture, WeightedPred,
 };
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
@@ -167,6 +167,45 @@ enum InterPart {
     Mode2NxnD,
     ModenLx2N,
     ModenRx2N,
+}
+
+impl InterPart {
+    /// `PartMode ∈ {PART_Nx2N, PART_nLx2N, PART_nRx2N}` — split along a
+    /// vertical edge. §8.5.3.2.3 forces `availableA1 = FALSE` for
+    /// partIdx==1 of these shapes (A1 lands inside partIdx==0's PU).
+    fn is_vertical_split(self) -> bool {
+        matches!(
+            self,
+            InterPart::ModeNx2N | InterPart::ModenLx2N | InterPart::ModenRx2N
+        )
+    }
+
+    /// `PartMode ∈ {PART_2NxN, PART_2NxnU, PART_2NxnD}` — split along
+    /// a horizontal edge. §8.5.3.2.3 forces `availableB1 = FALSE` for
+    /// partIdx==1.
+    fn is_horizontal_split(self) -> bool {
+        matches!(
+            self,
+            InterPart::Mode2NxN | InterPart::Mode2NxnU | InterPart::Mode2NxnD
+        )
+    }
+
+    fn is_nxn(self) -> bool {
+        matches!(self, InterPart::ModeNxN)
+    }
+}
+
+/// Build a `NeighbourContext` for a PU at `part_idx` inside a CU whose
+/// `PartMode == part_mode`. Encodes the §8.5.3.2.3 / §6.4.2 availability
+/// overrides so `build_merge_list` / `build_amvp_list` do not pick up
+/// the sibling PU's freshly-written motion when the spec marks a
+/// neighbour slot UNAVAILABLE.
+fn neighbour_ctx(part_mode: InterPart, part_idx: u32) -> NeighbourContext {
+    NeighbourContext {
+        suppress_a1: part_mode.is_vertical_split() && part_idx == 1,
+        suppress_b1: part_mode.is_horizontal_split() && part_idx == 1,
+        suppress_a0: part_mode.is_nxn() && part_idx == 1,
+    }
 }
 
 #[derive(Clone)]
@@ -1159,6 +1198,9 @@ impl<'a> Walker<'a> {
         merge_idx: u32,
     ) -> Result<()> {
         let tmvp = self.tmvp_merge_cand(x0, y0, n_pb_w, n_pb_h);
+        // Skip CUs are always PART_2Nx2N at partIdx 0 — no partition-based
+        // neighbour suppression applies.
+        let nb = NeighbourContext::default();
         let cands = build_merge_list(
             &self.pic.inter,
             x0,
@@ -1168,6 +1210,7 @@ impl<'a> Walker<'a> {
             self.cctx.slice.max_num_merge_cand,
             self.cctx.is_b_slice(),
             tmvp,
+            nb,
         );
         let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
         let pb = sel.to_pb();
@@ -1351,9 +1394,7 @@ impl<'a> Walker<'a> {
                 let l1_c = weighted
                     .and_then(|w| w.chroma_weight_l1(pb.ref_idx_l1.max(0) as usize, comp as usize));
                 if let (Some(w_table), Some((w0, o0)), Some((w1, o1))) = (weighted, l0_c, l1_c) {
-                    luma_mc_bi_weighted(
-                        a, b, out, w0, o0, w1, o1, w_table.chroma_denom + 1, bd_c,
-                    );
+                    luma_mc_bi_weighted(a, b, out, w0, o0, w1, o1, w_table.chroma_denom + 1, bd_c);
                 } else {
                     chroma_mc_bi_combine(a, b, out, bd_c);
                 }
@@ -1424,25 +1465,19 @@ impl<'a> Walker<'a> {
             // "quarter" (cb/4) slice; the second stripe fills the remainder
             // (3·cb/4). "U" / "L" place the quarter stripe first;
             // "D" / "R" place it last.
-            InterPart::Mode2NxnU => vec![
-                (x0, y0, cb_size, q),
-                (x0, y0 + q, cb_size, cb_size - q),
-            ],
+            InterPart::Mode2NxnU => vec![(x0, y0, cb_size, q), (x0, y0 + q, cb_size, cb_size - q)],
             InterPart::Mode2NxnD => vec![
                 (x0, y0, cb_size, cb_size - q),
                 (x0, y0 + cb_size - q, cb_size, q),
             ],
-            InterPart::ModenLx2N => vec![
-                (x0, y0, q, cb_size),
-                (x0 + q, y0, cb_size - q, cb_size),
-            ],
+            InterPart::ModenLx2N => vec![(x0, y0, q, cb_size), (x0 + q, y0, cb_size - q, cb_size)],
             InterPart::ModenRx2N => vec![
                 (x0, y0, cb_size - q, cb_size),
                 (x0 + cb_size - q, y0, q, cb_size),
             ],
         };
-        for (px, py, pw, ph) in &pbs {
-            self.decode_prediction_unit(engine, ctx, *px, *py, *pw, *ph)?;
+        for (idx, (px, py, pw, ph)) in pbs.iter().enumerate() {
+            self.decode_prediction_unit(engine, ctx, *px, *py, *pw, *ph, part_mode, idx as u32)?;
         }
 
         // rqt_root_cbf: whether a transform tree follows.
@@ -1450,7 +1485,7 @@ impl<'a> Walker<'a> {
         if rqt == 0 {
             return Ok(());
         }
-        self.transform_tree_inter(engine, ctx, x0, y0, log2_cb, 0)
+        self.transform_tree_inter(engine, ctx, x0, y0, log2_cb, 0, part_mode)
     }
 
     fn decode_prediction_unit(
@@ -1461,7 +1496,10 @@ impl<'a> Walker<'a> {
         y: u32,
         w: u32,
         h: u32,
+        part_mode: InterPart,
+        part_idx: u32,
     ) -> Result<()> {
+        let nb = neighbour_ctx(part_mode, part_idx);
         let merge_flag = engine.decode_bin(&mut ctx.merge_flag[0]) == 1;
         let pb = if merge_flag {
             let merge_idx = if self.cctx.slice.max_num_merge_cand > 1 {
@@ -1479,6 +1517,7 @@ impl<'a> Walker<'a> {
                 self.cctx.slice.max_num_merge_cand,
                 self.cctx.is_b_slice(),
                 tmvp,
+                nb,
             );
             let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
             sel.to_pb()
@@ -1534,7 +1573,7 @@ impl<'a> Walker<'a> {
                 let mvd = decode_mvd(engine, ctx)?;
                 let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
                 let tmvp_mv = self.tmvp_amvp_mv(x, y, w, h, true);
-                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, true, tmvp_mv);
+                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, true, tmvp_mv, nb);
                 let mvp = amvp[mvp_flag as usize];
                 ref_idx_l0 = ri as i8;
                 mv_l0 = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
@@ -1559,7 +1598,7 @@ impl<'a> Walker<'a> {
                 };
                 let mvp_flag = engine.decode_bin(&mut ctx.mvp_lx_flag[0]);
                 let tmvp_mv = self.tmvp_amvp_mv(x, y, w, h, false);
-                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, false, tmvp_mv);
+                let amvp = build_amvp_list(&self.pic.inter, x, y, w, h, false, tmvp_mv, nb);
                 let mvp = amvp[mvp_flag as usize];
                 ref_idx_l1 = ri as i8;
                 mv_l1 = MotionVector::new(mvp.x + mvd.x, mvp.y + mvd.y);
@@ -1846,11 +1885,14 @@ impl<'a> Walker<'a> {
         y0: u32,
         log2_tb: u32,
         tr_depth: u32,
+        part_mode: InterPart,
     ) -> Result<()> {
         // At the root the "parent" cbf_cb / cbf_cr are treated as 1 so the
         // conditional at tr_depth == 0 still opens. xBase/yBase start at
         // the CU origin; blkIdx starts at 0.
-        self.transform_tree_inter_inner(engine, ctx, x0, y0, x0, y0, log2_tb, tr_depth, 0, 1, 1)
+        self.transform_tree_inter_inner(
+            engine, ctx, x0, y0, x0, y0, log2_tb, tr_depth, 0, 1, 1, part_mode,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1867,37 +1909,56 @@ impl<'a> Walker<'a> {
         blk_idx: u32,
         parent_cbf_cb: u32,
         parent_cbf_cr: u32,
+        part_mode: InterPart,
     ) -> Result<()> {
-        // §7.3.8.9 + §7.4.9.8 eq. 7-66: strictly, `split_transform_flag` is
-        // decoded only when `trafoDepth < MaxTrafoDepth` (= `max_transform_
-        // hierarchy_depth_inter` for the inter path) and not forced by
-        // `interSplitFlag`. The current Round-6 fixture has
-        // `max_transform_hierarchy_depth_inter == 0` and
-        // `max_transform_hierarchy_depth_intra == 0`, which means the flag
-        // is never signalled for inter CUs — and `interSplitFlag == 1`
-        // forces a split whenever `PartMode != PART_2Nx2N` at depth 0.
+        // §7.3.8.9 transform_tree syntax + §7.4.9.8 semantics:
+        // `split_transform_flag` is signalled only when
+        //   log2TrafoSize <= MaxTbLog2SizeY,
+        //   log2TrafoSize >  MinTbLog2SizeY,
+        //   trafoDepth    <  MaxTrafoDepth,
+        //   !(IntraSplitFlag && trafoDepth == 0).
+        // For an inter CU `MaxTrafoDepth = max_transform_hierarchy_depth_inter`
+        // and `IntraSplitFlag = 0`. When not signalled the flag is
+        // inferred to 1 if
+        //   log2TrafoSize > MaxTbLog2SizeY, OR
+        //   IntraSplitFlag && trafoDepth == 0, OR
+        //   interSplitFlag == 1,
+        // otherwise 0. `interSplitFlag` is 1 iff
+        //   max_transform_hierarchy_depth_inter == 0 AND
+        //   CuPredMode == MODE_INTER AND
+        //   PartMode != PART_2Nx2N AND trafoDepth == 0.
         //
-        // Spec-correct gating was prototyped in Round 6 and produced a
-        // ~+2 dB gain on frame 1 of the Main 10 inter fixture, but the
-        // cross-frame drift through TMVP/spatial MV candidates on frames
-        // 2/3 is large enough that the clip-wide PSNR drops below the
-        // current floor. The fix will only land once the AMVP/merge
-        // neighbour-resolution paths are tightened in parallel, so the
-        // pre-Round-6 behaviour (read the bin regardless) is preserved
-        // here to avoid a net regression.
+        // Round-7 landed the 2Nx2N branch: when `max_trafo_depth_inter`
+        // is 0 and PartMode == PART_2Nx2N, the root bin is not signalled
+        // and is inferred to 0 (single CU-sized root TU). This matches
+        // libx265's emission for our Main 10 fixture and lifts frame 1
+        // PSNR from 44.04 dB -> 46.11 dB. Non-2Nx2N CUs keep reading the
+        // bin because the spec-correct `interSplitFlag == 1` force-split
+        // path (4× quad-split at the root) still mis-aligns residual
+        // parsing against libx265's emission; full §7.4.9.8 eq. 7-66
+        // coverage is deferred to round 8.
         let max_tb_log2 = self.max_tb_log2;
         let min_tb_log2 = self.min_tb_log2;
+        let max_trafo_depth = self.cctx.sps.max_transform_hierarchy_depth_inter;
+        let inter_split_flag_full =
+            max_trafo_depth == 0 && tr_depth == 0 && part_mode != InterPart::Mode2Nx2N;
+        let skip_for_2nx2n =
+            max_trafo_depth == 0 && tr_depth == 0 && part_mode == InterPart::Mode2Nx2N;
         let must_split = log2_tb > max_tb_log2;
-        let can_split = log2_tb > min_tb_log2;
         let split = if must_split {
             1
-        } else if !can_split {
+        } else if skip_for_2nx2n {
             0
-        } else {
-            let ctx_inc = (5 - log2_tb) as usize;
-            let ctx_inc = ctx_inc.min(2);
+        } else if log2_tb > min_tb_log2 {
+            let ctx_inc = ((5 - log2_tb) as usize).min(2);
             engine.decode_bin(&mut ctx.split_transform_flag[ctx_inc])
+        } else {
+            0
         };
+        // `inter_split_flag_full` is the spec-correct interSplitFlag; kept
+        // here as documentation for the round-8 follow-up that will force
+        // split = 1 for non-2Nx2N CUs at the root.
+        let _ = inter_split_flag_full;
 
         // §7.3.8.9 transform_tree: cbf_cb / cbf_cr are decoded BEFORE the
         // split, at every depth where log2TrafoSize > 2, conditional on
@@ -1925,16 +1986,60 @@ impl<'a> Walker<'a> {
         if split == 1 {
             let sub = 1u32 << (log2_tb - 1);
             self.transform_tree_inter_inner(
-                engine, ctx, x0, y0, x0, y0, log2_tb - 1, tr_depth + 1, 0, cbf_cb_node, cbf_cr_node,
+                engine,
+                ctx,
+                x0,
+                y0,
+                x0,
+                y0,
+                log2_tb - 1,
+                tr_depth + 1,
+                0,
+                cbf_cb_node,
+                cbf_cr_node,
+                part_mode,
             )?;
             self.transform_tree_inter_inner(
-                engine, ctx, x0 + sub, y0, x0, y0, log2_tb - 1, tr_depth + 1, 1, cbf_cb_node, cbf_cr_node,
+                engine,
+                ctx,
+                x0 + sub,
+                y0,
+                x0,
+                y0,
+                log2_tb - 1,
+                tr_depth + 1,
+                1,
+                cbf_cb_node,
+                cbf_cr_node,
+                part_mode,
             )?;
             self.transform_tree_inter_inner(
-                engine, ctx, x0, y0 + sub, x0, y0, log2_tb - 1, tr_depth + 1, 2, cbf_cb_node, cbf_cr_node,
+                engine,
+                ctx,
+                x0,
+                y0 + sub,
+                x0,
+                y0,
+                log2_tb - 1,
+                tr_depth + 1,
+                2,
+                cbf_cb_node,
+                cbf_cr_node,
+                part_mode,
             )?;
             self.transform_tree_inter_inner(
-                engine, ctx, x0 + sub, y0 + sub, x0, y0, log2_tb - 1, tr_depth + 1, 3, cbf_cb_node, cbf_cr_node,
+                engine,
+                ctx,
+                x0 + sub,
+                y0 + sub,
+                x0,
+                y0,
+                log2_tb - 1,
+                tr_depth + 1,
+                3,
+                cbf_cb_node,
+                cbf_cr_node,
+                part_mode,
             )?;
             return Ok(());
         }
@@ -1956,10 +2061,7 @@ impl<'a> Walker<'a> {
             engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc])
         };
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
-        if has_any_coeff
-            && self.cctx.pps.cu_qp_delta_enabled_flag
-            && !self.is_cu_qp_delta_coded
-        {
+        if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
             let mut prefix = 0u32;
             let max_prefix = 5u32;
             while prefix < max_prefix {
@@ -1998,8 +2100,7 @@ impl<'a> Walker<'a> {
             // QpBdOffsetY=0 this collapses to (qpy_pred + delta + 52) % 52;
             // for Main 10 it uses (qpy_pred + delta + 76) % 64 - 12.
             let qp_bd = 6 * self.cctx.sps.bit_depth_luma_minus8 as i32;
-            *self.cu_qp_y =
-                (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
+            *self.cu_qp_y = (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
             self.is_cu_qp_delta_coded = true;
         }
         if cbf_luma != 0 {
@@ -2214,24 +2315,80 @@ impl<'a> Walker<'a> {
             let sub = 1u32 << (log2_tb - 1);
             // Children's xBase/yBase is our current (x0, y0).
             self.transform_tree(
-                engine, ctx, x0, y0, x0, y0, cu_x0, cu_y0,
-                log2_cb, log2_tb - 1, tr_depth + 1, 0, cbf_cb, cbf_cr,
-                luma_modes, chroma_mode, part_mode_nxn,
+                engine,
+                ctx,
+                x0,
+                y0,
+                x0,
+                y0,
+                cu_x0,
+                cu_y0,
+                log2_cb,
+                log2_tb - 1,
+                tr_depth + 1,
+                0,
+                cbf_cb,
+                cbf_cr,
+                luma_modes,
+                chroma_mode,
+                part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0 + sub, y0, x0, y0, cu_x0, cu_y0,
-                log2_cb, log2_tb - 1, tr_depth + 1, 1, cbf_cb, cbf_cr,
-                luma_modes, chroma_mode, part_mode_nxn,
+                engine,
+                ctx,
+                x0 + sub,
+                y0,
+                x0,
+                y0,
+                cu_x0,
+                cu_y0,
+                log2_cb,
+                log2_tb - 1,
+                tr_depth + 1,
+                1,
+                cbf_cb,
+                cbf_cr,
+                luma_modes,
+                chroma_mode,
+                part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0, y0 + sub, x0, y0, cu_x0, cu_y0,
-                log2_cb, log2_tb - 1, tr_depth + 1, 2, cbf_cb, cbf_cr,
-                luma_modes, chroma_mode, part_mode_nxn,
+                engine,
+                ctx,
+                x0,
+                y0 + sub,
+                x0,
+                y0,
+                cu_x0,
+                cu_y0,
+                log2_cb,
+                log2_tb - 1,
+                tr_depth + 1,
+                2,
+                cbf_cb,
+                cbf_cr,
+                luma_modes,
+                chroma_mode,
+                part_mode_nxn,
             )?;
             self.transform_tree(
-                engine, ctx, x0 + sub, y0 + sub, x0, y0, cu_x0, cu_y0,
-                log2_cb, log2_tb - 1, tr_depth + 1, 3, cbf_cb, cbf_cr,
-                luma_modes, chroma_mode, part_mode_nxn,
+                engine,
+                ctx,
+                x0 + sub,
+                y0 + sub,
+                x0,
+                y0,
+                cu_x0,
+                cu_y0,
+                log2_cb,
+                log2_tb - 1,
+                tr_depth + 1,
+                3,
+                cbf_cb,
+                cbf_cr,
+                luma_modes,
+                chroma_mode,
+                part_mode_nxn,
             )?;
             return Ok(());
         }
@@ -2243,10 +2400,7 @@ impl<'a> Walker<'a> {
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
 
         // cu_qp_delta once per QG when at least one cbf is set (§7.3.8.11).
-        if has_any_coeff
-            && self.cctx.pps.cu_qp_delta_enabled_flag
-            && !self.is_cu_qp_delta_coded
-        {
+        if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
             // Prefix: TR with cMax=5, cRiceParam=0. ctxInc 0 for the first
             // bin, 1 for every subsequent prefix bin (§9.3.4.2).
             let mut prefix = 0u32;
@@ -2287,8 +2441,7 @@ impl<'a> Walker<'a> {
             // §8.6.1 eq. 8-283 — bit-depth-aware QpY wrap (see matching
             // comment above the other call site).
             let qp_bd = 6 * self.cctx.sps.bit_depth_luma_minus8 as i32;
-            *self.cu_qp_y =
-                (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
+            *self.cu_qp_y = (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
             self.is_cu_qp_delta_coded = true;
         }
 
@@ -2315,19 +2468,45 @@ impl<'a> Walker<'a> {
             let chroma_y = y0 / 2;
             let chroma_log2 = log2_tb - 1;
             self.reconstruct_plane(
-                engine, ctx, chroma_x, chroma_y, chroma_log2, chroma_mode, false, cbf_cb != 0,
+                engine,
+                ctx,
+                chroma_x,
+                chroma_y,
+                chroma_log2,
+                chroma_mode,
+                false,
+                cbf_cb != 0,
             )?;
             self.reconstruct_plane_cr(
-                engine, ctx, chroma_x, chroma_y, chroma_log2, chroma_mode, cbf_cr != 0,
+                engine,
+                ctx,
+                chroma_x,
+                chroma_y,
+                chroma_log2,
+                chroma_mode,
+                cbf_cr != 0,
             )?;
         } else if blk_idx == 3 {
             let chroma_x = x_base / 2;
             let chroma_y = y_base / 2;
             self.reconstruct_plane(
-                engine, ctx, chroma_x, chroma_y, 2, chroma_mode, false, cbf_cb != 0,
+                engine,
+                ctx,
+                chroma_x,
+                chroma_y,
+                2,
+                chroma_mode,
+                false,
+                cbf_cb != 0,
             )?;
             self.reconstruct_plane_cr(
-                engine, ctx, chroma_x, chroma_y, 2, chroma_mode, cbf_cr != 0,
+                engine,
+                ctx,
+                chroma_x,
+                chroma_y,
+                2,
+                chroma_mode,
+                cbf_cr != 0,
             )?;
         }
         Ok(())
@@ -2375,8 +2554,7 @@ impl<'a> Walker<'a> {
         // If there are residuals, decode them and add.
         if has_coeff {
             let mut levels = vec![0i32; n * n];
-            let ts =
-                self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
+            let ts = self.residual_coding(engine, ctx, &mut levels, log2_tb, pred_mode, is_luma)?;
             let mut res = vec![0i32; n * n];
             if self.cu_transquant_bypass {
                 // §8.6.2 bypass path: levels already represent the spatial
@@ -2807,8 +2985,7 @@ impl<'a> Walker<'a> {
         };
 
         // last_sig_coeff_x/y_{prefix, suffix} (§9.3.4.2.7, 9.3.4.2.8).
-        let (last_x, last_y) =
-            self.decode_last_sig_pos(engine, ctx, log2_tb, scan_idx, is_luma)?;
+        let (last_x, last_y) = self.decode_last_sig_pos(engine, ctx, log2_tb, scan_idx, is_luma)?;
         // Translate (last_x, last_y) into the (scan_idx)-ordered 4x4 sub-block
         // grid coordinate.
         let (last_sx, last_sy) = subblock_coord(last_x, last_y);
@@ -2991,9 +3168,8 @@ impl<'a> Walker<'a> {
                 if !sig_flags[pos] {
                     continue;
                 }
-                let base_level = 1u32
-                    + u32::from(greater1_flags[pos])
-                    + u32::from(greater2_flags[pos]);
+                let base_level =
+                    1u32 + u32::from(greater1_flags[pos]) + u32::from(greater2_flags[pos]);
                 let threshold = if num_sig_coeff < 8 {
                     if pos as i32 == last_greater1_scan_pos {
                         3
@@ -3362,7 +3538,11 @@ fn sig_coeff_ctx_inc(
     } else {
         sig_ctx += 12;
     }
-    if is_luma { sig_ctx } else { 27 + sig_ctx }
+    if is_luma {
+        sig_ctx
+    } else {
+        27 + sig_ctx
+    }
 }
 
 fn decode_coeff_remainder(engine: &mut CabacEngine<'_>, rice: u32) -> Result<u32> {

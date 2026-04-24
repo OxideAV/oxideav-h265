@@ -14,8 +14,8 @@
 //! * No tiles, no wavefront, deblock enabled via PPS defaults.
 
 use crate::encoder::bit_writer::{write_rbsp_trailing_bits, BitWriter};
-use crate::nal::{NalHeader, NalUnitType};
 use crate::encoder::nal_writer::build_annex_b_nal;
+use crate::nal::{NalHeader, NalUnitType};
 
 /// High-level config used by the emitters. Fixed-profile MVP: most fields
 /// are derived from width/height.
@@ -49,15 +49,15 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32) {
     bw.write_u1(0); // interlaced_source_flag
     bw.write_u1(0); // non_packed_constraint_flag
     bw.write_u1(1); // frame_only_constraint_flag
-    // general_reserved_zero_43bits.
+                    // general_reserved_zero_43bits.
     bw.write_zero_bits(43);
     // general_inbld_flag = 0.
     bw.write_u1(0);
     // general_level_idc (u8) = 30 (level 1.0 × 30 = 3.0).
     bw.write_bits(90, 8); // level 3.0 = 30 × 3 = 90
-    // No sub-layers: sub_layer_profile_present_flag / sub_layer_level_present_flag
-    // per sub-layer; if max_sub_layers_minus1 == 0 we still emit the reserved
-    // 2-bit padding once for the top level — only if max_sub_layers_minus1 > 0.
+                          // No sub-layers: sub_layer_profile_present_flag / sub_layer_level_present_flag
+                          // per sub-layer; if max_sub_layers_minus1 == 0 we still emit the reserved
+                          // 2-bit padding once for the top level — only if max_sub_layers_minus1 > 0.
     if max_sub_layers_minus1 > 0 {
         for _ in 0..max_sub_layers_minus1 {
             bw.write_u1(0); // sub_layer_profile_present_flag
@@ -97,7 +97,7 @@ pub fn build_vps_rbsp() -> Vec<u8> {
     bw.write_ue(1); // vps_max_dec_pic_buffering_minus1[0] = 1
     bw.write_ue(0); // vps_max_num_reorder_pics[0] = 0
     bw.write_ue(0); // vps_max_latency_increase_plus1[0] = 0
-    // vps_max_layer_id (u6) = 0
+                    // vps_max_layer_id (u6) = 0
     bw.write_bits(0, 6);
     // vps_num_layer_sets_minus1
     bw.write_ue(0);
@@ -142,7 +142,7 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(1); // max_dec_pic_buffering_minus1[0]
     bw.write_ue(0); // max_num_reorder_pics[0]
     bw.write_ue(0); // max_latency_increase_plus1[0]
-    // log2_min_luma_coding_block_size_minus3 = 1 → min CU = 16
+                    // log2_min_luma_coding_block_size_minus3 = 1 → min CU = 16
     bw.write_ue(1);
     // log2_diff_max_min_luma_coding_block_size = 0 → max CU = 16 (CTU=16)
     bw.write_ue(0);

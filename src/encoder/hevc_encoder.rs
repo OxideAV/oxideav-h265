@@ -3,8 +3,11 @@
 //!
 //! Scope:
 //!
-//! * Every frame is emitted as an IDR I-slice with a single access unit
-//!   consisting of (VPS, SPS, PPS, IDR_slice) Annex B NAL units.
+//! * First frame of every GOP is an IDR I-slice with the access unit
+//!   consisting of (VPS, SPS, PPS, IDR_slice) Annex B NAL units. Subsequent
+//!   frames in the same GOP are TrailR P-slices that reference the
+//!   previously-reconstructed frame (L0 only). The GOP length defaults to
+//!   64 to match a typical keyint.
 //! * Picture dimensions must be a multiple of the 16-pixel CTU size.
 //! * Only 8-bit 4:2:0 (`PixelFormat::Yuv420P`).
 
@@ -16,8 +19,12 @@ use oxideav_core::{
     TimeBase,
 };
 
+use crate::encoder::p_slice_writer::{build_p_slice_with_reconstruction, ReferenceFrame};
 use crate::encoder::params::{build_pps_nal, build_sps_nal, build_vps_nal, EncoderConfig};
-use crate::encoder::slice_writer::build_idr_slice_nal;
+use crate::encoder::slice_writer::build_idr_slice_nal_with_reconstruction;
+
+/// Default GOP size (distance between IDR keyframes).
+const GOP_SIZE: u32 = 64;
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     Ok(Box::new(HevcEncoder::from_params(params)?))
@@ -31,6 +38,10 @@ pub struct HevcEncoder {
     time_base: TimeBase,
     /// Cache of the once-per-stream VPS/SPS/PPS Annex B bytes.
     vps_sps_pps: Vec<u8>,
+    /// Frame counter — used to pick I vs P and to derive POC LSB.
+    frame_count: u32,
+    /// Last reconstruction retained as the L0 reference for the next P frame.
+    last_recon: Option<ReferenceFrame>,
 }
 
 impl HevcEncoder {
@@ -77,6 +88,8 @@ impl HevcEncoder {
             eof: false,
             time_base,
             vps_sps_pps,
+            frame_count: 0,
+            last_recon: None,
         })
     }
 }
@@ -108,15 +121,34 @@ impl Encoder for HevcEncoder {
             return Err(Error::invalid("h265 encoder: expected 3 planes"));
         }
 
-        let mut data: Vec<u8> = Vec::with_capacity(self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32);
-        data.extend_from_slice(&self.vps_sps_pps);
-        data.extend_from_slice(&build_idr_slice_nal(&self.cfg, vf));
+        let is_keyframe = self.frame_count % GOP_SIZE == 0 || self.last_recon.is_none();
+        let frame_idx_in_gop = self.frame_count % GOP_SIZE;
+        let mut data: Vec<u8> = Vec::with_capacity(
+            self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32,
+        );
+
+        if is_keyframe {
+            data.extend_from_slice(&self.vps_sps_pps);
+            let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, vf);
+            data.extend_from_slice(&nal);
+            self.last_recon = Some(recon);
+        } else {
+            let ref_frame = self
+                .last_recon
+                .as_ref()
+                .expect("P-slice without L0 reference");
+            let (nal, recon) =
+                build_p_slice_with_reconstruction(&self.cfg, vf, frame_idx_in_gop, ref_frame);
+            data.extend_from_slice(&nal);
+            self.last_recon = Some(recon);
+        }
 
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = vf.pts;
         pkt.dts = vf.pts;
-        pkt.flags.keyframe = true;
+        pkt.flags.keyframe = is_keyframe;
         self.pending.push_back(pkt);
+        self.frame_count += 1;
         Ok(())
     }
 

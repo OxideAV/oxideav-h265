@@ -287,9 +287,7 @@ impl Dpb {
     /// the returned entry is also marked as LT.
     pub fn find_by_poc_lsb(&self, poc_lsb: u32, max_poc_lsb: u32) -> Option<&RefPicture> {
         let mask = (max_poc_lsb - 1) as i32;
-        self.pics
-            .iter()
-            .find(|p| (p.poc & mask) as u32 == poc_lsb)
+        self.pics.iter().find(|p| (p.poc & mask) as u32 == poc_lsb)
     }
 
     /// Mark a DPB entry as a long-term reference by POC (§8.3.2). Used when
@@ -429,6 +427,27 @@ impl MergeCand {
     }
 }
 
+/// Per-PU spatial-neighbour availability overrides implementing
+/// §8.5.3.2.3 partIdx rules and the §6.4.2 PB availability exception.
+///
+/// The grid (`InterState`) is written at PU granularity as each PU is
+/// decoded, so the naive "read the cell at (xNb, yNb)" approach from
+/// the partIdx==1 PU would pick up the just-decoded partIdx==0 motion.
+/// The spec marks those neighbour slots UNAVAILABLE so this struct
+/// lets the caller tell `build_merge_list`/`build_amvp_list` which to
+/// suppress.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeighbourContext {
+    /// `availableA1 = FALSE` — set for PART_Nx2N / PART_nLx2N /
+    /// PART_nRx2N at partIdx == 1.
+    pub suppress_a1: bool,
+    /// `availableB1 = FALSE` — set for PART_2NxN / PART_2NxnU /
+    /// PART_2NxnD at partIdx == 1.
+    pub suppress_b1: bool,
+    /// `availableA0 = FALSE` — §6.4.2 NxN / partIdx == 1 exception.
+    pub suppress_a0: bool,
+}
+
 /// A temporal merge candidate looked up from a collocated reference
 /// picture, with optional pre-scaled MV. If `None` is returned from
 /// [`temporal_merge_cand`] there is no temporal candidate.
@@ -446,34 +465,72 @@ pub fn build_merge_list(
     max_num_merge_cand: u32,
     is_b_slice: bool,
     tmvp: Option<MergeCand>,
+    nb: NeighbourContext,
 ) -> Vec<MergeCand> {
     let mut cands: Vec<MergeCand> = Vec::with_capacity(max_num_merge_cand as usize);
 
-    let a1 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32 - 1);
-    let b1 = fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32 - 1, y_pb as i32 - 1);
+    // §8.5.3.2.3 spatial availability: suppress partIdx-disallowed
+    // neighbours so we don't pick up the just-decoded sibling PU's
+    // motion that the grid now contains.
+    let a1 = if nb.suppress_a1 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32 - 1)
+    };
+    let b1 = if nb.suppress_b1 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32 - 1, y_pb as i32 - 1)
+    };
     let b0 = fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32, y_pb as i32 - 1);
-    let a0 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32);
+    let a0 = if nb.suppress_a0 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32)
+    };
     let b2 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 - 1);
 
-    let push = |cands: &mut Vec<MergeCand>, cand: Option<MergeCand>| {
-        if let Some(c) = cand {
-            if !cands.iter().any(|existing| existing == &c) {
+    // §8.5.3.2.3 redundancy rules — each candidate is pruned only
+    // against a specific set of earlier slots (not "any existing"):
+    //   A1: always inserted when available
+    //   B1: dropped if equal to A1
+    //   B0: dropped if equal to B1
+    //   A0: dropped if equal to A1
+    //   B2: dropped if equal to A1 or B1; skipped entirely when
+    //       availableFlagA0 + A1 + B0 + B1 == 4.
+    if let Some(c) = a1 {
+        cands.push(c);
+    }
+    if cands.len() < max_num_merge_cand as usize {
+        if let Some(c) = b1 {
+            if Some(c) != a1 {
                 cands.push(c);
             }
         }
-    };
-    push(&mut cands, a1);
-    if cands.len() < max_num_merge_cand as usize {
-        push(&mut cands, b1);
     }
     if cands.len() < max_num_merge_cand as usize {
-        push(&mut cands, b0);
+        if let Some(c) = b0 {
+            if Some(c) != b1 {
+                cands.push(c);
+            }
+        }
     }
     if cands.len() < max_num_merge_cand as usize {
-        push(&mut cands, a0);
+        if let Some(c) = a0 {
+            if Some(c) != a1 {
+                cands.push(c);
+            }
+        }
     }
-    if cands.len() < max_num_merge_cand as usize && cands.len() < 4 {
-        push(&mut cands, b2);
+    if cands.len() < max_num_merge_cand as usize {
+        let full4 = a0.is_some() && a1.is_some() && b0.is_some() && b1.is_some();
+        if !full4 {
+            if let Some(c) = b2 {
+                if Some(c) != a1 && Some(c) != b1 {
+                    cands.push(c);
+                }
+            }
+        }
     }
 
     // Temporal candidate (§8.5.3.1.2.3).
@@ -563,6 +620,7 @@ pub fn build_amvp_list(
     n_pb_h: u32,
     want_l0: bool,
     tmvp: Option<MotionVector>,
+    nb: NeighbourContext,
 ) -> [MotionVector; 2] {
     let pick = |cand: MergeCand| -> Option<MotionVector> {
         if want_l0 && cand.pred_l0 {
@@ -578,14 +636,27 @@ pub fn build_amvp_list(
         }
     };
 
-    let a0 =
-        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32).and_then(pick);
-    let a1 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32 - 1)
-        .and_then(pick);
+    // §8.5.3.2.3 / §6.4.2 availability — same suppression as the merge
+    // list to keep partIdx 1 from seeing partIdx 0's just-written motion.
+    let a0 = if nb.suppress_a0 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32).and_then(pick)
+    };
+    let a1 = if nb.suppress_a1 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32 - 1)
+            .and_then(pick)
+    };
     let b0 =
         fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32, y_pb as i32 - 1).and_then(pick);
-    let b1 = fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32 - 1, y_pb as i32 - 1)
-        .and_then(pick);
+    let b1 = if nb.suppress_b1 {
+        None
+    } else {
+        fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32 - 1, y_pb as i32 - 1)
+            .and_then(pick)
+    };
     let b2 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 - 1).and_then(pick);
 
     let spatial_a = a0.or(a1).unwrap_or_default();
@@ -1036,7 +1107,17 @@ mod tests {
     #[test]
     fn merge_list_pads_with_zero_mv() {
         let inter = InterState::new(64, 64);
-        let list = build_merge_list(&inter, 16, 16, 8, 8, 5, false, None);
+        let list = build_merge_list(
+            &inter,
+            16,
+            16,
+            8,
+            8,
+            5,
+            false,
+            None,
+            NeighbourContext::default(),
+        );
         assert_eq!(list.len(), 5);
         for c in &list {
             assert_eq!(c.mv_l0, MotionVector::default());
@@ -1052,14 +1133,34 @@ mod tests {
         let pb = PbMotion::inter(0, MotionVector::new(4, -4));
         inter.set_rect(0, 16, 4, 4, pb);
         inter.set_rect(0, 20, 4, 4, pb);
-        let list = build_merge_list(&inter, 4, 16, 8, 8, 5, false, None);
+        let list = build_merge_list(
+            &inter,
+            4,
+            16,
+            8,
+            8,
+            5,
+            false,
+            None,
+            NeighbourContext::default(),
+        );
         assert_eq!(list[0].mv_l0, MotionVector::new(4, -4));
     }
 
     #[test]
     fn bi_merge_zero_is_bipred() {
         let inter = InterState::new(64, 64);
-        let list = build_merge_list(&inter, 16, 16, 8, 8, 5, true, None);
+        let list = build_merge_list(
+            &inter,
+            16,
+            16,
+            8,
+            8,
+            5,
+            true,
+            None,
+            NeighbourContext::default(),
+        );
         for c in &list {
             assert!(c.pred_l0 && c.pred_l1);
         }
@@ -1074,7 +1175,17 @@ mod tests {
         // Fill B1 with a uni-L1 candidate.
         let b1 = PbMotion::inter_l1(1, MotionVector::new(-2, 0));
         inter.set_rect(4, 12, 8, 4, b1);
-        let list = build_merge_list(&inter, 4, 16, 8, 8, 5, true, None);
+        let list = build_merge_list(
+            &inter,
+            4,
+            16,
+            8,
+            8,
+            5,
+            true,
+            None,
+            NeighbourContext::default(),
+        );
         // There must be at least one bi-pred candidate somewhere.
         assert!(list.iter().any(|c| c.pred_l0 && c.pred_l1));
     }
@@ -1126,7 +1237,7 @@ mod tests {
         let mut dpb = Dpb::new(2);
         dpb.push(stub_pic(0, true)); // LT
         dpb.push(stub_pic(1, false)); // ST
-        // Over capacity — should drop POC 1 (short-term) not POC 0 (LT).
+                                      // Over capacity — should drop POC 1 (short-term) not POC 0 (LT).
         dpb.push(stub_pic(2, false));
         assert!(dpb.get_by_poc(0).is_some(), "LT ref survived eviction");
         assert!(dpb.get_by_poc(1).is_none(), "ST ref was evicted");

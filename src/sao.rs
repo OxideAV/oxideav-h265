@@ -312,7 +312,10 @@ fn apply_ctb(
     // Edge offset (§8.7.3.3). Classify every sample, then add the category
     // offset. Samples whose neighbour is outside the picture fall into
     // category 0 (no filter) since their sign-diff cannot be evaluated.
-    let (d0, d1) = (EO_OFFSETS[eo_class as usize][0], EO_OFFSETS[eo_class as usize][1]);
+    let (d0, d1) = (
+        EO_OFFSETS[eo_class as usize][0],
+        EO_OFFSETS[eo_class as usize][1],
+    );
     for yy in 0..h {
         for xx in 0..w {
             let x = (x0 + xx) as i32;

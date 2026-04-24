@@ -70,7 +70,7 @@ mod box_parser;
 mod meta;
 
 pub use box_parser::{BoxHeader, BoxType};
-pub use meta::{Colr, ItemInfo, ItemLocation, Ispe, Meta, Property};
+pub use meta::{Colr, Ispe, ItemInfo, ItemLocation, Meta, Property};
 
 use box_parser::{b, iter_boxes, read_u32, type_str};
 
@@ -336,8 +336,8 @@ pub fn decode_primary(bytes: &[u8]) -> Result<VideoFrame> {
     let mut dec = HevcDecoder::new(CodecId::new(crate::CODEC_ID_STR));
     dec.consume_extradata(&img.hvcc_raw)?;
 
-    let packet = Packet::new(0, TimeBase::new(1, 1), img.primary_item_data.to_vec())
-        .with_keyframe(true);
+    let packet =
+        Packet::new(0, TimeBase::new(1, 1), img.primary_item_data.to_vec()).with_keyframe(true);
     dec.send_packet(&packet)?;
     dec.flush()?;
     match dec.receive_frame() {

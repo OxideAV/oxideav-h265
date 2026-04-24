@@ -15,7 +15,7 @@
 //! and coefficient scans — that matches what the decoder's path uses for
 //! 16×16 / 32×32 TUs and for every CU we emit. No scaling lists.
 
-use crate::cabac::{CtxState, SIG_COEFF_FLAG_INIT_VALUES};
+use crate::cabac::{CtxState, InitType, SIG_COEFF_FLAG_INIT_VALUES};
 use crate::encoder::cabac_writer::CabacWriter;
 use crate::scan::{scan_4x4, DIAG_SCAN_4X4};
 
@@ -36,12 +36,17 @@ pub struct ResidualCtx {
 
 impl ResidualCtx {
     pub fn new(slice_qp_y: i32) -> Self {
+        Self::with_init_type(slice_qp_y, InitType::I)
+    }
+
+    /// Build residual contexts for an arbitrary `InitType` — required for
+    /// P / B slice encoding where the Pa / Pb tables are used.
+    pub fn with_init_type(slice_qp_y: i32, it: InitType) -> Self {
         use crate::cabac::{
             init_context, init_row, CBF_CB_CR_INIT_VALUES, CBF_LUMA_INIT_VALUES,
             CODED_SUB_BLOCK_FLAG_INIT_VALUES, COEFF_ABS_GT1_INIT_VALUES, COEFF_ABS_GT2_INIT_VALUES,
-            InitType, LAST_SIG_COEFF_X_PREFIX_INIT_VALUES, LAST_SIG_COEFF_Y_PREFIX_INIT_VALUES,
+            LAST_SIG_COEFF_X_PREFIX_INIT_VALUES, LAST_SIG_COEFF_Y_PREFIX_INIT_VALUES,
         };
-        let it = InitType::I;
         let sig = SIG_COEFF_FLAG_INIT_VALUES[it as usize];
         let sig_ctx: Vec<CtxState> = sig.iter().map(|&v| init_context(v, slice_qp_y)).collect();
         Self {
@@ -259,8 +264,7 @@ pub fn encode_residual(
             let abs_level = levels[gy * n + gx].unsigned_abs();
             let gt1 = abs_level > 1;
             if num_greater1_flag < 8 {
-                let mut ctx_inc =
-                    (ctx_set as usize * 4) + usize::min(3, greater1_ctx as usize);
+                let mut ctx_inc = (ctx_set as usize * 4) + usize::min(3, greater1_ctx as usize);
                 if !is_luma {
                     ctx_inc += 16;
                 }
@@ -328,9 +332,7 @@ pub fn encode_residual(
             let gx = sx * 4 + cx as usize;
             let gy = sy * 4 + cy as usize;
             let abs_level = levels[gy * n + gx].unsigned_abs();
-            let base_level = 1u32
-                + u32::from(greater1_flags[pos])
-                + u32::from(greater2_flags[pos]);
+            let base_level = 1u32 + u32::from(greater1_flags[pos]) + u32::from(greater2_flags[pos]);
             let threshold = if num_sig_coeff < 8 {
                 if pos as i32 == last_greater1_scan_pos {
                     3
@@ -342,9 +344,8 @@ pub fn encode_residual(
             };
             if base_level == threshold {
                 let rice_param = if coeff_rem_seen {
-                    (last_rice_param
-                        + u32::from(last_abs_level > (3 * (1u32 << last_rice_param))))
-                    .min(4)
+                    (last_rice_param + u32::from(last_abs_level > (3 * (1u32 << last_rice_param))))
+                        .min(4)
                 } else {
                     0
                 };
@@ -623,7 +624,11 @@ fn sig_coeff_ctx_inc(
     } else {
         sig_ctx += 12;
     }
-    if is_luma { sig_ctx } else { 27 + sig_ctx }
+    if is_luma {
+        sig_ctx
+    } else {
+        27 + sig_ctx
+    }
 }
 
 #[cfg(test)]

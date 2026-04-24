@@ -29,7 +29,9 @@ use crate::encoder::params::EncoderConfig;
 use crate::encoder::residual_writer::{encode_residual, ResidualCtx};
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::nal::{NalHeader, NalUnitType};
-use crate::transform::{dequantize_flat, forward_transform_2d, inverse_transform_2d, quantize_flat};
+use crate::transform::{
+    dequantize_flat, forward_transform_2d, inverse_transform_2d, quantize_flat,
+};
 use oxideav_core::VideoFrame;
 
 /// CTU size = 16. minCU = 16. One 16×16 luma TB per CU.
@@ -54,6 +56,53 @@ pub fn build_idr_slice_nal(cfg: &EncoderConfig, frame: &VideoFrame) -> Vec<u8> {
     build_annex_b_nal(NalHeader::for_type(NalUnitType::IdrNLp), &rbsp)
 }
 
+/// Build the IDR I-slice NAL and also return the encoder's local
+/// reconstruction. The reconstruction is the same picture the decoder
+/// produces (pre-deblock, pre-SAO) and is suitable as the L0 reference
+/// picture for a subsequent P-slice emit.
+pub fn build_idr_slice_nal_with_reconstruction(
+    cfg: &EncoderConfig,
+    frame: &VideoFrame,
+) -> (Vec<u8>, crate::encoder::p_slice_writer::ReferenceFrame) {
+    let (rbsp, recon) = build_idr_slice_rbsp_with_reconstruction(cfg, frame);
+    let nal = build_annex_b_nal(NalHeader::for_type(NalUnitType::IdrNLp), &rbsp);
+    (nal, recon)
+}
+
+fn build_idr_slice_rbsp_with_reconstruction(
+    cfg: &EncoderConfig,
+    frame: &VideoFrame,
+) -> (Vec<u8>, crate::encoder::p_slice_writer::ReferenceFrame) {
+    let mut bw = BitWriter::new();
+    bw.write_u1(1);
+    bw.write_u1(0);
+    bw.write_ue(0);
+    bw.write_ue(2);
+    bw.write_se(0);
+    write_rbsp_trailing_bits(&mut bw);
+
+    let mut enc = EncoderState::new(cfg);
+    {
+        let mut cabac = CabacWriter::new(&mut bw);
+        let pic_w_ctb = cfg.width.div_ceil(CTU_SIZE);
+        let pic_h_ctb = cfg.height.div_ceil(CTU_SIZE);
+        let total_ctbs = pic_w_ctb * pic_h_ctb;
+        for i in 0..total_ctbs {
+            let ctb_x = (i % pic_w_ctb) * CTU_SIZE;
+            let ctb_y = (i / pic_w_ctb) * CTU_SIZE;
+            enc.encode_ctu(&mut cabac, frame, ctb_x, ctb_y);
+            let is_last = i + 1 == total_ctbs;
+            cabac.encode_terminate(if is_last { 1 } else { 0 });
+        }
+        cabac.encode_flush();
+    }
+    bw.align_to_byte_zero();
+    let recon = crate::encoder::p_slice_writer::ReferenceFrame::from_planes(
+        cfg.width, cfg.height, enc.rec_y, enc.rec_cb, enc.rec_cr,
+    );
+    (bw.finish(), recon)
+}
+
 /// Build the RBSP payload for the IDR I-slice.
 pub fn build_idr_slice_rbsp(cfg: &EncoderConfig, frame: &VideoFrame) -> Vec<u8> {
     let mut bw = BitWriter::new();
@@ -64,9 +113,9 @@ pub fn build_idr_slice_rbsp(cfg: &EncoderConfig, frame: &VideoFrame) -> Vec<u8> 
     bw.write_ue(0); // slice_pic_parameter_set_id
     bw.write_ue(2); // slice_type = I
     bw.write_se(0); // slice_qp_delta = 0 (init_qp=26 → SliceQpY=26)
-    // PPS disables deblocking and SAO is off, so the gate
-    // `(SAO || !deblock_disabled)` is false and the
-    // `slice_loop_filter_across_slices_enabled_flag` is NOT emitted.
+                    // PPS disables deblocking and SAO is off, so the gate
+                    // `(SAO || !deblock_disabled)` is false and the
+                    // `slice_loop_filter_across_slices_enabled_flag` is NOT emitted.
     write_rbsp_trailing_bits(&mut bw);
 
     // ---- slice_data() ------------------------------------------------
@@ -141,11 +190,7 @@ impl EncoderState {
                 it,
                 SLICE_QP_Y,
             ),
-            intra_chroma_pred_mode: init_row(
-                &INTRA_CHROMA_PRED_MODE_INIT_VALUES,
-                it,
-                SLICE_QP_Y,
-            ),
+            intra_chroma_pred_mode: init_row(&INTRA_CHROMA_PRED_MODE_INIT_VALUES, it, SLICE_QP_Y),
             residual: ResidualCtx::new(SLICE_QP_Y),
         }
     }
@@ -248,7 +293,14 @@ impl EncoderState {
                 filter_ref_samples(&mut r, n, strong, 8);
             }
             predict(&r, n, &mut pred, n, mode, true, 8);
-            let sad = sad_block_u16(&pred, n, &src_y.data, src_y.stride, x0 as usize, y0 as usize);
+            let sad = sad_block_u16(
+                &pred,
+                n,
+                &src_y.data,
+                src_y.stride,
+                x0 as usize,
+                y0 as usize,
+            );
             if sad < best_sad {
                 best_sad = sad;
                 best_mode = mode;
@@ -325,7 +377,11 @@ impl EncoderState {
         let mut pred16 = vec![0u16; n * n];
         predict(&refs, n, &mut pred16, n, mode, false, 8);
         let pred: Vec<u8> = pred16.iter().map(|&v| v as u8).collect();
-        let plane = if is_cr { &src.planes[2] } else { &src.planes[1] };
+        let plane = if is_cr {
+            &src.planes[2]
+        } else {
+            &src.planes[1]
+        };
         let qp = chroma_qp_for_slice();
         let mut residual = vec![0i32; n * n];
         for dy in 0..n {
@@ -540,7 +596,11 @@ impl EncoderState {
         let y0 = y as usize;
         let cw = self.cfg.width as usize / 2;
         let ch = self.cfg.height as usize / 2;
-        let plane = if is_cr { &mut self.rec_cr } else { &mut self.rec_cb };
+        let plane = if is_cr {
+            &mut self.rec_cr
+        } else {
+            &mut self.rec_cb
+        };
         for dy in 0..n {
             for dx in 0..n {
                 let xx = x0 + dx;
@@ -649,8 +709,14 @@ mod tests {
                     stride: 16,
                     data: y.clone(),
                 },
-                VideoPlane { stride: 8, data: cb },
-                VideoPlane { stride: 8, data: cr },
+                VideoPlane {
+                    stride: 8,
+                    data: cb,
+                },
+                VideoPlane {
+                    stride: 8,
+                    data: cr,
+                },
             ],
         };
         // Run the luma pipeline — prediction refs are unavailable (first
@@ -673,12 +739,7 @@ mod tests {
     fn luma_rem_roundtrip() {
         // For each mpm list + mode, the (prev_flag, mpm_idx, rem) we emit
         // must reconstruct back to the mode via the decoder's reorder rule.
-        let lists: [[u32; 3]; 4] = [
-            [0, 1, 26],
-            [10, 26, 0],
-            [18, 0, 1],
-            [5, 10, 15],
-        ];
+        let lists: [[u32; 3]; 4] = [[0, 1, 26], [10, 26, 0], [18, 0, 1], [5, 10, 15]];
         for mpm in &lists {
             for mode in 0u32..=34 {
                 let (prev, idx, rem) = resolve_luma_mode_signalling(mpm, mode);

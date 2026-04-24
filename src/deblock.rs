@@ -120,8 +120,24 @@ pub fn deblock_picture(
     // depths (§8.7.2.5.3 eqs. 8-294..8-296). The scaling is applied where
     // the tables are consulted, not here, to keep the call sites below
     // unchanged.
-    deblock_vertical_luma(pic, width, height, beta_offset, tc_offset, slice, bit_depth_y);
-    deblock_horizontal_luma(pic, width, height, beta_offset, tc_offset, slice, bit_depth_y);
+    deblock_vertical_luma(
+        pic,
+        width,
+        height,
+        beta_offset,
+        tc_offset,
+        slice,
+        bit_depth_y,
+    );
+    deblock_horizontal_luma(
+        pic,
+        width,
+        height,
+        beta_offset,
+        tc_offset,
+        slice,
+        bit_depth_y,
+    );
     deblock_vertical_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
     deblock_horizontal_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
     // Suppress unused-warnings: pps only consulted for chroma QP offsets
@@ -340,12 +356,28 @@ fn filter_luma_vertical(
             let q2 = q(buf, 2, row);
             let q3 = q(buf, 3, row);
             let tc2 = 2 * tc;
-            let np0 = clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            let np0 = clip3(
+                p0 - tc2,
+                p0 + tc2,
+                (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3,
+            );
             let np1 = clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2);
-            let np2 = clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-            let nq0 = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            let np2 = clip3(
+                p2 - tc2,
+                p2 + tc2,
+                (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3,
+            );
+            let nq0 = clip3(
+                q0 - tc2,
+                q0 + tc2,
+                (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3,
+            );
             let nq1 = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2);
-            let nq2 = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+            let nq2 = clip3(
+                q2 - tc2,
+                q2 + tc2,
+                (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3,
+            );
             buf[idx(x - 1, y + row)] = clip_bd_bd(np0);
             buf[idx(x - 2, y + row)] = clip_bd_bd(np1);
             buf[idx(x - 3, y + row)] = clip_bd_bd(np2);
@@ -375,11 +407,19 @@ fn filter_luma_vertical(
             buf[idx(x - 1, y + row)] = np0;
             buf[idx(x, y + row)] = nq0;
             if dep {
-                let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
+                let delta_p = clip3(
+                    -(tc >> 1),
+                    tc >> 1,
+                    (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
+                );
                 buf[idx(x - 2, y + row)] = clip_bd_bd(p1 + delta_p);
             }
             if deq {
-                let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
+                let delta_q = clip3(
+                    -(tc >> 1),
+                    tc >> 1,
+                    (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
+                );
                 buf[idx(x + 1, y + row)] = clip_bd_bd(q1 + delta_q);
             }
         }
@@ -432,12 +472,28 @@ fn filter_luma_horizontal(
             let q2 = q(buf, 2, col);
             let q3 = q(buf, 3, col);
             let tc2 = 2 * tc;
-            let np0 = clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            let np0 = clip3(
+                p0 - tc2,
+                p0 + tc2,
+                (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3,
+            );
             let np1 = clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2);
-            let np2 = clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
-            let nq0 = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            let np2 = clip3(
+                p2 - tc2,
+                p2 + tc2,
+                (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3,
+            );
+            let nq0 = clip3(
+                q0 - tc2,
+                q0 + tc2,
+                (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3,
+            );
             let nq1 = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2);
-            let nq2 = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3);
+            let nq2 = clip3(
+                q2 - tc2,
+                q2 + tc2,
+                (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3,
+            );
             buf[idx(x + col, y - 1)] = clip_bd_bd(np0);
             buf[idx(x + col, y - 2)] = clip_bd_bd(np1);
             buf[idx(x + col, y - 3)] = clip_bd_bd(np2);
@@ -463,11 +519,19 @@ fn filter_luma_horizontal(
             buf[idx(x + col, y - 1)] = clip_bd_bd(p0 + delta);
             buf[idx(x + col, y)] = clip_bd_bd(q0 - delta);
             if dep {
-                let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
+                let delta_p = clip3(
+                    -(tc >> 1),
+                    tc >> 1,
+                    (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
+                );
                 buf[idx(x + col, y - 2)] = clip_bd_bd(p1 + delta_p);
             }
             if deq {
-                let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
+                let delta_q = clip3(
+                    -(tc >> 1),
+                    tc >> 1,
+                    (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
+                );
                 buf[idx(x + col, y + 1)] = clip_bd_bd(q1 + delta_q);
             }
         }

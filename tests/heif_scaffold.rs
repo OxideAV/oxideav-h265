@@ -4,7 +4,6 @@
 //! file is empty and no tests run.
 #![cfg(feature = "heif")]
 
-
 //!
 //! Strategy — since ffmpeg 8.1 (the version shipped at `/opt/homebrew/bin/ffmpeg`
 //! on the dev machine) does NOT expose an HEIF muxer, this test builds a
@@ -69,8 +68,7 @@ fn scaffold_parses_hand_built_heic() {
     );
     assert_eq!(img.primary_item_id, 1);
     assert_eq!(
-        &img.primary_item.item_type,
-        b"hvc1",
+        &img.primary_item.item_type, b"hvc1",
         "primary item type must be 'hvc1'"
     );
     assert_eq!(
@@ -213,7 +211,7 @@ fn synthesise_hvcc_and_lp_idr(annex_b: &[u8]) -> (Vec<u8>, Vec<u8>) {
     h.push(0); // bit_depth_luma_minus8
     h.push(0); // bit_depth_chroma_minus8
     h.extend_from_slice(&0u16.to_be_bytes()); // avg_frame_rate
-               // constant_frame_rate(2)|num_temporal_layers(3)|temporal_id_nested(1)|lengthSizeMinusOne(2) = 0|0|0|3
+                                              // constant_frame_rate(2)|num_temporal_layers(3)|temporal_id_nested(1)|lengthSizeMinusOne(2) = 0|0|0|3
     h.push(0x03); // 0b00000011 — length_size_minus_one = 3 → 4-byte lengths
     h.push(3u8); // numOfArrays: VPS, SPS, PPS
 
@@ -243,10 +241,10 @@ fn build_heic(annex_b: &[u8]) -> Vec<u8> {
     let ftyp = box_bytes(
         b"ftyp",
         &[
-            b"heic".as_slice(),             // major_brand
-            &0u32.to_be_bytes(),            // minor_version
-            b"mif1".as_slice(),             // compatible_brand
-            b"heic".as_slice(),             // compatible_brand
+            b"heic".as_slice(),  // major_brand
+            &0u32.to_be_bytes(), // minor_version
+            b"mif1".as_slice(),  // compatible_brand
+            b"heic".as_slice(),  // compatible_brand
         ]
         .concat(),
     );

@@ -221,13 +221,7 @@ pub fn forward_transform_2d(
 /// The inverse applies `v = (level * 16 * scale << q_div + round) >> bd_shift`
 /// where `scale = LEVEL_SCALE[q_rem]` and `bd_shift = bit_depth + log2_tb - 5`.
 /// We invert that with a round-to-nearest on the level.
-pub fn quantize_flat(
-    coeffs: &[i32],
-    levels: &mut [i32],
-    qp: i32,
-    log2_tb: u32,
-    bit_depth: u32,
-) {
+pub fn quantize_flat(coeffs: &[i32], levels: &mut [i32], qp: i32, log2_tb: u32, bit_depth: u32) {
     let n = 1usize << log2_tb;
     debug_assert_eq!(coeffs.len(), n * n);
     debug_assert_eq!(levels.len(), n * n);
@@ -458,7 +452,13 @@ mod tests {
         // dead-zone).
         for qp in [8i32, 22, 26, 37] {
             let coeffs: Vec<i32> = (0..16)
-                .map(|i| if i % 2 == 0 { (i as i32 + 1) * 2000 } else { -(i as i32 + 1) * 2000 })
+                .map(|i| {
+                    if i % 2 == 0 {
+                        (i as i32 + 1) * 2000
+                    } else {
+                        -(i as i32 + 1) * 2000
+                    }
+                })
                 .collect();
             let mut levels = vec![0i32; 16];
             quantize_flat(&coeffs, &mut levels, qp, 2, 8);
@@ -469,7 +469,8 @@ mod tests {
                     coeffs[i].signum(),
                     deq[i].signum(),
                     "sign lost at qp={qp} i={i} coeff={} deq={}",
-                    coeffs[i], deq[i]
+                    coeffs[i],
+                    deq[i]
                 );
             }
         }

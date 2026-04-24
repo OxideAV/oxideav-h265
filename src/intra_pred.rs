@@ -182,26 +182,18 @@ pub fn filter_ref_samples(refs: &mut [u16], n: usize, strong: bool, bit_depth: u
         // left neighbour of refs[1] is refs[0] (corner). Endpoint refs[2n]
         // preserved (do not filter the 2n-1 sample, matching ffmpeg).
         for i in 1..(2 * n) {
-            tmp[i] = ((refs[i - 1] as u32
-                + 2 * refs[i] as u32
-                + refs[i + 1] as u32
-                + 2)
-                >> 2) as u16;
+            tmp[i] =
+                ((refs[i - 1] as u32 + 2 * refs[i] as u32 + refs[i + 1] as u32 + 2) >> 2) as u16;
         }
         // tmp[2n] stays = refs[2n] (the farthest top sample).
         // Left column: indices 2n+1..=4n. Neighbour of refs[2n+1] above is
         // refs[0] (corner). Endpoint refs[4n] preserved.
-        tmp[2 * n + 1] = ((refs[0] as u32
-            + 2 * refs[2 * n + 1] as u32
-            + refs[2 * n + 2] as u32
-            + 2)
-            >> 2) as u16;
+        tmp[2 * n + 1] =
+            ((refs[0] as u32 + 2 * refs[2 * n + 1] as u32 + refs[2 * n + 2] as u32 + 2) >> 2)
+                as u16;
         for i in (2 * n + 2)..(4 * n) {
-            tmp[i] = ((refs[i - 1] as u32
-                + 2 * refs[i] as u32
-                + refs[i + 1] as u32
-                + 2)
-                >> 2) as u16;
+            tmp[i] =
+                ((refs[i - 1] as u32 + 2 * refs[i] as u32 + refs[i + 1] as u32 + 2) >> 2) as u16;
         }
         // tmp[4n] stays = refs[4n].
         refs.copy_from_slice(&tmp);
@@ -283,11 +275,11 @@ pub fn predict_planar(refs: &[u16], n: usize, dst: &mut [u16], dst_stride: usize
         for x in 0..n {
             let top = refs[1 + x] as i32; // p[x, -1]
             let left = refs[2 * n + 1 + y] as i32; // p[-1, y]
-            // Spec §8.4.4.2.5:
-            //   predSamples[x][y] = ((nT - 1 - x) * p[-1, y] + (x+1)*p[nT, -1]
-            //                       + (nT - 1 - y) * p[x, -1] + (y+1)*p[-1, nT]
-            //                       + nT) >> (log2(nT)+1)
-            // p[nT,-1] is refs[1 + n] (top row slot at x=n), p[-1,nT]=refs[2n+1+n]
+                                                   // Spec §8.4.4.2.5:
+                                                   //   predSamples[x][y] = ((nT - 1 - x) * p[-1, y] + (x+1)*p[nT, -1]
+                                                   //                       + (nT - 1 - y) * p[x, -1] + (y+1)*p[-1, nT]
+                                                   //                       + nT) >> (log2(nT)+1)
+                                                   // p[nT,-1] is refs[1 + n] (top row slot at x=n), p[-1,nT]=refs[2n+1+n]
             let p_top_r = refs[1 + n] as i32; // p[nT, -1]
             let p_bot_l = refs[2 * n + 1 + n] as i32; // p[-1, nT]
             let v = ((n as i32 - 1 - x as i32) * left

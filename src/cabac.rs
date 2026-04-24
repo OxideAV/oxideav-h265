@@ -314,8 +314,11 @@ pub const CU_SKIP_FLAG_INIT_VALUES: [[u8; 3]; 3] = [
 pub const PRED_MODE_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[0], [149], [134]];
 
 /// `part_mode` (Table 9-16). Four contexts.
-pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] =
-    [[184, 154, 154, 154], [154, 139, 154, 154], [154, 139, 154, 154]];
+pub const PART_MODE_INIT_VALUES: [[u8; 4]; 3] = [
+    [184, 154, 154, 154],
+    [154, 139, 154, 154],
+    [154, 139, 154, 154],
+];
 
 /// `prev_intra_luma_pred_flag` (Table 9-17).
 pub const PREV_INTRA_LUMA_PRED_FLAG_INIT_VALUES: [[u8; 1]; 3] = [[184], [154], [183]];
@@ -425,8 +428,8 @@ pub const COEFF_ABS_GT2_INIT_VALUES: [[u8; 6]; 3] = [
 /// `coded_sub_block_flag` (Table 9-29). 4 contexts.
 pub const CODED_SUB_BLOCK_FLAG_INIT_VALUES: [[u8; 4]; 3] = [
     [91, 171, 134, 141],
-    [121, 140,  61, 154],
-    [121, 140,  61, 154],
+    [121, 140, 61, 154],
+    [121, 140, 61, 154],
 ];
 
 /// `sao_merge_left_flag` / `sao_merge_up_flag` (Table 9-32) — 1 context, same

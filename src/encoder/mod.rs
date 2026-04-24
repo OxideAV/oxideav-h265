@@ -32,6 +32,7 @@ pub mod bit_writer;
 pub mod cabac_writer;
 pub mod hevc_encoder;
 pub mod nal_writer;
+pub mod p_slice_writer;
 pub mod params;
 pub mod residual_writer;
 pub mod slice_writer;

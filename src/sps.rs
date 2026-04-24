@@ -698,4 +698,3 @@ pub fn parse_st_ref_pic_set(
         })
     }
 }
-

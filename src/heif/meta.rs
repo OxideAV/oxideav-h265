@@ -354,8 +354,8 @@ fn parse_iloc(payload: &[u8]) -> Result<Vec<ItemLocation>> {
 }
 
 fn parse_iprp(payload: &[u8]) -> Result<(Vec<Property>, Vec<ItemPropertyAssociation>)> {
-    let (ipco_payload, _) = find_box(payload, &IPCO)?
-        .ok_or_else(|| Error::invalid("heif: 'iprp' missing 'ipco'"))?;
+    let (ipco_payload, _) =
+        find_box(payload, &IPCO)?.ok_or_else(|| Error::invalid("heif: 'iprp' missing 'ipco'"))?;
     let properties = parse_ipco(ipco_payload)?;
     let mut assocs = Vec::new();
     for hdr in iter_boxes(payload) {
