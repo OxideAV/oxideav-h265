@@ -112,6 +112,9 @@ pub mod sps;
 pub mod transform;
 pub mod vps;
 
+#[cfg(feature = "heif")]
+pub mod heif;
+
 use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 

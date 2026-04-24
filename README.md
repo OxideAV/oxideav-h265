@@ -140,6 +140,72 @@ signalled (§8.5.3.3.4).
 * **Encoder** — this crate only decodes.
 * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 
+## HEIF / HEIC still images
+
+**Scaffold — feature-gated, off by default.** HEIC is an HEVC-coded
+still image wrapped in the HEIF (ISO/IEC 23008-12) container, which
+itself is a specialisation of ISO/IEC 14496-12. Because every layer
+above the HEVC bitstream is container-level, the HEIF parser can
+live inside this crate and delegate the pixel decode to the existing
+`HevcDecoder` — no separate codec crate is needed.
+
+Enable with:
+
+```toml
+[dependencies]
+oxideav-h265 = { version = "0.0", features = ["heif"] }
+```
+
+```rust
+#[cfg(feature = "heif")]
+{
+    use oxideav_h265::heif;
+    let bytes = std::fs::read("photo.heic")?;
+    if heif::probe(&bytes) {
+        let frame = heif::decode_primary(&bytes)?;
+        // frame.format == PixelFormat::Yuv420P (or Yuv420P10Le for Main 10).
+    }
+}
+# Ok::<(), oxideav_core::Error>(())
+```
+
+### What the scaffold walks
+
+`ftyp` (brand sniff for `heic`, `heix`, `heim`, `heis`, `hevc`,
+`hevx`, `mif1`, `msf1`) → `meta` → nested `hdlr`, `pitm`, `iinf` /
+`infe` (v2 / v3), `iloc` (v0 / v1 / v2, `construction_method == 0`),
+`iref` (v0 / v1), `iprp` / `ipco` / `ipma`. Typed item properties
+extracted: `hvcC`, `ispe`, `colr`. Unknown properties are retained
+as raw bytes so `ipma` association indices stay consistent.
+
+### Decode path
+
+`probe` → `parse` → locate the primary item via `pitm` + `iloc` →
+pre-pend VPS / SPS / PPS from the primary item's `hvcC` property
+into the decoder's extradata → send the primary item's
+length-prefixed HEVC payload as a single packet → pull the first
+frame.
+
+### Scaffold limits
+
+* **HEIC-only.** Primary item types other than `hvc1` / `hev1` are
+  rejected with `Error::Unsupported` — this crate does not decode AVIF
+  (`av01`, see `oxideav-avif`), JPEG (`jpeg`), or image sequences
+  requiring `moov` / sample-table walks.
+* **Single-extent items only.** Multi-extent `iloc` entries and
+  `construction_method != 0` (idat-embedded item data) surface as
+  `Error::Unsupported`.
+* **Grid / derivation items.** `iref`-driven grid composition
+  (`dimg`), alpha auxiliaries (`auxl` + `auxC`), and image-transform
+  properties (`irot` / `imir` / `clap`) are not applied — the
+  scaffold decodes the HEVC payload of the primary item exactly as
+  it appears in `mdat`.
+* **No HEIF spec in docs/.** ISO/IEC 23008-12 was not available in
+  `docs/`, so property-box decode follows the AVIF reference and
+  ISO/IEC 14496-12 §8.11 (item box structure shared with AVIF).
+* **Error messages name the missing box** (e.g. `"heif: missing
+  'meta' box"`) to keep diagnostics actionable at scaffold stage.
+
 ## Usage
 
 Registering the codec wires the decoder into `oxideav`'s codec

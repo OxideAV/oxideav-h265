@@ -16,3 +16,14 @@ categories = ["multimedia::encoding", "multimedia::video"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
+
+[features]
+# HEIF/HEIC still image + image sequence container support. Enables the
+# `heif` module which walks the ISOBMFF meta hierarchy (ftyp / meta /
+# hdlr / pitm / iinf / iloc / iref / iprp / ipco / ipma) and wires the
+# primary item's HEVC elementary stream + hvcC parameter sets through
+# the existing H.265 decoder. Scaffold-grade: the box walker is
+# complete enough to locate the primary item's payload, but end-to-end
+# decode of a real HEIC is gated on encoder-side fixtures.
+default = []
+heif = []
