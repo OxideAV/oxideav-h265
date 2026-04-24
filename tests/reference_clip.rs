@@ -2023,15 +2023,36 @@ fn main10_inter_decodes_with_pframes() {
     //     rules suppress A1 / B1 / A0 when the spec marks them
     //     unavailable inside the current CU.
     //
-    // Per-frame (libx265 Main 10, 80x48, QP 22):
+    // Round 8 investigation (see transform_tree_inter_inner comment in
+    // ctu.rs for the long-form writeup):
+    //   * Attempted the spec-correct interSplitFlag force-split for
+    //     non-2Nx2N CUs at `max_trafo_depth_inter == 0`. Per §7.3.8.10
+    //     the split_transform_flag bin should NOT be in the bitstream
+    //     (the `trafoDepth < MaxTrafoDepth` gate is false when both
+    //     are 0) and §7.4.9.8 should infer split = 1 for non-2Nx2N.
+    //     Implementing that path triggers `EGk prefix overflow` in
+    //     residual parsing. Empirically libx265 emits a bin for this
+    //     case despite the spec gate being false; reading it and using
+    //     the decoded value (round-7 behaviour) is what survives
+    //     parsing. The remaining frame-2/3 drift is NOT the inter
+    //     split path — it's a different downstream issue (likely MC
+    //     edge / AMVP scaling / TMVP) that was outside this round's
+    //     budget.
+    //   * Re-verified the round-7 part_mode claim against the 2026-01
+    //     spec Table 9-45: for `log2CbSize > MinCbLog2SizeY` and
+    //     `!amp_enabled_flag` PART_Nx2N binarization is `00` (2 bins)
+    //     not `001`. The `001` binarization only applies when AMP is
+    //     enabled. Our decoder already consumes the correct number
+    //     of bins — no bug here.
+    //
+    // Per-frame (libx265 Main 10, 80x48, QP 22) — unchanged from
+    // Round 7 (this round clarified the mechanism, did not land a
+    // PSNR-moving fix):
     //   frame 0  inf dB   (intra-only, bit-exact)
     //   frame 1  46.11 dB (first P; 44.04 pre-Round-7)
     //   frame 2  24.79 dB
     //   frame 3  20.00 dB (19.26 pre-Round-7)
     //   average  24.77 dB (24.19 pre-Round-7)
-    // Floor bumped from 22 → 24 dB — leaves ~0.7 dB headroom for the
-    // next round to recover the remaining frame-3 drift (likely tied
-    // to the deferred interSplitFlag force-split landing).
     assert!(
         psnr >= 24.0,
         "Main 10 inter decode PSNR below floor: {psnr:.2} dB"

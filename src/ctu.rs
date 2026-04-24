@@ -1952,16 +1952,36 @@ impl<'a> Walker<'a> {
         // is 0 and PartMode == PART_2Nx2N, the root bin is not signalled
         // and is inferred to 0 (single CU-sized root TU). This matches
         // libx265's emission for our Main 10 fixture and lifts frame 1
-        // PSNR from 44.04 dB -> 46.11 dB. Non-2Nx2N CUs keep reading the
-        // bin because the spec-correct `interSplitFlag == 1` force-split
-        // path (4× quad-split at the root) still mis-aligns residual
-        // parsing against libx265's emission; full §7.4.9.8 eq. 7-66
-        // coverage is deferred to round 8.
+        // PSNR from 44.04 dB -> 46.11 dB.
+        //
+        // Round-8 investigation: the spec-correct path for non-2Nx2N
+        // CUs with `max_trafo_depth_inter == 0` says (a) the signalling
+        // gate `trafoDepth < MaxTrafoDepth` (i.e. 0 < 0) is false, so
+        // no bin is emitted; (b) `interSplitFlag == 1` infers split = 1,
+        // so the TU tree must descend 4× at the root. Attempting that
+        // full spec path (skip bin, force split) produces `EGk prefix
+        // overflow` in residual parsing. Skipping the bin without
+        // force-splitting (collapse to a single leaf TU at the root)
+        // parses cleanly but drops average PSNR to 23.40 dB because
+        // the residuals are sized wrong. Reading the bin and using it
+        // as the actual split decision (round-7 behaviour retained
+        // here) survives parsing and gives 24.77 dB average. Empirical
+        // conclusion: libx265 emits a bin here despite the spec gate
+        // being false. The remaining frame-2/3 drift is not due to the
+        // inter split path: it's caused by a different, still-
+        // unidentified downstream drift (MC edge / TMVP / AMVP scaling
+        // remain likely candidates).
+        //
+        // Bug-2 (part_mode 3-bin for !amp_enabled, log2CbSize >
+        // MinCbLog2SizeY) re-checked against the 2026-01 spec: Table
+        // 9-45 assigns PART_Nx2N the bin string `00` (2 bins) in that
+        // column; the `001` entry is under `amp_enabled_flag` only.
+        // Our decoder consumes exactly the right number of bins in
+        // both paths — no bug here. The round-7 claim was a mis-read
+        // of Table 9-45 columns.
         let max_tb_log2 = self.max_tb_log2;
         let min_tb_log2 = self.min_tb_log2;
         let max_trafo_depth = self.cctx.sps.max_transform_hierarchy_depth_inter;
-        let inter_split_flag_full =
-            max_trafo_depth == 0 && tr_depth == 0 && part_mode != InterPart::Mode2Nx2N;
         let skip_for_2nx2n =
             max_trafo_depth == 0 && tr_depth == 0 && part_mode == InterPart::Mode2Nx2N;
         let must_split = log2_tb > max_tb_log2;
@@ -1975,10 +1995,6 @@ impl<'a> Walker<'a> {
         } else {
             0
         };
-        // `inter_split_flag_full` is the spec-correct interSplitFlag; kept
-        // here as documentation for the round-8 follow-up that will force
-        // split = 1 for non-2Nx2N CUs at the root.
-        let _ = inter_split_flag_full;
 
         // §7.3.8.9 transform_tree: cbf_cb / cbf_cr are decoded BEFORE the
         // split, at every depth where log2TrafoSize > 2, conditional on
