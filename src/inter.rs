@@ -646,6 +646,18 @@ fn luma_h_filter_int(p: impl Fn(i32, i32) -> i32, x: i32, y: i32, fx: usize) -> 
 /// `blk_w * blk_h`) with 1/4-pel MV `mv` applied to the reference at the
 /// block origin (x0, y0). Output is clipped to `[0, (1 << bit_depth) - 1]`
 /// per Clip1Y (§8.5.3.2.2). Supports 8- and 10-bit luma.
+///
+/// The integer pipeline follows the spec exactly:
+///   * §8.5.3.3.3.2 derives `predSamplesLX` using `shift1 = Min(4, BitDepth-8)`
+///     (per-row truncation, no rounding), `shift2 = 6` (vertical pass,
+///     no rounding) and `shift3 = Max(2, 14-BitDepth)` (full-pel pre-scale).
+///   * §8.5.3.3.4.2 eq. 8-262 converts `predSamplesLX` → `pbSamples` with
+///     `shift = Max(2, 14-BitDepth)` and `offset = 1 << (shift-1)`, then
+///     clips to `[0, (1<<bitDepth)-1]`.
+///
+/// At 8-bit this collapses to `(sum + 32) >> 6` (the legacy formulation);
+/// at 10-bit the per-row truncation of the sub-pel filter output is
+/// significant and must be preserved for bit-exact match with ffmpeg.
 pub fn luma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -666,44 +678,66 @@ pub fn luma_mc(
 
     let px = |x: i32, y: i32| -> i32 { ref_pic.sample_luma(x0 + ix + x, y0 + iy + y) as i32 };
     let max_val = (1i32 << bit_depth) - 1;
+    // §8.5.3.3.3.2 MC shifts.
+    let shift1_mc: i32 = core::cmp::min(4, bit_depth - 8);
+    let shift2_mc: i32 = 6;
+    let shift3_mc: i32 = core::cmp::max(2, 14 - bit_depth);
+    // §8.5.3.3.4.2 weighted-default shift back to sample range.
+    let shift_w: i32 = core::cmp::max(2, 14 - bit_depth);
+    let offset_w: i32 = 1 << (shift_w - 1);
 
     for j in 0..blk_h {
         for i in 0..blk_w {
-            let v = if fx == 0 && fy == 0 {
-                px(i, j)
+            // First compute predSamplesLX per §8.5.3.3.3.2.
+            let pred = if fx == 0 && fy == 0 {
+                // Full-pel: A << shift3 (Table 8-8 row 0).
+                px(i, j) << shift3_mc
             } else if fy == 0 {
-                let s = luma_h_filter_int(px, i, j, fx);
-                ((s + 32) >> 6).clamp(0, max_val)
+                // Horizontal filter only (position a/b/c): >> shift1.
+                luma_h_filter_int(px, i, j, fx) >> shift1_mc
             } else if fx == 0 {
+                // Vertical filter only (position d/h/n) on full-pel
+                // columns: >> shift1.
                 let mut s = 0i32;
                 let f = &LUMA_FILTER[fy];
                 for k in 0..8 {
                     s += f[k] * px(i, j + k as i32 - 3);
                 }
-                ((s + 32) >> 6).clamp(0, max_val)
+                s >> shift1_mc
             } else {
+                // Both fractions: per spec, first horizontal row filter
+                // shifted by shift1, then vertical filter on those rows
+                // shifted by shift2=6. Preserving the intermediate
+                // truncation is load-bearing at 10-bit.
                 let mut h = [0i32; 8];
                 for k in 0..8 {
                     let yk = j + k as i32 - 3;
-                    h[k] = luma_h_filter_int(px, i, yk, fx);
+                    h[k] = luma_h_filter_int(px, i, yk, fx) >> shift1_mc;
                 }
                 let mut s = 0i32;
                 let f = &LUMA_FILTER[fy];
                 for k in 0..8 {
                     s += f[k] * h[k];
                 }
-                ((s + 2048) >> 12).clamp(0, max_val)
+                s >> shift2_mc
             };
+            // §8.5.3.3.4.2 eq. 8-262 — uni-pred weighted-default: add
+            // rounding offset, right-shift, clip to sample range.
+            let v = ((pred + offset_w) >> shift_w).clamp(0, max_val);
             out[(j * blk_w + i) as usize] = v as u16;
         }
     }
     Ok(())
 }
 
-/// Uni-prediction luma MC that returns the 16-bit pre-shift samples for
-/// later bi-prediction averaging (§8.5.3.3.3). The returned values are
-/// at "shift 6" precision: a final `(a + b + 64) >> 7` combines two
-/// uni-pred arrays into bi-pred output.
+/// Uni-prediction luma MC that returns the spec-scale `predSamplesLX`
+/// values per §8.5.3.3.3.2 (pre-weighted). The output sits at
+/// `shift3 = Max(2, 14 - bitDepth)` precision: a final `(a + b + offset)
+/// >> shift` (§8.5.3.3.4.2 eq. 8-264) combines two uni-pred arrays.
+///
+/// The internal shifts (`shift1 = Min(4, bitDepth-8)`, `shift2 = 6`) must
+/// be applied exactly as specified — the per-row truncation at `shift1`
+/// is observable at 10-bit and is load-bearing for bit-exact decode.
 pub fn luma_mc_hp(
     ref_pic: &RefPicture,
     x0: i32,
@@ -712,6 +746,7 @@ pub fn luma_mc_hp(
     blk_h: i32,
     mv: MotionVector,
     out: &mut [i32],
+    bit_depth: i32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 luma_mc_hp: output buffer too small"));
@@ -722,35 +757,41 @@ pub fn luma_mc_hp(
     let iy = mv.y >> 2;
 
     let px = |x: i32, y: i32| -> i32 { ref_pic.sample_luma(x0 + ix + x, y0 + iy + y) as i32 };
+    let shift1: i32 = core::cmp::min(4, bit_depth - 8);
+    let shift2: i32 = 6;
+    let shift3: i32 = core::cmp::max(2, 14 - bit_depth);
 
     for j in 0..blk_h {
         for i in 0..blk_w {
             let v = if fx == 0 && fy == 0 {
-                // Up-scale to shift-6 precision.
-                px(i, j) << 6
+                // Full-pel: A << shift3 (Table 8-8 row 0).
+                px(i, j) << shift3
             } else if fy == 0 {
-                luma_h_filter_int(px, i, j, fx)
+                // Position a/b/c — horizontal filter >> shift1.
+                luma_h_filter_int(px, i, j, fx) >> shift1
             } else if fx == 0 {
+                // Position d/h/n — vertical filter on integer columns,
+                // >> shift1.
                 let mut s = 0i32;
                 let f = &LUMA_FILTER[fy];
                 for k in 0..8 {
                     s += f[k] * px(i, j + k as i32 - 3);
                 }
-                s
+                s >> shift1
             } else {
+                // Two-stage sub-pel: per-row horizontal filter >> shift1,
+                // then vertical filter >> shift2 = 6.
                 let mut h = [0i32; 8];
                 for k in 0..8 {
                     let yk = j + k as i32 - 3;
-                    h[k] = luma_h_filter_int(px, i, yk, fx);
+                    h[k] = luma_h_filter_int(px, i, yk, fx) >> shift1;
                 }
                 let mut s = 0i32;
                 let f = &LUMA_FILTER[fy];
                 for k in 0..8 {
                     s += f[k] * h[k];
                 }
-                // Drop back to shift-6 precision so both uni-pred paths
-                // share the same scale for bi-pred averaging.
-                s >> 6
+                s >> shift2
             };
             out[(j * blk_w + i) as usize] = v;
         }
@@ -804,6 +845,8 @@ pub fn luma_mc_bi_weighted(
 /// chroma uses 1/8-pel fractions so we split the MV accordingly.
 /// `out` is `blk_w * blk_h` and `comp` selects cb (0) or cr (1). Output is
 /// clipped to `[0, (1 << bit_depth) - 1]` per Clip1C (§8.5.3.2.2.2).
+/// Matches §8.5.3.3.3.3 + §8.5.3.3.4.2 eq. 8-262 exactly, including the
+/// `shift1 = Min(4, bitDepth-8)` per-row truncation at 10-bit.
 pub fn chroma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -832,25 +875,30 @@ pub fn chroma_mc(
         }
     };
     let max_val = (1i32 << bit_depth) - 1;
+    let shift1: i32 = core::cmp::min(4, bit_depth - 8);
+    let shift2: i32 = 6;
+    let shift3: i32 = core::cmp::max(2, 14 - bit_depth);
+    let shift_w: i32 = core::cmp::max(2, 14 - bit_depth);
+    let offset_w: i32 = 1 << (shift_w - 1);
 
     for j in 0..blk_h {
         for i in 0..blk_w {
-            let v = if fx == 0 && fy == 0 {
-                px(i, j)
+            let pred = if fx == 0 && fy == 0 {
+                px(i, j) << shift3
             } else if fy == 0 {
                 let f = &CHROMA_FILTER[fx];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += f[k] * px(i + k as i32 - 1, j);
                 }
-                ((s + 32) >> 6).clamp(0, max_val)
+                s >> shift1
             } else if fx == 0 {
                 let f = &CHROMA_FILTER[fy];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += f[k] * px(i, j + k as i32 - 1);
                 }
-                ((s + 32) >> 6).clamp(0, max_val)
+                s >> shift1
             } else {
                 let mut h = [0i32; 4];
                 let fh = &CHROMA_FILTER[fx];
@@ -860,22 +908,24 @@ pub fn chroma_mc(
                     for m in 0..4 {
                         s += fh[m] * px(i + m as i32 - 1, yk);
                     }
-                    h[k] = s;
+                    h[k] = s >> shift1;
                 }
                 let fv = &CHROMA_FILTER[fy];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += fv[k] * h[k];
                 }
-                ((s + 2048) >> 12).clamp(0, max_val)
+                s >> shift2
             };
+            let v = ((pred + offset_w) >> shift_w).clamp(0, max_val);
             out[(j * blk_w + i) as usize] = v as u16;
         }
     }
     Ok(())
 }
 
-/// Uni-prediction chroma MC at shift-6 precision for bi-pred combine.
+/// Uni-prediction chroma MC returning `predSamplesLX` (§8.5.3.3.3.3) at
+/// `shift3 = Max(2, 14 - bitDepth)` precision for bi-pred combine.
 pub fn chroma_mc_hp(
     ref_pic: &RefPicture,
     x0: i32,
@@ -885,6 +935,7 @@ pub fn chroma_mc_hp(
     mv: MotionVector,
     out: &mut [i32],
     comp: u8,
+    bit_depth: i32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 chroma_mc_hp: output buffer too small"));
@@ -902,25 +953,28 @@ pub fn chroma_mc_hp(
             _ => ref_pic.sample_cr(sx, sy) as i32,
         }
     };
+    let shift1: i32 = core::cmp::min(4, bit_depth - 8);
+    let shift2: i32 = 6;
+    let shift3: i32 = core::cmp::max(2, 14 - bit_depth);
 
     for j in 0..blk_h {
         for i in 0..blk_w {
             let v = if fx == 0 && fy == 0 {
-                px(i, j) << 6
+                px(i, j) << shift3
             } else if fy == 0 {
                 let f = &CHROMA_FILTER[fx];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += f[k] * px(i + k as i32 - 1, j);
                 }
-                s
+                s >> shift1
             } else if fx == 0 {
                 let f = &CHROMA_FILTER[fy];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += f[k] * px(i, j + k as i32 - 1);
                 }
-                s
+                s >> shift1
             } else {
                 let mut h = [0i32; 4];
                 let fh = &CHROMA_FILTER[fx];
@@ -930,14 +984,14 @@ pub fn chroma_mc_hp(
                     for m in 0..4 {
                         s += fh[m] * px(i + m as i32 - 1, yk);
                     }
-                    h[k] = s;
+                    h[k] = s >> shift1;
                 }
                 let fv = &CHROMA_FILTER[fy];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += fv[k] * h[k];
                 }
-                s >> 6
+                s >> shift2
             };
             out[(j * blk_w + i) as usize] = v;
         }

@@ -939,13 +939,15 @@ impl<'a> Walker<'a> {
                         }
                     }
                 } else if amp {
-                    // Horizontal or vertical AMP: the third bin is bypass-
-                    // coded (§9.3.4.2.1) — 0 distinguishes the symmetric
-                    // case, 1 triggers a fourth bypass bin for the quarter-
-                    // position selection.
-                    let is_amp = engine.decode_bypass();
+                    // AMP path, log2CbSize > MinCbLog2SizeY: the third bin
+                    // (binIdx 2) is **context-coded** with ctxInc = 3
+                    // per Table 9-48 — NOT bypass. Table 9-45 assigns
+                    // binIdx2 = 1 → symmetric (2NxN / Nx2N), binIdx2 = 0
+                    // → AMP, in which case binIdx 3 is a bypass bit that
+                    // selects the AMP quarter position.
+                    let b2 = engine.decode_bin(&mut ctx.part_mode[3]);
                     if b1 == 1 {
-                        if is_amp == 0 {
+                        if b2 == 1 {
                             InterPart::Mode2NxN
                         } else {
                             let pos = engine.decode_bypass();
@@ -955,7 +957,7 @@ impl<'a> Walker<'a> {
                                 InterPart::Mode2NxnD
                             }
                         }
-                    } else if is_amp == 0 {
+                    } else if b2 == 1 {
                         InterPart::ModeNx2N
                     } else {
                         let pos = engine.decode_bypass();
@@ -1267,10 +1269,10 @@ impl<'a> Walker<'a> {
             let mut a_l = vec![0i32; wz * hz];
             let mut b_l = vec![0i32; wz * hz];
             luma_mc_hp(
-                ref0, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l0, &mut a_l,
+                ref0, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l0, &mut a_l, bd_y,
             )?;
             luma_mc_hp(
-                ref_l1, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l1, &mut b_l,
+                ref_l1, x0 as i32, y0 as i32, w as i32, h as i32, pb.mv_l1, &mut b_l, bd_y,
             )?;
             let mut a_cb = vec![0i32; cw * ch];
             let mut b_cb = vec![0i32; cw * ch];
@@ -1285,6 +1287,7 @@ impl<'a> Walker<'a> {
                 pb.mv_l0,
                 &mut a_cb,
                 0,
+                bd_c,
             )?;
             chroma_mc_hp(
                 ref_l1,
@@ -1295,6 +1298,7 @@ impl<'a> Walker<'a> {
                 pb.mv_l1,
                 &mut b_cb,
                 0,
+                bd_c,
             )?;
             chroma_mc_hp(
                 ref0,
@@ -1305,6 +1309,7 @@ impl<'a> Walker<'a> {
                 pb.mv_l0,
                 &mut a_cr,
                 1,
+                bd_c,
             )?;
             chroma_mc_hp(
                 ref_l1,
@@ -1315,6 +1320,7 @@ impl<'a> Walker<'a> {
                 pb.mv_l1,
                 &mut b_cr,
                 1,
+                bd_c,
             )?;
 
             let l0_luma = weighted.and_then(|w| w.luma_weight_l0(pb.ref_idx_l0.max(0) as usize));
