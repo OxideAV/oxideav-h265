@@ -445,7 +445,23 @@ impl EncoderState {
             Some(self.intra_mode_grid[by * self.intra_w4 + bx] as u32)
         };
         let a = if x0 == 0 { None } else { get_mode(x0 - 1, y0) };
-        let b = if y0 == 0 { None } else { get_mode(x0, y0 - 1) };
+        // §8.4.2: when the above neighbour B is in a different CTB row,
+        // candIntraPredModeB is forced to INTRA_DC — regardless of what
+        // mode the row-above block actually used. The encoder must use the
+        // same derivation as the decoder or the emitted mpm_idx/rem will
+        // deserialise to a different mode downstream.
+        //
+        // CtbLog2SizeY for our encoder: CTU = 16 → ctb_log2 = 4. Hard-coded
+        // via the CTU_SIZE constant this file already uses.
+        let ctb_log2: u32 = CTU_SIZE.trailing_zeros();
+        let ctb_row_top = (y0 >> ctb_log2) << ctb_log2;
+        let b = if y0 == 0 {
+            None
+        } else if y0 - 1 < ctb_row_top {
+            Some(1)
+        } else {
+            get_mode(x0, y0 - 1)
+        };
         let cand_a = a.unwrap_or(1);
         let cand_b = b.unwrap_or(1);
         let mut list = [0u32; 3];

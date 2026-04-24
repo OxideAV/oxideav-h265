@@ -129,13 +129,12 @@ fn run_one(w: u32, h: u32) {
     let mse = sse as f64 / n as f64;
     let psnr = if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() };
     eprintln!("ffmpeg_accepts: {w}x{h} psnr_y={psnr:.2} dB bytes={}", bytes.len());
-    // ffmpeg accepts the stream (no decode errors) and produces a plausible
-    // picture, but a subtle divergence in intra-reconstruction across CTU
-    // row boundaries means the PSNR is lower than our own decoder's
-    // roundtrip. For now we just assert ffmpeg exits 0 and that the PSNR is
-    // non-degenerate (> 10 dB) — tracking the exact-match investigation as
-    // a follow-up.
-    assert!(psnr > 10.0, "ffmpeg-decoded luma PSNR too low: {psnr:.2}");
+    // With the CTB-row MPM rule fixed (§8.4.2: candIntraPredModeB forced to
+    // INTRA_DC when the B neighbour is in the CTB row above), ffmpeg's
+    // reconstruction matches ours within the encoder's QP-26 quantisation
+    // budget. Keep a bound that's tight enough to catch regressions but
+    // tolerant of small encoder-choice shifts.
+    assert!(psnr > 30.0, "ffmpeg-decoded luma PSNR too low: {psnr:.2}");
 
     // Clean up.
     let _ = std::fs::remove_file(&h265_path);

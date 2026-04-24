@@ -1711,7 +1711,24 @@ impl<'a> Walker<'a> {
             Some(self.pic.intra_luma_mode[by * self.pic.intra_width_4 + bx] as u32)
         };
         let a = if x0 == 0 { None } else { get_mode(x0 - 1, y0) };
-        let b = if y0 == 0 { None } else { get_mode(x0, y0 - 1) };
+        // §8.4.2: when the above neighbour B lies in a different CTB row
+        // than the current block (i.e. yPb-1 is above the current CTB),
+        // candIntraPredModeB is forced to INTRA_DC — even if the actual
+        // block at (x0, y0-1) has a different stored mode. This prevents
+        // the MPM list from crossing the CTB-row seam, matching how
+        // ffmpeg / the spec parse the bitstream.
+        let ctb_log2 = self.cctx.sps.log2_min_luma_coding_block_size_minus3
+            + 3
+            + self.cctx.sps.log2_diff_max_min_luma_coding_block_size;
+        let ctb_row_top = (y0 >> ctb_log2) << ctb_log2;
+        let b = if y0 == 0 {
+            None
+        } else if y0 - 1 < ctb_row_top {
+            // Across CTB-row boundary: B is treated as INTRA_DC.
+            Some(1)
+        } else {
+            get_mode(x0, y0 - 1)
+        };
         let cand_a = a.unwrap_or(1);
         let cand_b = b.unwrap_or(1);
         let mut list = [0u32; 3];
