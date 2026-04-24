@@ -25,7 +25,11 @@
 //!
 //! ## Restricted to
 //!
-//! * 8-bit depth, 4:2:0 chroma subsampling, no `separate_colour_plane`.
+//! * Bit depth 8 (Main) and 10 (Main 10). Chroma and luma depth must
+//!   match. Main 10 pixel decode is intra-only for the moment — P/B
+//!   slices at 10 bits surface `Error::Unsupported` until the inter MC
+//!   helpers learn bit-depth-aware clipping.
+//! * 4:2:0 chroma subsampling, no `separate_colour_plane`.
 //! * Single-tile, wavefront-off.
 //! * **I, P, and B slices.** Inter PB shapes are limited to
 //!   2Nx2N / 2NxN / Nx2N / NxN (no AMP).
