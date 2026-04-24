@@ -1847,6 +1847,27 @@ impl<'a> Walker<'a> {
         log2_tb: u32,
         tr_depth: u32,
     ) -> Result<()> {
+        // At the root the "parent" cbf_cb / cbf_cr are treated as 1 so the
+        // conditional at tr_depth == 0 still opens. xBase/yBase start at
+        // the CU origin; blkIdx starts at 0.
+        self.transform_tree_inter_inner(engine, ctx, x0, y0, x0, y0, log2_tb, tr_depth, 0, 1, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform_tree_inter_inner(
+        &mut self,
+        engine: &mut CabacEngine<'_>,
+        ctx: &mut Ctx,
+        x0: u32,
+        y0: u32,
+        x_base: u32,
+        y_base: u32,
+        log2_tb: u32,
+        tr_depth: u32,
+        blk_idx: u32,
+        parent_cbf_cb: u32,
+        parent_cbf_cr: u32,
+    ) -> Result<()> {
         let max_tb_log2 = self.max_tb_log2;
         let min_tb_log2 = self.min_tb_log2;
         let must_split = log2_tb > max_tb_log2;
@@ -1860,30 +1881,63 @@ impl<'a> Walker<'a> {
             let ctx_inc = ctx_inc.min(2);
             engine.decode_bin(&mut ctx.split_transform_flag[ctx_inc])
         };
+
+        // §7.3.8.9 transform_tree: cbf_cb / cbf_cr are decoded BEFORE the
+        // split, at every depth where log2TrafoSize > 2, conditional on
+        // (trafoDepth == 0 || parent cbf_cX != 0). They propagate to
+        // nested transform_tree calls so the child parse state matches.
+        let chroma_here = log2_tb > 2;
+        let cbf_ctx_inc = tr_depth.min(4) as usize;
+        let cbf_cb_node = if chroma_here && (tr_depth == 0 || parent_cbf_cb != 0) {
+            engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
+        } else if chroma_here {
+            0
+        } else {
+            // Below 8×8 we inherit the parent's cbf for purposes of the
+            // final-block chroma emission (§7.3.8.9 else-branch condition).
+            parent_cbf_cb
+        };
+        let cbf_cr_node = if chroma_here && (tr_depth == 0 || parent_cbf_cr != 0) {
+            engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
+        } else if chroma_here {
+            0
+        } else {
+            parent_cbf_cr
+        };
+
         if split == 1 {
             let sub = 1u32 << (log2_tb - 1);
-            self.transform_tree_inter(engine, ctx, x0, y0, log2_tb - 1, tr_depth + 1)?;
-            self.transform_tree_inter(engine, ctx, x0 + sub, y0, log2_tb - 1, tr_depth + 1)?;
-            self.transform_tree_inter(engine, ctx, x0, y0 + sub, log2_tb - 1, tr_depth + 1)?;
-            self.transform_tree_inter(engine, ctx, x0 + sub, y0 + sub, log2_tb - 1, tr_depth + 1)?;
+            self.transform_tree_inter_inner(
+                engine, ctx, x0, y0, x0, y0, log2_tb - 1, tr_depth + 1, 0, cbf_cb_node, cbf_cr_node,
+            )?;
+            self.transform_tree_inter_inner(
+                engine, ctx, x0 + sub, y0, x0, y0, log2_tb - 1, tr_depth + 1, 1, cbf_cb_node, cbf_cr_node,
+            )?;
+            self.transform_tree_inter_inner(
+                engine, ctx, x0, y0 + sub, x0, y0, log2_tb - 1, tr_depth + 1, 2, cbf_cb_node, cbf_cr_node,
+            )?;
+            self.transform_tree_inter_inner(
+                engine, ctx, x0 + sub, y0 + sub, x0, y0, log2_tb - 1, tr_depth + 1, 3, cbf_cb_node, cbf_cr_node,
+            )?;
             return Ok(());
         }
 
-        let mut cbf_cb = 0u32;
-        let mut cbf_cr = 0u32;
-        let chroma_log2 = if log2_tb == self.min_tb_log2 {
-            0
-        } else {
-            log2_tb - 1
-        };
-        let chroma_present = chroma_log2 >= 2;
-        let cbf_ctx_inc = tr_depth.min(4) as usize;
-        if chroma_present {
-            cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-            cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-        }
+        // Leaf. cbf_cb / cbf_cr here are the values observed at this node.
+        let cbf_cb = cbf_cb_node;
+        let cbf_cr = cbf_cr_node;
+        // §7.3.8.9 cbf_luma is decoded only when any of:
+        //   * CuPredMode == MODE_INTRA (always for intra CUs),
+        //   * trafoDepth != 0 (a split happened — leaf of a split tree),
+        //   * cbf_cb != 0 || cbf_cr != 0.
+        // Otherwise (inter root, unsplit, no chroma coeffs) rqt_root_cbf=1
+        // forces cbf_luma = 1 by inference: otherwise the tree would be
+        // empty which contradicts rqt_root_cbf=1.
         let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
-        let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
+        let cbf_luma = if tr_depth == 0 && cbf_cb == 0 && cbf_cr == 0 {
+            1
+        } else {
+            engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc])
+        };
         let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
         if has_any_coeff
             && self.cctx.pps.cu_qp_delta_enabled_flag
@@ -1934,14 +1988,28 @@ impl<'a> Walker<'a> {
         if cbf_luma != 0 {
             self.add_residual_plane(engine, ctx, x0, y0, log2_tb, true)?;
         }
-        if chroma_present {
+        // Chroma TB placement, matching §7.3.8.11 and the intra path:
+        //   log2_tb > 2: chroma TB co-located at (x0/2, y0/2), size log2_tb-1.
+        //   log2_tb == 2 && blk_idx == 3: emit one 4x4 chroma TB at the
+        //     4×4-parent base covering all 4 luma 4×4 siblings.
+        if log2_tb > 2 {
             let cx = x0 / 2;
             let cy = y0 / 2;
+            let chroma_log2 = log2_tb - 1;
             if cbf_cb != 0 {
                 self.add_residual_plane(engine, ctx, cx, cy, chroma_log2, false)?;
             }
             if cbf_cr != 0 {
                 self.add_residual_plane_cr(engine, ctx, cx, cy, chroma_log2)?;
+            }
+        } else if blk_idx == 3 {
+            let cx = x_base / 2;
+            let cy = y_base / 2;
+            if cbf_cb != 0 {
+                self.add_residual_plane(engine, ctx, cx, cy, 2, false)?;
+            }
+            if cbf_cr != 0 {
+                self.add_residual_plane_cr(engine, ctx, cx, cy, 2)?;
             }
         }
         Ok(())
