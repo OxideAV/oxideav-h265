@@ -1832,13 +1832,24 @@ fn main10_inter_decodes_with_pframes() {
             let off = y * vf.planes[0].stride;
             packed_actual.extend_from_slice(&vf.planes[0].data[off..off + row_bytes]);
         }
+        let mut frame_sse: u64 = 0;
+        let mut frame_n: u64 = 0;
         for i in (0..packed_actual.len()).step_by(2) {
             let a = (packed_actual[i] as u32) | ((packed_actual[i + 1] as u32) << 8);
             let e = (expected_y[i] as u32) | ((expected_y[i + 1] as u32) << 8);
             let d = a as i32 - e as i32;
-            sse += (d * d) as u64;
-            n += 1;
+            frame_sse += (d * d) as u64;
+            frame_n += 1;
         }
+        sse += frame_sse;
+        n += frame_n;
+        let frame_psnr = if frame_sse == 0 {
+            f64::INFINITY
+        } else {
+            let mse = frame_sse as f64 / frame_n as f64;
+            10.0 * (1023.0 * 1023.0 / mse).log10()
+        };
+        eprintln!("  frame {fi}: Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}");
     }
     let psnr = if sse == 0 {
         f64::INFINITY
