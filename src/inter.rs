@@ -759,11 +759,18 @@ pub fn luma_mc_hp(
 }
 
 /// Combine two uni-pred luma arrays produced by [`luma_mc_hp`] into a
-/// bi-predicted block (§8.5.3.3.3). Final sample is clipped by Clip1Y.
+/// bi-predicted block (§8.5.3.3.4.2 eq. 8-264). Final sample is clipped
+/// by Clip1Y.
+///
+/// Spec `shift2 = Max(3, 15 - BitDepth)`, `offset2 = 1 << (shift2 - 1)`:
+///   * 8-bit → shift=7, offset=64 (the only case covered pre-Main 10)
+///   * 10-bit → shift=5, offset=16
 pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16], bit_depth: i32) {
+    let shift = core::cmp::max(3, 15 - bit_depth);
+    let offset = 1i32 << (shift - 1);
     let max_val = (1i32 << bit_depth) - 1;
     for i in 0..out.len() {
-        let v = (a[i] + b[i] + 64) >> 7;
+        let v = (a[i] + b[i] + offset) >> shift;
         out[i] = v.clamp(0, max_val) as u16;
     }
 }
@@ -1024,6 +1031,22 @@ mod tests {
         let b = vec![20i32 << 6; 16];
         let mut out = vec![0u16; 16];
         luma_mc_bi_combine(&a, &b, &mut out, 8);
+        for v in &out {
+            assert_eq!(*v, 15);
+        }
+    }
+
+    #[test]
+    fn bi_combine_10bit_scales_correctly() {
+        // §8.5.3.3.4.2 eq. 8-264 — for 10-bit, shift2 = Max(3, 15-10) = 5
+        // and offset2 = 1 << 4 = 16. The high-precision uni-pred inputs
+        // carry an extra `<< shift3` factor relative to 8-bit (shift3 =
+        // Max(2, 14-10) = 4), so the same "average value 15" encoding
+        // lives at `15 << 4` per sample (combined scale = shift2).
+        let a = vec![10i32 << 4; 16];
+        let b = vec![20i32 << 4; 16];
+        let mut out = vec![0u16; 16];
+        luma_mc_bi_combine(&a, &b, &mut out, 10);
         for v in &out {
             assert_eq!(*v, 15);
         }
