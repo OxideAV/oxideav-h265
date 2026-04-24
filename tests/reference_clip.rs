@@ -2006,16 +2006,34 @@ fn main10_inter_decodes_with_pframes() {
         "Main 10 inter PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
         frames.len()
     );
-    // After landing the spec-correct inter transform_tree order
-    // (cbf_cb / cbf_cr at every depth with log2_tb > 2 before the split,
-    // gated by parent cbf per §7.3.8.9), PSNR on this fixture jumps to
-    // ~24 dB average (frame-1 first-P ~44 dB). Remaining drift compounds
-    // frame-to-frame at ~5-6 dB per P-frame (plausibly a residual-coding
-    // bit-depth bug or missing rcMax in sign_data_hiding — next round).
-    // Floor at 22 dB average picks up the improvement without forcing
-    // bit-exactness; per-frame min still 19 dB on frame 3.
+    // After Round 7:
+    //   * `split_transform_flag` gate (§7.3.8.9 + §7.4.9.8 eq. 7-66) —
+    //     2Nx2N inter at `max_transform_hierarchy_depth_inter == 0`
+    //     infers split = 0 rather than reading a phantom bin. Non-2Nx2N
+    //     CUs still use the legacy read-the-bin path; the full
+    //     `interSplitFlag == 1` force-split needs further bitstream
+    //     work before it can land without mis-aligning residuals.
+    //   * TMVP BR/centre positions (§8.5.3.2.8) now round to the 16×16
+    //     grid and the BR lookup is gated on `yPb >> CtbLog2 ==
+    //     yColBr >> CtbLog2`. Before this the naive exact-position
+    //     lookup was resolving to different grid cells than the spec
+    //     prescribes — visible as ~3 dB frame-3 drift on the fixture.
+    //   * `NeighbourContext` threaded into `build_merge_list` /
+    //     `build_amvp_list` so the §8.5.3.2.3 partIdx availability
+    //     rules suppress A1 / B1 / A0 when the spec marks them
+    //     unavailable inside the current CU.
+    //
+    // Per-frame (libx265 Main 10, 80x48, QP 22):
+    //   frame 0  inf dB   (intra-only, bit-exact)
+    //   frame 1  46.11 dB (first P; 44.04 pre-Round-7)
+    //   frame 2  24.79 dB
+    //   frame 3  20.00 dB (19.26 pre-Round-7)
+    //   average  24.77 dB (24.19 pre-Round-7)
+    // Floor bumped from 22 → 24 dB — leaves ~0.7 dB headroom for the
+    // next round to recover the remaining frame-3 drift (likely tied
+    // to the deferred interSplitFlag force-split landing).
     assert!(
-        psnr >= 22.0,
+        psnr >= 24.0,
         "Main 10 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }

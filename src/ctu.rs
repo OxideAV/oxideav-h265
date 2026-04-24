@@ -1417,19 +1417,30 @@ impl<'a> Walker<'a> {
             return None;
         }
         let coll = self.cctx.collocated_ref?;
-        // §8.5.3.2.9: pick the collocated PB at the bottom-right of the
-        // current PB, falling back to its centre when unavailable.
+        // §8.5.3.2.8 (§8.5.3.2.9 entry):
+        //   xColBr = xPb + nPbW; yColBr = yPb + nPbH.
+        //   Availability requires yPb >> CtbLog2 == yColBr >> CtbLog2
+        //   (same CTB row) AND both coords < picture size. The collocated
+        //   PB is the one covering ((xColBr>>4)<<4, (yColBr>>4)<<4) — a
+        //   16×16-aligned grid cell. Centre fallback uses (xPb+nPbW/2,
+        //   yPb+nPbH/2), round to 16×16, with no CTB-row constraint.
         let pic_w = self.cctx.sps.pic_width_in_luma_samples;
         let pic_h = self.cctx.sps.pic_height_in_luma_samples;
+        let ctb_log2 = self.cctx.sps.log2_min_luma_coding_block_size_minus3
+            + 3
+            + self.cctx.sps.log2_diff_max_min_luma_coding_block_size;
         let br_x = x0 + w;
         let br_y = y0 + h;
-        if br_x < pic_w && br_y < pic_h {
-            if let Some(pb) = coll.collocated_motion(br_x, br_y) {
+        let same_ctb_row = (y0 >> ctb_log2) == (br_y >> ctb_log2);
+        if same_ctb_row && br_x < pic_w && br_y < pic_h {
+            let ax = (br_x >> 4) << 4;
+            let ay = (br_y >> 4) << 4;
+            if let Some(pb) = coll.collocated_motion(ax, ay) {
                 return Some(MergeCand::from_pb_into_ref0(pb));
             }
         }
-        let cx = x0 + w / 2;
-        let cy = y0 + h / 2;
+        let cx = (x0 + w / 2) >> 4 << 4;
+        let cy = (y0 + h / 2) >> 4 << 4;
         let pb = coll.collocated_motion(cx, cy)?;
         Some(MergeCand::from_pb_into_ref0(pb))
     }
@@ -1633,10 +1644,17 @@ impl<'a> Walker<'a> {
             return None;
         }
         let coll = self.cctx.collocated_ref?;
+        // §8.5.3.2.8: same BR-then-centre rule as merge, with both
+        // locations rounded to the 16×16 grid and the BR path gated on
+        // "same CTB row as the current PB".
         let pic_w = self.cctx.sps.pic_width_in_luma_samples;
         let pic_h = self.cctx.sps.pic_height_in_luma_samples;
+        let ctb_log2 = self.cctx.sps.log2_min_luma_coding_block_size_minus3
+            + 3
+            + self.cctx.sps.log2_diff_max_min_luma_coding_block_size;
         let br_x = x0 + w;
         let br_y = y0 + h;
+        let same_ctb_row = (y0 >> ctb_log2) == (br_y >> ctb_log2);
         let pick = |pb: PbMotion| -> Option<MotionVector> {
             if want_l0 && pb.pred_l0 {
                 Some(pb.mv_l0)
@@ -1650,15 +1668,17 @@ impl<'a> Walker<'a> {
                 None
             }
         };
-        if br_x < pic_w && br_y < pic_h {
-            if let Some(pb) = coll.collocated_motion(br_x, br_y) {
+        if same_ctb_row && br_x < pic_w && br_y < pic_h {
+            let ax = (br_x >> 4) << 4;
+            let ay = (br_y >> 4) << 4;
+            if let Some(pb) = coll.collocated_motion(ax, ay) {
                 if let Some(mv) = pick(pb) {
                     return Some(mv);
                 }
             }
         }
-        let cx = x0 + w / 2;
-        let cy = y0 + h / 2;
+        let cx = (x0 + w / 2) >> 4 << 4;
+        let cy = (y0 + h / 2) >> 4 << 4;
         let pb = coll.collocated_motion(cx, cy)?;
         pick(pb)
     }
