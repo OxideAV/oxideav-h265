@@ -1861,16 +1861,16 @@ fn main10_inter_decodes_with_pframes() {
         "Main 10 inter PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
         frames.len()
     );
-    // After landing the bit-depth-aware dequant QP (QpY → Qp'Y =
-    // QpY + QpBdOffsetY), Main 10 intra is byte-exact and Main 10 inter
-    // PSNR is in the 20 dB range on this fixture. The residual gap at
-    // inter is likely unrelated to dequant — more plausibly either MC
-    // rounding at 10-bit in the spec's Clip1Y/Clip1C paths or a subtle
-    // reference-picture POC/reordering issue. Floor raised to 18 dB
-    // to guard against further regressions but not force byte-exactness
-    // yet.
+    // After landing the spec-correct inter transform_tree order
+    // (cbf_cb / cbf_cr at every depth with log2_tb > 2 before the split,
+    // gated by parent cbf per §7.3.8.9), PSNR on this fixture jumps to
+    // ~24 dB average (frame-1 first-P ~44 dB). Remaining drift compounds
+    // frame-to-frame at ~5-6 dB per P-frame (plausibly a residual-coding
+    // bit-depth bug or missing rcMax in sign_data_hiding — next round).
+    // Floor at 22 dB average picks up the improvement without forcing
+    // bit-exactness; per-frame min still 19 dB on frame 3.
     assert!(
-        psnr >= 18.0,
+        psnr >= 22.0,
         "Main 10 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }
