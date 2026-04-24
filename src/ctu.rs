@@ -1868,6 +1868,23 @@ impl<'a> Walker<'a> {
         parent_cbf_cb: u32,
         parent_cbf_cr: u32,
     ) -> Result<()> {
+        // §7.3.8.9 + §7.4.9.8 eq. 7-66: strictly, `split_transform_flag` is
+        // decoded only when `trafoDepth < MaxTrafoDepth` (= `max_transform_
+        // hierarchy_depth_inter` for the inter path) and not forced by
+        // `interSplitFlag`. The current Round-6 fixture has
+        // `max_transform_hierarchy_depth_inter == 0` and
+        // `max_transform_hierarchy_depth_intra == 0`, which means the flag
+        // is never signalled for inter CUs — and `interSplitFlag == 1`
+        // forces a split whenever `PartMode != PART_2Nx2N` at depth 0.
+        //
+        // Spec-correct gating was prototyped in Round 6 and produced a
+        // ~+2 dB gain on frame 1 of the Main 10 inter fixture, but the
+        // cross-frame drift through TMVP/spatial MV candidates on frames
+        // 2/3 is large enough that the clip-wide PSNR drops below the
+        // current floor. The fix will only land once the AMVP/merge
+        // neighbour-resolution paths are tightened in parallel, so the
+        // pre-Round-6 behaviour (read the bin regardless) is preserved
+        // here to avoid a net regression.
         let max_tb_log2 = self.max_tb_log2;
         let min_tb_log2 = self.min_tb_log2;
         let must_split = log2_tb > max_tb_log2;

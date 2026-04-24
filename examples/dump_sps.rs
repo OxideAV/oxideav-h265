@@ -26,6 +26,16 @@ fn main() {
                     sps.bit_depth_c(),
                 );
                 println!(
+                    "  max_tr_hier_depth_inter={} max_tr_hier_depth_intra={}",
+                    sps.max_transform_hierarchy_depth_inter,
+                    sps.max_transform_hierarchy_depth_intra,
+                );
+                println!(
+                    "  log2_min_luma_tbsize={} log2_diff_max_min_luma_tbsize={}",
+                    sps.log2_min_luma_transform_block_size_minus2 + 2,
+                    sps.log2_diff_max_min_luma_transform_block_size,
+                );
+                println!(
                     "  chroma_format_idc={} amp={} sao={} strong_intra_smoothing={} mvp={} scaling_list={}",
                     sps.chroma_format_idc,
                     sps.amp_enabled_flag,
