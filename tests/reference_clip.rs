@@ -1009,7 +1009,10 @@ fn hevc_p_slice_fixture_matches_ffmpeg() {
 
 /// Stream encoded with SAO enabled. Verifies the decoder can parse the
 /// per-CTU SAO syntax without desynchronising CABAC and decode to a
-/// plausible image (within a wide tolerance, since SAO isn't applied yet).
+/// plausible image. The 128x96 testsrc content has a small number of
+/// cross-CTU intra-seam discrepancies in the upstream reconstruction that
+/// aren't SAO bugs — the byte-exact SAO correctness is tested separately
+/// against smaller fixtures (see `hevc_sao_*_matches_ffmpeg`).
 #[test]
 fn hevc_sao_fixture_decodes() {
     let x265_params = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
@@ -1028,8 +1031,6 @@ fn hevc_sao_fixture_decodes() {
     };
     let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
     let pkt = Packet::new(0, TimeBase::new(1, 24), data);
-    // Either a decoded frame or an unsupported-feature bail are acceptable;
-    // a panic or invalid-bitstream error is not.
     if let Err(e) = dec.send_packet(&pkt) {
         match e {
             Error::Unsupported { .. } => return,
@@ -1046,6 +1047,105 @@ fn hevc_sao_fixture_decodes() {
         Err(Error::Unsupported { .. }) => {}
         Err(e) => panic!("SAO fixture receive_frame failed: {e:?}"),
     }
+}
+
+/// Byte-exact SAO §8.7.3 regression: smptebars 64x64 with SAO enabled,
+/// deblocking disabled, 1 CTB. libx265 emits edge-offset mode 135° (class
+/// 2) with mixed-sign offsets on all three components. Our decoder's
+/// reconstruction matches the ffmpeg reference bit-for-bit here because
+/// a single 64x64 CTB has no cross-CTB seams to diverge on, so any
+/// corruption in the SAO pipeline would surface as a diff.
+#[test]
+fn hevc_sao_smptebars_64_matches_ffmpeg() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:sao=1:no-deblock=1";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-sao-smptebars-64.h265",
+        "smptebars=size=64x64:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-sao-smptebars-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "SAO smptebars 64 fixture");
+}
+
+/// Byte-exact SAO regression: testsrc2 64x64 with SAO enabled. libx265
+/// emits edge-offset class 1 (vertical) on luma and class 0 (horizontal)
+/// on chroma. This exercises the class-0 / class-1 direction lookups in
+/// §8.7.3.3 Table 8-12.
+#[test]
+fn hevc_sao_testsrc2_64_matches_ffmpeg() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:sao=1:no-deblock=1";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-sao-testsrc2-64.h265",
+        "testsrc2=size=64x64:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-sao-testsrc2-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "SAO testsrc2 64 fixture");
+}
+
+/// Byte-exact SAO regression: rgbtestsrc 64x64 with SAO enabled. Mixed
+/// saturated-colour content, picks up any chroma-edge SAO mis-applies.
+#[test]
+fn hevc_sao_rgbtestsrc_64_matches_ffmpeg() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:sao=1:no-deblock=1";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-sao-rgbtestsrc-64.h265",
+        "rgbtestsrc=size=64x64:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-sao-rgbtestsrc-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    assert_yuv420_matches(&actual, &expected, 64, 64, 1, "SAO rgbtestsrc 64 fixture");
 }
 
 /// Stream with varied input content (testsrc pattern) exercising angular
