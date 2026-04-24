@@ -301,16 +301,9 @@ pub fn decode_slice_ctus(
             "h265 pixel decode requires matching luma/chroma bit depth",
         ));
     }
-    // Inter motion compensation (§8.5.3.3) currently clips at 8-bit
-    // amplitude; at 10-bit the bi-pred averaging step would be biased.
-    // Refuse inter slices until the MC helpers learn `bit_depth`.
-    if cctx.sps.bit_depth_y() > 8
-        && matches!(cctx.slice.slice_type, SliceType::P | SliceType::B)
-    {
-        return Err(Error::unsupported(
-            "h265 Main 10 inter slice decode is not yet supported",
-        ));
-    }
+    // Inter motion compensation (§8.5.3.3) clips at Clip1Y/Clip1C using
+    // `bit_depth` from the SPS, so Main 10 P/B slices now share the MC
+    // path with Main. Higher bit depths (>10) are rejected above.
     // Note: SAO parameters are parsed per-CTU (see decode_sao) into
     // `pic.sao_grid`; the post-decode filter (§8.7.3) runs from
     // `decoder::decode_*_slice` after deblocking. Deblocking (§8.7.2)
@@ -1218,6 +1211,8 @@ impl<'a> Walker<'a> {
 
         let is_bi = pb.pred_l0 && pb.pred_l1;
         let weighted = self.cctx.weighted_pred;
+        let bd_y = self.cctx.sps.bit_depth_y() as i32;
+        let bd_c = self.cctx.sps.bit_depth_c() as i32;
 
         if !is_bi {
             // Uni-prediction.
@@ -1236,6 +1231,7 @@ impl<'a> Walker<'a> {
                 h as i32,
                 mv,
                 &mut luma_out,
+                bd_y,
             )?;
             chroma_mc(
                 ref_pic,
@@ -1246,6 +1242,7 @@ impl<'a> Walker<'a> {
                 mv,
                 &mut cb_out,
                 0,
+                bd_c,
             )?;
             chroma_mc(
                 ref_pic,
@@ -1256,6 +1253,7 @@ impl<'a> Walker<'a> {
                 mv,
                 &mut cr_out,
                 1,
+                bd_c,
             )?;
         } else {
             let ref_l1 =
@@ -1327,9 +1325,10 @@ impl<'a> Walker<'a> {
                     w1,
                     o1,
                     w_table.luma_denom + 1,
+                    bd_y,
                 );
             } else {
-                luma_mc_bi_combine(&a_l, &b_l, &mut luma_out);
+                luma_mc_bi_combine(&a_l, &b_l, &mut luma_out, bd_y);
             }
 
             for comp in 0..2 {
@@ -1342,9 +1341,11 @@ impl<'a> Walker<'a> {
                 let l1_c = weighted
                     .and_then(|w| w.chroma_weight_l1(pb.ref_idx_l1.max(0) as usize, comp as usize));
                 if let (Some(w_table), Some((w0, o0)), Some((w1, o1))) = (weighted, l0_c, l1_c) {
-                    luma_mc_bi_weighted(a, b, out, w0, o0, w1, o1, w_table.chroma_denom + 1);
+                    luma_mc_bi_weighted(
+                        a, b, out, w0, o0, w1, o1, w_table.chroma_denom + 1, bd_c,
+                    );
                 } else {
-                    chroma_mc_bi_combine(a, b, out);
+                    chroma_mc_bi_combine(a, b, out, bd_c);
                 }
             }
         }

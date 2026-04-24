@@ -644,8 +644,8 @@ fn luma_h_filter_int(p: impl Fn(i32, i32) -> i32, x: i32, y: i32, fx: usize) -> 
 
 /// Perform full 2-D luma sub-pel interpolation into `out` (row-major
 /// `blk_w * blk_h`) with 1/4-pel MV `mv` applied to the reference at the
-/// block origin (x0, y0). Currently clips to 8-bit sample range (Main
-/// profile); 10-bit inter prediction is tracked separately.
+/// block origin (x0, y0). Output is clipped to `[0, (1 << bit_depth) - 1]`
+/// per Clip1Y (§8.5.3.2.2). Supports 8- and 10-bit luma.
 pub fn luma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -654,6 +654,7 @@ pub fn luma_mc(
     blk_h: i32,
     mv: MotionVector,
     out: &mut [u16],
+    bit_depth: i32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 luma_mc: output buffer too small"));
@@ -664,6 +665,7 @@ pub fn luma_mc(
     let iy = mv.y >> 2;
 
     let px = |x: i32, y: i32| -> i32 { ref_pic.sample_luma(x0 + ix + x, y0 + iy + y) as i32 };
+    let max_val = (1i32 << bit_depth) - 1;
 
     for j in 0..blk_h {
         for i in 0..blk_w {
@@ -671,14 +673,14 @@ pub fn luma_mc(
                 px(i, j)
             } else if fy == 0 {
                 let s = luma_h_filter_int(px, i, j, fx);
-                ((s + 32) >> 6).clamp(0, 255)
+                ((s + 32) >> 6).clamp(0, max_val)
             } else if fx == 0 {
                 let mut s = 0i32;
                 let f = &LUMA_FILTER[fy];
                 for k in 0..8 {
                     s += f[k] * px(i, j + k as i32 - 3);
                 }
-                ((s + 32) >> 6).clamp(0, 255)
+                ((s + 32) >> 6).clamp(0, max_val)
             } else {
                 let mut h = [0i32; 8];
                 for k in 0..8 {
@@ -690,7 +692,7 @@ pub fn luma_mc(
                 for k in 0..8 {
                     s += f[k] * h[k];
                 }
-                ((s + 2048) >> 12).clamp(0, 255)
+                ((s + 2048) >> 12).clamp(0, max_val)
             };
             out[(j * blk_w + i) as usize] = v as u16;
         }
@@ -757,17 +759,19 @@ pub fn luma_mc_hp(
 }
 
 /// Combine two uni-pred luma arrays produced by [`luma_mc_hp`] into a
-/// bi-predicted block (§8.5.3.3.3).
-pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16]) {
+/// bi-predicted block (§8.5.3.3.3). Final sample is clipped by Clip1Y.
+pub fn luma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16], bit_depth: i32) {
+    let max_val = (1i32 << bit_depth) - 1;
     for i in 0..out.len() {
         let v = (a[i] + b[i] + 64) >> 7;
-        out[i] = v.clamp(0, 255) as u16;
+        out[i] = v.clamp(0, max_val) as u16;
     }
 }
 
 /// Weighted-bi luma combine (§8.5.3.3.4) with unit-offset rounding.
 /// `(w0, o0)` and `(w1, o1)` are pulled from `pred_weight_table()`;
-/// `log2_wd` is `luma_log2_weight_denom + 1`.
+/// `log2_wd` is `luma_log2_weight_denom + 1`. Final sample is clipped by
+/// Clip1Y to the `bit_depth` sample range.
 pub fn luma_mc_bi_weighted(
     a: &[i32],
     b: &[i32],
@@ -777,19 +781,22 @@ pub fn luma_mc_bi_weighted(
     w1: i32,
     o1: i32,
     log2_wd: u32,
+    bit_depth: i32,
 ) {
     let shift = log2_wd;
     let round = 1i32 << shift;
+    let max_val = (1i32 << bit_depth) - 1;
     for i in 0..out.len() {
         let v = (a[i] * w0 + b[i] * w1 + ((o0 + o1 + 1) << (shift - 1)) + round) >> (shift + 1);
         // Note: `(shift - 1)` is safe since HEVC requires `log2_wd >= 1`.
-        out[i] = v.clamp(0, 255) as u16;
+        out[i] = v.clamp(0, max_val) as u16;
     }
 }
 
 /// Perform 2-D chroma sub-pel interpolation. `mv` is in 1/4-pel luma units;
 /// chroma uses 1/8-pel fractions so we split the MV accordingly.
-/// `out` is `blk_w * blk_h` and `comp` selects cb (0) or cr (1).
+/// `out` is `blk_w * blk_h` and `comp` selects cb (0) or cr (1). Output is
+/// clipped to `[0, (1 << bit_depth) - 1]` per Clip1C (§8.5.3.2.2.2).
 pub fn chroma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -799,6 +806,7 @@ pub fn chroma_mc(
     mv: MotionVector,
     out: &mut [u16],
     comp: u8,
+    bit_depth: i32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 chroma_mc: output buffer too small"));
@@ -816,6 +824,7 @@ pub fn chroma_mc(
             _ => ref_pic.sample_cr(sx, sy) as i32,
         }
     };
+    let max_val = (1i32 << bit_depth) - 1;
 
     for j in 0..blk_h {
         for i in 0..blk_w {
@@ -827,14 +836,14 @@ pub fn chroma_mc(
                 for k in 0..4 {
                     s += f[k] * px(i + k as i32 - 1, j);
                 }
-                ((s + 32) >> 6).clamp(0, 255)
+                ((s + 32) >> 6).clamp(0, max_val)
             } else if fx == 0 {
                 let f = &CHROMA_FILTER[fy];
                 let mut s = 0i32;
                 for k in 0..4 {
                     s += f[k] * px(i, j + k as i32 - 1);
                 }
-                ((s + 32) >> 6).clamp(0, 255)
+                ((s + 32) >> 6).clamp(0, max_val)
             } else {
                 let mut h = [0i32; 4];
                 let fh = &CHROMA_FILTER[fx];
@@ -851,7 +860,7 @@ pub fn chroma_mc(
                 for k in 0..4 {
                     s += fv[k] * h[k];
                 }
-                ((s + 2048) >> 12).clamp(0, 255)
+                ((s + 2048) >> 12).clamp(0, max_val)
             };
             out[(j * blk_w + i) as usize] = v as u16;
         }
@@ -929,9 +938,11 @@ pub fn chroma_mc_hp(
     Ok(())
 }
 
-/// Combine two uni-pred chroma arrays into a bi-predicted block.
-pub fn chroma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16]) {
-    luma_mc_bi_combine(a, b, out);
+/// Combine two uni-pred chroma arrays into a bi-predicted block. Final
+/// sample is clipped by Clip1C (same `(1 << bit_depth) - 1` envelope as
+/// luma when `BitDepthY == BitDepthC`).
+pub fn chroma_mc_bi_combine(a: &[i32], b: &[i32], out: &mut [u16], bit_depth: i32) {
+    luma_mc_bi_combine(a, b, out, bit_depth);
 }
 
 #[cfg(test)]
@@ -953,7 +964,7 @@ mod tests {
             is_long_term: false,
         };
         let mut out = vec![0u16; 8 * 8];
-        luma_mc(&pic, 4, 4, 8, 8, MotionVector::new(0, 0), &mut out).expect("luma_mc");
+        luma_mc(&pic, 4, 4, 8, 8, MotionVector::new(0, 0), &mut out, 8).expect("luma_mc");
         for j in 0..8 {
             for i in 0..8 {
                 assert_eq!(out[j * 8 + i], pic.luma[(4 + j) * 16 + (4 + i)]);
@@ -1012,7 +1023,7 @@ mod tests {
         let a = vec![10i32 << 6; 16]; // shift-6 encoding of value 10
         let b = vec![20i32 << 6; 16];
         let mut out = vec![0u16; 16];
-        luma_mc_bi_combine(&a, &b, &mut out);
+        luma_mc_bi_combine(&a, &b, &mut out, 8);
         for v in &out {
             assert_eq!(*v, 15);
         }
