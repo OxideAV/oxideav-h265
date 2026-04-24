@@ -172,6 +172,7 @@ impl HevcDecoder {
             ref_list_l1: &empty,
             collocated_ref: None,
             weighted_pred: None,
+            cur_poc: 0,
         };
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;
@@ -231,6 +232,7 @@ impl HevcDecoder {
             ref_list_l1: &rpl1,
             collocated_ref,
             weighted_pred: hdr.weighted_pred.as_ref(),
+            cur_poc: current_poc,
         };
         let byte_off = (hdr.slice_data_bit_offset / 8) as usize;
         decode_slice_ctus(rbsp, byte_off, &cctx, &mut pic)?;

@@ -66,6 +66,19 @@ pub struct PbMotion {
     pub ref_idx_l1: i8,
     pub mv_l0: MotionVector,
     pub mv_l1: MotionVector,
+    /// POC of `RefPicListX[ref_idx_l0]` at the time this PB was decoded.
+    /// Resolved once and stashed so a later slice's TMVP lookup (§8.5.3.2.9)
+    /// can compute `DiffPicOrderCnt(ColPic, refPicListCol[refIdxCol])`
+    /// without reconstructing the collocated slice's ref list. Valid only
+    /// when `pred_l0`.
+    pub ref_poc_l0: i32,
+    /// POC of `RefPicListX[ref_idx_l1]`. Valid only when `pred_l1`.
+    pub ref_poc_l1: i32,
+    /// `true` when `RefPicListX[ref_idx_l0]` was a long-term reference at
+    /// the time this PB was decoded. Used by TMVP to enforce the LT-flag
+    /// match gate (§8.5.3.2.9 eq. pre-8-204).
+    pub ref_lt_l0: bool,
+    pub ref_lt_l1: bool,
 }
 
 impl PbMotion {
@@ -114,6 +127,10 @@ impl PbMotion {
             ref_idx_l1,
             mv_l0,
             mv_l1,
+            ref_poc_l0: 0,
+            ref_poc_l1: 0,
+            ref_lt_l0: false,
+            ref_lt_l1: false,
         }
     }
 }
@@ -380,6 +397,10 @@ pub struct MergeCand {
     pub ref_idx_l1: i8,
     pub mv_l0: MotionVector,
     pub mv_l1: MotionVector,
+    pub ref_poc_l0: i32,
+    pub ref_poc_l1: i32,
+    pub ref_lt_l0: bool,
+    pub ref_lt_l1: bool,
 }
 
 impl MergeCand {
@@ -391,15 +412,21 @@ impl MergeCand {
             ref_idx_l1: pb.ref_idx_l1,
             mv_l0: pb.mv_l0,
             mv_l1: pb.mv_l1,
+            ref_poc_l0: pb.ref_poc_l0,
+            ref_poc_l1: pb.ref_poc_l1,
+            ref_lt_l0: pb.ref_lt_l0,
+            ref_lt_l1: pb.ref_lt_l1,
         }
     }
 
     /// Re-map a collocated-picture PB into a temporal merge candidate that
     /// refers to the current slice's ref-idx 0 in whichever list the
-    /// collocated PB used. §8.5.3.1.2.3 requires POC-distance scaling
-    /// (§8.5.3.1.8); we skip scaling for this simple implementation
-    /// because the short GOPs we target (|Δ|==1 refs) make the scale
-    /// factor ≈ 1.
+    /// collocated PB used. §8.5.3.1.2.3 / §8.5.3.2.9 requires POC-distance
+    /// scaling (eqs. 8-202..8-209) when `currPocDiff != colPocDiff` and
+    /// both refs are short-term. The caller is expected to supply the
+    /// already-scaled MV via [`from_pb_into_ref0_scaled`]; this plain
+    /// helper is kept for the short-GOP case where the scaling factor
+    /// collapses to 1.
     pub fn from_pb_into_ref0(pb: PbMotion) -> Self {
         // Force the candidate to reference the first entry of whichever
         // list matches the collocated PB's direction.
@@ -410,6 +437,10 @@ impl MergeCand {
             ref_idx_l1: 0,
             mv_l0: pb.mv_l0,
             mv_l1: pb.mv_l1,
+            ref_poc_l0: pb.ref_poc_l0,
+            ref_poc_l1: pb.ref_poc_l1,
+            ref_lt_l0: pb.ref_lt_l0,
+            ref_lt_l1: pb.ref_lt_l1,
         }
     }
 
@@ -423,6 +454,10 @@ impl MergeCand {
             ref_idx_l1: self.ref_idx_l1,
             mv_l0: self.mv_l0,
             mv_l1: self.mv_l1,
+            ref_poc_l0: self.ref_poc_l0,
+            ref_poc_l1: self.ref_poc_l1,
+            ref_lt_l0: self.ref_lt_l0,
+            ref_lt_l1: self.ref_lt_l1,
         }
     }
 }
@@ -560,6 +595,10 @@ pub fn build_merge_list(
                     ref_idx_l1: b.ref_idx_l1,
                     mv_l0: a.mv_l0,
                     mv_l1: b.mv_l1,
+                    ref_poc_l0: a.ref_poc_l0,
+                    ref_poc_l1: b.ref_poc_l1,
+                    ref_lt_l0: a.ref_lt_l0,
+                    ref_lt_l1: b.ref_lt_l1,
                 };
                 if !cands.iter().any(|existing| existing == &combined) {
                     cands.push(combined);
@@ -581,6 +620,10 @@ pub fn build_merge_list(
             ref_idx_l1: 0,
             mv_l0: MotionVector::default(),
             mv_l1: MotionVector::default(),
+            ref_poc_l0: 0,
+            ref_poc_l1: 0,
+            ref_lt_l0: false,
+            ref_lt_l1: false,
         });
     }
     cands.truncate(max_num_merge_cand as usize);
@@ -604,14 +647,225 @@ fn fetch_spatial_neighbour(inter: &InterState, x: i32, y: i32) -> Option<MergeCa
 //  AMVP candidate list
 // ---------------------------------------------------------------------------
 
-/// Build the two-entry AMVP MV-predictor list (§8.5.3.1.6) for a given
-/// reference list. Spatial neighbours A0/A1 contribute the first
-/// candidate; B0/B1/B2 contribute the second. TMVP fills remaining
-/// slots when available. Missing slots are filled with zero MV.
+/// Summary of a reference picture for AMVP POC-scaling (§8.5.3.2.7):
+/// POC value and long-term-ref flag. One entry per L0 / L1 slot so a
+/// neighbour's `(pred_flag, ref_idx)` can be resolved into the referenced
+/// picture's POC without pulling the full [`RefPicture`] tree.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefPocEntry {
+    pub poc: i32,
+    pub is_long_term: bool,
+}
+
+/// Per-slice POC context used by AMVP MV-predictor scaling. Built once
+/// per inter slice from the resolved `rpl0` / `rpl1` + current POC.
+#[derive(Clone, Debug, Default)]
+pub struct AmvpPocInfo<'a> {
+    pub cur_poc: i32,
+    pub rpl0: &'a [RefPocEntry],
+    pub rpl1: &'a [RefPocEntry],
+}
+
+impl<'a> AmvpPocInfo<'a> {
+    fn ref_entry(&self, want_l0: bool, ref_idx: i8) -> Option<RefPocEntry> {
+        let list = if want_l0 { self.rpl0 } else { self.rpl1 };
+        if ref_idx < 0 {
+            return None;
+        }
+        list.get(ref_idx as usize).copied()
+    }
+}
+
+/// Apply the §8.5.3.2.7 distance-scaling transform (eqs. 8-179..8-181)
+/// to a motion vector component pair, scaling from the neighbour's
+/// reference POC (`tx_src`) to the current PU's target reference POC
+/// (`tx_dst`). Both are expressed as signed POC deltas from `cur_poc`.
 ///
-/// `want_l0` selects which of the neighbour's lists to read. For P
-/// slices and L0 in B slices this is `true`. For L1 in B slices it is
-/// `false`.
+/// The two POC-difference inputs follow eqs. 8-182 / 8-183:
+///
+/// ```text
+/// td = Clip3(-128, 127, DiffPicOrderCnt(curr, neighbour_ref))   // 8-182
+/// tb = Clip3(-128, 127, DiffPicOrderCnt(curr, target_ref))      // 8-183
+/// tx = (16384 + (|td| >> 1)) / td                               // 8-179
+/// dsf = Clip3(-4096, 4095, (tb * tx + 32) >> 6)                 // 8-180
+/// mv' = Clip3(-32768, 32767, sign(dsf*mv) * ((|dsf*mv| + 127) >> 8))
+/// ```
+fn scale_mv_by_poc(mv: MotionVector, td: i32, tb: i32) -> MotionVector {
+    let td = td.clamp(-128, 127);
+    let tb = tb.clamp(-128, 127);
+    if td == 0 {
+        return mv;
+    }
+    // Integer division toward zero — matches spec semantics when td != 0.
+    let tx = (16384 + (td.abs() >> 1)) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+    let scale = |v: i32| -> i32 {
+        let prod = dsf * v;
+        let sign = if prod < 0 { -1 } else { 1 };
+        let abs = prod.unsigned_abs() as i64;
+        let rounded = ((abs + 127) >> 8) as i32;
+        (sign * rounded).clamp(-32768, 32767)
+    };
+    MotionVector::new(scale(mv.x), scale(mv.y))
+}
+
+/// Probe the two possible neighbour MVs (L_X first, then L_Y) for an
+/// exact POC match against `target_poc`. Returns the first match's MV.
+fn probe_neighbour_exact(
+    pb: &PbMotion,
+    want_l0: bool,
+    poc_info: &AmvpPocInfo<'_>,
+    target_poc: i32,
+) -> Option<MotionVector> {
+    if !pb.valid || pb.is_intra {
+        return None;
+    }
+    // §8.5.3.2.7 eqs. 8-171/8-172: check LX first, LY second.
+    for &list_l0 in &[want_l0, !want_l0] {
+        let (has, ridx, mv) = if list_l0 {
+            (pb.pred_l0, pb.ref_idx_l0, pb.mv_l0)
+        } else {
+            (pb.pred_l1, pb.ref_idx_l1, pb.mv_l1)
+        };
+        if !has {
+            continue;
+        }
+        let Some(entry) = poc_info.ref_entry(list_l0, ridx) else {
+            continue;
+        };
+        if entry.poc == target_poc {
+            return Some(mv);
+        }
+    }
+    None
+}
+
+/// Probe the two possible neighbour MVs (L_X first, then L_Y) for a
+/// long-term-flag match with `target_is_lt`. Returns the first match's
+/// `(mv, ref_poc)`; caller applies POC-distance scaling when both refs
+/// are short-term.
+fn probe_neighbour_lt_match(
+    pb: &PbMotion,
+    want_l0: bool,
+    poc_info: &AmvpPocInfo<'_>,
+    target_is_lt: bool,
+) -> Option<(MotionVector, i32, bool)> {
+    if !pb.valid || pb.is_intra {
+        return None;
+    }
+    // §8.5.3.2.7 eqs. 8-173/8-176: check LX first with LT-flag match,
+    // then LY. Unlike pass 1, the gate is on LongTermRefPic parity
+    // rather than exact POC.
+    for &list_l0 in &[want_l0, !want_l0] {
+        let (has, ridx, mv) = if list_l0 {
+            (pb.pred_l0, pb.ref_idx_l0, pb.mv_l0)
+        } else {
+            (pb.pred_l1, pb.ref_idx_l1, pb.mv_l1)
+        };
+        if !has {
+            continue;
+        }
+        let Some(entry) = poc_info.ref_entry(list_l0, ridx) else {
+            continue;
+        };
+        if entry.is_long_term == target_is_lt {
+            return Some((mv, entry.poc, entry.is_long_term));
+        }
+    }
+    None
+}
+
+fn fetch_pb(inter: &InterState, x: i32, y: i32) -> Option<PbMotion> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let bx = (x >> 2) as usize;
+    let by = (y >> 2) as usize;
+    inter.get(bx, by).copied()
+}
+
+/// Run the §8.5.3.2.7 pass-1 (exact POC match, no scaling) search across
+/// the ordered `slots` for either the A-group or the B-group. Also
+/// returns `any_available` — `true` when at least one slot had an
+/// available (non-intra) neighbour, even if its MV did not match the
+/// target POC. For the A-group this sets `isScaledFlagLX = 1`.
+fn amvp_pass1_exact_match(
+    inter: &InterState,
+    slots: &[(i32, i32, bool)],
+    want_l0: bool,
+    target_poc: i32,
+    poc_info: &AmvpPocInfo<'_>,
+) -> (Option<MotionVector>, bool) {
+    let mut any_available = false;
+    for &(nx, ny, suppressed) in slots {
+        if suppressed {
+            continue;
+        }
+        let Some(pb) = fetch_pb(inter, nx, ny) else {
+            continue;
+        };
+        if !pb.valid || pb.is_intra {
+            continue;
+        }
+        any_available = true;
+        if let Some(mv) = probe_neighbour_exact(&pb, want_l0, poc_info, target_poc) {
+            return (Some(mv), any_available);
+        }
+    }
+    (None, any_available)
+}
+
+/// Run the §8.5.3.2.7 pass-2 (LT-match + optional POC scaling) search
+/// across the ordered `slots`. Returns the first usable MV (scaled when
+/// both the target and the neighbour's ref are short-term).
+fn amvp_pass2_scaled(
+    inter: &InterState,
+    slots: &[(i32, i32, bool)],
+    want_l0: bool,
+    target_poc: i32,
+    target_is_lt: bool,
+    poc_info: &AmvpPocInfo<'_>,
+) -> Option<MotionVector> {
+    for &(nx, ny, suppressed) in slots {
+        if suppressed {
+            continue;
+        }
+        let Some(pb) = fetch_pb(inter, nx, ny) else {
+            continue;
+        };
+        let Some((mv, ref_poc, ref_is_lt)) =
+            probe_neighbour_lt_match(&pb, want_l0, poc_info, target_is_lt)
+        else {
+            continue;
+        };
+        // When either is long-term, skip distance scaling —
+        // eq. 8-181 only applies when both are short-term.
+        if target_is_lt || ref_is_lt {
+            return Some(mv);
+        }
+        let td = target_poc_to_clipped(poc_info.cur_poc, ref_poc);
+        let tb = target_poc_to_clipped(poc_info.cur_poc, target_poc);
+        return Some(scale_mv_by_poc(mv, td, tb));
+    }
+    None
+}
+
+fn target_poc_to_clipped(cur_poc: i32, ref_poc: i32) -> i32 {
+    (cur_poc - ref_poc).clamp(-128, 127)
+}
+
+/// Build the two-entry AMVP MV-predictor list (§8.5.3.1.6 / §8.5.3.2.7)
+/// for a given reference list.
+///
+/// `want_l0` selects which list's MV the current PU is asking to
+/// predict (L0 for P slices / L0 side of B, L1 for L1 side of B).
+/// `target_ref_idx` is the already-decoded refIdxLX the current PU uses.
+/// `poc_info` carries the current slice POC + the referenced-picture POC
+/// lists so neighbours whose refs differ from the target POC can be
+/// distance-scaled per eqs. 8-179..8-183.
+///
+/// Missing slots are filled with TMVP (when available) then zero MV.
+#[allow(clippy::too_many_arguments)]
 pub fn build_amvp_list(
     inter: &InterState,
     x_pb: u32,
@@ -619,60 +873,108 @@ pub fn build_amvp_list(
     n_pb_w: u32,
     n_pb_h: u32,
     want_l0: bool,
+    target_ref_idx: i8,
     tmvp: Option<MotionVector>,
     nb: NeighbourContext,
+    poc_info: &AmvpPocInfo<'_>,
 ) -> [MotionVector; 2] {
-    let pick = |cand: MergeCand| -> Option<MotionVector> {
-        if want_l0 && cand.pred_l0 {
-            Some(cand.mv_l0)
-        } else if !want_l0 && cand.pred_l1 {
-            Some(cand.mv_l1)
-        } else if cand.pred_l0 {
-            Some(cand.mv_l0)
-        } else if cand.pred_l1 {
-            Some(cand.mv_l1)
-        } else {
-            None
+    // Resolve target reference's POC + LT flag. If unavailable (shouldn't
+    // happen on a valid bitstream), fall back to current POC which makes
+    // the scaling a no-op.
+    let target = poc_info
+        .ref_entry(want_l0, target_ref_idx)
+        .unwrap_or(RefPocEntry {
+            poc: poc_info.cur_poc,
+            is_long_term: false,
+        });
+
+    // A-group: A0 then A1, with the §6.4.2 / §8.5.3.2.3 suppression
+    // matching the existing merge-list behaviour so partIdx 1 doesn't
+    // see partIdx 0's just-written motion.
+    let a_slots = [
+        (x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32, nb.suppress_a0),
+        (
+            x_pb as i32 - 1,
+            y_pb as i32 + n_pb_h as i32 - 1,
+            nb.suppress_a1,
+        ),
+    ];
+    // Pass 1 (exact POC) on A.
+    let (mv_a1, a_any) = amvp_pass1_exact_match(inter, &a_slots, want_l0, target.poc, poc_info);
+    // Pass 2 (LT-match + POC scaling) on A when pass 1 missed.
+    let mv_a = mv_a1.or_else(|| {
+        amvp_pass2_scaled(
+            inter,
+            &a_slots,
+            want_l0,
+            target.poc,
+            target.is_long_term,
+            poc_info,
+        )
+    });
+    // `isScaledFlagLX` from §8.5.3.2.7 step 5 of A-derivation:
+    // `isScaledFlagLX = 1 iff availableA0 OR availableA1`. Notably this
+    // is independent of whether the A-group actually picked a valid MV.
+    let is_scaled = a_any;
+
+    // B-group: B0, B1, B2 in scan order. B1 is suppression-gated.
+    let b_slots = [
+        (x_pb as i32 + n_pb_w as i32, y_pb as i32 - 1, false),
+        (
+            x_pb as i32 + n_pb_w as i32 - 1,
+            y_pb as i32 - 1,
+            nb.suppress_b1,
+        ),
+        (x_pb as i32 - 1, y_pb as i32 - 1, false),
+    ];
+    // Pass 1 on B (exact POC, no scaling).
+    let mv_b_pass1 = amvp_pass1_exact_match(inter, &b_slots, want_l0, target.poc, poc_info).0;
+
+    // §8.5.3.2.7 steps 4–5 of the B-derivation:
+    //   * When `isScaledFlagLX == 0` (no A-group availability at all) and
+    //     `availableFlagLXB == 1`, set `mvLXA = mvLXB` (step 4, eq. 8-186)
+    //     AND re-derive `mvLXB` with scaling (step 5).
+    //   * Otherwise (A had availability), keep mvLXB at pass-1 value only.
+    let (opt_a, opt_b) = if is_scaled {
+        (mv_a, mv_b_pass1)
+    } else {
+        // A-group had no availability. Clone pass-1 B into A (eq. 8-186)
+        // and re-derive B with scaling (step 5 / eqs. 8-193..8-197).
+        let cloned_a = mv_b_pass1;
+        let scaled_b = amvp_pass2_scaled(
+            inter,
+            &b_slots,
+            want_l0,
+            target.poc,
+            target.is_long_term,
+            poc_info,
+        );
+        (cloned_a, scaled_b)
+    };
+
+    // §8.5.3.1.6 list assembly: append each available candidate, drop the
+    // second if equal to the first, append TMVP when `listSize < 2`, pad
+    // to 2 with zero MV.
+    let mut out: Vec<MotionVector> = Vec::with_capacity(3);
+    if let Some(a) = opt_a {
+        out.push(a);
+    }
+    if let Some(b) = opt_b {
+        if out.is_empty() || out[0] != b {
+            out.push(b);
         }
-    };
-
-    // §8.5.3.2.3 / §6.4.2 availability — same suppression as the merge
-    // list to keep partIdx 1 from seeing partIdx 0's just-written motion.
-    let a0 = if nb.suppress_a0 {
-        None
-    } else {
-        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32).and_then(pick)
-    };
-    let a1 = if nb.suppress_a1 {
-        None
-    } else {
-        fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 + n_pb_h as i32 - 1)
-            .and_then(pick)
-    };
-    let b0 =
-        fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32, y_pb as i32 - 1).and_then(pick);
-    let b1 = if nb.suppress_b1 {
-        None
-    } else {
-        fetch_spatial_neighbour(inter, x_pb as i32 + n_pb_w as i32 - 1, y_pb as i32 - 1)
-            .and_then(pick)
-    };
-    let b2 = fetch_spatial_neighbour(inter, x_pb as i32 - 1, y_pb as i32 - 1).and_then(pick);
-
-    let spatial_a = a0.or(a1).unwrap_or_default();
-    let spatial_b = b0.or(b1).or(b2).unwrap_or_default();
-    let mut out = [spatial_a, spatial_b];
-    if out[0] == out[1] {
-        // Try TMVP to fill the second slot before falling back to zero.
+    }
+    if out.len() < 2 {
         if let Some(t) = tmvp {
-            if t != out[0] {
-                out[1] = t;
-                return out;
+            if out.is_empty() || out[0] != t {
+                out.push(t);
             }
         }
-        out[1] = MotionVector::default();
     }
-    out
+    while out.len() < 2 {
+        out.push(MotionVector::default());
+    }
+    [out[0], out[1]]
 }
 
 // ---------------------------------------------------------------------------

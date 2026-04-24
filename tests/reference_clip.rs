@@ -2006,55 +2006,39 @@ fn main10_inter_decodes_with_pframes() {
         "Main 10 inter PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
         frames.len()
     );
-    // After Round 7:
-    //   * `split_transform_flag` gate (§7.3.8.9 + §7.4.9.8 eq. 7-66) —
-    //     2Nx2N inter at `max_transform_hierarchy_depth_inter == 0`
-    //     infers split = 0 rather than reading a phantom bin. Non-2Nx2N
-    //     CUs still use the legacy read-the-bin path; the full
-    //     `interSplitFlag == 1` force-split needs further bitstream
-    //     work before it can land without mis-aligning residuals.
-    //   * TMVP BR/centre positions (§8.5.3.2.8) now round to the 16×16
-    //     grid and the BR lookup is gated on `yPb >> CtbLog2 ==
-    //     yColBr >> CtbLog2`. Before this the naive exact-position
-    //     lookup was resolving to different grid cells than the spec
-    //     prescribes — visible as ~3 dB frame-3 drift on the fixture.
-    //   * `NeighbourContext` threaded into `build_merge_list` /
-    //     `build_amvp_list` so the §8.5.3.2.3 partIdx availability
-    //     rules suppress A1 / B1 / A0 when the spec marks them
-    //     unavailable inside the current CU.
+    // Round 9 landed §8.5.3.2.7 AMVP POC-distance MV scaling and the
+    // companion §8.5.3.2.9 TMVP scaling:
+    //   * `build_amvp_list` now runs the spec's two-pass search —
+    //     pass 1 picks spatial neighbours whose reference POC matches
+    //     the current PU's target refIdxLX (no scaling); pass 2 falls
+    //     back to neighbours with matching `LongTermRefPic` flag and
+    //     applies distance scaling per eqs. 8-179..8-183 when both the
+    //     target and neighbour's refs are short-term.
+    //   * `isScaledFlagLX` gates the B-group: when no A neighbour was
+    //     available at all, pass-1 mvLXB is cloned into mvLXA (eq.
+    //     8-186) and mvLXB is re-derived with scaling (step 5 / eqs.
+    //     8-193..8-197).
+    //   * TMVP lookups in `tmvp_amvp_mv` and `tmvp_merge_cand` now
+    //     apply the same POC scaling (§8.5.3.2.9 eqs. 8-202..8-209),
+    //     gating on LT-flag match and skipping scaling when
+    //     `colPocDiff == currPocDiff` or either ref is long-term.
+    //   * `PbMotion` grew `ref_poc_{l0,l1}` + `ref_lt_{l0,l1}` so a
+    //     later slice's TMVP can resolve `refPicListCol[refIdxCol]` →
+    //     POC without rebuilding the collocated slice's ref list.
     //
-    // Round 8 investigation (see transform_tree_inter_inner comment in
-    // ctu.rs for the long-form writeup):
-    //   * Attempted the spec-correct interSplitFlag force-split for
-    //     non-2Nx2N CUs at `max_trafo_depth_inter == 0`. Per §7.3.8.10
-    //     the split_transform_flag bin should NOT be in the bitstream
-    //     (the `trafoDepth < MaxTrafoDepth` gate is false when both
-    //     are 0) and §7.4.9.8 should infer split = 1 for non-2Nx2N.
-    //     Implementing that path triggers `EGk prefix overflow` in
-    //     residual parsing. Empirically libx265 emits a bin for this
-    //     case despite the spec gate being false; reading it and using
-    //     the decoded value (round-7 behaviour) is what survives
-    //     parsing. The remaining frame-2/3 drift is NOT the inter
-    //     split path — it's a different downstream issue (likely MC
-    //     edge / AMVP scaling / TMVP) that was outside this round's
-    //     budget.
-    //   * Re-verified the round-7 part_mode claim against the 2026-01
-    //     spec Table 9-45: for `log2CbSize > MinCbLog2SizeY` and
-    //     `!amp_enabled_flag` PART_Nx2N binarization is `00` (2 bins)
-    //     not `001`. The `001` binarization only applies when AMP is
-    //     enabled. Our decoder already consumes the correct number
-    //     of bins — no bug here.
-    //
-    // Per-frame (libx265 Main 10, 80x48, QP 22) — unchanged from
-    // Round 7 (this round clarified the mechanism, did not land a
-    // PSNR-moving fix):
+    // Per-frame (libx265 Main 10, 80x48, QP 22):
     //   frame 0  inf dB   (intra-only, bit-exact)
-    //   frame 1  46.11 dB (first P; 44.04 pre-Round-7)
-    //   frame 2  24.79 dB
-    //   frame 3  20.00 dB (19.26 pre-Round-7)
-    //   average  24.77 dB (24.19 pre-Round-7)
+    //   frame 1  46.11 dB (unchanged — single-ref frame-0 fast path)
+    //   frame 2  26.34 dB (24.79 pre-Round-9, +1.55)
+    //   frame 3  20.54 dB (20.00 pre-Round-9, +0.54)
+    //   average  25.54 dB (24.77 pre-Round-9, +0.77)
+    //
+    // Frame 3 is still dominated by cumulative residual drift; pushing
+    // it past ~22 dB will need additional spec refinements beyond AMVP
+    // scaling (MC edge clipping vs pre-filter replication, or the
+    // remaining `interSplitFlag` non-2Nx2N parsing subtlety).
     assert!(
-        psnr >= 24.0,
+        psnr >= 25.0,
         "Main 10 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }
