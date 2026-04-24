@@ -588,9 +588,13 @@ struct Walker<'a> {
     /// QP of the previously-decoded QG in coding order (§8.6.1 QpY_PREV).
     /// Seeded with slice_qp_y and updated at each QG transition.
     qpy_prev: i32,
-    /// Predicted QP for the current QG (§8.6.1 eq. 8-286). Recomputed on
-    /// each QG transition from the left/above neighbours in `pic.qp_y`;
-    /// the actual `cu_qp_y` is then `(qpy_pred + cu_qp_delta + 52) % 52`.
+    /// Predicted QP for the current QG (§8.6.1 eq. 8-282). Recomputed on
+    /// each QG transition from the left/above neighbours in `pic.qp_y`.
+    /// The actual `cu_qp_y` (QpY, *not* primed) is then (eq. 8-283):
+    ///   `QpY = ((qPY_PRED + CuQpDeltaVal + 52 + 2*QpBdOffsetY)
+    ///          % (52 + QpBdOffsetY)) - QpBdOffsetY`
+    /// — i.e. the modulus widens with bit depth (to 64 for Main 10) so that
+    /// legal negative QpY values (down to -QpBdOffsetY) survive the wrap.
     qpy_pred: i32,
     /// Resolved scaling-list data (§7.4.5) for this slice, or `None` when
     /// `scaling_list_enabled_flag == 0` (in which case `m[x][y] = 16`).
@@ -1913,7 +1917,12 @@ impl<'a> Walker<'a> {
             } else {
                 0
             };
-            *self.cu_qp_y = (self.qpy_pred + delta + 52).rem_euclid(52);
+            // §8.6.1 eq. 8-283 — bit-depth-aware QpY wrap. For Main (8-bit)
+            // QpBdOffsetY=0 this collapses to (qpy_pred + delta + 52) % 52;
+            // for Main 10 it uses (qpy_pred + delta + 76) % 64 - 12.
+            let qp_bd = 6 * self.cctx.sps.bit_depth_luma_minus8 as i32;
+            *self.cu_qp_y =
+                (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
             self.is_cu_qp_delta_coded = true;
         }
         if cbf_luma != 0 {
@@ -2184,7 +2193,11 @@ impl<'a> Walker<'a> {
             } else {
                 0
             };
-            *self.cu_qp_y = (self.qpy_pred + delta + 52).rem_euclid(52);
+            // §8.6.1 eq. 8-283 — bit-depth-aware QpY wrap (see matching
+            // comment above the other call site).
+            let qp_bd = 6 * self.cctx.sps.bit_depth_luma_minus8 as i32;
+            *self.cu_qp_y =
+                (self.qpy_pred + delta + 52 + 2 * qp_bd).rem_euclid(52 + qp_bd) - qp_bd;
             self.is_cu_qp_delta_coded = true;
         }
 
@@ -2395,18 +2408,37 @@ impl<'a> Walker<'a> {
         dequantize_with_matrix(levels, out, qp, log2_tb, bit_depth, &matrix);
     }
 
+    /// Return the *primed* quantisation parameter for the given component
+    /// (§8.6.2 eq. 8-284 / 8-289 / 8-290). The "primed" QP is what the
+    /// dequantiser in §8.6.3 eq. 8-309 expects as `qP`:
+    ///
+    /// * luma: `Qp'Y = QpY + QpBdOffsetY`
+    /// * chroma: `Qp'C = QpC + QpBdOffsetC`
+    ///
+    /// For Main (8-bit) this matches the bare QP because `QpBdOffset* = 0`.
+    /// For Main 10, both offsets are 12 — the missing bit-depth offset was
+    /// the dominant cause of the 13 dB PSNR gap on Main 10 intra content.
     fn get_qp(&self, is_luma: bool, is_cr: bool) -> i32 {
+        let qp_bd_offset_y = 6 * self.cctx.sps.bit_depth_luma_minus8 as i32;
+        let qp_bd_offset_c = 6 * self.cctx.sps.bit_depth_chroma_minus8 as i32;
         if is_luma {
-            *self.cu_qp_y
+            // Qp'Y = QpY + QpBdOffsetY (eq. 8-284).
+            *self.cu_qp_y + qp_bd_offset_y
         } else {
             let qp_offset = if is_cr {
                 self.cctx.pps.pps_cr_qp_offset + self.cctx.slice.slice_cr_qp_offset
             } else {
                 self.cctx.pps.pps_cb_qp_offset + self.cctx.slice.slice_cb_qp_offset
             };
-            let qpy_offset = *self.cu_qp_y + qp_offset;
-            let qpy_offset = qpy_offset.clamp(-12, 57);
-            qp_y_to_qp_c(qpy_offset)
+            // eq. 8-285/8-286: qPiCb/Cr = Clip3(-QpBdOffsetC, 57,
+            //                                   QpY + pps_offset + slice_offset + CuQpOffset).
+            // (CuQpOffsetC* comes from chroma_qp_offset_list — not yet
+            //  parsed, defaults to 0 for streams that don't opt in.)
+            let qpi = (*self.cu_qp_y + qp_offset).clamp(-qp_bd_offset_c, 57);
+            // Table 8-10: QpC for ChromaArrayType == 1 (4:2:0).
+            let qp_c = qp_y_to_qp_c(qpi);
+            // eq. 8-289/8-290: Qp'Cb/Cr = QpC + QpBdOffsetC.
+            qp_c + qp_bd_offset_c
         }
     }
 

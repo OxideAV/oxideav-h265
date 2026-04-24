@@ -1684,16 +1684,14 @@ fn main10_intra_decodes_close_to_ffmpeg() {
     eprintln!(
         "Main 10 intra PSNR vs ffmpeg: {psnr:.2} dB, first8 actual={first_actual:?} expected={first_expected:?}"
     );
-    // Current Main 10 support is a stepping stone: the u16 sample pipeline
-    // is live but intra-mode selection and scaling don't match ffmpeg's
-    // bit-exact output yet (libx265 produces Rext-profile output with
-    // features the decoder hasn't fully validated). The threshold just
-    // guards against total regressions — a fully-black or NaN output would
-    // fall below this. Once the Main 10 intra path is aligned we'll tighten
-    // it to 30 dB+, as is standard for 8-bit intra.
+    // Main 10 intra is now bit-exact on this fixture (PSNR = inf).
+    // The 50 dB floor guards against any future regression in the
+    // bit-depth-aware dequant pipeline (§8.6.3 eq. 8-309 with
+    // `qP = Qp'Y = QpY + QpBdOffsetY`) while leaving some headroom for
+    // future encoders/parameter sweeps that might not be byte-exact.
     assert!(
-        psnr >= 10.0,
-        "Main 10 intra decode PSNR well below floor: {psnr:.2} dB"
+        psnr >= 50.0,
+        "Main 10 intra decode PSNR below floor: {psnr:.2} dB"
     );
     // Confirm the decoder at least produced non-uniform output in the
     // expected range (i.e. it did some intra prediction, not just filled
@@ -1852,12 +1850,17 @@ fn main10_inter_decodes_with_pframes() {
         "Main 10 inter PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
         frames.len()
     );
-    // Loose floor for now — same Rext-envelope mismatch as intra. The
-    // purpose of this test is to prove the MC path runs at 10-bit without
-    // panicking or erroring; tightening comes once Rext decode aligns.
+    // After landing the bit-depth-aware dequant QP (QpY → Qp'Y =
+    // QpY + QpBdOffsetY), Main 10 intra is byte-exact and Main 10 inter
+    // PSNR is in the 20 dB range on this fixture. The residual gap at
+    // inter is likely unrelated to dequant — more plausibly either MC
+    // rounding at 10-bit in the spec's Clip1Y/Clip1C paths or a subtle
+    // reference-picture POC/reordering issue. Floor raised to 18 dB
+    // to guard against further regressions but not force byte-exactness
+    // yet.
     assert!(
-        psnr >= 10.0,
-        "Main 10 inter decode PSNR well below floor: {psnr:.2} dB"
+        psnr >= 18.0,
+        "Main 10 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }
 
