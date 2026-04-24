@@ -329,6 +329,38 @@ fn assert_yuv420_matches(
     );
 }
 
+/// Compute the Y-plane PSNR (dB) between our decoder's output and a
+/// reference YUV420 buffer. Returns `f64::INFINITY` on a byte-exact match.
+fn y_plane_psnr_db(
+    actual: &[u8],
+    expected: &[u8],
+    width: usize,
+    height: usize,
+    frames: usize,
+) -> f64 {
+    let luma = width * height;
+    let chroma = (width / 2) * (height / 2);
+    let frame_len = luma + chroma * 2;
+    assert_eq!(actual.len(), expected.len(), "byte length mismatch");
+    assert_eq!(actual.len(), frame_len * frames, "frame-len mismatch");
+    let mut sse: u64 = 0;
+    let mut count: u64 = 0;
+    for f in 0..frames {
+        let base = f * frame_len;
+        for i in 0..luma {
+            let d = actual[base + i] as i32 - expected[base + i] as i32;
+            sse += (d * d) as u64;
+            count += 1;
+        }
+    }
+    if sse == 0 {
+        return f64::INFINITY;
+    }
+    let mse = sse as f64 / count as f64;
+    // PSNR for 8-bit: 10 * log10(255^2 / MSE).
+    10.0 * (255.0 * 255.0 / mse).log10()
+}
+
 /// Walk an MP4 box tree and find the body of the first box whose path
 /// matches the supplied 4-char fourcc list. Best-effort; returns `None`
 /// if any segment is missing.
@@ -1237,6 +1269,48 @@ fn hevc_deblocked_fixture_decodes() {
         Err(Error::Unsupported { .. }) => {}
         Err(e) => panic!("deblock fixture receive_frame failed: {e:?}"),
     }
+}
+
+/// PSNR regression for the in-loop deblocking pass (§8.7.2) on a single
+/// 64x64 CTB smptebars fixture. The deblock module's boundary-strength
+/// derivation is a best-effort approximation (the comments in deblock.rs
+/// spell this out), so we don't expect byte-exactness — but we do expect
+/// the reconstructed frame to stay within 40 dB Y-plane PSNR of the
+/// ffmpeg reference, which rules out any gross mis-apply. Current floor
+/// is comfortably above 50 dB on this content.
+#[test]
+fn hevc_deblock_smptebars_64_psnr() {
+    let x265 = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:deblock=0\\,0";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "intra-deblock-smptebars-64.h265",
+        "smptebars=size=64x64:rate=1:duration=1",
+        1,
+        1,
+        x265,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    let Some(expected) = ffmpeg_decode_raw(
+        &input_str,
+        &PathBuf::from("/tmp/hevc-deblock-smptebars-64.ref.yuv"),
+        Some(1),
+    ) else {
+        return;
+    };
+    let frames = decode_all_video_frames(data, 1);
+    let actual = flatten_yuv420_frames(&frames);
+    let psnr = y_plane_psnr_db(&actual, &expected, 64, 64, 1);
+    assert!(
+        psnr >= 40.0,
+        "deblock smptebars-64 Y-plane PSNR {:.2} dB < 40 dB floor; \
+         §8.7.2 filter likely mis-applied on some edges",
+        psnr,
+    );
 }
 
 /// Stream encoded with a 2x2 tile grid (§6.3.1). Validates the slice
