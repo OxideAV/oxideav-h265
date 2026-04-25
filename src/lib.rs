@@ -55,15 +55,15 @@
 //!
 //! * **[`encoder`]** — writes a single-IDR Annex B stream (VPS + SPS + PPS
 //!   + IDR slice) using a real intra pipeline: per-CU mode decision from a
-//!   small cardinal/diagonal subset, forward DCT-II / DST-VII + flat-list
-//!   quantisation at QP 26, and CABAC residual coding
-//!   (`sig_coeff_flag` / `greater1/2` / `coeff_abs_level_remaining` /
-//!   sign). 8-bit 4:2:0 Main profile, width/height multiples of 16
-//!   (fixed 16×16 CTU). Self-roundtrip through `HevcDecoder` produces
-//!   ~45 dB PSNR on synthetic fixtures at roughly 50× compression vs
-//!   raw-sample budget. ffmpeg accepts the stream without decode errors;
-//!   exact-match between ffmpeg and the encoder's locally-reconstructed
-//!   picture is a work-in-progress (see `tests/ffmpeg_accepts.rs`).
+//!     small cardinal/diagonal subset, forward DCT-II / DST-VII + flat-list
+//!     quantisation at QP 26, and CABAC residual coding
+//!     (`sig_coeff_flag` / `greater1/2` / `coeff_abs_level_remaining` /
+//!     sign). 8-bit 4:2:0 Main profile, width/height multiples of 16
+//!     (fixed 16×16 CTU). Self-roundtrip through `HevcDecoder` produces
+//!     ~45 dB PSNR on synthetic fixtures at roughly 50× compression vs
+//!     raw-sample budget. ffmpeg accepts the stream without decode errors;
+//!     exact-match between ffmpeg and the encoder's locally-reconstructed
+//!     picture is a work-in-progress (see `tests/ffmpeg_accepts.rs`).
 //!
 //! ## Crate layout
 //!

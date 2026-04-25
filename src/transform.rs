@@ -454,9 +454,9 @@ mod tests {
             let coeffs: Vec<i32> = (0..16)
                 .map(|i| {
                     if i % 2 == 0 {
-                        (i as i32 + 1) * 2000
+                        (i + 1) * 2000
                     } else {
-                        -(i as i32 + 1) * 2000
+                        -(i + 1) * 2000
                     }
                 })
                 .collect();

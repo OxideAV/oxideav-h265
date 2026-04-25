@@ -92,7 +92,7 @@ pub fn build_ref_samples(
     // the left column is walked in reverse.
 
     let any = available.iter().any(|&a| a);
-    let neutral = (1u16 << (bit_depth - 1)) as u16;
+    let neutral = 1u16 << (bit_depth - 1);
     let mut out = vec![neutral; len];
     if !any {
         return out;

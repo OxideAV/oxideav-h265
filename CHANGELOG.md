@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-h265/compare/v0.0.4...v0.0.5) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- round 9 — §8.5.3.2.7 AMVP POC scaling + §8.5.3.2.9 TMVP scaling
+- round-8 investigation — document interSplitFlag empirics
+- tighten TMVP 16-alignment + CTB-row gate (§8.5.3.2.8)
+- encoder — Main-profile CABAC P-slice (round 7)
+- round-6 diagnostic — surface interSplitFlag gap in SPS dumper
+- tests — raise Main 10 inter PSNR floor to 22 dB
+- fix inter transform_tree cbf_cb/cbf_cr order (§7.3.8.9)
+- spec-exact MC pipeline + AMP part_mode ctxInc (§8.5.3.3.3.2 / Table 9-48)
+- tests — per-frame PSNR breakdown in Main 10 inter test
+- fix bi-pred combine shift for 10-bit (§8.5.3.3.4.2 eq. 8-264)
+- plumb QpBdOffset into dequant + QP delta wrap (Main 10 fix)
+- add examples/dump_sps SPS/PPS flag dumper
+- add HEIF/HEIC scaffold module behind `heif` feature
+- thread bit_depth through inter MC for Main 10
+- add Main 10 intra integration test and scope doc
+- migrate sample storage to u16 for Main 10 support
+- add PSNR-gated deblock regression (§8.7.2)
+- add byte-exact SAO fixture tests (§8.7.3)
+- fix CTU-seam intra reconstruction
+- h265 encoder: doc update + looser ffmpeg bound
+- h265 encoder: replace PCM MVP with DCT + intra + residual CABAC
+- tests — Main10 + 4:4:4 surface clean Unsupported
+- h265 encoder: forward DCT/DST + forward quantisation
+- AMP inter shapes + cu_transquant_bypass
+- encoder — rename inner encoder module to silence clippy
+- document the encoder MVP in the crate-level doc
+- encoder — cover multi-CTU through ffmpeg; unique temp names
+- encoder — ffmpeg acceptance test + dump_h265 example
+- verify WPP slice decodes to a full frame end-to-end
+- tile + WPP CTU iteration with entry-point re-seeded CABAC
+- encoder — VPS/SPS/PPS emitters + CABAC writer + PCM I-slice MVP
+- parse tile geometry + entry-point offsets
+- parse transform_skip_flag + pcm CU path
+- parse scaling lists and honour them in dequantisation
+- parse ref_pic_list_modification and apply §8.3.4 reordering
+- add long-term reference pictures (§8.3.2)
+- add SAO sample application (§8.7.3)
+- add in-loop deblocking filter (§8.7.2)
+- subblock_scan — force diagonal for 16x16 / 32x32 TUs per §6.5.4
+- add lavfi-driven intra fixtures — more content variety
+- exact-match on testsrc fixture — spec QpY_PRED + intra ref fixes
+- all exact-match fixtures pass — decoded-block z-scan availability
+- spec-compliant split_cu_flag ctxInc + 64x64 qp51 fixture passes
+- add DST-VII DC basis sanity test
+- add DCT DC-only uniformity unit test
+- remove residual-coding trace instrumentation
+- reset IsCuQpDeltaCoded per QG boundary, not per CU
+- land first exact-match fixture — 16x16 gray IDR
+- fix sig_coeff_flag init values for initTypes 1 and 2
+- audit + correct three more CABAC init-value tables
+- intra_chroma_pred_mode I-slice init value 63 per HEVC V11 Table 9-13
+- add QP=51 single-CTU gray test fixture
+- sig_coeff_flag eq. 9-42 keeps sigCtx=0 without size modifiers
+- align transform_tree + cbf_cb_cr ctx with HEVC V11 + ffmpeg
+- spec-compliance fixes in residual coding + accept SAO streams
+- align residual coding + transforms with H.265 V11
+- README + lib docs reflect B-slice decode support
+- add B-slice fixture + integration test
+- land B-slice decode (bi-pred MC, TMVP, merge extensions)
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-h265/compare/v0.0.3...v0.0.4) - 2026-04-19
 
 ### Other

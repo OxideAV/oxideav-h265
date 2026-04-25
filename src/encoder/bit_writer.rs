@@ -96,8 +96,9 @@ impl BitWriter {
         // codeNum → (k = floor(log2(value+1)); prefix = k zeros + 1;
         //           suffix = (value+1) - 2^k in k bits).
         let v = value as u64 + 1;
-        let k = (63u32 - v.leading_zeros()) as u32; // floor(log2(v))
-                                                    // Write k zero bits, then the k+1 low bits of v (which starts with a 1).
+        // floor(log2(v))
+        let k = 63u32 - v.leading_zeros();
+        // Write k zero bits, then the k+1 low bits of v (which starts with a 1).
         self.write_zero_bits(k);
         // v has exactly k+1 significant bits.
         self.write_bits_long(v, k + 1);

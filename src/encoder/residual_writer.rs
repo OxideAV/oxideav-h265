@@ -426,7 +426,7 @@ fn encode_last_sig_pos(
     );
     // Suffix (bypass) if prefix > 3.
     if prefix_x > 3 {
-        let suffix_len = ((prefix_x - 2) >> 1) as u32;
+        let suffix_len = (prefix_x - 2) >> 1;
         let base = (1u32 << suffix_len) * (2 + (prefix_x & 1));
         let suffix = px - base;
         for bit in (0..suffix_len).rev() {
@@ -434,7 +434,7 @@ fn encode_last_sig_pos(
         }
     }
     if prefix_y > 3 {
-        let suffix_len = ((prefix_y - 2) >> 1) as u32;
+        let suffix_len = (prefix_y - 2) >> 1;
         let base = (1u32 << suffix_len) * (2 + (prefix_y & 1));
         let suffix = py - base;
         for bit in (0..suffix_len).rev() {
@@ -634,8 +634,6 @@ fn sig_coeff_ctx_inc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cabac::{init_row, CabacEngine, InitType};
-    use crate::encoder::bit_writer::BitWriter;
 
     #[test]
     fn last_coord_prefix_matches_spec() {

@@ -432,7 +432,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<SeqParameterSet> {
 fn skip_vui(br: &mut BitReader<'_>, sps_max_sub_layers_minus1: u8) -> Result<()> {
     // aspect_ratio_info_present_flag
     if br.u1()? == 1 {
-        let aspect_ratio_idc = br.u(8)? as u32;
+        let aspect_ratio_idc = br.u(8)?;
         if aspect_ratio_idc == 255 {
             br.skip(16)?; // sar_width
             br.skip(16)?; // sar_height

@@ -254,13 +254,12 @@ impl<'a> CabacEngine<'a> {
     /// Decode one bypass (equiprobable) bin (§9.3.4.3.4).
     pub fn decode_bypass(&mut self) -> u32 {
         self.ivl_offset = (self.ivl_offset << 1) | self.read_bit();
-        let v = if self.ivl_offset >= self.ivl_curr_range {
+        if self.ivl_offset >= self.ivl_curr_range {
             self.ivl_offset -= self.ivl_curr_range;
             1
         } else {
             0
-        };
-        v
+        }
     }
 
     /// Decode the terminating bin (§9.3.4.3.5). Returns 1 when the

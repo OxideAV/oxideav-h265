@@ -675,8 +675,8 @@ mod tests {
     #[test]
     fn beta_monotone_and_endpoints() {
         // Table 8-11 β values: zero for Q<16, monotone non-decreasing.
-        for q in 0..16 {
-            assert_eq!(BETA_TABLE[q], 0);
+        for &v in &BETA_TABLE[..16] {
+            assert_eq!(v, 0);
         }
         for q in 1..BETA_TABLE.len() {
             assert!(BETA_TABLE[q] >= BETA_TABLE[q - 1]);
@@ -686,8 +686,8 @@ mod tests {
 
     #[test]
     fn tc_monotone_and_endpoints() {
-        for q in 0..18 {
-            assert_eq!(TC_TABLE[q], 0);
+        for &v in &TC_TABLE[..18] {
+            assert_eq!(v, 0);
         }
         for q in 1..TC_TABLE.len() {
             assert!(TC_TABLE[q] >= TC_TABLE[q - 1]);
@@ -698,8 +698,8 @@ mod tests {
     #[test]
     fn chroma_qp_i2c_preserves_low_half() {
         // The spec's Table 8-10 is the identity up to QpI=29 for 4:2:0.
-        for i in 0..=29 {
-            assert_eq!(CHROMA_QP_I2C[i], i as u8);
+        for (i, &v) in CHROMA_QP_I2C.iter().enumerate().take(30) {
+            assert_eq!(v, i as u8);
         }
         // And the high half maps conservatively (Q >= 50 clamps to 51).
         assert_eq!(CHROMA_QP_I2C[51], 40);
@@ -741,10 +741,10 @@ mod tests {
         let before = buf;
         filter_luma_vertical(&mut buf, 16, 8, 0, 60, 10, 8);
         // Samples at the edge must have moved toward each other.
-        let p0_before = before[0 * 16 + 7] as i32;
-        let q0_before = before[0 * 16 + 8] as i32;
-        let p0_after = buf[0 * 16 + 7] as i32;
-        let q0_after = buf[0 * 16 + 8] as i32;
+        let p0_before = before[7] as i32;
+        let q0_before = before[8] as i32;
+        let p0_after = buf[7] as i32;
+        let q0_after = buf[8] as i32;
         assert!(p0_after >= p0_before, "p0 should increase toward q");
         assert!(q0_after <= q0_before, "q0 should decrease toward p");
     }
