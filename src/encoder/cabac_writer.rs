@@ -102,7 +102,7 @@ impl<'a> CabacWriter<'a> {
     pub fn encode_flush(&mut self) {
         self.ivl_curr_range = 2;
         self.renormalise();
-        self.put_bit(((self.ivl_low >> 9) & 1) as u32);
+        self.put_bit((self.ivl_low >> 9) & 1);
         // Write 2 bits: top bit of the remaining 8 is in bit 8, then bit 7;
         // spec combines as `((ivl_low >> 7) & 3) | 1`.
         let bits = ((self.ivl_low >> 7) & 3) | 1;

@@ -1617,29 +1617,28 @@ fn main10_fixture_surfaces_clean_unsupported() {
     let fixture_dir = generated_fixture_dir();
     ensure_dir(&fixture_dir);
     let out = fixture_dir.join("h265-main10-192x112-p10.hevc");
-    let main10_path = if out.exists() {
-        Some(out)
-    } else if ffmpeg_available()
-        && run_ffmpeg(&[
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=192x112:rate=25",
-            "-frames:v",
-            "1",
-            "-pix_fmt",
-            "yuv420p10le",
-            "-c:v",
-            "libx265",
-            "-x265-params",
-            "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1",
-            out.to_str().unwrap(),
-        ])
-    {
+    let have_out = out.exists()
+        || (ffmpeg_available()
+            && run_ffmpeg(&[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=192x112:rate=25",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1",
+                out.to_str().unwrap(),
+            ]));
+    let main10_path = if have_out {
         Some(out)
     } else {
         // Fall back to the checked-in fixture if ffmpeg can't produce one.

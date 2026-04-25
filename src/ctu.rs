@@ -2988,7 +2988,7 @@ impl<'a> Walker<'a> {
         } else {
             self.cctx.sps.bit_depth_c()
         };
-        let neutral = (1u16 << (bit_depth - 1)) as u16;
+        let neutral = 1u16 << (bit_depth - 1);
         let mut samples = vec![neutral; len];
         let mut avail = vec![false; len];
         let (stride, plane, pic_w, pic_h) = if is_luma {
@@ -3382,10 +3382,8 @@ impl<'a> Walker<'a> {
                     greater1_flags[pos] = v == 1;
                     last_used_greater1_flag = greater1_flags[pos];
                     num_greater1_flag += 1;
-                    if greater1_flags[pos] {
-                        if last_greater1_scan_pos == -1 {
-                            last_greater1_scan_pos = pos as i32;
-                        }
+                    if greater1_flags[pos] && last_greater1_scan_pos == -1 {
+                        last_greater1_scan_pos = pos as i32;
                     }
                     if greater1_ctx > 0 {
                         if greater1_flags[pos] {

@@ -277,7 +277,7 @@ pub fn parse_scaling_list_data(br: &mut BitReader<'_>) -> Result<ScalingListData
                     let delta = br.se()?;
                     next_coef = (next_coef + delta + 256).rem_euclid(256);
                     // Spec requires >0, but guard against malformed streams.
-                    *coef = next_coef.max(1).min(255) as u8;
+                    *coef = next_coef.clamp(1, 255) as u8;
                 }
                 out.lists[size_id][matrix_id] = list;
             }
@@ -334,8 +334,7 @@ mod tests {
 
     #[test]
     fn inverse_diag_4x4_matches_forward_scan() {
-        for i in 0..16 {
-            let (x, y) = DIAG_SCAN_4X4[i];
+        for (i, &(x, y)) in DIAG_SCAN_4X4.iter().enumerate() {
             assert_eq!(inverse_diag_scan_4x4(x, y) as usize, i);
         }
     }
@@ -379,7 +378,7 @@ mod tests {
         let mut bits: Vec<u8> = Vec::new();
         let mut cur: u8 = 0;
         let mut n: u8 = 0;
-        let mut push_bit = |b: u8, cur: &mut u8, n: &mut u8, bits: &mut Vec<u8>| {
+        let push_bit = |b: u8, cur: &mut u8, n: &mut u8, bits: &mut Vec<u8>| {
             *cur = (*cur << 1) | (b & 1);
             *n += 1;
             if *n == 8 {

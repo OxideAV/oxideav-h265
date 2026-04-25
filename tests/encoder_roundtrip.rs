@@ -110,13 +110,11 @@ fn self_roundtrip_achieves_reasonable_psnr() {
     let pkt = Packet::new(0, TimeBase::new(1, 30), bytes.clone());
     dec.send_packet(&pkt).expect("decoder send_packet");
 
-    let frame = loop {
-        match dec.receive_frame() {
-            Ok(Frame::Video(v)) => break v,
-            Ok(_) => panic!("non-video frame"),
-            Err(Error::NeedMore) => panic!("needed more data"),
-            Err(e) => panic!("decoder error: {e:?}"),
-        }
+    let frame = match dec.receive_frame() {
+        Ok(Frame::Video(v)) => v,
+        Ok(_) => panic!("non-video frame"),
+        Err(Error::NeedMore) => panic!("needed more data"),
+        Err(e) => panic!("decoder error: {e:?}"),
     };
     assert_eq!(frame.width, 64);
     assert_eq!(frame.height, 64);
