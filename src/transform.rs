@@ -289,15 +289,21 @@ pub fn dequantize_flat(
     // bdShift = bitDepth + log2(nTbS) + 10 - log2TransformRange.
     let bd_shift = bit_depth as i32 + log2_tb as i32 - 5;
 
+    let round = 1i64 << (bd_shift - 1);
     for i in 0..n * n {
-        let lvl = coeffs_in[i];
-        let mut v = lvl * 16 * scale;
+        let lvl = coeffs_in[i] as i64;
+        // Intermediate values can exceed i32 for high bit depths combined
+        // with large `nTbS` and large `qp` (eq. 8-309 with `m[x][y] = 16`):
+        // for Main 12 + 32×32 + 4:2:2 chroma, `lvl * 16 * scale << q_div`
+        // overflows i32 even when `lvl` itself stays inside the spec's
+        // [-32768, 32767] envelope. Compute the product in i64 and clamp
+        // the post-shift result back to 16-bit per §8.6.3.
+        let mut v = lvl * 16 * scale as i64;
         if q_div > 0 {
             v <<= q_div;
         }
-        let round = 1i32 << (bd_shift - 1);
         v = (v + round) >> bd_shift;
-        coeffs_out[i] = v.clamp(-32768, 32767);
+        coeffs_out[i] = v.clamp(-32768, 32767) as i32;
     }
 }
 

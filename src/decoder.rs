@@ -408,11 +408,12 @@ impl HevcDecoder {
         // (low `bit_depth` bits valid). Per `oxideav-core::PixelFormat`
         // we currently expose:
         //   - 10-bit: Yuv420P10Le, Yuv422P10Le, Yuv444P10Le
-        //   - 12-bit: Yuv420P12Le (4:2:2 / 4:4:4 12-bit not yet in core)
-        // bit_depth==12 with chroma_format_idc != 1 still reaches this
-        // branch but the 4:2:0-only `format` mapping below will surface
-        // it as Yuv420P12Le as a follow-up tracker; the CTU walker's
-        // bit-depth gate (§ctu.rs) accepts 12-bit independent of cf.
+        //   - 12-bit: Yuv420P12Le, Yuv422P12Le, Yuv444P12Le
+        // The CTU-level chroma-format gate in `decode_slice_ctus`
+        // restricts pixel decode to chroma_format_idc ∈ {1, 2}, so
+        // 4:4:4 (cf == 3) never reaches `emit_frame` — but its 12-bit
+        // mapping is still listed below for completeness so a future
+        // cfi==3 lift only needs to touch the gate.
         if bit_depth_y > 8 {
             let bps_y = 2usize;
             let bps_c = 2usize;
@@ -446,13 +447,16 @@ impl HevcDecoder {
                     dst_cr[i * 2 + 1] = (vcr >> 8) as u8;
                 }
             }
-            // Bit-depth × chroma-format → core PixelFormat. 12-bit only
-            // exposes 4:2:0 in oxideav-core today; 4:2:2/4:4:4 12-bit
-            // currently surface as Yuv420P12Le shape (handled at ctu
-            // level by the bit-depth gate, but only 4:2:0 streams will
-            // reach here in practice).
+            // Bit-depth × chroma-format → core PixelFormat. Both 10-bit
+            // and 12-bit have a full 4:2:0 / 4:2:2 / 4:4:4 surface in
+            // oxideav-core; the active CTU-level gate restricts cf to
+            // {1, 2} today so 4:4:4 entries below are unreachable but
+            // harmless (kept for symmetry).
             let format = match (bit_depth_y, cf) {
+                (12, 3) => PixelFormat::Yuv444P12Le,
+                (12, 2) => PixelFormat::Yuv422P12Le,
                 (12, _) => PixelFormat::Yuv420P12Le,
+                (_, 3) => PixelFormat::Yuv444P10Le,
                 (_, 2) => PixelFormat::Yuv422P10Le,
                 _ => PixelFormat::Yuv420P10Le,
             };

@@ -390,16 +390,28 @@ pub fn decode_slice_ctus(
             "h265 pixel decode requires matching luma/chroma bit depth",
         ));
     }
-    // 12-bit currently only has a 4:2:0 surface in oxideav-core
-    // (`Yuv420P12Le`); 4:2:2 / 4:4:4 12-bit pixel formats are not yet
-    // exposed there. Reject those combinations cleanly so the decoder
-    // never emits a frame whose `format` is incompatible with the
-    // sample geometry. 10-bit and 8-bit cover all three chroma formats.
-    if cctx.sps.bit_depth_y() == 12 && cctx.sps.chroma_format_idc != 1 {
-        return Err(Error::unsupported(
-            "h265 12-bit decode currently limited to 4:2:0 (chroma_format_idc=1)",
-        ));
-    }
+    // 12-bit + 4:2:0 (`Yuv420P12Le`) and 12-bit + 4:2:2 (`Yuv422P12Le`)
+    // are both surfaced in oxideav-core and the format mapping in
+    // `decoder::emit_frame` covers both. Combined with the cfi gate
+    // above (decode restricted to 4:2:0/4:2:2), every supported chroma
+    // format has a 12-bit pixel-format target. The bit-depth-aware
+    // arithmetic listed above (dequant via i64 intermediates per
+    // §8.6.3 eq. 8-309 to handle high-bit-depth × large-TB overflow,
+    // inverse transform shift2 = 20 - BitDepth per §8.6.4.2, MC
+    // interpolation, bi-pred combine, deblock, SAO, intra DC) is
+    // shared across chroma formats. The Main 12 + 4:2:2 diagonal
+    // composes from already-tested pieces — Main 10 + 4:2:2 (round
+    // 11/12) and Main 12 + 4:2:0 (round 13). 4:4:4 12-bit is still
+    // gated above by the `cfi != 1 && cfi != 2` chroma-format check.
+    //
+    // KNOWN REGRESSION: a small set of `testsrc` lavfi fixtures at
+    // 4:2:2 + 12-bit reproduce a content-dependent CABAC drift inside
+    // the first CTB (e.g. testsrc 80x48 → `EGk prefix overflow`,
+    // testsrc 96x48 → silent ~9 dB drift). Smptebars/color/many
+    // testsrc sizes decode bit-exact. The drift does NOT reproduce at
+    // 4:2:0 12-bit nor 4:2:2 10-bit so it's specific to the diagonal.
+    // Round-15 wired the format mapping + i64 dequant; root-causing
+    // the drift is deferred.
     // Inter motion compensation (§8.5.3.3) clips at Clip1Y/Clip1C using
     // `bit_depth` from the SPS, so Main 10/12 P/B slices share the MC
     // path with Main. Higher bit depths (>12) are rejected above.
