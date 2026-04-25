@@ -45,13 +45,21 @@ use crate::transform::{
     dequantize_flat, dequantize_with_matrix, inverse_transform_2d, transform_skip_2d,
 };
 
-/// Reconstructed picture (4:2:0, bit depth 8 or 10).
+/// Reconstructed picture (4:2:0 or 4:2:2, bit depth 8 or 10).
 ///
 /// Samples are stored as `u16` so Main and Main 10 share a single code
 /// path; callers that only care about 8-bit simply narrow on the way out.
+/// The chroma planes are sized according to `(SubWidthC, SubHeightC)` per
+/// §6.2 Table 6-1: `chroma_height = height / SubHeightC`. For 4:2:0 the
+/// chroma plane is half-width, half-height; for 4:2:2 it is half-width,
+/// full-height.
 pub struct Picture {
     pub width: u32,
     pub height: u32,
+    /// Subsampling factors: `(SubWidthC, SubHeightC)` per §6.2 Table 6-1.
+    /// `(2, 2)` for 4:2:0, `(2, 1)` for 4:2:2.
+    pub sub_x: u32,
+    pub sub_y: u32,
     pub luma: Vec<u16>,
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
@@ -85,16 +93,27 @@ pub struct Picture {
 }
 
 impl Picture {
+    /// Create a 4:2:0 reconstructed picture (legacy default for tests that
+    /// were written before 4:2:2 support landed).
     pub fn new(width: u32, height: u32) -> Self {
+        Self::new_with_chroma(width, height, 2, 2)
+    }
+
+    /// Create a reconstructed picture with explicit chroma subsampling
+    /// `(sub_x, sub_y)` per §6.2 Table 6-1: 4:2:0 → `(2, 2)`,
+    /// 4:2:2 → `(2, 1)`, 4:4:4 → `(1, 1)`.
+    pub fn new_with_chroma(width: u32, height: u32, sub_x: u32, sub_y: u32) -> Self {
         let w = width as usize;
         let h = height as usize;
-        let cw = w / 2;
-        let ch = h / 2;
+        let cw = w / sub_x as usize;
+        let ch = h / sub_y as usize;
         let iw4 = w.div_ceil(4);
         let ih4 = h.div_ceil(4);
         Self {
             width,
             height,
+            sub_x,
+            sub_y,
             // 8-bit neutral grey. Callers should re-init for other bit
             // depths if they care about the leading junk before the CTU
             // walker has written every sample; in practice every code path
@@ -115,6 +134,15 @@ impl Picture {
             inter: InterState::new(width, height),
             sao_grid: None,
         }
+    }
+
+    /// Picture dimensions in chroma samples.
+    pub fn chroma_width(&self) -> usize {
+        (self.width as usize) / (self.sub_x as usize)
+    }
+
+    pub fn chroma_height(&self) -> usize {
+        (self.height as usize) / (self.sub_y as usize)
     }
 }
 
@@ -327,8 +355,26 @@ pub fn decode_slice_ctus(
     if cctx.sps.separate_colour_plane_flag {
         return Err(Error::unsupported("h265 separate_colour_plane pending"));
     }
-    if cctx.sps.chroma_format_idc != 1 {
-        return Err(Error::unsupported("h265 only 4:2:0 pixel decode supported"));
+    // 4:2:0 (chroma_format_idc=1) and 4:2:2 (chroma_format_idc=2) are both
+    // supported. 4:4:4 (chroma_format_idc=3) is rejected because the
+    // chroma transform tree, MC scaling, and intra-mode mapping all change
+    // shape there. 4:0:0 (chroma_format_idc=0) is also rejected because
+    // every chroma-bearing code path in this crate would need new branches.
+    let cfi = cctx.sps.chroma_format_idc;
+    if cfi != 1 && cfi != 2 {
+        return Err(Error::unsupported(
+            "h265 pixel decode supports 4:2:0 and 4:2:2 only",
+        ));
+    }
+    // 4:2:2 P/B inter pixel decode is not yet supported because the chroma
+    // MC fractional-position derivation in §8.5.3.2.2 uses a different
+    // 4:2:2-specific phase shift on the vertical component that we have not
+    // wired up. Intra-only 4:2:2 (still pictures, IDR-only streams) is
+    // supported and exercised by the tests in `tests/ffmpeg_accepts.rs`.
+    if cfi == 2 && matches!(cctx.slice.slice_type, SliceType::P | SliceType::B) {
+        return Err(Error::unsupported(
+            "h265: 4:2:2 P/B slice decode not yet implemented",
+        ));
     }
     // 8-bit (Main) and 10-bit (Main 10) are both supported. Higher bit
     // depths (Main 12 / Main 4:2:2 10-bit etc.) have not been validated so
@@ -1138,8 +1184,8 @@ impl<'a> Walker<'a> {
                     };
                     let xx = (x0 / 2) + px;
                     let yy = (y0 / 2) + py;
-                    let pic_cw = (self.pic.width as usize) / 2;
-                    let pic_ch = (self.pic.height as usize) / 2;
+                    let pic_cw = self.pic.chroma_width();
+                    let pic_ch = self.pic.chroma_height();
                     if (xx as usize) < pic_cw && (yy as usize) < pic_ch {
                         let idx = yy as usize * self.pic.chroma_stride + xx as usize;
                         if chroma_plane == 0 {
@@ -2021,8 +2067,8 @@ impl<'a> Walker<'a> {
             log2_cb,
             0,
             0,
-            1,
-            1,
+            [1, 1],
+            [1, 1],
             &luma_modes,
             chroma_mode,
             part_mode_nxn,
@@ -2114,10 +2160,18 @@ impl<'a> Walker<'a> {
             3 => 1,
             _ => luma_mode, // DM
         };
-        if chosen == luma_mode && icpm != 4 {
+        let mode_idx = if chosen == luma_mode && icpm != 4 {
             34
         } else {
             chosen
+        };
+        // For ChromaArrayType == 2 (4:2:2), modeIdx is remapped via Table
+        // 8-3 (§8.4.3). For 4:2:0 (ChromaArrayType == 1) and 4:4:4 the
+        // chroma mode is `modeIdx` directly.
+        if self.cctx.sps.chroma_array_type() == 2 {
+            map_chroma_mode_4_2_2(mode_idx)
+        } else {
+            mode_idx
         }
     }
 
@@ -2475,27 +2529,21 @@ impl<'a> Walker<'a> {
             self.cctx.sps.bit_depth_c()
         };
         let max = (1i32 << bit_depth) - 1;
+        let cw = self.pic.chroma_width();
+        let ch = self.pic.chroma_height();
+        let pic_full_w = self.pic.width as usize;
+        let pic_full_h = self.pic.height as usize;
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
                 self.pic.luma_stride,
                 &mut self.pic.luma,
-                self.pic.width as usize,
-                self.pic.height as usize,
+                pic_full_w,
+                pic_full_h,
             )
         } else if is_cr {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cr,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cr, cw, ch)
         } else {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cb,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cb, cw, ch)
         };
         let x0 = x as usize;
         let y0 = y as usize;
@@ -2526,8 +2574,14 @@ impl<'a> Walker<'a> {
         log2_tb: u32,
         tr_depth: u32,
         blk_idx: u32,
-        parent_cbf_cb: u32,
-        parent_cbf_cr: u32,
+        // Parent's `cbf_cb` / `cbf_cr` arrays — `[primary, stacked-vertical]`.
+        // The stacked slot is only ever non-zero for ChromaArrayType == 2
+        // (4:2:2). Children inherit only the primary slot for the spec's
+        // `cbf_cb[xBase][yBase][trafoDepth - 1]` propagation, but the leaf
+        // `log2_tb == 2 && blk_idx == 3` path consults BOTH slots so the
+        // two stacked 4×4 chroma TBs each get the right cbf gate.
+        parent_cbf_cb: [u32; 2],
+        parent_cbf_cr: [u32; 2],
         luma_modes: &[u32; 4],
         chroma_mode: u32,
         part_mode_nxn: bool,
@@ -2554,23 +2608,43 @@ impl<'a> Walker<'a> {
             0
         };
 
-        // cbf_cb / cbf_cr at every tree node with log2_tb > 2 (§7.3.8.10,
-        // 4:2:0). Gated by parent's cbf at non-root depths; inherited from
-        // parent when not decoded.
-        let mut cbf_cb = parent_cbf_cb;
-        let mut cbf_cr = parent_cbf_cr;
+        // cbf_cb / cbf_cr at every tree node with log2_tb > 2 (§7.3.8.8).
+        // Gated by parent's cbf at non-root depths; inherited from parent
+        // when not decoded. For ChromaArrayType == 2 (4:2:2) a SECOND
+        // cbf_cb / cbf_cr pair is decoded for the stacked-vertical chroma
+        // TB at (x0, y0 + (1<<(log2TrafoSize-1))), but only when this is
+        // the leaf node (`!split` reached) or at log2TrafoSize == 3.
+        let cat = self.cctx.sps.chroma_array_type();
+        let mut cbf_cb: [u32; 2] = parent_cbf_cb;
+        let mut cbf_cr: [u32; 2] = parent_cbf_cr;
         if log2_tb > 2 {
             let cbf_ctx_inc = tr_depth.min(4) as usize;
-            if tr_depth == 0 || parent_cbf_cb == 1 {
-                cbf_cb = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            if tr_depth == 0 || parent_cbf_cb[0] == 1 {
+                cbf_cb[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
             } else {
-                cbf_cb = 0;
+                cbf_cb[0] = 0;
             }
-            if tr_depth == 0 || parent_cbf_cr == 1 {
-                cbf_cr = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            if cat == 2 && (split == 0 || log2_tb == 3) && (tr_depth == 0 || parent_cbf_cb[0] == 1)
+            {
+                cbf_cb[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            } else if cat != 2 {
+                cbf_cb[1] = 0;
+            }
+            if tr_depth == 0 || parent_cbf_cr[0] == 1 {
+                cbf_cr[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
             } else {
-                cbf_cr = 0;
+                cbf_cr[0] = 0;
             }
+            if cat == 2 && (split == 0 || log2_tb == 3) && (tr_depth == 0 || parent_cbf_cr[0] == 1)
+            {
+                cbf_cr[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+            } else if cat != 2 {
+                cbf_cr[1] = 0;
+            }
+        } else {
+            // log2_tb == 2: chroma cbfs at this depth aren't decoded;
+            // both inherit from the parent (same as before, just split
+            // across two slots for 4:2:2).
         }
 
         if split == 1 {
@@ -2659,7 +2733,8 @@ impl<'a> Walker<'a> {
         // cbf_luma is always read for intra leaves.
         let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
         let cbf_luma = engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc]);
-        let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        let has_any_coeff =
+            cbf_luma != 0 || cbf_cb[0] != 0 || cbf_cr[0] != 0 || cbf_cb[1] != 0 || cbf_cr[1] != 0;
 
         // cu_qp_delta once per QG when at least one cbf is set (§7.3.8.11).
         if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
@@ -2721,55 +2796,78 @@ impl<'a> Walker<'a> {
 
         self.reconstruct_plane(engine, ctx, x0, y0, log2_tb, luma_mode, true, cbf_luma != 0)?;
 
-        // Chroma residual placement (§7.3.8.11):
-        //   log2_tb > 2: chroma TB co-located at (x0/2, y0/2), size log2_tb-1.
-        //   log2_tb == 2 and blk_idx == 3: single chroma 4x4 at parent base
-        //     (x_base/2, y_base/2), covering all 4 luma 4x4 children.
+        // Chroma residual placement (§7.3.8.10 transform_unit):
+        //   log2TrafoSizeC = max(2, log2TrafoSize - (ChromaArrayType==3 ? 0 : 1)).
+        //   For ChromaArrayType == 2 (4:2:2), TWO chroma TBs are stacked
+        //   vertically: at (xC, yC) and (xC, yC + (1<<log2TrafoSizeC)).
+        //   For 4:2:0 there is one chroma TB co-located at (x0/2, y0/2).
+        //   When log2_tb == 2 the chroma TBs sit at the parent base
+        //   (xBase, yBase), and only emit when blk_idx == 3.
+        let sub_x = self.cctx.sps.sub_width_c();
+        let sub_y = self.cctx.sps.sub_height_c();
+        let chroma_passes: u32 = if cat == 2 { 2 } else { 1 };
         if log2_tb > 2 {
-            let chroma_x = x0 / 2;
-            let chroma_y = y0 / 2;
             let chroma_log2 = log2_tb - 1;
-            self.reconstruct_plane(
-                engine,
-                ctx,
-                chroma_x,
-                chroma_y,
-                chroma_log2,
-                chroma_mode,
-                false,
-                cbf_cb != 0,
-            )?;
-            self.reconstruct_plane_cr(
-                engine,
-                ctx,
-                chroma_x,
-                chroma_y,
-                chroma_log2,
-                chroma_mode,
-                cbf_cr != 0,
-            )?;
+            let chroma_step = 1u32 << chroma_log2;
+            let cx = x0 / sub_x;
+            let cy = y0 / sub_y;
+            for t in 0..chroma_passes {
+                let cby = cy + t * chroma_step;
+                self.reconstruct_plane(
+                    engine,
+                    ctx,
+                    cx,
+                    cby,
+                    chroma_log2,
+                    chroma_mode,
+                    false,
+                    cbf_cb[t as usize] != 0,
+                )?;
+            }
+            for t in 0..chroma_passes {
+                let cby = cy + t * chroma_step;
+                self.reconstruct_plane_cr(
+                    engine,
+                    ctx,
+                    cx,
+                    cby,
+                    chroma_log2,
+                    chroma_mode,
+                    cbf_cr[t as usize] != 0,
+                )?;
+            }
         } else if blk_idx == 3 {
-            let chroma_x = x_base / 2;
-            let chroma_y = y_base / 2;
-            self.reconstruct_plane(
-                engine,
-                ctx,
-                chroma_x,
-                chroma_y,
-                2,
-                chroma_mode,
-                false,
-                cbf_cb != 0,
-            )?;
-            self.reconstruct_plane_cr(
-                engine,
-                ctx,
-                chroma_x,
-                chroma_y,
-                2,
-                chroma_mode,
-                cbf_cr != 0,
-            )?;
+            // log2_tb == 2 path. Chroma TB(s) anchored at parent base.
+            // For 4:2:2, two 4×4 chroma TBs stacked vertically at chroma
+            // (xBase/2, yBase) and (xBase/2, yBase+4).
+            let cx = x_base / sub_x;
+            let cy = y_base / sub_y;
+            let chroma_step = 4u32; // 1 << log2TrafoSizeC == 1 << 2 == 4
+            for t in 0..chroma_passes {
+                let cby = cy + t * chroma_step;
+                self.reconstruct_plane(
+                    engine,
+                    ctx,
+                    cx,
+                    cby,
+                    2,
+                    chroma_mode,
+                    false,
+                    cbf_cb[t as usize] != 0,
+                )?;
+            }
+            for t in 0..chroma_passes {
+                let cby = cy + t * chroma_step;
+                self.reconstruct_plane_cr(
+                    engine,
+                    ctx,
+                    cx,
+                    cby,
+                    2,
+                    chroma_mode,
+                    cbf_cr[t as usize] != 0,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2966,8 +3064,15 @@ impl<'a> Walker<'a> {
             // (CuQpOffsetC* comes from chroma_qp_offset_list — not yet
             //  parsed, defaults to 0 for streams that don't opt in.)
             let qpi = (*self.cu_qp_y + qp_offset).clamp(-qp_bd_offset_c, 57);
-            // Table 8-10: QpC for ChromaArrayType == 1 (4:2:0).
-            let qp_c = qp_y_to_qp_c(qpi);
+            // §8.6.1: QpC derivation depends on ChromaArrayType.
+            //   ChromaArrayType == 1 (4:2:0): Table 8-10 (the qPi → QpC LUT).
+            //   ChromaArrayType == 2 (4:2:2): QpC = min(qPi, 51).
+            //   ChromaArrayType == 3 (4:4:4): QpC = qPi (no Table 8-10).
+            let qp_c = match self.cctx.sps.chroma_array_type() {
+                1 => qp_y_to_qp_c(qpi),
+                2 => qpi.min(51),
+                _ => qpi,
+            };
             // eq. 8-289/8-290: Qp'Cb/Cr = QpC + QpBdOffsetC.
             qp_c + qp_bd_offset_c
         }
@@ -3002,21 +3107,33 @@ impl<'a> Walker<'a> {
             (
                 self.pic.chroma_stride,
                 &self.pic.cr,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
+                self.pic.chroma_width(),
+                self.pic.chroma_height(),
             )
         } else {
             (
                 self.pic.chroma_stride,
                 &self.pic.cb,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
+                self.pic.chroma_width(),
+                self.pic.chroma_height(),
             )
         };
         let x0 = x0 as usize;
         let y0 = y0 as usize;
-        // Convert to luma-space coords for the decoded-block lookup.
-        let luma_shift = usize::from(!is_luma);
+        // Convert chroma coords back to luma-space for the decoded_4x4
+        // grid lookup. The grid is per luma 4×4 block; for 4:2:0 the
+        // chroma coord scales by SubWidthC=2 / SubHeightC=2; for 4:2:2 by
+        // SubWidthC=2 / SubHeightC=1 (no vertical shift on chroma).
+        let lx_shift = if is_luma {
+            0
+        } else {
+            (self.pic.sub_x >> 1) as usize
+        };
+        let ly_shift = if is_luma {
+            0
+        } else {
+            (self.pic.sub_y >> 1) as usize
+        };
         let is_decoded = |lx: usize, ly: usize| -> bool {
             let bx = lx >> 2;
             let by = ly >> 2;
@@ -3027,8 +3144,8 @@ impl<'a> Walker<'a> {
 
         // top-left corner p[-1, -1]
         if x0 > 0 && y0 > 0 {
-            let lx = (x0 - 1) << luma_shift;
-            let ly = (y0 - 1) << luma_shift;
+            let lx = (x0 - 1) << lx_shift;
+            let ly = (y0 - 1) << ly_shift;
             if is_decoded(lx, ly) {
                 samples[0] = plane[(y0 - 1) * stride + (x0 - 1)];
                 avail[0] = true;
@@ -3039,8 +3156,8 @@ impl<'a> Walker<'a> {
             for i in 0..(2 * n) {
                 let xx = x0 + i;
                 if xx < pic_w {
-                    let lx = xx << luma_shift;
-                    let ly = (y0 - 1) << luma_shift;
+                    let lx = xx << lx_shift;
+                    let ly = (y0 - 1) << ly_shift;
                     if is_decoded(lx, ly) {
                         samples[1 + i] = plane[(y0 - 1) * stride + xx];
                         avail[1 + i] = true;
@@ -3053,8 +3170,8 @@ impl<'a> Walker<'a> {
             for i in 0..(2 * n) {
                 let yy = y0 + i;
                 if yy < pic_h {
-                    let lx = (x0 - 1) << luma_shift;
-                    let ly = yy << luma_shift;
+                    let lx = (x0 - 1) << lx_shift;
+                    let ly = yy << ly_shift;
                     if is_decoded(lx, ly) {
                         samples[2 * n + 1 + i] = plane[yy * stride + (x0 - 1)];
                         avail[2 * n + 1 + i] = true;
@@ -3139,27 +3256,21 @@ impl<'a> Walker<'a> {
         is_luma: bool,
         is_cr: bool,
     ) {
+        let cw = self.pic.chroma_width();
+        let ch = self.pic.chroma_height();
+        let pic_full_w = self.pic.width as usize;
+        let pic_full_h = self.pic.height as usize;
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
                 self.pic.luma_stride,
                 &mut self.pic.luma,
-                self.pic.width as usize,
-                self.pic.height as usize,
+                pic_full_w,
+                pic_full_h,
             )
         } else if is_cr {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cr,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cr, cw, ch)
         } else {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cb,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cb, cw, ch)
         };
         let x0 = x as usize;
         let y0 = y as usize;
@@ -3175,27 +3286,21 @@ impl<'a> Walker<'a> {
     }
 
     fn write_block(&mut self, x: u32, y: u32, n: usize, block: &[u16], is_luma: bool, is_cr: bool) {
+        let cw = self.pic.chroma_width();
+        let ch = self.pic.chroma_height();
+        let pic_full_w = self.pic.width as usize;
+        let pic_full_h = self.pic.height as usize;
         let (stride, plane, pic_w, pic_h) = if is_luma {
             (
                 self.pic.luma_stride,
                 &mut self.pic.luma,
-                self.pic.width as usize,
-                self.pic.height as usize,
+                pic_full_w,
+                pic_full_h,
             )
         } else if is_cr {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cr,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cr, cw, ch)
         } else {
-            (
-                self.pic.chroma_stride,
-                &mut self.pic.cb,
-                (self.pic.width as usize) / 2,
-                (self.pic.height as usize) / 2,
-            )
+            (self.pic.chroma_stride, &mut self.pic.cb, cw, ch)
         };
         let x0 = x as usize;
         let y0 = y as usize;
@@ -3836,6 +3941,51 @@ fn decode_egk_bypass(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32> {
         suffix = (suffix << 1) | engine.decode_bypass();
     }
     Ok((((1u32 << prefix) - 1) << k) + suffix)
+}
+
+/// Map IntraPredModeC for ChromaArrayType == 2 (4:2:2) per Table 8-3
+/// (§8.4.3). For modeIdx ≤ 2 (planar/DC/mode 2) the mapping is the
+/// identity. For modeIdx 3..=34 the table substitutes the next-most-
+/// representative angular mode in the 4:2:2-aspect-ratio space.
+fn map_chroma_mode_4_2_2(mode_idx: u32) -> u32 {
+    match mode_idx {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 2,
+        4 => 2,
+        5 => 2,
+        6 => 3,
+        7 => 5,
+        8 => 7,
+        9 => 8,
+        10 => 10,
+        11 => 12,
+        12 => 13,
+        13 => 15,
+        14 => 17,
+        15 => 18,
+        16 => 19,
+        17 => 20,
+        18 => 21,
+        19 => 22,
+        20 => 23,
+        21 => 23,
+        22 => 24,
+        23 => 24,
+        24 => 25,
+        25 => 25,
+        26 => 26,
+        27 => 27,
+        28 => 27,
+        29 => 28,
+        30 => 28,
+        31 => 29,
+        32 => 29,
+        33 => 30,
+        34 => 31,
+        _ => mode_idx,
+    }
 }
 
 fn qp_y_to_qp_c(qp_y: i32) -> i32 {

@@ -161,7 +161,8 @@ impl HevcDecoder {
     ) -> Result<VideoFrame> {
         let width = sps.pic_width_in_luma_samples;
         let height = sps.pic_height_in_luma_samples;
-        let mut pic = Picture::new(width, height);
+        let mut pic =
+            Picture::new_with_chroma(width, height, sps.sub_width_c(), sps.sub_height_c());
         let empty: Vec<RefPicture> = Vec::new();
         let cctx = CtuContext {
             sps,
@@ -220,7 +221,8 @@ impl HevcDecoder {
             None
         };
 
-        let mut pic = Picture::new(width, height);
+        let mut pic =
+            Picture::new_with_chroma(width, height, sps.sub_width_c(), sps.sub_height_c());
         let is_b = hdr.slice_type == SliceType::B;
         let init_type = crate::cabac::InitType::for_slice(false, is_b, hdr.cabac_init_flag);
         let cctx = CtuContext {
@@ -391,7 +393,13 @@ impl HevcDecoder {
         let cropped_w = sps.cropped_width();
         let cropped_h = sps.cropped_height();
         let (cw, ch) = (cropped_w as usize, cropped_h as usize);
-        let (cwc, chc) = (cw / 2, ch / 2);
+        // Chroma plane dimensions for the cropped output, derived from
+        // SubWidthC / SubHeightC per §6.2 Table 6-1. 4:2:0 → (cw/2, ch/2);
+        // 4:2:2 → (cw/2, ch).
+        let sub_x = sps.sub_width_c() as usize;
+        let sub_y = sps.sub_height_c() as usize;
+        let (cwc, chc) = (cw / sub_x, ch / sub_y);
+        let cf = sps.chroma_format_idc;
         let bit_depth_y = sps.bit_depth_y();
         let bit_depth_c = sps.bit_depth_c();
         // Main 10 (bit_depth_y == 10) uses `Yuv420P10Le`: two bytes per
@@ -431,8 +439,12 @@ impl HevcDecoder {
                     dst_cr[i * 2 + 1] = (vcr >> 8) as u8;
                 }
             }
+            let format = match cf {
+                2 => PixelFormat::Yuv422P10Le,
+                _ => PixelFormat::Yuv420P10Le,
+            };
             return VideoFrame {
-                format: PixelFormat::Yuv420P10Le,
+                format,
                 width: cw as u32,
                 height: ch as u32,
                 pts: self.last_pts,
@@ -474,8 +486,12 @@ impl HevcDecoder {
             }
         }
         let _ = bit_depth_c;
+        let format = match cf {
+            2 => PixelFormat::Yuv422P,
+            _ => PixelFormat::Yuv420P,
+        };
         VideoFrame {
-            format: PixelFormat::Yuv420P,
+            format,
             width: cw as u32,
             height: ch as u32,
             pts: self.last_pts,

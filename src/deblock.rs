@@ -103,8 +103,9 @@ pub fn deblock_picture(
     if slice.slice_deblocking_filter_disabled_flag {
         return;
     }
-    if sps.chroma_format_idc != 1 {
-        // Only 4:2:0 supported here (mirrors the CTU walker's gate).
+    let cfi = sps.chroma_format_idc;
+    if cfi != 1 && cfi != 2 {
+        // 4:2:0 + 4:2:2 supported here (mirrors the CTU walker's gate).
         return;
     }
     let width = pic.width as usize;
@@ -138,8 +139,30 @@ pub fn deblock_picture(
         slice,
         bit_depth_y,
     );
-    deblock_vertical_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
-    deblock_horizontal_chroma(pic, width, height, tc_offset, slice, pps, bit_depth_c);
+    let sub_x = sps.sub_width_c();
+    let sub_y = sps.sub_height_c();
+    deblock_vertical_chroma(
+        pic,
+        width,
+        height,
+        tc_offset,
+        slice,
+        pps,
+        bit_depth_c,
+        sub_x,
+        sub_y,
+    );
+    deblock_horizontal_chroma(
+        pic,
+        width,
+        height,
+        tc_offset,
+        slice,
+        pps,
+        bit_depth_c,
+        sub_x,
+        sub_y,
+    );
     // Suppress unused-warnings: pps only consulted for chroma QP offsets
     // in chroma paths.
     let _ = pps;
@@ -538,7 +561,12 @@ fn filter_luma_horizontal(
     }
 }
 
-/// Chroma vertical edges. 4:2:0, so chroma 8-grid in luma = 4-grid in chroma.
+/// Chroma vertical edges. The chroma edge grid in the picture follows the
+/// luma 8-grid scaled by `(SubWidthC, SubHeightC)`. Each luma 4-row edge
+/// segment covers `4 / SubHeightC` chroma rows; the per-segment 2-row
+/// chroma filter runs once for 4:2:0 (covers 2 chroma rows = 4 luma rows)
+/// and twice for 4:2:2 (covers 4 chroma rows = 4 luma rows).
+#[allow(clippy::too_many_arguments)]
 fn deblock_vertical_chroma(
     pic: &mut Picture,
     width: usize,
@@ -547,21 +575,22 @@ fn deblock_vertical_chroma(
     slice: &SliceSegmentHeader,
     pps: &PicParameterSet,
     bit_depth: u32,
+    sub_x: u32,
+    sub_y: u32,
 ) {
-    let cw = width / 2;
-    let ch = height / 2;
+    let cw = width / sub_x as usize;
+    let ch = height / sub_y as usize;
     let cb_off = pps.pps_cb_qp_offset + slice.slice_cb_qp_offset;
     let cr_off = pps.pps_cr_qp_offset + slice.slice_cr_qp_offset;
-    // Chroma edges align with luma 8-grid → every 8 luma samples → every 4
-    // chroma samples. Only apply on edges where the corresponding luma
-    // edge had bS = 2 (chroma filter is strong-only, per §8.7.2.4).
+    let edge_dx_chroma = (8u32 / sub_x) as usize; // chroma stride between vertical edges
+    let seg_dy_chroma = (4u32 / sub_y) as usize; // chroma rows per luma 4-row segment
     let c_stride = pic.chroma_stride;
-    let mut xc = 4; // first vertical chroma edge
+    let mut xc = edge_dx_chroma; // first vertical chroma edge
     while xc + 2 <= cw {
-        let luma_x = xc * 2;
-        let mut yc = 0;
-        while yc + 2 <= ch {
-            let luma_y = yc * 2;
+        let luma_x = xc * sub_x as usize;
+        let mut yc = 0usize;
+        while yc + seg_dy_chroma <= ch {
+            let luma_y = yc * sub_y as usize;
             let p_bx = (luma_x - 1) >> 2;
             let p_by = luma_y >> 2;
             let q_bx = luma_x >> 2;
@@ -571,15 +600,34 @@ fn deblock_vertical_chroma(
                 let qpa = qp_avg(pic, luma_x - 1, luma_y, luma_x, luma_y);
                 let tc_cb = chroma_tc(qpa, cb_off, bs, tc_off, bit_depth);
                 let tc_cr = chroma_tc(qpa, cr_off, bs, tc_off, bit_depth);
-                filter_chroma_vertical(&mut pic.cb, c_stride, xc, yc, tc_cb, bit_depth);
-                filter_chroma_vertical(&mut pic.cr, c_stride, xc, yc, tc_cr, bit_depth);
+                let mut row_off = 0usize;
+                while row_off < seg_dy_chroma {
+                    filter_chroma_vertical(
+                        &mut pic.cb,
+                        c_stride,
+                        xc,
+                        yc + row_off,
+                        tc_cb,
+                        bit_depth,
+                    );
+                    filter_chroma_vertical(
+                        &mut pic.cr,
+                        c_stride,
+                        xc,
+                        yc + row_off,
+                        tc_cr,
+                        bit_depth,
+                    );
+                    row_off += 2;
+                }
             }
-            yc += 2;
+            yc += seg_dy_chroma;
         }
-        xc += 4;
+        xc += edge_dx_chroma;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deblock_horizontal_chroma(
     pic: &mut Picture,
     width: usize,
@@ -588,18 +636,22 @@ fn deblock_horizontal_chroma(
     slice: &SliceSegmentHeader,
     pps: &PicParameterSet,
     bit_depth: u32,
+    sub_x: u32,
+    sub_y: u32,
 ) {
-    let cw = width / 2;
-    let ch = height / 2;
+    let cw = width / sub_x as usize;
+    let ch = height / sub_y as usize;
     let cb_off = pps.pps_cb_qp_offset + slice.slice_cb_qp_offset;
     let cr_off = pps.pps_cr_qp_offset + slice.slice_cr_qp_offset;
+    let edge_dy_chroma = (8u32 / sub_y) as usize;
+    let _ = sub_x;
     let c_stride = pic.chroma_stride;
-    let mut yc = 4;
+    let mut yc = edge_dy_chroma;
     while yc + 2 <= ch {
-        let luma_y = yc * 2;
-        let mut xc = 0;
+        let luma_y = yc * sub_y as usize;
+        let mut xc = 0usize;
         while xc + 2 <= cw {
-            let luma_x = xc * 2;
+            let luma_x = xc * sub_x as usize;
             let p_bx = luma_x >> 2;
             let p_by = (luma_y - 1) >> 2;
             let q_bx = luma_x >> 2;
@@ -614,7 +666,7 @@ fn deblock_horizontal_chroma(
             }
             xc += 2;
         }
-        yc += 4;
+        yc += edge_dy_chroma;
     }
 }
 

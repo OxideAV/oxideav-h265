@@ -131,29 +131,59 @@ pub struct ConformanceWindow {
 }
 
 impl SeqParameterSet {
-    /// Width in luma samples, accounting for the conformance cropping window.
-    /// SubWidthC / SubHeightC per Table 6-1: 4:2:0 → (2,2); 4:2:2 → (2,1);
-    /// 4:4:4 → (1,1); 4:0:0 → (1,1).
-    pub fn cropped_width(&self) -> u32 {
-        let sub_x = match self.chroma_format_idc {
+    /// `ChromaArrayType` per §6.2: equal to `chroma_format_idc` unless
+    /// `separate_colour_plane_flag == 1` (in which case it is 0). Used as
+    /// the dispatch key for every chroma-aware code path.
+    pub fn chroma_array_type(&self) -> u32 {
+        if self.separate_colour_plane_flag {
+            0
+        } else {
+            self.chroma_format_idc
+        }
+    }
+
+    /// `SubWidthC` per §6.2 Table 6-1. 4:2:0 / 4:2:2 → 2; 4:4:4 / 4:0:0 → 1.
+    pub fn sub_width_c(&self) -> u32 {
+        match self.chroma_array_type() {
             1 | 2 => 2,
             _ => 1,
-        };
+        }
+    }
+
+    /// `SubHeightC` per §6.2 Table 6-1. 4:2:0 → 2; 4:2:2 / 4:4:4 → 1; 4:0:0 → 1.
+    pub fn sub_height_c(&self) -> u32 {
+        match self.chroma_array_type() {
+            1 => 2,
+            _ => 1,
+        }
+    }
+
+    /// Picture dimensions in chroma samples (`(width / SubWidthC,
+    /// height / SubHeightC)`). Returns `(0, 0)` for 4:0:0.
+    pub fn chroma_dims(&self) -> (u32, u32) {
+        if self.chroma_array_type() == 0 {
+            return (0, 0);
+        }
+        (
+            self.pic_width_in_luma_samples / self.sub_width_c(),
+            self.pic_height_in_luma_samples / self.sub_height_c(),
+        )
+    }
+
+    /// Width in luma samples, accounting for the conformance cropping window.
+    /// SubWidthC / SubHeightC per Table 6-1.
+    pub fn cropped_width(&self) -> u32 {
         let crop = self
             .conformance_window
-            .map(|c| sub_x * (c.left_offset + c.right_offset))
+            .map(|c| self.sub_width_c() * (c.left_offset + c.right_offset))
             .unwrap_or(0);
         self.pic_width_in_luma_samples.saturating_sub(crop)
     }
 
     pub fn cropped_height(&self) -> u32 {
-        let sub_y = match self.chroma_format_idc {
-            1 => 2,
-            _ => 1,
-        };
         let crop = self
             .conformance_window
-            .map(|c| sub_y * (c.top_offset + c.bottom_offset))
+            .map(|c| self.sub_height_c() * (c.top_offset + c.bottom_offset))
             .unwrap_or(0);
         self.pic_height_in_luma_samples.saturating_sub(crop)
     }
