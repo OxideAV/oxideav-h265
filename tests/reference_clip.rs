@@ -3370,3 +3370,204 @@ fn main12_422_inter_decodes_with_pframes() {
         "Main 4:2:2 12 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }
+
+/// Round 16 regression: 4:2:2 stacked-chroma cbf inference fix.
+///
+/// Before r16, the `cbf_cb[1]`/`cbf_cr[1]` slot for the SECOND
+/// (stacked-vertical) chroma TB in a 4:2:2 transform_tree node was
+/// only RESET to 0 when ChromaArrayType != 2 — for 4:2:2 it was left
+/// carrying the parent's value. When the outer cbf gate
+/// (§7.3.8.10: `trafoDepth == 0 || cbf_cb[xBase][yBase][trafoDepth-1]`)
+/// closed at depth ≥ 1 with parent cbf_cb[0] == 0 BUT parent
+/// cbf_cb[1] == 1, the child's cbf_cb[1] inherited that 1 instead of
+/// being inferred to 0 per §7.4.9.10 — so the leaf at log2_tb == 2
+/// blk_idx == 3 attempted to decode a Cb_bot residual the encoder
+/// hadn't emitted, misaligning CABAC for the rest of the slice.
+///
+/// The drift was content-dependent because it requires a parent that
+/// happened to decode `cbf_cb[1]=1, cbf_cb[0]=0` (or symmetrically for
+/// cbf_cr) AND descended into a child where the outer gate closed.
+/// Smptebars rarely produces that pattern; testsrc-style content does.
+/// The bug repro'd at any 4:2:2 bit depth (10 or 12) because the
+/// trigger is purely structural — the r15 note that singled out 12-bit
+/// turned out to be a lavfi sizing accident.
+///
+/// This regression test asserts bit-exactness on a fan of fixtures
+/// that all hit the bug pre-fix.
+#[test]
+fn r16_main422_testsrc_cbf_inference_bit_exact() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping r16 cbf inference regression");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    // (lavfi_src, w, h, max_pixel_val, pix_fmt, profile, tag)
+    let cases: &[(&str, u32, u32, u32, &str, &str, &str)] = &[
+        // 4:2:2 12-bit — the original regression target (r15 note).
+        (
+            "smptebars=size=80x48:rate=25",
+            80,
+            48,
+            4095,
+            "yuv422p12le",
+            "main422-12-intra",
+            "12-422",
+        ),
+        (
+            "testsrc=size=80x48:rate=25",
+            80,
+            48,
+            4095,
+            "yuv422p12le",
+            "main422-12-intra",
+            "12-422",
+        ),
+        (
+            "smptebars=size=96x48:rate=25",
+            96,
+            48,
+            4095,
+            "yuv422p12le",
+            "main422-12-intra",
+            "12-422",
+        ),
+        (
+            "testsrc=size=96x48:rate=25",
+            96,
+            48,
+            4095,
+            "yuv422p12le",
+            "main422-12-intra",
+            "12-422",
+        ),
+        // 4:2:2 10-bit testsrc 96x48 — same trigger, lower bit depth.
+        (
+            "testsrc=size=96x48:rate=25",
+            96,
+            48,
+            1023,
+            "yuv422p10le",
+            "main422-10-intra",
+            "10-422",
+        ),
+        // 4:2:0 controls — same content, but the bug never fires (no
+        // stacked chroma TB → no `cbf_cb[1]` slot).
+        (
+            "testsrc=size=96x48:rate=25",
+            96,
+            48,
+            4095,
+            "yuv420p12le",
+            "main12-intra",
+            "12-420",
+        ),
+        (
+            "testsrc=size=96x48:rate=25",
+            96,
+            48,
+            1023,
+            "yuv420p10le",
+            "main10-intra",
+            "10-420",
+        ),
+    ];
+    for (src, w, h, max_val_u32, pix_fmt, profile, tag) in cases {
+        let safe = src.replace([':', '='], "_");
+        let clip = fixture_dir.join(format!("r16_{tag}_{safe}.hevc"));
+        let yref = fixture_dir.join(format!("r16_{tag}_{safe}.yuv"));
+        if !clip.exists()
+            && !run_ffmpeg(&[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                src,
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                pix_fmt,
+                "-c:v",
+                "libx265",
+                "-profile:v",
+                profile,
+                "-preset:v",
+                "veryslow",
+                "-x265-params",
+                "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:\
+                 no-sao=1:no-deblock=1:no-amp=1:no-tskip=1:\
+                 no-strong-intra-smoothing=1:no-weightp=1:no-weightb=1:qp=22",
+                clip.to_str().unwrap(),
+            ])
+        {
+            eprintln!("failed to encode {src} @ {pix_fmt} — skipping");
+            continue;
+        }
+        if !yref.exists() {
+            run_ffmpeg(&[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                clip.to_str().unwrap(),
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                pix_fmt,
+                "-f",
+                "rawvideo",
+                yref.to_str().unwrap(),
+            ]);
+        }
+        let max_val = *max_val_u32 as f64;
+        let Some(data) = read_fixture(&clip.to_string_lossy()) else {
+            continue;
+        };
+        let expected = std::fs::read(&yref).expect("read ffmpeg ref yuv");
+        let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+        dec.send_packet(&pkt)
+            .unwrap_or_else(|e| panic!("[{tag} {src}] send_packet ERR: {e:?}"));
+        let vf = match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(v)) => v,
+            Ok(o) => panic!("[{tag} {src}] expected VideoFrame, got {o:?}"),
+            Err(e) => panic!("[{tag} {src}] receive_frame ERR: {e:?}"),
+        };
+        let w = *w as usize;
+        let h = *h as usize;
+        let row_bytes = w * 2;
+        let stride = vf.planes[0].stride;
+        let actual_y = &vf.planes[0].data;
+        let mut packed = Vec::with_capacity(w * h * 2);
+        for yi in 0..h {
+            let off = yi * stride;
+            packed.extend_from_slice(&actual_y[off..off + row_bytes]);
+        }
+        let exp_y = &expected[..w * h * 2];
+        let mut sse: u64 = 0;
+        for i in (0..packed.len()).step_by(2) {
+            let a = (packed[i] as u32) | ((packed[i + 1] as u32) << 8);
+            let e = (exp_y[i] as u32) | ((exp_y[i + 1] as u32) << 8);
+            let d = a as i32 - e as i32;
+            sse += (d * d) as u64;
+        }
+        let psnr = if sse == 0 {
+            f64::INFINITY
+        } else {
+            let mse = sse as f64 / (w * h) as f64;
+            10.0 * (max_val * max_val / mse).log10()
+        };
+        eprintln!("[{tag} {src}] luma PSNR={psnr:.2} dB sse={sse}");
+        // Bit-exact luma against ffmpeg reference. The cbf inference
+        // fix lifted all of these from severe drift / EGk overflow to
+        // ∞ dB, so a hard equality assertion is the right guard.
+        assert!(
+            sse == 0,
+            "[{tag} {src}] luma not bit-exact: sse={sse} (PSNR {psnr:.2} dB)"
+        );
+    }
+}

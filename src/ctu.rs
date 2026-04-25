@@ -404,14 +404,13 @@ pub fn decode_slice_ctus(
     // 11/12) and Main 12 + 4:2:0 (round 13). 4:4:4 12-bit is still
     // gated above by the `cfi != 1 && cfi != 2` chroma-format check.
     //
-    // KNOWN REGRESSION: a small set of `testsrc` lavfi fixtures at
-    // 4:2:2 + 12-bit reproduce a content-dependent CABAC drift inside
-    // the first CTB (e.g. testsrc 80x48 → `EGk prefix overflow`,
-    // testsrc 96x48 → silent ~9 dB drift). Smptebars/color/many
-    // testsrc sizes decode bit-exact. The drift does NOT reproduce at
-    // 4:2:0 12-bit nor 4:2:2 10-bit so it's specific to the diagonal.
-    // Round-15 wired the format mapping + i64 dequant; root-causing
-    // the drift is deferred.
+    // R16: the r15-documented testsrc 4:2:2 cross-CTB drift turned
+    // out to be a missing 4:2:2 cbf inference (§7.4.9.10) — the
+    // stacked-vertical second-chroma cbf slot was being inherited
+    // from the parent when the outer cbf gate closed, instead of
+    // being reset to 0. Fix lives in `transform_tree` below; the
+    // r15 note that the drift was 12-bit-specific was wrong (it
+    // reproduces at 10-bit too — bit depth never gated the trigger).
     // Inter motion compensation (§8.5.3.3) clips at Clip1Y/Clip1C using
     // `bit_depth` from the SPS, so Main 10/12 P/B slices share the MC
     // path with Main. Higher bit depths (>12) are rejected above.
@@ -2626,26 +2625,42 @@ impl<'a> Walker<'a> {
         let mut cbf_cr: [u32; 2] = parent_cbf_cr;
         if log2_tb > 2 {
             let cbf_ctx_inc = tr_depth.min(4) as usize;
-            if tr_depth == 0 || parent_cbf_cb[0] == 1 {
+            // §7.3.8.10 transform_tree: cbf_cb[x0][y0] is decoded under
+            // `(trafoDepth == 0 || cbf_cb[xBase][yBase][trafoDepth - 1])`;
+            // when not decoded the value at this depth is inferred to 0
+            // (§7.4.9.10). The stacked-vertical second cbf for 4:2:2 is
+            // gated by the SAME outer condition, so when that outer gate
+            // is closed BOTH the primary and the stacked cbf are inferred
+            // to 0 — we must reset cbf_cb[1] regardless of cat. Carrying
+            // over the parent's cbf_cb[1] (which itself was decoded one
+            // level up) into a child where the outer gate is closed
+            // misaligns CABAC at the leaf because it then attempts to
+            // decode a chroma residual that the encoder didn't emit.
+            // Symmetrical fix for cbf_cr.
+            let outer_gate_cb = tr_depth == 0 || parent_cbf_cb[0] == 1;
+            if outer_gate_cb {
                 cbf_cb[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
             } else {
                 cbf_cb[0] = 0;
             }
-            if cat == 2 && (split == 0 || log2_tb == 3) && (tr_depth == 0 || parent_cbf_cb[0] == 1)
-            {
+            if cat == 2 && (split == 0 || log2_tb == 3) && outer_gate_cb {
                 cbf_cb[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-            } else if cat != 2 {
+            } else {
+                // 4:2:0 (cat != 2) never has a stacked cbf; for 4:2:2 the
+                // stacked cbf is inferred to 0 whenever the outer gate is
+                // closed or the gate-conditions (split == 0 || log2 == 3)
+                // are not met.
                 cbf_cb[1] = 0;
             }
-            if tr_depth == 0 || parent_cbf_cr[0] == 1 {
+            let outer_gate_cr = tr_depth == 0 || parent_cbf_cr[0] == 1;
+            if outer_gate_cr {
                 cbf_cr[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
             } else {
                 cbf_cr[0] = 0;
             }
-            if cat == 2 && (split == 0 || log2_tb == 3) && (tr_depth == 0 || parent_cbf_cr[0] == 1)
-            {
+            if cat == 2 && (split == 0 || log2_tb == 3) && outer_gate_cr {
                 cbf_cr[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
-            } else if cat != 2 {
+            } else {
                 cbf_cr[1] = 0;
             }
         } else {
