@@ -376,6 +376,8 @@ impl HevcDecoder {
             poc,
             width: pic.width,
             height: pic.height,
+            sub_x: pic.sub_x,
+            sub_y: pic.sub_y,
             luma: pic.luma.clone(),
             cb: pic.cb.clone(),
             cr: pic.cr.clone(),

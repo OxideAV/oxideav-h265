@@ -129,10 +129,15 @@ signalled (§8.5.3.3.4).
 
 ### Bit depths and chroma
 
-* **Main (8-bit)** and **Main 10** are supported for 4:2:0. Higher bit
-  depths (Main 12) and `bit_depth_luma_minus8 != bit_depth_chroma_minus8`
+* **Main (8-bit)** and **Main 10** are supported. Higher bit depths
+  (Main 12) and `bit_depth_luma_minus8 != bit_depth_chroma_minus8`
   surface as `Error::Unsupported`.
-* **Chroma formats other than 4:2:0** — 4:2:2, 4:4:4, monochrome, and
+* **4:2:0 (`chroma_format_idc=1`) and 4:2:2 (`chroma_format_idc=2`)** are
+  supported for I, P, and B slices. The 4:2:2 inter path applies
+  §8.5.3.2.10 chroma MV derivation
+  (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) so the same `chroma_mc` /
+  `chroma_mc_hp` covers both layouts.
+* **4:4:4 (`chroma_format_idc=3`)**, monochrome, and
   `separate_colour_plane_flag = 1` all surface as
   `Error::Unsupported`.
 

@@ -204,11 +204,21 @@ impl InterState {
 /// Carries both the reconstructed sample planes and a snapshot of the
 /// picture's motion field so later slices can perform temporal motion
 /// vector lookups (TMVP, §8.5.3.2.9).
+///
+/// Chroma plane dimensions are derived from `(SubWidthC, SubHeightC)`
+/// per §6.2 Table 6-1: 4:2:0 → `(2, 2)`, 4:2:2 → `(2, 1)`. The
+/// `sample_cb`/`sample_cr` accessors clamp on the chroma-plane geometry
+/// `(width / SubWidthC, height / SubHeightC)`.
 #[derive(Clone, Debug)]
 pub struct RefPicture {
     pub poc: i32,
     pub width: u32,
     pub height: u32,
+    /// `SubWidthC` per §6.2 Table 6-1 (1 or 2). Only 4:2:0 / 4:2:2 are
+    /// in scope today, so this is always 2; tracked for future formats.
+    pub sub_x: u32,
+    /// `SubHeightC` per §6.2 Table 6-1 (1 or 2). 4:2:0 → 2, 4:2:2 → 1.
+    pub sub_y: u32,
     pub luma: Vec<u16>,
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
@@ -234,16 +244,16 @@ impl RefPicture {
     }
 
     pub fn sample_cb(&self, x: i32, y: i32) -> u16 {
-        let w = (self.width / 2) as i32;
-        let h = (self.height / 2) as i32;
+        let w = (self.width / self.sub_x) as i32;
+        let h = (self.height / self.sub_y) as i32;
         let xc = x.clamp(0, w - 1) as usize;
         let yc = y.clamp(0, h - 1) as usize;
         self.cb[yc * self.chroma_stride + xc]
     }
 
     pub fn sample_cr(&self, x: i32, y: i32) -> u16 {
-        let w = (self.width / 2) as i32;
-        let h = (self.height / 2) as i32;
+        let w = (self.width / self.sub_x) as i32;
+        let h = (self.height / self.sub_y) as i32;
         let xc = x.clamp(0, w - 1) as usize;
         let yc = y.clamp(0, h - 1) as usize;
         self.cr[yc * self.chroma_stride + xc]
@@ -1214,12 +1224,25 @@ pub fn luma_mc_bi_weighted(
     }
 }
 
-/// Perform 2-D chroma sub-pel interpolation. `mv` is in 1/4-pel luma units;
-/// chroma uses 1/8-pel fractions so we split the MV accordingly.
-/// `out` is `blk_w * blk_h` and `comp` selects cb (0) or cr (1). Output is
-/// clipped to `[0, (1 << bit_depth) - 1]` per Clip1C (§8.5.3.2.2.2).
-/// Matches §8.5.3.3.3.3 + §8.5.3.3.4.2 eq. 8-262 exactly, including the
-/// `shift1 = Min(4, bitDepth-8)` per-row truncation at 10-bit.
+/// Perform 2-D chroma sub-pel interpolation. `mv` is the **luma** motion
+/// vector in 1/4-pel units; the spec's §8.5.3.2.10 derivation for the
+/// chroma MV is applied here: `mvCLX[0] = mvLX[0] * 2 / SubWidthC`,
+/// `mvCLX[1] = mvLX[1] * 2 / SubHeightC`. The result is in 1/8-pel chroma
+/// sample units, so the integer / fractional split is `>> 3` and `& 7`.
+///
+/// `(x0, y0)` is the chroma block origin (already divided by SubWidthC /
+/// SubHeightC by the caller). `out` is `blk_w * blk_h` and `comp` selects
+/// cb (0) or cr (1). Output is clipped to `[0, (1 << bit_depth) - 1]`
+/// per Clip1C (§8.5.3.2.2.2). Matches §8.5.3.3.3.3 + §8.5.3.3.4.2 eq.
+/// 8-262 exactly, including the `shift1 = Min(4, bitDepth-8)` per-row
+/// truncation at 10-bit.
+///
+/// For 4:2:0 (`(sub_x, sub_y) = (2, 2)`) the chroma MV equals the luma
+/// MV numerically, recovering the legacy 1/8-pel interpretation. For
+/// 4:2:2 (`(2, 1)`) the vertical component doubles so each whole-luma
+/// step still maps onto a whole chroma row, with `yFracC` always taking
+/// only even values (0, 2, 4, 6).
+#[allow(clippy::too_many_arguments)]
 pub fn chroma_mc(
     ref_pic: &RefPicture,
     x0: i32,
@@ -1230,14 +1253,19 @@ pub fn chroma_mc(
     out: &mut [u16],
     comp: u8,
     bit_depth: i32,
+    sub_x: u32,
+    sub_y: u32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 chroma_mc: output buffer too small"));
     }
-    let fx = (mv.x & 7) as usize;
-    let fy = (mv.y & 7) as usize;
-    let ix = mv.x >> 3;
-    let iy = mv.y >> 3;
+    // §8.5.3.2.10 eq. 8-210 / 8-211 — derive chroma MV from luma MV.
+    let mvc_x = mv.x * 2 / sub_x as i32;
+    let mvc_y = mv.y * 2 / sub_y as i32;
+    let fx = (mvc_x & 7) as usize;
+    let fy = (mvc_y & 7) as usize;
+    let ix = mvc_x >> 3;
+    let iy = mvc_y >> 3;
 
     let px = |x: i32, y: i32| -> i32 {
         let sx = x0 + ix + x;
@@ -1299,6 +1327,9 @@ pub fn chroma_mc(
 
 /// Uni-prediction chroma MC returning `predSamplesLX` (§8.5.3.3.3.3) at
 /// `shift3 = Max(2, 14 - bitDepth)` precision for bi-pred combine.
+/// `mv` is the **luma** MV; chroma MV derivation follows §8.5.3.2.10
+/// using `(sub_x, sub_y)`.
+#[allow(clippy::too_many_arguments)]
 pub fn chroma_mc_hp(
     ref_pic: &RefPicture,
     x0: i32,
@@ -1309,14 +1340,19 @@ pub fn chroma_mc_hp(
     out: &mut [i32],
     comp: u8,
     bit_depth: i32,
+    sub_x: u32,
+    sub_y: u32,
 ) -> Result<()> {
     if out.len() < (blk_w * blk_h) as usize {
         return Err(Error::invalid("h265 chroma_mc_hp: output buffer too small"));
     }
-    let fx = (mv.x & 7) as usize;
-    let fy = (mv.y & 7) as usize;
-    let ix = mv.x >> 3;
-    let iy = mv.y >> 3;
+    // §8.5.3.2.10 eq. 8-210 / 8-211 — derive chroma MV from luma MV.
+    let mvc_x = mv.x * 2 / sub_x as i32;
+    let mvc_y = mv.y * 2 / sub_y as i32;
+    let fx = (mvc_x & 7) as usize;
+    let fy = (mvc_y & 7) as usize;
+    let ix = mvc_x >> 3;
+    let iy = mvc_y >> 3;
 
     let px = |x: i32, y: i32| -> i32 {
         let sx = x0 + ix + x;
@@ -1389,6 +1425,8 @@ mod tests {
             poc: 0,
             width: 16,
             height: 16,
+            sub_x: 2,
+            sub_y: 2,
             luma: (0..(16 * 16)).map(|i| (i & 0xFF) as u16).collect(),
             cb: vec![128; 8 * 8],
             cr: vec![128; 8 * 8],
@@ -1524,6 +1562,8 @@ mod tests {
             poc,
             width: 4,
             height: 4,
+            sub_x: 2,
+            sub_y: 2,
             luma: vec![0; 16],
             cb: vec![128; 4],
             cr: vec![128; 4],

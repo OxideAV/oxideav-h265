@@ -366,16 +366,10 @@ pub fn decode_slice_ctus(
             "h265 pixel decode supports 4:2:0 and 4:2:2 only",
         ));
     }
-    // 4:2:2 P/B inter pixel decode is not yet supported because the chroma
-    // MC fractional-position derivation in §8.5.3.2.2 uses a different
-    // 4:2:2-specific phase shift on the vertical component that we have not
-    // wired up. Intra-only 4:2:2 (still pictures, IDR-only streams) is
-    // supported and exercised by the tests in `tests/ffmpeg_accepts.rs`.
-    if cfi == 2 && matches!(cctx.slice.slice_type, SliceType::P | SliceType::B) {
-        return Err(Error::unsupported(
-            "h265: 4:2:2 P/B slice decode not yet implemented",
-        ));
-    }
+    // 4:2:2 P/B inter is supported via §8.5.3.2.10 chroma MV derivation
+    // (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) inside `chroma_mc` /
+    // `chroma_mc_hp`, plus full-height chroma plane geometry plumbed
+    // through `motion_compensate_pb`.
     // 8-bit (Main) and 10-bit (Main 10) are both supported. Higher bit
     // depths (Main 12 / Main 4:2:2 10-bit etc.) have not been validated so
     // surface them as a clean unsupported error rather than producing
@@ -1270,6 +1264,13 @@ impl<'a> Walker<'a> {
 
     /// Run motion compensation for a prediction block and write the result
     /// into the picture. Supports L0 uni-pred, L1 uni-pred, and bi-pred.
+    ///
+    /// Chroma plane dimensions follow `(SubWidthC, SubHeightC)` per §6.2
+    /// Table 6-1: 4:2:0 → `(2, 2)` (chroma block half-width, half-height),
+    /// 4:2:2 → `(2, 1)` (half-width, full-height). The chroma MC origin
+    /// is `(x0 / SubWidthC, y0 / SubHeightC)`; the chroma MV derivation
+    /// from the luma MV (§8.5.3.2.10) is performed inside
+    /// `chroma_mc` / `chroma_mc_hp`.
     fn motion_compensate_pb(
         &mut self,
         x0: u32,
@@ -1280,8 +1281,14 @@ impl<'a> Walker<'a> {
     ) -> Result<()> {
         let wz = w as usize;
         let hz = h as usize;
-        let cw = (w / 2) as usize;
-        let ch = (h / 2) as usize;
+        let sub_x = self.cctx.sps.sub_width_c();
+        let sub_y = self.cctx.sps.sub_height_c();
+        let cw = (w / sub_x) as usize;
+        let ch = (h / sub_y) as usize;
+        let cx0 = (x0 / sub_x) as i32;
+        let cy0 = (y0 / sub_y) as i32;
+        let cw_i = cw as i32;
+        let ch_i = ch as i32;
 
         let ref0 = if pb.pred_l0 {
             let idx = pb.ref_idx_l0.max(0) as usize;
@@ -1334,25 +1341,29 @@ impl<'a> Walker<'a> {
             )?;
             chroma_mc(
                 ref_pic,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
+                cx0,
+                cy0,
+                cw_i,
+                ch_i,
                 mv,
                 &mut cb_out,
                 0,
                 bd_c,
+                sub_x,
+                sub_y,
             )?;
             chroma_mc(
                 ref_pic,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
+                cx0,
+                cy0,
+                cw_i,
+                ch_i,
                 mv,
                 &mut cr_out,
                 1,
                 bd_c,
+                sub_x,
+                sub_y,
             )?;
         } else {
             let ref_l1 =
@@ -1372,48 +1383,16 @@ impl<'a> Walker<'a> {
             let mut a_cr = vec![0i32; cw * ch];
             let mut b_cr = vec![0i32; cw * ch];
             chroma_mc_hp(
-                ref0,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
-                pb.mv_l0,
-                &mut a_cb,
-                0,
-                bd_c,
+                ref0, cx0, cy0, cw_i, ch_i, pb.mv_l0, &mut a_cb, 0, bd_c, sub_x, sub_y,
             )?;
             chroma_mc_hp(
-                ref_l1,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
-                pb.mv_l1,
-                &mut b_cb,
-                0,
-                bd_c,
+                ref_l1, cx0, cy0, cw_i, ch_i, pb.mv_l1, &mut b_cb, 0, bd_c, sub_x, sub_y,
             )?;
             chroma_mc_hp(
-                ref0,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
-                pb.mv_l0,
-                &mut a_cr,
-                1,
-                bd_c,
+                ref0, cx0, cy0, cw_i, ch_i, pb.mv_l0, &mut a_cr, 1, bd_c, sub_x, sub_y,
             )?;
             chroma_mc_hp(
-                ref_l1,
-                (x0 / 2) as i32,
-                (y0 / 2) as i32,
-                cw as i32,
-                ch as i32,
-                pb.mv_l1,
-                &mut b_cr,
-                1,
-                bd_c,
+                ref_l1, cx0, cy0, cw_i, ch_i, pb.mv_l1, &mut b_cr, 1, bd_c, sub_x, sub_y,
             )?;
 
             let l0_luma = weighted.and_then(|w| w.luma_weight_l0(pb.ref_idx_l0.max(0) as usize));
@@ -1452,8 +1431,8 @@ impl<'a> Walker<'a> {
         }
 
         self.write_rect(x0, y0, wz, hz, &luma_out, true, false);
-        self.write_rect(x0 / 2, y0 / 2, cw, ch, &cb_out, false, false);
-        self.write_rect(x0 / 2, y0 / 2, cw, ch, &cr_out, false, true);
+        self.write_rect(x0 / sub_x, y0 / sub_y, cw, ch, &cb_out, false, false);
+        self.write_rect(x0 / sub_x, y0 / sub_y, cw, ch, &cr_out, false, true);
         self.pic.inter.set_rect(x0, y0, w, h, pb);
         Ok(())
     }

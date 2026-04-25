@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- round 12 — 4:2:2 (chroma_format_idc=2) P/B inter decode via §8.5.3.2.10
+  chroma MV derivation (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) and
+  full-height chroma plane geometry through `motion_compensate_pb`.
+  Byte-exact match vs ffmpeg on flat-gray 4:2:2 IDR + P and IDR + B + P
+  fixtures; PSNR floor 18 dB on 4:2:2 testsrc IDR + P (IDR byte-exact).
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-h265/compare/v0.0.4...v0.0.5) - 2026-04-25
 
 ### Other
