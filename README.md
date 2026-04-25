@@ -71,8 +71,12 @@ signalled (§8.5.3.3.4).
   * **4×4 DST-VII** for intra luma 4×4 blocks.
   * **4×4 / 8×8 / 16×16 / 32×32 DCT-II** — integer basis matrices from
     Tables 8-7 / 8-8, separable 2-D pass (shift 7 → shift 20−bitDepth).
-* **Dequantisation** — flat scaling per §8.6.3 using the `levelScale[]`
-  rem6 table.
+* **Dequantisation** — §8.6.3 with the `levelScale[]` rem6 table. When the
+  active SPS / PPS signals `scaling_list_enabled_flag = 1` (§7.4.5),
+  the `dequantize_with_matrix` path applies the explicit
+  `scaling_list_data()` matrices (or the spec's default Tables 7-5 / 7-6
+  when `scaling_list_pred_matrix_id_delta == 0`); otherwise the
+  flat-quant `m[x][y] = 16` shortcut is used.
 * **Reconstruction** — `clip1Y(pred + residual)` into the 8-bit picture
   buffer.
 
@@ -112,32 +116,50 @@ signalled (§8.5.3.3.4).
   used for intra and are added to the MC prediction (clipped to
   8-bit). 4×4 inter luma uses DCT-II (not DST-VII).
 
+### Loop filters
+
+* **Deblocking filter** (§8.7.2) — implemented. Boundary-strength
+  derivation is a best-effort approximation (see comments in
+  `deblock.rs`); the integration test
+  `hevc_deblock_smptebars_64_psnr` keeps the reconstructed Y plane
+  within a 40 dB floor of the ffmpeg reference (currently >50 dB on
+  `smptebars-64`).
+* **SAO** (§8.7.3) — implemented. Per-CTB params are parsed during the
+  CABAC walk and the EO / BO filter passes are applied after deblocking.
+
+### Bit depths and chroma
+
+* **Main (8-bit)** and **Main 10** are supported for 4:2:0. Higher bit
+  depths (Main 12) and `bit_depth_luma_minus8 != bit_depth_chroma_minus8`
+  surface as `Error::Unsupported`.
+* **Chroma formats other than 4:2:0** — 4:2:2, 4:4:4, monochrome, and
+  `separate_colour_plane_flag = 1` all surface as
+  `Error::Unsupported`.
+
+### Tooling already in scope
+
+* **Tiles** (§6.5.1) — multi-tile streams decode through a per-tile
+  CABAC re-init at each entry-point byte (`hevc_tiles_fixture_decodes`).
+* **Wavefront parallel processing** (§6.3.2) — single-thread WPP
+  re-init from the row-above context snapshot
+  (`hevc_wpp_fixture_decodes`).
+* **Scaling lists** (§7.4.5) — explicit `scaling_list_data()` from the
+  SPS or PPS, plus the spec defaults (Table 7-5 / 7-6) when
+  `scaling_list_pred_matrix_id_delta == 0`. The
+  `dequantize_with_matrix` path is byte-exact against ffmpeg on the
+  intra fixture (`hevc_scaling_lists_intra_64_matches_ffmpeg`).
+
 ### Not yet implemented
 
 * **Asymmetric motion partitions (AMP)** — rejected with
   `Error::Unsupported`.
 * **List modification** — `ref_pic_list_modification()` is rejected.
 * **Long-term reference pictures** — rejected.
-* **Deblocking filter** (§8.7.2) — not yet applied. The reconstructed
-  picture therefore carries visible block-edge artefacts; downstream
-  consumers that need a post-filtered frame need to apply an external
-  deblocker for now.
-* **SAO** (§8.7.3) — the per-CTU SAO parameters are parsed out of the
-  bitstream so the CABAC position stays correct, but the filter itself
-  is not applied.
-* **Bit depths other than 8** — 10-bit / 12-bit streams are rejected
-  with `Error::Unsupported("h265 only 8-bit pixel decode supported")`.
-* **Chroma formats other than 4:2:0** — 4:2:2, 4:4:4, monochrome, and
-  `separate_colour_plane_flag = 1` are all rejected with
-  `Error::Unsupported`.
+* **Bit depths > 10** — Main 12 streams are rejected with
+  `Error::Unsupported("h265 pixel decode limited to bit_depth <= 10")`.
 * **PCM coding units** — `pcm_enabled_flag = 1` streams are rejected.
-* **Scaling lists** — `scaling_list_enabled_flag = 1` streams are
-  rejected (flat dequantisation only).
 * **Transform skip** — rejected.
-* **Tiles / wavefront parallel processing** — single-tile, WPP-off
-  streams only.
 * **Slice segment header extension** bytes past the v1 I-slice path.
-* **Encoder** — this crate only decodes.
 * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 
 ## HEIF / HEIC still images
