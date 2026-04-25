@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame, VideoPlane,
 };

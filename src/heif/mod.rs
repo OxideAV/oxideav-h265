@@ -63,8 +63,8 @@ use oxideav_core::{Error, Frame, Packet, Result, TimeBase, VideoFrame};
 
 use crate::decoder::HevcDecoder;
 use crate::hvcc::{parse_hvcc, HvcConfig};
-use oxideav_codec::Decoder;
 use oxideav_core::CodecId;
+use oxideav_core::Decoder;
 
 mod box_parser;
 mod meta;

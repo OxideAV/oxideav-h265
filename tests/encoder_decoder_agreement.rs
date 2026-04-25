@@ -3,11 +3,11 @@
 //! our own decoder's CABAC consume path for consistent coefficient
 //! interpretation.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
     VideoPlane,
 };
+use oxideav_core::{Decoder, Encoder};
 
 use oxideav_h265::decoder::HevcDecoder;
 use oxideav_h265::encoder::HevcEncoder;

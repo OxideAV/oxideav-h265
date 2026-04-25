@@ -26,7 +26,7 @@
 //! * Any rate control — QP is irrelevant for PCM.
 //!
 //! Wiring: [`register_encoder`] attaches [`make_encoder`] to the codec
-//! registry; [`HevcEncoder`] implements `oxideav_codec::Encoder`.
+//! registry; [`HevcEncoder`] implements `oxideav_core::Encoder`.
 
 pub mod bit_writer;
 pub mod cabac_writer;

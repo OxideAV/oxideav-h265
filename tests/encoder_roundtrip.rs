@@ -5,11 +5,11 @@
 //! `HevcDecoder`, and checks that the reconstruction is within a
 //! reasonable PSNR bound and much smaller than the raw sample budget.
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
     VideoPlane,
 };
+use oxideav_core::{Decoder, Encoder};
 
 use oxideav_h265::decoder::HevcDecoder;
 use oxideav_h265::encoder::HevcEncoder;

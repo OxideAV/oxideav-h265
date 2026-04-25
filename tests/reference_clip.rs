@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{Error, Packet, TimeBase};
 use oxideav_h265::nal::{iter_annex_b, iter_length_prefixed, NalHeader, NalUnitType};
 use oxideav_h265::pps::parse_pps;

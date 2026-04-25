@@ -1,7 +1,7 @@
 //! HEVC decoder glue.
 //!
 //! Ties the parameter-set and slice-header parsers to the CTU pipeline and
-//! exposes an `oxideav_codec::Decoder` implementation. Scope:
+//! exposes an `oxideav_core::Decoder` implementation. Scope:
 //!
 //! * **I, P, and B slices, 8-bit 4:2:0** — full pixel decode. Reconstructed
 //!   luma and chroma are emitted as a `VideoFrame` (pixel format
@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
     VideoPlane,

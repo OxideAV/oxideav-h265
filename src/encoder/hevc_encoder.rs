@@ -1,5 +1,5 @@
 //! `HevcEncoder` — wires the VPS / SPS / PPS / slice emitters into the
-//! `oxideav_codec::Encoder` trait.
+//! `oxideav_core::Encoder` trait.
 //!
 //! Scope:
 //!
@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
     TimeBase,

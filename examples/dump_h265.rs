@@ -2,7 +2,7 @@
 //!
 //! Usage: `cargo run --example dump_h265 > out.h265`
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame, VideoPlane,
 };

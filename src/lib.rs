@@ -115,8 +115,8 @@ pub mod vps;
 #[cfg(feature = "heif")]
 pub mod heif;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Canonical oxideav codec id for H.265 / HEVC.
 pub const CODEC_ID_STR: &str = "h265";
