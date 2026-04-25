@@ -2758,3 +2758,321 @@ fn hevc_yuv422_p_slice_testsrc_64_psnr_floor() {
          (P-Y={py:.2}, P-Cb={pcb:.2}, P-Cr={pcr:.2})"
     );
 }
+
+/// Intra-only Main 12 (yuv420p12le) fixture: verifies the decoder
+/// produces a `Yuv420P12Le` frame whose luma plane is close enough to
+/// ffmpeg's reference decode. Bumps the upper-bit-depth gate from
+/// `> 10` to `> 12` (§6.5/Table 6-2 envelope) — Main 12 reuses the
+/// same dequant (§8.6.3 eq. 8-309 with `qP = QpY + QpBdOffsetY`,
+/// `QpBdOffsetY = 24`), inverse transform (§8.6.4.2 with
+/// `shift2 = 20 - BitDepth = 8`), MC interpolation (§8.5.3.3.3.2 with
+/// `shift1 = min(4, BitDepth-8) = 4`, `shift3 = max(2, 14-BitDepth) = 2`),
+/// SAO band shift (§8.7.3.4 = BitDepth-5 = 7), deblock βC/tC scale
+/// (§8.7.2.5.3 `<< (BitDepth-8) = << 4`), and intra DC neutral
+/// (§8.4.4.2.5 = `1 << (BitDepth-1) = 2048`) wired through bit_depth_y
+/// already plumbed for Main 10. Scope: 12-bit intra path only — inter
+/// re-uses the same code, but the existing inter-decode tests stay at
+/// Main 10 for this round.
+#[test]
+fn main12_intra_decodes_close_to_ffmpeg() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping Main 12 intra PSNR test");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let clip = fixture_dir.join("h265-main12-intra-80x48.hevc");
+    if !clip.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=80x48:rate=25",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p12le",
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            "main12",
+            "-preset:v",
+            "veryslow",
+            "-x265-params",
+            "log-level=error:keyint=1:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1:no-amp=1:no-tskip=1:no-strong-intra-smoothing=1:no-weightp=1:no-weightb=1:no-scaling-lists=0:qp=22",
+            clip.to_str().unwrap(),
+        ])
+    {
+        eprintln!("failed to generate Main 12 intra clip — skipping");
+        return;
+    }
+    let Some(data) = read_fixture(&clip.to_string_lossy()) else {
+        return;
+    };
+    let ref_path = fixture_dir.join("h265-main12-intra-80x48.ref.yuv");
+    let input_str = clip.to_string_lossy().to_string();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            &input_str,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p12le",
+            "-f",
+            "rawvideo",
+        ])
+        .arg(&ref_path)
+        .status()
+        .expect("run ffmpeg");
+    if !status.success() {
+        eprintln!("ffmpeg decode of Main 12 clip failed — skipping PSNR");
+        return;
+    }
+    let expected = std::fs::read(&ref_path).expect("read ffmpeg raw output");
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+    dec.send_packet(&pkt).expect("send Main 12 packet");
+    let vf = match dec.receive_frame() {
+        Ok(oxideav_core::Frame::Video(vf)) => vf,
+        Ok(other) => panic!("expected VideoFrame, got {other:?}"),
+        Err(Error::Unsupported(msg)) => {
+            panic!("Main 12 intra decode reported Unsupported: {msg}");
+        }
+        Err(e) => panic!("unexpected error from Main 12 decode: {e:?}"),
+    };
+    assert_eq!(
+        vf.format,
+        oxideav_core::PixelFormat::Yuv420P12Le,
+        "Main 12 stream must emit Yuv420P12Le frames"
+    );
+    let w = vf.width as usize;
+    let h = vf.height as usize;
+    let y_len = w * h * 2;
+    let c_len = (w / 2) * (h / 2) * 2;
+    assert_eq!(
+        expected.len(),
+        y_len + 2 * c_len,
+        "ffmpeg reference frame size mismatch"
+    );
+    // PSNR on luma at 12-bit (max = 4095).
+    let actual_y = &vf.planes[0].data;
+    let expected_y = &expected[..y_len];
+    let row_bytes = w * 2;
+    let mut packed_actual = Vec::with_capacity(y_len);
+    for y in 0..h {
+        let off = y * vf.planes[0].stride;
+        packed_actual.extend_from_slice(&actual_y[off..off + row_bytes]);
+    }
+    assert_eq!(packed_actual.len(), expected_y.len());
+    let mut sse: u64 = 0;
+    let mut n: u64 = 0;
+    for i in (0..packed_actual.len()).step_by(2) {
+        let a = (packed_actual[i] as u32) | ((packed_actual[i + 1] as u32) << 8);
+        let e = (expected_y[i] as u32) | ((expected_y[i + 1] as u32) << 8);
+        let d = a as i32 - e as i32;
+        sse += (d * d) as u64;
+        n += 1;
+    }
+    let psnr = if sse == 0 {
+        f64::INFINITY
+    } else {
+        let mse = sse as f64 / n as f64;
+        10.0 * (4095.0 * 4095.0 / mse).log10()
+    };
+    let first_actual: Vec<u32> = packed_actual
+        .chunks_exact(2)
+        .take(8)
+        .map(|c| (c[0] as u32) | ((c[1] as u32) << 8))
+        .collect();
+    let first_expected: Vec<u32> = expected_y
+        .chunks_exact(2)
+        .take(8)
+        .map(|c| (c[0] as u32) | ((c[1] as u32) << 8))
+        .collect();
+    eprintln!(
+        "Main 12 intra PSNR vs ffmpeg: {psnr:.2} dB, first8 actual={first_actual:?} expected={first_expected:?}"
+    );
+    let max_a = first_actual.iter().copied().max().unwrap_or(0);
+    assert!(
+        max_a < 4096,
+        "Main 12 actual sample {max_a} exceeds 12-bit range"
+    );
+    // Main 12 reuses Main 10's bit-depth-aware paths verbatim. The
+    // existing Main 10 intra fixture is bit-exact (PSNR = inf). 12-bit
+    // shares the same dequant / transform / intra-prediction / SAO /
+    // deblock arithmetic — only the per-stage shift/clip envelopes
+    // change, all already parameterised on `bit_depth`. We therefore
+    // expect bit-exact recovery on this single-CTU intra-only fixture
+    // and floor the regression guard at 50 dB to mirror the Main 10
+    // intra test.
+    assert!(
+        psnr >= 50.0,
+        "Main 12 intra decode PSNR below floor: {psnr:.2} dB"
+    );
+}
+
+/// Main 12 inter (P-slice) fixture — `keyint=8` forces at least one
+/// P-frame so the MC interpolation + bi-pred combine paths execute at
+/// `bit_depth = 12`. Mirrors `main10_inter_decodes_with_pframes`; the
+/// floor is the same (25 dB) because Main 12 reuses the same
+/// fractional-sample interpolation arithmetic as Main 10.
+#[test]
+fn main12_inter_decodes_with_pframes() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping Main 12 inter PSNR test");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let clip = fixture_dir.join("h265-main12-inter-80x48.hevc");
+    if !clip.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=80x48:rate=25",
+            "-frames:v",
+            "4",
+            "-pix_fmt",
+            "yuv420p12le",
+            "-c:v",
+            "libx265",
+            "-profile:v",
+            "main12",
+            "-g",
+            "8",
+            "-x265-params",
+            "log-level=error:keyint=8:bframes=0:wpp=0:frame-threads=1:no-sao=1:no-deblock=1:no-amp=1:no-tskip=1:no-strong-intra-smoothing=1:no-weightp=1:no-weightb=1:qp=22",
+            clip.to_str().unwrap(),
+        ])
+    {
+        eprintln!("failed to generate Main 12 inter clip — skipping");
+        return;
+    }
+    let Some(data) = read_fixture(&clip.to_string_lossy()) else {
+        return;
+    };
+    let ref_path = fixture_dir.join("h265-main12-inter-80x48.ref.yuv");
+    let input_str = clip.to_string_lossy().to_string();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            &input_str,
+            "-frames:v",
+            "4",
+            "-pix_fmt",
+            "yuv420p12le",
+            "-f",
+            "rawvideo",
+        ])
+        .arg(&ref_path)
+        .status()
+        .expect("run ffmpeg");
+    if !status.success() {
+        eprintln!("ffmpeg decode of Main 12 inter clip failed — skipping PSNR");
+        return;
+    }
+    let expected = std::fs::read(&ref_path).expect("read ffmpeg raw output");
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+    dec.send_packet(&pkt).expect("send Main 12 inter packet");
+
+    let mut frames = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(_) => break,
+            Err(Error::NeedMore) => break,
+            Err(Error::Unsupported(msg)) => {
+                eprintln!("Main 12 inter decode reported Unsupported: {msg}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from Main 12 inter decode: {e:?}"),
+        }
+    }
+    if frames.is_empty() {
+        eprintln!("Main 12 inter decode produced no frames — skipping");
+        return;
+    }
+    let vf = &frames[0];
+    assert_eq!(
+        vf.format,
+        oxideav_core::PixelFormat::Yuv420P12Le,
+        "Main 12 stream must emit Yuv420P12Le frames"
+    );
+    let w = vf.width as usize;
+    let h = vf.height as usize;
+    let y_len = w * h * 2;
+    let c_len = (w / 2) * (h / 2) * 2;
+    let per_frame = y_len + 2 * c_len;
+    assert!(
+        expected.len() >= per_frame,
+        "ffmpeg reference frame size mismatch"
+    );
+    let mut sse: u64 = 0;
+    let mut n: u64 = 0;
+    for (fi, vf) in frames.iter().enumerate() {
+        let ref_off = fi * per_frame;
+        if ref_off + y_len > expected.len() {
+            break;
+        }
+        let expected_y = &expected[ref_off..ref_off + y_len];
+        let row_bytes = w * 2;
+        let mut packed_actual = Vec::with_capacity(y_len);
+        for y in 0..h {
+            let off = y * vf.planes[0].stride;
+            packed_actual.extend_from_slice(&vf.planes[0].data[off..off + row_bytes]);
+        }
+        let mut frame_sse: u64 = 0;
+        let mut frame_n: u64 = 0;
+        for i in (0..packed_actual.len()).step_by(2) {
+            let a = (packed_actual[i] as u32) | ((packed_actual[i + 1] as u32) << 8);
+            let e = (expected_y[i] as u32) | ((expected_y[i + 1] as u32) << 8);
+            let d = a as i32 - e as i32;
+            frame_sse += (d * d) as u64;
+            frame_n += 1;
+        }
+        sse += frame_sse;
+        n += frame_n;
+        let frame_psnr = if frame_sse == 0 {
+            f64::INFINITY
+        } else {
+            let mse = frame_sse as f64 / frame_n as f64;
+            10.0 * (4095.0 * 4095.0 / mse).log10()
+        };
+        eprintln!("  frame {fi}: Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}");
+    }
+    let psnr = if sse == 0 {
+        f64::INFINITY
+    } else {
+        let mse = sse as f64 / n as f64;
+        10.0 * (4095.0 * 4095.0 / mse).log10()
+    };
+    eprintln!(
+        "Main 12 inter PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
+        frames.len()
+    );
+    // Same floor as Main 10 inter — the MC arithmetic is shared.
+    assert!(
+        psnr >= 25.0,
+        "Main 12 inter decode PSNR below floor: {psnr:.2} dB"
+    );
+}

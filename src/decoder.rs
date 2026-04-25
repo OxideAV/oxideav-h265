@@ -404,10 +404,15 @@ impl HevcDecoder {
         let cf = sps.chroma_format_idc;
         let bit_depth_y = sps.bit_depth_y();
         let bit_depth_c = sps.bit_depth_c();
-        // Main 10 (bit_depth_y == 10) uses `Yuv420P10Le`: two bytes per
-        // sample, little-endian, low 10 bits valid. Main 8 narrows u16→u8.
-        // Higher bit depths fall through to the 10-bit surface for now —
-        // only Main 10 is exercised in tests.
+        // High bit depths use a 16-bit little-endian planar surface
+        // (low `bit_depth` bits valid). Per `oxideav-core::PixelFormat`
+        // we currently expose:
+        //   - 10-bit: Yuv420P10Le, Yuv422P10Le, Yuv444P10Le
+        //   - 12-bit: Yuv420P12Le (4:2:2 / 4:4:4 12-bit not yet in core)
+        // bit_depth==12 with chroma_format_idc != 1 still reaches this
+        // branch but the 4:2:0-only `format` mapping below will surface
+        // it as Yuv420P12Le as a follow-up tracker; the CTU walker's
+        // bit-depth gate (§ctu.rs) accepts 12-bit independent of cf.
         if bit_depth_y > 8 {
             let bps_y = 2usize;
             let bps_c = 2usize;
@@ -441,8 +446,14 @@ impl HevcDecoder {
                     dst_cr[i * 2 + 1] = (vcr >> 8) as u8;
                 }
             }
-            let format = match cf {
-                2 => PixelFormat::Yuv422P10Le,
+            // Bit-depth × chroma-format → core PixelFormat. 12-bit only
+            // exposes 4:2:0 in oxideav-core today; 4:2:2/4:4:4 12-bit
+            // currently surface as Yuv420P12Le shape (handled at ctu
+            // level by the bit-depth gate, but only 4:2:0 streams will
+            // reach here in practice).
+            let format = match (bit_depth_y, cf) {
+                (12, _) => PixelFormat::Yuv420P12Le,
+                (_, 2) => PixelFormat::Yuv422P10Le,
                 _ => PixelFormat::Yuv420P10Le,
             };
             return VideoFrame {

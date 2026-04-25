@@ -370,13 +370,19 @@ pub fn decode_slice_ctus(
     // (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) inside `chroma_mc` /
     // `chroma_mc_hp`, plus full-height chroma plane geometry plumbed
     // through `motion_compensate_pb`.
-    // 8-bit (Main) and 10-bit (Main 10) are both supported. Higher bit
-    // depths (Main 12 / Main 4:2:2 10-bit etc.) have not been validated so
-    // surface them as a clean unsupported error rather than producing
-    // garbage reconstructions.
-    if cctx.sps.bit_depth_y() > 10 || cctx.sps.bit_depth_c() > 10 {
+    // 8-bit (Main), 10-bit (Main 10), and 12-bit (Main 12) are supported.
+    // The arithmetic in dequant (§8.6.3 eq. 8-309), inverse transform
+    // (§8.6.4.2 shift = 20 - BitDepth), MC interpolation (§8.5.3.3.3.2
+    // shift1 = min(4, BitDepth-8), shift3 = max(2, 14-BitDepth)), bi-pred
+    // combine (§8.5.3.3.4.2 shift = max(3, 15-BitDepth)), deblock βC/tC
+    // table scale (§8.7.2.5.3), SAO band shift (§8.7.3.4 = BitDepth-5),
+    // and intra DC neutral (§8.4.4.2.5) all consume `bit_depth` from the
+    // SPS, so 12-bit needs no per-stage code change beyond lifting this
+    // gate. Bit depths above 12 stay rejected — Main 16 and 4:4:4
+    // intra/inter Rext profiles are out of scope.
+    if cctx.sps.bit_depth_y() > 12 || cctx.sps.bit_depth_c() > 12 {
         return Err(Error::unsupported(
-            "h265 pixel decode limited to bit_depth <= 10",
+            "h265 pixel decode limited to bit_depth <= 12",
         ));
     }
     if cctx.sps.bit_depth_y() != cctx.sps.bit_depth_c() {
@@ -384,9 +390,19 @@ pub fn decode_slice_ctus(
             "h265 pixel decode requires matching luma/chroma bit depth",
         ));
     }
+    // 12-bit currently only has a 4:2:0 surface in oxideav-core
+    // (`Yuv420P12Le`); 4:2:2 / 4:4:4 12-bit pixel formats are not yet
+    // exposed there. Reject those combinations cleanly so the decoder
+    // never emits a frame whose `format` is incompatible with the
+    // sample geometry. 10-bit and 8-bit cover all three chroma formats.
+    if cctx.sps.bit_depth_y() == 12 && cctx.sps.chroma_format_idc != 1 {
+        return Err(Error::unsupported(
+            "h265 12-bit decode currently limited to 4:2:0 (chroma_format_idc=1)",
+        ));
+    }
     // Inter motion compensation (§8.5.3.3) clips at Clip1Y/Clip1C using
-    // `bit_depth` from the SPS, so Main 10 P/B slices now share the MC
-    // path with Main. Higher bit depths (>10) are rejected above.
+    // `bit_depth` from the SPS, so Main 10/12 P/B slices share the MC
+    // path with Main. Higher bit depths (>12) are rejected above.
     // Note: SAO parameters are parsed per-CTU (see decode_sao) into
     // `pic.sao_grid`; the post-decode filter (§8.7.3) runs from
     // `decoder::decode_*_slice` after deblocking. Deblocking (§8.7.2)
