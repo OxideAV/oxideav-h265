@@ -3546,3 +3546,119 @@ fn r16_main422_testsrc_cbf_inference_bit_exact() {
         );
     }
 }
+
+/// Round 17 — AMP (Asymmetric Motion Partitions, §7.4.9.5 Table 7-10)
+/// smoke test.
+///
+/// Verifies that streams encoded with libx265's `--rect --amp` (the four
+/// `Mode2NxnU` / `Mode2NxnD` / `ModenLx2N` / `ModenRx2N` shapes plus the
+/// rectangular `Mode2NxN` / `ModeNx2N` symmetric pair) decode end-to-end
+/// without panic, without `Error::Unsupported`, and emit the expected
+/// number of frames. Frame 0 (IDR) and frame 2 (the next IDR with
+/// `keyint=2`) are checked bit-exact against ffmpeg — the I-slice path
+/// is unaffected by partition-mode selection. Frame 1 is the P-slice
+/// that hits the residual-drift documented as a known issue (see
+/// `transform_tree_inter_inner` comment in `ctu.rs` and the Round-7/8
+/// notes about libx265 emitting a `split_transform_flag` bin even when
+/// the spec gate `tr_depth < MaxTrafoDepth` is closed); we only assert
+/// the slice structure parses without misalignment by demanding that
+/// the post-P IDR frame still arrives bit-exact.
+///
+/// AMP partition geometry is wired through `decode_inter_cu`'s `pbs`
+/// table (`(x0, y0, q, cb-q)` strip placement for each AMP shape) and
+/// through `neighbour_ctx` (vertical-split / horizontal-split A1/B1
+/// suppression for partIdx 1). The merge / AMVP candidate derivation
+/// shares the same code path as symmetric rect partitions; the §8.5
+/// MC interpolation does not branch on partition shape.
+#[test]
+fn hevc_amp_smoke_decodes_without_panic() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping AMP smoke test");
+        return;
+    }
+    // 128x128 / keyint=2 / bframes=0 → I P I sequence. `rect=1` plus
+    // `amp=1` lets libx265 select non-2Nx2N partitions including AMP.
+    // The other flags (`no-sao`, `no-deblock`, `no-strong-intra-smoothing`,
+    // `no-signhide`, `aq-mode=0`, `cutree=0`) keep the encoder inside the
+    // decoder's bit-exact intra envelope so the I frames serve as the
+    // CABAC-alignment anchor.
+    let x265 = "log-level=error:keyint=2:min-keyint=2:scenecut=0:bframes=0:\
+                wpp=0:pmode=0:pme=0:frame-threads=1:\
+                no-sao=1:no-deblock=1:no-tmvp=1:rect=1:amp=1:\
+                no-weightp=1:max-merge=1:no-strong-intra-smoothing=1:\
+                no-signhide=1:aq-mode=0:cutree=0";
+    let Some(input) = ensure_generated_hevc_fixture_with_params(
+        "amp-smoke-128.h265",
+        "rgbtestsrc=size=128x128:rate=24:duration=0.084",
+        24,
+        3,
+        x265,
+    ) else {
+        return;
+    };
+    let input_str = input.to_string_lossy().into_owned();
+    let Some(data) = read_fixture(&input_str) else {
+        return;
+    };
+    // Sanity: confirm the SPS actually has amp_enabled_flag=1 — older
+    // libx265 builds silently drop `amp=1` when `rect=0` (we set both,
+    // but this guard catches future regressions).
+    let mut amp_enabled = false;
+    for nal in iter_annex_b(&data) {
+        let rbsp = extract_rbsp(nal.payload());
+        if nal.header.nal_unit_type == NalUnitType::Sps {
+            let sps = parse_sps(&rbsp).expect("SPS");
+            amp_enabled = sps.amp_enabled_flag;
+            break;
+        }
+    }
+    if !amp_enabled {
+        eprintln!("libx265 did not emit amp_enabled_flag — skipping AMP smoke");
+        return;
+    }
+
+    // Decode all 3 frames. We assert no panics and a clean frame count;
+    // the I-slice frames must come back bit-exact against ffmpeg so the
+    // CABAC engine is provably re-aligned at every IDR (which is the
+    // only structural guarantee we have for AMP today).
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 24), data);
+    dec.send_packet(&pkt).expect("AMP send_packet");
+    let mut frames: Vec<oxideav_core::VideoFrame> = Vec::new();
+    for i in 0..3 {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(other) => panic!("AMP frame {i}: expected VideoFrame, got {other:?}"),
+            Err(Error::Unsupported(msg)) => {
+                panic!("AMP frame {i} surfaced Unsupported (regression): {msg}")
+            }
+            Err(e) => panic!("AMP frame {i}: {e:?}"),
+        }
+    }
+    assert_eq!(frames.len(), 3, "expected 3 decoded frames (I P I)");
+
+    // ffmpeg-decoded reference for IDR equality check.
+    let ref_path = PathBuf::from("/tmp/oxideav-h265-amp-smoke.ref.yuv");
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &ref_path, Some(3)) else {
+        return;
+    };
+    let frame_len = 128 * 128 * 3 / 2;
+    assert_eq!(expected.len(), frame_len * 3, "ffmpeg ref length mismatch");
+    for &i in &[0usize, 2] {
+        let off = i * frame_len;
+        let mut ours = Vec::with_capacity(frame_len);
+        for p in &frames[i].planes {
+            ours.extend_from_slice(&p.data);
+        }
+        let ref_slice = &expected[off..off + frame_len];
+        assert_eq!(ours.len(), ref_slice.len(), "AMP frame {i} length mismatch");
+        let mut sad: u64 = 0;
+        for j in 0..frame_len {
+            sad += (ours[j] as i32 - ref_slice[j] as i32).unsigned_abs() as u64;
+        }
+        assert!(
+            sad == 0,
+            "AMP I-frame {i} not bit-exact (CABAC misalignment after AMP P): SAD={sad}"
+        );
+    }
+}

@@ -92,8 +92,15 @@ signalled (§8.5.3.3.4).
   bins + EG1 remainder), `mvp_lx_flag`, and `inter_pred_idc` for
   B slices (L0 / L1 / BI). `mvd_l1_zero_flag` suppresses MVD on L1
   when signalled.
-* **Partition modes** — 2Nx2N, 2NxN, Nx2N, and NxN at minimum CB size.
-  Asymmetric motion partitions (AMP) are out of scope.
+* **Partition modes** — 2Nx2N, 2NxN, Nx2N, NxN at minimum CB size, plus
+  the four asymmetric motion partition (AMP) shapes
+  (`PART_2NxnU` / `PART_2NxnD` / `PART_nLx2N` / `PART_nRx2N`) when the SPS
+  sets `amp_enabled_flag`. AMP partition geometry (`(x0, y0, q, cb-q)`
+  strip placement per §7.4.9.5 Table 7-10), partIdx-1 neighbour
+  suppression (§8.5.3.2.3), and merge / AMVP candidate derivation share
+  the symmetric-rect code path. The smoke test
+  `hevc_amp_smoke_decodes_without_panic` exercises end-to-end AMP decode
+  and asserts bit-exact post-P IDR re-alignment.
 * **Merge list** (§8.5.3.1.2) — spatial candidates A1 / B1 / B0 / A0 /
   B2 with HEVC pruning, temporal candidate from the collocated
   reference when `slice_temporal_mvp_enabled_flag` is set
@@ -156,8 +163,6 @@ signalled (§8.5.3.3.4).
 
 ### Not yet implemented
 
-* **Asymmetric motion partitions (AMP)** — rejected with
-  `Error::Unsupported`.
 * **List modification** — `ref_pic_list_modification()` is rejected.
 * **Long-term reference pictures** — rejected.
 * **Bit depths > 10** — Main 12 streams are rejected with

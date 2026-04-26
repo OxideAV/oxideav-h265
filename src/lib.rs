@@ -33,8 +33,19 @@
 //!   SubHeightC`). 4:4:4 / 4:0:0 / `separate_colour_plane` all rejected
 //!   with a clean `Error::Unsupported`.
 //! * Single-tile, wavefront-off.
-//! * **I, P, and B slices.** Inter PB shapes are limited to
-//!   2Nx2N / 2NxN / Nx2N / NxN (no AMP).
+//! * **I, P, and B slices.** Inter PB shapes: 2Nx2N / 2NxN / Nx2N / NxN
+//!   (the four symmetric Table 7-10 partitions) plus the four AMP shapes
+//!   (`Mode2NxnU` / `Mode2NxnD` / `ModenLx2N` / `ModenRx2N`) when the SPS
+//!   sets `amp_enabled_flag`. AMP partition geometry, neighbour-context
+//!   suppression for partIdx 1, and the merge / AMVP candidate
+//!   derivation share the symmetric-rect code path. The §7.4.9.10
+//!   `interSplitFlag` interaction with non-2Nx2N inter CUs at
+//!   `max_transform_hierarchy_depth_inter == 0` follows libx265's
+//!   empirical bin-emission (round-7/8 investigation) — see the
+//!   `transform_tree_inter_inner` comment in `ctu.rs` for the full
+//!   trade-off; some content-dependent P-slice drift remains on
+//!   non-trivial fixtures (the existing tests use loose
+//!   "frame-changes-after-P" assertions on this path).
 //!
 //! ## Out of scope
 //!
