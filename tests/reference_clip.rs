@@ -1580,6 +1580,18 @@ fn hevc_scaling_lists_inter_64_decodes() {
 /// (cross-CTU regressions also affect tile boundaries), so we only
 /// demand the decoder either produces a plausible frame or bails with
 /// Unsupported — a panic or invalid-bitstream error fails the test.
+///
+/// Round-19 audit caveat: most homebrew/Mac libx265 builds don't expose
+/// the `tiles=NxM` x265-param at all (no `--tiles` CLI option, no
+/// `params->tiles*` API surfaced through libavcodec on those builds).
+/// In that case `tiles_enabled_flag` stays `false` in the produced
+/// bitstream and this test reduces to a no-op early-return — and the
+/// per-tile CABAC re-init path in `decode_slice_ctus` never gets
+/// exercised by integration tests. To unblock real tile-pixel auditing
+/// we'd need a tile-capable encoder (HM `TAppEncoder`, Kvazaar with
+/// `--tiles`, or a libx265 build compiled with the (Linux-only) tile
+/// hooks enabled). Until then, the unit tests in `pps::tests::tile_*`
+/// keep the `TileInfo` parser honest at the syntax level only.
 #[test]
 fn hevc_tiles_fixture_decodes() {
     // 640x480 at 64-wide CTBs → 10x8 CTBs, big enough that libx265 will
@@ -1631,9 +1643,14 @@ fn hevc_tiles_fixture_decodes() {
         }
     }
     if !tiles_checked {
-        // libx265 in some builds silently ignores `tiles=NxM` and emits a
-        // single-tile stream. Nothing more we can check; the PPS/slice
-        // parse path is exercised by the unit tests.
+        // See the audit caveat above: libx265 here is silently dropping
+        // `tiles=NxM`. This is reported once per test invocation so the
+        // skipped-coverage situation is visible rather than silent.
+        eprintln!(
+            "TILE AUDIT SKIPPED: encoder produced a single-tile stream \
+             (tiles=2x2 ignored by this libx265 build); per-tile CABAC \
+             re-init in decode_slice_ctus is NOT exercised by this test"
+        );
         return;
     }
 
@@ -1722,6 +1739,113 @@ fn hevc_wpp_fixture_decodes() {
         Err(Error::Unsupported(_)) => {}
         Err(e) => panic!("wpp fixture receive_frame failed: {e:?}"),
     }
+}
+
+/// Round-19 audit: real-bitstream WPP PSNR vs the matching non-WPP
+/// stream. WPP (§6.3.2) introduces sub-stream entry points and CABAC
+/// context inheritance from the row above's second CTU (§9.3.2.4); a
+/// regression in either piece silently corrupts CTU rows >= 1.
+///
+/// The audit is paired: a WPP and a no-WPP build of the SAME source
+/// are decoded and PSNR-compared against a per-stream ffmpeg reference.
+/// Since libx265 may make different mode-decision choices when wpp is
+/// toggled, we don't expect identical outputs, but we DO require:
+///
+/// - the WPP stream's PSNR to be at least within `WPP_TOLERANCE_DB`
+///   of the no-WPP stream's PSNR (a regression in the WPP code path
+///   would crater the WPP PSNR while leaving the no-WPP one alone),
+/// - and a hard floor of `WPP_PSNR_FLOOR_DB` on the WPP stream itself
+///   so that pathological WPP decode bugs (CABAC desync, mis-seeded
+///   contexts) cannot hide behind already-imperfect baseline decode.
+///
+/// Empirical (round-19): WPP=24.36 dB, no-WPP=22.17 dB, fresh-init-only
+/// WPP variant collapses to 9.66 dB. The floor was chosen to be safely
+/// above the broken-WPP regime and just below the empirical baseline.
+#[test]
+fn hevc_wpp_psnr_audit() {
+    if !ffmpeg_available() {
+        return;
+    }
+    const WPP_PSNR_FLOOR_DB: f64 = 18.0;
+    const WPP_TOLERANCE_DB: f64 = 6.0;
+    let common = "log-level=error:keyint=1:min-keyint=1:scenecut=0:bframes=0:\
+                  pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1";
+    let wpp_params = format!("{common}:wpp=1");
+    let nowpp_params = format!("{common}:wpp=0");
+    let lavfi = "testsrc=size=256x192:rate=1:duration=1";
+    let Some(wpp_path) = ensure_generated_hevc_fixture_with_params(
+        "audit-wpp-256x192.h265",
+        lavfi,
+        1,
+        1,
+        &wpp_params,
+    ) else {
+        return;
+    };
+    let Some(nowpp_path) = ensure_generated_hevc_fixture_with_params(
+        "audit-nowpp-256x192.h265",
+        lavfi,
+        1,
+        1,
+        &nowpp_params,
+    ) else {
+        return;
+    };
+
+    // Confirm the WPP fixture really has WPP turned on. Some toolchains
+    // ignore `wpp=1`; in that case we cannot run the audit.
+    let wpp_data = read_fixture(&wpp_path.to_string_lossy()).expect("read wpp");
+    let nowpp_data = read_fixture(&nowpp_path.to_string_lossy()).expect("read nowpp");
+    let mut wpp_on = false;
+    let mut sps_opt: Option<_> = None;
+    let mut pps_opt: Option<oxideav_h265::pps::PicParameterSet> = None;
+    for nal in iter_annex_b(&wpp_data) {
+        let rbsp = extract_rbsp(nal.payload());
+        match nal.header.nal_unit_type {
+            NalUnitType::Sps => sps_opt = Some(parse_sps(&rbsp).expect("SPS")),
+            NalUnitType::Pps => {
+                let p = parse_pps(&rbsp).expect("PPS");
+                wpp_on = p.entropy_coding_sync_enabled_flag;
+                pps_opt = Some(p);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(sps_opt.is_some(), "wpp fixture missing SPS");
+    assert!(pps_opt.is_some(), "wpp fixture missing PPS");
+    if !wpp_on {
+        eprintln!("encoder ignored wpp=1 — skipping WPP PSNR audit");
+        return;
+    }
+
+    let ref_path = generated_fixture_dir().join("audit-wpp-256x192.ref.yuv");
+    let nowpp_ref_path = generated_fixture_dir().join("audit-nowpp-256x192.ref.yuv");
+    let Some(wpp_ref) = ffmpeg_decode_raw(wpp_path.to_str().unwrap(), &ref_path, Some(1)) else {
+        return;
+    };
+    let Some(nowpp_ref) = ffmpeg_decode_raw(nowpp_path.to_str().unwrap(), &nowpp_ref_path, Some(1))
+    else {
+        return;
+    };
+
+    let frames_wpp = decode_all_video_frames(wpp_data, 1);
+    let frames_nowpp = decode_all_video_frames(nowpp_data, 1);
+    let actual_wpp = flatten_yuv420_frames(&frames_wpp);
+    let actual_nowpp = flatten_yuv420_frames(&frames_nowpp);
+    assert_eq!(actual_wpp.len(), wpp_ref.len(), "wpp size mismatch");
+    assert_eq!(actual_nowpp.len(), nowpp_ref.len(), "nowpp size mismatch");
+    let psnr_wpp = y_plane_psnr_db(&actual_wpp, &wpp_ref, 256, 192, 1);
+    let psnr_nowpp = y_plane_psnr_db(&actual_nowpp, &nowpp_ref, 256, 192, 1);
+    eprintln!("WPP PSNR audit: wpp={psnr_wpp:.2} dB, nowpp={psnr_nowpp:.2} dB");
+    assert!(
+        psnr_wpp >= WPP_PSNR_FLOOR_DB,
+        "WPP decode collapsed below floor: wpp={psnr_wpp:.2} dB < {WPP_PSNR_FLOOR_DB} dB",
+    );
+    assert!(
+        psnr_wpp + WPP_TOLERANCE_DB >= psnr_nowpp,
+        "WPP decode lags non-WPP by more than {WPP_TOLERANCE_DB} dB: wpp={psnr_wpp:.2} dB, nowpp={psnr_nowpp:.2} dB",
+    );
 }
 
 /// Main10 (yuv420p10le) fixture: verifies the SPS parser accepts

@@ -4122,4 +4122,110 @@ mod tests {
     fn read_fl_bits_zero_width() {
         assert_eq!(read_fl_bits(&[], 0, 0, 0), Some(0));
     }
+
+    /// Round-19 audit: with no PPS tile_info, TilePlan collapses to one
+    /// tile spanning the whole picture (§6.5.1).
+    #[test]
+    fn tile_plan_single_tile_when_no_tile_info() {
+        let pps = crate::pps::PicParameterSet {
+            pps_pic_parameter_set_id: 0,
+            pps_seq_parameter_set_id: 0,
+            dependent_slice_segments_enabled_flag: false,
+            output_flag_present_flag: false,
+            num_extra_slice_header_bits: 0,
+            sign_data_hiding_enabled_flag: false,
+            cabac_init_present_flag: false,
+            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l1_default_active_minus1: 0,
+            init_qp_minus26: 0,
+            constrained_intra_pred_flag: false,
+            transform_skip_enabled_flag: false,
+            cu_qp_delta_enabled_flag: false,
+            diff_cu_qp_delta_depth: 0,
+            pps_cb_qp_offset: 0,
+            pps_cr_qp_offset: 0,
+            pps_slice_chroma_qp_offsets_present_flag: false,
+            weighted_pred_flag: false,
+            weighted_bipred_flag: false,
+            transquant_bypass_enabled_flag: false,
+            tiles_enabled_flag: false,
+            entropy_coding_sync_enabled_flag: false,
+            tile_info: None,
+            pps_loop_filter_across_slices_enabled_flag: true,
+            deblocking_filter_control_present_flag: false,
+            deblocking_filter_override_enabled_flag: false,
+            pps_deblocking_filter_disabled_flag: false,
+            pps_beta_offset_div2: 0,
+            pps_tc_offset_div2: 0,
+            pps_scaling_list_data_present_flag: false,
+            scaling_list_data: None,
+            lists_modification_present_flag: false,
+            log2_parallel_merge_level_minus2: 0,
+            slice_segment_header_extension_present_flag: false,
+        };
+        let plan = TilePlan::build(&pps, 10, 8);
+        assert_eq!(plan.num_tiles(), 1);
+        assert_eq!(plan.tile_bounds(0), (0, 0, 10, 8));
+    }
+
+    /// Round-19 audit: with a uniform 2x2 PPS tile_info on a 10x8 CTB
+    /// picture, the resulting tile plan splits into a 5+5 columns by
+    /// 4+4 rows grid (§6.5.1, Table 6-1 uniform spacing rule).
+    #[test]
+    fn tile_plan_uniform_2x2_split() {
+        let ti = crate::pps::TileInfo {
+            num_tile_columns_minus1: 1,
+            num_tile_rows_minus1: 1,
+            uniform_spacing_flag: true,
+            column_width_minus1: vec![],
+            row_height_minus1: vec![],
+            loop_filter_across_tiles_enabled_flag: true,
+        };
+        let pps = crate::pps::PicParameterSet {
+            tiles_enabled_flag: true,
+            tile_info: Some(ti),
+            ..crate::pps::PicParameterSet {
+                pps_pic_parameter_set_id: 0,
+                pps_seq_parameter_set_id: 0,
+                dependent_slice_segments_enabled_flag: false,
+                output_flag_present_flag: false,
+                num_extra_slice_header_bits: 0,
+                sign_data_hiding_enabled_flag: false,
+                cabac_init_present_flag: false,
+                num_ref_idx_l0_default_active_minus1: 0,
+                num_ref_idx_l1_default_active_minus1: 0,
+                init_qp_minus26: 0,
+                constrained_intra_pred_flag: false,
+                transform_skip_enabled_flag: false,
+                cu_qp_delta_enabled_flag: false,
+                diff_cu_qp_delta_depth: 0,
+                pps_cb_qp_offset: 0,
+                pps_cr_qp_offset: 0,
+                pps_slice_chroma_qp_offsets_present_flag: false,
+                weighted_pred_flag: false,
+                weighted_bipred_flag: false,
+                transquant_bypass_enabled_flag: false,
+                tiles_enabled_flag: false,
+                entropy_coding_sync_enabled_flag: false,
+                tile_info: None,
+                pps_loop_filter_across_slices_enabled_flag: true,
+                deblocking_filter_control_present_flag: false,
+                deblocking_filter_override_enabled_flag: false,
+                pps_deblocking_filter_disabled_flag: false,
+                pps_beta_offset_div2: 0,
+                pps_tc_offset_div2: 0,
+                pps_scaling_list_data_present_flag: false,
+                scaling_list_data: None,
+                lists_modification_present_flag: false,
+                log2_parallel_merge_level_minus2: 0,
+                slice_segment_header_extension_present_flag: false,
+            }
+        };
+        let plan = TilePlan::build(&pps, 10, 8);
+        assert_eq!(plan.num_tiles(), 4);
+        assert_eq!(plan.tile_bounds(0), (0, 0, 5, 4));
+        assert_eq!(plan.tile_bounds(1), (5, 0, 5, 4));
+        assert_eq!(plan.tile_bounds(2), (0, 4, 5, 4));
+        assert_eq!(plan.tile_bounds(3), (5, 4, 5, 4));
+    }
 }
