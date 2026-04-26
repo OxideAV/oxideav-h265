@@ -27,11 +27,7 @@ fn make_gradient(w: u32, h: u32, offset: i32) -> VideoFrame {
     let cw = (w / 2) as usize;
     let ch = (h / 2) as usize;
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -49,15 +45,15 @@ fn make_gradient(w: u32, h: u32, offset: i32) -> VideoFrame {
     }
 }
 
-fn psnr_y(src: &VideoFrame, dec: &VideoFrame) -> f64 {
+fn psnr_y(src: &VideoFrame, dec: &VideoFrame, w: u32, h: u32) -> f64 {
     let ss = src.planes[0].stride;
     let ds = dec.planes[0].stride;
     let src_y = &src.planes[0].data;
     let dec_y = &dec.planes[0].data;
     let mut sse: u64 = 0;
-    let n = (src.width * src.height) as u64;
-    for yy in 0..src.height as usize {
-        for xx in 0..src.width as usize {
+    let n = (w * h) as u64;
+    for yy in 0..h as usize {
+        for xx in 0..w as usize {
             let s = src_y[yy * ss + xx] as i64;
             let d = dec_y[yy * ds + xx] as i64;
             let diff = s - d;
@@ -112,9 +108,9 @@ fn i_plus_p_roundtrip_through_our_decoder() {
         }
     }
 
-    let p0 = psnr_y(&f0, &frames[0]);
-    let p1 = psnr_y(&f1, &frames[1]);
-    let p2 = psnr_y(&f2, &frames[2]);
+    let p0 = psnr_y(&f0, &frames[0], w, h);
+    let p1 = psnr_y(&f1, &frames[1], w, h);
+    let p2 = psnr_y(&f2, &frames[2], w, h);
     eprintln!("IPP psnr: f0={p0:.2} f1={p1:.2} f2={p2:.2}");
     assert!(p0 > 30.0, "I-frame PSNR too low: {p0:.2}");
     assert!(p1 > 25.0, "P-frame 1 PSNR too low: {p1:.2}");

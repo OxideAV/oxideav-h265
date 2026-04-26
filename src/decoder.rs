@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame,
     VideoPlane,
 };
 
@@ -51,7 +51,6 @@ pub struct HevcDecoder {
     pending: VecDeque<VideoFrame>,
     eof: bool,
     last_pts: Option<i64>,
-    last_time_base: TimeBase,
     /// Decoded picture buffer holding previously decoded reference pictures.
     dpb: Dpb,
     /// Running POC of the previous picture (§8.3.1).
@@ -71,7 +70,6 @@ impl HevcDecoder {
             pending: VecDeque::new(),
             eof: false,
             last_pts: None,
-            last_time_base: TimeBase::new(1, 1),
             dpb: Dpb::new(8),
             prev_poc_msb: 0,
             prev_poc_lsb: 0,
@@ -447,25 +445,12 @@ impl HevcDecoder {
                     dst_cr[i * 2 + 1] = (vcr >> 8) as u8;
                 }
             }
-            // Bit-depth × chroma-format → core PixelFormat. Both 10-bit
-            // and 12-bit have a full 4:2:0 / 4:2:2 / 4:4:4 surface in
-            // oxideav-core; the active CTU-level gate restricts cf to
-            // {1, 2} today so 4:4:4 entries below are unreachable but
-            // harmless (kept for symmetry).
-            let format = match (bit_depth_y, cf) {
-                (12, 3) => PixelFormat::Yuv444P12Le,
-                (12, 2) => PixelFormat::Yuv422P12Le,
-                (12, _) => PixelFormat::Yuv420P12Le,
-                (_, 3) => PixelFormat::Yuv444P10Le,
-                (_, 2) => PixelFormat::Yuv422P10Le,
-                _ => PixelFormat::Yuv420P10Le,
-            };
+            // Pixel format (bit-depth × chroma-format → core PixelFormat,
+            // 10-bit or 12-bit YUV planar) lives on the stream's
+            // CodecParameters now and is no longer attached to the frame.
+            let _ = (bit_depth_y, cf);
             return VideoFrame {
-                format,
-                width: cw as u32,
-                height: ch as u32,
                 pts: self.last_pts,
-                time_base: self.last_time_base,
                 planes: vec![
                     VideoPlane {
                         stride: y_stride,
@@ -502,17 +487,12 @@ impl HevcDecoder {
                 dst_cr[i] = src_cr[i].min(255) as u8;
             }
         }
-        let _ = bit_depth_c;
-        let format = match cf {
-            2 => PixelFormat::Yuv422P,
-            _ => PixelFormat::Yuv420P,
-        };
+        // Pixel format (Yuv420P or Yuv422P based on chroma_format_idc)
+        // lives on the stream's CodecParameters now and is no longer
+        // attached to the frame.
+        let _ = (bit_depth_c, cf);
         VideoFrame {
-            format,
-            width: cw as u32,
-            height: ch as u32,
             pts: self.last_pts,
-            time_base: self.last_time_base,
             planes: vec![
                 VideoPlane {
                     stride: cw,
@@ -559,7 +539,6 @@ impl Decoder for HevcDecoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.last_pts = packet.pts;
-        self.last_time_base = packet.time_base;
         let nals: Vec<NalRef<'_>> = match self.length_size {
             Some(n) => iter_length_prefixed(&packet.data, n)?,
             None => iter_annex_b(&packet.data).collect(),

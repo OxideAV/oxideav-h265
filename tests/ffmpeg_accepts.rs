@@ -13,7 +13,7 @@ use std::process::Command;
 
 use oxideav_core::Encoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame, VideoPlane,
 };
 
 use oxideav_h265::encoder::HevcEncoder;
@@ -36,11 +36,7 @@ fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
     let cw = (w / 2) as usize;
     let ch = (h / 2) as usize;
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
@@ -58,10 +54,10 @@ fn make_gradient_frame(w: u32, h: u32) -> VideoFrame {
     }
 }
 
-fn encode(frame: &VideoFrame) -> Vec<u8> {
+fn encode(frame: &VideoFrame, w: u32, h: u32) -> Vec<u8> {
     let mut params = CodecParameters::video(CodecId::new("h265"));
-    params.width = Some(frame.width);
-    params.height = Some(frame.height);
+    params.width = Some(w);
+    params.height = Some(h);
     params.pixel_format = Some(PixelFormat::Yuv420P);
     params.frame_rate = Some(Rational::new(30, 1));
     let mut enc = HevcEncoder::from_params(&params).unwrap();
@@ -71,7 +67,7 @@ fn encode(frame: &VideoFrame) -> Vec<u8> {
 
 fn run_one(w: u32, h: u32) {
     let src = make_gradient_frame(w, h);
-    let bytes = encode(&src);
+    let bytes = encode(&src, w, h);
 
     let tmp: PathBuf = std::env::temp_dir();
     // Include dimensions + a nanosecond timestamp in the filename so

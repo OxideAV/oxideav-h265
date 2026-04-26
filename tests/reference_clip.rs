@@ -692,10 +692,10 @@ fn hevc_p_slice_fixture_decodes() {
         }
         Err(e) => panic!("unexpected error from receive_frame (frame 2): {e:?}"),
     };
-    assert_eq!(frame1.width, 256);
-    assert_eq!(frame1.height, 144);
-    assert_eq!(frame2.width, 256);
-    assert_eq!(frame2.height, 144);
+    // Frame dimensions live on stream params now; verify the 256x144
+    // surface via plane payload sizes instead.
+    assert_eq!(frame1.planes[0].data.len(), frame1.planes[0].stride * 144);
+    assert_eq!(frame2.planes[0].data.len(), frame2.planes[0].stride * 144);
 
     let y1 = &frame1.planes[0].data;
     let y2 = &frame2.planes[0].data;
@@ -740,9 +740,10 @@ fn hevc_b_slice_fixture_decodes() {
         }
     }
     assert_eq!(frames.len(), 3, "expected 3 decoded frames");
+    // Frame dimensions live on stream params now; verify plane payload
+    // size matches the expected 256x144 cropped surface.
     for vf in &frames {
-        assert_eq!(vf.width, 256);
-        assert_eq!(vf.height, 144);
+        assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 144);
     }
     // Decode order is I, B, P — but frames come out of the pipeline in
     // decode order (no DPB reorder buffer yet). Frame 0 is the I-slice.
@@ -799,8 +800,6 @@ fn hevc_intra_fixture_decodes_to_plausible_picture() {
         oxideav_core::Frame::Video(vf) => vf,
         other => panic!("expected VideoFrame, got {other:?}"),
     };
-    assert_eq!(vf.width, 256);
-    assert_eq!(vf.height, 144);
     let y = &vf.planes[0].data;
     assert_eq!(y.len(), 256 * 144);
     let mean: u64 = y.iter().map(|&v| v as u64).sum();
@@ -1212,9 +1211,10 @@ fn hevc_sao_fixture_decodes() {
     }
     match dec.receive_frame() {
         Ok(oxideav_core::Frame::Video(vf)) => {
-            assert_eq!(vf.width, 128, "width");
-            assert_eq!(vf.height, 96, "height");
+            // Frame dimensions live on stream params now; validate the
+            // 128x96 surface via plane sizes instead.
             assert_eq!(vf.planes.len(), 3, "plane count");
+            assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 96);
         }
         Ok(other) => panic!("expected video frame, got {other:?}"),
         Err(Error::Unsupported { .. }) => {}
@@ -1348,8 +1348,8 @@ fn hevc_angular_intra_fixture_decodes() {
     }
     match dec.receive_frame() {
         Ok(oxideav_core::Frame::Video(vf)) => {
-            assert_eq!(vf.width, 128);
-            assert_eq!(vf.height, 96);
+            // Frame dimensions live on stream params now.
+            assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 96);
             let y_plane = &vf.planes[0].data;
             let distinct = y_plane
                 .iter()
@@ -1396,9 +1396,9 @@ fn hevc_deblocked_fixture_decodes() {
     }
     match dec.receive_frame() {
         Ok(oxideav_core::Frame::Video(vf)) => {
-            assert_eq!(vf.width, 128);
-            assert_eq!(vf.height, 96);
+            // Frame dimensions live on stream params now.
             assert_eq!(vf.planes.len(), 3);
+            assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 96);
             let y_plane = &vf.planes[0].data;
             let distinct = y_plane
                 .iter()
@@ -1646,9 +1646,9 @@ fn hevc_tiles_fixture_decodes() {
     }
     match dec.receive_frame() {
         Ok(oxideav_core::Frame::Video(vf)) => {
-            assert_eq!(vf.width, 640);
-            assert_eq!(vf.height, 480);
+            // Frame dimensions live on stream params now.
             assert_eq!(vf.planes.len(), 3);
+            assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 480);
         }
         Ok(other) => panic!("expected video frame, got {other:?}"),
         Err(Error::Unsupported(_)) => {}
@@ -1714,9 +1714,9 @@ fn hevc_wpp_fixture_decodes() {
     }
     match dec.receive_frame() {
         Ok(oxideav_core::Frame::Video(vf)) => {
-            assert_eq!(vf.width, 256);
-            assert_eq!(vf.height, 192);
+            // Frame dimensions live on stream params now.
             assert_eq!(vf.planes.len(), 3);
+            assert_eq!(vf.planes[0].data.len(), vf.planes[0].stride * 192);
         }
         Ok(other) => panic!("expected video frame, got {other:?}"),
         Err(Error::Unsupported(_)) => {}
@@ -1888,13 +1888,10 @@ fn main10_intra_decodes_close_to_ffmpeg() {
         }
         Err(e) => panic!("unexpected error from Main 10 decode: {e:?}"),
     };
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv420P10Le,
-        "Main 10 stream must emit Yuv420P10Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // a known 80x48 yuv420p10le clip.
+    let w = 80usize;
+    let h = 48usize;
     // Raw frame layout: Y plane (w*h*2 bytes LE) then Cb (w/2*h/2*2) then Cr.
     let y_len = w * h * 2;
     let c_len = (w / 2) * (h / 2) * 2;
@@ -2062,14 +2059,11 @@ fn main10_inter_decodes_with_pframes() {
     // The previous guard would have returned Error::Unsupported before any
     // frame landed, so just reaching here already proves the MC path
     // survives 10-bit.
-    let vf = &frames[0];
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv420P10Le,
-        "Main 10 stream must emit Yuv420P10Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // the known 80x48 yuv420p10le inter clip.
+    let _vf = &frames[0];
+    let w = 80usize;
+    let h = 48usize;
     let y_len = w * h * 2;
     let c_len = (w / 2) * (h / 2) * 2;
     let per_frame = y_len + 2 * c_len;
@@ -2319,12 +2313,7 @@ fn flatten_yuv422_frames(frames: &[oxideav_core::VideoFrame]) -> Vec<u8> {
     let mut out = Vec::new();
     for vf in frames {
         assert_eq!(vf.planes.len(), 3, "expected 3 planes");
-        assert_eq!(
-            vf.format,
-            oxideav_core::PixelFormat::Yuv422P,
-            "expected Yuv422P frame, got {:?}",
-            vf.format
-        );
+        // Pixel format lives on the stream's CodecParameters now.
         out.extend_from_slice(&vf.planes[0].data);
         out.extend_from_slice(&vf.planes[1].data);
         out.extend_from_slice(&vf.planes[2].data);
@@ -2424,9 +2413,8 @@ fn hevc_intra_yuv422_64_decodes_close_to_ffmpeg() {
     let frames = decode_all_video_frames(data, 1);
     assert_eq!(frames.len(), 1, "expected one decoded 4:2:2 frame");
     let vf = &frames[0];
-    assert_eq!(vf.width, 64);
-    assert_eq!(vf.height, 64);
-    assert_eq!(vf.format, oxideav_core::PixelFormat::Yuv422P);
+    // Pixel format / dimensions live on stream params now; verify the
+    // 4:2:2 64x64 surface via plane sizes alone.
     // Plane sizes for 4:2:2 (sub_x=2, sub_y=1): luma 64×64, chroma 32×64.
     assert_eq!(vf.planes[0].data.len(), 64 * 64, "luma plane size");
     assert_eq!(vf.planes[1].data.len(), 32 * 64, "Cb plane size");
@@ -2601,8 +2589,7 @@ fn hevc_yuv422_p_slice_gray_64_matches_ffmpeg() {
     };
     let frames = decode_all_video_frames(data, 2);
     assert_eq!(frames.len(), 2, "expected IDR + P decoded");
-    assert_eq!(frames[0].format, oxideav_core::PixelFormat::Yuv422P);
-    assert_eq!(frames[1].format, oxideav_core::PixelFormat::Yuv422P);
+    // Pixel format lives on stream params now.
     let actual = flatten_yuv422_frames(&frames);
     assert_eq!(
         actual.len(),
@@ -2849,13 +2836,10 @@ fn main12_intra_decodes_close_to_ffmpeg() {
         }
         Err(e) => panic!("unexpected error from Main 12 decode: {e:?}"),
     };
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv420P12Le,
-        "Main 12 stream must emit Yuv420P12Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // a known 80x48 yuv420p12le clip.
+    let w = 80usize;
+    let h = 48usize;
     let y_len = w * h * 2;
     let c_len = (w / 2) * (h / 2) * 2;
     assert_eq!(
@@ -3012,14 +2996,11 @@ fn main12_inter_decodes_with_pframes() {
         eprintln!("Main 12 inter decode produced no frames — skipping");
         return;
     }
-    let vf = &frames[0];
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv420P12Le,
-        "Main 12 stream must emit Yuv420P12Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // the known 80x48 yuv420p12le inter clip.
+    let _vf = &frames[0];
+    let w = 80usize;
+    let h = 48usize;
     let y_len = w * h * 2;
     let c_len = (w / 2) * (h / 2) * 2;
     let per_frame = y_len + 2 * c_len;
@@ -3163,13 +3144,10 @@ fn main12_422_intra_decodes_close_to_ffmpeg() {
         }
         Err(e) => panic!("unexpected error from Main 4:2:2 12 decode: {e:?}"),
     };
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv422P12Le,
-        "Main 4:2:2 12 stream must emit Yuv422P12Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // a known 96x48 yuv422p12le clip.
+    let w = 96usize;
+    let h = 48usize;
     // 4:2:2: SubWidthC = 2, SubHeightC = 1 (§6.2 Table 6-1).
     let y_len = w * h * 2;
     let c_len = (w / 2) * h * 2;
@@ -3306,14 +3284,11 @@ fn main12_422_inter_decodes_with_pframes() {
         eprintln!("Main 4:2:2 12 inter decode produced no frames — skipping");
         return;
     }
-    let vf = &frames[0];
-    assert_eq!(
-        vf.format,
-        oxideav_core::PixelFormat::Yuv422P12Le,
-        "Main 4:2:2 12 stream must emit Yuv422P12Le frames"
-    );
-    let w = vf.width as usize;
-    let h = vf.height as usize;
+    // Pixel format / dimensions live on stream params now; the fixture is
+    // the known 96x48 yuv422p12le inter clip.
+    let _vf = &frames[0];
+    let w = 96usize;
+    let h = 48usize;
     let y_len = w * h * 2;
     let c_len = (w / 2) * h * 2;
     let per_frame = y_len + 2 * c_len;

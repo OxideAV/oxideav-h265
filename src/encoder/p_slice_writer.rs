@@ -55,37 +55,6 @@ pub struct ReferenceFrame {
 }
 
 impl ReferenceFrame {
-    pub fn from_frame(frame: &VideoFrame) -> Self {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
-        let cw = w / 2;
-        let ch = h / 2;
-        let mut y = vec![0u8; w * h];
-        let mut cb = vec![0u8; cw * ch];
-        let mut cr = vec![0u8; cw * ch];
-        let py = &frame.planes[0];
-        let pcb = &frame.planes[1];
-        let pcr = &frame.planes[2];
-        for yy in 0..h {
-            y[yy * w..yy * w + w].copy_from_slice(&py.data[yy * py.stride..yy * py.stride + w]);
-        }
-        for yy in 0..ch {
-            cb[yy * cw..yy * cw + cw]
-                .copy_from_slice(&pcb.data[yy * pcb.stride..yy * pcb.stride + cw]);
-            cr[yy * cw..yy * cw + cw]
-                .copy_from_slice(&pcr.data[yy * pcr.stride..yy * pcr.stride + cw]);
-        }
-        Self {
-            width: frame.width,
-            height: frame.height,
-            y,
-            cb,
-            cr,
-            y_stride: w,
-            c_stride: cw,
-        }
-    }
-
     pub fn from_planes(width: u32, height: u32, y: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>) -> Self {
         let w = width as usize;
         let cw = w / 2;

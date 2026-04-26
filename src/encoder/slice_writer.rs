@@ -681,7 +681,7 @@ fn chroma_qp_for_slice() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{PixelFormat, TimeBase, VideoPlane};
+    use oxideav_core::VideoPlane;
 
     #[test]
     fn encoder_local_reconstruction_matches_input_ballpark() {
@@ -699,11 +699,7 @@ mod tests {
         let cb = vec![128u8; 8 * 8];
         let cr = vec![128u8; 8 * 8];
         let src = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: 16,
-            height: 16,
             pts: Some(0),
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 VideoPlane {
                     stride: 16,

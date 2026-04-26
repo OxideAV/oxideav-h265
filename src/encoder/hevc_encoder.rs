@@ -108,15 +108,9 @@ impl Encoder for HevcEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("h265 encoder: video frames only")),
         };
-        if vf.width != self.cfg.width || vf.height != self.cfg.height {
-            return Err(Error::invalid(format!(
-                "h265 encoder: frame dims {}x{} mismatch encoder {}x{}",
-                vf.width, vf.height, self.cfg.width, self.cfg.height
-            )));
-        }
-        if vf.format != PixelFormat::Yuv420P {
-            return Err(Error::invalid("h265 encoder: only Yuv420P frames"));
-        }
+        // Pixel format / dimensions live on the stream's CodecParameters
+        // and on `self.cfg`; the slim VideoFrame no longer carries them so
+        // we trust the caller to honour the encoder's `output_params()`.
         if vf.planes.len() != 3 {
             return Err(Error::invalid("h265 encoder: expected 3 planes"));
         }

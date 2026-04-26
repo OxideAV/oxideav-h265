@@ -4,7 +4,7 @@
 
 use oxideav_core::Encoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame, VideoPlane,
 };
 use oxideav_h265::encoder::HevcEncoder;
 
@@ -22,11 +22,7 @@ fn main() {
     let cw = (w / 2) as usize;
     let ch = (h / 2) as usize;
     let frame = VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: w,
-        height: h,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane {
                 stride: w as usize,
