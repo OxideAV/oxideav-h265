@@ -2241,22 +2241,28 @@ impl<'a> Walker<'a> {
         // PSNR from 44.04 dB -> 46.11 dB.
         //
         // Round-8 investigation: the spec-correct path for non-2Nx2N
-        // CUs with `max_trafo_depth_inter == 0` says (a) the signalling
-        // gate `trafoDepth < MaxTrafoDepth` (i.e. 0 < 0) is false, so
-        // no bin is emitted; (b) `interSplitFlag == 1` infers split = 1,
-        // so the TU tree must descend 4× at the root. Attempting that
-        // full spec path (skip bin, force split) produces `EGk prefix
-        // overflow` in residual parsing. Skipping the bin without
-        // force-splitting (collapse to a single leaf TU at the root)
-        // parses cleanly but drops average PSNR to 23.40 dB because
-        // the residuals are sized wrong. Reading the bin and using it
-        // as the actual split decision (round-7 behaviour retained
-        // here) survives parsing and gives 24.77 dB average. Empirical
-        // conclusion: libx265 emits a bin here despite the spec gate
-        // being false. The remaining frame-2/3 drift is not due to the
-        // inter split path: it's caused by a different, still-
-        // unidentified downstream drift (MC edge / TMVP / AMVP scaling
-        // remain likely candidates).
+        // inter at trafoDepth=0 with max_trafo_depth_inter=0 says skip
+        // the bin AND infer split=1 (interSplitFlag carve-out). Trying
+        // that triggers `EGk prefix overflow` in residual parsing, while
+        // reading the bin as a normal split decision parses cleanly and
+        // gives 24-25 dB average PSNR — keeping that empirical path.
+        //
+        // Round-18 audit (re-confirmed and traced): with H265_TRACE_TT
+        // wired, the bin libx265 emits at this position is sometimes 0
+        // (single 8×8 leaf TU at log2_tb=3 / 2NxN) and sometimes 1
+        // (split into 4× 4×4 sub-TUs). Treating it as a real split
+        // decision is the only path that keeps frame-1 at 46.11 dB and
+        // average at 25.54 dB. Forcing split=1 (true spec inference)
+        // while still reading the bin drops average to 20.18 dB —
+        // proof the bin value carries information. Skipping the bin
+        // entirely overflows EGk on the very next CU because the
+        // remainder of the bitstream presumes the bit was consumed.
+        // libx265's emission is therefore equivalent to MaxTrafoDepth=1
+        // (a one-level split-or-not choice) for non-2Nx2N inter at
+        // root, which is non-conformant with the 2021/2026 spec but
+        // consistently observable. Frame 2/3 drift remains and is
+        // unrelated to the split path — likely MC half-pel edge handling
+        // or TMVP scan order.
         //
         // Bug-2 (part_mode 3-bin for !amp_enabled, log2CbSize >
         // MinCbLog2SizeY) re-checked against the 2026-01 spec: Table
@@ -2281,6 +2287,16 @@ impl<'a> Walker<'a> {
         } else {
             0
         };
+        if std::env::var_os("H265_TRACE_TT").is_some() {
+            // Per-CU trace of the inter transform_tree split decision.
+            // Enabled with H265_TRACE_TT=1 — used in the round-18
+            // interSplitFlag audit to confirm that libx265 emits a
+            // meaningful bin at non-2Nx2N inter root with
+            // max_transform_hierarchy_depth_inter == 0.
+            eprintln!(
+                "h265 tt x={x0} y={y0} log2_tb={log2_tb} tr_depth={tr_depth} part={part_mode:?} max_inter={max_trafo_depth} skip2N={skip_for_2nx2n} split={split}"
+            );
+        }
 
         // §7.3.8.9 transform_tree: cbf_cb / cbf_cr are decoded BEFORE the
         // split, at every depth where log2TrafoSize > 2, conditional on
