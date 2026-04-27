@@ -56,6 +56,14 @@ pub struct PbMotion {
     pub valid: bool,
     /// Whether the PB is intra-coded (skips motion).
     pub is_intra: bool,
+    /// `cu_skip_flag` value at the time this PB was decoded (§9.3.4.2.2).
+    /// Used by the `cu_skip_flag` neighbour-context derivation in the next
+    /// CU's CABAC parse: `condTermFlag{L,A} = cu_skip_flag` of the
+    /// neighbouring PB. Without this we previously approximated with
+    /// `is_inter` which is too lax (every inter PB looked like a skip PB
+    /// to the context derivation), shifting CABAC contexts by one slot
+    /// for some neighbour configurations.
+    pub is_skip: bool,
     /// `pred_flag_l0`: this PB uses a reference from L0.
     pub pred_l0: bool,
     /// `pred_flag_l1`: this PB uses a reference from L1.
@@ -121,6 +129,7 @@ impl PbMotion {
         Self {
             valid: true,
             is_intra: false,
+            is_skip: false,
             pred_l0: true,
             pred_l1: true,
             ref_idx_l0,
@@ -458,6 +467,10 @@ impl MergeCand {
         PbMotion {
             valid: true,
             is_intra: false,
+            // Skip status is set by the caller — `to_pb` produces a
+            // non-skip merge PB by default; `perform_merge` flips
+            // `is_skip = true` for skip CUs.
+            is_skip: false,
             pred_l0: self.pred_l0,
             pred_l1: self.pred_l1,
             ref_idx_l0: self.ref_idx_l0,
@@ -1464,7 +1477,33 @@ mod tests {
             assert_eq!(c.ref_idx_l0, 0);
             assert!(c.pred_l0);
             assert!(!c.pred_l1);
+            // r19: merge zero-pad still sets ref_poc=0 (the merge-list
+            // builder doesn't have RPL POCs in scope). The CALLER is
+            // expected to refresh ref_poc against the current slice's
+            // RPL[ref_idx] before stashing the PB into the inter grid.
+            assert_eq!(c.ref_poc_l0, 0);
         }
+    }
+
+    #[test]
+    fn pb_motion_default_is_not_skip() {
+        // r19 is_skip default propagation: zero-init / `to_pb` paths
+        // produce non-skip PBs. Skip CUs explicitly flip the bit at
+        // the perform_merge call site (see ctu.rs `perform_merge`).
+        assert!(!PbMotion::default().is_skip);
+        let merge = MergeCand {
+            pred_l0: true,
+            pred_l1: false,
+            ref_idx_l0: 0,
+            ref_idx_l1: 0,
+            mv_l0: MotionVector::new(1, -1),
+            mv_l1: MotionVector::default(),
+            ref_poc_l0: 0,
+            ref_poc_l1: 0,
+            ref_lt_l0: false,
+            ref_lt_l1: false,
+        };
+        assert!(!merge.to_pb().is_skip);
     }
 
     #[test]

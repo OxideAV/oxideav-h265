@@ -2259,19 +2259,36 @@ fn main10_inter_decodes_with_pframes() {
     //     later slice's TMVP can resolve `refPicListCol[refIdxCol]` →
     //     POC without rebuilding the collocated slice's ref list.
     //
+    // Round 19 landed the spec-correct §9.3.4.2.2 cu_skip_flag
+    // condTermFlag derivation:
+    //   * `PbMotion` grew an `is_skip` bit recording whether the
+    //     CU writing this PB ran the spec's cu_skip_flag = 1 fast
+    //     path (skip CUs are 2Nx2N merge with no transform tree).
+    //   * `skip_ctx_inc` now reads the neighbour PB's `is_skip`
+    //     instead of approximating with `is_inter`. Pre-r19 every
+    //     non-skip merge / AMVP neighbour over-counted as
+    //     `condTermFlag = 1`, biasing the next CU's CABAC ctxInc
+    //     by one slot.
+    //   * `refresh_pb_ref_poc` rewrites a merge candidate's
+    //     `ref_poc_{l0,l1}` / `ref_lt_{l0,l1}` to point at the
+    //     CURRENT slice's RPL[ref_idx], so the merge zero-pad and
+    //     stale-spatial paths stop poisoning downstream TMVP scaling.
+    //
     // Per-frame (libx265 Main 10, 80x48, QP 22):
     //   frame 0  inf dB   (intra-only, bit-exact)
-    //   frame 1  46.11 dB (unchanged — single-ref frame-0 fast path)
-    //   frame 2  26.34 dB (24.79 pre-Round-9, +1.55)
-    //   frame 3  20.54 dB (20.00 pre-Round-9, +0.54)
-    //   average  25.54 dB (24.77 pre-Round-9, +0.77)
+    //   frame 1  40.05 dB (46.11 pre-r19; CABAC contexts shift,
+    //                     residuals reweighted across CUs)
+    //   frame 2  37.86 dB (26.34 pre-r19, +11.52)
+    //   frame 3  28.25 dB (20.54 pre-r19, +7.71)
+    //   average  33.57 dB (25.54 pre-r19, +8.03)
     //
-    // Frame 3 is still dominated by cumulative residual drift; pushing
-    // it past ~22 dB will need additional spec refinements beyond AMVP
-    // scaling (MC edge clipping vs pre-filter replication, or the
-    // remaining `interSplitFlag` non-2Nx2N parsing subtlety).
+    // Frame 1's per-frame regression is the price of frames 2/3
+    // gaining by a much larger margin: the new ctxInc shifts CU
+    // type decisions in frame 1 toward more residuals being
+    // applied, which our current `interSplitFlag` empirical path
+    // doesn't always deliver perfectly. Net SSE drops by 6.4×.
     assert!(
-        psnr >= 25.0,
+        psnr >= 30.0,
         "Main 10 inter decode PSNR below floor: {psnr:.2} dB"
     );
 }

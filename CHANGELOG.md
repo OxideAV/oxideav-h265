@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 19 — §9.3.4.2.2 `cu_skip_flag` ctxInc spec-correctness +
+  §8.5.3.2.9 merge `ref_poc` refresh. `PbMotion` grew an `is_skip`
+  bit recording whether the CU writing this PB ran the
+  `cu_skip_flag = 1` fast path; `skip_ctx_inc` now reads the
+  neighbour PB's `is_skip` (was approximating with `is_inter`,
+  over-counting `condTermFlag = 1` for every non-skip inter
+  neighbour and biasing CABAC ctxInc by one slot). Companion
+  `refresh_pb_ref_poc` rewrites a merge candidate's stale
+  `ref_poc_{l0,l1}` / `ref_lt_{l0,l1}` against the CURRENT slice's
+  RPL[ref_idx] before stashing the PB into the inter grid, so the
+  merge zero-pad and stale-spatial-neighbour paths stop poisoning
+  downstream TMVP scaling. Main 10 inter 80×48 testsrc PSNR lifts
+  from 25.54 → 33.57 dB average (frames 1/2/3: 46.11/26.34/20.54 →
+  40.05/37.86/28.25; net SSE drops 6.4×). Main 12 inter PSNR
+  reaches 27.67 dB.
 - round 12 — 4:2:2 (chroma_format_idc=2) P/B inter decode via §8.5.3.2.10
   chroma MV derivation (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) and
   full-height chroma plane geometry through `motion_compensate_pb`.
