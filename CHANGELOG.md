@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-h265/compare/v0.0.5...v0.0.6) - 2026-04-30
+
+### Other
+
+- TMVP scan-order audit (§8.5.3.2.8 / §8.5.3.2.9)
+- cu_skip_flag ctxInc + merge ref_poc refresh — Main 10 inter 25.54 → 33.57 dB
+- round 19 — WPP audit (§6.3.2 / §9.3.2.4) + tile audit toolchain block
+- round 18 — interSplitFlag empirical bin audit (§7.4.9.8)
+- round 17 — AMP (§7.4.9.5) lifted from out-of-scope to wired
+- adopt slim VideoFrame shape
+- round 16 — fix 4:2:2 stacked-chroma cbf inference (§7.4.9.10)
+- round 15 — Main 12 + 4:2:2 (yuv422p12le) decode support
+- round 13 — Main 12 (12-bit) decode support
+- round 12 — 4:2:2 (chroma_format_idc=2) P/B inter decode
+- round 11 — 4:2:2 (chroma_format_idc=2) intra decode
+- lock in scaling-list decode with a byte-exact ffmpeg fixture
+- pin release-plz to patch-only bumps
+
 ### Other
 
 - round 20 — TMVP scan-order audit (§8.5.3.2.8 / §8.5.3.2.9). The
