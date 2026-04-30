@@ -177,6 +177,27 @@ impl<'a> CtuContext<'a> {
     pub fn is_b_slice(&self) -> bool {
         matches!(self.slice.slice_type, SliceType::B)
     }
+
+    /// `NoBackwardPredFlag` per §8.5.3.2.8 / §8.5.3.2.9 (after the
+    /// "Decoding process for collocated picture and no backward prediction
+    /// flag" definition block in §8.5.3.1.2.3 / §7.4.7.1).
+    ///
+    /// `NoBackwardPredFlag = 1` iff `DiffPicOrderCnt(aPic, currPic) <= 0`
+    /// for every `aPic` in `RefPicList0` or `RefPicList1`. Operationally:
+    /// every reference is in the past or the current picture itself —
+    /// there is no future reference visible from the current slice.
+    ///
+    /// `DiffPicOrderCnt(a, b) = a.poc - b.poc`, so the gate collapses to
+    /// `aPic.poc <= currPic.poc` for every reference, which is the
+    /// condition tested below. P-slices typically satisfy this (their L0
+    /// is past-only); B-slices with a backward L1 ref do not, and the
+    /// `collocated_from_l0_flag` selector then dictates listCol per
+    /// §8.5.3.2.9.
+    pub fn no_backward_pred_flag(&self) -> bool {
+        let cur = self.cur_poc;
+        self.ref_list_l0.iter().all(|p| p.poc <= cur)
+            && self.ref_list_l1.iter().all(|p| p.poc <= cur)
+    }
 }
 
 /// Inter CU partition modes we support.
@@ -1507,16 +1528,34 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    /// Look up the collocated PB motion from the slice's configured
-    /// collocated reference picture and convert it to a merge candidate.
-    /// Returns `None` when TMVP is disabled or the collocated block is
-    /// intra.
+    /// Run §8.5.3.2.8 (TMVP scan-order: BR → centre) for one reference list
+    /// `LX` (selected by `want_l0`) and target ref index `target_ref_idx`,
+    /// invoking §8.5.3.2.9 (collocated motion vector derivation, including
+    /// listCol pick + LT-flag gate + POC-distance scaling) at each scan
+    /// position.
     ///
-    /// Per §8.5.3.2.9 the MV is POC-distance scaled when the current and
-    /// collocated references are both short-term and have different POC
-    /// deltas; the candidate is forced to reference index 0 of whichever
-    /// list matches the collocated PB's direction.
-    fn tmvp_merge_cand(&self, x0: u32, y0: u32, w: u32, h: u32) -> Option<MergeCand> {
+    /// Returns the scaled `mvLXCol` for the current slice's `LX[target_ref_idx]`
+    /// when `availableFlagLXCol == 1`; `None` otherwise (TMVP off, no
+    /// collocated picture, target ref out of range, both BR + centre fall
+    /// through every gate).
+    ///
+    /// **Spec note (§8.5.3.2.8 step 2)**: the centre fallback fires when the
+    /// BR invocation yields `availableFlagLXCol == 0`, *not* only when the
+    /// BR PB itself is intra. So a BR PB whose listCol-selected MV fails
+    /// the LT-flag gate of §8.5.3.2.9 still triggers the centre retry.
+    /// Pre-r20 the merge path conflated "intra at BR" with "no scan-order
+    /// fallback needed", losing valid centre candidates for B-slices when
+    /// BR landed on a uni-pred PB whose only list mismatched the target's
+    /// LT flag.
+    fn tmvp_lx_for_target(
+        &self,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        want_l0: bool,
+        target_ref_idx: i8,
+    ) -> Option<MotionVector> {
         if !self.cctx.slice.slice_temporal_mvp_enabled_flag {
             return None;
         }
@@ -1529,90 +1568,159 @@ impl<'a> Walker<'a> {
         let br_x = x0 + w;
         let br_y = y0 + h;
         let same_ctb_row = (y0 >> ctb_log2) == (br_y >> ctb_log2);
-        let pb_opt = if same_ctb_row && br_x < pic_w && br_y < pic_h {
+
+        // Resolve target reference's POC + LT flag — needed for the
+        // §8.5.3.2.9 LT-gate and POC-distance scaling.
+        let list_x = if want_l0 {
+            self.cctx.ref_list_l0
+        } else {
+            self.cctx.ref_list_l1
+        };
+        let target = list_x.get(target_ref_idx.max(0) as usize)?;
+        let cur_poc_diff = self.cctx.cur_poc - target.poc;
+        let target_is_lt = target.is_long_term;
+
+        // §8.5.3.2.9 listCol picker. Returns the collocated PB's
+        // (mvCol, refPocCol, refLtCol) — the colPb's referenced-picture
+        // metadata as captured at decode time, not the current slice's.
+        //
+        // Selection rule:
+        //   * If predFlagL0Col == 0: use L1.
+        //   * Else if predFlagL1Col == 0: use L0.
+        //   * Else (both flags set): if NoBackwardPredFlag == 1, use LX
+        //     (i.e. the list matching the current invocation X);
+        //     otherwise use LN with N = collocated_from_l0_flag.
+        let no_back = self.cctx.no_backward_pred_flag();
+        let coll_from_l0 = self.cctx.slice.collocated_from_l0_flag;
+        let resolve = |pb: PbMotion| -> Option<(MotionVector, i32, bool)> {
+            if pb.pred_l0 && pb.pred_l1 {
+                if no_back {
+                    // Use LX of the collocated PB (X = current invocation).
+                    if want_l0 {
+                        Some((pb.mv_l0, pb.ref_poc_l0, pb.ref_lt_l0))
+                    } else {
+                        Some((pb.mv_l1, pb.ref_poc_l1, pb.ref_lt_l1))
+                    }
+                } else {
+                    // Use LN where N = collocated_from_l0_flag. When
+                    // ColPic was picked from L0 (collocated_from_l0_flag
+                    // == 1), N == 1 → use the colPb's L1; conversely
+                    // N == 0 → use colPb's L0.
+                    if coll_from_l0 {
+                        Some((pb.mv_l1, pb.ref_poc_l1, pb.ref_lt_l1))
+                    } else {
+                        Some((pb.mv_l0, pb.ref_poc_l0, pb.ref_lt_l0))
+                    }
+                }
+            } else if pb.pred_l0 {
+                Some((pb.mv_l0, pb.ref_poc_l0, pb.ref_lt_l0))
+            } else if pb.pred_l1 {
+                Some((pb.mv_l1, pb.ref_poc_l1, pb.ref_lt_l1))
+            } else {
+                None
+            }
+        };
+
+        // §8.5.3.2.9 LT-gate + POC scaling (eqs. 8-202..8-209).
+        let scale_for_target =
+            |mv: MotionVector, ref_poc: i32, ref_lt: bool| -> Option<MotionVector> {
+                if ref_lt != target_is_lt {
+                    return None;
+                }
+                let col_poc_diff = coll.poc - ref_poc;
+                if target_is_lt || ref_lt || col_poc_diff == cur_poc_diff {
+                    return Some(mv);
+                }
+                let td = col_poc_diff.clamp(-128, 127);
+                let tb = cur_poc_diff.clamp(-128, 127);
+                if td == 0 {
+                    return Some(mv);
+                }
+                let tx = (16384 + (td.abs() >> 1)) / td;
+                let dsf = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
+                let scale = |v: i32| -> i32 {
+                    let prod = dsf * v;
+                    let sign = if prod < 0 { -1 } else { 1 };
+                    let abs = prod.unsigned_abs() as i64;
+                    let rounded = ((abs + 127) >> 8) as i32;
+                    (sign * rounded).clamp(-32768, 32767)
+                };
+                Some(MotionVector::new(scale(mv.x), scale(mv.y)))
+            };
+
+        // Step 1 (BR). Gate on same CTB row and BR position inside the
+        // picture envelope, per §8.5.3.2.8 eqs. 8-198/8-199.
+        if same_ctb_row && br_x < pic_w && br_y < pic_h {
             let ax = (br_x >> 4) << 4;
             let ay = (br_y >> 4) << 4;
-            coll.collocated_motion(ax, ay).or_else(|| {
-                let cx = (x0 + w / 2) >> 4 << 4;
-                let cy = (y0 + h / 2) >> 4 << 4;
-                coll.collocated_motion(cx, cy)
-            })
-        } else {
-            let cx = (x0 + w / 2) >> 4 << 4;
-            let cy = (y0 + h / 2) >> 4 << 4;
-            coll.collocated_motion(cx, cy)
-        };
-        let pb = pb_opt?;
-        let cand = MergeCand::from_pb_into_ref0(pb);
-        // Apply §8.5.3.2.9 POC-distance scaling to whichever side(s) of
-        // the merge candidate are active. Target is refIdx 0 in each
-        // list; look up that POC + LT flag from the current slice.
-        let scale_side = |mv: MotionVector,
-                          ref_poc: i32,
-                          ref_lt: bool,
-                          target_poc: Option<i32>,
-                          target_lt: Option<bool>|
-         -> Option<MotionVector> {
-            let target_poc = target_poc?;
-            let target_lt = target_lt?;
-            if ref_lt != target_lt {
-                return None;
-            }
-            let cur_poc_diff = self.cctx.cur_poc - target_poc;
-            let col_poc_diff = coll.poc - ref_poc;
-            if target_lt || ref_lt || col_poc_diff == cur_poc_diff {
-                return Some(mv);
-            }
-            let td = col_poc_diff.clamp(-128, 127);
-            let tb = cur_poc_diff.clamp(-128, 127);
-            if td == 0 {
-                return Some(mv);
-            }
-            let tx = (16384 + (td.abs() >> 1)) / td;
-            let dsf = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
-            let scale = |v: i32| -> i32 {
-                let prod = dsf * v;
-                let sign = if prod < 0 { -1 } else { 1 };
-                let abs = prod.unsigned_abs() as i64;
-                let rounded = ((abs + 127) >> 8) as i32;
-                (sign * rounded).clamp(-32768, 32767)
-            };
-            Some(MotionVector::new(scale(mv.x), scale(mv.y)))
-        };
-        let mut out = cand;
-        if out.pred_l0 {
-            let target_poc = self.cctx.ref_list_l0.first().map(|p| p.poc);
-            let target_lt = self.cctx.ref_list_l0.first().map(|p| p.is_long_term);
-            match scale_side(
-                out.mv_l0,
-                cand.ref_poc_l0,
-                cand.ref_lt_l0,
-                target_poc,
-                target_lt,
-            ) {
-                Some(mv) => out.mv_l0 = mv,
-                None => out.pred_l0 = false,
+            if let Some(pb) = coll.collocated_motion(ax, ay) {
+                if let Some((mv, rp, rl)) = resolve(pb) {
+                    if let Some(scaled) = scale_for_target(mv, rp, rl) {
+                        return Some(scaled);
+                    }
+                }
             }
         }
-        if out.pred_l1 {
-            let target_poc = self.cctx.ref_list_l1.first().map(|p| p.poc);
-            let target_lt = self.cctx.ref_list_l1.first().map(|p| p.is_long_term);
-            match scale_side(
-                out.mv_l1,
-                cand.ref_poc_l1,
-                cand.ref_lt_l1,
-                target_poc,
-                target_lt,
-            ) {
-                Some(mv) => out.mv_l1 = mv,
-                None => out.pred_l1 = false,
-            }
-        }
-        // If neither side remains valid, the merge cand is effectively intra.
-        if !out.pred_l0 && !out.pred_l1 {
+        // Step 2 (centre). Fires whenever step 1 did not produce a
+        // valid availability flag — including the case where BR landed
+        // on a valid PB but its listCol-selected MV failed the LT gate.
+        let cx = (x0 + w / 2) >> 4 << 4;
+        let cy = (y0 + h / 2) >> 4 << 4;
+        let pb = coll.collocated_motion(cx, cy)?;
+        let (mv, rp, rl) = resolve(pb)?;
+        scale_for_target(mv, rp, rl)
+    }
+
+    /// Look up the collocated PB motion from the slice's configured
+    /// collocated reference picture and convert it to a merge candidate
+    /// per §8.5.3.1.7 + §8.5.3.2.8 + §8.5.3.2.9.
+    ///
+    /// Returns `None` when both L0 and L1 invocations of §8.5.3.2.8
+    /// yield `availableFlagLXCol == 0` (§8.5.3.1.7 then sets
+    /// `availableFlagCol = 0` and the temporal merge candidate is
+    /// dropped from the merge list).
+    ///
+    /// The L0 and L1 invocations scan **independently** through BR →
+    /// centre — each gets its own §8.5.3.2.9 LT gate / POC scaling
+    /// outcome. The merge-cand `pred_lX` flags reflect the per-side
+    /// availability from §8.5.3.1.7 eqs. 8-115 / 8-118
+    /// (`predFlagLXCol = availableFlagLXCol`), not the collocated PB's
+    /// own pred flags.
+    fn tmvp_merge_cand(&self, x0: u32, y0: u32, w: u32, h: u32) -> Option<MergeCand> {
+        if !self.cctx.slice.slice_temporal_mvp_enabled_flag {
             return None;
         }
-        Some(out)
+        let _ = self.cctx.collocated_ref?;
+        let target_l0 = self.cctx.ref_list_l0.first();
+        let target_l1 = self.cctx.ref_list_l1.first();
+
+        // Step 3 (§8.5.3.1.7): invoke §8.5.3.2.8 for L0 with refIdxL0Col=0.
+        let mv_l0 = self.tmvp_lx_for_target(x0, y0, w, h, true, 0);
+        // Step 4 (§8.5.3.1.7): invoke §8.5.3.2.8 for L1 with refIdxL1Col=0,
+        // only on B-slices.
+        let mv_l1 = if self.cctx.is_b_slice() {
+            self.tmvp_lx_for_target(x0, y0, w, h, false, 0)
+        } else {
+            None
+        };
+
+        let pred_l0 = mv_l0.is_some();
+        let pred_l1 = mv_l1.is_some();
+        if !pred_l0 && !pred_l1 {
+            return None;
+        }
+        Some(MergeCand {
+            pred_l0,
+            pred_l1,
+            ref_idx_l0: 0,
+            ref_idx_l1: 0,
+            mv_l0: mv_l0.unwrap_or_default(),
+            mv_l1: mv_l1.unwrap_or_default(),
+            ref_poc_l0: target_l0.map(|p| p.poc).unwrap_or(0),
+            ref_poc_l1: target_l1.map(|p| p.poc).unwrap_or(0),
+            ref_lt_l0: target_l0.map(|p| p.is_long_term).unwrap_or(false),
+            ref_lt_l1: target_l1.map(|p| p.is_long_term).unwrap_or(false),
+        })
     }
 
     fn decode_inter_cu(
@@ -1906,6 +2014,11 @@ impl<'a> Walker<'a> {
     /// Returns the collocated PB's MV scaled by POC distance to the current
     /// PU's target reference, or `None` when TMVP is off / unavailable.
     ///
+    /// Thin wrapper around [`tmvp_lx_for_target`] — the AMVP and merge
+    /// paths share the same scan-order + listCol-pick + LT-gate +
+    /// POC-scaling pipeline; only the consumer differs (AMVP gets the
+    /// raw MV; merge wraps it in a `MergeCand`).
+    ///
     /// Scaling (eqs. 8-202..8-209) only applies when the current and
     /// collocated references are both short-term; when either is long-term
     /// the spec gates on LT-flag match and uses the raw MV.
@@ -1918,99 +2031,7 @@ impl<'a> Walker<'a> {
         want_l0: bool,
         target_ref_idx: i8,
     ) -> Option<MotionVector> {
-        if !self.cctx.slice.slice_temporal_mvp_enabled_flag {
-            return None;
-        }
-        let coll = self.cctx.collocated_ref?;
-        // §8.5.3.2.8: same BR-then-centre rule as merge, with both
-        // locations rounded to the 16×16 grid and the BR path gated on
-        // "same CTB row as the current PB".
-        let pic_w = self.cctx.sps.pic_width_in_luma_samples;
-        let pic_h = self.cctx.sps.pic_height_in_luma_samples;
-        let ctb_log2 = self.cctx.sps.log2_min_luma_coding_block_size_minus3
-            + 3
-            + self.cctx.sps.log2_diff_max_min_luma_coding_block_size;
-        let br_x = x0 + w;
-        let br_y = y0 + h;
-        let same_ctb_row = (y0 >> ctb_log2) == (br_y >> ctb_log2);
-
-        // Resolve the target reference's POC + LT flag from the current
-        // slice so we can compute `currPocDiff` per eq. 8-203.
-        let list_x = if want_l0 {
-            self.cctx.ref_list_l0
-        } else {
-            self.cctx.ref_list_l1
-        };
-        let target = list_x.get(target_ref_idx.max(0) as usize)?;
-        let cur_poc_diff = self.cctx.cur_poc - target.poc;
-        let target_is_lt = target.is_long_term;
-
-        // Given a collocated PB, pick the MV + its (ref_poc, ref_lt)
-        // from whichever list the spec's §8.5.3.2.9 logic selects.
-        let resolve = |pb: PbMotion| -> Option<(MotionVector, i32, bool)> {
-            // §8.5.3.2.9: if predFlagL0Col == 0, use L1; if only L0, use L0;
-            // if both, depend on NoBackwardPredFlag (we approximate with
-            // `want_l0`, matching the simple-GOP encoder that libx265
-            // produces for no-B-frame clips).
-            let (mv, ref_poc, ref_lt) = if pb.pred_l0 && pb.pred_l1 {
-                if want_l0 {
-                    (pb.mv_l0, pb.ref_poc_l0, pb.ref_lt_l0)
-                } else {
-                    (pb.mv_l1, pb.ref_poc_l1, pb.ref_lt_l1)
-                }
-            } else if pb.pred_l0 {
-                (pb.mv_l0, pb.ref_poc_l0, pb.ref_lt_l0)
-            } else if pb.pred_l1 {
-                (pb.mv_l1, pb.ref_poc_l1, pb.ref_lt_l1)
-            } else {
-                return None;
-            };
-            Some((mv, ref_poc, ref_lt))
-        };
-        let scale_for_target =
-            |mv: MotionVector, ref_poc: i32, ref_lt: bool| -> Option<MotionVector> {
-                // §8.5.3.2.9 LT-flag gate: must match; otherwise TMVP is
-                // unavailable for this PB.
-                if ref_lt != target_is_lt {
-                    return None;
-                }
-                let col_poc_diff = coll.poc - ref_poc;
-                // If either is long-term, or deltas match, use raw MV.
-                if target_is_lt || ref_lt || col_poc_diff == cur_poc_diff {
-                    return Some(mv);
-                }
-                let td = col_poc_diff.clamp(-128, 127);
-                let tb = cur_poc_diff.clamp(-128, 127);
-                if td == 0 {
-                    return Some(mv);
-                }
-                let tx = (16384 + (td.abs() >> 1)) / td;
-                let dsf = ((tb * tx + 32) >> 6).clamp(-4096, 4095);
-                let scale = |v: i32| -> i32 {
-                    let prod = dsf * v;
-                    let sign = if prod < 0 { -1 } else { 1 };
-                    let abs = prod.unsigned_abs() as i64;
-                    let rounded = ((abs + 127) >> 8) as i32;
-                    (sign * rounded).clamp(-32768, 32767)
-                };
-                Some(MotionVector::new(scale(mv.x), scale(mv.y)))
-            };
-        if same_ctb_row && br_x < pic_w && br_y < pic_h {
-            let ax = (br_x >> 4) << 4;
-            let ay = (br_y >> 4) << 4;
-            if let Some(pb) = coll.collocated_motion(ax, ay) {
-                if let Some((mv, rp, rl)) = resolve(pb) {
-                    if let Some(scaled) = scale_for_target(mv, rp, rl) {
-                        return Some(scaled);
-                    }
-                }
-            }
-        }
-        let cx = (x0 + w / 2) >> 4 << 4;
-        let cy = (y0 + h / 2) >> 4 << 4;
-        let pb = coll.collocated_motion(cx, cy)?;
-        let (mv, rp, rl) = resolve(pb)?;
-        scale_for_target(mv, rp, rl)
+        self.tmvp_lx_for_target(x0, y0, w, h, want_l0, target_ref_idx)
     }
 
     fn decode_intra_prediction_and_transforms(

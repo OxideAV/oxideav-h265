@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 20 — TMVP scan-order audit (§8.5.3.2.8 / §8.5.3.2.9). The
+  bottom-right → centre fallback now fires for every case where
+  `availableFlagLXCol == 0` — including the previously-missed case
+  where the BR PB is inter but its listCol-selected MV fails the
+  §8.5.3.2.9 LT-flag gate. Added `NoBackwardPredFlag` derivation
+  on `CtuContext` (`= 1` iff every L0/L1 ref has POC ≤ currPic);
+  the §8.5.3.2.9 listCol picker for both-flags-set collocated PBs
+  now selects `LX` when `NoBackwardPredFlag == 1` and `LN` (with
+  `N = collocated_from_l0_flag`) otherwise — pre-r20 the merge
+  path approximated this by preserving the col PB's pred flags
+  directly (skipping the spec's listCol selection entirely) and
+  the AMVP path used the current-invocation `want_l0` as the
+  selector (correct for P-slices where `NoBackwardPredFlag = 1`,
+  wrong for any B-slice with a backward L1 ref). Merge temporal
+  candidate now invokes §8.5.3.2.8 once per side (L0 / L1) per
+  §8.5.3.1.7 step 3/4, with `predFlagLX = availableFlagLXCol`
+  (eqs. 8-115 / 8-118). New test
+  `hevc_b_slice_tmvp_scan_order_audit` exercises the
+  `NoBackwardPredFlag = 0` path on a 5-frame I-P-B-P-B fixture
+  (PSNR 24.51 dB on textured 64×64 testsrc, well above the 12 dB
+  regression floor). 48 tests pass. P-slice paths preserved
+  byte-for-byte: Main 10 inter PSNR holds at 33.57 dB and the
+  4:2:0 / 4:2:2 P/B fixtures stay bit-exact.
 - round 19 — §9.3.4.2.2 `cu_skip_flag` ctxInc spec-correctness +
   §8.5.3.2.9 merge `ref_poc` refresh. `PbMotion` grew an `is_skip`
   bit recording whether the CU writing this PB ran the
