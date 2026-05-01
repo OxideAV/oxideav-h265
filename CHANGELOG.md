@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 23 — B-slice **merge / B_Skip encode** (§7.3.8.6, §8.5.3.2.2..5,
+  §8.5.3.2.10, §9.3.4.2.2 / Table 9-32, §9.3.4.2.10). The B-slice
+  writer (`src/encoder/b_slice_writer.rs`) now picks per CU between
+  three modes by luma SAD:
+  (1) **B_Skip** — `cu_skip_flag = 1` followed by the truncated-rice
+  `merge_idx`. No residual, no `pred_mode_flag`, no `part_mode`, no
+  `merge_flag`. Selected when the best merge candidate's prediction
+  SAD is at or below `SKIP_RESIDUAL_THRESHOLD = 1024` luma pels for
+  a 16×16 CU (≈ 4 per-pixel error — one Qstep at QP 26). On the
+  static-content fixture this collapses every B-slice CU to skip,
+  dropping each B-slice from hundreds of bytes to 24-26 bytes total.
+  (2) **Merge** — `merge_flag = 1` + `merge_idx`, with residual coded
+  through the existing inter pipeline. Selected when the best merge
+  candidate beats explicit AMVP on luma SAD but residual energy is
+  above the skip threshold.
+  (3) **Explicit AMVP** — the round-22 fall-through (L0-only / L1-only
+  / Bi pick with explicit MVD per list).
+  Slice-header `five_minus_max_num_merge_cand` is now `0` (was `4`)
+  so the merge list grows from 1 → 5 entries; the encoder picks
+  whichever of the §8.5.3.2.{2..5} candidates (spatial A0/A1/B0/B1/B2,
+  combined bi-pred, zero-MV pad) minimises SAD against the source.
+  The merge list is built with the same call into `build_merge_list_full`
+  the decoder uses, so encoder + decoder agree on the picked
+  candidate's motion byte-for-byte. The encoder now maintains a full
+  `inter::InterState` populated with `PbMotion` records (alongside
+  the legacy `mv_grid_l0/l1`) — needed both for merge derivation
+  (which reads spatial PBs from the grid) and for `cu_skip_flag`
+  ctxInc, which now follows the spec's `condTermFlagX = neighbour.is_skip`
+  rule (decoder's r19 fix). Three new tests in
+  `tests/encoder_b_slice.rs`:
+  `b_skip_engages_on_static_content` (5-frame zero-motion gradient,
+  packet sizes [109, 24, 26, 24, 26] in decode order — B-slice
+  CUs collapse to skip CUs at 2 bits/CU);
+  `b_slice_merge_path_decodes_within_psnr_floor` (5-frame translating
+  gradient through our decoder, every frame ≥ 25 dB);
+  `b_skip_ffmpeg_cross_decode_psnr` (writes the static-content
+  bitstream to `/tmp/oxideav-h265-fixtures/encoder-b-skip-r23.hevc`,
+  decodes via libavcodec, every frame ≥ 22 dB — proves the skip
+  path stays in CABAC sync end-to-end). The pre-existing r22
+  `ipbpb_roundtrip_through_our_decoder` PSNR shifts from
+  44.99 / 32.51 / 39.59 / 27.17 / 31.46 to 44.99 / 32.51 / 38.56 /
+  27.17 / 30.82 (decode order) — the slight B-frame regressions
+  trade off against the dramatic skip-path size reduction on
+  near-static content. 154 tests pass (88 unit + 50 reference + 7
+  encoder_b_slice + 4 ffmpeg_accepts + 3 reference + 1 encoder_p_slice
+  + 1 encoder_roundtrip). Pending for r24+: AMP / rectangular
+  partitions (Nx2N / 2NxN), `mvd_l1_zero_flag` optimisation, B-pyramid
+  (mini-GOP > 2), 10-bit encode.
+
 - round 22 — B-slice **encode** (§7.4.7.1, §8.5.3.3.3.1, §9.3.4.2.2).
   New `src/encoder/b_slice_writer.rs` emits a single-segment B
   (TrailR) slice referencing one past anchor (L0) and one future

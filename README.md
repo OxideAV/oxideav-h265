@@ -218,14 +218,41 @@ own decoder.
   9-32 CtDepth path. The display-order frames the caller sends are
   reordered internally so the held-back B always emits **after** its
   future anchor.
+* **Merge mode + B_Skip (round 23)** — B-slice CUs now choose between
+  three modes per CU based on luma SAD:
+  - **B_Skip** (`cu_skip_flag = 1` + `merge_idx`): emitted when the
+    best merge candidate's prediction SAD is at or below
+    `SKIP_RESIDUAL_THRESHOLD` (≈ 1024 luma pels for a 16×16 CU,
+    ≈ 4 pels per pixel — one Qstep at QP 26). Static / near-static
+    CUs collapse from a full residual to a 2-bit skip CU, dropping
+    a 5-frame static-content B-slice from hundreds of bytes down to
+    24-26 bytes total. No residual, no AMVP, no `merge_flag` —
+    just `cu_skip_flag = 1` then the `merge_idx` truncated-rice bins.
+  - **Merge** (`merge_flag = 1` + `merge_idx`): emitted when the best
+    merge candidate beats the explicit AMVP candidate on luma SAD but
+    still has non-trivial residual. The candidate is materialised
+    against the same merge derivation the decoder runs
+    (`build_merge_list_full` — spatial A0/A1/B0/B1/B2, combined
+    bi-pred, zero-MV pad), so encoder + decoder agree on the picked
+    candidate's MV byte-for-byte.
+  - **Explicit AMVP** (round 22 path): the fall-through when neither
+    skip nor merge wins.
+  Slice-header `five_minus_max_num_merge_cand` is now `0` (was `4`)
+  so the merge list grows from 1 → 5 entries — the SAD search picks
+  whichever spatial / combined / pad candidate matches the source
+  best. `cu_skip_flag` ctxInc derivation uses the spec's `condTermFlagX
+  = neighbour.is_skip` rule (decoder's r19 fix), with the encoder
+  maintaining a per-4×4 `is_skip` grid via `InterState` so the
+  context derivation stays in lock-step with the decoder.
 * **Quality at QP 26 / 5-frame I-P-B-P-B**, 64×64 gradient with 1-pel
-  per-frame motion: I 44.99 dB, P 32.51 dB, B 39.59 dB, P 27.17 dB,
-  B 31.46 dB (self-roundtrip). The ffmpeg cross-decode test in
-  `tests/encoder_b_slice.rs` confirms each frame is bitstream-valid:
-  ffmpeg's decoder produces 33-44 dB across all 5 frames.
-* **Pending:** merge encode (`merge_flag = 1`), B_Skip CUs, AMP /
-  rectangular partitions, weighted bi-pred, mini-GOP > 2,
-  `mvd_l1_zero_flag` optimisation.
+  per-frame motion: I 44.99 dB, P 32.51 dB, B 38.56 dB, P 27.17 dB,
+  B 30.82 dB (self-roundtrip). On static (zero-motion) input the
+  skip path dominates: ffmpeg cross-decode produces 44.99 / 28.77 /
+  35.18 / 22.86 / 25.97 dB at POC 0..4. The ffmpeg cross-decode test
+  in `tests/encoder_b_slice.rs` confirms each frame is bitstream-valid.
+* **Pending:** AMP / rectangular partitions (Nx2N / 2NxN), weighted
+  bi-pred, mini-GOP > 2 (B-pyramid), `mvd_l1_zero_flag` optimisation,
+  10-bit encode.
 
 ## HEIF / HEIC still images
 

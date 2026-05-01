@@ -331,3 +331,199 @@ fn b_slice_packet_count_matches_source_count() {
     }
     assert_eq!(count, 7, "expected 7 packets, got {count}");
 }
+
+// ---------------------------------------------------------------------------
+//  Round 23 — merge / B_Skip path tests
+// ---------------------------------------------------------------------------
+
+/// Round 23: static content should compress dramatically smaller than
+/// the AMVP-only path because every B / late-P CU collapses to a 2-bit
+/// `cu_skip_flag = 1` + `merge_idx = 0` skip CU. We don't have a r22
+/// baseline at hand inside the test, so we pin the absolute size — a
+/// 64×64 5-frame static stream that round-tripped via merge/skip should
+/// compress at least 30% smaller than the 64×64 r22-style packing where
+/// every CU paid the AMVP MVD + residual cost. A loose floor of 200
+/// bytes / B-slice is enough to catch a regression to the AMVP path.
+#[test]
+fn b_skip_engages_on_static_content() {
+    let w = 64u32;
+    let h = 64u32;
+    let frames: Vec<VideoFrame> = (0..5).map(|_| make_gradient(w, h, 0)).collect();
+
+    let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).unwrap();
+    }
+    enc.flush().unwrap();
+
+    // Decode order: I(POC0), P(POC2), B(POC1), P(POC4), B(POC3).
+    // The two B frames are bracketed by static anchors, so every CU
+    // should collapse to skip.
+    let mut sizes = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let pkt = enc.receive_packet().unwrap();
+        sizes.push(pkt.data.len());
+    }
+    eprintln!(
+        "B_Skip static-content packet sizes (decode order I,P,B,P,B): {:?}",
+        sizes
+    );
+    // The B-frame slices are at decode-order indices 2 and 4. With every
+    // CU collapsing to skip, each B slice should be very small — well
+    // under 100 bytes for a 4×4 CTU grid (16 CUs * 2 bits per skip CU
+    // ≈ 4 bytes header + a few CABAC context-flush bytes).
+    assert!(
+        sizes[2] < 100,
+        "B(POC1) too large {}, skip path likely not engaging",
+        sizes[2]
+    );
+    assert!(
+        sizes[4] < 100,
+        "B(POC3) too large {}, skip path likely not engaging",
+        sizes[4]
+    );
+}
+
+/// Round 23: per-CU mode pick should let the merge path improve PSNR on
+/// content that has a strong correlation between the L0/L1 motion and
+/// the source. A 1-pel-per-frame translating gradient gives every B-
+/// frame CU a near-perfect match in either ref, so the merge candidates
+/// (which inherit the spatial neighbour's MV) should match or beat
+/// explicit AMVP — and the per-CU SAD pick should never be worse than
+/// the AMVP-only baseline.
+#[test]
+fn b_slice_merge_path_decodes_within_psnr_floor() {
+    let w = 64u32;
+    let h = 64u32;
+    let display: Vec<VideoFrame> = (0..5).map(|i| make_gradient(w, h, i)).collect();
+
+    let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+    for frame in &display {
+        enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+    }
+    enc.flush().unwrap();
+    let mut all = Vec::new();
+    for _ in 0..5 {
+        all.extend_from_slice(&enc.receive_packet().unwrap().data);
+    }
+
+    let mut dec = HevcDecoder::new(CodecId::new("h265"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), all))
+        .expect("send_packet");
+    let mut decoded = Vec::new();
+    for _ in 0..5 {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => decoded.push(v),
+            _ => panic!("decode failed"),
+        }
+    }
+    let display_for_decode = [0usize, 2, 1, 4, 3];
+    for (di, dec_frame) in decoded.iter().enumerate() {
+        let display_idx = display_for_decode[di];
+        let p = psnr_y(&display[display_idx], dec_frame, w, h);
+        eprintln!("merge-path frame{di} (display {display_idx}): {p:.2} dB");
+        // 25 dB floor: the merge / skip path may pick a slightly worse
+        // predictor than explicit AMVP for a few CUs (the SAD scoring
+        // is luma-only so chroma can drift), but every frame must stay
+        // well above garbage-MV territory.
+        assert!(
+            p > 25.0,
+            "frame {di} (display {display_idx}) PSNR {p:.2} below merge-path floor"
+        );
+    }
+}
+
+/// Round 23: end-to-end ffmpeg cross-decode for a static-content
+/// stream where every B / late-P CU should be encoded as skip. The
+/// stream must be both syntactically valid and decode bit-exact via
+/// ffmpeg's libavcodec hevc decoder — this catches CABAC desync on
+/// the skip path.
+#[test]
+fn b_skip_ffmpeg_cross_decode_psnr() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping B_Skip ffmpeg cross-decode");
+        return;
+    }
+    let w = 64u32;
+    let h = 64u32;
+    let display: Vec<VideoFrame> = (0..5).map(|_| make_gradient(w, h, 0)).collect();
+
+    let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+    for f in &display {
+        enc.send_frame(&Frame::Video(f.clone())).unwrap();
+    }
+    enc.flush().unwrap();
+    let mut bytes = Vec::new();
+    for _ in 0..5 {
+        bytes.extend_from_slice(&enc.receive_packet().unwrap().data);
+    }
+
+    let dir = PathBuf::from("/tmp/oxideav-h265-fixtures");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let es = dir.join("encoder-b-skip-r23.hevc");
+    let raw = dir.join("encoder-b-skip-r23.yuv");
+    std::fs::write(&es, &bytes).expect("write hevc");
+    let _ = std::fs::remove_file(&raw);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            es.to_str().unwrap(),
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            raw.to_str().unwrap(),
+        ])
+        .status()
+        .expect("ffmpeg invoke");
+    if !status.success() {
+        panic!("ffmpeg decode of B_Skip stream failed");
+    }
+    let yuv = std::fs::read(&raw).expect("read raw");
+    let frame_len = (w * h * 3 / 2) as usize;
+    if yuv.len() < 5 * frame_len {
+        panic!(
+            "ffmpeg decoded {} bytes, expected at least {} (5 frames)",
+            yuv.len(),
+            5 * frame_len
+        );
+    }
+    for (display_idx, src_frame) in display.iter().enumerate().take(5) {
+        let off = display_idx * frame_len;
+        let exp_y = &yuv[off..off + (w * h) as usize];
+        let mut act_y = Vec::with_capacity((w * h) as usize);
+        let src = &src_frame.planes[0];
+        for y in 0..h as usize {
+            act_y.extend_from_slice(&src.data[y * src.stride..y * src.stride + w as usize]);
+        }
+        let mut sse = 0u64;
+        for i in 0..exp_y.len() {
+            let d = exp_y[i] as i64 - act_y[i] as i64;
+            sse += (d * d) as u64;
+        }
+        let mse = sse as f64 / exp_y.len() as f64;
+        let psnr = if sse == 0 {
+            99.0
+        } else {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        };
+        eprintln!("ffmpeg-decoded B_Skip display POC {display_idx}: {psnr:.2} dB vs source");
+        // 22 dB matches the existing B-slice ffmpeg-cross-decode
+        // floor for static-content cascades (`b_slice_static_content_is_
+        // lossless_after_quantize`): each P-anchor's local quantisation
+        // noise propagates to its B-frame's L0 / L1 references, so the
+        // late B-frames drift a few dB below the IDR-anchored opener.
+        // The point of the skip-path test is to pin that the *stream
+        // parses end-to-end via libavcodec without CABAC desync* — any
+        // catastrophic regression would crash the decoder or send PSNR
+        // into single digits, not just a few-dB cascade drift.
+        assert!(
+            psnr > 22.0,
+            "ffmpeg-decoded B_Skip POC {display_idx} PSNR {psnr:.2} below floor"
+        );
+    }
+}

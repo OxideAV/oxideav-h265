@@ -1,21 +1,34 @@
-//! B-slice header + CABAC slice-data emission (round 22).
+//! B-slice header + CABAC slice-data emission (rounds 22–23).
 //!
-//! Scope:
+//! Scope (round 23):
 //!
 //! * Single-segment B (TrailR) slice referencing two pictures: one
 //!   earlier-POC L0 reference and one later-POC L1 reference. Both list
 //!   sizes are 1 (`num_ref_idx_l{0,1}_active_minus1 = 0`) so `ref_idx_lX`
 //!   is implicit per §7.3.8.6.
-//! * Per-CU pipeline: INTER 2Nx2N, `cu_skip_flag = 0`, `pred_mode_flag = 0`,
-//!   `merge_flag = 0`. Encoder picks the best of L0-only / L1-only / Bi
-//!   for every CU by comparing reconstructed-MC SAD against the source
-//!   (rate-distortion approximation: pick whichever predictor minimises
-//!   absolute-difference; the residual / quant pipeline is identical
-//!   across all three so the predictor pick directly controls quality).
+//! * Per-CU pipeline picks among three modes:
+//!     - **B_Skip** (round 23): `cu_skip_flag = 1` + `merge_idx`. No
+//!       residual, no `pred_mode`, no `part_mode`, no explicit AMVP. The
+//!       CU inherits the chosen merge candidate's motion in full
+//!       (§8.5.3.2.10). Selected when the best merge candidate's SAD
+//!       residual is below `SKIP_RESIDUAL_THRESHOLD`.
+//!     - **Merge** (round 23): `cu_skip_flag = 0`, `pred_mode_flag = 0`,
+//!       `part_mode = 2Nx2N`, `merge_flag = 1`, `merge_idx`. Residual
+//!       coded normally. Selected when the best merge SAD beats the
+//!       best AMVP SAD.
+//!     - **Explicit AMVP** (round 22): `merge_flag = 0` with explicit
+//!       `inter_pred_idc`, per-list `ref_idx`/`mvd`/`mvp_lx_flag = 0`.
+//! * Merge candidate list: full §8.5.3.2.{2..5} pipeline via
+//!   [`build_merge_list_full`] — spatial A0/A1/B0/B1/B2, temporal (we
+//!   don't enable TMVP so it's skipped), combined bi-pred, then zero-MV
+//!   pad. With `max_num_merge_cand = 5` we get up to five candidates.
+//! * Slice header now emits `five_minus_max_num_merge_cand = 0` (vs r22's
+//!   `4`) so the merge list grows from 1 → 5 entries. The unused entries
+//!   stay zero-MV pads when the SAD search picks the explicit-AMVP path
+//!   instead.
 //! * `inter_pred_idc` (§9.3.4.2.2 Table 9-32): bin 0 ctxInc =
 //!   `CtDepth[x0][y0]` for `(nPbW + nPbH) != 12`. Our CU is 16×16 so
-//!   nPbW + nPbH = 32 and CtDepth = 0 → bin0_ctx = 0. We never produce
-//!   small (4×8 / 8×4) PBs in this writer so the small-PU path is unused.
+//!   nPbW + nPbH = 32 and CtDepth = 0 → bin0_ctx = 0.
 //! * Both AMVP candidates per list collapse to a single predictor
 //!   (`mvp_lx_flag = 0`); we mirror the P-slice writer's spatial-only
 //!   AMVP that walks A0/A1 then B0/B1/B2 on the local 4×4 mv grid.
@@ -29,14 +42,20 @@
 //!   `num_positive_pics = 1` RPS is signalled inline per slice
 //!   (`short_term_ref_pic_set_sps_flag = 0`).
 //!
-//! Out of scope for r22 (deferred to r23+): merge encode, B_Skip encode,
-//! AMP / Nx2N / 2NxN partitions, MVD-l1-zero optimisation,
-//! `weighted_bipred`.
+//! `cu_skip_flag` ctxInc: §9.3.4.2.2 Table 9-32 — `ctxInc =
+//! condTermFlagL + condTermFlagA` where `condTermFlagX = neighbour.is_skip`
+//! (decoder's r19 fix). The encoder maintains a per-4×4 `is_skip` grid
+//! (populated alongside the MV grids) so the ctxInc derivation stays in
+//! lock-step with the decoder.
+//!
+//! Out of scope for r23 (deferred to r24+): AMP / Nx2N / 2NxN partitions,
+//! `mvd_l1_zero_flag` optimisation, B-pyramid (mini-GOP > 2), 10-bit.
 
 use crate::cabac::{
     init_row, CtxState, InitType, ABS_MVD_GREATER_FLAGS_INIT_VALUES, CU_SKIP_FLAG_INIT_VALUES,
-    INTER_PRED_IDC_INIT_VALUES, MERGE_FLAG_INIT_VALUES, MVP_LX_FLAG_INIT_VALUES,
-    PART_MODE_INIT_VALUES, PRED_MODE_FLAG_INIT_VALUES, RQT_ROOT_CBF_INIT_VALUES,
+    INTER_PRED_IDC_INIT_VALUES, MERGE_FLAG_INIT_VALUES, MERGE_IDX_INIT_VALUES,
+    MVP_LX_FLAG_INIT_VALUES, PART_MODE_INIT_VALUES, PRED_MODE_FLAG_INIT_VALUES,
+    RQT_ROOT_CBF_INIT_VALUES,
 };
 use crate::encoder::bit_writer::{write_rbsp_trailing_bits, BitWriter};
 use crate::encoder::cabac_writer::CabacWriter;
@@ -44,6 +63,10 @@ use crate::encoder::nal_writer::build_annex_b_nal;
 use crate::encoder::p_slice_writer::ReferenceFrame;
 use crate::encoder::params::EncoderConfig;
 use crate::encoder::residual_writer::{encode_residual, ResidualCtx};
+use crate::inter::{
+    build_merge_list_full, InterState, MergeCand, MergeCombinedCfg, MergeZeroPad, MotionVector,
+    NeighbourContext, PbMotion, RefPocEntry,
+};
 use crate::nal::{NalHeader, NalUnitType};
 use crate::transform::{
     dequantize_flat, forward_transform_2d, inverse_transform_2d, quantize_flat,
@@ -56,6 +79,24 @@ const CTU_SIZE: u32 = 16;
 const SLICE_QP_Y: i32 = 26;
 /// Integer search window (luma pixels). ±`ME_RANGE` both directions.
 const ME_RANGE: i32 = 8;
+/// `MaxNumMergeCand` advertised in the slice header. Round 23 lifts this
+/// from 1 (round 22) to 5 — the spec's maximum. Larger lists are a
+/// strict super-set: with `max == 1` only the first spatial candidate is
+/// reachable via `merge_idx`, with `max == 5` the SAD search can pick
+/// any of A0/A1/B0/B1/B2 + (eventually) combined bi-pred + zero-MV pads.
+const MAX_NUM_MERGE_CAND: u32 = 5;
+/// `five_minus_max_num_merge_cand` slice-header field. With the current
+/// `MAX_NUM_MERGE_CAND = 5`, this is `5 - 5 = 0`.
+const FIVE_MINUS_MAX_MERGE: u32 = 5 - MAX_NUM_MERGE_CAND;
+/// Skip threshold: when the best merge candidate's residual SAD is at or
+/// below this many luma pels of distortion, the encoder emits the CU as
+/// `B_Skip` (no residual, no AMVP, no `merge_flag`). The threshold is
+/// generous so static / near-static CUs collapse to a 2-bit skip CU
+/// (`cu_skip_flag = 1`, `merge_idx = 0`) while preserving a clean
+/// fall-through to the merge / AMVP residual path for moving content.
+/// Value chosen as one quantisation step (≈ Qstep at QP 26) per pel
+/// over a 16×16 CU = 4 × 256 ≈ 1024.
+const SKIP_RESIDUAL_THRESHOLD: u64 = 1024;
 
 /// Build Annex B bytes for a B (TrailR) slice NAL.
 ///
@@ -106,12 +147,12 @@ pub fn build_b_slice_with_reconstruction(
                     // pps.cabac_init_present_flag = 0 → skipped.
                     // slice_temporal_mvp_enabled_flag = 0 → no collocated.
                     // pps.weighted_bipred_flag = 0 → no weighted_pred table.
-    bw.write_ue(4); // five_minus_max_num_merge_cand → max_num_merge_cand = 1
+    bw.write_ue(FIVE_MINUS_MAX_MERGE); // max_num_merge_cand = MAX_NUM_MERGE_CAND
     bw.write_se(0); // slice_qp_delta = 0.
     write_rbsp_trailing_bits(&mut bw);
 
     // ---- slice_data() ------------------------------------------------
-    let mut enc = BEncoderState::new(cfg, ref_l0.clone(), ref_l1.clone());
+    let mut enc = BEncoderState::new(cfg, ref_l0.clone(), ref_l1.clone(), delta_l0, delta_l1);
     {
         let mut cabac = CabacWriter::new(&mut bw);
         let pic_w_ctb = cfg.width.div_ceil(CTU_SIZE);
@@ -138,13 +179,26 @@ struct BEncoderState {
     cfg: EncoderConfig,
     ref_l0: ReferenceFrame,
     ref_l1: ReferenceFrame,
+    /// POC of the L0 reference relative to the current picture (< 0).
+    /// Recorded so spatial neighbours pulled from `inter_state` carry
+    /// matching `ref_poc_l0` for `build_merge_list_full`'s combined-bi
+    /// gate.
+    delta_l0: i32,
+    /// POC of the L1 reference relative to the current picture (> 0).
+    delta_l1: i32,
     rec_y: Vec<u8>,
     rec_cb: Vec<u8>,
     rec_cr: Vec<u8>,
     y_stride: usize,
     c_stride: usize,
+    /// Per-PB motion grid — drives the merge candidate derivation
+    /// (`build_merge_list_full`). Mirrors `decoder.pic.inter`.
+    inter_state: InterState,
     /// Per-4×4 block: Some((mv_x, mv_y)) for each list when this PB used
-    /// that list, None otherwise. Used by AMVP spatial-neighbour fetch.
+    /// that list, None otherwise. Used by the AMVP spatial-neighbour
+    /// fetch which scans the encoder's local grid (the decoder runs the
+    /// same scan on its `pic.inter` PB grid; both produce the same MV
+    /// when the MV records line up).
     mv_grid_l0: Vec<Option<(i32, i32)>>,
     mv_grid_l1: Vec<Option<(i32, i32)>>,
     grid_w4: usize,
@@ -155,6 +209,7 @@ struct BEncoderState {
     pred_mode_flag: [CtxState; 1],
     part_mode: [CtxState; 4],
     merge_flag: [CtxState; 1],
+    merge_idx: [CtxState; 1],
     mvp_lx_flag: [CtxState; 1],
     abs_mvd_greater: [CtxState; 2],
     rqt_root_cbf: [CtxState; 1],
@@ -162,8 +217,31 @@ struct BEncoderState {
     residual: ResidualCtx,
 }
 
+/// Per-CU mode pick.
+#[derive(Clone, Copy, Debug)]
+enum BMode {
+    /// `cu_skip_flag = 1` + `merge_idx`. Best merge candidate, no residual.
+    Skip { merge_idx: u32 },
+    /// `merge_flag = 1` + `merge_idx`. Best merge candidate, residual coded.
+    Merge { merge_idx: u32 },
+    /// Explicit AMVP. `use_l0`/`use_l1` indicate which lists are active;
+    /// `mv_l0`/`mv_l1` are the integer-pel selected MVs.
+    Amvp {
+        use_l0: bool,
+        use_l1: bool,
+        mv_l0: (i32, i32),
+        mv_l1: (i32, i32),
+    },
+}
+
 impl BEncoderState {
-    fn new(cfg: &EncoderConfig, ref_l0: ReferenceFrame, ref_l1: ReferenceFrame) -> Self {
+    fn new(
+        cfg: &EncoderConfig,
+        ref_l0: ReferenceFrame,
+        ref_l1: ReferenceFrame,
+        delta_l0: i32,
+        delta_l1: i32,
+    ) -> Self {
         let w = cfg.width as usize;
         let h = cfg.height as usize;
         let cw = w / 2;
@@ -176,11 +254,14 @@ impl BEncoderState {
             cfg: *cfg,
             ref_l0,
             ref_l1,
+            delta_l0,
+            delta_l1,
             rec_y: vec![128u8; w * h],
             rec_cb: vec![128u8; cw * ch],
             rec_cr: vec![128u8; cw * ch],
             y_stride: w,
             c_stride: cw,
+            inter_state: InterState::new(cfg.width, cfg.height),
             mv_grid_l0: vec![None; grid_w4 * grid_h4],
             mv_grid_l1: vec![None; grid_w4 * grid_h4],
             grid_w4,
@@ -189,6 +270,7 @@ impl BEncoderState {
             pred_mode_flag: init_row(&PRED_MODE_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             part_mode: init_row(&PART_MODE_INIT_VALUES, it, SLICE_QP_Y),
             merge_flag: init_row(&MERGE_FLAG_INIT_VALUES, it, SLICE_QP_Y),
+            merge_idx: init_row(&MERGE_IDX_INIT_VALUES, it, SLICE_QP_Y),
             mvp_lx_flag: init_row(&MVP_LX_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             abs_mvd_greater: init_row(&ABS_MVD_GREATER_FLAGS_INIT_VALUES, it, SLICE_QP_Y),
             rqt_root_cbf: init_row(&RQT_ROOT_CBF_INIT_VALUES, it, SLICE_QP_Y),
@@ -198,110 +280,326 @@ impl BEncoderState {
     }
 
     fn encode_ctu(&mut self, cw: &mut CabacWriter<'_>, src: &VideoFrame, x0: u32, y0: u32) {
-        // cu_skip_flag = 0, ctx_inc = neighbours-with-skip count (we never
-        // emit skip so the count is always derived from "neighbour was an
-        // inter PB" — same approximation P-slice writer uses).
-        let skip_ctx_inc = self.skip_ctx_inc(x0, y0);
-        cw.encode_bin(&mut self.cu_skip_flag[skip_ctx_inc], 0);
+        // ---- evaluate merge candidates (driven SAD pick) ---------------
+        let merge_cands = self.build_merge_cands(x0, y0);
+        let (merge_idx_best, merge_pb, merge_sad, merge_pred_y, merge_pred_cb, merge_pred_cr) =
+            self.pick_merge_candidate(src, x0, y0, &merge_cands);
 
-        // pred_mode_flag = 0 (INTER).
-        cw.encode_bin(&mut self.pred_mode_flag[0], 0);
-
-        // part_mode bin 0 = 1 (2Nx2N). No more bins for 2Nx2N inter.
-        cw.encode_bin(&mut self.part_mode[0], 1);
-
-        // merge_flag = 0.
-        cw.encode_bin(&mut self.merge_flag[0], 0);
-
-        // ---- candidate MVs per list -----------------------------------
+        // ---- evaluate explicit AMVP: per-list integer-pel SAD search ---
         let (mv_l0_int, sad_l0) = self.estimate_mv_int(src, x0, y0, /* l1 */ false);
         let (mv_l1_int, sad_l1) = self.estimate_mv_int(src, x0, y0, /* l1 */ true);
-
-        // Bi-pred candidate: average the two list predictors and SAD.
         let (luma_pred_l0, cb_pred_l0, cr_pred_l0) =
             motion_compensate(&self.ref_l0, x0, y0, mv_l0_int.0, mv_l0_int.1);
         let (luma_pred_l1, cb_pred_l1, cr_pred_l1) =
             motion_compensate(&self.ref_l1, x0, y0, mv_l1_int.0, mv_l1_int.1);
-        let mut luma_pred_bi = vec![0u8; luma_pred_l0.len()];
-        for i in 0..luma_pred_bi.len() {
-            // Round-half-up average matches §8.5.3.3.3.1 default-bipred
-            // weighting `(P0 + P1 + 1) >> 1` (without weighted-pred table).
-            luma_pred_bi[i] = ((luma_pred_l0[i] as u32 + luma_pred_l1[i] as u32 + 1) >> 1) as u8;
-        }
-        let mut cb_pred_bi = vec![0u8; cb_pred_l0.len()];
-        for i in 0..cb_pred_bi.len() {
-            cb_pred_bi[i] = ((cb_pred_l0[i] as u32 + cb_pred_l1[i] as u32 + 1) >> 1) as u8;
-        }
-        let mut cr_pred_bi = vec![0u8; cr_pred_l0.len()];
-        for i in 0..cr_pred_bi.len() {
-            cr_pred_bi[i] = ((cr_pred_l0[i] as u32 + cr_pred_l1[i] as u32 + 1) >> 1) as u8;
-        }
+        let (luma_pred_bi, cb_pred_bi, cr_pred_bi) = make_bipred(
+            &luma_pred_l0,
+            &cb_pred_l0,
+            &cr_pred_l0,
+            &luma_pred_l1,
+            &cb_pred_l1,
+            &cr_pred_l1,
+        );
         let sad_bi = sad_luma(src, x0, y0, &luma_pred_bi, CTU_SIZE);
+        let (amvp_use_l0, amvp_use_l1, amvp_luma, amvp_cb, amvp_cr, amvp_sad) =
+            if sad_bi <= sad_l0 && sad_bi <= sad_l1 {
+                (true, true, luma_pred_bi, cb_pred_bi, cr_pred_bi, sad_bi)
+            } else if sad_l0 <= sad_l1 {
+                (true, false, luma_pred_l0, cb_pred_l0, cr_pred_l0, sad_l0)
+            } else {
+                (false, true, luma_pred_l1, cb_pred_l1, cr_pred_l1, sad_l1)
+            };
 
-        // Pick predictor with minimum luma SAD.
-        let (use_l0, use_l1, luma_pred, cb_pred, cr_pred) = if sad_bi <= sad_l0 && sad_bi <= sad_l1
-        {
-            (true, true, luma_pred_bi, cb_pred_bi, cr_pred_bi)
-        } else if sad_l0 <= sad_l1 {
-            (true, false, luma_pred_l0, cb_pred_l0, cr_pred_l0)
+        // ---- pick mode -------------------------------------------------
+        // Skip when the best merge SAD is below the threshold AND merge
+        // beats AMVP (otherwise we'd lose quality on a moving CU just to
+        // save 2 bits of header).
+        let merge_wins = merge_sad < amvp_sad;
+        let mode = if merge_wins && merge_sad <= SKIP_RESIDUAL_THRESHOLD {
+            BMode::Skip {
+                merge_idx: merge_idx_best,
+            }
+        } else if merge_wins {
+            BMode::Merge {
+                merge_idx: merge_idx_best,
+            }
         } else {
-            (false, true, luma_pred_l1, cb_pred_l1, cr_pred_l1)
+            BMode::Amvp {
+                use_l0: amvp_use_l0,
+                use_l1: amvp_use_l1,
+                mv_l0: mv_l0_int,
+                mv_l1: mv_l1_int,
+            }
         };
 
-        // ---- inter_pred_idc (B-slice only; bin0 ctxInc = CtDepth = 0
-        //      since CU is at CTB depth 0) ---------------------------------
-        // Bin 0: 1 = PRED_BI, 0 = uni (then bin 1 selects L0/L1).
-        // Bin 1 ctxInc = 4. (n+w) != 12 so we always take the
-        // CtDepth-indexed bin0 path; CtDepth for our 16×16 CU at 16×16 CTB
-        // is 0 → bin0_ctx = 0.
-        let bin0_ctx = 0usize;
-        if use_l0 && use_l1 {
-            cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 1);
-        } else {
-            cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 0);
-            cw.encode_bin(&mut self.inter_pred_idc[4], if use_l1 { 1 } else { 0 });
-        }
+        // ---- emit ------------------------------------------------------
+        let skip_ctx_inc = self.skip_ctx_inc(x0, y0);
+        match mode {
+            BMode::Skip { merge_idx } => {
+                cw.encode_bin(&mut self.cu_skip_flag[skip_ctx_inc], 1);
+                self.emit_merge_idx(cw, merge_idx);
+                // Merge MC + state update — no residual.
+                let pb = self.materialise_merge_pb(merge_pb, /* is_skip */ true);
+                self.apply_prediction_no_residual(
+                    x0,
+                    y0,
+                    &merge_pred_y,
+                    &merge_pred_cb,
+                    &merge_pred_cr,
+                );
+                self.publish_pb(x0, y0, CTU_SIZE, pb);
+            }
+            BMode::Merge { merge_idx } => {
+                cw.encode_bin(&mut self.cu_skip_flag[skip_ctx_inc], 0);
+                cw.encode_bin(&mut self.pred_mode_flag[0], 0); // INTER
+                cw.encode_bin(&mut self.part_mode[0], 1); // 2Nx2N
+                cw.encode_bin(&mut self.merge_flag[0], 1);
+                self.emit_merge_idx(cw, merge_idx);
+                let pb = self.materialise_merge_pb(merge_pb, /* is_skip */ false);
+                self.code_residual(
+                    cw,
+                    src,
+                    x0,
+                    y0,
+                    &merge_pred_y,
+                    &merge_pred_cb,
+                    &merge_pred_cr,
+                );
+                self.publish_pb(x0, y0, CTU_SIZE, pb);
+            }
+            BMode::Amvp {
+                use_l0,
+                use_l1,
+                mv_l0,
+                mv_l1,
+            } => {
+                cw.encode_bin(&mut self.cu_skip_flag[skip_ctx_inc], 0);
+                cw.encode_bin(&mut self.pred_mode_flag[0], 0); // INTER
+                cw.encode_bin(&mut self.part_mode[0], 1); // 2Nx2N
+                cw.encode_bin(&mut self.merge_flag[0], 0);
 
-        // ---- per-list AMVP / MVD ---------------------------------------
-        // num_ref_idx_lX_active_minus1 == 0 → ref_idx_lX is NOT coded.
-        if use_l0 {
-            let mv_qp = (mv_l0_int.0 * 4, mv_l0_int.1 * 4);
-            let mvp = self.amvp_predictor(x0, y0, CTU_SIZE, CTU_SIZE, /* l1 */ false);
-            self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
-            cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
-        }
-        if use_l1 {
-            let mv_qp = (mv_l1_int.0 * 4, mv_l1_int.1 * 4);
-            let mvp = self.amvp_predictor(x0, y0, CTU_SIZE, CTU_SIZE, /* l1 */ true);
-            // mvd_l1_zero_flag = 0 → emit the L1 MVD normally.
-            self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
-            cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
-        }
+                // inter_pred_idc bin0 ctxInc = CtDepth = 0.
+                let bin0_ctx = 0usize;
+                if use_l0 && use_l1 {
+                    cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 1);
+                } else {
+                    cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 0);
+                    cw.encode_bin(&mut self.inter_pred_idc[4], if use_l1 { 1 } else { 0 });
+                }
+                if use_l0 {
+                    let mv_qp = (mv_l0.0 * 4, mv_l0.1 * 4);
+                    let mvp = self.amvp_predictor(x0, y0, CTU_SIZE, CTU_SIZE, /* l1 */ false);
+                    self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
+                    cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
+                }
+                if use_l1 {
+                    let mv_qp = (mv_l1.0 * 4, mv_l1.1 * 4);
+                    let mvp = self.amvp_predictor(x0, y0, CTU_SIZE, CTU_SIZE, /* l1 */ true);
+                    self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
+                    cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
+                }
 
-        // Publish chosen MVs on the per-list 4×4 grid for AMVP neighbour
-        // lookups by subsequent CUs in raster scan.
-        if use_l0 {
-            self.store_mv(x0, y0, CTU_SIZE, (mv_l0_int.0 * 4, mv_l0_int.1 * 4), false);
-        }
-        if use_l1 {
-            self.store_mv(x0, y0, CTU_SIZE, (mv_l1_int.0 * 4, mv_l1_int.1 * 4), true);
-        }
+                self.code_residual(cw, src, x0, y0, &amvp_luma, &amvp_cb, &amvp_cr);
 
-        // ---- residual --------------------------------------------------
-        let log2_tb = 4u32;
-        let c_log2 = 3u32;
-        let (luma_levels, luma_rec) = self.process_inter_luma(src, x0, y0, &luma_pred);
+                // Build the PB record published to the inter grid.
+                let mv_l0_qp = MotionVector::new(mv_l0.0 * 4, mv_l0.1 * 4);
+                let mv_l1_qp = MotionVector::new(mv_l1.0 * 4, mv_l1.1 * 4);
+                let pb = PbMotion {
+                    valid: true,
+                    is_intra: false,
+                    is_skip: false,
+                    pred_l0: use_l0,
+                    pred_l1: use_l1,
+                    ref_idx_l0: if use_l0 { 0 } else { -1 },
+                    ref_idx_l1: if use_l1 { 0 } else { -1 },
+                    mv_l0: if use_l0 {
+                        mv_l0_qp
+                    } else {
+                        MotionVector::default()
+                    },
+                    mv_l1: if use_l1 {
+                        mv_l1_qp
+                    } else {
+                        MotionVector::default()
+                    },
+                    ref_poc_l0: if use_l0 { self.delta_l0 } else { 0 },
+                    ref_poc_l1: if use_l1 { self.delta_l1 } else { 0 },
+                    ref_lt_l0: false,
+                    ref_lt_l1: false,
+                };
+                self.publish_pb(x0, y0, CTU_SIZE, pb);
+            }
+        }
+    }
+
+    /// Build the merge candidate list for the CU at `(x0, y0)`. Mirrors
+    /// the decoder's call into `build_merge_list_full` exactly so the
+    /// candidate at index `merge_idx` here matches the candidate the
+    /// decoder will materialise.
+    fn build_merge_cands(&self, x0: u32, y0: u32) -> Vec<MergeCand> {
+        let nb = NeighbourContext::default();
+        let rpl0 = vec![RefPocEntry {
+            poc: self.delta_l0,
+            is_long_term: false,
+        }];
+        let rpl1 = vec![RefPocEntry {
+            poc: self.delta_l1,
+            is_long_term: false,
+        }];
+        let comb_cfg = MergeCombinedCfg {
+            rpl0: &rpl0,
+            rpl1: &rpl1,
+        };
+        let zero_cfg = MergeZeroPad {
+            num_ref_idx: 1, // both lists have exactly 1 entry
+            rpl0: &rpl0,
+            rpl1: &rpl1,
+        };
+        // No TMVP — `slice_temporal_mvp_enabled_flag = 0`.
+        build_merge_list_full(
+            &self.inter_state,
+            x0,
+            y0,
+            CTU_SIZE,
+            CTU_SIZE,
+            MAX_NUM_MERGE_CAND,
+            true, // is_b_slice
+            None, // tmvp
+            nb,
+            comb_cfg,
+            zero_cfg,
+        )
+    }
+
+    /// Score every merge candidate by SAD against the source and return
+    /// `(idx, candidate, sad, luma_pred, cb_pred, cr_pred)` for the best.
+    fn pick_merge_candidate(
+        &self,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        cands: &[MergeCand],
+    ) -> (u32, MergeCand, u64, Vec<u8>, Vec<u8>, Vec<u8>) {
+        debug_assert!(!cands.is_empty(), "merge list must have ≥ 1 entry");
+        let mut best_idx = 0u32;
+        let mut best_sad = u64::MAX;
+        let mut best_y = Vec::new();
+        let mut best_cb = Vec::new();
+        let mut best_cr = Vec::new();
+        let mut best_cand = cands[0];
+        for (i, cand) in cands.iter().enumerate() {
+            // Convert candidate quarter-pel MV → integer luma pel for our
+            // integer-only MC path. Anything off-grid is approximated;
+            // the decoder reads the same MV bits so its MC will match.
+            let (luma, cb, cr) = self.merge_motion_compensate(x0, y0, cand);
+            let sad = sad_luma(src, x0, y0, &luma, CTU_SIZE);
+            if sad < best_sad {
+                best_sad = sad;
+                best_idx = i as u32;
+                best_y = luma;
+                best_cb = cb;
+                best_cr = cr;
+                best_cand = *cand;
+            }
+        }
+        (best_idx, best_cand, best_sad, best_y, best_cb, best_cr)
+    }
+
+    /// Motion-compensate a merge candidate. Bipred candidates average the
+    /// two list predictors with `(P0 + P1 + 1) >> 1` (default-bipred
+    /// weighting per §8.5.3.3.3.1).
+    fn merge_motion_compensate(
+        &self,
+        x0: u32,
+        y0: u32,
+        cand: &MergeCand,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        // Quarter-pel MV → integer luma pel via floor-div by 4. The
+        // decoder runs a full sub-pel interpolation but in this writer's
+        // configuration every MV that the encoder ever stores is a
+        // multiple of 4 (ME runs at integer pel, store_mv multiplies by
+        // 4), so the chosen merge candidate's MV is also a multiple of
+        // 4. The arithmetic-shift below is the inverse of that store.
+        let mv0 = (cand.mv_l0.x >> 2, cand.mv_l0.y >> 2);
+        let mv1 = (cand.mv_l1.x >> 2, cand.mv_l1.y >> 2);
+        match (cand.pred_l0, cand.pred_l1) {
+            (true, false) => motion_compensate(&self.ref_l0, x0, y0, mv0.0, mv0.1),
+            (false, true) => motion_compensate(&self.ref_l1, x0, y0, mv1.0, mv1.1),
+            (true, true) => {
+                let (y0p, cb0p, cr0p) = motion_compensate(&self.ref_l0, x0, y0, mv0.0, mv0.1);
+                let (y1p, cb1p, cr1p) = motion_compensate(&self.ref_l1, x0, y0, mv1.0, mv1.1);
+                make_bipred(&y0p, &cb0p, &cr0p, &y1p, &cb1p, &cr1p)
+            }
+            (false, false) => {
+                // Should never happen — the merge derivation always
+                // produces at least one prediction list. Fall back to L0
+                // zero-MV to keep the encoder safe.
+                motion_compensate(&self.ref_l0, x0, y0, 0, 0)
+            }
+        }
+    }
+
+    /// Convert a [`MergeCand`] into a [`PbMotion`] suitable for the inter
+    /// grid. Patches `ref_poc_*` from the slice's RPL so the grid carries
+    /// spec-correct shadow metadata for future neighbour lookups.
+    fn materialise_merge_pb(&self, cand: MergeCand, is_skip: bool) -> PbMotion {
+        let mut pb = cand.to_pb();
+        pb.is_skip = is_skip;
+        if pb.pred_l0 {
+            pb.ref_poc_l0 = self.delta_l0;
+            pb.ref_lt_l0 = false;
+        }
+        if pb.pred_l1 {
+            pb.ref_poc_l1 = self.delta_l1;
+            pb.ref_lt_l1 = false;
+        }
+        pb
+    }
+
+    /// Write the merge candidate's prediction into the local
+    /// reconstruction buffers without coding any residual (skip path).
+    fn apply_prediction_no_residual(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        luma_pred: &[u8],
+        cb_pred: &[u8],
+        cr_pred: &[u8],
+    ) {
         let cx = x0 / 2;
         let cy = y0 / 2;
-        let (cb_levels, cb_rec) = self.process_inter_chroma(src, cx, cy, &cb_pred, false);
-        let (cr_levels, cr_rec) = self.process_inter_chroma(src, cx, cy, &cr_pred, true);
+        let n = CTU_SIZE as usize;
+        let cn = n / 2;
+        self.write_luma_block(x0, y0, n, luma_pred);
+        self.write_chroma_block(cx, cy, cn, cb_pred, false);
+        self.write_chroma_block(cx, cy, cn, cr_pred, true);
+    }
+
+    /// Code the residual for a CU given its prediction. Updates the local
+    /// reconstruction buffers with `pred + dequant(quant(residual))`.
+    fn code_residual(
+        &mut self,
+        cw: &mut CabacWriter<'_>,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        luma_pred: &[u8],
+        cb_pred: &[u8],
+        cr_pred: &[u8],
+    ) {
+        let log2_tb = 4u32;
+        let c_log2 = 3u32;
+        let (luma_levels, luma_rec) = self.process_inter_luma(src, x0, y0, luma_pred);
+        let cx = x0 / 2;
+        let cy = y0 / 2;
+        let (cb_levels, cb_rec) = self.process_inter_chroma(src, cx, cy, cb_pred, false);
+        let (cr_levels, cr_rec) = self.process_inter_chroma(src, cx, cy, cr_pred, true);
 
         let cbf_luma = luma_levels.iter().any(|&l| l != 0);
         let cbf_cb = cb_levels.iter().any(|&l| l != 0);
         let cbf_cr = cr_levels.iter().any(|&l| l != 0);
         let any_residual = cbf_luma || cbf_cb || cbf_cr;
 
-        // rqt_root_cbf
         cw.encode_bin(&mut self.rqt_root_cbf[0], any_residual as u32);
 
         if any_residual {
@@ -322,19 +620,74 @@ impl BEncoderState {
             }
         }
 
-        // Write reconstructed samples for the in-picture neighbour state.
         self.write_luma_block(x0, y0, CTU_SIZE as usize, &luma_rec);
         self.write_chroma_block(cx, cy, 1 << c_log2, &cb_rec, false);
         self.write_chroma_block(cx, cy, 1 << c_log2, &cr_rec, true);
     }
 
-    /// §9.3.4.2.2 cu_skip_flag ctxInc with the spec's `condTermFlagX =
-    /// neighbour.is_skip`. Our writer never emits skip CUs so the
-    /// neighbour skip flag is always 0 — ctxInc collapses to 0 for every
-    /// CU. Mirrors the decoder's r19 fix exactly so the arithmetic stays
-    /// in sync.
-    fn skip_ctx_inc(&self, _x0: u32, _y0: u32) -> usize {
-        0
+    /// Publish a CU's PB onto the per-4×4 inter / mv grids so subsequent
+    /// CUs see the right neighbour state for AMVP / merge / skip-ctx
+    /// derivation.
+    fn publish_pb(&mut self, x0: u32, y0: u32, size: u32, pb: PbMotion) {
+        self.inter_state.set_rect(x0, y0, size, size, pb);
+        if pb.pred_l0 {
+            self.store_mv(x0, y0, size, (pb.mv_l0.x, pb.mv_l0.y), false);
+        }
+        if pb.pred_l1 {
+            self.store_mv(x0, y0, size, (pb.mv_l1.x, pb.mv_l1.y), true);
+        }
+    }
+
+    /// Emit `merge_idx` per §9.3.4.2.10 — bin 0 context-coded, remainder
+    /// bypass-unary up to `MAX_NUM_MERGE_CAND - 1`.
+    fn emit_merge_idx(&mut self, cw: &mut CabacWriter<'_>, idx: u32) {
+        if MAX_NUM_MERGE_CAND <= 1 {
+            return;
+        }
+        if idx == 0 {
+            cw.encode_bin(&mut self.merge_idx[0], 0);
+            return;
+        }
+        cw.encode_bin(&mut self.merge_idx[0], 1);
+        let max = MAX_NUM_MERGE_CAND - 1; // cMax in the TR binarisation
+        let mut v = 1u32;
+        while v < max {
+            if v == idx {
+                cw.encode_bypass(0);
+                return;
+            }
+            cw.encode_bypass(1);
+            v += 1;
+        }
+        // idx == max: ran out of bins, no terminating 0 needed.
+    }
+
+    /// §9.3.4.2.2 cu_skip_flag ctxInc = `condTermFlagL + condTermFlagA`
+    /// where `condTermFlagX = neighbour.is_skip`. Mirrors the decoder's
+    /// r19 fix exactly so encoder and decoder stay in CABAC sync. This
+    /// is the lookup that tripped Main 10 inter to 25 dB before r19.
+    fn skip_ctx_inc(&self, x0: u32, y0: u32) -> usize {
+        let left = if x0 == 0 {
+            0
+        } else {
+            let bx = ((x0 - 1) >> 2) as usize;
+            let by = (y0 >> 2) as usize;
+            self.inter_state
+                .get(bx, by)
+                .map(|p| p.valid && p.is_skip)
+                .unwrap_or(false) as usize
+        };
+        let above = if y0 == 0 {
+            0
+        } else {
+            let bx = (x0 >> 2) as usize;
+            let by = ((y0 - 1) >> 2) as usize;
+            self.inter_state
+                .get(bx, by)
+                .map(|p| p.valid && p.is_skip)
+                .unwrap_or(false) as usize
+        };
+        (left + above).min(2)
     }
 
     /// Integer-pel motion estimation against one of the references.
@@ -608,6 +961,31 @@ fn motion_compensate(
         }
     }
     (luma, cb, cr)
+}
+
+/// Default-bipred average `(P0 + P1 + 1) >> 1` (§8.5.3.3.3.1) for the
+/// three planes.
+fn make_bipred(
+    y0: &[u8],
+    cb0: &[u8],
+    cr0: &[u8],
+    y1: &[u8],
+    cb1: &[u8],
+    cr1: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut y = vec![0u8; y0.len()];
+    let mut cb = vec![0u8; cb0.len()];
+    let mut cr = vec![0u8; cr0.len()];
+    for i in 0..y.len() {
+        y[i] = ((y0[i] as u32 + y1[i] as u32 + 1) >> 1) as u8;
+    }
+    for i in 0..cb.len() {
+        cb[i] = ((cb0[i] as u32 + cb1[i] as u32 + 1) >> 1) as u8;
+    }
+    for i in 0..cr.len() {
+        cr[i] = ((cr0[i] as u32 + cr1[i] as u32 + 1) >> 1) as u8;
+    }
+    (y, cb, cr)
 }
 
 /// Luma SAD between source CTU and a prediction buffer.
