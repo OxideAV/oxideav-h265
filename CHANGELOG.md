@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 26 — **Main 12 (12-bit) encode** (§A.3.7, §7.4.3.2.1, §8.6.1).
+  `HevcEncoder::from_params` now accepts `PixelFormat::Yuv420P12Le`
+  source frames and routes them through a new
+  `src/encoder/slice_writer_main12.rs` which mirrors the round-25
+  Main 10 I-slice writer on `u16` samples with `bit_depth = 12`
+  threaded through every `intra_pred::predict` /
+  `transform::{forward,inverse,quantize,dequantize}_*` call. The SPS
+  emits `bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 4` and
+  `general_profile_idc = 4` (Format Range Extensions, where Main 12
+  lives per §A.3.7), with the VPS PTL agreeing byte-for-byte. The 9
+  RExt constraint flags inside the `profile_tier_level()` reserved
+  region are populated to the §A.3.7 "Main 12" signature
+  (`max_12bit_constraint_flag = 1`, `max_422chroma_constraint_flag = 1`,
+  `max_420chroma_constraint_flag = 1`,
+  `lower_bit_rate_constraint_flag = 1`, the rest 0) so ffmpeg's
+  `decode_profile_tier_level` maps the stream to the concrete Main 12
+  profile rather than to a generic "RExt".
+  `general_profile_compatibility_flag` carries the Main + Main 10 +
+  RExt bits per §A.3.5 so a sniffer that probes any of those bits
+  accepts the stream. `EncoderConfig::new_main12(w, h)` is the direct
+  constructor for callers wiring the encoder by hand. The forward
+  quantiser uses **Qp'Y = SliceQpY + QpBdOffsetY = 26 + 24 = 50** so
+  the encoder's forward quant matches the decoder's `get_qp` inverse
+  exactly (mirrored on chroma) — without the `QpBdOffset = 24` step
+  the reconstruction overshoots the source by `2^24 / step` and the
+  cross-decode collapses to ~10 dB, the same failure mode the
+  round-25 Main 10 work hit before its `QpBdOffset = 12` fix. Scope:
+  every 12-bit input frame is emitted as an IDR I-slice — 12-bit P/B
+  is the next round; `mini_gop_size > 1` at 12-bit is rejected at
+  construction time. The 8-bit Main and 10-bit Main 10 emission paths
+  (rounds 1..25) are unchanged byte-for-byte. Five new tests in
+  `tests/encoder_main12.rs` exercise the SPS / NAL ordering, the
+  64×64 + 128×128 self-roundtrip (each ≈ 45 dB Y on the 12-bit /
+  peak = 4095 scale), the ffmpeg cross-decode (≥ 45 dB Y, gated on
+  the existing `FFMPEG` env var) — measured 45.04 dB Y on the 64×64
+  gradient — and the mini_gop=2 rejection. Two new tests in
+  `src/encoder/params.rs::tests` (Main 12 SPS bit_depth + RExt compat
+  bits, Main 12 VPS profile_idc) plus two new
+  `src/encoder/slice_writer_main12::tests` (local reconstruction PSNR
+  + IDR NAL emission) cover the lib side.
 - round 25 — **Main 10 (10-bit) encode** (§A.3.3, §7.4.3.2.1, §8.6.1).
   `HevcEncoder::from_params` now accepts `PixelFormat::Yuv420P10Le`
   source frames and routes them through a new

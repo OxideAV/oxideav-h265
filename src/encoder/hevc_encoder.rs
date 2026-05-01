@@ -33,6 +33,7 @@ use crate::encoder::params::{
 };
 use crate::encoder::slice_writer::build_idr_slice_nal_with_reconstruction;
 use crate::encoder::slice_writer_main10::build_idr_slice_nal_main10;
+use crate::encoder::slice_writer_main12::build_idr_slice_nal_main12;
 
 /// Default GOP size (distance between IDR keyframes).
 const GOP_SIZE: u32 = 64;
@@ -86,16 +87,20 @@ impl HevcEncoder {
             )));
         }
         let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        // Round 25: accept Yuv420P (Main, 8-bit) and Yuv420P10Le (Main 10).
-        // Main 10 currently only covers the IDR I-slice path — B / P slices
-        // at 10 bit will fail on the next `send_frame` with a clear error
-        // (mini_gop check below also rejects mini_gop > 1 at 10-bit).
+        // Round 25 / 26: accept Yuv420P (Main, 8-bit), Yuv420P10Le
+        // (Main 10), and Yuv420P12Le (Main 12 / RExt). The high-bit-depth
+        // paths currently only cover the IDR I-slice path — B / P slices
+        // at 10 / 12 bit will fail on the next `send_frame` with a clear
+        // error (the mini_gop check below also rejects mini_gop > 1
+        // at 10 / 12-bit).
         let bit_depth = match pix {
             PixelFormat::Yuv420P => 8u32,
             PixelFormat::Yuv420P10Le => 10u32,
+            PixelFormat::Yuv420P12Le => 12u32,
             _ => {
                 return Err(Error::unsupported(format!(
-                    "h265 encoder: only Yuv420P / Yuv420P10Le are supported (got {pix:?})"
+                    "h265 encoder: only Yuv420P / Yuv420P10Le / Yuv420P12Le are supported \
+                     (got {pix:?})"
                 )));
             }
         };
@@ -110,6 +115,12 @@ impl HevcEncoder {
                  (and currently emits keyframe-only — P/B at 10 bit is a follow-up)",
             ));
         }
+        if bit_depth == 12 && mini_gop > 1 {
+            return Err(Error::unsupported(
+                "h265 encoder: Main 12 (Yuv420P12Le) only supports mini_gop_size = 1 \
+                 (and currently emits keyframe-only — P/B at 12 bit is a follow-up)",
+            ));
+        }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
 
         let mut output_params = params.clone();
@@ -121,10 +132,10 @@ impl HevcEncoder {
         output_params.frame_rate = Some(frame_rate);
 
         let time_base = TimeBase::new(frame_rate.den.max(1), frame_rate.num.max(1));
-        let cfg = if bit_depth == 10 {
-            EncoderConfig::new_main10(width, height)
-        } else {
-            EncoderConfig::new(width, height)
+        let cfg = match bit_depth {
+            12 => EncoderConfig::new_main12(width, height),
+            10 => EncoderConfig::new_main10(width, height),
+            _ => EncoderConfig::new(width, height),
         };
 
         let mut vps_sps_pps = Vec::new();
@@ -158,22 +169,35 @@ impl HevcEncoder {
             self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32,
         );
         data.extend_from_slice(&self.vps_sps_pps);
-        if self.cfg.bit_depth == 10 {
-            // Main 10 IDR — see `slice_writer_main10`. We do NOT cache a
-            // P-slice reference since 10-bit P/B is not yet implemented;
-            // every frame this encoder emits at 10-bit is currently a
-            // keyframe (the GOP gate forces an IDR every `GOP_SIZE` frames
-            // in 8-bit mode; in 10-bit mode the next non-keyframe will
-            // surface `Error::Unsupported` in `send_frame`).
-            let nal = build_idr_slice_nal_main10(&self.cfg, frame);
-            data.extend_from_slice(&nal);
-            self.last_recon = None;
-            self.last_recon_poc = 0;
-        } else {
-            let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
-            data.extend_from_slice(&nal);
-            self.last_recon = Some(recon);
-            self.last_recon_poc = 0;
+        match self.cfg.bit_depth {
+            12 => {
+                // Main 12 IDR — see `slice_writer_main12`. We do NOT cache
+                // a P-slice reference since 12-bit P/B is not yet
+                // implemented; every frame this encoder emits at 12-bit
+                // is currently a keyframe.
+                let nal = build_idr_slice_nal_main12(&self.cfg, frame);
+                data.extend_from_slice(&nal);
+                self.last_recon = None;
+                self.last_recon_poc = 0;
+            }
+            10 => {
+                // Main 10 IDR — see `slice_writer_main10`. We do NOT cache a
+                // P-slice reference since 10-bit P/B is not yet implemented;
+                // every frame this encoder emits at 10-bit is currently a
+                // keyframe (the GOP gate forces an IDR every `GOP_SIZE` frames
+                // in 8-bit mode; in 10-bit mode the next non-keyframe will
+                // surface `Error::Unsupported` in `send_frame`).
+                let nal = build_idr_slice_nal_main10(&self.cfg, frame);
+                data.extend_from_slice(&nal);
+                self.last_recon = None;
+                self.last_recon_poc = 0;
+            }
+            _ => {
+                let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
+                data.extend_from_slice(&nal);
+                self.last_recon = Some(recon);
+                self.last_recon_poc = 0;
+            }
         }
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = frame.pts;

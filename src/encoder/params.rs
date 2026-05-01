@@ -26,16 +26,19 @@ use crate::nal::{NalHeader, NalUnitType};
 /// High-level config used by the emitters. Fixed-profile MVP: most fields
 /// are derived from width/height.
 ///
-/// `bit_depth` toggles between Main (8) and Main 10 (10). The 8-bit path
-/// is the default and stays byte-for-byte compatible with the round-1..24
-/// emissions; the 10-bit path is engaged via [`EncoderConfig::new_main10`]
-/// and only used by the I-slice writer for now (see crate README).
+/// `bit_depth` toggles between Main (8), Main 10 (10), and Main 12 (12).
+/// The 8-bit path is the default and stays byte-for-byte compatible with
+/// the round-1..24 emissions; the 10-bit path is engaged via
+/// [`EncoderConfig::new_main10`] (round 25) and the 12-bit path via
+/// [`EncoderConfig::new_main12`] (round 26). Both high-bit-depth paths
+/// are I-slice-only for now (see crate README).
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
     /// Component bit depth for both luma and chroma. Encoder supports
-    /// 8 (Main profile) and 10 (Main 10 profile).
+    /// 8 (Main profile), 10 (Main 10 profile), and 12 (Main 12 / RExt
+    /// profile).
     pub bit_depth: u32,
 }
 
@@ -57,6 +60,16 @@ impl EncoderConfig {
             bit_depth: 10,
         }
     }
+
+    /// 12-bit Main 12 (RExt) profile encoder config. Round 26: I-slice
+    /// only (mirrors the round-25 Main 10 IDR-only restriction).
+    pub fn new_main12(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth: 12,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -65,16 +78,31 @@ impl EncoderConfig {
 
 fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_depth: u32) {
     // general_profile_space (u2) = 0, general_tier_flag (u1) = 0 (Main).
-    // general_profile_idc (u5) = 1 (Main) for 8-bit, 2 (Main 10) for 10-bit.
+    // general_profile_idc (u5):
+    //   * 1 (Main)               for 8-bit
+    //   * 2 (Main 10)            for 10-bit
+    //   * 4 (Format Range Ext.)  for 12-bit (Main 12 lives in RExt per §A.3.7)
     bw.write_bits(0, 2);
     bw.write_u1(0);
-    let profile_idc: u32 = if bit_depth >= 10 { 2 } else { 1 };
+    let profile_idc: u32 = if bit_depth >= 12 {
+        4
+    } else if bit_depth >= 10 {
+        2
+    } else {
+        1
+    };
     bw.write_bits(profile_idc, 5);
-    // general_profile_compatibility_flag[32]: bit at position
-    // `profile_idc` is set; for Main 10 we also set the Main bit per
-    // §A.3.5 ("a Main 10 decoder must also accept Main streams"), so
-    // both bit 1 and bit 2 are set.
-    let compat: u32 = if bit_depth >= 10 {
+    // general_profile_compatibility_flag[32]: per §A.3.5 a higher-bit-depth
+    // decoder must accept lower-bit-depth streams, so we layer the compat
+    // bits cumulatively:
+    //   * 8-bit:  Main only             → bit 1
+    //   * 10-bit: Main + Main 10        → bits 1, 2
+    //   * 12-bit: Main + Main 10 + RExt → bits 1, 2, 4   (RExt sniffer
+    //     probes bit 4; backward compat keeps Main / Main 10 sniffers
+    //     happy on the same bitstream)
+    let compat: u32 = if bit_depth >= 12 {
+        (1u32 << (31 - 1)) | (1u32 << (31 - 2)) | (1u32 << (31 - 4))
+    } else if bit_depth >= 10 {
         (1u32 << (31 - 1)) | (1u32 << (31 - 2))
     } else {
         1u32 << (31 - 1)
@@ -85,8 +113,30 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_
     bw.write_u1(0); // interlaced_source_flag
     bw.write_u1(0); // non_packed_constraint_flag
     bw.write_u1(1); // frame_only_constraint_flag
-                    // general_reserved_zero_43bits.
-    bw.write_zero_bits(43);
+                    // general_reserved_zero_43bits, *or* — for profile_idc = 4
+                    // (Format Range Extensions) — the 9 RExt constraint flags
+                    // (§A.3.5 / §A.3.7) followed by 34 reserved zeros. The
+                    // constraint flag values below are the §A.3.7 "Main 12"
+                    // signature: 12-bit max, 4:2:0/4:2:2 max, non-intra,
+                    // non-still, lower-bit-rate. ffmpeg's
+                    // `decode_profile_tier_level` reads these bits to map a
+                    // RExt stream to the specific Main 12 profile; without
+                    // them the stream is reported as "Rext" with no concrete
+                    // profile and several decoders refuse it.
+    if profile_idc == 4 {
+        bw.write_u1(1); // max_12bit_constraint_flag
+        bw.write_u1(0); // max_10bit_constraint_flag
+        bw.write_u1(0); // max_8bit_constraint_flag
+        bw.write_u1(1); // max_422chroma_constraint_flag
+        bw.write_u1(1); // max_420chroma_constraint_flag
+        bw.write_u1(0); // max_monochrome_constraint_flag
+        bw.write_u1(0); // intra_constraint_flag (Main 12 supports inter)
+        bw.write_u1(0); // one_picture_only_constraint_flag
+        bw.write_u1(1); // lower_bit_rate_constraint_flag
+        bw.write_zero_bits(34); // reserved
+    } else {
+        bw.write_zero_bits(43);
+    }
     // general_inbld_flag = 0.
     bw.write_u1(0);
     // general_level_idc (u8) = 30 (level 1.0 × 30 = 3.0).
@@ -176,9 +226,10 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(cfg.height);
     // conformance_window_flag = 0
     bw.write_u1(0);
-    // bit_depth_luma_minus8, bit_depth_chroma_minus8 — 0 for Main (8-bit)
-    // and 2 for Main 10 (10-bit). The decoder honours both and emits
-    // either Yuv420P or Yuv420P10Le accordingly.
+    // bit_depth_luma_minus8, bit_depth_chroma_minus8 — 0 for Main (8-bit),
+    // 2 for Main 10 (10-bit), 4 for Main 12 (12-bit). The decoder honours
+    // all three and emits either Yuv420P, Yuv420P10Le, or Yuv420P12Le
+    // accordingly.
     let depth_minus8 = cfg.bit_depth.saturating_sub(8);
     bw.write_ue(depth_minus8);
     bw.write_ue(depth_minus8);
@@ -391,6 +442,39 @@ mod tests {
         assert_eq!(
             vps.profile_tier_level.general_profile_idc, 2,
             "Main 10 VPS PTL should carry profile_idc = 2"
+        );
+    }
+
+    #[test]
+    fn sps_main12_carries_bit_depth_four() {
+        // Round 26: Main 12 SPS must declare 12-bit luma + chroma and the
+        // RExt profile (general_profile_idc = 4 per §A.3.7).
+        let rbsp = build_sps_rbsp(&EncoderConfig::new_main12(64, 64));
+        let sps = parse_sps(&rbsp).expect("parse main12 sps");
+        assert_eq!(sps.bit_depth_luma_minus8, 4);
+        assert_eq!(sps.bit_depth_chroma_minus8, 4);
+        assert_eq!(sps.bit_depth_y(), 12);
+        assert_eq!(sps.bit_depth_c(), 12);
+        assert_eq!(sps.profile_tier_level.general_profile_idc, 4);
+        // The Main / Main 10 / RExt compatibility bits are all set per
+        // §A.3.5 — a Main 12 stream must be readable by a sniffer that
+        // probes any of those bits.
+        let compat = sps.profile_tier_level.general_profile_compatibility_flag;
+        assert!(compat & (1u32 << (31 - 1)) != 0, "Main compat bit");
+        assert!(compat & (1u32 << (31 - 2)) != 0, "Main 10 compat bit");
+        assert!(compat & (1u32 << (31 - 4)) != 0, "RExt compat bit");
+    }
+
+    #[test]
+    fn vps_main12_profile_idc_is_four() {
+        // VPS PTL must agree with the SPS PTL on profile_idc — ffmpeg
+        // cross-checks the two and refuses streams where they differ.
+        let rbsp = build_vps_rbsp_with_bit_depth(12);
+        let vps = parse_vps(&rbsp).expect("parse main12 vps");
+        assert_eq!(vps.vps_video_parameter_set_id, 0);
+        assert_eq!(
+            vps.profile_tier_level.general_profile_idc, 4,
+            "Main 12 VPS PTL should carry profile_idc = 4 (RExt)"
         );
     }
 }

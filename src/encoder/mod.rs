@@ -38,5 +38,6 @@ pub mod params;
 pub mod residual_writer;
 pub mod slice_writer;
 pub mod slice_writer_main10;
+pub mod slice_writer_main12;
 
 pub use hevc_encoder::{make_encoder, HevcEncoder};

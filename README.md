@@ -153,9 +153,10 @@ signalled (§8.5.3.3.4).
 
 ### Bit depths and chroma
 
-* **Main (8-bit)** and **Main 10** are supported. Higher bit depths
-  (Main 12) and `bit_depth_luma_minus8 != bit_depth_chroma_minus8`
-  surface as `Error::Unsupported`.
+* **Main (8-bit)**, **Main 10**, and **Main 12** are supported on the
+  decode side; `bit_depth_luma_minus8 != bit_depth_chroma_minus8` and
+  bit depths > 12 surface as `Error::Unsupported`. Encode covers
+  Main / Main 10 / Main 12 (Main 10 / 12 are I-slice-only).
 * **4:2:0 (`chroma_format_idc=1`) and 4:2:2 (`chroma_format_idc=2`)** are
   supported for I, P, and B slices. The 4:2:2 inter path applies
   §8.5.3.2.10 chroma MV derivation
@@ -182,8 +183,9 @@ signalled (§8.5.3.3.4).
 
 * **List modification** — `ref_pic_list_modification()` is rejected.
 * **Long-term reference pictures** — rejected.
-* **Bit depths > 10** — Main 12 streams are rejected with
-  `Error::Unsupported("h265 pixel decode limited to bit_depth <= 10")`.
+* **Bit depths > 12** — streams with `bit_depth > 12` (e.g. Main
+  16, Main 4:4:4 16) are rejected with
+  `Error::Unsupported("h265 pixel decode limited to bit_depth <= 12")`.
 * **PCM coding units** — `pcm_enabled_flag = 1` streams are rejected.
 * **Transform skip** — rejected.
 * **Slice segment header extension** bytes past the v1 I-slice path.
@@ -193,7 +195,7 @@ signalled (§8.5.3.3.4).
 
 The encoder lives in `src/encoder/` and implements the
 `oxideav_core::Encoder` trait. Output is Annex B byte-stream HEVC,
-4:2:0 (Main / Main 10 — round 25), 16×16 CTU + 16×16 CU layout, fixed
+4:2:0 (Main / Main 10 / Main 12 — rounds 25 / 26), 16×16 CTU + 16×16 CU layout, fixed
 QP 26, no SAO, no deblocking. The current envelope is small but
 spec-correct: every bitstream we emit is decodable by ffmpeg's
 libavcodec hevc and by our own decoder.
@@ -268,10 +270,36 @@ libavcodec hevc and by our own decoder.
   emits an IDR for every input frame at 10-bit (the 8-bit P/B path
   is unchanged and still requires `Yuv420P`); `mini_gop_size > 1` at
   10-bit is rejected at construction time.
+* **Main 12 encode (round 26)** — `Yuv420P12Le` source frames are now
+  accepted by `HevcEncoder::from_params`. The Main 12 path emits a
+  **profile_idc = 4** (Format Range Extensions) SPS with
+  `bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 4` and the
+  matching VPS PTL. The 9 RExt constraint flags inside the
+  `profile_tier_level()` reserved-43-bits region are populated to the
+  §A.3.7 "Main 12" signature: `max_12bit = 1`, `max_10bit = 0`,
+  `max_8bit = 0`, `max_422chroma = 1`, `max_420chroma = 1`,
+  `max_monochrome = 0`, `intra = 0`, `one_picture_only = 0`,
+  `lower_bit_rate = 1`. `general_profile_compatibility_flag` sets
+  bits 1 (Main), 2 (Main 10), and 4 (RExt) per §A.3.5, so a sniffer
+  probing any of those bits accepts the stream. The pipeline mirrors
+  the round-25 Main 10 writer in a parallel `slice_writer_main12`
+  module: every sample is `u16`, `bit_depth = 12` flows through
+  `intra_pred::predict` / `transform::{forward,inverse,quantize,
+  dequantize}_*`, and the forward quantiser uses **Qp'Y = SliceQpY +
+  QpBdOffsetY = 26 + 24 = 50** to match the decoder's inverse on the
+  12-bit grid (without the `QpBdOffset` step the reconstruction
+  overshoots by `2^24 / step` and the cross-decode collapses to
+  ~10 dB — the same failure mode the round-25 Main 10 work hit).
+  Self-roundtrip and ffmpeg cross-decode of a 64×64 / 128×128 12-bit
+  gradient both clear ~45 dB Y on the 12-bit (peak = 4095) scale.
+  Scope: I-slice only — every input frame at 12-bit is emitted as
+  an IDR (the 8-bit and 10-bit paths are unchanged byte-for-byte);
+  `mini_gop_size > 1` at 12-bit is rejected at construction time.
+  4:2:2 / 4:4:4 at 12-bit and 12-bit P/B remain out of scope.
 * **Pending:** AMP / rectangular partitions (Nx2N / 2NxN), weighted
   bi-pred, mini-GOP > 2 (B-pyramid), `mvd_l1_zero_flag` optimisation,
-  10-bit P/B-slice encode (currently the 10-bit emit path is
-  IDR-only), 12-bit / 4:4:4 encode.
+  10-bit / 12-bit P/B-slice encode (currently the high-bit-depth emit
+  paths are IDR-only), 4:4:4 encode.
 
 ## HEIF / HEIC still images
 
