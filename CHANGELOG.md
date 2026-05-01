@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 22 — B-slice **encode** (§7.4.7.1, §8.5.3.3.3.1, §9.3.4.2.2).
+  New `src/encoder/b_slice_writer.rs` emits a single-segment B
+  (TrailR) slice referencing one past anchor (L0) and one future
+  anchor (L1), both with `num_ref_idx_lX_active_minus1 = 0`. The
+  encoder's display-order input is re-ordered into decode order
+  (I-P-B-P-B from a I-B-P-B-P display sequence) by holding back
+  every odd-display-POC frame until its future anchor lands, then
+  emitting the B with `delta_l0 = -1`, `delta_l1 = +1` from
+  `b_poc`. Per-CU pipeline:
+  (1) integer-pel ±8 luma SAD search **per list** (step 2 → chroma
+  MV stays integer, matching the decoder's full-pel `chroma_mc` byte
+  for byte);
+  (2) bipred predictor = `(P_L0 + P_L1 + 1) >> 1` (default weighting,
+  §8.5.3.3.3.1);
+  (3) per-CU pick of `L0-only` / `L1-only` / `Bi` by SAD against the
+  source — the residual / quant pipeline is identical across the
+  three so the predictor pick directly drives quality;
+  (4) `inter_pred_idc` bin 0 ctxInc = `CtDepth` (§9.3.4.2.2 Table
+  9-32) — for our single 16×16 CU at a 16×16 CTB this collapses to
+  `bin0_ctx = 0`; bin 1 ctxInc = 4 (uni-pred L0 vs L1 selector);
+  (5) explicit AMVP per list (`mvp_lx_flag = 0`) sharing the same
+  spatial-only A0/A1/B0/B1/B2 walk as the P-slice writer, but
+  against per-list 4×4 mv grids;
+  (6) `mvd_l1_zero_flag = 0` so L1 MVD is encoded normally;
+  (7) `cu_skip_flag` ctxInc = 0 (we never emit skip, so per the
+  decoder's r19 rule `condTermFlagX = neighbour.is_skip` is always
+  0 — same fix the decoder shipped to bring Main 10 inter PSNR up
+  to 33.57 dB).
+  P-slice writer gains a `..._delta` variant so the second-anchor
+  P (POC 4 referencing POC 2 with delta -2) emits the right RPS;
+  the default `delta_l0 = -1` path stays byte-identical so the
+  existing P-only fixtures don't regress.
+  New `HevcEncoder::from_params_with_mini_gop(params, 2)`
+  constructor selects the I-P-B-P-B GOP. Three new unit tests in
+  `tests/encoder_b_slice.rs`:
+  `ipbpb_roundtrip_through_our_decoder` (5-frame translation
+  oracle, 44.99 / 32.51 / 39.59 / 27.17 / 31.46 dB per
+  decode-order frame, plus a B-beats-later-P invariant),
+  `b_slice_static_content_is_lossless_after_quantize` (static
+  source, every frame ≥ 22 dB), `b_slice_packet_count_matches_source_count`
+  (7 source frames → 7 packets in decode order),
+  `b_slice_ffmpeg_cross_decode_psnr` (writes the bitstream to
+  `/tmp/oxideav-h265-fixtures/encoder-b-slice-r22.hevc`, decodes
+  with ffmpeg, every display frame ≥ 33 dB vs source — 44.99 /
+  35.16 / 36.28 / 34.34 / 33.34 dB at POC 0..4). 151 tests pass
+  (88 unit + 50 reference + 4 encoder_b_slice + 4 ffmpeg_accepts +
+  3 reference + 1 encoder_p_slice + 1 encoder_roundtrip). Pending
+  for r23: merge encode, B_Skip encode, AMP / Nx2N / 2NxN
+  partitions, mini-GOP > 2.
+
 - round 21 — merge / AMVP candidate-list audit (§8.5.3.2.2 .. §8.5.3.2.5)
   + `inter_pred_idc` ctxInc fix (§9.3.4.2.2 Table 9-32). Four
   spec-correctness patches:

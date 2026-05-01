@@ -4,10 +4,15 @@
 //! Scope:
 //!
 //! * First frame of every GOP is an IDR I-slice with the access unit
-//!   consisting of (VPS, SPS, PPS, IDR_slice) Annex B NAL units. Subsequent
-//!   frames in the same GOP are TrailR P-slices that reference the
-//!   previously-reconstructed frame (L0 only). The GOP length defaults to
-//!   64 to match a typical keyint.
+//!   consisting of (VPS, SPS, PPS, IDR_slice) Annex B NAL units.
+//! * Subsequent frames in the same GOP are TrailR slices. By default
+//!   every non-key frame is a P-slice referencing the previously
+//!   reconstructed frame (L0 only). When the encoder is constructed
+//!   with `with_mini_gop_size(2)` (round 22), the GOP follows the
+//!   I-P-B-P-B decode-order pattern: every other display position is a
+//!   B-slice with one past + one future reference. The caller still
+//!   delivers frames in display order; the encoder reorders them
+//!   internally.
 //! * Picture dimensions must be a multiple of the 16-pixel CTU size.
 //! * Only 8-bit 4:2:0 (`PixelFormat::Yuv420P`).
 
@@ -16,10 +21,13 @@ use std::collections::VecDeque;
 use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
-    TimeBase,
+    TimeBase, VideoFrame,
 };
 
-use crate::encoder::p_slice_writer::{build_p_slice_with_reconstruction, ReferenceFrame};
+use crate::encoder::b_slice_writer::build_b_slice_with_reconstruction;
+use crate::encoder::p_slice_writer::{
+    build_p_slice_with_reconstruction, build_p_slice_with_reconstruction_delta, ReferenceFrame,
+};
 use crate::encoder::params::{build_pps_nal, build_sps_nal, build_vps_nal, EncoderConfig};
 use crate::encoder::slice_writer::build_idr_slice_nal_with_reconstruction;
 
@@ -38,14 +46,31 @@ pub struct HevcEncoder {
     time_base: TimeBase,
     /// Cache of the once-per-stream VPS/SPS/PPS Annex B bytes.
     vps_sps_pps: Vec<u8>,
-    /// Frame counter — used to pick I vs P and to derive POC LSB.
+    /// Frame counter — number of source frames the caller has sent so far.
+    /// In display order (one increment per `send_frame`).
     frame_count: u32,
     /// Last reconstruction retained as the L0 reference for the next P frame.
     last_recon: Option<ReferenceFrame>,
+    /// POC of the picture in `last_recon` (display-order POC).
+    last_recon_poc: u32,
+    /// Mini-GOP size (1 = P-only, 2 = I-P-B-P-B with one B between each
+    /// pair of P/I anchor frames).
+    mini_gop_size: u32,
+    /// Frame held back in display order while we wait for the next anchor
+    /// (P or I) so the held frame can be emitted as a B-slice. Only used
+    /// when `mini_gop_size > 1`.
+    pending_b: Option<(VideoFrame, u32 /* display-order POC */)>,
 }
 
 impl HevcEncoder {
     pub fn from_params(params: &CodecParameters) -> Result<Self> {
+        Self::from_params_with_mini_gop(params, 1)
+    }
+
+    /// Construct a B-slice-enabled encoder with the given mini-GOP size.
+    /// `mini_gop = 1` is P-only (legacy). `mini_gop = 2` interleaves one
+    /// B-slice between each pair of anchor frames.
+    pub fn from_params_with_mini_gop(params: &CodecParameters, mini_gop: u32) -> Result<Self> {
         let width = params
             .width
             .ok_or_else(|| Error::invalid("h265 encoder: missing width"))?;
@@ -61,6 +86,11 @@ impl HevcEncoder {
         if pix != PixelFormat::Yuv420P {
             return Err(Error::unsupported(format!(
                 "h265 encoder: only Yuv420P is supported (got {pix:?})"
+            )));
+        }
+        if mini_gop == 0 || mini_gop > 2 {
+            return Err(Error::unsupported(format!(
+                "h265 encoder: mini_gop_size must be 1 or 2 (got {mini_gop})"
             )));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
@@ -90,7 +120,89 @@ impl HevcEncoder {
             vps_sps_pps,
             frame_count: 0,
             last_recon: None,
+            last_recon_poc: 0,
+            mini_gop_size: mini_gop,
+            pending_b: None,
         })
+    }
+
+    /// Emit an I-slice access unit (VPS+SPS+PPS+IDR) for `frame` at POC 0.
+    fn emit_idr(&mut self, frame: &VideoFrame) -> Packet {
+        let mut data: Vec<u8> = Vec::with_capacity(
+            self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32,
+        );
+        data.extend_from_slice(&self.vps_sps_pps);
+        let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
+        data.extend_from_slice(&nal);
+        self.last_recon = Some(recon);
+        self.last_recon_poc = 0;
+        let mut pkt = Packet::new(0, self.time_base, data);
+        pkt.pts = frame.pts;
+        pkt.dts = frame.pts;
+        pkt.flags.keyframe = true;
+        pkt
+    }
+
+    /// Emit a P-slice referencing `self.last_recon`. `display_poc` is the
+    /// frame's display-order POC; the frame index inside the GOP is the
+    /// same value because the GOP starts at display POC 0.
+    fn emit_p(&mut self, frame: &VideoFrame, display_poc: u32) -> Packet {
+        let ref_frame = self.last_recon.clone().expect("P-slice without ref");
+        let delta_l0 = self.last_recon_poc as i32 - display_poc as i32;
+        let (nal, recon) = if delta_l0 == -1 {
+            // Default delta = -1 path keeps the original P-only emission
+            // byte-for-byte identical (regression guard for the existing
+            // P-slice / cross-decode tests).
+            build_p_slice_with_reconstruction(&self.cfg, frame, display_poc, &ref_frame)
+        } else {
+            build_p_slice_with_reconstruction_delta(
+                &self.cfg,
+                frame,
+                display_poc,
+                delta_l0,
+                &ref_frame,
+            )
+        };
+        let mut data: Vec<u8> = Vec::with_capacity(nal.len() + 16);
+        data.extend_from_slice(&nal);
+        self.last_recon = Some(recon);
+        self.last_recon_poc = display_poc;
+        let mut pkt = Packet::new(0, self.time_base, data);
+        pkt.pts = frame.pts;
+        pkt.dts = frame.pts;
+        pkt.flags.keyframe = false;
+        pkt
+    }
+
+    /// Emit a B-slice. `b_frame` is the held-back source; `b_poc` is its
+    /// display-order POC (between the L0 ref and the just-emitted P/I
+    /// anchor's POC). `l0` and `l1` are the reconstructions used for
+    /// motion compensation.
+    fn emit_b(
+        &mut self,
+        b_frame: &VideoFrame,
+        b_poc: u32,
+        l0_poc: u32,
+        l1_poc: u32,
+        l0: &ReferenceFrame,
+        l1: &ReferenceFrame,
+    ) -> Packet {
+        let delta_l0 = l0_poc as i32 - b_poc as i32; // negative
+        let delta_l1 = l1_poc as i32 - b_poc as i32; // positive
+        let (nal, _recon) = build_b_slice_with_reconstruction(
+            &self.cfg, b_frame, b_poc, delta_l0, delta_l1, l0, l1,
+        );
+        // The B-frame is non-reference (TrailR is fine here per spec; we
+        // don't store its reconstruction back into `last_recon` because
+        // the next anchor P-slice already has its own L0 = the previous
+        // anchor's reconstruction).
+        let mut data: Vec<u8> = Vec::with_capacity(nal.len() + 16);
+        data.extend_from_slice(&nal);
+        let mut pkt = Packet::new(0, self.time_base, data);
+        pkt.pts = b_frame.pts;
+        pkt.dts = b_frame.pts;
+        pkt.flags.keyframe = false;
+        pkt
     }
 }
 
@@ -108,40 +220,58 @@ impl Encoder for HevcEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("h265 encoder: video frames only")),
         };
-        // Pixel format / dimensions live on the stream's CodecParameters
-        // and on `self.cfg`; the slim VideoFrame no longer carries them so
-        // we trust the caller to honour the encoder's `output_params()`.
         if vf.planes.len() != 3 {
             return Err(Error::invalid("h265 encoder: expected 3 planes"));
         }
 
-        let is_keyframe = self.frame_count % GOP_SIZE == 0 || self.last_recon.is_none();
-        let frame_idx_in_gop = self.frame_count % GOP_SIZE;
-        let mut data: Vec<u8> = Vec::with_capacity(
-            self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32,
-        );
+        let display_poc = self.frame_count;
+        let is_keyframe = display_poc % GOP_SIZE == 0 || self.last_recon.is_none();
 
         if is_keyframe {
-            data.extend_from_slice(&self.vps_sps_pps);
-            let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, vf);
-            data.extend_from_slice(&nal);
-            self.last_recon = Some(recon);
+            // IDR resets the GOP. Any pending B (shouldn't happen if the
+            // caller respects mini-GOP boundaries, but be defensive) is
+            // dropped — its references would be invalidated by the IDR.
+            self.pending_b = None;
+            let pkt = self.emit_idr(vf);
+            self.pending.push_back(pkt);
+        } else if self.mini_gop_size == 1 {
+            // P-only path — encode immediately referencing last_recon.
+            let pkt = self.emit_p(vf, display_poc);
+            self.pending.push_back(pkt);
         } else {
-            let ref_frame = self
-                .last_recon
-                .as_ref()
-                .expect("P-slice without L0 reference");
-            let (nal, recon) =
-                build_p_slice_with_reconstruction(&self.cfg, vf, frame_idx_in_gop, ref_frame);
-            data.extend_from_slice(&nal);
-            self.last_recon = Some(recon);
+            // mini_gop == 2: anchor-pair pattern. Display-order positions:
+            //   0 (anchor / I), 1 (B), 2 (anchor / P), 3 (B), 4 (anchor / P), ...
+            // Decode-order: I, P_at_poc2, B_at_poc1, P_at_poc4, B_at_poc3, ...
+            // i.e. odd display POCs are B, even ones are anchors.
+            let is_anchor = display_poc % 2 == 0;
+            if is_anchor {
+                // This is the next P-anchor. Emit it FIRST so the
+                // intervening B-frame can reference it as L1.
+                let p_poc = display_poc;
+                // Stash the B-frame (if any) before we mutate last_recon.
+                let pending_b = self.pending_b.take();
+                let l0_poc = self.last_recon_poc;
+                let l0_for_b = self.last_recon.clone();
+                let p_pkt = self.emit_p(vf, p_poc);
+                self.pending.push_back(p_pkt);
+                // Now emit the held B-frame referencing the previous
+                // anchor (L0) and the just-emitted P (L1).
+                if let Some((b_frame, b_poc)) = pending_b {
+                    let l0 = l0_for_b.expect("B-slice without L0 ref");
+                    let l1 = self
+                        .last_recon
+                        .as_ref()
+                        .expect("B-slice without L1 ref")
+                        .clone();
+                    let b_pkt = self.emit_b(&b_frame, b_poc, l0_poc, p_poc, &l0, &l1);
+                    self.pending.push_back(b_pkt);
+                }
+            } else {
+                // Hold back as the pending B; it will be emitted right
+                // after the next anchor P.
+                self.pending_b = Some((vf.clone(), display_poc));
+            }
         }
-
-        let mut pkt = Packet::new(0, self.time_base, data);
-        pkt.pts = vf.pts;
-        pkt.dts = vf.pts;
-        pkt.flags.keyframe = is_keyframe;
-        self.pending.push_back(pkt);
         self.frame_count += 1;
         Ok(())
     }
@@ -158,6 +288,14 @@ impl Encoder for HevcEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        // If a B-frame is still buffered at flush, we don't have a future
+        // anchor to bipredict from; degrade it to a P-slice referencing
+        // the previous anchor (L0 only). This keeps the stream
+        // self-consistent without losing the source frame.
+        if let Some((b_frame, b_poc)) = self.pending_b.take() {
+            let pkt = self.emit_p(&b_frame, b_poc);
+            self.pending.push_back(pkt);
+        }
         self.eof = true;
         Ok(())
     }

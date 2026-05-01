@@ -189,6 +189,44 @@ signalled (§8.5.3.3.4).
 * **Slice segment header extension** bytes past the v1 I-slice path.
 * **Scalable / multiview / 3D extensions** (SHVC, MV-HEVC, 3D-HEVC).
 
+## Encode support
+
+The encoder lives in `src/encoder/` and implements the
+`oxideav_core::Encoder` trait. Output is Annex B byte-stream HEVC,
+8-bit 4:2:0, 16×16 CTU + 16×16 CU layout, fixed QP 26, no SAO, no
+deblocking. The current envelope is small but spec-correct: every
+bitstream we emit is decodable by ffmpeg's libavcodec hevc and by our
+own decoder.
+
+* **I slices (round 1+)** — IDR `IdrNLp` keyframes with VPS / SPS /
+  PPS prefixed. Per-CU intra mode decision over a 7-mode subset
+  (planar, DC, four cardinals, two diagonals). One 16×16 luma TB +
+  two 8×8 chroma TBs per CU.
+* **P slices (round 13+)** — `TrailR` slices referencing the
+  immediately preceding picture. Per-CU integer-pel ±8 SAD search,
+  one AMVP candidate (`mvp_l0_flag = 0`), explicit MVD coding.
+* **B slices (round 22)** — `TrailR` slices referencing one earlier
+  + one later anchor (`I-P-B-P-B` decode order, `I-B-P-B-P` display
+  order). Opt-in via
+  `HevcEncoder::from_params_with_mini_gop(params, 2)`. Per-CU
+  rate-distortion choice between L0-only / L1-only / Bi (each a
+  separate ±8 luma SAD search; bipred is a round-half-up
+  `(P0 + P1 + 1) >> 1` average matching §8.5.3.3.3.1 default
+  weighting). Both AMVP candidates per list collapse to a single
+  predictor; explicit MVD on each list (`mvd_l1_zero_flag = 0`).
+  `inter_pred_idc` ctxInc derivation matches the §9.3.4.2.2 Table
+  9-32 CtDepth path. The display-order frames the caller sends are
+  reordered internally so the held-back B always emits **after** its
+  future anchor.
+* **Quality at QP 26 / 5-frame I-P-B-P-B**, 64×64 gradient with 1-pel
+  per-frame motion: I 44.99 dB, P 32.51 dB, B 39.59 dB, P 27.17 dB,
+  B 31.46 dB (self-roundtrip). The ffmpeg cross-decode test in
+  `tests/encoder_b_slice.rs` confirms each frame is bitstream-valid:
+  ffmpeg's decoder produces 33-44 dB across all 5 frames.
+* **Pending:** merge encode (`merge_flag = 1`), B_Skip CUs, AMP /
+  rectangular partitions, weighted bi-pred, mini-GOP > 2,
+  `mvd_l1_zero_flag` optimisation.
+
 ## HEIF / HEIC still images
 
 **Scaffold — feature-gated, off by default.** HEIC is an HEVC-coded

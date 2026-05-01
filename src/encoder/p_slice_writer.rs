@@ -70,14 +70,14 @@ impl ReferenceFrame {
     }
 
     #[inline]
-    fn sample_y(&self, x: i32, y: i32) -> u8 {
+    pub(crate) fn sample_y(&self, x: i32, y: i32) -> u8 {
         let xc = x.clamp(0, self.width as i32 - 1) as usize;
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
         self.y[yc * self.y_stride + xc]
     }
 
     #[inline]
-    fn sample_c(&self, x: i32, y: i32, is_cr: bool) -> u8 {
+    pub(crate) fn sample_c(&self, x: i32, y: i32, is_cr: bool) -> u8 {
         let cw = (self.width / 2) as i32;
         let ch = (self.height / 2) as i32;
         let xc = x.clamp(0, cw - 1) as usize;
@@ -167,13 +167,31 @@ pub fn build_p_slice_rbsp(
 
 /// Return the reconstructed frame the encoder produced while writing the
 /// P slice — wrapped in a [`ReferenceFrame`] so the caller can feed it
-/// back as the next slice's L0 reference.
+/// back as the next slice's L0 reference. The L0 reference is assumed
+/// to be at POC = frame_idx − 1 (i.e. the immediately preceding picture).
 pub fn build_p_slice_with_reconstruction(
     cfg: &EncoderConfig,
     frame: &VideoFrame,
     frame_idx: u32,
     ref_frame: &ReferenceFrame,
 ) -> (Vec<u8>, ReferenceFrame) {
+    build_p_slice_with_reconstruction_delta(
+        cfg, frame, frame_idx, /* delta_l0 */ -1, ref_frame,
+    )
+}
+
+/// Same as [`build_p_slice_with_reconstruction`] but allows the caller to
+/// declare a non-default L0 POC delta. Used by the mini-GOP-2 (B-slice)
+/// path where the P-anchor at display POC `2k` references the previous
+/// anchor at POC `2k − 2`.
+pub fn build_p_slice_with_reconstruction_delta(
+    cfg: &EncoderConfig,
+    frame: &VideoFrame,
+    frame_idx: u32,
+    delta_l0: i32,
+    ref_frame: &ReferenceFrame,
+) -> (Vec<u8>, ReferenceFrame) {
+    debug_assert!(delta_l0 < 0, "P-slice L0 ref must have negative POC delta");
     let rbsp;
     let recon;
     {
@@ -186,7 +204,7 @@ pub fn build_p_slice_with_reconstruction(
         bw.write_u1(0);
         bw.write_ue(1);
         bw.write_ue(0);
-        bw.write_ue(0);
+        bw.write_ue((-delta_l0 - 1) as u32);
         bw.write_u1(1);
         bw.write_u1(0);
         bw.write_ue(4);

@@ -28,6 +28,7 @@
 //! Wiring: [`register_encoder`] attaches [`make_encoder`] to the codec
 //! registry; [`HevcEncoder`] implements `oxideav_core::Encoder`.
 
+pub mod b_slice_writer;
 pub mod bit_writer;
 pub mod cabac_writer;
 pub mod hevc_encoder;
