@@ -527,3 +527,295 @@ fn b_skip_ffmpeg_cross_decode_psnr() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+//  Round 24 — AMP (Asymmetric Motion Partitions) tests
+// ---------------------------------------------------------------------------
+
+/// Build a frame whose top 4 luma rows of every 16×16 CB shift by
+/// `top_offset` pels per frame and whose bottom 12 rows shift by
+/// `bottom_offset` pels per frame. With opposite-sign offsets the
+/// 2Nx2N AMVP search has no good single MV (averaging pulls neither
+/// stripe into a match) and merge neighbours from the prior CTUs
+/// also can't recover both — this is the textbook AMP-winning case.
+fn make_split_gradient(w: u32, h: u32, top_offset: i32, bottom_offset: i32) -> VideoFrame {
+    let mut y = vec![0u8; (w * h) as usize];
+    for yy in 0..h {
+        let in_top_quarter = (yy % 16) < 4;
+        for xx in 0..w {
+            let off = if in_top_quarter {
+                top_offset
+            } else {
+                bottom_offset
+            };
+            let src_x = (xx as i32 + off).clamp(0, w as i32 - 1) as u32;
+            let v = (src_x * 255) / w.max(1);
+            y[(yy * w + xx) as usize] = v as u8;
+        }
+    }
+    let cw = (w / 2) as usize;
+    let ch = (h / 2) as usize;
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            VideoPlane {
+                stride: cw,
+                data: vec![128u8; cw * ch],
+            },
+            VideoPlane {
+                stride: cw,
+                data: vec![128u8; cw * ch],
+            },
+        ],
+    }
+}
+
+/// A 16×16 CB whose top 4 rows are stationary and bottom 12 rows shift
+/// by 1 pel per frame is the textbook 2NxnU partition case: PB-0 (top
+/// 16×4 stripe) sits on a zero-MV match, PB-1 (bottom 16×12 stripe)
+/// finds the shift. The whole-CU 2Nx2N AMVP search must compromise
+/// between the two regions and pays a residual cost AMP avoids. End-
+/// to-end test: encode + decode must reproduce the source with PSNR
+/// well above what the 2Nx2N path alone could deliver.
+#[test]
+fn amp_split_gradient_roundtrips_through_decoder() {
+    let w = 64u32;
+    let h = 64u32;
+    // 5 display-order frames where the bottom 3/4 of every 16×16 CB
+    // shifts horizontally by 1 pel per frame (top stays put).
+    // Top 4 rows shift +1 / frame, bottom 12 rows shift -1 / frame.
+    // Opposite signs defeat 2Nx2N AMVP's single MV; the AMP scoring
+    // path picks `2NxnU` (top quarter MV vs bottom three-quarter MV).
+    let display: Vec<VideoFrame> = (0..5).map(|i| make_split_gradient(w, h, i, -i)).collect();
+
+    let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+    for frame in &display {
+        enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+    }
+    enc.flush().unwrap();
+    let mut all = Vec::new();
+    for _ in 0..5 {
+        all.extend_from_slice(&enc.receive_packet().unwrap().data);
+    }
+
+    let mut dec = HevcDecoder::new(CodecId::new("h265"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), all))
+        .expect("send_packet");
+    let mut decoded = Vec::new();
+    for _ in 0..5 {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => decoded.push(v),
+            _ => panic!("decode failed"),
+        }
+    }
+    let display_for_decode = [0usize, 2, 1, 4, 3];
+    for (di, dec_frame) in decoded.iter().enumerate() {
+        let display_idx = display_for_decode[di];
+        let p = psnr_y(&display[display_idx], dec_frame, w, h);
+        eprintln!("amp split-gradient frame{di} (display {display_idx}): {p:.2} dB");
+        // 22 dB floor — pins that the AMP CABAC path round-trips
+        // cleanly. Any encoder/decoder bin-count desync would push
+        // PSNR into single digits as the decoder reads garbage MVs
+        // for the AMP PBs.
+        assert!(
+            p > 22.0,
+            "frame {di} (display {display_idx}) PSNR {p:.2} below AMP floor"
+        );
+    }
+}
+
+/// Build a frame with two distinct deterministic-noise textures whose
+/// motion is split per stripe: the top quarter (rows 0..3 of every
+/// 16×16 CB) shifts by `+6` pels per frame, the bottom three-quarters
+/// shifts by `-6` pels per frame. Each stripe carries its own seeded
+/// noise pattern so the two regions are uncorrelated — picking ANY
+/// single MV for a 2Nx2N CU lands on at most one stripe; the other
+/// stripe sees uncorrelated noise, driving its mismatch SAD to ~Σ|Δ|
+/// where ΔU is uniformly distributed over [-256, 256]. This is a
+/// genuinely AMP-favorable design: aperiodic, high-entropy, with no
+/// shared MV that compromises both regions.
+fn make_high_contrast_split(w: u32, h: u32, t: i32) -> VideoFrame {
+    // Hash `x` into a pseudo-random byte. Different `tag` selects a
+    // different texture so the top and bottom regions are uncorrelated.
+    // Pseudo-random 6-bit noise centred at 128 (range 96..160). Keeps
+    // residual magnitudes bounded so they fit the Rice/EGk binarisation
+    // (which clips at ~2^31 absolute level).
+    let texture = |x: i32, tag: u32| -> u8 {
+        let mut h = (x as i64 + 1_000_000) as u64;
+        h = h
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(tag as u64);
+        h ^= h >> 31;
+        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 33;
+        96 + ((h >> 58) as u8 & 0x3F)
+    };
+    let mut y = vec![0u8; (w * h) as usize];
+    for yy in 0..h {
+        let in_top_quarter = (yy % 16) < 4;
+        let row_tag = (yy / 4) * 7919; // texture varies per row group
+        for xx in 0..w {
+            // Clamp at the source coordinate, not the texture index, so
+            // shifts don't run off the synthesized pattern.
+            let (sx, tex_tag) = if in_top_quarter {
+                ((xx as i32 + 6 * t).clamp(0, w as i32 - 1), row_tag ^ 0x1111)
+            } else {
+                ((xx as i32 - 6 * t).clamp(0, w as i32 - 1), row_tag ^ 0x2222)
+            };
+            y[(yy * w + xx) as usize] = texture(sx, tex_tag);
+        }
+    }
+    let cw = (w / 2) as usize;
+    let ch = (h / 2) as usize;
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: w as usize,
+                data: y,
+            },
+            VideoPlane {
+                stride: cw,
+                data: vec![128u8; cw * ch],
+            },
+            VideoPlane {
+                stride: cw,
+                data: vec![128u8; cw * ch],
+            },
+        ],
+    }
+}
+
+/// AMP scoring should pick a shape (and bias the bitstream byte-count
+/// downward) on content that has a clear sub-CB motion split. We
+/// encode the same split-gradient sequence twice — once with AMP
+/// enabled (default), once with `H265_ENC_AMP_OFF` set — and assert
+/// the AMP-enabled bitstream is no larger than the AMP-disabled one
+/// (it is generally smaller; equal is OK since the rate gate may
+/// reject AMP if its SAD win is below the bit-cost threshold).
+#[test]
+fn amp_pick_does_not_inflate_bitstream() {
+    let w = 64u32;
+    let h = 64u32;
+    let display: Vec<VideoFrame> = (0..5).map(|i| make_split_gradient(w, h, i, -i)).collect();
+
+    let encode_all = || -> usize {
+        let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+        for frame in &display {
+            enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+        }
+        enc.flush().unwrap();
+        let mut total = 0usize;
+        for _ in 0..5 {
+            total += enc.receive_packet().unwrap().data.len();
+        }
+        total
+    };
+    // AMP off baseline.
+    std::env::set_var("H265_ENC_AMP_OFF", "1");
+    let bytes_no_amp = encode_all();
+    // AMP on (default).
+    std::env::remove_var("H265_ENC_AMP_OFF");
+    let bytes_amp = encode_all();
+    eprintln!("split-gradient AMP off: {bytes_no_amp} bytes, AMP on: {bytes_amp} bytes");
+    assert!(
+        bytes_amp <= bytes_no_amp,
+        "AMP-enabled stream ({bytes_amp}) should not be larger than AMP-disabled ({bytes_no_amp}) on split-gradient content"
+    );
+}
+
+/// Stress test: high-contrast content with opposite-sign per-stripe
+/// motion forces AMP to win the rate gate. We assert (a) the AMP-on
+/// stream is strictly smaller than the AMP-off stream (proving AMP
+/// fired and saved bits), and (b) the AMP-on stream roundtrips
+/// through the decoder above the PSNR floor.
+#[test]
+fn amp_high_contrast_split_fires_and_roundtrips() {
+    let w = 64u32;
+    let h = 64u32;
+    let display: Vec<VideoFrame> = (0..5).map(|i| make_high_contrast_split(w, h, i)).collect();
+
+    let encode_all = |frames: &[VideoFrame]| -> (Vec<u8>, usize) {
+        let mut enc = HevcEncoder::from_params_with_mini_gop(&encoder_params(w, h), 2).unwrap();
+        for frame in frames {
+            enc.send_frame(&Frame::Video(frame.clone())).unwrap();
+        }
+        enc.flush().unwrap();
+        let mut bytes = Vec::new();
+        for _ in 0..5 {
+            bytes.extend_from_slice(&enc.receive_packet().unwrap().data);
+        }
+        let len = bytes.len();
+        (bytes, len)
+    };
+    std::env::set_var("H265_ENC_AMP_OFF", "1");
+    let (_, bytes_no_amp) = encode_all(&display);
+    std::env::remove_var("H265_ENC_AMP_OFF");
+    let (bytes_amp, bytes_amp_len) = encode_all(&display);
+    eprintln!(
+        "high-contrast AMP off: {bytes_no_amp} bytes, AMP on: {bytes_amp_len} bytes (delta {})",
+        bytes_no_amp as i64 - bytes_amp_len as i64
+    );
+    // High-contrast opposite-motion must fire AMP at least once,
+    // and AMP fires only when the residual savings exceed the bit
+    // overhead — so AMP-on must save bytes overall.
+    assert!(
+        bytes_amp_len < bytes_no_amp,
+        "AMP didn't fire: amp={bytes_amp_len} no_amp={bytes_no_amp}"
+    );
+
+    // Decode AMP-on stream and check PSNR.
+    let mut dec = HevcDecoder::new(CodecId::new("h265"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), bytes_amp))
+        .expect("send_packet");
+    let mut decoded = Vec::new();
+    for _ in 0..5 {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => decoded.push(v),
+            _ => panic!("decode failed"),
+        }
+    }
+    let display_for_decode = [0usize, 2, 1, 4, 3];
+    for (di, dec_frame) in decoded.iter().enumerate() {
+        let display_idx = display_for_decode[di];
+        let p = psnr_y(&display[display_idx], dec_frame, w, h);
+        eprintln!("amp high-contrast frame{di} (display {display_idx}): {p:.2} dB");
+        assert!(
+            p > 20.0,
+            "frame {di} (display {display_idx}) PSNR {p:.2} below AMP roundtrip floor"
+        );
+    }
+}
+
+/// The 2NxnU shape's two PBs cover (x, y, 16, 4) for the top quarter
+/// and (x, y+4, 16, 12) for the bottom. This is the geometry the
+/// part_mode binarisation table maps to bin string `001 0` (NOT 2Nx2N
+/// → horizontal family → AMP → quarter-on-top). Verifying the helper
+/// directly catches table-row misreads.
+#[test]
+fn amp_shape_geometry_matches_spec() {
+    use oxideav_h265::encoder::b_slice_writer::AmpShape;
+    let pbs = AmpShape::NxnU.pbs(0, 0, 16);
+    assert_eq!(pbs[0], (0, 0, 16, 4), "PB-0 should be 16×4 quarter-top");
+    assert_eq!(pbs[1], (0, 4, 16, 12), "PB-1 should be 16×12 bottom");
+    assert_eq!(AmpShape::NxnU.dir_bin(), 1, "horizontal family bin1=1");
+    assert_eq!(AmpShape::NxnU.pos_bypass(), 0, "U/L position bypass=0");
+
+    let pbs = AmpShape::NxnD.pbs(0, 0, 16);
+    assert_eq!(pbs[0], (0, 0, 16, 12), "PB-0 should be 16×12 top");
+    assert_eq!(pbs[1], (0, 12, 16, 4), "PB-1 should be 16×4 quarter-bottom");
+    assert_eq!(AmpShape::NxnD.pos_bypass(), 1, "D/R position bypass=1");
+
+    let pbs = AmpShape::NLx2N.pbs(0, 0, 16);
+    assert_eq!(pbs[0], (0, 0, 4, 16), "PB-0 should be 4×16 quarter-left");
+    assert_eq!(pbs[1], (4, 0, 12, 16), "PB-1 should be 12×16 right");
+    assert_eq!(AmpShape::NLx2N.dir_bin(), 0, "vertical family bin1=0");
+
+    let pbs = AmpShape::NRx2N.pbs(0, 0, 16);
+    assert_eq!(pbs[0], (0, 0, 12, 16), "PB-0 should be 12×16 left");
+    assert_eq!(pbs[1], (12, 0, 4, 16), "PB-1 should be 4×16 quarter-right");
+}

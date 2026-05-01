@@ -55,7 +55,7 @@ use crate::cabac::{
     init_row, CtxState, InitType, ABS_MVD_GREATER_FLAGS_INIT_VALUES, CU_SKIP_FLAG_INIT_VALUES,
     INTER_PRED_IDC_INIT_VALUES, MERGE_FLAG_INIT_VALUES, MERGE_IDX_INIT_VALUES,
     MVP_LX_FLAG_INIT_VALUES, PART_MODE_INIT_VALUES, PRED_MODE_FLAG_INIT_VALUES,
-    RQT_ROOT_CBF_INIT_VALUES,
+    RQT_ROOT_CBF_INIT_VALUES, SPLIT_CU_FLAG_INIT_VALUES, SPLIT_TRANSFORM_FLAG_INIT_VALUES,
 };
 use crate::encoder::bit_writer::{write_rbsp_trailing_bits, BitWriter};
 use crate::encoder::cabac_writer::CabacWriter;
@@ -73,12 +73,27 @@ use crate::transform::{
 };
 use oxideav_core::VideoFrame;
 
-/// CTU size = 16. minCU = 16. 2Nx2N inter CU ⇒ one 16×16 luma PB + TB.
+/// CTU size = 16. minCU = 8 (round 24 — lifted to unblock AMP). The
+/// encoder still places one 16×16 CB per CTB, but the SPS now allows
+/// further splits down to 8×8 (we never use them) and AMP partitions
+/// inside the 16×16 CB (which we do use here).
 const CTU_SIZE: u32 = 16;
 /// Slice QP — matches the I/P-slice emitter so rate/quality stay aligned.
 const SLICE_QP_Y: i32 = 26;
 /// Integer search window (luma pixels). ±`ME_RANGE` both directions.
 const ME_RANGE: i32 = 8;
+/// Lagrangian λ for the AMP-vs-2Nx2N rate gate. Roughly `0.85 *
+/// 2^((QP-12)/3)` per the HEVC reference's standard mapping; at QP 26
+/// that's ≈ 21.5. We round up so the gate is slightly conservative
+/// (prefers 2Nx2N when AMP doesn't beat it by a clear margin).
+const AMP_LAMBDA: u64 = 22;
+/// Estimated extra bits paid for an AMP partition (vs the 1-bit `part_mode
+/// = 1` for 2Nx2N). Spec: `0` (NOT 2Nx2N) + dir bit + `0` (AMP) + bypass
+/// position (=4 bins for part_mode) + the second PB's merge_flag +
+/// inter_pred_idc + MVD pair + mvp_lx_flag. With small / near-zero MVDs
+/// the typical extra is ~12 bins. `AMP_LAMBDA × 12 ≈ 264` SAD units is
+/// the minimum margin AMP must beat 2Nx2N by.
+const AMP_BIT_COST: u64 = 12;
 /// `MaxNumMergeCand` advertised in the slice header. Round 23 lifts this
 /// from 1 (round 22) to 5 — the spec's maximum. Larger lists are a
 /// strict super-set: with `max == 1` only the first spatial candidate is
@@ -205,6 +220,7 @@ struct BEncoderState {
     grid_h4: usize,
 
     // CABAC contexts (B slices use InitType::Pb when cabac_init_flag=0).
+    split_cu_flag: [CtxState; 3],
     cu_skip_flag: [CtxState; 3],
     pred_mode_flag: [CtxState; 1],
     part_mode: [CtxState; 4],
@@ -214,7 +230,84 @@ struct BEncoderState {
     abs_mvd_greater: [CtxState; 2],
     rqt_root_cbf: [CtxState; 1],
     inter_pred_idc: [CtxState; 5],
+    /// Round 24 — needed for AMP CUs because the decoder reads the bin at
+    /// the inter root TU when `part_mode != Mode2Nx2N` (see decoder's
+    /// `transform_tree_inter_inner` § 7.3.8.9 path). For 2Nx2N we still
+    /// take the `skip_for_2nx2n` shortcut and don't emit anything here.
+    split_transform_flag: [CtxState; 3],
     residual: ResidualCtx,
+}
+
+/// AMP partition shapes (§7.4.9.5 Table 7-10) the round-24 encoder
+/// considers as candidates against 2Nx2N. Each shape produces two PBs
+/// over a 16×16 CB; the "quarter" stripe is 4 luma pels thick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmpShape {
+    /// `2NxnU` — top stripe 16×4, bottom stripe 16×12.
+    NxnU,
+    /// `2NxnD` — top stripe 16×12, bottom stripe 16×4.
+    NxnD,
+    /// `nLx2N` — left stripe 4×16, right stripe 12×16.
+    NLx2N,
+    /// `nRx2N` — left stripe 12×16, right stripe 4×16.
+    NRx2N,
+}
+
+impl AmpShape {
+    /// Return the two PB rectangles `(x, y, w, h)` for this shape rooted
+    /// at `(x0, y0)` over a `cb_size × cb_size` CB.
+    pub fn pbs(self, x0: u32, y0: u32, cb_size: u32) -> [(u32, u32, u32, u32); 2] {
+        let q = cb_size / 4;
+        match self {
+            // §7.4.9.5: "U" / "L" → quarter stripe FIRST.
+            AmpShape::NxnU => [(x0, y0, cb_size, q), (x0, y0 + q, cb_size, cb_size - q)],
+            // "D" / "R" → quarter stripe LAST.
+            AmpShape::NxnD => [
+                (x0, y0, cb_size, cb_size - q),
+                (x0, y0 + cb_size - q, cb_size, q),
+            ],
+            AmpShape::NLx2N => [(x0, y0, q, cb_size), (x0 + q, y0, cb_size - q, cb_size)],
+            AmpShape::NRx2N => [
+                (x0, y0, cb_size - q, cb_size),
+                (x0 + cb_size - q, y0, q, cb_size),
+            ],
+        }
+    }
+
+    /// Horizontal family (split along Y) → bin1 = 1; vertical family
+    /// (split along X) → bin1 = 0. Mirrors the decoder's part_mode
+    /// derivation in `coding_quadtree`.
+    pub fn dir_bin(self) -> u32 {
+        match self {
+            AmpShape::NxnU | AmpShape::NxnD => 1,
+            AmpShape::NLx2N | AmpShape::NRx2N => 0,
+        }
+    }
+
+    /// AMP position bypass bit per §9.3.4.2: `0` = quarter on the
+    /// top/left, `1` = quarter on the bottom/right.
+    pub fn pos_bypass(self) -> u32 {
+        match self {
+            AmpShape::NxnU | AmpShape::NLx2N => 0,
+            AmpShape::NxnD | AmpShape::NRx2N => 1,
+        }
+    }
+}
+
+const AMP_CANDIDATES: [AmpShape; 4] = [
+    AmpShape::NxnU,
+    AmpShape::NxnD,
+    AmpShape::NLx2N,
+    AmpShape::NRx2N,
+];
+
+/// Per-PB motion pick used by the AMP path.
+#[derive(Clone, Copy, Debug, Default)]
+struct PbPick {
+    use_l0: bool,
+    use_l1: bool,
+    mv_l0: (i32, i32),
+    mv_l1: (i32, i32),
 }
 
 /// Per-CU mode pick.
@@ -224,14 +317,16 @@ enum BMode {
     Skip { merge_idx: u32 },
     /// `merge_flag = 1` + `merge_idx`. Best merge candidate, residual coded.
     Merge { merge_idx: u32 },
-    /// Explicit AMVP. `use_l0`/`use_l1` indicate which lists are active;
-    /// `mv_l0`/`mv_l1` are the integer-pel selected MVs.
+    /// Explicit AMVP, 2Nx2N. `use_l0`/`use_l1` indicate which lists are
+    /// active; `mv_l0`/`mv_l1` are the integer-pel selected MVs.
     Amvp {
         use_l0: bool,
         use_l1: bool,
         mv_l0: (i32, i32),
         mv_l1: (i32, i32),
     },
+    /// Explicit AMVP, AMP partition. Per-PB list selection + integer-pel MV.
+    AmvpAmp { shape: AmpShape, picks: [PbPick; 2] },
 }
 
 impl BEncoderState {
@@ -266,6 +361,7 @@ impl BEncoderState {
             mv_grid_l1: vec![None; grid_w4 * grid_h4],
             grid_w4,
             grid_h4,
+            split_cu_flag: init_row(&SPLIT_CU_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             cu_skip_flag: init_row(&CU_SKIP_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             pred_mode_flag: init_row(&PRED_MODE_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             part_mode: init_row(&PART_MODE_INIT_VALUES, it, SLICE_QP_Y),
@@ -275,11 +371,16 @@ impl BEncoderState {
             abs_mvd_greater: init_row(&ABS_MVD_GREATER_FLAGS_INIT_VALUES, it, SLICE_QP_Y),
             rqt_root_cbf: init_row(&RQT_ROOT_CBF_INIT_VALUES, it, SLICE_QP_Y),
             inter_pred_idc: init_row(&INTER_PRED_IDC_INIT_VALUES, it, SLICE_QP_Y),
+            split_transform_flag: init_row(&SPLIT_TRANSFORM_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             residual: ResidualCtx::with_init_type(SLICE_QP_Y, it),
         }
     }
 
     fn encode_ctu(&mut self, cw: &mut CabacWriter<'_>, src: &VideoFrame, x0: u32, y0: u32) {
+        // Round 24: split_cu_flag = 0 at CTB root (log2_cb=4 > minCb=3,
+        // depth-0 neighbours never carry cqtDepth > 0 → ctxInc = 0).
+        cw.encode_bin(&mut self.split_cu_flag[0], 0);
+
         // ---- evaluate merge candidates (driven SAD pick) ---------------
         let merge_cands = self.build_merge_cands(x0, y0);
         let (merge_idx_best, merge_pb, merge_sad, merge_pred_y, merge_pred_cb, merge_pred_cr) =
@@ -310,6 +411,27 @@ impl BEncoderState {
                 (false, true, luma_pred_l1, cb_pred_l1, cr_pred_l1, sad_l1)
             };
 
+        // ---- evaluate AMP candidates -----------------------------------
+        // For each of the 4 AMP shapes, run a per-stripe integer ME on
+        // the better of L0 / L1, build the composite prediction, and
+        // score. Winner has to beat 2Nx2N by at least
+        // `AMP_LAMBDA × AMP_BIT_COST` (~352 SAD units at QP 26) to be
+        // picked — the rate gate for a partition that pays the second
+        // PB's ~16-bit overhead.
+        let mut best_amp: Option<(AmpShape, [PbPick; 2], u64)> = None;
+        if std::env::var_os("H265_ENC_AMP_OFF").is_none() {
+            for shape in AMP_CANDIDATES {
+                let (picks, sad) = self.evaluate_amp_shape(src, x0, y0, shape);
+                let is_better = best_amp.as_ref().map(|(_, _, s)| sad < *s).unwrap_or(true);
+                if is_better {
+                    best_amp = Some((shape, picks, sad));
+                }
+            }
+        }
+        let amp_winner = best_amp
+            .as_ref()
+            .filter(|(_, _, sad)| *sad + AMP_LAMBDA * AMP_BIT_COST < amvp_sad);
+
         // ---- pick mode -------------------------------------------------
         // Skip when the best merge SAD is below the threshold AND merge
         // beats AMVP (otherwise we'd lose quality on a moving CU just to
@@ -322,6 +444,11 @@ impl BEncoderState {
         } else if merge_wins {
             BMode::Merge {
                 merge_idx: merge_idx_best,
+            }
+        } else if let Some((shape, picks, _)) = amp_winner {
+            BMode::AmvpAmp {
+                shape: *shape,
+                picks: *picks,
             }
         } else {
             BMode::Amvp {
@@ -428,6 +555,356 @@ impl BEncoderState {
                     ref_lt_l1: false,
                 };
                 self.publish_pb(x0, y0, CTU_SIZE, pb);
+            }
+            BMode::AmvpAmp { shape, picks } => {
+                self.emit_amvp_amp(cw, src, x0, y0, skip_ctx_inc, shape, picks);
+            }
+        }
+    }
+
+    /// Score one AMP shape: per-stripe integer ME on the better of
+    /// L0 / L1, build the full composite luma / chroma prediction, return
+    /// `(picks, sad)`.
+    fn evaluate_amp_shape(
+        &self,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        shape: AmpShape,
+    ) -> ([PbPick; 2], u64) {
+        let pbs = shape.pbs(x0, y0, CTU_SIZE);
+        let mut picks = [PbPick::default(); 2];
+        for (idx, (pb_x, pb_y, pb_w, pb_h)) in pbs.iter().enumerate() {
+            // Per-stripe SAD: pick L0-only or L1-only, smaller wins.
+            let (mv0, sad0) = self.estimate_mv_int_rect(src, *pb_x, *pb_y, *pb_w, *pb_h, false);
+            let (mv1, sad1) = self.estimate_mv_int_rect(src, *pb_x, *pb_y, *pb_w, *pb_h, true);
+            picks[idx] = if sad0 <= sad1 {
+                PbPick {
+                    use_l0: true,
+                    use_l1: false,
+                    mv_l0: mv0,
+                    mv_l1: (0, 0),
+                }
+            } else {
+                PbPick {
+                    use_l0: false,
+                    use_l1: true,
+                    mv_l0: (0, 0),
+                    mv_l1: mv1,
+                }
+            };
+        }
+        let (luma, _, _) = self.amp_composite(x0, y0, shape, &picks);
+        let sad = sad_luma(src, x0, y0, &luma, CTU_SIZE);
+        (picks, sad)
+    }
+
+    /// Build the AMP composite prediction (per-stripe MC, glued together)
+    /// for one CB. Returns `(luma_16x16, cb_8x8, cr_8x8)`.
+    fn amp_composite(
+        &self,
+        x0: u32,
+        y0: u32,
+        shape: AmpShape,
+        picks: &[PbPick; 2],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let n = CTU_SIZE as usize;
+        let cn = n / 2;
+        let mut luma = vec![0u8; n * n];
+        let mut cb = vec![0u8; cn * cn];
+        let mut cr = vec![0u8; cn * cn];
+        let pbs = shape.pbs(x0, y0, CTU_SIZE);
+        for (idx, (pb_x, pb_y, pb_w, pb_h)) in pbs.iter().enumerate() {
+            let pick = &picks[idx];
+            let (mv_x, mv_y) = if pick.use_l0 { pick.mv_l0 } else { pick.mv_l1 };
+            let r = if pick.use_l0 {
+                &self.ref_l0
+            } else {
+                &self.ref_l1
+            };
+            // Luma stripe.
+            for j in 0..(*pb_h as i32) {
+                for i in 0..(*pb_w as i32) {
+                    let abs_x = *pb_x as i32 + i;
+                    let abs_y = *pb_y as i32 + j;
+                    let lx = (abs_x - x0 as i32) as usize;
+                    let ly = (abs_y - y0 as i32) as usize;
+                    luma[ly * n + lx] = r.sample_y(abs_x + mv_x, abs_y + mv_y);
+                }
+            }
+            // Chroma stripe — 4:2:0 means the chroma rect is half the
+            // luma rect; AMP stripes (4 luma) divide cleanly by 2.
+            let cx0 = (*pb_x / 2) as i32;
+            let cy0 = (*pb_y / 2) as i32;
+            let cw_pb = (*pb_w / 2) as i32;
+            let ch_pb = (*pb_h / 2) as i32;
+            let mv_cx = mv_x / 2;
+            let mv_cy = mv_y / 2;
+            let cb0_cx = (x0 / 2) as i32;
+            let cb0_cy = (y0 / 2) as i32;
+            for j in 0..ch_pb {
+                for i in 0..cw_pb {
+                    let abs_cx = cx0 + i;
+                    let abs_cy = cy0 + j;
+                    let lx = (abs_cx - cb0_cx) as usize;
+                    let ly = (abs_cy - cb0_cy) as usize;
+                    cb[ly * cn + lx] = r.sample_c(abs_cx + mv_cx, abs_cy + mv_cy, false);
+                    cr[ly * cn + lx] = r.sample_c(abs_cx + mv_cx, abs_cy + mv_cy, true);
+                }
+            }
+        }
+        (luma, cb, cr)
+    }
+
+    /// Emit the full CABAC payload for an AMP-partitioned CU. Order
+    /// follows §7.3.8.5: `cu_skip_flag = 0`, `pred_mode_flag = 0`,
+    /// `part_mode` (4 bins for AMP per Table 9-45), then per-PB
+    /// `prediction_unit()`, then `rqt_root_cbf`,
+    /// `split_transform_flag = 0`, then the residual.
+    fn emit_amvp_amp(
+        &mut self,
+        cw: &mut CabacWriter<'_>,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        skip_ctx_inc: usize,
+        shape: AmpShape,
+        picks: [PbPick; 2],
+    ) {
+        cw.encode_bin(&mut self.cu_skip_flag[skip_ctx_inc], 0);
+        cw.encode_bin(&mut self.pred_mode_flag[0], 0); // INTER
+
+        // part_mode bins per Table 9-45 (AMP path, log2CbSize > MinCbLog2SizeY):
+        //   bin0 (ctx 0) = 0   — NOT 2Nx2N
+        //   bin1 (ctx 1) = dir — 1 horizontal family (2NxnU/D), 0 vertical
+        //   bin2 (ctx 3) = 0   — AMP (vs symmetric 2NxN/Nx2N which is 1)
+        //   bin3 bypass  = pos — 0 = U/L (quarter first), 1 = D/R (quarter last)
+        cw.encode_bin(&mut self.part_mode[0], 0);
+        cw.encode_bin(&mut self.part_mode[1], shape.dir_bin());
+        cw.encode_bin(&mut self.part_mode[3], 0);
+        cw.encode_bypass(shape.pos_bypass());
+
+        // Build the composite prediction so we can both publish the MC
+        // result and run residual coding against it.
+        let pbs = shape.pbs(x0, y0, CTU_SIZE);
+        let (composite_y, composite_cb, composite_cr) = self.amp_composite(x0, y0, shape, &picks);
+
+        // Per-PB prediction_unit syntax in raster order.
+        for (idx, (pb_x, pb_y, pb_w, pb_h)) in pbs.iter().enumerate() {
+            let pick = &picks[idx];
+            cw.encode_bin(&mut self.merge_flag[0], 0);
+
+            // inter_pred_idc bin 0: ctxInc = CtDepth = 0 (depth-0 16×16 CB).
+            // AMP "quarter" stripes are 16×4 / 4×16 (sum 20) and the
+            // "3·n" stripes sum to 28 — neither hits 12 so the small-PU
+            // ctxInc = 4 path is not taken.
+            let bin0_ctx = 0usize;
+            if pick.use_l0 && pick.use_l1 {
+                cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 1);
+            } else {
+                cw.encode_bin(&mut self.inter_pred_idc[bin0_ctx], 0);
+                cw.encode_bin(&mut self.inter_pred_idc[4], if pick.use_l1 { 1 } else { 0 });
+            }
+            if pick.use_l0 {
+                let mv_qp = (pick.mv_l0.0 * 4, pick.mv_l0.1 * 4);
+                let mvp = self.amvp_predictor(*pb_x, *pb_y, *pb_w, *pb_h, /* l1 */ false);
+                self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
+                cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
+            }
+            if pick.use_l1 {
+                let mv_qp = (pick.mv_l1.0 * 4, pick.mv_l1.1 * 4);
+                let mvp = self.amvp_predictor(*pb_x, *pb_y, *pb_w, *pb_h, /* l1 */ true);
+                self.encode_mvd(cw, mv_qp.0 - mvp.0, mv_qp.1 - mvp.1);
+                cw.encode_bin(&mut self.mvp_lx_flag[0], 0);
+            }
+            // Publish PB-0 BEFORE PB-1 so PB-1's AMVP sees the right
+            // neighbour. (PB-1 published below.)
+            if idx == 0 {
+                self.publish_pb_pick(*pb_x, *pb_y, *pb_w, *pb_h, pick);
+            }
+        }
+        let (pb1_x, pb1_y, pb1_w, pb1_h) = pbs[1];
+        self.publish_pb_pick(pb1_x, pb1_y, pb1_w, pb1_h, &picks[1]);
+
+        // Code the composite residual. Differs from the 2Nx2N path in
+        // one bin: the decoder reads `split_transform_flag` at the root
+        // because the CU is not 2Nx2N (the `skip_for_2nx2n` shortcut in
+        // `transform_tree_inter_inner` is gated on
+        // `part_mode == Mode2Nx2N`). Emit `0` so the root stays a single
+        // 16×16 luma TB.
+        self.code_residual_amp(cw, src, x0, y0, &composite_y, &composite_cb, &composite_cr);
+    }
+
+    /// Code the composite residual for an AMP CU. Differs from
+    /// [`Self::code_residual`] in one bin: `split_transform_flag = 0`
+    /// at the root for a non-2Nx2N inter CU.
+    fn code_residual_amp(
+        &mut self,
+        cw: &mut CabacWriter<'_>,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        luma_pred: &[u8],
+        cb_pred: &[u8],
+        cr_pred: &[u8],
+    ) {
+        let log2_tb = 4u32;
+        let c_log2 = 3u32;
+        let (luma_levels, luma_rec) = self.process_inter_luma(src, x0, y0, luma_pred);
+        let cx = x0 / 2;
+        let cy = y0 / 2;
+        let (cb_levels, cb_rec) = self.process_inter_chroma(src, cx, cy, cb_pred, false);
+        let (cr_levels, cr_rec) = self.process_inter_chroma(src, cx, cy, cr_pred, true);
+
+        let cbf_luma = luma_levels.iter().any(|&l| l != 0);
+        let cbf_cb = cb_levels.iter().any(|&l| l != 0);
+        let cbf_cr = cr_levels.iter().any(|&l| l != 0);
+        let any_residual = cbf_luma || cbf_cb || cbf_cr;
+
+        cw.encode_bin(&mut self.rqt_root_cbf[0], any_residual as u32);
+        if !any_residual {
+            self.write_luma_block(x0, y0, CTU_SIZE as usize, luma_pred);
+            self.write_chroma_block(cx, cy, 1 << c_log2, cb_pred, false);
+            self.write_chroma_block(cx, cy, 1 << c_log2, cr_pred, true);
+            return;
+        }
+
+        // §7.3.8.9 transform_tree at the root (tr_depth = 0) for an AMP
+        // CU. The decoder reads cbf_cb / cbf_cr BEFORE the split bin
+        // (chroma_here = log2_tb > 2 = true; tr_depth == 0 ⇒
+        // parent_cbf treated as 1; ctxInc = 0).
+        cw.encode_bin(&mut self.residual.cbf_cb_cr[0], cbf_cb as u32);
+        cw.encode_bin(&mut self.residual.cbf_cb_cr[0], cbf_cr as u32);
+        // split_transform_flag at root: ctxInc = min((5 - log2_tb), 2)
+        // = min(1, 2) = 1. Emit 0 → single 16×16 root luma TB.
+        cw.encode_bin(&mut self.split_transform_flag[1], 0);
+        // cbf_luma at the leaf (tr_depth still 0). ctxInc = 1 (tr_depth
+        // == 0). cbf_luma is inferred = 1 when `cbf_cb == 0 && cbf_cr
+        // == 0`, otherwise emitted.
+        let cbf_luma_inferred = !cbf_cb && !cbf_cr;
+        if !cbf_luma_inferred {
+            cw.encode_bin(&mut self.residual.cbf_luma[1], cbf_luma as u32);
+        }
+        if cbf_luma {
+            encode_residual(cw, &mut self.residual, &luma_levels, log2_tb, true);
+        }
+        if cbf_cb {
+            encode_residual(cw, &mut self.residual, &cb_levels, c_log2, false);
+        }
+        if cbf_cr {
+            encode_residual(cw, &mut self.residual, &cr_levels, c_log2, false);
+        }
+
+        self.write_luma_block(x0, y0, CTU_SIZE as usize, &luma_rec);
+        self.write_chroma_block(cx, cy, 1 << c_log2, &cb_rec, false);
+        self.write_chroma_block(cx, cy, 1 << c_log2, &cr_rec, true);
+    }
+
+    /// Build & publish a [`PbMotion`] for one AMP PB.
+    fn publish_pb_pick(&mut self, x: u32, y: u32, w: u32, h: u32, pick: &PbPick) {
+        let mv_l0_qp = MotionVector::new(pick.mv_l0.0 * 4, pick.mv_l0.1 * 4);
+        let mv_l1_qp = MotionVector::new(pick.mv_l1.0 * 4, pick.mv_l1.1 * 4);
+        let pb = PbMotion {
+            valid: true,
+            is_intra: false,
+            is_skip: false,
+            pred_l0: pick.use_l0,
+            pred_l1: pick.use_l1,
+            ref_idx_l0: if pick.use_l0 { 0 } else { -1 },
+            ref_idx_l1: if pick.use_l1 { 0 } else { -1 },
+            mv_l0: if pick.use_l0 {
+                mv_l0_qp
+            } else {
+                MotionVector::default()
+            },
+            mv_l1: if pick.use_l1 {
+                mv_l1_qp
+            } else {
+                MotionVector::default()
+            },
+            ref_poc_l0: if pick.use_l0 { self.delta_l0 } else { 0 },
+            ref_poc_l1: if pick.use_l1 { self.delta_l1 } else { 0 },
+            ref_lt_l0: false,
+            ref_lt_l1: false,
+        };
+        self.inter_state.set_rect(x, y, w, h, pb);
+        if pb.pred_l0 {
+            self.store_mv_rect(x, y, w, h, (pb.mv_l0.x, pb.mv_l0.y), false);
+        }
+        if pb.pred_l1 {
+            self.store_mv_rect(x, y, w, h, (pb.mv_l1.x, pb.mv_l1.y), true);
+        }
+    }
+
+    /// Per-rectangle integer-pel ME (equivalent to `estimate_mv_int` but
+    /// over a `(w, h)` PB rather than the full CTU). Steps of 2 keep
+    /// chroma MVs at integer pel.
+    fn estimate_mv_int_rect(
+        &self,
+        src: &VideoFrame,
+        x0: u32,
+        y0: u32,
+        w: u32,
+        h: u32,
+        is_l1: bool,
+    ) -> ((i32, i32), u64) {
+        let nw = w as i32;
+        let nh = h as i32;
+        let src_y = &src.planes[0];
+        let pic_w = self.cfg.width as i32;
+        let pic_h = self.cfg.height as i32;
+        let r = if is_l1 { &self.ref_l1 } else { &self.ref_l0 };
+        let mut best_sad = u64::MAX;
+        let mut best = (0i32, 0i32);
+        let mut dy = -ME_RANGE;
+        while dy <= ME_RANGE {
+            let mut dx = -ME_RANGE;
+            while dx <= ME_RANGE {
+                let rx = x0 as i32 + dx;
+                let ry = y0 as i32 + dy;
+                if rx < 0 || ry < 0 || rx + nw > pic_w || ry + nh > pic_h {
+                    dx += 2;
+                    continue;
+                }
+                let mut sad = 0u64;
+                for j in 0..nh {
+                    for i in 0..nw {
+                        let s = src_y.data
+                            [(y0 as i32 + j) as usize * src_y.stride + (x0 as i32 + i) as usize]
+                            as i32;
+                        let rr = r.sample_y(rx + i, ry + j) as i32;
+                        sad += (s - rr).unsigned_abs() as u64;
+                    }
+                }
+                if sad < best_sad {
+                    best_sad = sad;
+                    best = (dx, dy);
+                }
+                dx += 2;
+            }
+            dy += 2;
+        }
+        (best, best_sad)
+    }
+
+    /// Rectangle variant of [`Self::store_mv`] for AMP PB shapes.
+    fn store_mv_rect(&mut self, x: u32, y: u32, w: u32, h: u32, mv: (i32, i32), is_l1: bool) {
+        let grid = if is_l1 {
+            &mut self.mv_grid_l1
+        } else {
+            &mut self.mv_grid_l0
+        };
+        let bx0 = (x >> 2) as usize;
+        let by0 = (y >> 2) as usize;
+        let nw4 = (w >> 2) as usize;
+        let nh4 = (h >> 2) as usize;
+        for dy in 0..nh4 {
+            for dx in 0..nw4 {
+                let bx = bx0 + dx;
+                let by = by0 + dy;
+                if bx < self.grid_w4 && by < self.grid_h4 {
+                    grid[by * self.grid_w4 + bx] = Some(mv);
+                }
             }
         }
     }

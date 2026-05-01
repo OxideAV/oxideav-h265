@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 25 — **Main 10 (10-bit) encode** (§A.3.3, §7.4.3.2.1, §8.6.1).
+  `HevcEncoder::from_params` now accepts `PixelFormat::Yuv420P10Le`
+  source frames and routes them through a new
+  `src/encoder/slice_writer_main10.rs` which mirrors the round-1+
+  I-slice writer but operates on `u16` samples throughout and threads
+  `bit_depth = 10` through every `intra_pred::predict` /
+  `transform::{forward,inverse,quantize,dequantize}_*` call. The SPS
+  emits `bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 2` and
+  `general_profile_idc = 2` (Main 10), with the VPS PTL agreeing
+  byte-for-byte (`general_profile_compatibility_flag` carries both
+  the Main and Main 10 bits per §A.3.5 so a Main-only sniffer still
+  recognises the stream). `EncoderConfig` grew a `bit_depth: u32`
+  field driving SPS / VPS emission, plus
+  `EncoderConfig::new_main10(w, h)` for callers wiring the encoder
+  directly. The forward quantiser uses
+  **Qp'Y = SliceQpY + QpBdOffsetY = 26 + 12 = 38** so the encoder's
+  forward quant matches the decoder's `get_qp` inverse exactly
+  (mirrored on chroma). Scope: every 10-bit input frame is emitted as
+  an IDR I-slice — 10-bit P/B is the next round; `mini_gop_size > 1`
+  at 10-bit is rejected at construction time. The 8-bit Main encode
+  path (rounds 1..24) is unchanged byte-for-byte: the new code lives
+  in a parallel `slice_writer_main10` module rather than templating
+  over the existing 8-bit `EncoderState`. Five new tests in
+  `tests/encoder_main10.rs` exercise the SPS / NAL ordering, the
+  64×64 + 128×128 self-roundtrip (each ≈ 45 dB Y on the 10-bit /
+  peak = 1023 scale), the ffmpeg cross-decode (≥ 40 dB Y, gated on
+  the existing `FFMPEG` env var), and the mini_gop=2 rejection. Two
+  new tests in `src/encoder/params.rs::tests` (Main 10 SPS bit_depth
+  and Main 10 VPS profile_idc) plus two new
+  `src/encoder/slice_writer_main10::tests` (local reconstruction PSNR
+  + IDR NAL emission) cover the lib side.
 - round 23 — B-slice **merge / B_Skip encode** (§7.3.8.6, §8.5.3.2.2..5,
   §8.5.3.2.10, §9.3.4.2.2 / Table 9-32, §9.3.4.2.10). The B-slice
   writer (`src/encoder/b_slice_writer.rs`) now picks per CU between

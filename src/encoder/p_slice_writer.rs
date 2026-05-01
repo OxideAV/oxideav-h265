@@ -20,7 +20,7 @@
 use crate::cabac::{
     init_row, CtxState, InitType, ABS_MVD_GREATER_FLAGS_INIT_VALUES, CU_SKIP_FLAG_INIT_VALUES,
     MERGE_FLAG_INIT_VALUES, MVP_LX_FLAG_INIT_VALUES, PART_MODE_INIT_VALUES,
-    PRED_MODE_FLAG_INIT_VALUES, RQT_ROOT_CBF_INIT_VALUES,
+    PRED_MODE_FLAG_INIT_VALUES, RQT_ROOT_CBF_INIT_VALUES, SPLIT_CU_FLAG_INIT_VALUES,
 };
 use crate::encoder::bit_writer::{write_rbsp_trailing_bits, BitWriter};
 use crate::encoder::cabac_writer::CabacWriter;
@@ -251,6 +251,7 @@ struct PEncoderState {
     grid_h4: usize,
 
     // CABAC contexts.
+    split_cu_flag: [CtxState; 3],
     cu_skip_flag: [CtxState; 3],
     pred_mode_flag: [CtxState; 1],
     part_mode: [CtxState; 4],
@@ -281,6 +282,7 @@ impl PEncoderState {
             mv_grid: vec![None; grid_w4 * grid_h4],
             grid_w4,
             grid_h4,
+            split_cu_flag: init_row(&SPLIT_CU_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             cu_skip_flag: init_row(&CU_SKIP_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             pred_mode_flag: init_row(&PRED_MODE_FLAG_INIT_VALUES, it, SLICE_QP_Y),
             part_mode: init_row(&PART_MODE_INIT_VALUES, it, SLICE_QP_Y),
@@ -293,7 +295,13 @@ impl PEncoderState {
     }
 
     fn encode_ctu(&mut self, cw: &mut CabacWriter<'_>, src: &VideoFrame, x0: u32, y0: u32) {
-        // One 16×16 CU per 16×16 CTU (no split_cu_flag at min CB).
+        // Round 24: minCb is now log2 = 3 (8×8) so the encoder must
+        // signal `split_cu_flag` at the CTB root for every 16×16 CB
+        // (log2_cb = 4 > minCb = 3). Every CB stays at 16×16 (no
+        // sub-CU splits), so we always emit 0. ctxInc = 0 because
+        // depth-0 neighbours never carry cqtDepth > 0.
+        cw.encode_bin(&mut self.split_cu_flag[0], 0);
+
         // cu_skip_flag: emit 0. ctx_inc depends on left / above neighbour's
         // skip status — we never flag skip so all neighbours contribute 0,
         // but we still use the same ctx lookup as the decoder.
@@ -380,41 +388,14 @@ impl PEncoderState {
         self.write_chroma_block(cx, cy, 1 << c_log2, &cr_rec, true);
     }
 
-    /// §9.3.4.2.2 cu_skip_flag ctx_inc: count of `(L.skip + A.skip)` where
-    /// L / A are the neighbours' skip flags. The decoder approximates this
-    /// by `(L.is_valid_inter + A.is_valid_inter)` since it doesn't track
-    /// skip per PB. We mirror that approximation exactly — every emitted
-    /// P-slice inter CU counts as "neighbour is valid inter".
+    /// §9.3.4.2.2 cu_skip_flag ctx_inc = `condTermFlagL + condTermFlagA`
+    /// where `condTermFlagX = neighbour.is_skip`. Round 24 mirrors the
+    /// decoder's r19 fix: P-slice never emits skip CUs (every CU goes
+    /// through explicit AMVP or merge), so the encoder always reports
+    /// "neighbour is_skip = 0" → ctx_inc = 0 for every CU.
     fn skip_ctx_inc(&self, x0: u32, y0: u32) -> usize {
-        let left = if x0 == 0 {
-            0
-        } else {
-            let bx = ((x0 - 1) >> 2) as usize;
-            let by = (y0 >> 2) as usize;
-            if bx < self.grid_w4
-                && by < self.grid_h4
-                && self.mv_grid[by * self.grid_w4 + bx].is_some()
-            {
-                1
-            } else {
-                0
-            }
-        };
-        let above = if y0 == 0 {
-            0
-        } else {
-            let bx = (x0 >> 2) as usize;
-            let by = ((y0 - 1) >> 2) as usize;
-            if bx < self.grid_w4
-                && by < self.grid_h4
-                && self.mv_grid[by * self.grid_w4 + bx].is_some()
-            {
-                1
-            } else {
-                0
-            }
-        };
-        (left + above).min(2)
+        let _ = (x0, y0);
+        0
     }
 
     /// Integer-pel motion estimation: SAD search over ±ME_RANGE luma

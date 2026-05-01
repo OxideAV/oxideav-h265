@@ -5,10 +5,16 @@
 //!
 //! * Main profile, level 3.0 (bounds: 720×576 @ 30 fps), Tier Main.
 //! * 8-bit 4:2:0 luma + chroma.
-//! * CTU size = 16, min CU size = 16 (log2=4) — every CTU is exactly one
-//!   16×16 coding unit, no split_cu_flag at CU root.
+//! * CTU size = 16, **min CU size = 8** (log2=3). The encoder still keeps
+//!   every CB at 16×16 — it emits `split_cu_flag = 0` at the CTB root —
+//!   but lifting `MinCbLog2SizeY` to 3 unblocks AMP for the B-slice
+//!   writer (round 24): `amp_enabled_flag` only takes effect when
+//!   `log2CbSize > MinCbLog2SizeY` per §7.4.9.5.
 //! * Transform range 4..16. `max_transform_hierarchy_depth_intra = 0` so
 //!   the 16×16 CU carries one 16×16 luma TB + one 8×8 chroma TB pair.
+//! * `amp_enabled_flag = 1` — round 24 (B-slice writer scores 2NxnU /
+//!   2NxnD / nLx2N / nRx2N against 2Nx2N and picks the best by Lagrangian
+//!   SAD).
 //! * `pcm_enabled_flag = 0`, `scaling_list_enabled_flag = 0`,
 //!   `sample_adaptive_offset_enabled_flag = 0`.
 //! * No tiles, no wavefront, deblock enabled via PPS defaults.
@@ -19,15 +25,37 @@ use crate::nal::{NalHeader, NalUnitType};
 
 /// High-level config used by the emitters. Fixed-profile MVP: most fields
 /// are derived from width/height.
+///
+/// `bit_depth` toggles between Main (8) and Main 10 (10). The 8-bit path
+/// is the default and stays byte-for-byte compatible with the round-1..24
+/// emissions; the 10-bit path is engaged via [`EncoderConfig::new_main10`]
+/// and only used by the I-slice writer for now (see crate README).
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
     pub height: u32,
+    /// Component bit depth for both luma and chroma. Encoder supports
+    /// 8 (Main profile) and 10 (Main 10 profile).
+    pub bit_depth: u32,
 }
 
 impl EncoderConfig {
+    /// 8-bit Main-profile encoder config.
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            bit_depth: 8,
+        }
+    }
+
+    /// 10-bit Main 10 profile encoder config.
+    pub fn new_main10(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth: 10,
+        }
     }
 }
 
@@ -35,14 +63,22 @@ impl EncoderConfig {
 // profile_tier_level()  §7.3.3
 // -----------------------------------------------------------------------
 
-fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32) {
-    // general_profile_space (u2) = 0, general_tier_flag (u1) = 0 (Main),
-    // general_profile_idc (u5) = 1 (Main).
+fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_depth: u32) {
+    // general_profile_space (u2) = 0, general_tier_flag (u1) = 0 (Main).
+    // general_profile_idc (u5) = 1 (Main) for 8-bit, 2 (Main 10) for 10-bit.
     bw.write_bits(0, 2);
     bw.write_u1(0);
-    bw.write_bits(1, 5);
-    // general_profile_compatibility_flag[32] — only bit 1 is set (Main).
-    let compat: u32 = 1 << (31 - 1);
+    let profile_idc: u32 = if bit_depth >= 10 { 2 } else { 1 };
+    bw.write_bits(profile_idc, 5);
+    // general_profile_compatibility_flag[32]: bit at position
+    // `profile_idc` is set; for Main 10 we also set the Main bit per
+    // §A.3.5 ("a Main 10 decoder must also accept Main streams"), so
+    // both bit 1 and bit 2 are set.
+    let compat: u32 = if bit_depth >= 10 {
+        (1u32 << (31 - 1)) | (1u32 << (31 - 2))
+    } else {
+        1u32 << (31 - 1)
+    };
     bw.write_bits(compat, 32);
     // progressive / interlaced / non-packed / frame-only constraint flags (all 0).
     bw.write_u1(1); // progressive_source_flag
@@ -74,6 +110,14 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32) {
 // -----------------------------------------------------------------------
 
 pub fn build_vps_rbsp() -> Vec<u8> {
+    build_vps_rbsp_with_bit_depth(8)
+}
+
+/// Build the VPS RBSP with an explicit `bit_depth` driving the
+/// profile_tier_level emission. `bit_depth = 8` matches the original
+/// 8-bit Main emission byte-for-byte; `bit_depth = 10` switches the PTL
+/// to Main 10 (profile_idc = 2 + the Main+Main10 compatibility bits).
+pub fn build_vps_rbsp_with_bit_depth(bit_depth: u32) -> Vec<u8> {
     let mut bw = BitWriter::new();
     // vps_video_parameter_set_id (u4)
     bw.write_bits(0, 4);
@@ -89,7 +133,7 @@ pub fn build_vps_rbsp() -> Vec<u8> {
     // vps_reserved_0xffff_16bits
     bw.write_bits(0xFFFF, 16);
     // profile_tier_level(1, vps_max_sub_layers_minus1)
-    write_profile_tier_level(&mut bw, 0);
+    write_profile_tier_level(&mut bw, 0, bit_depth);
     // vps_sub_layer_ordering_info_present_flag
     bw.write_u1(0);
     // For i = max_sub_layers_minus1..max_sub_layers_minus1 inclusive when
@@ -122,7 +166,7 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     // sps_temporal_id_nesting_flag (u1)
     bw.write_u1(1);
     // profile_tier_level(1, sps_max_sub_layers_minus1)
-    write_profile_tier_level(&mut bw, 0);
+    write_profile_tier_level(&mut bw, 0, cfg.bit_depth);
     // sps_seq_parameter_set_id
     bw.write_ue(0);
     // chroma_format_idc = 1 (4:2:0)
@@ -132,9 +176,12 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(cfg.height);
     // conformance_window_flag = 0
     bw.write_u1(0);
-    // bit_depth_luma_minus8, bit_depth_chroma_minus8
-    bw.write_ue(0);
-    bw.write_ue(0);
+    // bit_depth_luma_minus8, bit_depth_chroma_minus8 — 0 for Main (8-bit)
+    // and 2 for Main 10 (10-bit). The decoder honours both and emits
+    // either Yuv420P or Yuv420P10Le accordingly.
+    let depth_minus8 = cfg.bit_depth.saturating_sub(8);
+    bw.write_ue(depth_minus8);
+    bw.write_ue(depth_minus8);
     // log2_max_pic_order_cnt_lsb_minus4 (ue(v)) — pick 4 → MaxPicOrderCntLsb=256
     bw.write_ue(4);
     // sps_sub_layer_ordering_info_present_flag = 0
@@ -142,10 +189,14 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(1); // max_dec_pic_buffering_minus1[0]
     bw.write_ue(0); // max_num_reorder_pics[0]
     bw.write_ue(0); // max_latency_increase_plus1[0]
-                    // log2_min_luma_coding_block_size_minus3 = 1 → min CU = 16
-    bw.write_ue(1);
-    // log2_diff_max_min_luma_coding_block_size = 0 → max CU = 16 (CTU=16)
+                    // log2_min_luma_coding_block_size_minus3 = 0 → min CU = 8.
+                    // Round 24: lifts MinCbLog2SizeY to 3 so 16×16 CBs sit at
+                    // log2CbSize > MinCbLog2SizeY, which is the §7.4.9.5
+                    // gate for AMP. We still emit one 16×16 CB per 16×16
+                    // CTB (split_cu_flag = 0 at CTB root).
     bw.write_ue(0);
+    // log2_diff_max_min_luma_coding_block_size = 1 → max CU = 16 (CTU=16)
+    bw.write_ue(1);
     // log2_min_luma_transform_block_size_minus2 = 0 → min TB = 4
     // (Chroma 8×8 TB requires TB = 8 which is min_luma_tb for intra; spec
     // fixes chroma TB = log2_luma_tb - 1 at 4:2:0.)
@@ -158,8 +209,8 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     bw.write_ue(0);
     // scaling_list_enabled_flag = 0
     bw.write_u1(0);
-    // amp_enabled_flag = 0
-    bw.write_u1(0);
+    // amp_enabled_flag = 1 (round 24 — B-slice AMP encode)
+    bw.write_u1(1);
     // sample_adaptive_offset_enabled_flag = 0
     bw.write_u1(0);
     // pcm_enabled_flag = 0
@@ -250,9 +301,16 @@ pub fn build_pps_rbsp() -> Vec<u8> {
     bw.finish()
 }
 
-/// Build Annex B bytes for a VPS NAL.
+/// Build Annex B bytes for a VPS NAL (8-bit Main).
 pub fn build_vps_nal() -> Vec<u8> {
-    let rbsp = build_vps_rbsp();
+    build_vps_nal_with_bit_depth(8)
+}
+
+/// Build Annex B bytes for a VPS NAL with the given component bit depth
+/// (8 or 10). At 10 the embedded `profile_tier_level()` switches to
+/// Main 10 (profile_idc = 2).
+pub fn build_vps_nal_with_bit_depth(bit_depth: u32) -> Vec<u8> {
+    let rbsp = build_vps_rbsp_with_bit_depth(bit_depth);
     build_annex_b_nal(NalHeader::for_type(NalUnitType::Vps), &rbsp)
 }
 
@@ -293,9 +351,13 @@ mod tests {
         assert_eq!(sps.bit_depth_luma_minus8, 0);
         assert_eq!(sps.bit_depth_chroma_minus8, 0);
         assert!(!sps.pcm_enabled_flag);
-        // 16×16 CTU: minCB=16, maxCB=16.
-        assert_eq!(sps.log2_min_luma_coding_block_size_minus3, 1);
-        assert_eq!(sps.log2_diff_max_min_luma_coding_block_size, 0);
+        // 16×16 CTU: minCB=8 (lifted in round 24 to unblock AMP),
+        // maxCB=16.
+        assert_eq!(sps.log2_min_luma_coding_block_size_minus3, 0);
+        assert_eq!(sps.log2_diff_max_min_luma_coding_block_size, 1);
+        // amp_enabled_flag flipped on in round 24 so the B-slice writer
+        // can emit asymmetric partitions.
+        assert!(sps.amp_enabled_flag);
     }
 
     #[test]
@@ -305,5 +367,30 @@ mod tests {
         assert_eq!(pps.pps_pic_parameter_set_id, 0);
         assert_eq!(pps.pps_seq_parameter_set_id, 0);
         assert!(!pps.tiles_enabled_flag);
+    }
+
+    #[test]
+    fn sps_main10_carries_bit_depth_two() {
+        // Round 25: Main 10 SPS must declare 10-bit luma + chroma.
+        let rbsp = build_sps_rbsp(&EncoderConfig::new_main10(64, 64));
+        let sps = parse_sps(&rbsp).expect("parse main10 sps");
+        assert_eq!(sps.bit_depth_luma_minus8, 2);
+        assert_eq!(sps.bit_depth_chroma_minus8, 2);
+        assert_eq!(sps.bit_depth_y(), 10);
+        assert_eq!(sps.bit_depth_c(), 10);
+        assert_eq!(sps.profile_tier_level.general_profile_idc, 2);
+    }
+
+    #[test]
+    fn vps_main10_profile_idc_is_two() {
+        // VPS must echo the Main 10 profile so a probe that only inspects
+        // the VPS (e.g. extradata sniffers) sees Main 10 immediately.
+        let rbsp = build_vps_rbsp_with_bit_depth(10);
+        let vps = parse_vps(&rbsp).expect("parse main10 vps");
+        assert_eq!(vps.vps_video_parameter_set_id, 0);
+        assert_eq!(
+            vps.profile_tier_level.general_profile_idc, 2,
+            "Main 10 VPS PTL should carry profile_idc = 2"
+        );
     }
 }

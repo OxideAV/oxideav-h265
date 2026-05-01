@@ -193,10 +193,10 @@ signalled (§8.5.3.3.4).
 
 The encoder lives in `src/encoder/` and implements the
 `oxideav_core::Encoder` trait. Output is Annex B byte-stream HEVC,
-8-bit 4:2:0, 16×16 CTU + 16×16 CU layout, fixed QP 26, no SAO, no
-deblocking. The current envelope is small but spec-correct: every
-bitstream we emit is decodable by ffmpeg's libavcodec hevc and by our
-own decoder.
+4:2:0 (Main / Main 10 — round 25), 16×16 CTU + 16×16 CU layout, fixed
+QP 26, no SAO, no deblocking. The current envelope is small but
+spec-correct: every bitstream we emit is decodable by ffmpeg's
+libavcodec hevc and by our own decoder.
 
 * **I slices (round 1+)** — IDR `IdrNLp` keyframes with VPS / SPS /
   PPS prefixed. Per-CU intra mode decision over a 7-mode subset
@@ -250,9 +250,28 @@ own decoder.
   skip path dominates: ffmpeg cross-decode produces 44.99 / 28.77 /
   35.18 / 22.86 / 25.97 dB at POC 0..4. The ffmpeg cross-decode test
   in `tests/encoder_b_slice.rs` confirms each frame is bitstream-valid.
+* **Main 10 encode (round 25)** — `Yuv420P10Le` source frames are now
+  accepted by `HevcEncoder::from_params`. The Main 10 path emits a
+  **profile_idc = 2** SPS with `bit_depth_luma_minus8 =
+  bit_depth_chroma_minus8 = 2` and the matching VPS PTL (the Main +
+  Main 10 compatibility bits in `general_profile_compatibility_flag`
+  are both set per §A.3.5). The pipeline keeps the round-1+ I-slice
+  CTU layout (16×16 luma TB + two 8×8 chroma TBs, intra mode subset)
+  but switches every sample container to `u16` and threads
+  `bit_depth = 10` through `intra_pred::predict` /
+  `transform::{forward,inverse,quantize,dequantize}_*`. The forward
+  quantiser uses **Qp'Y = SliceQpY + QpBdOffsetY = 26 + 12 = 38**
+  to mirror the decoder's `get_qp` (eq. 8-284); the same QP'C = 38
+  drives the chroma TBs. Self-roundtrip and ffmpeg cross-decode of a
+  64×64 / 128×128 10-bit gradient both clear ~45 dB Y on the
+  10-bit (peak = 1023) scale. Scope: I-slice only — the encoder
+  emits an IDR for every input frame at 10-bit (the 8-bit P/B path
+  is unchanged and still requires `Yuv420P`); `mini_gop_size > 1` at
+  10-bit is rejected at construction time.
 * **Pending:** AMP / rectangular partitions (Nx2N / 2NxN), weighted
   bi-pred, mini-GOP > 2 (B-pyramid), `mvd_l1_zero_flag` optimisation,
-  10-bit encode.
+  10-bit P/B-slice encode (currently the 10-bit emit path is
+  IDR-only), 12-bit / 4:4:4 encode.
 
 ## HEIF / HEIC still images
 

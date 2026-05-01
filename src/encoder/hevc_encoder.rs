@@ -28,8 +28,11 @@ use crate::encoder::b_slice_writer::build_b_slice_with_reconstruction;
 use crate::encoder::p_slice_writer::{
     build_p_slice_with_reconstruction, build_p_slice_with_reconstruction_delta, ReferenceFrame,
 };
-use crate::encoder::params::{build_pps_nal, build_sps_nal, build_vps_nal, EncoderConfig};
+use crate::encoder::params::{
+    build_pps_nal, build_sps_nal, build_vps_nal_with_bit_depth, EncoderConfig,
+};
 use crate::encoder::slice_writer::build_idr_slice_nal_with_reconstruction;
+use crate::encoder::slice_writer_main10::build_idr_slice_nal_main10;
 
 /// Default GOP size (distance between IDR keyframes).
 const GOP_SIZE: u32 = 64;
@@ -83,15 +86,29 @@ impl HevcEncoder {
             )));
         }
         let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        if pix != PixelFormat::Yuv420P {
-            return Err(Error::unsupported(format!(
-                "h265 encoder: only Yuv420P is supported (got {pix:?})"
-            )));
-        }
+        // Round 25: accept Yuv420P (Main, 8-bit) and Yuv420P10Le (Main 10).
+        // Main 10 currently only covers the IDR I-slice path — B / P slices
+        // at 10 bit will fail on the next `send_frame` with a clear error
+        // (mini_gop check below also rejects mini_gop > 1 at 10-bit).
+        let bit_depth = match pix {
+            PixelFormat::Yuv420P => 8u32,
+            PixelFormat::Yuv420P10Le => 10u32,
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "h265 encoder: only Yuv420P / Yuv420P10Le are supported (got {pix:?})"
+                )));
+            }
+        };
         if mini_gop == 0 || mini_gop > 2 {
             return Err(Error::unsupported(format!(
                 "h265 encoder: mini_gop_size must be 1 or 2 (got {mini_gop})"
             )));
+        }
+        if bit_depth == 10 && mini_gop > 1 {
+            return Err(Error::unsupported(
+                "h265 encoder: Main 10 (Yuv420P10Le) only supports mini_gop_size = 1 \
+                 (and currently emits keyframe-only — P/B at 10 bit is a follow-up)",
+            ));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
 
@@ -100,14 +117,23 @@ impl HevcEncoder {
         output_params.codec_id = CodecId::new(super::super::CODEC_ID_STR);
         output_params.width = Some(width);
         output_params.height = Some(height);
-        output_params.pixel_format = Some(PixelFormat::Yuv420P);
+        output_params.pixel_format = Some(pix);
         output_params.frame_rate = Some(frame_rate);
 
         let time_base = TimeBase::new(frame_rate.den.max(1), frame_rate.num.max(1));
-        let cfg = EncoderConfig::new(width, height);
+        let cfg = if bit_depth == 10 {
+            EncoderConfig::new_main10(width, height)
+        } else {
+            EncoderConfig::new(width, height)
+        };
 
         let mut vps_sps_pps = Vec::new();
-        vps_sps_pps.extend_from_slice(&build_vps_nal());
+        // Round 25: VPS PTL must declare Main 10 when the SPS does, so the
+        // VPS's profile_tier_level() agrees with the SPS's. ffmpeg's HEVC
+        // parser cross-checks the two and refuses streams where they differ.
+        // For 8-bit input the helper still produces the round-1..24 VPS
+        // bytes verbatim so the existing fixtures keep matching.
+        vps_sps_pps.extend_from_slice(&build_vps_nal_with_bit_depth(bit_depth));
         vps_sps_pps.extend_from_slice(&build_sps_nal(&cfg));
         vps_sps_pps.extend_from_slice(&build_pps_nal());
 
@@ -132,10 +158,23 @@ impl HevcEncoder {
             self.vps_sps_pps.len() + 64 + (self.cfg.width * self.cfg.height) as usize * 3 / 2 + 32,
         );
         data.extend_from_slice(&self.vps_sps_pps);
-        let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
-        data.extend_from_slice(&nal);
-        self.last_recon = Some(recon);
-        self.last_recon_poc = 0;
+        if self.cfg.bit_depth == 10 {
+            // Main 10 IDR — see `slice_writer_main10`. We do NOT cache a
+            // P-slice reference since 10-bit P/B is not yet implemented;
+            // every frame this encoder emits at 10-bit is currently a
+            // keyframe (the GOP gate forces an IDR every `GOP_SIZE` frames
+            // in 8-bit mode; in 10-bit mode the next non-keyframe will
+            // surface `Error::Unsupported` in `send_frame`).
+            let nal = build_idr_slice_nal_main10(&self.cfg, frame);
+            data.extend_from_slice(&nal);
+            self.last_recon = None;
+            self.last_recon_poc = 0;
+        } else {
+            let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
+            data.extend_from_slice(&nal);
+            self.last_recon = Some(recon);
+            self.last_recon_poc = 0;
+        }
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = frame.pts;
         pkt.dts = frame.pts;
