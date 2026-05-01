@@ -30,9 +30,10 @@ use crate::cabac::{
     TRANSFORM_SKIP_FLAG_CHROMA_INIT_VALUES, TRANSFORM_SKIP_FLAG_LUMA_INIT_VALUES,
 };
 use crate::inter::{
-    build_amvp_list, build_merge_list, chroma_mc, chroma_mc_bi_combine, chroma_mc_hp, luma_mc,
+    build_amvp_list, build_merge_list_full, chroma_mc, chroma_mc_bi_combine, chroma_mc_hp, luma_mc,
     luma_mc_bi_combine, luma_mc_bi_weighted, luma_mc_hp, AmvpPocInfo, InterState, MergeCand,
-    MotionVector, NeighbourContext, PbMotion, RefPicture, RefPocEntry, WeightedPred,
+    MergeCombinedCfg, MergeZeroPad, MotionVector, NeighbourContext, PbMotion, RefPicture,
+    RefPocEntry, WeightedPred,
 };
 use crate::intra_pred::{build_ref_samples, filter_decision, filter_ref_samples, predict};
 use crate::pps::PicParameterSet;
@@ -1330,7 +1331,17 @@ impl<'a> Walker<'a> {
         // Skip CUs are always PART_2Nx2N at partIdx 0 — no partition-based
         // neighbour suppression applies.
         let nb = NeighbourContext::default();
-        let cands = build_merge_list(
+        let (rpl0_entries, rpl1_entries) = self.merge_rpl_entries();
+        let comb_cfg = MergeCombinedCfg {
+            rpl0: &rpl0_entries,
+            rpl1: &rpl1_entries,
+        };
+        let zero_cfg = MergeZeroPad {
+            num_ref_idx: self.merge_num_ref_idx(),
+            rpl0: &rpl0_entries,
+            rpl1: &rpl1_entries,
+        };
+        let cands = build_merge_list_full(
             &self.pic.inter,
             x0,
             y0,
@@ -1340,6 +1351,8 @@ impl<'a> Walker<'a> {
             self.cctx.is_b_slice(),
             tmvp,
             nb,
+            comb_cfg,
+            zero_cfg,
         );
         let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
         let mut pb = sel.to_pb();
@@ -1349,8 +1362,59 @@ impl<'a> Walker<'a> {
         // condTermFlag.
         pb.is_skip = true;
         self.refresh_pb_ref_poc(&mut pb);
+        // §8.5.3.2.2 step 10: when bi-pred is selected and the PU is
+        // a 4×8 / 8×4 (i.e. nOrigPbW + nOrigPbH == 12), the spec
+        // forces refIdxL1 = -1, predFlagL1 = 0 — bi-pred is not
+        // allowed for the smallest PU sizes. Skip CUs are 2N×2N so
+        // this can only fire when 2N == 4 (8×8 CU split into 4×4
+        // PUs) — the test still has zero cost for the dominant case.
+        if (n_pb_w + n_pb_h) == 12 && pb.pred_l0 && pb.pred_l1 {
+            pb.pred_l1 = false;
+            pb.ref_idx_l1 = -1;
+            pb.mv_l1 = MotionVector::default();
+            pb.ref_poc_l1 = 0;
+            pb.ref_lt_l1 = false;
+        }
         self.motion_compensate_pb(x0, y0, n_pb_w, n_pb_h, pb)?;
         Ok(())
+    }
+
+    /// Build (rpl0, rpl1) `RefPocEntry` slices for the current slice's
+    /// active reference lists. Used by §8.5.3.2.4 combined-bi-pred POC
+    /// equality + §8.5.3.2.5 zero-MV ref_poc population.
+    fn merge_rpl_entries(&self) -> (Vec<RefPocEntry>, Vec<RefPocEntry>) {
+        let rpl0 = self
+            .cctx
+            .ref_list_l0
+            .iter()
+            .map(|p| RefPocEntry {
+                poc: p.poc,
+                is_long_term: p.is_long_term,
+            })
+            .collect();
+        let rpl1 = self
+            .cctx
+            .ref_list_l1
+            .iter()
+            .map(|p| RefPocEntry {
+                poc: p.poc,
+                is_long_term: p.is_long_term,
+            })
+            .collect();
+        (rpl0, rpl1)
+    }
+
+    /// `numRefIdx` per §8.5.3.2.5: `num_ref_idx_l0_active_minus1 + 1`
+    /// for P slices, `Min(L0+1, L1+1)` for B slices. Used by the
+    /// zero-MV merge-candidate ref_idx ramp.
+    fn merge_num_ref_idx(&self) -> u32 {
+        let l0 = self.cctx.slice.num_ref_idx_l0_active_minus1 + 1;
+        if self.cctx.is_b_slice() {
+            let l1 = self.cctx.slice.num_ref_idx_l1_active_minus1 + 1;
+            l0.min(l1)
+        } else {
+            l0
+        }
     }
 
     /// Run motion compensation for a prediction block and write the result
@@ -1765,8 +1829,18 @@ impl<'a> Walker<'a> {
                 (x0 + cb_size - q, y0, q, cb_size),
             ],
         };
+        // §9.3.4.2.2 / Table 9-32: `inter_pred_idc` bin 0 ctxInc is
+        // `CtDepth[x0][y0]` (0..=3) when `(nPbW + nPbH) != 12`, and 4
+        // otherwise. CtDepth is the CB's depth in the coding-quadtree
+        // (CTB depth = 0; deepest split = 3 at the min-CB).
+        let ctb_log2 = self.cctx.sps.log2_min_luma_coding_block_size_minus3
+            + 3
+            + self.cctx.sps.log2_diff_max_min_luma_coding_block_size;
+        let ct_depth = ctb_log2.saturating_sub(log2_cb).min(3);
         for (idx, (px, py, pw, ph)) in pbs.iter().enumerate() {
-            self.decode_prediction_unit(engine, ctx, *px, *py, *pw, *ph, part_mode, idx as u32)?;
+            self.decode_prediction_unit(
+                engine, ctx, *px, *py, *pw, *ph, part_mode, idx as u32, ct_depth,
+            )?;
         }
 
         // rqt_root_cbf: whether a transform tree follows.
@@ -1777,6 +1851,7 @@ impl<'a> Walker<'a> {
         self.transform_tree_inter(engine, ctx, x0, y0, log2_cb, 0, part_mode)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_prediction_unit(
         &mut self,
         engine: &mut CabacEngine<'_>,
@@ -1787,6 +1862,7 @@ impl<'a> Walker<'a> {
         h: u32,
         part_mode: InterPart,
         part_idx: u32,
+        ct_depth: u32,
     ) -> Result<()> {
         let nb = neighbour_ctx(part_mode, part_idx);
         let merge_flag = engine.decode_bin(&mut ctx.merge_flag[0]) == 1;
@@ -1797,7 +1873,17 @@ impl<'a> Walker<'a> {
                 0
             };
             let tmvp = self.tmvp_merge_cand(x, y, w, h);
-            let cands = build_merge_list(
+            let (rpl0_entries, rpl1_entries) = self.merge_rpl_entries();
+            let comb_cfg = MergeCombinedCfg {
+                rpl0: &rpl0_entries,
+                rpl1: &rpl1_entries,
+            };
+            let zero_cfg = MergeZeroPad {
+                num_ref_idx: self.merge_num_ref_idx(),
+                rpl0: &rpl0_entries,
+                rpl1: &rpl1_entries,
+            };
+            let cands = build_merge_list_full(
                 &self.pic.inter,
                 x,
                 y,
@@ -1807,6 +1893,8 @@ impl<'a> Walker<'a> {
                 self.cctx.is_b_slice(),
                 tmvp,
                 nb,
+                comb_cfg,
+                zero_cfg,
             );
             let sel = cands.get(merge_idx as usize).copied().unwrap_or_default();
             let mut pb = sel.to_pb();
@@ -1817,17 +1905,33 @@ impl<'a> Walker<'a> {
             // any merge candidate that came from spatial neighbours
             // recorded in an earlier slice with different RPLs.
             self.refresh_pb_ref_poc(&mut pb);
+            // §8.5.3.2.2 step 10: 4×8 / 8×4 PUs cannot be bi-predicted
+            // even when the merge candidate is bi-pred — force back
+            // to L0 uni-pred. This restriction applies AFTER the
+            // candidate is chosen, not as part of list construction.
+            if (w + h) == 12 && pb.pred_l0 && pb.pred_l1 {
+                pb.pred_l1 = false;
+                pb.ref_idx_l1 = -1;
+                pb.mv_l1 = MotionVector::default();
+                pb.ref_poc_l1 = 0;
+                pb.ref_lt_l1 = false;
+            }
             pb
         } else {
-            // §7.3.8.6: inter_pred_idc = 0 (L0), 1 (L1), 2 (BI). Only signalled
-            // for B slices; for P slices L0 is implied.
+            // §7.3.8.6 / §9.3.4.2.2 Table 9-32: inter_pred_idc =
+            //   0 (PRED_L0), 1 (PRED_L1), 2 (PRED_BI).
+            // Only signalled for B slices; for P slices L0 is implied.
+            //
+            // Bin 0 ctxInc (§9.3.4.2.2 Table 9-32):
+            //   * `(nPbW + nPbH) != 12`: CtDepth[x0][y0]   ∈ {0,1,2,3}
+            //   * `(nPbW + nPbH) == 12`: 4
+            // Bin 1 ctxInc is always 4.
+            //
+            // 8×4 / 4×8 PUs (`nPbW+nPbH == 12`) cannot be bi-predicted —
+            // bin 0 directly selects L0 vs L1.
             let (use_l0, use_l1) = if self.cctx.is_b_slice() {
-                // inter_pred_idc: bin 0 with context (nPbW + nPbH == 12 uses
-                // ctx 4); when bin 0 == 1 bin 1 chooses L0 vs L1. When the
-                // PB is <8 samples in either dim, only L0/L1 is allowed.
-                let nb_eq_8 = (w + h) == 12;
-                let bin0_ctx = if nb_eq_8 { 4 } else { 0 };
-                let small = w + h == 12; // 8×4 / 4×8 partitions: no bi-pred.
+                let small = (w + h) == 12;
+                let bin0_ctx = if small { 4 } else { (ct_depth as usize).min(3) };
                 if small {
                     let uni = engine.decode_bin(&mut ctx.inter_pred_idc[bin0_ctx]);
                     if uni == 0 {

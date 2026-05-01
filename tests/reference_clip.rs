@@ -3925,14 +3925,145 @@ fn hevc_b_slice_tmvp_scan_order_audit() {
         );
         return;
     }
-    // Y-plane PSNR averaged across all 5 frames. The reference comes out in
-    // *display* order (I, B, P, B, P after libx265's reorder), and our
-    // decoder emits in *decode* order (I, P, B, P, B). For an averaged PSNR
-    // we sum SSE per-frame against the corresponding decode-order entries
-    // in the ffmpeg reference, which is also in decode order when ffmpeg
-    // is asked for raw output of the same stream. (ffmpeg's libavformat
-    // reorders for display when `-an` is on a player path; for `-f rawvideo`
-    // out, it stays in decode order.)
+    // Y-plane PSNR averaged across all 5 frames. The ffmpeg `-f rawvideo`
+    // reference is emitted in **display order** (POC 0, 1, 2, 3, 4 →
+    // I, B, P, B, P), and our decoder emits in **decode order**
+    // (I, P, B, P, B → POC 0, 2, 1, 4, 3). For the averaged PSNR we
+    // remap our decode-order frames to display order before differencing
+    // against the reference.
+    //
+    // Round 21: the previous comparison aligned frame indices directly
+    // (decode-order vs display-order), which was misaligned and conflated
+    // the B-slice merge gap with a 3-frame POC mismatch — the reported
+    // 24.51 dB was an artifact of that misalignment, not a B-slice
+    // decode error per se. The remapped comparison below is the
+    // spec-correct PSNR oracle.
+    let display_for_decode_idx = [0usize, 2, 1, 4, 3];
+    let frame_len = 64 * 64 * 3 / 2;
+    let mut sse = 0u64;
+    let mut n = 0u64;
+    for (fi, vf) in frames.iter().enumerate() {
+        let display_fi = display_for_decode_idx.get(fi).copied().unwrap_or(fi);
+        if (display_fi + 1) * frame_len > expected.len() {
+            break;
+        }
+        let exp_y = &expected[display_fi * frame_len..display_fi * frame_len + 64 * 64];
+        let mut act_y = Vec::with_capacity(64 * 64);
+        for y in 0..64 {
+            let off = y * vf.planes[0].stride;
+            act_y.extend_from_slice(&vf.planes[0].data[off..off + 64]);
+        }
+        let mut frame_sse = 0u64;
+        for i in 0..(64 * 64) {
+            let d = act_y[i] as i32 - exp_y[i] as i32;
+            frame_sse += (d * d) as u64;
+        }
+        sse += frame_sse;
+        n += (64 * 64) as u64;
+        let frame_psnr = if frame_sse == 0 {
+            f64::INFINITY
+        } else {
+            let mse = frame_sse as f64 / (64 * 64) as f64;
+            10.0 * (255.0 * 255.0 / mse).log10()
+        };
+        eprintln!(
+            "  B-TMVP decode#{fi} (display POC {display_fi}): Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}"
+        );
+    }
+    let psnr = if sse == 0 {
+        f64::INFINITY
+    } else {
+        let mse = sse as f64 / n as f64;
+        10.0 * (255.0 * 255.0 / mse).log10()
+    };
+    eprintln!(
+        "B-slice TMVP scan-order PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
+        frames.len()
+    );
+    // Floor — the B-slice path still has gaps beyond TMVP; this just
+    // guards against a regression that re-breaks listCol picking.
+    assert!(
+        psnr >= 12.0,
+        "B-slice TMVP scan-order PSNR below floor: {psnr:.2} dB"
+    );
+}
+
+/// R21 baseline: matches `hevc_b_slice_tmvp_scan_order_audit` byte-for-byte
+/// in its libx265 invocation but with `bframes=0` so the GOP collapses to
+/// pure P-slices (decode order = display order). This isolates the merge
+/// audit's effect on the P-slice path: any regression that breaks
+/// uni-pred merge handling will show up here at high SNR.
+#[test]
+fn hevc_p_slice_short_gop_textured_64() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping P-slice short-GOP test");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let clip = fixture_dir.join("h265-p-short-gop-64x64.hevc");
+    if !clip.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=1",
+            "-frames:v",
+            "5",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            // Same as B-TMVP fixture but bframes=0 — display order = decode
+            // order, no temporal-MV reorder. Any divergence here is a bug
+            // in the P-slice path, NOT the B-slice path.
+            "log-level=error:keyint=5:min-keyint=5:bframes=0:scenecut=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:no-amp=1:no-tskip=1:no-strong-intra-smoothing=1:no-weightp=1:qp=22",
+            clip.to_str().unwrap(),
+        ])
+    {
+        eprintln!("failed to generate P-slice short-GOP fixture — skipping");
+        return;
+    }
+    let Some(data) = read_fixture(&clip.to_string_lossy()) else {
+        return;
+    };
+    let ref_path = fixture_dir.join("h265-p-short-gop-64x64.ref.yuv");
+    let input_str = clip.to_string_lossy().to_string();
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &ref_path, Some(5)) else {
+        return;
+    };
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 10), data);
+    if let Err(Error::Unsupported(msg)) = dec.send_packet(&pkt) {
+        eprintln!("P-slice short-GOP fixture not in scope: {msg}");
+        return;
+    }
+    let mut frames = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(_) => break,
+            Err(Error::NeedMore) => break,
+            Err(Error::Unsupported(msg)) => {
+                eprintln!("P-slice short-GOP decode reported Unsupported: {msg}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from P-slice short-GOP decode: {e:?}"),
+        }
+    }
+    if frames.len() < 5 {
+        eprintln!(
+            "P-slice short-GOP decode produced {} frames; expected 5 — skipping PSNR",
+            frames.len()
+        );
+        return;
+    }
     let frame_len = 64 * 64 * 3 / 2;
     let mut sse = 0u64;
     let mut n = 0u64;
@@ -3959,7 +4090,7 @@ fn hevc_b_slice_tmvp_scan_order_audit() {
             let mse = frame_sse as f64 / (64 * 64) as f64;
             10.0 * (255.0 * 255.0 / mse).log10()
         };
-        eprintln!("  B-TMVP frame {fi}: Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}");
+        eprintln!("  P-only frame {fi}: Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}");
     }
     let psnr = if sse == 0 {
         f64::INFINITY
@@ -3968,13 +4099,148 @@ fn hevc_b_slice_tmvp_scan_order_audit() {
         10.0 * (255.0 * 255.0 / mse).log10()
     };
     eprintln!(
-        "B-slice TMVP scan-order PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
+        "P-slice short-GOP textured PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
         frames.len()
     );
-    // Floor — the B-slice path still has gaps beyond TMVP; this just
-    // guards against a regression that re-breaks listCol picking.
     assert!(
         psnr >= 12.0,
-        "B-slice TMVP scan-order PSNR below floor: {psnr:.2} dB"
+        "P-slice short-GOP PSNR below floor: {psnr:.2} dB"
+    );
+}
+
+/// R21 oracle: a low-motion 5-frame I-P-B-P-B fixture (`testsrc=rate=60`)
+/// where the per-frame motion is small enough that the P-slice
+/// reconstruction stays close to ffmpeg's reference. This isolates the
+/// B-slice merge / AMVP candidate-list path from the residual P-slice
+/// degradation that affects the higher-motion `rate=10` oracle.
+///
+/// Decode order is I, P, B, P, B (POC 0, 2, 1, 4, 3). Display order is
+/// POC 0..4. The reference comes out in display order so we remap
+/// before differencing.
+///
+/// With the round-21 spatial-merge audit landed (§8.5.3.2.4 Table 8-7
+/// combined-bi-pred ordering, §8.5.3.2.5 zero-MV ramp, §8.5.3.2.2 step 10
+/// 4×8 / 8×4 bi-pred restriction, §9.3.4.2.2 inter_pred_idc CtDepth
+/// ctxInc), this fixture sits comfortably above 30 dB across all 5
+/// frames.
+#[test]
+fn hevc_b_slice_low_motion_merge_audit() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg missing — skipping B-slice low-motion merge audit");
+        return;
+    }
+    let fixture_dir = generated_fixture_dir();
+    ensure_dir(&fixture_dir);
+    let clip = fixture_dir.join("h265-b-low-motion-64x64.hevc");
+    if !clip.exists()
+        && !run_ffmpeg(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=60:duration=1",
+            "-frames:v",
+            "5",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "log-level=error:keyint=5:min-keyint=5:bframes=1:b-pyramid=0:scenecut=0:wpp=0:pmode=0:pme=0:frame-threads=1:no-sao=1:no-deblock=1:no-amp=1:no-tskip=1:no-strong-intra-smoothing=1:no-weightp=1:no-weightb=1:qp=22",
+            clip.to_str().unwrap(),
+        ])
+    {
+        eprintln!("failed to generate B-slice low-motion fixture — skipping");
+        return;
+    }
+    let Some(data) = read_fixture(&clip.to_string_lossy()) else {
+        return;
+    };
+    let ref_path = fixture_dir.join("h265-b-low-motion-64x64.ref.yuv");
+    let input_str = clip.to_string_lossy().to_string();
+    let Some(expected) = ffmpeg_decode_raw(&input_str, &ref_path, Some(5)) else {
+        return;
+    };
+
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 60), data);
+    if let Err(Error::Unsupported(msg)) = dec.send_packet(&pkt) {
+        eprintln!("B-slice low-motion fixture not in scope: {msg}");
+        return;
+    }
+    let mut frames = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(_) => break,
+            Err(Error::NeedMore) => break,
+            Err(Error::Unsupported(msg)) => {
+                eprintln!("B-slice low-motion decode reported Unsupported: {msg}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from B-slice low-motion decode: {e:?}"),
+        }
+    }
+    if frames.len() < 5 {
+        eprintln!(
+            "B-slice low-motion decode produced {} frames; expected 5 — skipping PSNR",
+            frames.len()
+        );
+        return;
+    }
+    // Decode-order → display-order remap (see hevc_b_slice_tmvp_scan_order_audit
+    // for the rationale): I, P, B, P, B → POC 0, 2, 1, 4, 3.
+    let display_for_decode_idx = [0usize, 2, 1, 4, 3];
+    let frame_len = 64 * 64 * 3 / 2;
+    let mut sse = 0u64;
+    let mut n = 0u64;
+    for (fi, vf) in frames.iter().enumerate() {
+        let display_fi = display_for_decode_idx.get(fi).copied().unwrap_or(fi);
+        if (display_fi + 1) * frame_len > expected.len() {
+            break;
+        }
+        let exp_y = &expected[display_fi * frame_len..display_fi * frame_len + 64 * 64];
+        let mut act_y = Vec::with_capacity(64 * 64);
+        for y in 0..64 {
+            let off = y * vf.planes[0].stride;
+            act_y.extend_from_slice(&vf.planes[0].data[off..off + 64]);
+        }
+        let mut frame_sse = 0u64;
+        for i in 0..(64 * 64) {
+            let d = act_y[i] as i32 - exp_y[i] as i32;
+            frame_sse += (d * d) as u64;
+        }
+        sse += frame_sse;
+        n += (64 * 64) as u64;
+        let frame_psnr = if frame_sse == 0 {
+            f64::INFINITY
+        } else {
+            let mse = frame_sse as f64 / (64 * 64) as f64;
+            10.0 * (255.0 * 255.0 / mse).log10()
+        };
+        eprintln!(
+            "  B-low-motion decode#{fi} (display POC {display_fi}): Y PSNR {frame_psnr:.2} dB, SSE {frame_sse}"
+        );
+    }
+    let psnr = if sse == 0 {
+        f64::INFINITY
+    } else {
+        let mse = sse as f64 / n as f64;
+        10.0 * (255.0 * 255.0 / mse).log10()
+    };
+    eprintln!(
+        "B-slice low-motion merge-audit PSNR vs ffmpeg: {psnr:.2} dB over {} frames",
+        frames.len()
+    );
+    // Round-21 floor: the merge audit + inter_pred_idc CtDepth fix takes
+    // this fixture above 30 dB. We pin at 30 dB to leave headroom for
+    // future refinements without making the test brittle to encoder /
+    // ffmpeg version drift.
+    assert!(
+        psnr >= 30.0,
+        "B-slice low-motion merge-audit PSNR below 30 dB floor: {psnr:.2} dB"
     );
 }

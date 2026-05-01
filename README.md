@@ -91,7 +91,11 @@ signalled (§8.5.3.3.4).
   `ref_idx_lx` (truncated rice), `mvd_coding()` (two greater-flag
   bins + EG1 remainder), `mvp_lx_flag`, and `inter_pred_idc` for
   B slices (L0 / L1 / BI). `mvd_l1_zero_flag` suppresses MVD on L1
-  when signalled.
+  when signalled. R21: `inter_pred_idc` bin 0 now uses
+  `CtDepth[x0][y0]` (the CB's quadtree depth, ∈ {0,1,2,3}) for
+  ctxInc when `nPbW + nPbH != 12` and ctx 4 otherwise — pre-r21
+  we forced ctx 0 for every non-small PU, biasing the bin's
+  arithmetic-coding context independently of CB size.
 * **Partition modes** — 2Nx2N, 2NxN, Nx2N, NxN at minimum CB size, plus
   the four asymmetric motion partition (AMP) shapes
   (`PART_2NxnU` / `PART_2NxnD` / `PART_nLx2N` / `PART_nRx2N`) when the SPS
@@ -101,11 +105,24 @@ signalled (§8.5.3.3.4).
   the symmetric-rect code path. The smoke test
   `hevc_amp_smoke_decodes_without_panic` exercises end-to-end AMP decode
   and asserts bit-exact post-P IDR re-alignment.
-* **Merge list** (§8.5.3.1.2) — spatial candidates A1 / B1 / B0 / A0 /
+* **Merge list** (§8.5.3.2.2) — spatial candidates A1 / B1 / B0 / A0 /
   B2 with HEVC pruning, temporal candidate from the collocated
   reference when `slice_temporal_mvp_enabled_flag` is set
-  (§8.5.3.1.2.3), combined bi-predictive fillers for B slices
-  (§8.5.3.1.2.4), and zero-MV / zero-bi-MV filler.
+  (§8.5.3.2.8 / §8.5.3.2.9), combined bi-predictive fillers for B
+  slices (§8.5.3.2.4), and zero-MV / zero-bi-MV filler
+  (§8.5.3.2.5). The round-21 audit pinned three remaining
+  divergences: (a) §8.5.3.2.4 now follows the spec's Table 8-7
+  combIdx ordering and adds `combCandk` whenever
+  `DiffPicOrderCnt(L0, L1) != 0 || mvL0 != mvL1` (no global dedup
+  against existing entries); (b) §8.5.3.2.5 zero-MV pads now ramp
+  `refIdxLX = (zeroIdx < numRefIdx) ? zeroIdx : 0` per spec rather
+  than collapsing every pad slot onto `refIdx = 0`; (c) §8.5.3.2.2
+  step 10 forces `predFlagL1 = 0, refIdxL1 = -1` after candidate
+  selection on 4×8 / 8×4 PUs (`nOrigPbW + nOrigPbH == 12`).
+  §8.5.3.2.3 redundancy now compares only `(predFlag, refIdx, mv)`
+  on each list — the shadow `ref_poc` / `ref_lt` metadata is no
+  longer part of the equality, matching the spec's "same motion
+  vectors and same reference indices" wording.
 * **AMVP** (§8.5.3.1.6) — per-list spatial MV predictor pair with
   deduplication, plus a TMVP candidate sourced from the collocated
   reference (no POC-distance scaling — the short GOPs we target

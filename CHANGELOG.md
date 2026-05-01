@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 21 — merge / AMVP candidate-list audit (§8.5.3.2.2 .. §8.5.3.2.5)
+  + `inter_pred_idc` ctxInc fix (§9.3.4.2.2 Table 9-32). Four
+  spec-correctness patches:
+  (1) §8.5.3.2.4 combined bi-pred now walks the spec's Table 8-7
+  fixed `(l0CandIdx, l1CandIdx)` schedule with the spec's exact
+  termination at `combIdx == numOrigMergeCand * (numOrigMergeCand - 1)`;
+  the candidate gate is `predFlagL0 && predFlagL1 &&
+  (DiffPicOrderCnt(L0, L1) != 0 || mvL0 != mvL1)`. Pre-r21 we ran
+  a generic O(N²) double-loop with a non-spec "skip if equal to any
+  existing entry" dedup, missing combined candidates the spec adds
+  and adding ones it skips.
+  (2) §8.5.3.2.5 zero-MV padding now uses the spec's
+  `refIdxLX = (zeroIdx < numRefIdx) ? zeroIdx : 0` ramp (zeroIdx
+  monotonic per pad iteration). Pre-r21 every pad slot collapsed
+  to `refIdx = 0`, so a `merge_idx` selecting a pad-region entry
+  picked the wrong reference picture when `numRefIdx > 1`.
+  (3) §8.5.3.2.2 step 10 enforced at the merge / AMVP call sites:
+  4×8 / 8×4 PUs (`nOrigPbW + nOrigPbH == 12`) cannot be
+  bi-predicted — even when the chosen merge candidate is bi-pred,
+  `predFlagL1` is forced to 0 and `refIdxL1` to −1 after candidate
+  selection.
+  (4) §9.3.4.2.2 Table 9-32 `inter_pred_idc` bin 0 ctxInc is now
+  `CtDepth[x0][y0]` (∈ {0,1,2,3}) when `(nPbW + nPbH) != 12`,
+  matching the spec's CB-depth-aware ctx bank. Pre-r21 we forced
+  ctx 0 for every non-small PU regardless of CB depth, biasing
+  the CABAC context for any deeply-split B-slice CU.
+  §8.5.3.2.3 redundancy comparison was also tightened: the spec's
+  "same motion vectors and same reference indices" rule compares
+  only `(predFlag, refIdx, mv)` per list — pre-r21 we compared all
+  `MergeCand` fields including the shadow `ref_poc` / `ref_lt`
+  metadata, which can legitimately differ between two PBs the
+  spec considers equivalent for redundancy.
+  Two new fixtures: `hevc_p_slice_short_gop_textured_64`
+  (P-only baseline guard against merge audit regressions) and
+  `hevc_b_slice_low_motion_merge_audit` (rate=60 textured I-P-B-P-B
+  oracle), the latter at **42.01 dB average** (per-frame: I=∞,
+  P=57.56, B=61.92, P=36.08, B=41.82). The original
+  `hevc_b_slice_tmvp_scan_order_audit` fixture (rate=10 high-motion
+  GOP) remains as the round-20 regression guard at 24.65 dB —
+  unchanged because its per-frame error is dominated by an
+  upstream P-slice rate-10 testsrc bug that's outside the merge
+  audit scope. Decode-order vs display-order remap added to the
+  PSNR oracle (the ffmpeg `-f rawvideo` reference comes out in
+  display order; our decoder emits in decode order, so frames are
+  remapped via `[0, 2, 1, 4, 3]` before differencing). 50 tests
+  pass. Main 10 inter PSNR holds at 33.57 dB and the 4:2:0 / 4:2:2
+  P/B fixtures stay bit-exact.
+
 - round 20 — TMVP scan-order audit (§8.5.3.2.8 / §8.5.3.2.9). The
   bottom-right → centre fallback now fires for every case where
   `availableFlagLXCol == 0` — including the previously-missed case

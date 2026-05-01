@@ -506,6 +506,57 @@ pub struct NeighbourContext {
     pub suppress_a0: bool,
 }
 
+/// Per-slice configuration for the zero-MV padding step of the merge
+/// list builder (§8.5.3.2.5). `num_ref_idx` is the spec's `numRefIdx`
+/// — `num_ref_idx_l0_active_minus1 + 1` for P slices, or the minimum
+/// of `(L0+1, L1+1)` for B slices. The optional `rpl0` / `rpl1` slices
+/// supply the per-list reference-picture POCs and long-term flags so
+/// the padded candidates carry spec-correct `ref_poc_*` / `ref_lt_*`
+/// metadata for downstream TMVP / collocated lookups (§8.5.3.2.9).
+/// When the slices are empty the legacy zero-POC behaviour applies
+/// (callers patch the metadata via `refresh_pb_ref_poc` instead).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MergeZeroPad<'a> {
+    pub num_ref_idx: u32,
+    pub rpl0: &'a [RefPocEntry],
+    pub rpl1: &'a [RefPocEntry],
+}
+
+/// Per-slice POC context used by the §8.5.3.2.4 combined-bi-pred check.
+/// Carries the (rpl0, rpl1) POC + long-term flags so the spec's
+///   `DiffPicOrderCnt(RefPicList0[refIdxL0l0Cand], RefPicList1[refIdxL1l1Cand]) != 0
+///        || mvL0l0Cand != mvL1l1Cand`
+/// gate can be evaluated. When `rpl0` / `rpl1` are empty the gate
+/// degrades to "any (mvL0, mvL1) pair is allowed" — sufficient for the
+/// unit tests that don't simulate a full RPL.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MergeCombinedCfg<'a> {
+    pub rpl0: &'a [RefPocEntry],
+    pub rpl1: &'a [RefPocEntry],
+}
+
+/// Compare two merge candidates under the spec's "same motion vectors
+/// and same reference indices" rule (§8.5.3.2.3). The `ref_poc_*` /
+/// `ref_lt_*` shadow fields are *not* part of the equality test —
+/// they're derived metadata and may differ for two PBs that the spec
+/// considers equivalent (e.g. a TMVP-projected candidate vs a spatial
+/// neighbour pointing at the same RPL slot).
+fn merge_same_motion(a: MergeCand, b: MergeCand) -> bool {
+    a.pred_l0 == b.pred_l0
+        && a.pred_l1 == b.pred_l1
+        && a.ref_idx_l0 == b.ref_idx_l0
+        && a.ref_idx_l1 == b.ref_idx_l1
+        && a.mv_l0 == b.mv_l0
+        && a.mv_l1 == b.mv_l1
+}
+
+fn opt_same_motion(a: Option<MergeCand>, b: Option<MergeCand>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => merge_same_motion(x, y),
+        _ => false,
+    }
+}
+
 /// A temporal merge candidate looked up from a collocated reference
 /// picture, with optional pre-scaled MV. If `None` is returned from
 /// [`temporal_merge_cand`] there is no temporal candidate.
@@ -514,6 +565,11 @@ pub struct NeighbourContext {
 /// nPbW × nPbH. Follows §8.5.3.1.2. Returns `max_num_merge_cand`
 /// candidates (padded with zero-MV if fewer qualify). Set
 /// `is_b_slice` to enable combined bi-pred candidates.
+///
+/// Round 21 (§8.5.3.2.4 / §8.5.3.2.5 audit): the combined-bi-pred and
+/// zero-MV stages now follow the spec exactly. See [`build_merge_list_full`]
+/// for the form callers should use when they have the slice's RPLs in
+/// scope; this thin wrapper preserves the legacy unit-test contract.
 pub fn build_merge_list(
     inter: &InterState,
     x_pb: u32,
@@ -524,6 +580,38 @@ pub fn build_merge_list(
     is_b_slice: bool,
     tmvp: Option<MergeCand>,
     nb: NeighbourContext,
+) -> Vec<MergeCand> {
+    build_merge_list_full(
+        inter,
+        x_pb,
+        y_pb,
+        n_pb_w,
+        n_pb_h,
+        max_num_merge_cand,
+        is_b_slice,
+        tmvp,
+        nb,
+        MergeCombinedCfg::default(),
+        MergeZeroPad::default(),
+    )
+}
+
+/// Spec-faithful form of [`build_merge_list`] that accepts the slice's
+/// reference-picture POC tables so the §8.5.3.2.4 combined-bi-pred
+/// check and §8.5.3.2.5 zero-MV ramp can use the spec's exact rules.
+#[allow(clippy::too_many_arguments)]
+pub fn build_merge_list_full(
+    inter: &InterState,
+    x_pb: u32,
+    y_pb: u32,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    max_num_merge_cand: u32,
+    is_b_slice: bool,
+    tmvp: Option<MergeCand>,
+    nb: NeighbourContext,
+    comb: MergeCombinedCfg<'_>,
+    zero: MergeZeroPad<'_>,
 ) -> Vec<MergeCand> {
     let mut cands: Vec<MergeCand> = Vec::with_capacity(max_num_merge_cand as usize);
 
@@ -556,26 +644,32 @@ pub fn build_merge_list(
     //   A0: dropped if equal to A1
     //   B2: dropped if equal to A1 or B1; skipped entirely when
     //       availableFlagA0 + A1 + B0 + B1 == 4.
+    //
+    // Round 21: the equality predicate is the spec's "same motion
+    // vectors and same reference indices" — we *don't* compare the
+    // shadow `ref_poc_*` / `ref_lt_*` fields, which are derived
+    // metadata that can legitimately differ between two PBs the spec
+    // considers equivalent for redundancy purposes.
     if let Some(c) = a1 {
         cands.push(c);
     }
     if cands.len() < max_num_merge_cand as usize {
         if let Some(c) = b1 {
-            if Some(c) != a1 {
+            if !opt_same_motion(Some(c), a1) {
                 cands.push(c);
             }
         }
     }
     if cands.len() < max_num_merge_cand as usize {
         if let Some(c) = b0 {
-            if Some(c) != b1 {
+            if !opt_same_motion(Some(c), b1) {
                 cands.push(c);
             }
         }
     }
     if cands.len() < max_num_merge_cand as usize {
         if let Some(c) = a0 {
-            if Some(c) != a1 {
+            if !opt_same_motion(Some(c), a1) {
                 cands.push(c);
             }
         }
@@ -584,7 +678,7 @@ pub fn build_merge_list(
         let full4 = a0.is_some() && a1.is_some() && b0.is_some() && b1.is_some();
         if !full4 {
             if let Some(c) = b2 {
-                if Some(c) != a1 && Some(c) != b1 {
+                if !opt_same_motion(Some(c), a1) && !opt_same_motion(Some(c), b1) {
                     cands.push(c);
                 }
             }
@@ -598,56 +692,141 @@ pub fn build_merge_list(
         }
     }
 
-    // Combined bi-pred candidates for B slices (§8.5.3.1.2.4).
-    if is_b_slice && cands.len() < max_num_merge_cand as usize {
-        let n = cands.len();
-        'outer: for l0_idx in 0..n {
-            for l1_idx in 0..n {
-                if l0_idx == l1_idx {
-                    continue;
-                }
-                let a = cands[l0_idx];
-                let b = cands[l1_idx];
-                if !a.pred_l0 || !b.pred_l1 {
-                    continue;
-                }
-                let combined = MergeCand {
-                    pred_l0: true,
-                    pred_l1: true,
-                    ref_idx_l0: a.ref_idx_l0,
-                    ref_idx_l1: b.ref_idx_l1,
-                    mv_l0: a.mv_l0,
-                    mv_l1: b.mv_l1,
-                    ref_poc_l0: a.ref_poc_l0,
-                    ref_poc_l1: b.ref_poc_l1,
-                    ref_lt_l0: a.ref_lt_l0,
-                    ref_lt_l1: b.ref_lt_l1,
-                };
-                if !cands.iter().any(|existing| existing == &combined) {
-                    cands.push(combined);
-                    if cands.len() >= max_num_merge_cand as usize {
-                        break 'outer;
-                    }
-                }
+    let num_orig = cands.len();
+
+    // Combined bi-pred candidates for B slices (§8.5.3.2.4).
+    //
+    // Round 21: walk the spec's combIdx ordering (Table 8-7) instead
+    // of the generic O(N²) double loop, and use the spec gate
+    //   predFlagL0[l0Cand] && predFlagL1[l1Cand] &&
+    //   ( DiffPicOrderCnt(RefPicList0[refIdxL0l0Cand],
+    //                     RefPicList1[refIdxL1l1Cand]) != 0
+    //     || mvL0l0Cand != mvL1l1Cand )
+    // for "add this candidate". The earlier code's "skip if equal to
+    // any existing entry" check was non-spec — combined-bi-pred entries
+    // are added in the spec without any global dedup.
+    if is_b_slice && cands.len() < max_num_merge_cand as usize && num_orig > 1 {
+        // Table 8-7 — fixed (l0CandIdx, l1CandIdx) ordering for combIdx
+        // 0..11. The spec's loop terminates at combIdx ==
+        // numOrigMergeCand * (numOrigMergeCand - 1) (i.e. all ordered
+        // pairs of distinct indices in the original list, up to 4
+        // entries → 12 pairs).
+        const COMB_TABLE: [(usize, usize); 12] = [
+            (0, 1),
+            (1, 0),
+            (0, 2),
+            (2, 0),
+            (1, 2),
+            (2, 1),
+            (0, 3),
+            (3, 0),
+            (1, 3),
+            (3, 1),
+            (2, 3),
+            (3, 2),
+        ];
+        let max_comb_idx = (num_orig * (num_orig - 1)).min(COMB_TABLE.len());
+        for &(l0_idx, l1_idx) in COMB_TABLE.iter().take(max_comb_idx) {
+            if cands.len() >= max_num_merge_cand as usize {
+                break;
             }
+            if l0_idx >= num_orig || l1_idx >= num_orig {
+                continue;
+            }
+            let l0_cand = cands[l0_idx];
+            let l1_cand = cands[l1_idx];
+            if !l0_cand.pred_l0 || !l1_cand.pred_l1 {
+                continue;
+            }
+            // Spec gate: skip if the L0/L1 motion is bit-identical
+            // (same MV + same POC). Otherwise the candidate is added.
+            let l0_poc = comb
+                .rpl0
+                .get(l0_cand.ref_idx_l0.max(0) as usize)
+                .map(|e| e.poc)
+                .unwrap_or(l0_cand.ref_poc_l0);
+            let l1_poc = comb
+                .rpl1
+                .get(l1_cand.ref_idx_l1.max(0) as usize)
+                .map(|e| e.poc)
+                .unwrap_or(l1_cand.ref_poc_l1);
+            let poc_eq = l0_poc == l1_poc;
+            let mv_eq = l0_cand.mv_l0 == l1_cand.mv_l1;
+            if poc_eq && mv_eq {
+                continue;
+            }
+            let l0_lt = comb
+                .rpl0
+                .get(l0_cand.ref_idx_l0.max(0) as usize)
+                .map(|e| e.is_long_term)
+                .unwrap_or(l0_cand.ref_lt_l0);
+            let l1_lt = comb
+                .rpl1
+                .get(l1_cand.ref_idx_l1.max(0) as usize)
+                .map(|e| e.is_long_term)
+                .unwrap_or(l1_cand.ref_lt_l1);
+            cands.push(MergeCand {
+                pred_l0: true,
+                pred_l1: true,
+                ref_idx_l0: l0_cand.ref_idx_l0,
+                ref_idx_l1: l1_cand.ref_idx_l1,
+                mv_l0: l0_cand.mv_l0,
+                mv_l1: l1_cand.mv_l1,
+                ref_poc_l0: l0_poc,
+                ref_poc_l1: l1_poc,
+                ref_lt_l0: l0_lt,
+                ref_lt_l1: l1_lt,
+            });
         }
     }
 
-    // Pad with zero MV per §8.5.3.1.3. For B slices the zero candidate is
-    // bi-pred; for P slices it's L0-only.
+    // Zero-MV padding (§8.5.3.2.5).
+    //
+    // Round 21: each padded candidate uses
+    //   refIdxLX = (zeroIdx < numRefIdx) ? zeroIdx : 0
+    // with `zeroIdx` incremented per pad iteration. Pre-r21 we
+    // hard-coded `refIdxLX = 0` for every pad slot, which silently
+    // collapses N pads onto a single ref entry — wrong when the
+    // selected merge_idx lands in the pad region.
+    let num_ref_idx = if zero.num_ref_idx == 0 {
+        // Legacy / unit-test path: behave like the pre-r21 builder.
+        1
+    } else {
+        zero.num_ref_idx
+    };
+    let mut zero_idx: u32 = 0;
     while (cands.len() as u32) < max_num_merge_cand {
+        let ri = if zero_idx < num_ref_idx {
+            zero_idx as i8
+        } else {
+            0
+        };
+        let (l0_poc, l0_lt) = zero
+            .rpl0
+            .get(ri.max(0) as usize)
+            .map(|e| (e.poc, e.is_long_term))
+            .unwrap_or((0, false));
+        let (l1_poc, l1_lt) = if is_b_slice {
+            zero.rpl1
+                .get(ri.max(0) as usize)
+                .map(|e| (e.poc, e.is_long_term))
+                .unwrap_or((0, false))
+        } else {
+            (0, false)
+        };
         cands.push(MergeCand {
             pred_l0: true,
             pred_l1: is_b_slice,
-            ref_idx_l0: 0,
-            ref_idx_l1: 0,
+            ref_idx_l0: ri,
+            ref_idx_l1: if is_b_slice { ri } else { 0 },
             mv_l0: MotionVector::default(),
             mv_l1: MotionVector::default(),
-            ref_poc_l0: 0,
-            ref_poc_l1: 0,
-            ref_lt_l0: false,
-            ref_lt_l1: false,
+            ref_poc_l0: l0_poc,
+            ref_poc_l1: l1_poc,
+            ref_lt_l0: l0_lt,
+            ref_lt_l1: l1_lt,
         });
+        zero_idx += 1;
     }
     cands.truncate(max_num_merge_cand as usize);
     cands
