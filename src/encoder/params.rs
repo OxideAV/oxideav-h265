@@ -95,6 +95,20 @@ impl EncoderConfig {
             chroma_format_idc: 3,
         }
     }
+
+    /// 10-bit Main 4:4:4 10 (RExt) profile encoder config. Round 31:
+    /// combines the 4:4:4 chroma topology of `new_main444_8` with the
+    /// 10-bit precision of `new_main10`. I-slice only.
+    /// SubWidthC = SubHeightC = 1 (chroma at full luma resolution) and
+    /// `bit_depth = 10` so QpBdOffset = 12 applies on both luma and chroma.
+    pub fn new_main444_10(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth: 10,
+            chroma_format_idc: 3,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -164,15 +178,28 @@ fn write_profile_tier_level(
                     // profile and several decoders refuse it.
     if profile_idc == 4 {
         if chroma_format_idc == 3 {
-            // §A.3.4 Main 4:4:4 signature: max bit depth = 8 here (we
-            // currently only emit 8-bit 4:4:4), all chroma formats up to
-            // 4:4:4 allowed (so max_422 = 0, max_420 = 0, max_mono = 0),
-            // not intra-only, not one-picture-only, lower-bit-rate set.
-            // For 8-bit 4:4:4 the §A.3.4 "Main 4:4:4" row sets
-            // max_12bit=1, max_10bit=1, max_8bit=1.
-            bw.write_u1(1); // max_12bit_constraint_flag
-            bw.write_u1(1); // max_10bit_constraint_flag
-            bw.write_u1(1); // max_8bit_constraint_flag
+            // §A.3.4 Table A.2: at chroma_format_idc == 3 the row to write
+            // depends on bit_depth.
+            //   * 8-bit (Main 4:4:4)     → max_12bit=1, max_10bit=1, max_8bit=1
+            //   * 10-bit (Main 4:4:4 10) → max_12bit=1, max_10bit=1, max_8bit=0
+            //   * 12-bit (Main 4:4:4 12) → max_12bit=1, max_10bit=0, max_8bit=0
+            // The other six flags are identical across all three rows
+            // (max_422 = 0, max_420 = 0, max_mono = 0, intra = 0,
+            // one_picture = 0, lower_bit_rate = 1) because Main 4:4:4 in
+            // any bit depth supports inter, every chroma format up to
+            // 4:4:4, and is not still-picture-only. The encoder currently
+            // emits 8-bit and 10-bit 4:4:4; 12-bit 4:4:4 is out of scope
+            // (covered by the 8-bit row's `_ =>` fallback should a future
+            // round wire it up).
+            let max_12bit = 1u32;
+            let (max_10bit, max_8bit) = match bit_depth {
+                8 => (1u32, 1u32),
+                10 => (1u32, 0u32),
+                _ => (0u32, 0u32),
+            };
+            bw.write_u1(max_12bit); // max_12bit_constraint_flag
+            bw.write_u1(max_10bit); // max_10bit_constraint_flag
+            bw.write_u1(max_8bit); // max_8bit_constraint_flag
             bw.write_u1(0); // max_422chroma_constraint_flag (allow 4:4:4)
             bw.write_u1(0); // max_420chroma_constraint_flag (allow 4:4:4)
             bw.write_u1(0); // max_monochrome_constraint_flag
