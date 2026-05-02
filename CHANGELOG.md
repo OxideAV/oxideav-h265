@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 32 — **Main 4:4:4 12 (12-bit 4:4:4) encode** (§A.3.4, §6.2,
+  §7.3.8.10, §8.6.1). `HevcEncoder::from_params` now accepts
+  `PixelFormat::Yuv444P12Le` source frames and routes them through a
+  new `src/encoder/slice_writer_main444_12.rs` which combines the
+  4:4:4 chroma topology of the round-30 8-bit 4:4:4 writer
+  (`SubWidthC = SubHeightC = 1` per Table 6-1, with each 16×16 luma
+  TB co-located with a 16×16 Cb TB and a 16×16 Cr TB at `(x0, y0)`)
+  and the 12-bit pipeline of the round-26 Main 12 writer (`u16`
+  sample containers, `bit_depth = 12` threaded through every
+  `intra_pred::predict` / `transform::*` call, and `Qp'Y = SliceQpY +
+  QpBdOffsetY = 26 + 24 = 50` on both luma and chroma — at
+  ChromaArrayType == 3 the §8.6.1 Table 8-10 chroma collapse does
+  **not** apply, so Qp'Cb = Qp'Cr = Qp'Y). The SPS emits
+  `chroma_format_idc = 3` plus an explicit `separate_colour_plane_flag
+  = 0` bit, `bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 4`, and
+  `general_profile_idc = 4` (Format Range Extensions, where Main
+  4:4:4 12 lives per §A.3.4). The §A.3.4 "Main 4:4:4 12" RExt
+  constraint-flag signature is written into the
+  `profile_tier_level()` reserved region — `max_12bit = 1`,
+  `max_10bit = 0` (differs from the round-31 Main 4:4:4 10 row),
+  `max_8bit = 0`, `max_422chroma = 0`, `max_420chroma = 0`,
+  `max_monochrome = 0`, `intra = 0`, `one_picture_only = 0`,
+  `lower_bit_rate = 1`. The VPS PTL agrees byte-for-byte with the SPS
+  PTL; `general_profile_compatibility_flag` sets only bit 4 since
+  §A.3.5 does not allow Main / Main 10 to claim 4:4:4 compatibility.
+  Reconstruction planes are seeded with `NEUTRAL = 1 << 11 = 2048`.
+  The decoder side reuses the round-30 cfi=3 lift (`ctu.rs` cfi gate
+  + §7.3.8.10 chroma-TB-sizing rule) and the existing
+  `bit_depth <= 12` envelope unchanged — no new decoder work was
+  needed; `decoder::emit_frame`'s 4:4:4 12-bit `Yuv444P12Le` mapping
+  was already plumbed through `sub_width_c() / sub_height_c()`.
+  Self-roundtrip on a 64×64 / 128×128 Yuv444P12Le gradient at QP 26
+  produces 45.04 / 45.69 dB Y on the 12-bit (peak = 4095) scale;
+  ffmpeg cross-decode returns 45.04 dB Y on the 64×64 gradient, both
+  well above the round-32 ≥ 40 dB acceptance bar. Scope: I-slice
+  only — every input frame at 4:4:4 + 12-bit is emitted as an IDR
+  (`mini_gop > 1` is rejected at construction time). 4:4:4 P/B
+  remains out of scope. The 8-bit 4:2:0, Main 10, Main 12, Main 4:4:4
+  8-bit, and Main 4:4:4 10 emission paths (rounds 1..31) are
+  unchanged byte-for-byte — the new `(12, 3)` config row in
+  `EncoderConfig` and the new `(bit_depth, chroma_format_idc) ==
+  (12, 3)` arm in `emit_idr` (placed before the `(12, _)` Main 12
+  arm so the more-specific 4:4:4 row matches first) are the only
+  branches added on the encode path; the SPS / VPS PTL emitter's
+  existing `chroma_format_idc == 3` branch already routes 12-bit
+  through the `_ => (0, 0)` `(max_10bit, max_8bit)` arm so the
+  round-30 / 31 rows stay bit-identical. Five new tests in
+  `tests/encoder_main444_12.rs` plus two new tests in
+  `slice_writer_main444_12::tests` and two new SPS / VPS regression
+  tests in `params::tests` cover the SPS Main 4:4:4 12 signature
+  (incl. a direct-bitstream walk of the 9 RExt constraint flags), the
+  64×64 + 128×128 self-roundtrip, the ffmpeg cross-decode, and the
+  mini_gop=2 rejection.
+
 - round 31 — **Main 4:4:4 10 (10-bit 4:4:4) encode** (§A.3.4, §6.2,
   §7.3.8.10, §8.6.1). `HevcEncoder::from_params` now accepts
   `PixelFormat::Yuv444P10Le` source frames and routes them through a

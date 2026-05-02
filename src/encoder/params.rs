@@ -35,7 +35,10 @@ use crate::nal::{NalHeader, NalUnitType};
 ///
 /// `chroma_format_idc` selects 4:2:0 (1) or 4:4:4 (3). 4:2:2 is not
 /// emitted by this encoder. 4:4:4 + 8-bit (Main 4:4:4 — round-30) is
-/// engaged via [`EncoderConfig::new_main444_8`]; it lives in the RExt
+/// engaged via [`EncoderConfig::new_main444_8`]; 4:4:4 + 10-bit (Main
+/// 4:4:4 10 — round 31) via [`EncoderConfig::new_main444_10`]; and
+/// 4:4:4 + 12-bit (Main 4:4:4 12 — round 32) via
+/// [`EncoderConfig::new_main444_12`]. All three live in the RExt
 /// profile (`profile_idc = 4`) per §A.3.4.
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
@@ -106,6 +109,21 @@ impl EncoderConfig {
             width,
             height,
             bit_depth: 10,
+            chroma_format_idc: 3,
+        }
+    }
+
+    /// 12-bit Main 4:4:4 12 (RExt) profile encoder config. Round 32:
+    /// combines the 4:4:4 chroma topology of `new_main444_8` with the
+    /// 12-bit precision of `new_main12`. I-slice only.
+    /// SubWidthC = SubHeightC = 1 (chroma at full luma resolution) and
+    /// `bit_depth = 12` so QpBdOffset = 24 applies on both luma and chroma
+    /// (Qp'Y = Qp'Cb = Qp'Cr = 26 + 24 = 50 at default QP 26).
+    pub fn new_main444_12(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth: 12,
             chroma_format_idc: 3,
         }
     }
@@ -187,10 +205,8 @@ fn write_profile_tier_level(
             // (max_422 = 0, max_420 = 0, max_mono = 0, intra = 0,
             // one_picture = 0, lower_bit_rate = 1) because Main 4:4:4 in
             // any bit depth supports inter, every chroma format up to
-            // 4:4:4, and is not still-picture-only. The encoder currently
-            // emits 8-bit and 10-bit 4:4:4; 12-bit 4:4:4 is out of scope
-            // (covered by the 8-bit row's `_ =>` fallback should a future
-            // round wire it up).
+            // 4:4:4, and is not still-picture-only. Round 32 wired up
+            // 12-bit 4:4:4 (the `_` arm matches `bit_depth = 12`).
             let max_12bit = 1u32;
             let (max_10bit, max_8bit) = match bit_depth {
                 8 => (1u32, 1u32),
@@ -585,6 +601,44 @@ mod tests {
         assert_eq!(
             vps.profile_tier_level.general_profile_idc, 4,
             "Main 12 VPS PTL should carry profile_idc = 4 (RExt)"
+        );
+    }
+
+    #[test]
+    fn sps_main444_12_carries_bit_depth_four_and_cfi_three() {
+        // Round 32: Main 4:4:4 12 SPS must declare 12-bit luma + chroma,
+        // chroma_format_idc = 3, separate_colour_plane_flag = 0, and the
+        // RExt profile (general_profile_idc = 4 per §A.3.4).
+        let rbsp = build_sps_rbsp(&EncoderConfig::new_main444_12(64, 64));
+        let sps = parse_sps(&rbsp).expect("parse main444_12 sps");
+        assert_eq!(sps.bit_depth_luma_minus8, 4);
+        assert_eq!(sps.bit_depth_chroma_minus8, 4);
+        assert_eq!(sps.bit_depth_y(), 12);
+        assert_eq!(sps.bit_depth_c(), 12);
+        assert_eq!(sps.chroma_format_idc, 3);
+        assert!(!sps.separate_colour_plane_flag);
+        assert_eq!(sps.profile_tier_level.general_profile_idc, 4);
+        assert_eq!(sps.sub_width_c(), 1);
+        assert_eq!(sps.sub_height_c(), 1);
+        // §A.3.5: at chroma_format_idc == 3 only the RExt compatibility
+        // bit (bit 4) is valid — Main / Main 10 do not cover 4:4:4.
+        let compat = sps.profile_tier_level.general_profile_compatibility_flag;
+        assert_eq!(
+            compat,
+            1u32 << (31 - 4),
+            "only RExt compat bit set at 4:4:4"
+        );
+    }
+
+    #[test]
+    fn vps_main444_12_profile_idc_is_four() {
+        // Round 32: VPS PTL agrees with SPS PTL — profile_idc = 4 (RExt).
+        let rbsp = build_vps_rbsp_with_profile(12, 3);
+        let vps = parse_vps(&rbsp).expect("parse main444_12 vps");
+        assert_eq!(vps.vps_video_parameter_set_id, 0);
+        assert_eq!(
+            vps.profile_tier_level.general_profile_idc, 4,
+            "Main 4:4:4 12 VPS PTL should carry profile_idc = 4 (RExt)"
         );
     }
 }

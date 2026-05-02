@@ -41,5 +41,6 @@ pub mod slice_writer_main10;
 pub mod slice_writer_main12;
 pub mod slice_writer_main444;
 pub mod slice_writer_main444_10;
+pub mod slice_writer_main444_12;
 
 pub use hevc_encoder::{make_encoder, HevcEncoder};

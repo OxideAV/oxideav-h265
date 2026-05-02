@@ -37,6 +37,7 @@ use crate::encoder::slice_writer_main10::build_idr_slice_nal_main10;
 use crate::encoder::slice_writer_main12::build_idr_slice_nal_main12;
 use crate::encoder::slice_writer_main444::build_idr_slice_nal_main444_8;
 use crate::encoder::slice_writer_main444_10::build_idr_slice_nal_main444_10;
+use crate::encoder::slice_writer_main444_12::build_idr_slice_nal_main444_12;
 
 /// Default GOP size (distance between IDR keyframes).
 const GOP_SIZE: u32 = 64;
@@ -90,23 +91,25 @@ impl HevcEncoder {
             )));
         }
         let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        // Round 25 / 26 / 30 / 31: accept Yuv420P (Main, 8-bit),
+        // Round 25 / 26 / 30 / 31 / 32: accept Yuv420P (Main, 8-bit),
         // Yuv420P10Le (Main 10), Yuv420P12Le (Main 12 / RExt),
-        // Yuv444P (Main 4:4:4 8-bit), and Yuv444P10Le (Main 4:4:4 10).
-        // The high-bit-depth + 4:4:4 paths currently only cover the IDR
-        // I-slice path — B / P slices at non-Main configs will fail on
-        // the next `send_frame` with a clear error (the mini_gop check
-        // below also rejects mini_gop > 1 outside the 8-bit 4:2:0 path).
+        // Yuv444P (Main 4:4:4 8-bit), Yuv444P10Le (Main 4:4:4 10), and
+        // Yuv444P12Le (Main 4:4:4 12). The high-bit-depth + 4:4:4 paths
+        // currently only cover the IDR I-slice path — B / P slices at
+        // non-Main configs will fail on the next `send_frame` with a
+        // clear error (the mini_gop check below also rejects mini_gop > 1
+        // outside the 8-bit 4:2:0 path).
         let (bit_depth, chroma_format_idc) = match pix {
             PixelFormat::Yuv420P => (8u32, 1u32),
             PixelFormat::Yuv420P10Le => (10u32, 1u32),
             PixelFormat::Yuv420P12Le => (12u32, 1u32),
             PixelFormat::Yuv444P => (8u32, 3u32),
             PixelFormat::Yuv444P10Le => (10u32, 3u32),
+            PixelFormat::Yuv444P12Le => (12u32, 3u32),
             _ => {
                 return Err(Error::unsupported(format!(
                     "h265 encoder: only Yuv420P / Yuv420P10Le / Yuv420P12Le / \
-                     Yuv444P / Yuv444P10Le are supported (got {pix:?})"
+                     Yuv444P / Yuv444P10Le / Yuv444P12Le are supported (got {pix:?})"
                 )));
             }
         };
@@ -147,6 +150,7 @@ impl HevcEncoder {
         let cfg = match (bit_depth, chroma_format_idc) {
             (8, 3) => EncoderConfig::new_main444_8(width, height),
             (10, 3) => EncoderConfig::new_main444_10(width, height),
+            (12, 3) => EncoderConfig::new_main444_12(width, height),
             (12, _) => EncoderConfig::new_main12(width, height),
             (10, _) => EncoderConfig::new_main10(width, height),
             _ => EncoderConfig::new(width, height),
@@ -205,6 +209,19 @@ impl HevcEncoder {
                 // reconstruction is cached since P/B at 4:4:4 is a
                 // follow-up.
                 let nal = build_idr_slice_nal_main444_10(&self.cfg, frame);
+                data.extend_from_slice(&nal);
+                self.last_recon = None;
+                self.last_recon_poc = 0;
+            }
+            (12, 3) => {
+                // Main 4:4:4 12 IDR — see `slice_writer_main444_12`.
+                // Combines the 4:4:4 chroma topology of the round-30
+                // 8-bit 4:4:4 path with the 12-bit precision of the
+                // round-26 Main 12 writer (Qp'Y = Qp'Cb = Qp'Cr =
+                // 26 + 24 = 50 at default QP 26). Keyframe only — no
+                // reconstruction is cached since P/B at 4:4:4 is a
+                // follow-up.
+                let nal = build_idr_slice_nal_main444_12(&self.cfg, frame);
                 data.extend_from_slice(&nal);
                 self.last_recon = None;
                 self.last_recon_poc = 0;
