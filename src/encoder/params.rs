@@ -32,6 +32,11 @@ use crate::nal::{NalHeader, NalUnitType};
 /// [`EncoderConfig::new_main10`] (round 25) and the 12-bit path via
 /// [`EncoderConfig::new_main12`] (round 26). Both high-bit-depth paths
 /// are I-slice-only for now (see crate README).
+///
+/// `chroma_format_idc` selects 4:2:0 (1) or 4:4:4 (3). 4:2:2 is not
+/// emitted by this encoder. 4:4:4 + 8-bit (Main 4:4:4 — round-30) is
+/// engaged via [`EncoderConfig::new_main444_8`]; it lives in the RExt
+/// profile (`profile_idc = 4`) per §A.3.4.
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -40,34 +45,54 @@ pub struct EncoderConfig {
     /// 8 (Main profile), 10 (Main 10 profile), and 12 (Main 12 / RExt
     /// profile).
     pub bit_depth: u32,
+    /// Chroma format per §6.2 Table 6-1. 1 = 4:2:0, 3 = 4:4:4. The 8-bit
+    /// 4:2:0 path is the round-1..24 default; the 8-bit 4:4:4 path
+    /// (round 30) lifts SubWidthC = SubHeightC = 1 so chroma blocks live
+    /// at full luma resolution.
+    pub chroma_format_idc: u32,
 }
 
 impl EncoderConfig {
-    /// 8-bit Main-profile encoder config.
+    /// 8-bit Main-profile encoder config (4:2:0).
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
             bit_depth: 8,
+            chroma_format_idc: 1,
         }
     }
 
-    /// 10-bit Main 10 profile encoder config.
+    /// 10-bit Main 10 profile encoder config (4:2:0).
     pub fn new_main10(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
             bit_depth: 10,
+            chroma_format_idc: 1,
         }
     }
 
-    /// 12-bit Main 12 (RExt) profile encoder config. Round 26: I-slice
-    /// only (mirrors the round-25 Main 10 IDR-only restriction).
+    /// 12-bit Main 12 (RExt) profile encoder config (4:2:0). Round 26:
+    /// I-slice only (mirrors the round-25 Main 10 IDR-only restriction).
     pub fn new_main12(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
             bit_depth: 12,
+            chroma_format_idc: 1,
+        }
+    }
+
+    /// 8-bit Main 4:4:4 (RExt) profile encoder config. Round 30:
+    /// I-slice only — mirrors the Main 10 / Main 12 IDR-only restriction.
+    /// SubWidthC = SubHeightC = 1, so chroma planes match luma resolution.
+    pub fn new_main444_8(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth: 8,
+            chroma_format_idc: 3,
         }
     }
 }
@@ -76,15 +101,24 @@ impl EncoderConfig {
 // profile_tier_level()  §7.3.3
 // -----------------------------------------------------------------------
 
-fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_depth: u32) {
+fn write_profile_tier_level(
+    bw: &mut BitWriter,
+    max_sub_layers_minus1: u32,
+    bit_depth: u32,
+    chroma_format_idc: u32,
+) {
     // general_profile_space (u2) = 0, general_tier_flag (u1) = 0 (Main).
     // general_profile_idc (u5):
-    //   * 1 (Main)               for 8-bit
-    //   * 2 (Main 10)            for 10-bit
-    //   * 4 (Format Range Ext.)  for 12-bit (Main 12 lives in RExt per §A.3.7)
+    //   * 1 (Main)               for 8-bit 4:2:0
+    //   * 2 (Main 10)            for 10-bit 4:2:0
+    //   * 4 (Format Range Ext.)  for 12-bit (Main 12) and any 4:4:4
+    //     (Main 4:4:4) per §A.3.7 / §A.3.4
     bw.write_bits(0, 2);
     bw.write_u1(0);
-    let profile_idc: u32 = if bit_depth >= 12 {
+    let profile_idc: u32 = if chroma_format_idc == 3 || bit_depth >= 12 {
+        // Main 4:4:4 and Main 12 both live in the Format Range Extensions
+        // profile (§A.3.4 / §A.3.7); the constraint flags below
+        // disambiguate them.
         4
     } else if bit_depth >= 10 {
         2
@@ -95,12 +129,17 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_
     // general_profile_compatibility_flag[32]: per §A.3.5 a higher-bit-depth
     // decoder must accept lower-bit-depth streams, so we layer the compat
     // bits cumulatively:
-    //   * 8-bit:  Main only             → bit 1
-    //   * 10-bit: Main + Main 10        → bits 1, 2
-    //   * 12-bit: Main + Main 10 + RExt → bits 1, 2, 4   (RExt sniffer
+    //   * 8-bit 4:2:0:  Main only             → bit 1
+    //   * 10-bit 4:2:0: Main + Main 10        → bits 1, 2
+    //   * 12-bit 4:2:0: Main + Main 10 + RExt → bits 1, 2, 4   (RExt sniffer
     //     probes bit 4; backward compat keeps Main / Main 10 sniffers
     //     happy on the same bitstream)
-    let compat: u32 = if bit_depth >= 12 {
+    //   * 4:4:4       : RExt only             → bit 4 (Main / Main 10 do
+    //     not cover 4:4:4 chroma format, so cumulative-bit-set is invalid
+    //     here per §A.3.5).
+    let compat: u32 = if chroma_format_idc == 3 {
+        1u32 << (31 - 4)
+    } else if bit_depth >= 12 {
         (1u32 << (31 - 1)) | (1u32 << (31 - 2)) | (1u32 << (31 - 4))
     } else if bit_depth >= 10 {
         (1u32 << (31 - 1)) | (1u32 << (31 - 2))
@@ -124,16 +163,35 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_
                     // them the stream is reported as "Rext" with no concrete
                     // profile and several decoders refuse it.
     if profile_idc == 4 {
-        bw.write_u1(1); // max_12bit_constraint_flag
-        bw.write_u1(0); // max_10bit_constraint_flag
-        bw.write_u1(0); // max_8bit_constraint_flag
-        bw.write_u1(1); // max_422chroma_constraint_flag
-        bw.write_u1(1); // max_420chroma_constraint_flag
-        bw.write_u1(0); // max_monochrome_constraint_flag
-        bw.write_u1(0); // intra_constraint_flag (Main 12 supports inter)
-        bw.write_u1(0); // one_picture_only_constraint_flag
-        bw.write_u1(1); // lower_bit_rate_constraint_flag
-        bw.write_zero_bits(34); // reserved
+        if chroma_format_idc == 3 {
+            // §A.3.4 Main 4:4:4 signature: max bit depth = 8 here (we
+            // currently only emit 8-bit 4:4:4), all chroma formats up to
+            // 4:4:4 allowed (so max_422 = 0, max_420 = 0, max_mono = 0),
+            // not intra-only, not one-picture-only, lower-bit-rate set.
+            // For 8-bit 4:4:4 the §A.3.4 "Main 4:4:4" row sets
+            // max_12bit=1, max_10bit=1, max_8bit=1.
+            bw.write_u1(1); // max_12bit_constraint_flag
+            bw.write_u1(1); // max_10bit_constraint_flag
+            bw.write_u1(1); // max_8bit_constraint_flag
+            bw.write_u1(0); // max_422chroma_constraint_flag (allow 4:4:4)
+            bw.write_u1(0); // max_420chroma_constraint_flag (allow 4:4:4)
+            bw.write_u1(0); // max_monochrome_constraint_flag
+            bw.write_u1(0); // intra_constraint_flag (Main 4:4:4 supports inter)
+            bw.write_u1(0); // one_picture_only_constraint_flag
+            bw.write_u1(1); // lower_bit_rate_constraint_flag
+            bw.write_zero_bits(34); // reserved
+        } else {
+            bw.write_u1(1); // max_12bit_constraint_flag
+            bw.write_u1(0); // max_10bit_constraint_flag
+            bw.write_u1(0); // max_8bit_constraint_flag
+            bw.write_u1(1); // max_422chroma_constraint_flag
+            bw.write_u1(1); // max_420chroma_constraint_flag
+            bw.write_u1(0); // max_monochrome_constraint_flag
+            bw.write_u1(0); // intra_constraint_flag (Main 12 supports inter)
+            bw.write_u1(0); // one_picture_only_constraint_flag
+            bw.write_u1(1); // lower_bit_rate_constraint_flag
+            bw.write_zero_bits(34); // reserved
+        }
     } else {
         bw.write_zero_bits(43);
     }
@@ -160,14 +218,22 @@ fn write_profile_tier_level(bw: &mut BitWriter, max_sub_layers_minus1: u32, bit_
 // -----------------------------------------------------------------------
 
 pub fn build_vps_rbsp() -> Vec<u8> {
-    build_vps_rbsp_with_bit_depth(8)
+    build_vps_rbsp_with_profile(8, 1)
 }
 
 /// Build the VPS RBSP with an explicit `bit_depth` driving the
-/// profile_tier_level emission. `bit_depth = 8` matches the original
-/// 8-bit Main emission byte-for-byte; `bit_depth = 10` switches the PTL
-/// to Main 10 (profile_idc = 2 + the Main+Main10 compatibility bits).
+/// profile_tier_level emission. Defaults to 4:2:0 chroma format.
+/// `bit_depth = 8` matches the original 8-bit Main emission byte-for-byte;
+/// `bit_depth = 10` switches the PTL to Main 10 (profile_idc = 2 + the
+/// Main+Main10 compatibility bits).
 pub fn build_vps_rbsp_with_bit_depth(bit_depth: u32) -> Vec<u8> {
+    build_vps_rbsp_with_profile(bit_depth, 1)
+}
+
+/// Build the VPS RBSP with both `bit_depth` and `chroma_format_idc`
+/// driving the profile_tier_level emission. `chroma_format_idc = 3`
+/// engages the Main 4:4:4 signature (round 30).
+pub fn build_vps_rbsp_with_profile(bit_depth: u32, chroma_format_idc: u32) -> Vec<u8> {
     let mut bw = BitWriter::new();
     // vps_video_parameter_set_id (u4)
     bw.write_bits(0, 4);
@@ -183,7 +249,7 @@ pub fn build_vps_rbsp_with_bit_depth(bit_depth: u32) -> Vec<u8> {
     // vps_reserved_0xffff_16bits
     bw.write_bits(0xFFFF, 16);
     // profile_tier_level(1, vps_max_sub_layers_minus1)
-    write_profile_tier_level(&mut bw, 0, bit_depth);
+    write_profile_tier_level(&mut bw, 0, bit_depth, chroma_format_idc);
     // vps_sub_layer_ordering_info_present_flag
     bw.write_u1(0);
     // For i = max_sub_layers_minus1..max_sub_layers_minus1 inclusive when
@@ -216,11 +282,18 @@ pub fn build_sps_rbsp(cfg: &EncoderConfig) -> Vec<u8> {
     // sps_temporal_id_nesting_flag (u1)
     bw.write_u1(1);
     // profile_tier_level(1, sps_max_sub_layers_minus1)
-    write_profile_tier_level(&mut bw, 0, cfg.bit_depth);
+    write_profile_tier_level(&mut bw, 0, cfg.bit_depth, cfg.chroma_format_idc);
     // sps_seq_parameter_set_id
     bw.write_ue(0);
-    // chroma_format_idc = 1 (4:2:0)
-    bw.write_ue(1);
+    // chroma_format_idc — 1 (4:2:0) by default; 3 (4:4:4) for the Main
+    // 4:4:4 path. When chroma_format_idc == 3, the SPS bitstream includes
+    // a single separate_colour_plane_flag bit (we emit 0 — no separate
+    // colour planes; chroma is interleaved at full luma resolution per
+    // §6.2 Table 6-1).
+    bw.write_ue(cfg.chroma_format_idc);
+    if cfg.chroma_format_idc == 3 {
+        bw.write_u1(0); // separate_colour_plane_flag = 0
+    }
     // pic_width_in_luma_samples, pic_height_in_luma_samples (ue(v))
     bw.write_ue(cfg.width);
     bw.write_ue(cfg.height);
@@ -359,9 +432,19 @@ pub fn build_vps_nal() -> Vec<u8> {
 
 /// Build Annex B bytes for a VPS NAL with the given component bit depth
 /// (8 or 10). At 10 the embedded `profile_tier_level()` switches to
-/// Main 10 (profile_idc = 2).
+/// Main 10 (profile_idc = 2). 4:2:0 is assumed; for 4:4:4 see
+/// [`build_vps_nal_with_profile`].
 pub fn build_vps_nal_with_bit_depth(bit_depth: u32) -> Vec<u8> {
     let rbsp = build_vps_rbsp_with_bit_depth(bit_depth);
+    build_annex_b_nal(NalHeader::for_type(NalUnitType::Vps), &rbsp)
+}
+
+/// Build Annex B bytes for a VPS NAL with both `bit_depth` and
+/// `chroma_format_idc` driving the embedded `profile_tier_level()`.
+/// `chroma_format_idc = 3` engages the Main 4:4:4 RExt signature
+/// (round 30).
+pub fn build_vps_nal_with_profile(bit_depth: u32, chroma_format_idc: u32) -> Vec<u8> {
+    let rbsp = build_vps_rbsp_with_profile(bit_depth, chroma_format_idc);
     build_annex_b_nal(NalHeader::for_type(NalUnitType::Vps), &rbsp)
 }
 

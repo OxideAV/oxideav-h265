@@ -377,15 +377,27 @@ pub fn decode_slice_ctus(
     if cctx.sps.separate_colour_plane_flag {
         return Err(Error::unsupported("h265 separate_colour_plane pending"));
     }
-    // 4:2:0 (chroma_format_idc=1) and 4:2:2 (chroma_format_idc=2) are both
-    // supported. 4:4:4 (chroma_format_idc=3) is rejected because the
-    // chroma transform tree, MC scaling, and intra-mode mapping all change
-    // shape there. 4:0:0 (chroma_format_idc=0) is also rejected because
-    // every chroma-bearing code path in this crate would need new branches.
+    // 4:2:0 (chroma_format_idc=1), 4:2:2 (chroma_format_idc=2), and
+    // 4:4:4 (chroma_format_idc=3) are supported. 4:0:0
+    // (chroma_format_idc=0) is rejected because every chroma-bearing
+    // code path in this crate would need new branches. 4:4:4 was lifted
+    // in round 30 alongside the Main 4:4:4 encoder; the chroma TB
+    // sizing in `transform_tree` consults
+    // `chroma_array_type()` so the chroma TBs land at full luma
+    // resolution (log2TrafoSizeC = log2TrafoSize per §7.3.8.10), and
+    // intra mode mapping at 4:4:4 is the identity (§8.4.3 — the
+    // Table 8-3 422 remap is only applied for ChromaArrayType == 2).
+    // The 4:4:4 lift is currently I-slice only — P/B at 4:4:4 needs a
+    // chroma MV scaling / PartIdx audit similar to round 11/12 4:2:2.
     let cfi = cctx.sps.chroma_format_idc;
-    if cfi != 1 && cfi != 2 {
+    if cfi != 1 && cfi != 2 && cfi != 3 {
         return Err(Error::unsupported(
-            "h265 pixel decode supports 4:2:0 and 4:2:2 only",
+            "h265 pixel decode supports 4:2:0, 4:2:2, and 4:4:4 only",
+        ));
+    }
+    if cfi == 3 && cctx.slice.slice_type != SliceType::I {
+        return Err(Error::unsupported(
+            "h265 pixel decode at 4:4:4 supports I slices only",
         ));
     }
     // 4:2:2 P/B inter is supported via §8.5.3.2.10 chroma MV derivation
@@ -3016,13 +3028,15 @@ impl<'a> Walker<'a> {
         //   For ChromaArrayType == 2 (4:2:2), TWO chroma TBs are stacked
         //   vertically: at (xC, yC) and (xC, yC + (1<<log2TrafoSizeC)).
         //   For 4:2:0 there is one chroma TB co-located at (x0/2, y0/2).
+        //   For 4:4:4 the chroma TB matches the luma TB in size and
+        //   location (sub_x = sub_y = 1, log2TrafoSizeC = log2TrafoSize).
         //   When log2_tb == 2 the chroma TBs sit at the parent base
         //   (xBase, yBase), and only emit when blk_idx == 3.
         let sub_x = self.cctx.sps.sub_width_c();
         let sub_y = self.cctx.sps.sub_height_c();
         let chroma_passes: u32 = if cat == 2 { 2 } else { 1 };
         if log2_tb > 2 {
-            let chroma_log2 = log2_tb - 1;
+            let chroma_log2 = if cat == 3 { log2_tb } else { log2_tb - 1 };
             let chroma_step = 1u32 << chroma_log2;
             let cx = x0 / sub_x;
             let cy = y0 / sub_y;

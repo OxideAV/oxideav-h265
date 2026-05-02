@@ -2293,8 +2293,13 @@ fn main10_inter_decodes_with_pframes() {
     );
 }
 
-/// 4:4:4 fixture: confirms the decoder surfaces a clean `Unsupported`
-/// instead of panicking for `chroma_format_idc == 3` streams.
+/// 4:4:4 fixture: round 30 lifted the decoder gate to accept
+/// `chroma_format_idc == 3` (Main 4:4:4 / RExt). The fixture comes from
+/// libx265 with arbitrary intra modes and tiles disabled; the decoder
+/// must either return a frame (no panic, no malformed bitstream error)
+/// or surface `Unsupported` for syntax it still doesn't honour. The
+/// pre-round-30 path (where every 4:4:4 stream surfaced `Unsupported`)
+/// is also still accepted so the historical regression guard holds.
 #[test]
 fn yuv444_fixture_surfaces_clean_unsupported() {
     if !ffmpeg_available() {
@@ -2350,6 +2355,11 @@ fn yuv444_fixture_surfaces_clean_unsupported() {
     match dec.send_packet(&pkt) {
         Ok(()) => match dec.receive_frame() {
             Err(Error::Unsupported(_)) | Err(Error::NeedMore) => {}
+            // Round 30: 4:4:4 decode is now wired up. We accept either a
+            // successful frame (the decoder produced the picture
+            // end-to-end) or `Unsupported` when libx265 emitted features
+            // beyond the I-slice + 16×16 CTU envelope this crate covers.
+            Ok(oxideav_core::Frame::Video(_)) => {}
             other => panic!("unexpected receive_frame on 4:4:4 fixture: {other:?}"),
         },
         Err(Error::Unsupported(_)) => {}

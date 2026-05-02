@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 30 — **Main 4:4:4 (8-bit) encode + decode** (§A.3.4, §6.2,
+  §7.3.8.10). `HevcEncoder::from_params` now accepts
+  `PixelFormat::Yuv444P` source frames and routes them through a new
+  `src/encoder/slice_writer_main444.rs` which mirrors the round-25 / 26
+  parallel-writer pattern but at the 4:4:4 chroma topology
+  (`SubWidthC = SubHeightC = 1` per Table 6-1). Each 16×16 luma TB is
+  paired with a 16×16 Cb TB and a 16×16 Cr TB, all co-located at
+  `(x0, y0)` — vs. the 8×8 chroma TBs at `(x0/2, y0/2)` the 4:2:0 path
+  emits. The SPS emits `chroma_format_idc = 3`, an explicit
+  `separate_colour_plane_flag = 0` bit (only present when
+  `chroma_format_idc == 3` per §7.3.2.2), `bit_depth_luma_minus8 = 0`,
+  and `general_profile_idc = 4` (Format Range Extensions, where Main
+  4:4:4 lives per §A.3.4). The §A.3.4 "Main 4:4:4" RExt constraint-flag
+  signature is written into the `profile_tier_level()` reserved region:
+  `max_12bit / max_10bit / max_8bit = 1`, `max_422chroma = 0`,
+  `max_420chroma = 0`, `max_monochrome = 0`,
+  `lower_bit_rate_constraint_flag = 1`, the rest 0. The VPS PTL agrees
+  byte-for-byte with the SPS PTL so ffmpeg's `decode_profile_tier_level`
+  cross-check passes; `general_profile_compatibility_flag` sets only
+  bit 4 since §A.3.5 does not allow Main / Main 10 to claim 4:4:4
+  compatibility. Decoder side: the cfi gate in `ctu.rs::decode_slice_ctus`
+  was lifted from `cfi != 1 && cfi != 2` to `cfi != 1 && cfi != 2 && cfi != 3`
+  with an additional `slice_type == I` gate at 4:4:4 (P/B at 4:4:4 is a
+  follow-up; the chroma-MV scaling / PartIdx / chroma-MC interpolation
+  audit is separate work). `transform_tree`'s chroma TB sizing now
+  honours the §7.3.8.10 `log2TrafoSizeC = max(2, log2TrafoSize -
+  (ChromaArrayType==3 ? 0 : 1))` rule (was hard-coded to `log2_tb - 1`),
+  so chroma TBs at 4:4:4 land at 16×16 alongside the luma TB. Self-
+  roundtrip on a 64×64 / 128×128 Yuv444P gradient at QP 26 produces
+  44.99 / 46.28 dB Y; ffmpeg cross-decode of the same bitstream returns
+  44.99 dB Y. Scope: I-slice only — every input frame at 4:4:4 is
+  emitted as an IDR (4:4:4 + `mini_gop > 1` is rejected at construction
+  time). 4:4:4 at 10 / 12 bit, monochrome, and `separate_colour_plane`
+  remain out of scope.
+
 - round 26 — **Main 12 (12-bit) encode** (§A.3.7, §7.4.3.2.1, §8.6.1).
   `HevcEncoder::from_params` now accepts `PixelFormat::Yuv420P12Le`
   source frames and routes them through a new

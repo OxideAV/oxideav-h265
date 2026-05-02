@@ -153,17 +153,23 @@ signalled (§8.5.3.3.4).
 
 ### Bit depths and chroma
 
-* **Main (8-bit)**, **Main 10**, and **Main 12** are supported on the
-  decode side; `bit_depth_luma_minus8 != bit_depth_chroma_minus8` and
-  bit depths > 12 surface as `Error::Unsupported`. Encode covers
-  Main / Main 10 / Main 12 (Main 10 / 12 are I-slice-only).
+* **Main (8-bit)**, **Main 10**, **Main 12**, and **Main 4:4:4 (8-bit)**
+  are supported on the decode side; `bit_depth_luma_minus8 != bit_depth_chroma_minus8`
+  and bit depths > 12 surface as `Error::Unsupported`. Encode covers
+  Main / Main 10 / Main 12 / Main 4:4:4 (Main 10 / 12 / 4:4:4 are
+  I-slice-only).
 * **4:2:0 (`chroma_format_idc=1`) and 4:2:2 (`chroma_format_idc=2`)** are
   supported for I, P, and B slices. The 4:2:2 inter path applies
   §8.5.3.2.10 chroma MV derivation
   (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) so the same `chroma_mc` /
   `chroma_mc_hp` covers both layouts.
-* **4:4:4 (`chroma_format_idc=3`)**, monochrome, and
-  `separate_colour_plane_flag = 1` all surface as
+* **4:4:4 (`chroma_format_idc=3`)** is supported on I-slices (round 30).
+  `transform_tree` honours the §7.3.8.10 `log2TrafoSizeC = max(2,
+  log2TrafoSize - (ChromaArrayType==3 ? 0 : 1))` rule, so chroma TBs at
+  4:4:4 are full luma resolution and co-located with the luma TB. P/B
+  at 4:4:4 still surfaces as `Error::Unsupported` (chroma-MV scaling /
+  PartIdx / chroma-MC interpolation audit is a follow-up).
+* **Monochrome** and `separate_colour_plane_flag = 1` surface as
   `Error::Unsupported`.
 
 ### Tooling already in scope
@@ -194,11 +200,12 @@ signalled (§8.5.3.3.4).
 ## Encode support
 
 The encoder lives in `src/encoder/` and implements the
-`oxideav_core::Encoder` trait. Output is Annex B byte-stream HEVC,
-4:2:0 (Main / Main 10 / Main 12 — rounds 25 / 26), 16×16 CTU + 16×16 CU layout, fixed
-QP 26, no SAO, no deblocking. The current envelope is small but
-spec-correct: every bitstream we emit is decodable by ffmpeg's
-libavcodec hevc and by our own decoder.
+`oxideav_core::Encoder` trait. Output is Annex B byte-stream HEVC at
+4:2:0 (Main / Main 10 / Main 12 — rounds 25 / 26) or 4:4:4 (Main 4:4:4
+8-bit — round 30), 16×16 CTU + 16×16 CU layout, fixed QP 26, no SAO,
+no deblocking. The current envelope is small but spec-correct: every
+bitstream we emit is decodable by ffmpeg's libavcodec hevc and by our
+own decoder.
 
 * **I slices (round 1+)** — IDR `IdrNLp` keyframes with VPS / SPS /
   PPS prefixed. Per-CU intra mode decision over a 7-mode subset
@@ -296,10 +303,37 @@ libavcodec hevc and by our own decoder.
   an IDR (the 8-bit and 10-bit paths are unchanged byte-for-byte);
   `mini_gop_size > 1` at 12-bit is rejected at construction time.
   4:2:2 / 4:4:4 at 12-bit and 12-bit P/B remain out of scope.
+* **Main 4:4:4 encode (round 30)** — `Yuv444P` source frames are now
+  accepted by `HevcEncoder::from_params`. The Main 4:4:4 path emits a
+  **profile_idc = 4** (RExt) SPS with `chroma_format_idc = 3` plus the
+  explicit `separate_colour_plane_flag = 0` bit (§7.3.2.2 only emits
+  this bit when `chroma_format_idc == 3`), `bit_depth_luma_minus8 =
+  bit_depth_chroma_minus8 = 0`, and the matching VPS PTL. The §A.3.4
+  RExt constraint flags are written as the "Main 4:4:4" signature
+  (`max_8bit / max_10bit / max_12bit = 1`, `max_422chroma = 0`,
+  `max_420chroma = 0`, `max_monochrome = 0`,
+  `lower_bit_rate_constraint_flag = 1`).
+  `general_profile_compatibility_flag` sets only bit 4 (RExt) — Main
+  and Main 10 don't cover 4:4:4 chroma format, so the cumulative
+  Main + Main 10 bits the round-26 Main 12 path sets are intentionally
+  left at 0 here. The pipeline mirrors the round-25 / 26 parallel-writer
+  pattern in `slice_writer_main444` but at the 4:4:4 chroma topology:
+  per-CU chroma TBs are 16×16 (matching the luma TB) and co-located at
+  `(x0, y0)` instead of being 8×8 at `(x0/2, y0/2)`. The encoder's
+  reconstructed Cb / Cr planes are full luma resolution so neighbour
+  samples for chroma intra prediction line up with the luma decoded
+  grid (no `>> 1` shift applied to the chroma `is_decoded` lookup).
+  Self-roundtrip and ffmpeg cross-decode of a 64×64 / 128×128 Yuv444P
+  gradient both clear ~45 dB Y on the 8-bit (peak = 255) scale. Scope:
+  I-slice only — every input frame at 4:4:4 is emitted as an IDR (the
+  4:2:0 P/B path is unchanged byte-for-byte); `mini_gop > 1` at 4:4:4
+  is rejected at construction time. 4:4:4 at 10 / 12 bit is out of
+  scope.
 * **Pending:** AMP / rectangular partitions (Nx2N / 2NxN), weighted
   bi-pred, mini-GOP > 2 (B-pyramid), `mvd_l1_zero_flag` optimisation,
   10-bit / 12-bit P/B-slice encode (currently the high-bit-depth emit
-  paths are IDR-only), 4:4:4 encode.
+  paths are IDR-only), 10-bit / 12-bit 4:4:4 encode, 4:4:4 P/B-slice
+  encode (the 4:4:4 emit path is currently IDR-only).
 
 ## HEIF / HEIC still images
 
