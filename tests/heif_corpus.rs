@@ -108,7 +108,13 @@ fn report_only_reason(name: &str) -> &'static str {
              3-plane planar YUV input, so the BitExact gate needs a 1-plane \
              luma comparator path before promotion"
         }
-        "still-10bit-main10" => "HEVC Main 10 not pixel-emitting end-to-end",
+        "still-10bit-main10" => {
+            "Main 10 (bit_depth=10) decode lands via the existing >8-bit \
+             emit_frame branch (16-bit LE-packed planar YUV); BitExact \
+             promotion blocked on a 16-bit-aware compare_bit_exact path \
+             that reads u16 samples from plane.data and produces 16-bit \
+             packed RGB to match the Rgb48Le oracle"
+        }
         "still-yuv444" => "HEVC 4:4:4 (chroma_format_idc=3) not pixel-emitting",
         "image-sequence-3frame" => {
             "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
