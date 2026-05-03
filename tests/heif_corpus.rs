@@ -77,9 +77,15 @@ fn report_only_reason(name: &str) -> &'static str {
             "thumbnail item iref present; primary decode parity not yet verified"
         }
         "still-image-with-alpha" => "alpha auxiliary uses HEVC monochrome (chroma_format_idc=0)",
-        "still-image-with-icc" => "ICC profile retained as Property::Other; no ICC-aware compare yet",
-        "still-image-with-exif" => "Exif metadata item only; primary decode parity not yet verified",
-        "still-image-with-xmp" => "XMP metadata item only; primary decode parity not yet verified",
+        "still-image-with-icc" => {
+            "ICC profile retained as Property::Other; no ICC-aware compare yet"
+        }
+        "still-image-with-exif" => {
+            "Exif metadata item only; primary decode parity not yet verified"
+        }
+        "still-image-with-xmp" => {
+            "XMP metadata item only; primary decode parity not yet verified"
+        }
         "still-image-grid-2x2" => {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
@@ -298,7 +304,10 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
     msgs.push(format!("tier={:?} heic_bytes={}", fx.tier, fx.heic.len()));
     if !p {
         msgs.push("probe: REJECTED".to_string());
-        return (msgs, Outcome::Skipped("probe rejected ftyp brands".to_string()));
+        return (
+            msgs,
+            Outcome::Skipped("probe rejected ftyp brands".to_string()),
+        );
     }
     stats.probed_ok += 1;
     msgs.push("probe: ok".to_string());
