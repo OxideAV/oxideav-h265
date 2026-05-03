@@ -75,7 +75,7 @@ mod meta;
 
 pub use box_parser::{BoxHeader, BoxType};
 pub use meta::{
-    AuxC, Clap, Colr, Imir, Irot, IrefEntry, Ispe, ItemInfo, ItemLocation, Meta, Property,
+    AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Property,
 };
 
 /// Auxiliary-image type URN that identifies the alpha plane of an HEVC
