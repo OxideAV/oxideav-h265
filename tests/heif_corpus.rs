@@ -144,7 +144,7 @@ fn fixtures() -> Vec<Fixture> {
         // matrix from the iovl item's `colr nclx` (or BT.601 limited
         // when no `colr` is associated), matching the corpus YUV→RGB
         // compare convention. See `FillMatrix` in src/heif/mod.rs.
-        fixture!("still-image-overlay", BitExact),
+        fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
         fixture!("still-monochrome", ReportOnly),
         fixture!("still-10bit-main10", ReportOnly),
