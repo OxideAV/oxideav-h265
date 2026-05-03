@@ -53,9 +53,12 @@
 
 #![cfg(feature = "heif")]
 
-use oxideav_h265::heif::{self, ImageGrid, Property};
+use oxideav_h265::heif::{self, ImageGrid, ImageOverlay, Property};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // BitExact is the round-3+ promotion target — no fixture is
+                    // tagged BitExact in round 2 yet, but the variant is wired
+                    // through so the future tightening is a one-line tag flip.
 enum Tier {
     /// Expect a successful decode whose output matches `expected.png`
     /// byte-for-byte. Promote a `ReportOnly` fixture to this once the
@@ -230,6 +233,20 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     // 4. Detected feature signals (informational).
     if let Some(alpha_id) = heif::find_alpha_item_id(&hdr.meta, primary_id) {
         msgs.push(format!("alpha: aux_item={alpha_id} (urn=auxid:1)"));
+        // Try to decode the alpha plane on its own. Most monochrome
+        // HEVC bitstreams won't decode through `oxideav-h265` yet
+        // (chroma_format_idc=0 isn't pixel-emitting), so this is
+        // expected to ERR with an Unsupported message — the test
+        // surfaces it for round-3 visibility.
+        match heif::decode_alpha_for_primary(fx.heic) {
+            Ok(Some(vf)) => msgs.push(format!(
+                "alpha decode: ok (planes={} stride[0]={})",
+                vf.planes.len(),
+                vf.planes[0].stride
+            )),
+            Ok(None) => msgs.push("alpha decode: no aux item (race?)".to_string()),
+            Err(e) => msgs.push(format!("alpha decode: ERR {e}")),
+        }
     }
     if let Some(Property::Ispe(e)) = hdr.meta.property_for(primary_id, b"ispe") {
         msgs.push(format!("ispe: {}x{}", e.width, e.height));
@@ -252,6 +269,20 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     let cdsc_targets = hdr.meta.iref_targets(b"cdsc", primary_id);
     if !cdsc_targets.is_empty() {
         msgs.push(format!("cdsc (from primary): {cdsc_targets:?}"));
+    }
+    // Overlay descriptor inspection.
+    if info.item_type == *b"iovl" {
+        let n_refs = dimg_targets.len();
+        match heif::item_bytes_in(fx.heic, &hdr.meta, primary_id) {
+            Ok(iovl_bytes) => match ImageOverlay::parse(iovl_bytes, n_refs) {
+                Ok(o) => msgs.push(format!(
+                    "iovl: canvas={}x{} fill_rgba={:?} offsets={:?}",
+                    o.output_width, o.output_height, o.canvas_fill_rgba, o.offsets,
+                )),
+                Err(e) => msgs.push(format!("iovl: parse ERR {e}")),
+            },
+            Err(e) => msgs.push(format!("iovl: item_bytes ERR {e}")),
+        }
     }
     // Grid descriptor inspection.
     if info.item_type == *b"grid" {
@@ -330,6 +361,9 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
 
 /// Plane-level byte equality. Compares only the planes both frames
 /// have in common; mismatched plane counts always fail.
+#[allow(dead_code)] // Wired in for the round-3+ BitExact promotion; round 2
+                    // ships every fixture as ReportOnly so this helper isn't
+                    // hit yet.
 fn compare_bit_exact(
     oracle: &oxideav_core::VideoFrame,
     actual: &oxideav_core::VideoFrame,

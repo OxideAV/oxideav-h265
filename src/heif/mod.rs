@@ -455,6 +455,169 @@ impl ImageGrid {
     }
 }
 
+/// `ImageOverlay` derived-item payload — ISO/IEC 23008-12 §6.6.2.3.3.
+/// The item bytes for an `item_type == 'iovl'` have the layout:
+///
+/// ```text
+/// u8 version                (must be 0)
+/// u8 flags                  (bit 0 = 1: 32-bit dims+offsets, else 16-bit)
+/// u16 canvas_fill_R         (always 16-bit per spec, regardless of flags)
+/// u16 canvas_fill_G
+/// u16 canvas_fill_B
+/// u16 canvas_fill_A
+/// uN output_width
+/// uN output_height
+/// per dimg-referenced source image (in iref order):
+///   sN horizontal_offset
+///   sN vertical_offset
+/// ```
+///
+/// `dimg` reference order on the item gives the layer order (back-to-
+/// front); the per-source `(h_offset, v_offset)` is signed and may be
+/// negative so a layer can spill past the canvas edge. The number of
+/// `(offset_x, offset_y)` pairs equals the `dimg` reference count;
+/// pass that count via `n_refs` so the parser knows when to stop.
+#[derive(Clone, Debug)]
+pub struct ImageOverlay {
+    pub version: u8,
+    pub flags: u8,
+    pub canvas_fill_rgba: [u16; 4],
+    pub output_width: u32,
+    pub output_height: u32,
+    /// Per constituent `(h_offset, v_offset)` in **luma** pixels.
+    pub offsets: Vec<(i32, i32)>,
+}
+
+impl ImageOverlay {
+    /// Parse an `iovl`-item payload. `n_refs` is the count of `dimg`
+    /// references on the item — the parser reads exactly that many
+    /// `(h_offset, v_offset)` pairs after the canvas declaration.
+    pub fn parse(payload: &[u8], n_refs: usize) -> Result<Self> {
+        if payload.len() < 12 {
+            return Err(Error::invalid(format!(
+                "heif: iovl payload {} bytes < 12 (version + flags + RGBA fill)",
+                payload.len()
+            )));
+        }
+        let version = payload[0];
+        if version != 0 {
+            return Err(Error::invalid(format!("heif: iovl version {version} != 0")));
+        }
+        let flags = payload[1];
+        let wide = (flags & 1) != 0;
+        let mut canvas_fill_rgba = [0u16; 4];
+        for (i, w) in canvas_fill_rgba.iter_mut().enumerate() {
+            *w = u16::from_be_bytes([payload[2 + i * 2], payload[3 + i * 2]]);
+        }
+        let mut pos = 10;
+        let dim_bytes = if wide { 4 } else { 2 };
+        if payload.len() < pos + dim_bytes * 2 {
+            return Err(Error::invalid("heif: iovl truncated at output_width/height"));
+        }
+        let output_width = read_var_be(payload, pos, wide)?;
+        pos += dim_bytes;
+        let output_height = read_var_be(payload, pos, wide)?;
+        pos += dim_bytes;
+        let off_bytes = dim_bytes;
+        if payload.len() < pos + 2 * off_bytes * n_refs {
+            return Err(Error::invalid(format!(
+                "heif: iovl truncated at per-ref offsets (need {} bytes for {} refs)",
+                2 * off_bytes * n_refs,
+                n_refs
+            )));
+        }
+        let mut offsets = Vec::with_capacity(n_refs);
+        for _ in 0..n_refs {
+            let h = read_var_be_signed(payload, pos, wide)?;
+            pos += off_bytes;
+            let v = read_var_be_signed(payload, pos, wide)?;
+            pos += off_bytes;
+            offsets.push((h, v));
+        }
+        Ok(Self {
+            version,
+            flags,
+            canvas_fill_rgba,
+            output_width,
+            output_height,
+            offsets,
+        })
+    }
+}
+
+fn read_var_be(buf: &[u8], at: usize, wide: bool) -> Result<u32> {
+    if wide {
+        if at + 4 > buf.len() {
+            return Err(Error::invalid("heif: var_be truncated u32"));
+        }
+        Ok(u32::from_be_bytes([
+            buf[at],
+            buf[at + 1],
+            buf[at + 2],
+            buf[at + 3],
+        ]))
+    } else {
+        if at + 2 > buf.len() {
+            return Err(Error::invalid("heif: var_be truncated u16"));
+        }
+        Ok(u16::from_be_bytes([buf[at], buf[at + 1]]) as u32)
+    }
+}
+
+fn read_var_be_signed(buf: &[u8], at: usize, wide: bool) -> Result<i32> {
+    if wide {
+        if at + 4 > buf.len() {
+            return Err(Error::invalid("heif: var_be_signed truncated i32"));
+        }
+        Ok(i32::from_be_bytes([
+            buf[at],
+            buf[at + 1],
+            buf[at + 2],
+            buf[at + 3],
+        ]))
+    } else {
+        if at + 2 > buf.len() {
+            return Err(Error::invalid("heif: var_be_signed truncated i16"));
+        }
+        Ok(i16::from_be_bytes([buf[at], buf[at + 1]]) as i32)
+    }
+}
+
+/// Decode any single HEVC-coded item by id (`hvc1` / `hev1`). Useful
+/// for callers that want to walk auxiliary / thumbnail / burst items
+/// alongside the primary; the public [`decode_primary`] is the right
+/// entry point for the typical "open this HEIC and give me the
+/// picture" path.
+pub fn decode_item(file: &[u8], item_id: u32) -> Result<VideoFrame> {
+    let hdr = parse_header(file)?;
+    let info = hdr.meta.item_by_id(item_id).ok_or_else(|| {
+        Error::invalid(format!("heif: decode_item: id {item_id} not in 'iinf'"))
+    })?;
+    if info.item_type != ITEM_TYPE_HVC1 && info.item_type != ITEM_TYPE_HEV1 {
+        return Err(Error::unsupported(format!(
+            "heif: decode_item: id {item_id} item_type '{}' is not 'hvc1' / 'hev1'",
+            type_str(&info.item_type)
+        )));
+    }
+    decode_hvc_item(&hdr, item_id)
+}
+
+/// Decode the alpha auxiliary item attached to the primary, if any.
+/// Returns `Ok(None)` when the primary has no alpha aux; an
+/// `Err(Error::Unsupported)` when the alpha plane is monochrome HEVC
+/// and the underlying decoder doesn't yet emit `Gray8` plane output.
+pub fn decode_alpha_for_primary(file: &[u8]) -> Result<Option<VideoFrame>> {
+    let hdr = parse_header(file)?;
+    let primary_id = hdr
+        .meta
+        .primary_item_id
+        .ok_or_else(|| Error::invalid("heif: missing 'pitm'"))?;
+    let Some(alpha_id) = find_alpha_item_id(&hdr.meta, primary_id) else {
+        return Ok(None);
+    };
+    decode_hvc_item(&hdr, alpha_id).map(Some)
+}
+
 /// Locate the alpha auxiliary item for `primary_id`. An item qualifies
 /// when:
 ///
@@ -828,6 +991,69 @@ mod tests {
         buf.extend_from_slice(b"ftyp");
         buf.extend_from_slice(&ftyp);
         assert!(probe(&buf));
+    }
+
+    #[test]
+    fn image_grid_parses_16bit() {
+        // version=0 flags=0 rows-1=1 cols-1=1 → 2x2 grid; output 256x128.
+        let buf = [0u8, 0, 1, 1, 0x01, 0x00, 0x00, 0x80];
+        let g = ImageGrid::parse(&buf).unwrap();
+        assert_eq!(g.rows, 2);
+        assert_eq!(g.columns, 2);
+        assert_eq!(g.output_width, 256);
+        assert_eq!(g.output_height, 128);
+        assert_eq!(g.expected_tile_count(), 4);
+    }
+
+    #[test]
+    fn image_grid_parses_32bit() {
+        // flags bit 0 = 1 → 32-bit dims.
+        let mut buf = vec![0u8, 1, 0, 0]; // version, flags=1, rows=1 cols=1
+        buf.extend_from_slice(&65536u32.to_be_bytes());
+        buf.extend_from_slice(&32768u32.to_be_bytes());
+        let g = ImageGrid::parse(&buf).unwrap();
+        assert_eq!(g.rows, 1);
+        assert_eq!(g.columns, 1);
+        assert_eq!(g.output_width, 65536);
+        assert_eq!(g.output_height, 32768);
+    }
+
+    #[test]
+    fn image_grid_rejects_short_payload() {
+        let buf = [0u8, 0, 0, 0]; // 4 bytes < 8
+        assert!(ImageGrid::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn image_overlay_parses_16bit_two_layers() {
+        // version 0, flags 0, RGBA fill = (0x4000, 0x4000, 0x4000, 0xFFFF),
+        // canvas 256x256, two layers at (96, 96) and (-1, 0).
+        let mut buf = Vec::new();
+        buf.push(0); // version
+        buf.push(0); // flags
+        buf.extend_from_slice(&0x4000u16.to_be_bytes());
+        buf.extend_from_slice(&0x4000u16.to_be_bytes());
+        buf.extend_from_slice(&0x4000u16.to_be_bytes());
+        buf.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        buf.extend_from_slice(&256u16.to_be_bytes());
+        buf.extend_from_slice(&256u16.to_be_bytes());
+        // Layer 1: (96, 96)
+        buf.extend_from_slice(&96i16.to_be_bytes());
+        buf.extend_from_slice(&96i16.to_be_bytes());
+        // Layer 2: (-1, 0) — exercises signed offset
+        buf.extend_from_slice(&(-1i16).to_be_bytes());
+        buf.extend_from_slice(&0i16.to_be_bytes());
+        let o = ImageOverlay::parse(&buf, 2).unwrap();
+        assert_eq!(o.canvas_fill_rgba, [0x4000, 0x4000, 0x4000, 0xFFFF]);
+        assert_eq!(o.output_width, 256);
+        assert_eq!(o.output_height, 256);
+        assert_eq!(o.offsets, vec![(96, 96), (-1, 0)]);
+    }
+
+    #[test]
+    fn alpha_urn_constant_matches_spec() {
+        // §6.6.2.1.1 — the URN for the HEVC alpha auxiliary type.
+        assert_eq!(ALPHA_URN_HEVC, "urn:mpeg:hevc:2015:auxid:1");
     }
 
     #[test]
