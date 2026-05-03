@@ -253,6 +253,13 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     if let Some(Property::Colr(c)) = hdr.meta.property_for(primary_id, b"colr") {
         msgs.push(format!("colr: {c:?}"));
     }
+    if let Some(Property::Clap(c)) = hdr.meta.property_for(primary_id, b"clap") {
+        msgs.push(format!(
+            "clap: width={}/{} height={}/{} h_off={}/{} v_off={}/{}",
+            c.width_n, c.width_d, c.height_n, c.height_d,
+            c.horiz_off_n, c.horiz_off_d, c.vert_off_n, c.vert_off_d,
+        ));
+    }
     let dimg_targets = hdr.meta.iref_targets(b"dimg", primary_id);
     if !dimg_targets.is_empty() {
         msgs.push(format!("dimg: {dimg_targets:?}"));

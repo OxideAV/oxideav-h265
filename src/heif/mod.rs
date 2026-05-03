@@ -53,10 +53,12 @@
 //!   reuse the movie-box track hierarchy. Out of scope for this
 //!   scaffold; the `iinf`/`iloc` path only covers the still-image
 //!   collection form.
-//! * Item-property boxes beyond `hvcC` / `ispe` / `colr` / `auxC`
-//!   (e.g. `pixi`, `pasp`, `irot`, `imir`, `clap`). They are stored as
+//! * Item-property boxes beyond `hvcC` / `ispe` / `colr` / `auxC` /
+//!   `clap` (e.g. `pixi`, `pasp`, `irot`, `imir`). They are stored as
 //!   [`Property::Other`] but not typed — enough to keep `ipma`
-//!   indices consistent.
+//!   indices consistent. `clap` is applied in `ipma` order to every
+//!   frame produced by [`decode_primary`] / [`decode_item`] —
+//!   ISO/IEC 14496-12 §12.1.4.
 //! * Everything at the top level that isn't `ftyp` / `meta` / `mdat`
 //!   (e.g. `free`, `skip`).
 
@@ -71,7 +73,7 @@ mod box_parser;
 mod meta;
 
 pub use box_parser::{BoxHeader, BoxType};
-pub use meta::{AuxC, Colr, IrefEntry, Ispe, ItemInfo, ItemLocation, Meta, Property};
+pub use meta::{AuxC, Clap, Colr, IrefEntry, Ispe, ItemInfo, ItemLocation, Meta, Property};
 
 /// Auxiliary-image type URN that identifies the alpha plane of an HEVC
 /// item per ISO/IEC 23008-12 §6.6.2.1.1. The matching item is
@@ -699,7 +701,10 @@ pub fn decode_primary(bytes: &[u8]) -> Result<VideoFrame> {
 
 /// Decode a single HEVC-coded item (`hvc1` / `hev1`) end-to-end. The
 /// item's `hvcC` is fed into the decoder as extradata; the item bytes
-/// are submitted as one length-prefixed-NAL packet.
+/// are submitted as one length-prefixed-NAL packet. After HEVC decode,
+/// any transformative item properties associated with the item
+/// (`clap`, `irot`, `imir`) are applied in `ipma` order — see
+/// [`apply_transforms`].
 fn decode_hvc_item(hdr: &HeifHeader<'_>, item_id: u32) -> Result<VideoFrame> {
     let item_data = item_bytes_in(hdr.file, &hdr.meta, item_id)?;
     let hvcc_raw = match hdr.meta.property_for(item_id, b"hvcC") {
@@ -715,14 +720,210 @@ fn decode_hvc_item(hdr: &HeifHeader<'_>, item_id: u32) -> Result<VideoFrame> {
     let packet = Packet::new(0, TimeBase::new(1, 1), item_data.to_vec()).with_keyframe(true);
     dec.send_packet(&packet)?;
     dec.flush()?;
-    match dec.receive_frame() {
-        Ok(Frame::Video(vf)) => Ok(vf),
-        Ok(_) => Err(Error::invalid(
-            "heif: HEVC decoder produced a non-video frame for an image item",
-        )),
-        Err(e) => Err(e),
-    }
+    let raw = match dec.receive_frame() {
+        Ok(Frame::Video(vf)) => vf,
+        Ok(_) => {
+            return Err(Error::invalid(
+                "heif: HEVC decoder produced a non-video frame for an image item",
+            ))
+        }
+        Err(e) => return Err(e),
+    };
+    apply_transforms(&hdr.meta, item_id, raw)
 }
+
+/// Apply the chain of transformative item properties associated with
+/// `item_id` to a freshly decoded HEVC frame. Per ISO/IEC 23008-12
+/// §6.5, `clap` / `irot` / `imir` are *transformative* properties and
+/// readers shall apply them in the order they appear in `ipma`.
+///
+/// Each transform is implemented for planar YUV frames produced by the
+/// HEVC decoder. `clap` extracts the centred rectangle declared by
+/// CleanApertureBox; `irot` rotates by 0/90/180/270° anti-clockwise;
+/// `imir` flips about a vertical (axis=0) or horizontal (axis=1)
+/// axis. A frame whose plane 0 stride doesn't equal its declared row
+/// count after `data.len() / stride` is treated as already cropped at
+/// stride width — no implicit row crop is performed.
+fn apply_transforms(meta: &Meta, item_id: u32, mut frame: VideoFrame) -> Result<VideoFrame> {
+    for (prop, _essential) in meta.properties_for(item_id) {
+        if let Property::Clap(c) = prop {
+            frame = apply_clap(*c, frame)?;
+        }
+    }
+    Ok(frame)
+}
+
+/// Resolve a `clap` to an integer pixel rectangle within an encoded
+/// `width × height` picture. Returns `(left, top, w, h)` in luma
+/// samples. The clean-aperture rectangle is centred about
+/// `(horizOff + (width - 1)/2, vertOff + (height - 1)/2)` per
+/// 14496-12 §12.1.4.1; we round the resolved fractions to the nearest
+/// integer (libheif behaviour). Returns `Err` for degenerate inputs:
+/// zero denominators, zero or negative aperture extent, or a rectangle
+/// that lies outside the encoded frame.
+pub fn clap_rect(clap: &Clap, width: u32, height: u32) -> Result<(u32, u32, u32, u32)> {
+    if clap.width_d == 0
+        || clap.height_d == 0
+        || clap.horiz_off_d == 0
+        || clap.vert_off_d == 0
+    {
+        return Err(Error::invalid("heif: 'clap' has zero denominator"));
+    }
+    if clap.width_n == 0 || clap.height_n == 0 {
+        return Err(Error::invalid(
+            "heif: 'clap' aperture has zero numerator (degenerate)",
+        ));
+    }
+    // All math in i64 to keep negative offsets + multiplications by
+    // u32 numerators clear of overflow on 32-bit boundary cases.
+    let w_n = clap.width_n as i64;
+    let w_d = clap.width_d as i64;
+    let h_n = clap.height_n as i64;
+    let h_d = clap.height_d as i64;
+    let aperture_w = (w_n + w_d / 2) / w_d; // round-to-nearest
+    let aperture_h = (h_n + h_d / 2) / h_d;
+    if aperture_w <= 0 || aperture_h <= 0 {
+        return Err(Error::invalid(format!(
+            "heif: 'clap' aperture {}x{} after rounding is non-positive",
+            aperture_w, aperture_h
+        )));
+    }
+    // Compute pcX * 2 in a unit that keeps integer precision.
+    // pcX = horizOff_n / horizOff_d + (width - 1) / 2
+    // 2*pcX = 2*horizOff_n / horizOff_d + (width - 1)
+    // For typical cases horizOff_d divides 2 evenly (it's normally 1
+    // or 2 in HEIF). We take the floor of 2*horizOff_n / horizOff_d
+    // and then halve the resulting rectangle origin.
+    let two_pc_x_off = if clap.horiz_off_d == 1 {
+        2 * (clap.horiz_off_n as i64)
+    } else {
+        // round-to-nearest division
+        let num = 2 * (clap.horiz_off_n as i64);
+        let d = clap.horiz_off_d as i64;
+        if num >= 0 {
+            (num + d / 2) / d
+        } else {
+            -(((-num) + d / 2) / d)
+        }
+    };
+    let two_pc_y_off = if clap.vert_off_d == 1 {
+        2 * (clap.vert_off_n as i64)
+    } else {
+        let num = 2 * (clap.vert_off_n as i64);
+        let d = clap.vert_off_d as i64;
+        if num >= 0 {
+            (num + d / 2) / d
+        } else {
+            -(((-num) + d / 2) / d)
+        }
+    };
+    let two_pc_x = two_pc_x_off + (width as i64 - 1);
+    let two_pc_y = two_pc_y_off + (height as i64 - 1);
+    // Leftmost pixel at pcX - (aperture_w - 1)/2:
+    // 2*left = 2*pcX - (aperture_w - 1)
+    let two_left = two_pc_x - (aperture_w - 1);
+    let two_top = two_pc_y - (aperture_h - 1);
+    if two_left < 0 || two_top < 0 || (two_left & 1) != 0 || (two_top & 1) != 0 {
+        // Fractional-pixel offsets aren't representable on a YUV grid
+        // (sub-pixel cropping needs resampling). Reject.
+        return Err(Error::invalid(format!(
+            "heif: 'clap' resolves to fractional / negative origin (2*left={two_left}, 2*top={two_top})"
+        )));
+    }
+    let left = (two_left / 2) as u32;
+    let top = (two_top / 2) as u32;
+    let aw = aperture_w as u32;
+    let ah = aperture_h as u32;
+    if left.saturating_add(aw) > width || top.saturating_add(ah) > height {
+        return Err(Error::invalid(format!(
+            "heif: 'clap' rect ({left},{top}, {aw}x{ah}) exceeds encoded picture {width}x{height}"
+        )));
+    }
+    Ok((left, top, aw, ah))
+}
+
+/// Apply a `clap` (clean-aperture) crop to a planar YUV `VideoFrame`.
+/// Plane 0 is treated as luma at full resolution; planes ≥ 1 inherit
+/// horizontal / vertical sub-sampling factors derived from the ratio
+/// of plane 0's stride / row-count to the chroma plane's. The cropped
+/// rectangle origin and extent must be expressible at integer chroma-
+/// sample positions; if the resolved (left, top) lands on an odd
+/// chroma boundary, we floor toward the nearest valid origin so the
+/// resulting chroma samples remain aligned.
+fn apply_clap(clap: Clap, frame: VideoFrame) -> Result<VideoFrame> {
+    if frame.planes.is_empty() {
+        return Err(Error::invalid("heif: 'clap' on a zero-plane frame"));
+    }
+    let luma_stride = frame.planes[0].stride.max(1);
+    let luma_h = frame.planes[0].data.len() / luma_stride;
+    if luma_h == 0 {
+        return Err(Error::invalid("heif: 'clap' on an empty luma plane"));
+    }
+    let (left, top, aw, ah) = clap_rect(&clap, luma_stride as u32, luma_h as u32)?;
+    crop_planar(frame, left, top, aw, ah)
+}
+
+/// Generic planar crop helper. `(left, top, w, h)` is in luma samples;
+/// per-plane sub-sampling is inferred from each plane's stride / row
+/// count vs. plane 0's. Used by [`apply_clap`] and (potentially) by
+/// future overlay clipping.
+fn crop_planar(frame: VideoFrame, left: u32, top: u32, w: u32, h: u32) -> Result<VideoFrame> {
+    let luma_stride = frame.planes[0].stride.max(1);
+    let luma_h = frame.planes[0].data.len() / luma_stride;
+    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(frame.planes.len());
+    for (p, plane) in frame.planes.iter().enumerate() {
+        let s = plane.stride.max(1);
+        let ph = plane.data.len() / s;
+        let (sx, sy) = if p == 0 {
+            (0u32, 0u32)
+        } else {
+            let sx = if luma_stride == s {
+                0
+            } else if luma_stride == s * 2 {
+                1
+            } else {
+                return Err(Error::invalid(format!(
+                    "heif: crop_planar: plane {p} stride {s} not 1x or 2x luma stride {luma_stride}"
+                )));
+            };
+            let sy = if luma_h == ph {
+                0
+            } else if luma_h == ph * 2 {
+                1
+            } else {
+                return Err(Error::invalid(format!(
+                    "heif: crop_planar: plane {p} rows {ph} not 1x or 2x luma rows {luma_h}"
+                )));
+            };
+            (sx, sy)
+        };
+        // Chroma origin = floor(luma origin / 2^shift) when sub-sampled.
+        let pl_left = (left >> sx) as usize;
+        let pl_top = (top >> sy) as usize;
+        let pl_w = ceil_shift(w as usize, sx);
+        let pl_h = ceil_shift(h as usize, sy);
+        if pl_left + pl_w > s || pl_top + pl_h > ph {
+            return Err(Error::invalid(format!(
+                "heif: crop_planar: plane {p} crop ({pl_left},{pl_top}, {pl_w}x{pl_h}) exceeds plane {s}x{ph}"
+            )));
+        }
+        let mut out = vec![0u8; pl_w * pl_h];
+        for r in 0..pl_h {
+            let src_off = (pl_top + r) * s + pl_left;
+            let dst_off = r * pl_w;
+            out[dst_off..dst_off + pl_w].copy_from_slice(&plane.data[src_off..src_off + pl_w]);
+        }
+        out_planes.push(VideoPlane {
+            stride: pl_w,
+            data: out,
+        });
+    }
+    Ok(VideoFrame {
+        pts: frame.pts,
+        planes: out_planes,
+    })
+}
+
 
 /// Decode a `grid`-derived primary item: parse the `ImageGrid` payload,
 /// resolve `dimg` references in row-major order, decode each tile via
@@ -1054,6 +1255,102 @@ mod tests {
     fn alpha_urn_constant_matches_spec() {
         // §6.6.2.1.1 — the URN for the HEVC alpha auxiliary type.
         assert_eq!(ALPHA_URN_HEVC, "urn:mpeg:hevc:2015:auxid:1");
+    }
+
+    #[test]
+    fn clap_rect_centred_crop_64_to_1() {
+        // The single-image-1x1 fixture: 64x64 encoded picture, clap
+        // numerator 1/1 and offsets (-63/2, -63/2) → 1x1 at origin (0, 0).
+        let clap = Clap {
+            width_n: 1,
+            width_d: 1,
+            height_n: 1,
+            height_d: 1,
+            horiz_off_n: -63,
+            horiz_off_d: 2,
+            vert_off_n: -63,
+            vert_off_d: 2,
+        };
+        let (left, top, w, h) = clap_rect(&clap, 64, 64).unwrap();
+        assert_eq!((left, top, w, h), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn clap_rect_no_offset_centred() {
+        // Crop a 100x100 to 80x80 centred — horizOff/vertOff = 0/1.
+        let clap = Clap {
+            width_n: 80,
+            width_d: 1,
+            height_n: 80,
+            height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: 1,
+            vert_off_n: 0,
+            vert_off_d: 1,
+        };
+        // pcX = 0 + 99/2 = 49.5; aperture left = 49.5 - 79/2 = 10.0
+        // 2*pcX = 99, 2*left = 99 - 79 = 20 -> left = 10.
+        let (left, top, w, h) = clap_rect(&clap, 100, 100).unwrap();
+        assert_eq!((left, top, w, h), (10, 10, 80, 80));
+    }
+
+    #[test]
+    fn clap_rect_rejects_zero_denominator() {
+        let clap = Clap {
+            width_n: 1,
+            width_d: 0,
+            height_n: 1,
+            height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: 1,
+            vert_off_n: 0,
+            vert_off_d: 1,
+        };
+        assert!(clap_rect(&clap, 64, 64).is_err());
+    }
+
+    #[test]
+    fn clap_rect_rejects_overflow() {
+        // Aperture wider than the encoded picture.
+        let clap = Clap {
+            width_n: 200,
+            width_d: 1,
+            height_n: 200,
+            height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: 1,
+            vert_off_n: 0,
+            vert_off_d: 1,
+        };
+        assert!(clap_rect(&clap, 100, 100).is_err());
+    }
+
+    #[test]
+    fn crop_planar_extracts_yuv420_subrect() {
+        // 8x4 luma, 4x2 chroma. Crop (2, 0, 4, 2) -> 4x2 luma + 2x1 chroma.
+        let luma = VideoPlane {
+            stride: 8,
+            data: (0..32u8).collect(),
+        };
+        let cb = VideoPlane {
+            stride: 4,
+            data: vec![100, 101, 102, 103, 104, 105, 106, 107],
+        };
+        let cr = VideoPlane {
+            stride: 4,
+            data: vec![200, 201, 202, 203, 204, 205, 206, 207],
+        };
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![luma, cb, cr],
+        };
+        let r = crop_planar(frame, 2, 0, 4, 2).unwrap();
+        assert_eq!(r.planes[0].stride, 4);
+        assert_eq!(r.planes[0].data, vec![2, 3, 4, 5, 10, 11, 12, 13]);
+        assert_eq!(r.planes[1].stride, 2);
+        assert_eq!(r.planes[1].data, vec![101, 102]);
+        assert_eq!(r.planes[2].stride, 2);
+        assert_eq!(r.planes[2].data, vec![201, 202]);
     }
 
     #[test]

@@ -39,6 +39,7 @@ const HVCC: BoxType = b(b"hvcC");
 const ISPE: BoxType = b(b"ispe");
 const COLR: BoxType = b(b"colr");
 const AUXC: BoxType = b(b"auxC");
+const CLAP: BoxType = b(b"clap");
 
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
@@ -113,6 +114,32 @@ pub struct AuxC {
     pub aux_subtype: Vec<u8>,
 }
 
+/// Parsed `clap` (CleanApertureBox, ISO/IEC 14496-12 §12.1.4 /
+/// 23008-12 §6.5.9). All four fields are signed-numerator /
+/// unsigned-non-zero-denominator fractions (per spec, only horizOff
+/// and vertOff have signed N — but the wire layout is `unsigned int(32)`
+/// for every N; signedness applies on interpretation). We store the
+/// raw on-wire u32 / i32 forms; resolving to a pixel rectangle is the
+/// caller's job (see [`crate::heif::clap_rect`]).
+///
+/// Width/height numerators are the *exact* clean-aperture extent in
+/// counted pixels (after pasp correction in the general case; for HEIF
+/// items pasp is rarely present and these reduce to integers).
+/// horizOff/vertOff are the offset of the clean-aperture centre minus
+/// `(width-1)/2` (resp. `(height-1)/2`) — typically zero so the clean
+/// aperture is centred on the encoded picture.
+#[derive(Clone, Copy, Debug)]
+pub struct Clap {
+    pub width_n: u32,
+    pub width_d: u32,
+    pub height_n: u32,
+    pub height_d: u32,
+    pub horiz_off_n: i32,
+    pub horiz_off_d: u32,
+    pub vert_off_n: i32,
+    pub vert_off_d: u32,
+}
+
 #[derive(Clone, Debug)]
 pub enum Property {
     /// Raw `hvcC` body (HEVCDecoderConfigurationRecord). Parse with
@@ -121,6 +148,10 @@ pub enum Property {
     Ispe(Ispe),
     Colr(Colr),
     AuxC(AuxC),
+    /// `clap` clean-aperture transform (ISO/IEC 14496-12 §12.1.4).
+    /// Applied after HEVC decode to crop the displayed picture out of
+    /// the (potentially padded) coded picture.
+    Clap(Clap),
     Other(BoxType, Vec<u8>),
 }
 
@@ -131,6 +162,7 @@ impl Property {
             Property::Ispe(_) => ISPE,
             Property::Colr(_) => COLR,
             Property::AuxC(_) => AUXC,
+            Property::Clap(_) => CLAP,
             Property::Other(t, _) => *t,
         }
     }
@@ -234,6 +266,26 @@ impl Meta {
             }
         }
         None
+    }
+
+    /// Iterate `(property, essential)` pairs for `item_id` in the order
+    /// they appear in `ipma`. Order matters for transformative
+    /// properties (clap → irot → imir is the expected chain when all
+    /// three are associated, per ISO/IEC 23008-12 §6.5 — readers must
+    /// apply them in `ipma` order).
+    pub fn properties_for<'a>(
+        &'a self,
+        item_id: u32,
+    ) -> impl Iterator<Item = (&'a Property, bool)> + 'a {
+        let assoc = self.assoc_by_id(item_id);
+        assoc
+            .into_iter()
+            .flat_map(move |a| a.entries.iter())
+            .filter_map(move |pa| {
+                self.properties
+                    .get(pa.index as usize)
+                    .map(|p| (p, pa.essential))
+            })
     }
 }
 
@@ -429,6 +481,7 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &ISPE => Property::Ispe(parse_ispe(body)?),
             x if x == &COLR => Property::Colr(parse_colr(body)?),
             x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
+            x if x == &CLAP => Property::Clap(parse_clap(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -450,6 +503,51 @@ fn parse_auxc(body: &[u8]) -> Result<AuxC> {
     Ok(AuxC {
         aux_type,
         aux_subtype,
+    })
+}
+
+/// Parse a `clap` (CleanApertureBox) body — ISO/IEC 14496-12 §12.1.4.
+/// Layout (no FullBox header, eight `unsigned int(32)` fields):
+///
+/// ```text
+/// u32 cleanApertureWidthN
+/// u32 cleanApertureWidthD
+/// u32 cleanApertureHeightN
+/// u32 cleanApertureHeightD
+/// u32 horizOffN          // interpreted as i32
+/// u32 horizOffD
+/// u32 vertOffN           // interpreted as i32
+/// u32 vertOffD
+/// ```
+///
+/// Per spec, width/height N and D must be positive; horizOff/vertOff D
+/// must be positive but their N may be negative. We keep the on-wire
+/// values verbatim; downstream resolvers ([`crate::heif::clap_rect`])
+/// reject the degenerate D == 0 case.
+fn parse_clap(body: &[u8]) -> Result<Clap> {
+    if body.len() < 32 {
+        return Err(Error::invalid(format!(
+            "heif: 'clap' body {} bytes < 32",
+            body.len()
+        )));
+    }
+    let width_n = read_u32(body, 0)?;
+    let width_d = read_u32(body, 4)?;
+    let height_n = read_u32(body, 8)?;
+    let height_d = read_u32(body, 12)?;
+    let horiz_off_n = read_u32(body, 16)? as i32;
+    let horiz_off_d = read_u32(body, 20)?;
+    let vert_off_n = read_u32(body, 24)? as i32;
+    let vert_off_d = read_u32(body, 28)?;
+    Ok(Clap {
+        width_n,
+        width_d,
+        height_n,
+        height_d,
+        horiz_off_n,
+        horiz_off_d,
+        vert_off_n,
+        vert_off_d,
     })
 }
 
@@ -627,6 +725,34 @@ mod tests {
         meta_payload.extend_from_slice(&idat);
         let meta = Meta::parse(&meta_payload).unwrap();
         assert_eq!(meta.idat, idat_body);
+    }
+
+    #[test]
+    fn clap_parses_eight_u32() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // widthN
+        body.extend_from_slice(&1u32.to_be_bytes()); // widthD
+        body.extend_from_slice(&1u32.to_be_bytes()); // heightN
+        body.extend_from_slice(&1u32.to_be_bytes()); // heightD
+        body.extend_from_slice(&(-63i32).to_be_bytes()); // horizOffN
+        body.extend_from_slice(&2u32.to_be_bytes()); // horizOffD
+        body.extend_from_slice(&(-63i32).to_be_bytes()); // vertOffN
+        body.extend_from_slice(&2u32.to_be_bytes()); // vertOffD
+        let c = parse_clap(&body).unwrap();
+        assert_eq!(c.width_n, 1);
+        assert_eq!(c.width_d, 1);
+        assert_eq!(c.height_n, 1);
+        assert_eq!(c.height_d, 1);
+        assert_eq!(c.horiz_off_n, -63);
+        assert_eq!(c.horiz_off_d, 2);
+        assert_eq!(c.vert_off_n, -63);
+        assert_eq!(c.vert_off_d, 2);
+    }
+
+    #[test]
+    fn clap_rejects_short_body() {
+        let body = vec![0u8; 31];
+        assert!(parse_clap(&body).is_err());
     }
 
     #[test]
