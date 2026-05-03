@@ -270,14 +270,17 @@ fn corpus_walk_and_report() {
     );
 
     // Every fixture must at least pass probe + header walk — those
-    // come from the box parser side which is mature.
+    // come from the box parser side which is mature. The Ignored tier
+    // short-circuits before parse_header (probe + skip), so it's
+    // excluded from the parse_header total.
     assert_eq!(
         stats.probed_ok, stats.total,
         "probe should accept every corpus fixture"
     );
     assert_eq!(
-        stats.parsed_header_ok, stats.total,
-        "parse_header should walk every corpus fixture"
+        stats.parsed_header_ok,
+        stats.total - stats.ignored,
+        "parse_header should walk every non-Ignored corpus fixture"
     );
     // BitExact tier promotes are strict — once a fixture is tagged
     // BitExact, a divergence MUST fail the build.

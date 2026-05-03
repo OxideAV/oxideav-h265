@@ -1221,8 +1221,7 @@ fn composite_grid_frames(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<Video
     }
     // Build per-plane output buffers at the canvas size.
     let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(n_planes);
-    for p in 0..n_planes {
-        let (sx, sy) = shifts[p];
+    for &(sx, sy) in shifts.iter().take(n_planes) {
         let pw = ceil_shift(out_w, sx);
         let ph = ceil_shift(out_h, sy);
         out_planes.push(VideoPlane {
@@ -1398,8 +1397,7 @@ fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Resu
     // (the only layouts produced by the HEVC decoder this round). For
     // single-plane layouts (monochrome) only Y_fill is used.
     let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(n_planes);
-    for p in 0..n_planes {
-        let (sx, sy) = shifts[p];
+    for (p, &(sx, sy)) in shifts.iter().enumerate().take(n_planes) {
         let pw = ceil_shift(out_w, sx);
         let ph = ceil_shift(out_h, sy);
         let fill = match p {
