@@ -115,7 +115,16 @@ fn report_only_reason(name: &str) -> &'static str {
              that reads u16 samples from plane.data and produces 16-bit \
              packed RGB to match the Rgb48Le oracle"
         }
-        "still-yuv444" => "HEVC 4:4:4 (chroma_format_idc=3) not pixel-emitting",
+        "still-yuv444" => {
+            "HEVC 4:4:4 I-slice decode is enabled (round 30 lift); decoder \
+             pipeline produces a 3-plane planar YUV at full chroma resolution \
+             (sub_x=sub_y=1). The compare_bit_exact path infers sub_x / sub_y \
+             from cb_stride vs y_stride and would compare cleanly, but bit-\
+             exact parity against the oracle PNG isn't yet validated for an \
+             arbitrary HEIF-Main-4:4:4 stream — the encoder unit tests \
+             exercise 4:4:4 round-trip at PSNR ≥ 30 dB rather than byte-\
+             exact, so a real-encoder fixture may diverge"
+        }
         "image-sequence-3frame" => {
             "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
         }
