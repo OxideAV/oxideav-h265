@@ -768,11 +768,7 @@ fn apply_transforms(meta: &Meta, item_id: u32, mut frame: VideoFrame) -> Result<
 /// zero denominators, zero or negative aperture extent, or a rectangle
 /// that lies outside the encoded frame.
 pub fn clap_rect(clap: &Clap, width: u32, height: u32) -> Result<(u32, u32, u32, u32)> {
-    if clap.width_d == 0
-        || clap.height_d == 0
-        || clap.horiz_off_d == 0
-        || clap.vert_off_d == 0
-    {
+    if clap.width_d == 0 || clap.height_d == 0 || clap.horiz_off_d == 0 || clap.vert_off_d == 0 {
         return Err(Error::invalid("heif: 'clap' has zero denominator"));
     }
     if clap.width_n == 0 || clap.height_n == 0 {
@@ -1075,7 +1071,10 @@ fn apply_imir(imir: Imir, frame: VideoFrame) -> Result<VideoFrame> {
                 dst.copy_from_slice(src_row);
             }
         }
-        out_planes.push(VideoPlane { stride: s, data: out });
+        out_planes.push(VideoPlane {
+            stride: s,
+            data: out,
+        });
     }
     Ok(VideoFrame {
         pts: frame.pts,

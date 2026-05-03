@@ -256,8 +256,14 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     if let Some(Property::Clap(c)) = hdr.meta.property_for(primary_id, b"clap") {
         msgs.push(format!(
             "clap: width={}/{} height={}/{} h_off={}/{} v_off={}/{}",
-            c.width_n, c.width_d, c.height_n, c.height_d,
-            c.horiz_off_n, c.horiz_off_d, c.vert_off_n, c.vert_off_d,
+            c.width_n,
+            c.width_d,
+            c.height_n,
+            c.height_d,
+            c.horiz_off_n,
+            c.horiz_off_d,
+            c.vert_off_n,
+            c.vert_off_d,
         ));
     }
     if let Some(Property::Irot(r)) = hdr.meta.property_for(primary_id, b"irot") {
