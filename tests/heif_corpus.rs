@@ -90,8 +90,12 @@ fn report_only_reason(name: &str) -> &'static str {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
         "still-image-overlay" => {
-            "promoted to BitExact in round 5 — kept here as the slot stays valid \
-             if a future fixture variant reverts the iovl colr to BT.709 explicitly"
+            "iovl canvas-fill matrix matches the corpus convention (round 5 \
+             phase A) but the underlying HEVC layer pixels still diverge from \
+             the oracle: 97.3% of bytes differ with max |Δ|=160 after planar→\
+             packed RGB conversion through compare_bit_exact. Bisect the per-\
+             layer decode (background item 1 vs overlay item 2) before re-\
+             promoting"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "still-monochrome" => "HEVC monochrome (chroma_format_idc=0) not pixel-emitting",
@@ -140,10 +144,18 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
-        // Round-5 promoted: iovl canvas-fill conversion now picks the
-        // matrix from the iovl item's `colr nclx` (or BT.601 limited
-        // when no `colr` is associated), matching the corpus YUV→RGB
-        // compare convention. See `FillMatrix` in src/heif/mod.rs.
+        // Round-5 phase A made the iovl canvas-fill matrix match the
+        // corpus convention via `FillMatrix` in src/heif/mod.rs (see
+        // commit 57e21e1). That promotion was reverted in 293ac2a
+        // because the underlying HEVC layer pixels still diverge from
+        // the oracle once converted to RGB through `compare_bit_exact`
+        // (97.3% of bytes differ, max |Δ|=160 — far beyond a per-pixel
+        // round-trip precision drift). The comparator already runs the
+        // planar-YUV → packed-RGB step uniformly for every BitExact
+        // fixture (see `compare_bit_exact` below — wired in round 4 by
+        // f78b612), so the gap is in the layer pixel decode itself,
+        // not the comparator wiring. Stays ReportOnly until the per-
+        // layer divergence is bisected.
         fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
         fixture!("still-monochrome", ReportOnly),
