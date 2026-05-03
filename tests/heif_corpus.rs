@@ -1,23 +1,24 @@
 //! Integration test exercising the HEIF / HEIC scaffold against the
 //! 14-fixture corpus shipped at `tests/fixtures/heif/`.
 //!
-//! Compiled only when the `heif` feature is enabled — on a default
-//! build this file is empty and contributes no tests.
+//! Compiled only when the `heif` feature is enabled — which is the
+//! crate's default since `09a9203`, so this file actually executes in
+//! CI on every PR.
 //!
 //! # Tier system
 //!
 //! Each fixture is tagged with one of:
 //!
 //! * [`Tier::BitExact`] — we expect to decode the primary item end-to-
-//!   end and the resulting `VideoFrame` to match the planar projection
-//!   of the per-fixture `expected.png` byte-for-byte (after YUV→RGBA
-//!   conversion). This is the eventual goal; in round 2 nothing is
-//!   tagged BitExact yet because:
-//!   - We do not perform YUV → RGBA colorspace conversion in this
-//!     crate (that lives in `oxideav-pixfmt`).
-//!   - Several fixtures use HEVC profile/chroma combinations that the
-//!     `oxideav-h265` decoder does not yet emit pixels for
-//!     (Main 10, 4:4:4, monochrome).
+//!   end and the resulting `VideoFrame` to match `expected.png` byte-
+//!   for-byte after a YUV→RGB conversion of our HEVC output. The
+//!   conversion follows the BT.601 limited-range matrix by default —
+//!   the same convention oxideav-webp settled on in `155c954` (RFC
+//!   9649 §2.5; HEIC fixtures without an `nclx` `colr` follow the
+//!   ISO/IEC 23008-12 §6.5.5 default of BT.709 primaries with BT.601
+//!   matrix coefficients). When the primary item carries an `nclx`
+//!   `colr` we honour its `matrix_coefficients` (1 → BT.709, 6/5 →
+//!   BT.601) and `full_range_flag`.
 //!
 //! * [`Tier::ReportOnly`] — the test runs end-to-end but does not
 //!   fail on a divergence. Per-fixture statistics (decode succeeded /
@@ -40,35 +41,57 @@
 //! 4. We dispatch on primary item type:
 //!    * `hvc1` / `hev1` — try [`heif::decode_primary`].
 //!    * `grid` — try [`heif::decode_primary`] (per-tile decode + paste).
-//!    * `iovl` — recognised; not yet composited.
+//!    * `iovl` — try [`heif::decode_primary`] (round-3 phase C
+//!      composition).
 //!    * other (image sequence / metadata-only) — skipped per Tier.
 //! 5. Optional features are sniffed (alpha auxiliary item, embedded
 //!    ICC profile, dimg / cdsc / thmb iref edges) and reported.
-//!
-//! The expected PNG oracle is decoded for dimensional comparison; a
-//! true byte-level RGBA diff is deferred to round 3+ once the
-//! HEVC-decoder side covers Main10/4:4:4/monochrome and a YUV→RGBA
-//! converter is wired in.
+//! 6. For `BitExact` fixtures: HEVC YUV420 output is converted to
+//!    packed RGB24 via the per-fixture matrix and compared byte-for-
+//!    byte with the `expected.png` oracle.
 
 #![cfg(feature = "heif")]
 
-use oxideav_h265::heif::{self, ImageGrid, ImageOverlay, Property};
+use oxideav_h265::heif::{self, Colr, ImageGrid, ImageOverlay, Property};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // BitExact is the round-3+ promotion target — no fixture is
-                    // tagged BitExact in round 2 yet, but the variant is wired
-                    // through so the future tightening is a one-line tag flip.
 enum Tier {
     /// Expect a successful decode whose output matches `expected.png`
-    /// byte-for-byte. Promote a `ReportOnly` fixture to this once the
-    /// underlying HEVC decoder + YUV→RGBA conversion pipeline are
+    /// byte-for-byte after YUV→RGB conversion. Promote a `ReportOnly`
+    /// fixture to this once the underlying HEVC decoder pipeline is
     /// complete enough to satisfy it.
     BitExact,
     /// Run end-to-end and report stats but never fail on divergence.
-    /// Default for round 2 — every fixture starts here.
     ReportOnly,
     /// Out of scope this round (image sequences, pure-metadata items).
     Ignored,
+}
+
+/// Per-fixture reason a `ReportOnly` tier hasn't been promoted to
+/// `BitExact`. Surfaced in the round-end summary so the next round's
+/// task scope is a one-line read.
+fn report_only_reason(name: &str) -> &'static str {
+    match name {
+        "single-image-512x512-q60" => "decoder DPB residual mismatch (no exact ground truth)",
+        "single-image-with-thumbnail" => {
+            "thumbnail item iref present; primary decode parity not yet verified"
+        }
+        "still-image-with-alpha" => "alpha auxiliary uses HEVC monochrome (chroma_format_idc=0)",
+        "still-image-with-icc" => "ICC profile retained as Property::Other; no ICC-aware compare yet",
+        "still-image-with-exif" => "Exif metadata item only; primary decode parity not yet verified",
+        "still-image-with-xmp" => "XMP metadata item only; primary decode parity not yet verified",
+        "still-image-grid-2x2" => {
+            "grid composition lands; bit-exact tile-boundary parity not yet verified"
+        }
+        "still-image-overlay" => {
+            "iovl canvas fill uses BT.709; corpus expected.png is BT.601 default → 1 LSB drift"
+        }
+        "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
+        "still-monochrome" => "HEVC monochrome (chroma_format_idc=0) not pixel-emitting",
+        "still-10bit-main10" => "HEVC Main 10 not pixel-emitting end-to-end",
+        "still-yuv444" => "HEVC 4:4:4 (chroma_format_idc=3) not pixel-emitting",
+        _ => "tier left as ReportOnly pending bit-exact verification",
+    }
 }
 
 struct Fixture {
@@ -98,7 +121,8 @@ macro_rules! fixture {
 
 fn fixtures() -> Vec<Fixture> {
     vec![
-        fixture!("single-image-1x1", ReportOnly),
+        // Round-4 promoted: 64x64 HEVC → clap → 1x1 YUV → 1x1 RGB.
+        fixture!("single-image-1x1", BitExact),
         fixture!("single-image-512x512-q60", ReportOnly),
         fixture!("single-image-with-thumbnail", ReportOnly),
         fixture!("still-image-with-alpha", ReportOnly),
@@ -106,6 +130,16 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
+        // Round-4 left at ReportOnly: iovl composition lands on a YUV
+        // canvas, but `compose_overlay_frames` computes its canvas fill
+        // via the BT.709 limited-range matrix (see
+        // `bt709_limited_rgb_to_yuv` in src/heif/mod.rs) while the
+        // expected.png was generated without a `colr` — so the test's
+        // YUV→RGB compare defaults to BT.601 and round-trips the grey
+        // fill 1 LSB high. Promoting requires either matching the iovl
+        // fill matrix to the corpus convention or accepting a known-
+        // bounded ±1 LSB tolerance on canvas-fill pixels; both are out
+        // of scope for round 4.
         fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
         fixture!("still-monochrome", ReportOnly),
@@ -127,24 +161,101 @@ struct Stats {
     ignored: usize,
 }
 
+/// Round-end summary classification driving the report-card output.
+/// Filled in once per fixture by [`run_one`].
+#[derive(Clone, Debug)]
+enum Outcome {
+    /// Tier::BitExact + comparison succeeded.
+    BitExactPass,
+    /// Tier::BitExact + comparison failed (build-fail).
+    BitExactFail(String),
+    /// Tier::ReportOnly with a documented reason.
+    ReportOnly(&'static str),
+    /// Tier::Ignored — out of scope this round.
+    Ignored,
+    /// Probe / header / pitm failure: structural problem (build-fail).
+    Skipped(String),
+}
+
 #[test]
 fn corpus_walk_and_report() {
     let mut stats = Stats::default();
-    let mut all_messages = Vec::new();
+    let mut all_messages: Vec<(String, Vec<String>, Outcome)> = Vec::new();
     for fx in fixtures() {
         stats.total += 1;
-        let msgs = run_one(&fx, &mut stats);
-        all_messages.push((fx.name.to_string(), msgs));
+        let (msgs, outcome) = run_one(&fx, &mut stats);
+        all_messages.push((fx.name.to_string(), msgs, outcome));
     }
 
     eprintln!();
-    eprintln!("=== HEIF corpus report ===");
-    for (name, msgs) in &all_messages {
+    eprintln!("=== HEIF corpus per-fixture log ===");
+    for (name, msgs, _) in &all_messages {
         eprintln!("[{name}]");
         for m in msgs {
             eprintln!("  {m}");
         }
     }
+
+    // ---- Report card ------------------------------------------------
+    // Three sections so the next round's task scope is a one-line read.
+    eprintln!();
+    eprintln!("=== HEIF corpus report card ===");
+
+    eprintln!();
+    eprintln!("PROMOTED TO BIT-EXACT ({}):", stats.bit_exact);
+    let mut any_pass = false;
+    for (name, _, outcome) in &all_messages {
+        if matches!(outcome, Outcome::BitExactPass) {
+            eprintln!("  PASS  {name}");
+            any_pass = true;
+        }
+    }
+    if !any_pass {
+        eprintln!("  (none)");
+    }
+
+    eprintln!();
+    eprintln!("BIT-EXACT FAILED ({}):", stats.bit_exact_failed);
+    let mut any_fail = false;
+    for (name, _, outcome) in &all_messages {
+        if let Outcome::BitExactFail(why) = outcome {
+            eprintln!("  FAIL  {name}: {why}");
+            any_fail = true;
+        }
+    }
+    if !any_fail {
+        eprintln!("  (none)");
+    }
+
+    eprintln!();
+    eprintln!("STILL REPORT-ONLY (with reason):");
+    for (name, _, outcome) in &all_messages {
+        if let Outcome::ReportOnly(reason) = outcome {
+            eprintln!("  - {name}: {reason}");
+        }
+    }
+
+    eprintln!();
+    eprintln!("IGNORED (out of scope this round):");
+    for (name, _, outcome) in &all_messages {
+        if matches!(outcome, Outcome::Ignored) {
+            eprintln!("  - {name}");
+        }
+    }
+
+    let any_skipped = all_messages
+        .iter()
+        .any(|(_, _, o)| matches!(o, Outcome::Skipped(_)));
+    if any_skipped {
+        eprintln!();
+        eprintln!("STRUCTURAL FAILURE (probe / header / pitm):");
+        for (name, _, outcome) in &all_messages {
+            if let Outcome::Skipped(why) = outcome {
+                eprintln!("  ! {name}: {why}");
+            }
+        }
+    }
+
     eprintln!();
     eprintln!(
         "Totals: probed_ok={}/{} parsed_header_ok={} decoded_ok={} decode_failed={} bit_exact={}/{} ignored={}",
@@ -176,7 +287,7 @@ fn corpus_walk_and_report() {
     );
 }
 
-fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
+fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
     let mut msgs = Vec::new();
 
     // 1. probe
@@ -184,7 +295,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     msgs.push(format!("tier={:?} heic_bytes={}", fx.tier, fx.heic.len()));
     if !p {
         msgs.push("probe: REJECTED".to_string());
-        return msgs;
+        return (msgs, Outcome::Skipped("probe rejected ftyp brands".to_string()));
     }
     stats.probed_ok += 1;
     msgs.push("probe: ok".to_string());
@@ -192,7 +303,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     if matches!(fx.tier, Tier::Ignored) {
         stats.ignored += 1;
         msgs.push("ignored: out of scope this round (e.g. image sequence track)".to_string());
-        return msgs;
+        return (msgs, Outcome::Ignored);
     }
 
     // 2. parse_header
@@ -200,7 +311,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
         Ok(h) => h,
         Err(e) => {
             msgs.push(format!("parse_header: ERR {e}"));
-            return msgs;
+            return (msgs, Outcome::Skipped(format!("parse_header: {e}")));
         }
     };
     stats.parsed_header_ok += 1;
@@ -216,7 +327,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
         Some(p) => p,
         None => {
             msgs.push("pitm: ABSENT".to_string());
-            return msgs;
+            return (msgs, Outcome::Skipped("pitm absent".to_string()));
         }
     };
     let info = hdr
@@ -250,7 +361,11 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     if let Some(Property::Ispe(e)) = hdr.meta.property_for(primary_id, b"ispe") {
         msgs.push(format!("ispe: {}x{}", e.width, e.height));
     }
-    if let Some(Property::Colr(c)) = hdr.meta.property_for(primary_id, b"colr") {
+    let primary_colr = match hdr.meta.property_for(primary_id, b"colr") {
+        Some(Property::Colr(c)) => Some(c.clone()),
+        _ => None,
+    };
+    if let Some(ref c) = primary_colr {
         msgs.push(format!("colr: {c:?}"));
     }
     if let Some(Property::Clap(c)) = hdr.meta.property_for(primary_id, b"clap") {
@@ -350,6 +465,11 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
     }
 
     // 6. End-to-end decode attempt via the high-level shim.
+    let mut outcome = match fx.tier {
+        Tier::BitExact => Outcome::BitExactFail("decode never returned a frame".to_string()),
+        Tier::ReportOnly => Outcome::ReportOnly(report_only_reason(fx.name)),
+        Tier::Ignored => Outcome::Ignored, // unreachable: handled earlier
+    };
     match heif::decode_primary(fx.heic) {
         Ok(vf) => {
             stats.decoded_ok += 1;
@@ -362,65 +482,234 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
             ));
 
             // BitExact comparison — only attempted for tiers explicitly
-            // promoted to BitExact. Round 2 has none promoted.
+            // promoted to BitExact.
             if matches!(fx.tier, Tier::BitExact) {
+                let matrix = matrix_from_colr(primary_colr.as_ref());
+                msgs.push(format!("bit-exact: matrix={matrix:?}"));
                 if let Some(ref o) = oracle {
-                    let ok = compare_bit_exact(o, &vf);
-                    if ok {
-                        stats.bit_exact += 1;
-                        msgs.push("bit-exact: MATCH".to_string());
-                    } else {
-                        stats.bit_exact_failed += 1;
-                        msgs.push("bit-exact: DIFF (see plane stats)".to_string());
+                    match compare_bit_exact(o, &vf, matrix) {
+                        Ok(()) => {
+                            stats.bit_exact += 1;
+                            msgs.push("bit-exact: MATCH".to_string());
+                            outcome = Outcome::BitExactPass;
+                        }
+                        Err(why) => {
+                            stats.bit_exact_failed += 1;
+                            msgs.push(format!("bit-exact: DIFF ({why})"));
+                            outcome = Outcome::BitExactFail(why);
+                        }
                     }
                 } else {
-                    msgs.push(
-                        "bit-exact: SKIP (oracle PNG decode failed — can't compare)".to_string(),
-                    );
+                    let why = "oracle PNG decode failed — can't compare".to_string();
+                    msgs.push(format!("bit-exact: SKIP ({why})"));
+                    stats.bit_exact_failed += 1;
+                    outcome = Outcome::BitExactFail(why);
                 }
             }
         }
         Err(e) => {
             stats.decode_failed += 1;
             msgs.push(format!("decode_primary: ERR {e}"));
+            if matches!(fx.tier, Tier::BitExact) {
+                outcome = Outcome::BitExactFail(format!("decode_primary: {e}"));
+            }
         }
     }
 
-    msgs
+    (msgs, outcome)
 }
 
-/// Plane-level byte equality. Compares only the planes both frames
-/// have in common; mismatched plane counts always fail.
-#[allow(dead_code)] // Wired in for the round-3+ BitExact promotion; round 2
-                    // ships every fixture as ReportOnly so this helper isn't
-                    // hit yet.
-fn compare_bit_exact(oracle: &oxideav_core::VideoFrame, actual: &oxideav_core::VideoFrame) -> bool {
-    if oracle.planes.len() != actual.planes.len() {
-        eprintln!(
-            "  bit-exact: plane count {} != {}",
-            actual.planes.len(),
+/// Choice of YUV→RGB conversion matrix for the bit-exact compare.
+/// Anchored on the primary item's `colr nclx` `matrix_coefficients` /
+/// `full_range` flag when present, defaulting to BT.601 limited (the
+/// convention oxideav-webp settled on in `155c954` and the ISO/IEC
+/// 23008-12 §6.5.5 default for HEIC images without an explicit
+/// colour profile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Matrix {
+    Bt601Limited,
+    Bt601Full,
+    Bt709Limited,
+    Bt709Full,
+}
+
+fn matrix_from_colr(colr: Option<&Colr>) -> Matrix {
+    match colr {
+        Some(Colr::Nclx {
+            matrix_coefficients,
+            full_range,
+            ..
+        }) => match (*matrix_coefficients, *full_range) {
+            (1, true) => Matrix::Bt709Full,
+            (1, false) => Matrix::Bt709Limited,
+            // matrix_coefficients = 5 (BT.470BG) / 6 (BT.601) /
+            // 7 (SMPTE-170M) all share the BT.601 luma weights.
+            (_, true) => Matrix::Bt601Full,
+            (_, false) => Matrix::Bt601Limited,
+        },
+        // No nclx (or icc-only): default to BT.601 limited per webp #253
+        // convention. ISO/IEC 23008-12 §6.5.5 says the absence of
+        // `colr` makes colour interpretation implementation-defined; we
+        // pick the convention shared with libwebp / libheif's defaults.
+        _ => Matrix::Bt601Limited,
+    }
+}
+
+/// Bit-exact compare of an HEVC YUV planar frame against an
+/// `expected.png`-decoded packed-RGB frame. The oracle is always a
+/// single packed plane (oxideav-png returns 1-plane Rgb24/Rgba/Gray8);
+/// our HEVC output is always 3-plane planar YUV (4:2:0 or 4:2:2). We
+/// convert the actual YUV to packed RGB24 using `matrix` and compare
+/// byte-for-byte.
+///
+/// Returns `Ok(())` on byte-equal match; `Err(reason)` otherwise.
+fn compare_bit_exact(
+    oracle: &oxideav_core::VideoFrame,
+    actual: &oxideav_core::VideoFrame,
+    matrix: Matrix,
+) -> Result<(), String> {
+    if oracle.planes.len() != 1 {
+        return Err(format!(
+            "oracle is not single-plane packed (got {} planes)",
             oracle.planes.len()
-        );
-        return false;
+        ));
     }
-    for (i, (a, e)) in actual.planes.iter().zip(oracle.planes.iter()).enumerate() {
-        if a.stride != e.stride {
-            eprintln!("  bit-exact: plane {i} stride {} != {}", a.stride, e.stride);
-            return false;
+    if actual.planes.len() != 3 {
+        return Err(format!(
+            "actual frame is not 3-plane planar YUV (got {} planes)",
+            actual.planes.len()
+        ));
+    }
+    let oracle_stride = oracle.planes[0].stride.max(1);
+    let oracle_h = oracle.planes[0].data.len() / oracle_stride;
+    // Three packed channels per pixel → expected stride = w * 3.
+    if oracle_stride % 3 != 0 {
+        return Err(format!(
+            "oracle stride {oracle_stride} is not a multiple of 3 (only Rgb24 oracles supported)"
+        ));
+    }
+    let oracle_w = oracle_stride / 3;
+
+    let y_stride = actual.planes[0].stride.max(1);
+    let y_rows = actual.planes[0].data.len() / y_stride;
+    let cb_stride = actual.planes[1].stride.max(1);
+    let cb_rows = actual.planes[1].data.len() / cb_stride;
+    let cr_stride = actual.planes[2].stride.max(1);
+    let cr_rows = actual.planes[2].data.len() / cr_stride;
+
+    if y_stride != oracle_w || y_rows != oracle_h {
+        return Err(format!(
+            "luma dims {y_stride}x{y_rows} != oracle dims {oracle_w}x{oracle_h}"
+        ));
+    }
+    if cb_stride != cr_stride || cb_rows != cr_rows {
+        return Err(format!(
+            "chroma planes disagree: Cb={cb_stride}x{cb_rows} Cr={cr_stride}x{cr_rows}"
+        ));
+    }
+
+    // Infer chroma sub-sampling from the per-plane dims.
+    let sub_x = if cb_stride == y_stride {
+        1
+    } else if cb_stride * 2 == y_stride {
+        2
+    } else {
+        return Err(format!(
+            "unsupported chroma subsampling sx (luma stride {y_stride}, chroma stride {cb_stride})"
+        ));
+    };
+    let sub_y = if cb_rows == y_rows {
+        1
+    } else if cb_rows * 2 == y_rows {
+        2
+    } else {
+        return Err(format!(
+            "unsupported chroma subsampling sy (luma rows {y_rows}, chroma rows {cb_rows})"
+        ));
+    };
+
+    let yp = &actual.planes[0].data;
+    let up = &actual.planes[1].data;
+    let vp = &actual.planes[2].data;
+
+    let mut rgb = vec![0u8; oracle_w * oracle_h * 3];
+    for y in 0..oracle_h {
+        let cy = y / sub_y;
+        for x in 0..oracle_w {
+            let cx = x / sub_x;
+            let yv = yp[y * y_stride + x];
+            let uv = up[cy * cb_stride + cx];
+            let vv = vp[cy * cr_stride + cx];
+            let (r, g, b) = yuv_to_rgb(yv, uv, vv, matrix);
+            let off = (y * oracle_w + x) * 3;
+            rgb[off] = r;
+            rgb[off + 1] = g;
+            rgb[off + 2] = b;
         }
-        if a.data != e.data {
-            let mut diff = 0usize;
-            for (av, ev) in a.data.iter().zip(e.data.iter()) {
-                if av != ev {
-                    diff += 1;
-                }
+    }
+
+    // Compare byte-for-byte against the oracle.
+    if rgb == oracle.planes[0].data {
+        return Ok(());
+    }
+    let mut diff = 0usize;
+    let mut max_abs = 0i32;
+    for (a, e) in rgb.iter().zip(oracle.planes[0].data.iter()) {
+        if a != e {
+            diff += 1;
+            let d = (*a as i32 - *e as i32).abs();
+            if d > max_abs {
+                max_abs = d;
             }
-            eprintln!(
-                "  bit-exact: plane {i} differs in {diff} of {} bytes",
-                a.data.len()
-            );
-            return false;
         }
     }
-    true
+    Err(format!(
+        "{diff} of {} bytes differ (max |Δ|={max_abs})",
+        rgb.len()
+    ))
+}
+
+/// Per-pixel YUV→RGB. Scalar implementation matching the textbook
+/// BT.601 / BT.709 formulas. Limited-range path uses Y' ∈ [16,235],
+/// C ∈ [16,240]; full-range maps directly. Output channels are clamped
+/// to [0, 255]. Hand-rolled in the test (rather than reaching for
+/// `oxideav-pixfmt::yuv::yuv_to_rgb`) so we don't pull a workspace dep
+/// in just for the `heif` integration test — task scope.
+fn yuv_to_rgb(y: u8, u: u8, v: u8, matrix: Matrix) -> (u8, u8, u8) {
+    // Coefficients per Rec. ITU-R BT.601-7 §2.5.1 / BT.709-6 §3.
+    let (kr, kb, limited) = match matrix {
+        Matrix::Bt601Limited => (0.299_f32, 0.114_f32, true),
+        Matrix::Bt601Full => (0.299_f32, 0.114_f32, false),
+        Matrix::Bt709Limited => (0.2126_f32, 0.0722_f32, true),
+        Matrix::Bt709Full => (0.2126_f32, 0.0722_f32, false),
+    };
+    let kg = 1.0 - kr - kb;
+    let (yv, cb, cr) = if limited {
+        // Y' linear-extends [16,235] → [0,255]; chroma centres at 128
+        // and scales by 2*(1-k) * 255/224 to recover (R-Y') etc.
+        let yv = (y as f32 - 16.0) * (255.0 / 219.0);
+        let cb = (u as f32 - 128.0) * (255.0 / 224.0);
+        let cr = (v as f32 - 128.0) * (255.0 / 224.0);
+        (yv, cb, cr)
+    } else {
+        let yv = y as f32;
+        let cb = u as f32 - 128.0;
+        let cr = v as f32 - 128.0;
+        (yv, cb, cr)
+    };
+    let r = yv + 2.0 * (1.0 - kr) * cr;
+    let b = yv + 2.0 * (1.0 - kb) * cb;
+    let g = yv - (2.0 * kr * (1.0 - kr) / kg) * cr - (2.0 * kb * (1.0 - kb) / kg) * cb;
+    (clamp_u8(r), clamp_u8(g), clamp_u8(b))
+}
+
+fn clamp_u8(v: f32) -> u8 {
+    let r = v.round();
+    if r < 0.0 {
+        0
+    } else if r > 255.0 {
+        255
+    } else {
+        r as u8
+    }
 }
