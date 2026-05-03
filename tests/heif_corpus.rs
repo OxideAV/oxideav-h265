@@ -260,6 +260,24 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
             c.horiz_off_n, c.horiz_off_d, c.vert_off_n, c.vert_off_d,
         ));
     }
+    if let Some(Property::Irot(r)) = hdr.meta.property_for(primary_id, b"irot") {
+        msgs.push(format!(
+            "irot: angle={} ({}°)",
+            r.angle,
+            (r.angle as u32) * 90,
+        ));
+    }
+    if let Some(Property::Imir(m)) = hdr.meta.property_for(primary_id, b"imir") {
+        msgs.push(format!(
+            "imir: axis={} ({})",
+            m.axis,
+            if m.axis == 0 {
+                "vertical/flip-cols"
+            } else {
+                "horizontal/flip-rows"
+            },
+        ));
+    }
     let dimg_targets = hdr.meta.iref_targets(b"dimg", primary_id);
     if !dimg_targets.is_empty() {
         msgs.push(format!("dimg: {dimg_targets:?}"));

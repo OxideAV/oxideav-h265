@@ -40,6 +40,8 @@ const ISPE: BoxType = b(b"ispe");
 const COLR: BoxType = b(b"colr");
 const AUXC: BoxType = b(b"auxC");
 const CLAP: BoxType = b(b"clap");
+const IROT: BoxType = b(b"irot");
+const IMIR: BoxType = b(b"imir");
 
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
@@ -140,6 +142,25 @@ pub struct Clap {
     pub vert_off_d: u32,
 }
 
+/// Parsed `irot` (ImageRotation, ISO/IEC 23008-12 §6.5.10). Single
+/// byte: `(reserved << 2) | angle`. `angle * 90` is the rotation in
+/// degrees, anti-clockwise.
+#[derive(Clone, Copy, Debug)]
+pub struct Irot {
+    /// 0..=3 — the value stored in the low 2 bits of the box body.
+    pub angle: u8,
+}
+
+/// Parsed `imir` (ImageMirror, ISO/IEC 23008-12 §6.5.12). Single
+/// byte: `(reserved << 1) | axis`. `axis == 0` mirrors about the
+/// vertical axis (i.e. flips columns left↔right); `axis == 1` mirrors
+/// about the horizontal axis (i.e. flips rows top↔bottom).
+#[derive(Clone, Copy, Debug)]
+pub struct Imir {
+    /// 0 or 1 — the value stored in the low bit of the box body.
+    pub axis: u8,
+}
+
 #[derive(Clone, Debug)]
 pub enum Property {
     /// Raw `hvcC` body (HEVCDecoderConfigurationRecord). Parse with
@@ -152,6 +173,14 @@ pub enum Property {
     /// Applied after HEVC decode to crop the displayed picture out of
     /// the (potentially padded) coded picture.
     Clap(Clap),
+    /// `irot` image-rotation transform (ISO/IEC 23008-12 §6.5.10).
+    /// Applied after `clap` (per `ipma` order) to rotate the displayed
+    /// picture in 90° increments anti-clockwise.
+    Irot(Irot),
+    /// `imir` image-mirror transform (ISO/IEC 23008-12 §6.5.12).
+    /// Applied per `ipma` order to flip the displayed picture about a
+    /// vertical (axis=0) or horizontal (axis=1) axis.
+    Imir(Imir),
     Other(BoxType, Vec<u8>),
 }
 
@@ -163,6 +192,8 @@ impl Property {
             Property::Colr(_) => COLR,
             Property::AuxC(_) => AUXC,
             Property::Clap(_) => CLAP,
+            Property::Irot(_) => IROT,
+            Property::Imir(_) => IMIR,
             Property::Other(t, _) => *t,
         }
     }
@@ -482,6 +513,8 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &COLR => Property::Colr(parse_colr(body)?),
             x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
             x if x == &CLAP => Property::Clap(parse_clap(body)?),
+            x if x == &IROT => Property::Irot(parse_irot(body)?),
+            x if x == &IMIR => Property::Imir(parse_imir(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
@@ -548,6 +581,30 @@ fn parse_clap(body: &[u8]) -> Result<Clap> {
         horiz_off_d,
         vert_off_n,
         vert_off_d,
+    })
+}
+
+/// Parse an `irot` (ImageRotation) body — ISO/IEC 23008-12 §6.5.10.
+/// Single byte: top 6 bits reserved (must be 0); low 2 bits carry the
+/// rotation count in units of 90° anti-clockwise.
+fn parse_irot(body: &[u8]) -> Result<Irot> {
+    if body.is_empty() {
+        return Err(Error::invalid("heif: 'irot' body is empty"));
+    }
+    Ok(Irot {
+        angle: body[0] & 0x03,
+    })
+}
+
+/// Parse an `imir` (ImageMirror) body — ISO/IEC 23008-12 §6.5.12.
+/// Single byte: top 7 bits reserved (must be 0); low bit selects the
+/// mirror axis (0 = vertical axis, 1 = horizontal axis).
+fn parse_imir(body: &[u8]) -> Result<Imir> {
+    if body.is_empty() {
+        return Err(Error::invalid("heif: 'imir' body is empty"));
+    }
+    Ok(Imir {
+        axis: body[0] & 0x01,
     })
 }
 
@@ -753,6 +810,26 @@ mod tests {
     fn clap_rejects_short_body() {
         let body = vec![0u8; 31];
         assert!(parse_clap(&body).is_err());
+    }
+
+    #[test]
+    fn irot_masks_to_low_two_bits() {
+        // Spec: top 6 bits reserved (must be zero), low 2 bits carry
+        // the angle. We mask defensively rather than reject — surfaces
+        // angle even on out-of-spec writers.
+        assert_eq!(parse_irot(&[0x00]).unwrap().angle, 0);
+        assert_eq!(parse_irot(&[0x01]).unwrap().angle, 1);
+        assert_eq!(parse_irot(&[0x02]).unwrap().angle, 2);
+        assert_eq!(parse_irot(&[0x03]).unwrap().angle, 3);
+        assert_eq!(parse_irot(&[0xFF]).unwrap().angle, 3);
+    }
+
+    #[test]
+    fn imir_masks_to_low_bit() {
+        assert_eq!(parse_imir(&[0x00]).unwrap().axis, 0);
+        assert_eq!(parse_imir(&[0x01]).unwrap().axis, 1);
+        assert_eq!(parse_imir(&[0xFE]).unwrap().axis, 0);
+        assert_eq!(parse_imir(&[0xFF]).unwrap().axis, 1);
     }
 
     #[test]

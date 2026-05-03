@@ -54,11 +54,12 @@
 //!   scaffold; the `iinf`/`iloc` path only covers the still-image
 //!   collection form.
 //! * Item-property boxes beyond `hvcC` / `ispe` / `colr` / `auxC` /
-//!   `clap` (e.g. `pixi`, `pasp`, `irot`, `imir`). They are stored as
-//!   [`Property::Other`] but not typed — enough to keep `ipma`
-//!   indices consistent. `clap` is applied in `ipma` order to every
+//!   `clap` / `irot` / `imir` (e.g. `pixi`, `pasp`). They are stored
+//!   as [`Property::Other`] but not typed — enough to keep `ipma`
+//!   indices consistent. The transformative property triplet
+//!   (`clap` / `irot` / `imir`) is applied in `ipma` order to every
 //!   frame produced by [`decode_primary`] / [`decode_item`] —
-//!   ISO/IEC 14496-12 §12.1.4.
+//!   ISO/IEC 14496-12 §12.1.4 + ISO/IEC 23008-12 §6.5.10 / §6.5.12.
 //! * Everything at the top level that isn't `ftyp` / `meta` / `mdat`
 //!   (e.g. `free`, `skip`).
 
@@ -73,7 +74,9 @@ mod box_parser;
 mod meta;
 
 pub use box_parser::{BoxHeader, BoxType};
-pub use meta::{AuxC, Clap, Colr, IrefEntry, Ispe, ItemInfo, ItemLocation, Meta, Property};
+pub use meta::{
+    AuxC, Clap, Colr, Imir, Irot, IrefEntry, Ispe, ItemInfo, ItemLocation, Meta, Property,
+};
 
 /// Auxiliary-image type URN that identifies the alpha plane of an HEVC
 /// item per ISO/IEC 23008-12 §6.6.2.1.1. The matching item is
@@ -746,8 +749,11 @@ fn decode_hvc_item(hdr: &HeifHeader<'_>, item_id: u32) -> Result<VideoFrame> {
 /// stride width — no implicit row crop is performed.
 fn apply_transforms(meta: &Meta, item_id: u32, mut frame: VideoFrame) -> Result<VideoFrame> {
     for (prop, _essential) in meta.properties_for(item_id) {
-        if let Property::Clap(c) = prop {
-            frame = apply_clap(*c, frame)?;
+        match prop {
+            Property::Clap(c) => frame = apply_clap(*c, frame)?,
+            Property::Irot(r) => frame = apply_irot(*r, frame)?,
+            Property::Imir(m) => frame = apply_imir(*m, frame)?,
+            _ => {}
         }
     }
     Ok(frame)
@@ -924,6 +930,158 @@ fn crop_planar(frame: VideoFrame, left: u32, top: u32, w: u32, h: u32) -> Result
     })
 }
 
+/// Apply an `irot` (image-rotation) transform — rotates the picture by
+/// `angle * 90°` anti-clockwise. `angle == 0` is the identity. For
+/// `angle == 1` (90° CCW) and `angle == 3` (270° CCW) the output's
+/// width and height are swapped, which means chroma sub-sampling
+/// factors that are horizontal-only (4:2:2) become ill-defined post-
+/// rotation. We refuse such rotations and require either 4:2:0
+/// (symmetric) or 4:4:4 (no sub-sampling).
+fn apply_irot(irot: Irot, frame: VideoFrame) -> Result<VideoFrame> {
+    let angle = irot.angle & 0x03;
+    if angle == 0 {
+        return Ok(frame);
+    }
+    if frame.planes.is_empty() {
+        return Err(Error::invalid("heif: 'irot' on a zero-plane frame"));
+    }
+    let luma_stride = frame.planes[0].stride.max(1);
+    let luma_h = frame.planes[0].data.len() / luma_stride;
+    // Validate per-plane sub-sampling is symmetric for 90° / 270°.
+    if angle == 1 || angle == 3 {
+        for (p, plane) in frame.planes.iter().enumerate().skip(1) {
+            let s = plane.stride.max(1);
+            let ph = plane.data.len() / s;
+            let sx = if luma_stride == s {
+                0
+            } else if luma_stride == s * 2 {
+                1
+            } else {
+                return Err(Error::invalid(format!(
+                    "heif: 'irot' plane {p} sub-sampling not 1x/2x"
+                )));
+            };
+            let sy = if luma_h == ph {
+                0
+            } else if luma_h == ph * 2 {
+                1
+            } else {
+                return Err(Error::invalid(format!(
+                    "heif: 'irot' plane {p} sub-sampling not 1x/2x"
+                )));
+            };
+            if sx != sy {
+                return Err(Error::unsupported(
+                    "heif: 'irot' 90/270° on non-symmetric chroma (e.g. 4:2:2) is not supported",
+                ));
+            }
+        }
+    }
+    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(frame.planes.len());
+    for plane in &frame.planes {
+        let s = plane.stride.max(1);
+        let h = plane.data.len() / s;
+        let rotated = match angle {
+            1 => rotate_ccw_90(plane, s, h),
+            2 => rotate_180(plane, s, h),
+            3 => rotate_ccw_270(plane, s, h),
+            _ => unreachable!(),
+        };
+        out_planes.push(rotated);
+    }
+    Ok(VideoFrame {
+        pts: frame.pts,
+        planes: out_planes,
+    })
+}
+
+fn rotate_ccw_90(plane: &VideoPlane, w: usize, h: usize) -> VideoPlane {
+    // Anti-clockwise 90°: the right column becomes the top row.
+    // Output dims: w_out = h, h_out = w.
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let src = plane.data[y * w + x];
+            let dx = y;
+            let dy = w - 1 - x;
+            out[dy * h + dx] = src;
+        }
+    }
+    VideoPlane {
+        stride: h,
+        data: out,
+    }
+}
+
+fn rotate_180(plane: &VideoPlane, w: usize, h: usize) -> VideoPlane {
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let src = plane.data[y * w + x];
+            out[(h - 1 - y) * w + (w - 1 - x)] = src;
+        }
+    }
+    VideoPlane {
+        stride: w,
+        data: out,
+    }
+}
+
+fn rotate_ccw_270(plane: &VideoPlane, w: usize, h: usize) -> VideoPlane {
+    // Anti-clockwise 270° == clockwise 90°: the top row becomes the
+    // right column.
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let src = plane.data[y * w + x];
+            let dx = h - 1 - y;
+            let dy = x;
+            out[dy * h + dx] = src;
+        }
+    }
+    VideoPlane {
+        stride: h,
+        data: out,
+    }
+}
+
+/// Apply an `imir` (image-mirror) transform — `axis == 0` mirrors
+/// about the vertical axis (flips columns left↔right), `axis == 1`
+/// mirrors about the horizontal axis (flips rows top↔bottom). Per
+/// ISO/IEC 23008-12 §6.5.12.3.
+fn apply_imir(imir: Imir, frame: VideoFrame) -> Result<VideoFrame> {
+    if frame.planes.is_empty() {
+        return Err(Error::invalid("heif: 'imir' on a zero-plane frame"));
+    }
+    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(frame.planes.len());
+    for plane in &frame.planes {
+        let s = plane.stride.max(1);
+        let h = plane.data.len() / s;
+        let mut out = vec![0u8; s * h];
+        if imir.axis == 0 {
+            // Flip horizontally (about the vertical axis): every row
+            // is reversed in place.
+            for y in 0..h {
+                for x in 0..s {
+                    out[y * s + (s - 1 - x)] = plane.data[y * s + x];
+                }
+            }
+        } else {
+            // Flip vertically (about the horizontal axis): row order
+            // is reversed; each row is copied verbatim.
+            for y in 0..h {
+                let src_row = &plane.data[y * s..y * s + s];
+                let dst = &mut out[(h - 1 - y) * s..(h - 1 - y) * s + s];
+                dst.copy_from_slice(src_row);
+            }
+        }
+        out_planes.push(VideoPlane { stride: s, data: out });
+    }
+    Ok(VideoFrame {
+        pts: frame.pts,
+        planes: out_planes,
+    })
+}
 
 /// Decode a `grid`-derived primary item: parse the `ImageGrid` payload,
 /// resolve `dimg` references in row-major order, decode each tile via
@@ -1323,6 +1481,115 @@ mod tests {
             vert_off_d: 1,
         };
         assert!(clap_rect(&clap, 100, 100).is_err());
+    }
+
+    #[test]
+    fn rotate_ccw_90_inverts_columns_to_rows() {
+        // 2x3 plane:    rotated 90° CCW becomes 3x2:
+        //  A B          B D F
+        //  C D    -->   A C E
+        //  E F
+        let plane = VideoPlane {
+            stride: 2,
+            data: vec![b'A', b'B', b'C', b'D', b'E', b'F'],
+        };
+        let r = rotate_ccw_90(&plane, 2, 3);
+        assert_eq!(r.stride, 3);
+        assert_eq!(r.data, vec![b'B', b'D', b'F', b'A', b'C', b'E']);
+    }
+
+    #[test]
+    fn rotate_180_flips_both_axes() {
+        let plane = VideoPlane {
+            stride: 2,
+            data: vec![b'A', b'B', b'C', b'D'],
+        };
+        let r = rotate_180(&plane, 2, 2);
+        assert_eq!(r.stride, 2);
+        assert_eq!(r.data, vec![b'D', b'C', b'B', b'A']);
+    }
+
+    #[test]
+    fn rotate_ccw_270_inverts_rows_to_columns() {
+        // 2x3 plane → 3x2 rotated 270° CCW (= 90° CW):
+        //  A B          E C A
+        //  C D    -->   F D B
+        //  E F
+        let plane = VideoPlane {
+            stride: 2,
+            data: vec![b'A', b'B', b'C', b'D', b'E', b'F'],
+        };
+        let r = rotate_ccw_270(&plane, 2, 3);
+        assert_eq!(r.stride, 3);
+        assert_eq!(r.data, vec![b'E', b'C', b'A', b'F', b'D', b'B']);
+    }
+
+    #[test]
+    fn imir_axis_0_flips_horizontally() {
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 3,
+                data: vec![1, 2, 3, 4, 5, 6],
+            }],
+        };
+        let r = apply_imir(Imir { axis: 0 }, frame).unwrap();
+        assert_eq!(r.planes[0].data, vec![3, 2, 1, 6, 5, 4]);
+    }
+
+    #[test]
+    fn imir_axis_1_flips_vertically() {
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 3,
+                data: vec![1, 2, 3, 4, 5, 6],
+            }],
+        };
+        let r = apply_imir(Imir { axis: 1 }, frame).unwrap();
+        assert_eq!(r.planes[0].data, vec![4, 5, 6, 1, 2, 3]);
+    }
+
+    #[test]
+    fn apply_irot_identity_returns_input_unchanged() {
+        let frame = VideoFrame {
+            pts: Some(7),
+            planes: vec![VideoPlane {
+                stride: 4,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }],
+        };
+        let out = apply_irot(Irot { angle: 0 }, frame.clone()).unwrap();
+        assert_eq!(out.planes[0].data, frame.planes[0].data);
+        assert_eq!(out.planes[0].stride, 4);
+    }
+
+    #[test]
+    fn apply_irot_90_swaps_dimensions_for_yuv420() {
+        // 4x4 luma, 2x2 chroma — symmetric 4:2:0 so 90° is allowed.
+        let luma = VideoPlane {
+            stride: 4,
+            data: (0..16u8).collect(),
+        };
+        let cb = VideoPlane {
+            stride: 2,
+            data: vec![100, 101, 102, 103],
+        };
+        let cr = VideoPlane {
+            stride: 2,
+            data: vec![200, 201, 202, 203],
+        };
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![luma, cb, cr],
+        };
+        let r = apply_irot(Irot { angle: 1 }, frame).unwrap();
+        // Luma is still 4x4 because input was square. Verify a corner
+        // moved correctly: in[0][0] (=0) should become out[3][0] (=12
+        // in row-major after 90° CCW rotation of a 4x4 grid).
+        assert_eq!(r.planes[0].stride, 4);
+        // After CCW 90: out[w-1-x][y] = in[y][x]. For y=0,x=0: out[3][0] = in[0][0]=0.
+        assert_eq!(r.planes[0].data[3 * 4], 0);
     }
 
     #[test]
