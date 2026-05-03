@@ -616,6 +616,22 @@ pub fn decode_item(file: &[u8], item_id: u32) -> Result<VideoFrame> {
 /// Returns `Ok(None)` when the primary has no alpha aux; an
 /// `Err(Error::Unsupported)` when the alpha plane is monochrome HEVC
 /// and the underlying decoder doesn't yet emit `Gray8` plane output.
+///
+/// # Phase-E status (2026-05)
+///
+/// HEIF's alpha aux convention always encodes the alpha plane as a
+/// monochrome (`chroma_format_idc == 0`) HEVC bitstream — every
+/// fixture in the corpus that has an alpha auxiliary (
+/// `still-image-with-alpha`, `still-image-overlay`'s stamp side)
+/// triggers this path. The underlying [`HevcDecoder`] does not yet
+/// emit single-plane `Gray8` output, so this function surfaces the
+/// decoder's `Error::Unsupported` verbatim.
+///
+/// Adding HEVC monochrome decoding is a separate, larger task — out
+/// of scope for HEIF round 3 (which lands clap / irot / imir / iovl
+/// composition on top of an existing colour-HEVC decode pipeline).
+/// Once the decoder grows monochrome support, this function will
+/// just start working — no HEIF-side change is needed.
 pub fn decode_alpha_for_primary(file: &[u8]) -> Result<Option<VideoFrame>> {
     let hdr = parse_header(file)?;
     let primary_id = hdr
