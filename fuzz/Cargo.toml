@@ -1,0 +1,53 @@
+[package]
+name = "oxideav-h265-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libde265 / libx265 interop: each cross-decode
+# harness `dlopen`s the system-installed shared library at startup.
+# No `*-sys` crate, no libde265 / libx265 source pulled into the dep
+# tree. Harnesses skip silently when the shared library isn't installed
+# (see fuzz/src/lib.rs). Workspace policy bars vendoring libde265 /
+# libx265 / libavcodec source — we only inspect the public C headers
+# (<libde265/de265.h>, <x265.h>) for function signatures + struct
+# layouts.
+libloading = "0.8"
+
+[dependencies.oxideav-h265]
+path = ".."
+
+[lib]
+name = "oxideav_h265_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "hevc_self_roundtrip"
+path = "fuzz_targets/hevc_self_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "x265_encode_oxideav_decode"
+path = "fuzz_targets/x265_encode_oxideav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oxideav_encode_libde265_decode"
+path = "fuzz_targets/oxideav_encode_libde265_decode.rs"
+test = false
+doc = false
