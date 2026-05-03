@@ -181,7 +181,16 @@ fn fixtures() -> Vec<Fixture> {
         // depth (10-bit, mask 0x3FF), and writes LSB-aligned 16-bit
         // RGB matching the Rgb48Le oracle PNG.
         fixture!("still-10bit-main10", BitExact),
-        fixture!("still-yuv444", ReportOnly),
+        // Task #321 promotes: HEVC 4:4:4 I-slice decode (round 30 lift)
+        // produces a 3-plane planar YUV at full chroma resolution
+        // (sub_x=sub_y=1). The compare_bit_exact path infers sub_x /
+        // sub_y from cb_stride vs y_stride and runs the BT.601-limited
+        // YUV→RGB matrix uniformly. The comparator extension in 3e7c6f5
+        // (PNG-IHDR-driven dispatch + compare_rgb24 / compare_rgba /
+        // compare_rgb48le specialised paths) lands the missing 4:4:4
+        // chroma-stride accounting needed for this fixture; promotion
+        // exercises the wired path against the oracle.
+        fixture!("still-yuv444", BitExact),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
         // a sample table + decoder hvcC out of the image-sequence
         // file. The HEVC decode of each sample isn't yet validated
