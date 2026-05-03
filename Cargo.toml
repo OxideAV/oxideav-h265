@@ -23,6 +23,11 @@ oxideav-core = "0.1"
 # only — on a default build the test file is empty and the dep is
 # unused-but-cheap.
 oxideav-png = "0.1"
+# Re-exported by the test for typed access to `VideoFrame` in the
+# round-3+ bit-exact comparison helper. (`oxideav-h265` depends on
+# `oxideav-core` as a regular dep already; the dev-dep entry lets
+# integration tests name the type directly.)
+oxideav-core = "0.1"
 
 [features]
 # HEIF/HEIC still image + image sequence container support. Enables the
