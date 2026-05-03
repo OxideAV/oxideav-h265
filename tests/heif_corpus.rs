@@ -95,6 +95,9 @@ fn report_only_reason(name: &str) -> &'static str {
         "still-monochrome" => "HEVC monochrome (chroma_format_idc=0) not pixel-emitting",
         "still-10bit-main10" => "HEVC Main 10 not pixel-emitting end-to-end",
         "still-yuv444" => "HEVC 4:4:4 (chroma_format_idc=3) not pixel-emitting",
+        "image-sequence-3frame" => {
+            "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
+        }
         _ => "tier left as ReportOnly pending bit-exact verification",
     }
 }
@@ -144,7 +147,12 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-monochrome", ReportOnly),
         fixture!("still-10bit-main10", ReportOnly),
         fixture!("still-yuv444", ReportOnly),
-        fixture!("image-sequence-3frame", Ignored),
+        // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
+        // a sample table + decoder hvcC out of the image-sequence
+        // file. The HEVC decode of each sample isn't yet validated
+        // bit-exact (no oracle PNG per sample) — this stays at
+        // ReportOnly until that pipeline lands.
+        fixture!("image-sequence-3frame", ReportOnly),
     ]
 }
 
@@ -467,6 +475,31 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
             o.planes[0].stride,
             o.planes[0].data.len() / o.planes[0].stride.max(1),
         ));
+    }
+
+    // 5b. Image-sequence walker — informational. Surfaces sample
+    // count + per-sample sizes when the file carries a `moov` (HEIF
+    // image-sequence brands `msf1` / `hevc` / `heis`). Round-5
+    // landed [`heif::parse_moov`]; per-sample HEVC decode parity is
+    // round-6 work.
+    match heif::parse_moov(fx.heic) {
+        Ok(Some(summary)) => {
+            msgs.push(format!(
+                "moov: timescale={} sample_entry='{}' samples={} display={:?}",
+                summary.timescale,
+                std::str::from_utf8(&summary.sample_entry).unwrap_or("?"),
+                summary.samples.len(),
+                summary.display_dims,
+            ));
+            for (i, s) in summary.samples.iter().enumerate() {
+                msgs.push(format!(
+                    "moov sample[{i}]: offset={} size={} duration={} sync={}",
+                    s.offset, s.size, s.duration, s.is_sync,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => msgs.push(format!("moov: ERR {e}")),
     }
 
     // 6. End-to-end decode attempt via the high-level shim.

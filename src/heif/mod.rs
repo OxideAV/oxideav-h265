@@ -72,10 +72,15 @@ use oxideav_core::Decoder;
 
 mod box_parser;
 mod meta;
+mod moov;
 
 pub use box_parser::{BoxHeader, BoxType};
 pub use meta::{
     AuxC, Clap, Colr, Imir, IrefEntry, Irot, Ispe, ItemInfo, ItemLocation, Meta, Property,
+};
+pub use moov::{
+    decode_image_sequence, parse_moov, sample_bytes as moov_sample_bytes, MoovSummary,
+    Sample as MoovSample,
 };
 
 /// Auxiliary-image type URN that identifies the alpha plane of an HEVC
