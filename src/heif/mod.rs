@@ -1328,6 +1328,7 @@ fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame>
 /// the older unit tests keep building unchanged; the iovl pipeline now
 /// flows through `compose_overlay_frames_with_matrix` so the canvas-
 /// fill matrix can track the iovl item's `colr nclx` property.
+#[cfg(test)]
 fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Result<VideoFrame> {
     compose_overlay_frames_with_matrix(overlay, layers, FillMatrix::Bt709Limited)
 }
