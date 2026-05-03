@@ -97,13 +97,6 @@ fn report_only_reason(name: &str) -> &'static str {
              promoting"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
-        "still-10bit-main10" => {
-            "Main 10 (bit_depth=10) decode lands via the existing >8-bit \
-             emit_frame branch (16-bit LE-packed planar YUV); BitExact \
-             promotion blocked on a 16-bit-aware compare_bit_exact path \
-             that reads u16 samples from plane.data and produces 16-bit \
-             packed RGB to match the Rgb48Le oracle"
-        }
         "still-yuv444" => {
             "HEVC 4:4:4 I-slice decode is enabled (round 30 lift); decoder \
              pipeline produces a 3-plane planar YUV at full chroma resolution \
@@ -181,7 +174,13 @@ fn fixtures() -> Vec<Fixture> {
         // (Gray8); the comparator's compare_rgb24 1-plane branch
         // splats Y to (Y,Y,Y) packed RGB and matches the oracle.
         fixture!("still-monochrome", BitExact),
-        fixture!("still-10bit-main10", ReportOnly),
+        // Round 7 + task #320 promoted: bit_depth=10 lift in
+        // emit_frame produces a 3-plane 16-bit-LE-packed YUV
+        // VideoFrame; the comparator's compare_rgb48le branch reads
+        // u16 samples, runs the YUV→RGB matrix at the source bit
+        // depth (10-bit, mask 0x3FF), and writes LSB-aligned 16-bit
+        // RGB matching the Rgb48Le oracle PNG.
+        fixture!("still-10bit-main10", BitExact),
         fixture!("still-yuv444", ReportOnly),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
         // a sample table + decoder hvcC out of the image-sequence
