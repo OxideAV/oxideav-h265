@@ -78,11 +78,6 @@ fn report_only_reason(name: &str) -> &'static str {
         "single-image-with-thumbnail" => {
             "thumbnail item iref present; primary decode parity not yet verified"
         }
-        "still-image-with-alpha" => {
-            "primary 4:2:0 colour decode + alpha aux 4:0:0 (monochrome) decode \
-             both land via the round-6 chroma_format_idc=0 lift; bit-exact \
-             oracle for the colour primary not yet validated"
-        }
         "still-image-with-icc" => {
             "ICC profile retained as Property::Other; no ICC-aware compare yet"
         }
@@ -157,7 +152,12 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("single-image-1x1", BitExact),
         fixture!("single-image-512x512-q60", ReportOnly),
         fixture!("single-image-with-thumbnail", ReportOnly),
-        fixture!("still-image-with-alpha", ReportOnly),
+        // Round 6 + task #320 promoted: chroma_format_idc=0 lift
+        // unblocks the alpha-aux decode (every HEIF alpha aux is a
+        // monochrome HEVC stream per ISO/IEC 23008-12 §6.6.2.1); the
+        // comparator's compare_rgba branch assembles RGBA from the
+        // primary 4:2:0 colour decode + the 1-plane Gray8 alpha aux.
+        fixture!("still-image-with-alpha", BitExact),
         fixture!("still-image-with-icc", ReportOnly),
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
