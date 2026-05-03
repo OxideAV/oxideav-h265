@@ -92,9 +92,11 @@ fn report_only_reason(name: &str) -> &'static str {
             "iovl canvas-fill matrix matches the corpus convention (round 5 \
              phase A) but the underlying HEVC layer pixels still diverge from \
              the oracle: 97.3% of bytes differ with max |Δ|=160 after planar→\
-             packed RGB conversion through compare_bit_exact. Bisect the per-\
-             layer decode (background item 1 vs overlay item 2) before re-\
-             promoting"
+             packed RGB conversion through compare_bit_exact. Task #319 wires \
+             a per-layer bisect probe into the iovl branch — the per-fixture \
+             log lines `iovl bisect: layer[i] id=N dims=WxH dest=(x,y) \
+             diff=D/T max|Δ|=Δ samples=...` show which constituent layer \
+             carries the drift; check CI output for the per-layer breakdown"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "still-yuv444" => {
@@ -472,18 +474,85 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
     if !cdsc_targets.is_empty() {
         msgs.push(format!("cdsc (from primary): {cdsc_targets:?}"));
     }
-    // Overlay descriptor inspection.
+    // Overlay descriptor inspection + per-layer bisect probe.
     if info.item_type == *b"iovl" {
         let n_refs = dimg_targets.len();
-        match heif::item_bytes_in(fx.heic, &hdr.meta, primary_id) {
+        let iovl_parsed = match heif::item_bytes_in(fx.heic, &hdr.meta, primary_id) {
             Ok(iovl_bytes) => match ImageOverlay::parse(iovl_bytes, n_refs) {
-                Ok(o) => msgs.push(format!(
-                    "iovl: canvas={}x{} fill_rgba={:?} offsets={:?}",
-                    o.output_width, o.output_height, o.canvas_fill_rgba, o.offsets,
-                )),
-                Err(e) => msgs.push(format!("iovl: parse ERR {e}")),
+                Ok(o) => {
+                    msgs.push(format!(
+                        "iovl: canvas={}x{} fill_rgba={:?} offsets={:?}",
+                        o.output_width, o.output_height, o.canvas_fill_rgba, o.offsets,
+                    ));
+                    Some(o)
+                }
+                Err(e) => {
+                    msgs.push(format!("iovl: parse ERR {e}"));
+                    None
+                }
             },
-            Err(e) => msgs.push(format!("iovl: item_bytes ERR {e}")),
+            Err(e) => {
+                msgs.push(format!("iovl: item_bytes ERR {e}"));
+                None
+            }
+        };
+        // Task #319 — bisect which constituent layer drifts. Decode
+        // each `dimg` target on its own via `heif::decode_item`,
+        // convert to packed RGB24 with the iovl item's matrix, clip
+        // the oracle PNG to the layer's destination rectangle (using
+        // the iovl `(h_off, v_off)` and the layer's ispe dims), and
+        // diff. The layer with the larger per-pixel drift is the one
+        // the iovl-level compare is failing on.
+        // Decode the oracle inline so we don't wait for the later
+        // step — the bisect probe runs before the iovl composition
+        // compare.
+        let oracle_for_bisect = oxideav_png::decode_png_to_frame(fx.expected_png, None).ok();
+        if let (Some(overlay), Some(oracle_frame)) =
+            (iovl_parsed.as_ref(), oracle_for_bisect.as_ref())
+        {
+            let matrix = matrix_from_colr(primary_colr.as_ref());
+            // Oracle is packed Rgb24 for this fixture — width = stride / 3.
+            let oracle_stride = oracle_frame.planes[0].stride.max(1);
+            let oracle_w = oracle_stride / 3;
+            let oracle_h = oracle_frame.planes[0].data.len() / oracle_stride;
+            let oracle_bytes = &oracle_frame.planes[0].data;
+            for (i, lid) in dimg_targets.iter().enumerate() {
+                let (h_off, v_off) = overlay.offsets.get(i).copied().unwrap_or((0, 0));
+                match heif::decode_item(fx.heic, *lid) {
+                    Ok(layer_vf) => {
+                        // Convert layer YUV → packed RGB24 using the
+                        // same matrix the iovl composition will use,
+                        // then diff against the clipped oracle window.
+                        match layer_to_rgb24(&layer_vf, matrix) {
+                            Ok((rgb, lw, lh)) => {
+                                let (diff, max_abs, total, oob, samples) =
+                                    diff_layer_against_clipped_oracle(
+                                        &rgb,
+                                        lw,
+                                        lh,
+                                        oracle_bytes,
+                                        oracle_w,
+                                        oracle_h,
+                                        h_off,
+                                        v_off,
+                                    );
+                                msgs.push(format!(
+                                    "iovl bisect: layer[{i}] id={lid} dims={lw}x{lh} \
+                                     dest=({h_off},{v_off}) diff={diff}/{total} \
+                                     max|Δ|={max_abs} oob_skipped={oob} \
+                                     samples={samples:?}"
+                                ));
+                            }
+                            Err(why) => msgs.push(format!(
+                                "iovl bisect: layer[{i}] id={lid} rgb-convert ERR {why}"
+                            )),
+                        }
+                    }
+                    Err(e) => msgs.push(format!(
+                        "iovl bisect: layer[{i}] id={lid} decode_item ERR {e}"
+                    )),
+                }
+            }
         }
     }
     // Grid descriptor inspection.
@@ -1181,4 +1250,133 @@ fn clamp_u16(v: f64, max_val: f64) -> u16 {
     } else {
         r as u16
     }
+}
+
+/// Convert a single HEVC layer's `VideoFrame` (1-plane luma OR 3-plane
+/// 8-bit planar YUV) to a packed `Vec<u8>` of `width * height * 3`
+/// Rgb24 bytes. Used by the iovl-bisect probe in [`run_one`] to diff
+/// each constituent layer against the oracle window — independent of
+/// the iovl composition step.
+///
+/// Returns `(rgb_bytes, width, height)`.
+fn layer_to_rgb24(
+    layer: &oxideav_core::VideoFrame,
+    matrix: Matrix,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    let y_stride = layer.planes[0].stride.max(1);
+    let y_rows = layer.planes[0].data.len() / y_stride;
+    let yp = &layer.planes[0].data;
+    if layer.planes.len() == 1 {
+        let mut rgb = vec![0u8; y_stride * y_rows * 3];
+        for y in 0..y_rows {
+            for x in 0..y_stride {
+                let yv = yp[y * y_stride + x];
+                let off = (y * y_stride + x) * 3;
+                rgb[off] = yv;
+                rgb[off + 1] = yv;
+                rgb[off + 2] = yv;
+            }
+        }
+        return Ok((rgb, y_stride, y_rows));
+    }
+    if layer.planes.len() != 3 {
+        return Err(format!(
+            "layer is not 1-plane luma or 3-plane planar YUV (got {} planes)",
+            layer.planes.len()
+        ));
+    }
+    let cb_stride = layer.planes[1].stride.max(1);
+    let cb_rows = layer.planes[1].data.len() / cb_stride;
+    let cr_stride = layer.planes[2].stride.max(1);
+    let cr_rows = layer.planes[2].data.len() / cr_stride;
+    if cb_stride != cr_stride || cb_rows != cr_rows {
+        return Err(format!(
+            "chroma planes disagree: Cb={cb_stride}x{cb_rows} Cr={cr_stride}x{cr_rows}"
+        ));
+    }
+    let (sub_x, sub_y) = infer_subsampling(y_stride, y_rows, cb_stride, cb_rows)?;
+    let up = &layer.planes[1].data;
+    let vp = &layer.planes[2].data;
+    let w = y_stride;
+    let h = y_rows;
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        let cy = y / sub_y;
+        for x in 0..w {
+            let cx = x / sub_x;
+            let yv = yp[y * y_stride + x];
+            let uv = up[cy * cb_stride + cx];
+            let vv = vp[cy * cr_stride + cx];
+            let (r, g, b) = yuv_to_rgb(yv, uv, vv, matrix);
+            let off = (y * w + x) * 3;
+            rgb[off] = r;
+            rgb[off + 1] = g;
+            rgb[off + 2] = b;
+        }
+    }
+    Ok((rgb, w, h))
+}
+
+/// Diff a packed-Rgb24 layer against the corresponding window of the
+/// packed-Rgb24 oracle. The layer is positioned at `(h_off, v_off)`
+/// inside the canvas; pixels that fall outside the canvas are counted
+/// in `oob_skipped` rather than the diff.
+///
+/// Returns `(diff_bytes, max_abs_delta, total_in_bounds_bytes,
+/// oob_skipped_bytes, sample_positions)`. `sample_positions` is a
+/// short list of `(x, y, layer_rgb, oracle_rgb)` for the first few
+/// differing pixels — useful for drift fingerprinting.
+fn diff_layer_against_clipped_oracle(
+    layer_rgb: &[u8],
+    layer_w: usize,
+    layer_h: usize,
+    oracle_rgb: &[u8],
+    oracle_w: usize,
+    oracle_h: usize,
+    h_off: i32,
+    v_off: i32,
+) -> (
+    usize,
+    i32,
+    usize,
+    usize,
+    Vec<(usize, usize, [u8; 3], [u8; 3])>,
+) {
+    let mut diff = 0usize;
+    let mut max_abs = 0i32;
+    let mut total = 0usize;
+    let mut oob = 0usize;
+    let mut samples: Vec<(usize, usize, [u8; 3], [u8; 3])> = Vec::new();
+    for y in 0..layer_h {
+        let oy = v_off + y as i32;
+        for x in 0..layer_w {
+            let ox = h_off + x as i32;
+            if oy < 0 || ox < 0 || (oy as usize) >= oracle_h || (ox as usize) >= oracle_w {
+                oob += 3;
+                continue;
+            }
+            let l_off = (y * layer_w + x) * 3;
+            let o_off = ((oy as usize) * oracle_w + (ox as usize)) * 3;
+            let lp = [layer_rgb[l_off], layer_rgb[l_off + 1], layer_rgb[l_off + 2]];
+            let op = [
+                oracle_rgb[o_off],
+                oracle_rgb[o_off + 1],
+                oracle_rgb[o_off + 2],
+            ];
+            for ch in 0..3 {
+                total += 1;
+                if lp[ch] != op[ch] {
+                    diff += 1;
+                    let d = (lp[ch] as i32 - op[ch] as i32).abs();
+                    if d > max_abs {
+                        max_abs = d;
+                    }
+                }
+            }
+            if lp != op && samples.len() < 4 {
+                samples.push((x, y, lp, op));
+            }
+        }
+    }
+    (diff, max_abs, total, oob, samples)
 }
