@@ -102,12 +102,6 @@ fn report_only_reason(name: &str) -> &'static str {
              promoting"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
-        "still-monochrome" => {
-            "monochrome decode lands via the round-6 chroma_format_idc=0 lift \
-             (1-plane luma VideoFrame); compare_bit_exact still requires a \
-             3-plane planar YUV input, so the BitExact gate needs a 1-plane \
-             luma comparator path before promotion"
-        }
         "still-10bit-main10" => {
             "Main 10 (bit_depth=10) decode lands via the existing >8-bit \
              emit_frame branch (16-bit LE-packed planar YUV); BitExact \
@@ -182,7 +176,11 @@ fn fixtures() -> Vec<Fixture> {
         // layer divergence is bisected.
         fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
-        fixture!("still-monochrome", ReportOnly),
+        // Round 6 + task #320 promoted: chroma_format_idc=0 lift in
+        // emit_monochrome_frame produces a 1-plane luma VideoFrame
+        // (Gray8); the comparator's compare_rgb24 1-plane branch
+        // splats Y to (Y,Y,Y) packed RGB and matches the oracle.
+        fixture!("still-monochrome", BitExact),
         fixture!("still-10bit-main10", ReportOnly),
         fixture!("still-yuv444", ReportOnly),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
