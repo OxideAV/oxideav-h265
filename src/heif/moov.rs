@@ -177,10 +177,12 @@ pub fn decode_image_sequence(file: &[u8], summary: &MoovSummary) -> Result<Vec<V
     for s in &summary.samples {
         let bytes = sample_bytes(file, s)?;
         let pkt = Packet::new(
-            pts as i64,
-            TimeBase::new(1, summary.timescale.max(1)),
+            0,
+            TimeBase::new(1, summary.timescale.max(1) as i64),
             bytes.to_vec(),
         )
+        .with_pts(pts as i64)
+        .with_duration(s.duration as i64)
         .with_keyframe(s.is_sync);
         dec.send_packet(&pkt)?;
         // Drain any frames the decoder has ready before sending the
