@@ -55,6 +55,8 @@
 use oxideav_h265::heif::{self, Colr, ImageGrid, ImageOverlay, Property};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Ignored is part of the corpus tier vocabulary
+                    // even when no current fixture lands there.
 enum Tier {
     /// Expect a successful decode whose output matches `expected.png`
     /// byte-for-byte after YUV→RGB conversion. Promote a `ReportOnly`
