@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-h265/compare/v0.0.5...v0.0.6) - 2026-05-03
+
+### Added
+
+- enable heif by default
+
+### Other
+
+- revert still-image-overlay to ReportOnly
+- allow dead Tier::Ignored variant
+- cfg(test)-gate the legacy compose_overlay_frames shim
+- add cargo-fuzz harnesses for HEVC encode/decode (task #308)
+- fix Packet::new arg order in moov walker
+- round 5 phase B — moov/stbl walker for image-sequence-3frame
+- round 5 phase A — match iovl canvas-fill matrix to corpus convention
+- rustfmt — XMP arm fits single-line
+- rustfmt fixes from round 4 CI
+- round 4 cleanup — clippy needless_range_loop + ignored-tier assertion
+- round 4 — wire YUV→RGB compare + promote single-image-1x1
+- document phase E alpha-monochrome-blocker on decode_alpha_for_primary
+- round 3 phase C — iovl overlay composition
+- rustfmt — alphabetise meta re-export
+- rustfmt fixes for round-3 phase A/B
+- round 3 phase B — irot rotation + imir mirroring
+- round 3 phase A — clap clean-aperture cropping
+- fix clippy doc_overindented_list_items in corpus test
+- rustfmt fixes from CI
+- add oxideav-core dev-dep for the corpus test
+- add iovl parser + decode_item/decode_alpha_for_primary helpers
+- round 2 — corpus harness + iloc cm=1 + grid + auxC + alpha lookup
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- Main 4:4:4 12 (12-bit 4:4:4) encode (§A.3.4, §7.3.8.10, §8.6.1)
+- Main 4:4:4 10 (10-bit 4:4:4) encode (§A.3.4, §7.3.8.10, §8.6.1)
+- Main 4:4:4 (8-bit) encode + decode (§A.3.4, §6.2, §7.3.8.10)
+- Main 12 (12-bit) encode (§A.3.7, §7.4.3.2.1, §8.6.1)
+- Main 10 (10-bit) encode + r24 AMP B-slice prep
+- B-slice merge / B_Skip encode (§8.5.3.2.2..5, §8.5.3.2.10)
+- B-slice encode (§7.4.7.1, §8.5.3.3.3.1, §9.3.4.2.2)
+- merge / AMVP candidate-list audit (§8.5.3.2.2 .. §8.5.3.2.5) + inter_pred_idc CtDepth ctxInc
+- TMVP scan-order audit (§8.5.3.2.8 / §8.5.3.2.9)
+- cu_skip_flag ctxInc + merge ref_poc refresh — Main 10 inter 25.54 → 33.57 dB
+- round 19 — WPP audit (§6.3.2 / §9.3.2.4) + tile audit toolchain block
+- round 18 — interSplitFlag empirical bin audit (§7.4.9.8)
+- round 17 — AMP (§7.4.9.5) lifted from out-of-scope to wired
+- adopt slim VideoFrame shape
+- round 16 — fix 4:2:2 stacked-chroma cbf inference (§7.4.9.10)
+- round 15 — Main 12 + 4:2:2 (yuv422p12le) decode support
+- round 13 — Main 12 (12-bit) decode support
+- round 12 — 4:2:2 (chroma_format_idc=2) P/B inter decode
+- round 11 — 4:2:2 (chroma_format_idc=2) intra decode
+- lock in scaling-list decode with a byte-exact ffmpeg fixture
+- pin release-plz to patch-only bumps
+
 ### Other
 
 - round 32 — **Main 4:4:4 12 (12-bit 4:4:4) encode** (§A.3.4, §6.2,
