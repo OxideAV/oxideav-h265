@@ -905,7 +905,7 @@ fn compare_rgb24(
 }
 
 /// Rgba oracle compare: assemble 8-bit RGBA from a 3-plane YUV primary
-/// + a 1-plane Gray8 alpha auxiliary (decoded via
+/// and a 1-plane Gray8 alpha auxiliary (decoded via
 /// [`heif::decode_alpha_for_primary`]).
 fn compare_rgba(
     oracle: &oxideav_core::VideoFrame,
@@ -1326,6 +1326,7 @@ fn layer_to_rgb24(
 /// oob_skipped_bytes, sample_positions)`. `sample_positions` is a
 /// short list of `(x, y, layer_rgb, oracle_rgb)` for the first few
 /// differing pixels — useful for drift fingerprinting.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn diff_layer_against_clipped_oracle(
     layer_rgb: &[u8],
     layer_w: usize,

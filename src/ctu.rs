@@ -2529,9 +2529,7 @@ impl<'a> Walker<'a> {
         let cbf_ctx_inc = tr_depth.min(4) as usize;
         let cbf_cb_node = if chroma_here && (tr_depth == 0 || parent_cbf_cb != 0) {
             engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
-        } else if chroma_here {
-            0
-        } else if cat_here == 0 {
+        } else if chroma_here || cat_here == 0 {
             0
         } else {
             // Below 8×8 we inherit the parent's cbf for purposes of the
@@ -2540,9 +2538,7 @@ impl<'a> Walker<'a> {
         };
         let cbf_cr_node = if chroma_here && (tr_depth == 0 || parent_cbf_cr != 0) {
             engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
-        } else if chroma_here {
-            0
-        } else if cat_here == 0 {
+        } else if chroma_here || cat_here == 0 {
             0
         } else {
             parent_cbf_cr
