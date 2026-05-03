@@ -104,8 +104,12 @@ pub fn deblock_picture(
         return;
     }
     let cfi = sps.chroma_format_idc;
-    if cfi != 1 && cfi != 2 {
-        // 4:2:0 + 4:2:2 supported here (mirrors the CTU walker's gate).
+    if cfi != 0 && cfi != 1 && cfi != 2 {
+        // 4:0:0, 4:2:0, and 4:2:2 supported here (mirrors the CTU walker's
+        // chroma sub-sampling gate). 4:0:0 (monochrome) skips the chroma
+        // deblock step further down. 4:4:4 still falls into the early
+        // return — its chroma deblock parity has not been audited
+        // (chroma_deblock helpers were written for sub_x/sub_y >= 1).
         return;
     }
     let width = pic.width as usize;
@@ -139,6 +143,11 @@ pub fn deblock_picture(
         slice,
         bit_depth_y,
     );
+    if cfi == 0 {
+        // Monochrome: no chroma planes to deblock.
+        let _ = (pps, bit_depth_c);
+        return;
+    }
     let sub_x = sps.sub_width_c();
     let sub_y = sps.sub_height_c();
     deblock_vertical_chroma(

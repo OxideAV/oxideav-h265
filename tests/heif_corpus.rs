@@ -78,7 +78,11 @@ fn report_only_reason(name: &str) -> &'static str {
         "single-image-with-thumbnail" => {
             "thumbnail item iref present; primary decode parity not yet verified"
         }
-        "still-image-with-alpha" => "alpha auxiliary uses HEVC monochrome (chroma_format_idc=0)",
+        "still-image-with-alpha" => {
+            "primary 4:2:0 colour decode + alpha aux 4:0:0 (monochrome) decode \
+             both land via the round-6 chroma_format_idc=0 lift; bit-exact \
+             oracle for the colour primary not yet validated"
+        }
         "still-image-with-icc" => {
             "ICC profile retained as Property::Other; no ICC-aware compare yet"
         }
@@ -98,7 +102,12 @@ fn report_only_reason(name: &str) -> &'static str {
              promoting"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
-        "still-monochrome" => "HEVC monochrome (chroma_format_idc=0) not pixel-emitting",
+        "still-monochrome" => {
+            "monochrome decode lands via the round-6 chroma_format_idc=0 lift \
+             (1-plane luma VideoFrame); compare_bit_exact still requires a \
+             3-plane planar YUV input, so the BitExact gate needs a 1-plane \
+             luma comparator path before promotion"
+        }
         "still-10bit-main10" => "HEVC Main 10 not pixel-emitting end-to-end",
         "still-yuv444" => "HEVC 4:4:4 (chroma_format_idc=3) not pixel-emitting",
         "image-sequence-3frame" => {

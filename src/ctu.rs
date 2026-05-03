@@ -377,27 +377,36 @@ pub fn decode_slice_ctus(
     if cctx.sps.separate_colour_plane_flag {
         return Err(Error::unsupported("h265 separate_colour_plane pending"));
     }
-    // 4:2:0 (chroma_format_idc=1), 4:2:2 (chroma_format_idc=2), and
-    // 4:4:4 (chroma_format_idc=3) are supported. 4:0:0
-    // (chroma_format_idc=0) is rejected because every chroma-bearing
-    // code path in this crate would need new branches. 4:4:4 was lifted
-    // in round 30 alongside the Main 4:4:4 encoder; the chroma TB
-    // sizing in `transform_tree` consults
-    // `chroma_array_type()` so the chroma TBs land at full luma
-    // resolution (log2TrafoSizeC = log2TrafoSize per §7.3.8.10), and
-    // intra mode mapping at 4:4:4 is the identity (§8.4.3 — the
+    // 4:2:0 (chroma_format_idc=1), 4:2:2 (chroma_format_idc=2),
+    // 4:4:4 (chroma_format_idc=3), and 4:0:0 (chroma_format_idc=0,
+    // monochrome) are supported. 4:4:4 was lifted in round 30 alongside
+    // the Main 4:4:4 encoder; the chroma TB sizing in `transform_tree`
+    // consults `chroma_array_type()` so the chroma TBs land at full
+    // luma resolution (log2TrafoSizeC = log2TrafoSize per §7.3.8.10),
+    // and intra mode mapping at 4:4:4 is the identity (§8.4.3 — the
     // Table 8-3 422 remap is only applied for ChromaArrayType == 2).
-    // The 4:4:4 lift is currently I-slice only — P/B at 4:4:4 needs a
-    // chroma MV scaling / PartIdx audit similar to round 11/12 4:2:2.
+    // 4:0:0 (HEIF round 6, task #300) skips every chroma-bearing site
+    // (intra_chroma_pred_mode, cbf_cb / cbf_cr, chroma residual recon,
+    // chroma deblock, chroma SAO) — gated below on
+    // `chroma_array_type() == 0`. The 4:4:4 and 4:0:0 lifts are
+    // currently I-slice only — P/B at 4:4:4 needs a chroma MV scaling
+    // / PartIdx audit similar to round 11/12 4:2:2; P/B at 4:0:0 has
+    // no chroma but the inter path is still gated until the alpha-aux
+    // / monochrome corpus is exercised on a non-still file.
     let cfi = cctx.sps.chroma_format_idc;
-    if cfi != 1 && cfi != 2 && cfi != 3 {
+    if cfi > 3 {
         return Err(Error::unsupported(
-            "h265 pixel decode supports 4:2:0, 4:2:2, and 4:4:4 only",
+            "h265 pixel decode supports 4:0:0, 4:2:0, 4:2:2, and 4:4:4 only",
         ));
     }
     if cfi == 3 && cctx.slice.slice_type != SliceType::I {
         return Err(Error::unsupported(
             "h265 pixel decode at 4:4:4 supports I slices only",
+        ));
+    }
+    if cfi == 0 && cctx.slice.slice_type != SliceType::I {
+        return Err(Error::unsupported(
+            "h265 pixel decode at 4:0:0 (monochrome) supports I slices only",
         ));
     }
     // 4:2:2 P/B inter is supported via §8.5.3.2.10 chroma MV derivation
@@ -1220,37 +1229,47 @@ impl<'a> Walker<'a> {
             }
         }
         // Read chroma Cb then Cr: (n/2) × (n/2) samples at `pcm_depth_c` bits.
-        let cn = n / 2;
-        for chroma_plane in 0..2usize {
-            for py in 0..cn {
-                for px in 0..cn {
-                    let sample = read_fl_bits(data, byte_pos, bit_off, pcm_depth_c)
-                        .ok_or_else(|| Error::invalid("h265 pcm: chroma sample read past EOF"))?;
-                    bit_off += pcm_depth_c as u32;
-                    while bit_off >= 8 {
-                        bit_off -= 8;
-                        byte_pos += 1;
-                    }
-                    let shift = bit_depth_c - pcm_depth_c as i32;
-                    let px_val = if shift >= 0 {
-                        (sample as i32) << shift
-                    } else {
-                        (sample as i32) >> (-shift)
-                    };
-                    let xx = (x0 / 2) + px;
-                    let yy = (y0 / 2) + py;
-                    let pic_cw = self.pic.chroma_width();
-                    let pic_ch = self.pic.chroma_height();
-                    if (xx as usize) < pic_cw && (yy as usize) < pic_ch {
-                        let idx = yy as usize * self.pic.chroma_stride + xx as usize;
-                        if chroma_plane == 0 {
-                            self.pic.cb[idx] = px_val.clamp(0, max_c) as u16;
+        // Monochrome (ChromaArrayType == 0) skips the chroma PCM block per
+        // §7.3.8.5 — the pcm_sample syntax only emits luma samples when
+        // chroma is absent.
+        let cat = self.cctx.sps.chroma_array_type();
+        if cat != 0 {
+            let cn = n / 2;
+            for chroma_plane in 0..2usize {
+                for py in 0..cn {
+                    for px in 0..cn {
+                        let sample = read_fl_bits(data, byte_pos, bit_off, pcm_depth_c)
+                            .ok_or_else(|| {
+                                Error::invalid("h265 pcm: chroma sample read past EOF")
+                            })?;
+                        bit_off += pcm_depth_c as u32;
+                        while bit_off >= 8 {
+                            bit_off -= 8;
+                            byte_pos += 1;
+                        }
+                        let shift = bit_depth_c - pcm_depth_c as i32;
+                        let px_val = if shift >= 0 {
+                            (sample as i32) << shift
                         } else {
-                            self.pic.cr[idx] = px_val.clamp(0, max_c) as u16;
+                            (sample as i32) >> (-shift)
+                        };
+                        let xx = (x0 / 2) + px;
+                        let yy = (y0 / 2) + py;
+                        let pic_cw = self.pic.chroma_width();
+                        let pic_ch = self.pic.chroma_height();
+                        if (xx as usize) < pic_cw && (yy as usize) < pic_ch {
+                            let idx = yy as usize * self.pic.chroma_stride + xx as usize;
+                            if chroma_plane == 0 {
+                                self.pic.cb[idx] = px_val.clamp(0, max_c) as u16;
+                            } else {
+                                self.pic.cr[idx] = px_val.clamp(0, max_c) as u16;
+                            }
                         }
                     }
                 }
             }
+        } else {
+            let _ = (bit_depth_c, max_c, pcm_depth_c);
         }
         // Any leftover bit_off lands on the next byte.
         if bit_off > 0 {
@@ -2232,20 +2251,31 @@ impl<'a> Walker<'a> {
             );
         }
 
-        // intra_chroma_pred_mode (once per CU) — TR(cMax=4).
-        let icpm_first = engine.decode_bin(&mut ctx.intra_chroma_pred_mode[0]);
-        let icpm = if icpm_first == 0 {
-            4 // DM mode (inherit luma)
+        // intra_chroma_pred_mode (once per CU) — TR(cMax=4). Per §7.3.8.5,
+        // this syntax element is only signalled when ChromaArrayType != 0;
+        // monochrome (4:0:0) streams skip it entirely. Use DM (inherit luma)
+        // as the chroma_mode placeholder so downstream code that still
+        // references `chroma_mode` for cat=0 paths sees a well-defined value
+        // — but every consumer of `chroma_mode` is gated on cat != 0 below
+        // (chroma transform_tree skip), so the value is unused for monochrome.
+        let chroma_mode = if self.cctx.sps.chroma_array_type() != 0 {
+            let icpm_first = engine.decode_bin(&mut ctx.intra_chroma_pred_mode[0]);
+            let icpm = if icpm_first == 0 {
+                4 // DM mode (inherit luma)
+            } else {
+                // TR-coded bypass 2 bits for the remaining 4 choices.
+                let b0 = engine.decode_bypass();
+                let b1 = engine.decode_bypass();
+                (b0 << 1) | b1
+            };
+            // intraPredModeC for the CU (§8.4.3). Chroma predicts from the
+            // CU-top-left luma mode (2Nx2N chroma unit). For NxN this is the luma
+            // mode at (x0, y0).
+            self.resolve_chroma_mode(luma_modes[0], icpm)
         } else {
-            // TR-coded bypass 2 bits for the remaining 4 choices.
-            let b0 = engine.decode_bypass();
-            let b1 = engine.decode_bypass();
-            (b0 << 1) | b1
+            // Unused for monochrome; placeholder = DM mode.
+            luma_modes[0]
         };
-        // intraPredModeC for the CU (§8.4.3). Chroma predicts from the
-        // CU-top-left luma mode (2Nx2N chroma unit). For NxN this is the luma
-        // mode at (x0, y0).
-        let chroma_mode = self.resolve_chroma_mode(luma_modes[0], icpm);
 
         // transform_tree: one call at CU root. x_base/y_base and parent_cbf
         // are unused at the root (tr_depth == 0 always decodes cbf directly).
@@ -2491,11 +2521,17 @@ impl<'a> Walker<'a> {
         // split, at every depth where log2TrafoSize > 2, conditional on
         // (trafoDepth == 0 || parent cbf_cX != 0). They propagate to
         // nested transform_tree calls so the child parse state matches.
-        let chroma_here = log2_tb > 2;
+        // For monochrome (ChromaArrayType == 0) the spec inhibits both
+        // cbf_cb and cbf_cr — the transform_unit only carries luma — so
+        // we skip the CABAC decode and inherit 0.
+        let cat_here = self.cctx.sps.chroma_array_type();
+        let chroma_here = log2_tb > 2 && cat_here != 0;
         let cbf_ctx_inc = tr_depth.min(4) as usize;
         let cbf_cb_node = if chroma_here && (tr_depth == 0 || parent_cbf_cb != 0) {
             engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
         } else if chroma_here {
+            0
+        } else if cat_here == 0 {
             0
         } else {
             // Below 8×8 we inherit the parent's cbf for purposes of the
@@ -2505,6 +2541,8 @@ impl<'a> Walker<'a> {
         let cbf_cr_node = if chroma_here && (tr_depth == 0 || parent_cbf_cr != 0) {
             engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
         } else if chroma_here {
+            0
+        } else if cat_here == 0 {
             0
         } else {
             parent_cbf_cr
@@ -2828,7 +2866,14 @@ impl<'a> Walker<'a> {
         let cat = self.cctx.sps.chroma_array_type();
         let mut cbf_cb: [u32; 2] = parent_cbf_cb;
         let mut cbf_cr: [u32; 2] = parent_cbf_cr;
-        if log2_tb > 2 {
+        // Monochrome (4:0:0) inhibits cbf_cb / cbf_cr per §7.3.8.10 — the
+        // transform_unit only carries the luma residual. Force both to 0
+        // and skip the CABAC decode entirely.
+        if cat == 0 {
+            cbf_cb = [0, 0];
+            cbf_cr = [0, 0];
+        }
+        if log2_tb > 2 && cat != 0 {
             let cbf_ctx_inc = tr_depth.min(4) as usize;
             // §7.3.8.10 transform_tree: cbf_cb[x0][y0] is decoded under
             // `(trafoDepth == 0 || cbf_cb[xBase][yBase][trafoDepth - 1])`;
@@ -3032,10 +3077,12 @@ impl<'a> Walker<'a> {
         //   location (sub_x = sub_y = 1, log2TrafoSizeC = log2TrafoSize).
         //   When log2_tb == 2 the chroma TBs sit at the parent base
         //   (xBase, yBase), and only emit when blk_idx == 3.
+        // Monochrome (4:0:0) skips both chroma reconstruction paths —
+        // §7.3.8.10 transform_unit carries no chroma residual.
         let sub_x = self.cctx.sps.sub_width_c();
         let sub_y = self.cctx.sps.sub_height_c();
         let chroma_passes: u32 = if cat == 2 { 2 } else { 1 };
-        if log2_tb > 2 {
+        if cat != 0 && log2_tb > 2 {
             let chroma_log2 = if cat == 3 { log2_tb } else { log2_tb - 1 };
             let chroma_step = 1u32 << chroma_log2;
             let cx = x0 / sub_x;
@@ -3065,7 +3112,7 @@ impl<'a> Walker<'a> {
                     cbf_cr[t as usize] != 0,
                 )?;
             }
-        } else if blk_idx == 3 {
+        } else if cat != 0 && blk_idx == 3 {
             // log2_tb == 2 path. Chroma TB(s) anchored at parent base.
             // For 4:2:2, two 4×4 chroma TBs stacked vertically at chroma
             // (xBase/2, yBase) and (xBase/2, yBase+4).

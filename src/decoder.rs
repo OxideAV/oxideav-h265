@@ -394,23 +394,29 @@ impl HevcDecoder {
         let (cw, ch) = (cropped_w as usize, cropped_h as usize);
         // Chroma plane dimensions for the cropped output, derived from
         // SubWidthC / SubHeightC per §6.2 Table 6-1. 4:2:0 → (cw/2, ch/2);
-        // 4:2:2 → (cw/2, ch).
+        // 4:2:2 → (cw/2, ch). For monochrome (4:0:0) `chroma_array_type`
+        // returns 0 and we emit a single luma plane below — the chroma
+        // planes are never written by the CTU walker.
         let sub_x = sps.sub_width_c() as usize;
         let sub_y = sps.sub_height_c() as usize;
         let (cwc, chc) = (cw / sub_x, ch / sub_y);
         let cf = sps.chroma_format_idc;
         let bit_depth_y = sps.bit_depth_y();
         let bit_depth_c = sps.bit_depth_c();
+        // Monochrome (cf == 0): emit a single Gray8 / Gray16 plane.
+        // The chroma surfaces inside `pic` are sized as if cf == 1 (sub_x =
+        // sub_y = 1 from `Picture::new_with_chroma`) but contain only the
+        // initial neutral grey fill — the CTU walker skips every chroma
+        // recon site for cat == 0. Returning a single-plane frame matches
+        // the HEIF alpha-aux convention (1-byte luma per pixel).
+        if cf == 0 {
+            return self.emit_monochrome_frame(pic, sps, cw, ch);
+        }
         // High bit depths use a 16-bit little-endian planar surface
         // (low `bit_depth` bits valid). Per `oxideav-core::PixelFormat`
         // we currently expose:
         //   - 10-bit: Yuv420P10Le, Yuv422P10Le, Yuv444P10Le
         //   - 12-bit: Yuv420P12Le, Yuv422P12Le, Yuv444P12Le
-        // The CTU-level chroma-format gate in `decode_slice_ctus`
-        // restricts pixel decode to chroma_format_idc ∈ {1, 2}, so
-        // 4:4:4 (cf == 3) never reaches `emit_frame` — but its 12-bit
-        // mapping is still listed below for completeness so a future
-        // cfi==3 lift only needs to touch the gate.
         if bit_depth_y > 8 {
             let bps_y = 2usize;
             let bps_c = 2usize;
@@ -506,6 +512,58 @@ impl HevcDecoder {
                     data: cr_plane,
                 },
             ],
+        }
+    }
+
+    /// Single-plane luma emission for monochrome streams (cf == 0).
+    /// Mirrors the 8-bit and >8-bit branches of `emit_frame` but skips
+    /// the chroma planes entirely — the HEIF alpha auxiliary convention
+    /// (ISO/IEC 23008-12 §6.6.2.1) and the only consumer of cf == 0 in
+    /// this crate today.
+    fn emit_monochrome_frame(
+        &self,
+        pic: &Picture,
+        sps: &SeqParameterSet,
+        cw: usize,
+        ch: usize,
+    ) -> VideoFrame {
+        let bit_depth_y = sps.bit_depth_y();
+        if bit_depth_y > 8 {
+            let bps_y = 2usize;
+            let y_stride = cw * bps_y;
+            let max_y = (1u16 << bit_depth_y) - 1;
+            let mut y_plane = vec![0u8; y_stride * ch];
+            for y in 0..ch {
+                let src = &pic.luma[y * pic.luma_stride..y * pic.luma_stride + cw];
+                let dst = &mut y_plane[y * y_stride..y * y_stride + y_stride];
+                for (i, &s) in src.iter().enumerate() {
+                    let v = s.min(max_y);
+                    dst[i * 2] = (v & 0xFF) as u8;
+                    dst[i * 2 + 1] = (v >> 8) as u8;
+                }
+            }
+            return VideoFrame {
+                pts: self.last_pts,
+                planes: vec![VideoPlane {
+                    stride: y_stride,
+                    data: y_plane,
+                }],
+            };
+        }
+        let mut y_plane = vec![0u8; cw * ch];
+        for y in 0..ch {
+            let src = &pic.luma[y * pic.luma_stride..y * pic.luma_stride + cw];
+            let dst = &mut y_plane[y * cw..(y + 1) * cw];
+            for (i, &s) in src.iter().enumerate() {
+                dst[i] = s.min(255) as u8;
+            }
+        }
+        VideoFrame {
+            pts: self.last_pts,
+            planes: vec![VideoPlane {
+                stride: cw,
+                data: y_plane,
+            }],
         }
     }
 
