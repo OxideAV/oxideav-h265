@@ -16,6 +16,14 @@ categories = ["multimedia::encoding", "multimedia::video"]
 [dependencies]
 oxideav-core = "0.1"
 
+[dev-dependencies]
+# Used by the HEIF fixture-corpus integration test (`tests/heif_corpus.rs`)
+# to decode each fixture's `expected.png` oracle for byte-by-byte
+# comparison with our `decode_primary` output. Behind the `heif` feature
+# only — on a default build the test file is empty and the dep is
+# unused-but-cheap.
+oxideav-png = "0.1"
+
 [features]
 # HEIF/HEIC still image + image sequence container support. Enables the
 # `heif` module which walks the ISOBMFF meta hierarchy (ftyp / meta /

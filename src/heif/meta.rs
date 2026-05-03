@@ -33,9 +33,12 @@ const IPCO: BoxType = b(b"ipco");
 const IPMA: BoxType = b(b"ipma");
 const IREF: BoxType = b(b"iref");
 
+const IDAT: BoxType = b(b"idat");
+
 const HVCC: BoxType = b(b"hvcC");
 const ISPE: BoxType = b(b"ispe");
 const COLR: BoxType = b(b"colr");
+const AUXC: BoxType = b(b"auxC");
 
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
@@ -96,6 +99,20 @@ pub struct IrefEntry {
     pub to_ids: Vec<u32>,
 }
 
+/// Parsed `auxC` (auxiliary configuration, ISO/IEC 23008-12 §6.6.2 /
+/// 14496-12 §8.11.5). Carries the per-aux-type URN that classifies an
+/// auxiliary item (alpha, depth, …). The HEIF/AVIF alpha-plane URN for
+/// HEVC is `urn:mpeg:hevc:2015:auxid:1` (§6.6.2.1.1).
+#[derive(Clone, Debug)]
+pub struct AuxC {
+    /// Null-terminated UTF-8 URN identifying the aux type. Matched
+    /// against [`crate::heif::ALPHA_URN_HEVC`] etc. by callers.
+    pub aux_type: String,
+    /// Trailing aux_subtype bytes (variable-length). Empty for HEVC
+    /// alpha; reserved for future aux types.
+    pub aux_subtype: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Property {
     /// Raw `hvcC` body (HEVCDecoderConfigurationRecord). Parse with
@@ -103,6 +120,7 @@ pub enum Property {
     HvcC(Vec<u8>),
     Ispe(Ispe),
     Colr(Colr),
+    AuxC(AuxC),
     Other(BoxType, Vec<u8>),
 }
 
@@ -112,6 +130,7 @@ impl Property {
             Property::HvcC(_) => HVCC,
             Property::Ispe(_) => ISPE,
             Property::Colr(_) => COLR,
+            Property::AuxC(_) => AUXC,
             Property::Other(t, _) => *t,
         }
     }
@@ -126,6 +145,11 @@ pub struct Meta {
     pub properties: Vec<Property>,
     pub associations: Vec<ItemPropertyAssociation>,
     pub irefs: Vec<IrefEntry>,
+    /// Body of the (optional) `idat` box living inside `meta`. ISO/IEC
+    /// 14496-12 §8.11.4 — payloads of items whose iloc entry uses
+    /// `construction_method == 1` (item data embedded in `idat`) live
+    /// here. Empty when the file has no `idat` box.
+    pub idat: Vec<u8>,
 }
 
 impl Meta {
@@ -156,10 +180,37 @@ impl Meta {
                 x if x == &IREF => {
                     me.irefs = parse_iref(payload)?;
                 }
+                x if x == &IDAT => {
+                    me.idat = payload.to_vec();
+                }
                 _ => {}
             }
         }
         Ok(me)
+    }
+
+    /// Return the list of target item IDs referenced from `from_id` via
+    /// an iref entry of the given `reference_type` (e.g. `b"dimg"` for
+    /// grid tiles, `b"auxl"` for alpha auxiliaries).
+    pub fn iref_targets(&self, reference_type: &BoxType, from_id: u32) -> Vec<u32> {
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.from_id == from_id {
+                return e.to_ids.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Return the source of the first iref of `reference_type` whose
+    /// `to_ids` contains `to_id`. Useful for finding the alpha auxiliary
+    /// that points at the primary item via `auxl`.
+    pub fn iref_source_of(&self, reference_type: &BoxType, to_id: u32) -> Option<u32> {
+        for e in &self.irefs {
+            if &e.reference_type == reference_type && e.to_ids.contains(&to_id) {
+                return Some(e.from_id);
+            }
+        }
+        None
     }
 
     pub fn item_by_id(&self, id: u32) -> Option<&ItemInfo> {
@@ -377,11 +428,29 @@ fn parse_ipco(payload: &[u8]) -> Result<Vec<Property>> {
             x if x == &HVCC => Property::HvcC(body.to_vec()),
             x if x == &ISPE => Property::Ispe(parse_ispe(body)?),
             x if x == &COLR => Property::Colr(parse_colr(body)?),
+            x if x == &AUXC => Property::AuxC(parse_auxc(body)?),
             other => Property::Other(*other, body.to_vec()),
         };
         out.push(prop);
     }
     Ok(out)
+}
+
+/// Parse an `auxC` (AuxiliaryTypeProperty) body — ISO/IEC 23008-12
+/// §6.6.2 / 14496-12 §8.11.5. Layout after the FullBox header:
+///
+/// ```text
+/// utf8 aux_type      (NUL-terminated)
+/// u8[] aux_subtype   (rest of the box; may be empty)
+/// ```
+fn parse_auxc(body: &[u8]) -> Result<AuxC> {
+    let (_v, _f, rest) = parse_full_box(body)?;
+    let (aux_type, next) = read_cstr(rest, 0)?;
+    let aux_subtype = rest[next..].to_vec();
+    Ok(AuxC {
+        aux_type,
+        aux_subtype,
+    })
 }
 
 fn parse_ispe(body: &[u8]) -> Result<Ispe> {
@@ -532,6 +601,32 @@ mod tests {
         let ispe = parse_ispe(&buf).unwrap();
         assert_eq!(ispe.width, 100);
         assert_eq!(ispe.height, 200);
+    }
+
+    #[test]
+    fn auxc_round_trip() {
+        // FullBox header (4 zero bytes) + NUL-terminated URN.
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(b"urn:mpeg:hevc:2015:auxid:1\0");
+        let auxc = parse_auxc(&body).unwrap();
+        assert_eq!(auxc.aux_type, "urn:mpeg:hevc:2015:auxid:1");
+        assert!(auxc.aux_subtype.is_empty());
+    }
+
+    #[test]
+    fn idat_box_captured_in_meta() {
+        // Build a minimal meta containing only an `idat` box (and the
+        // FullBox prefix for `meta` itself).
+        let idat_body: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+        let mut idat = Vec::new();
+        let total = (8 + idat_body.len()) as u32;
+        idat.extend_from_slice(&total.to_be_bytes());
+        idat.extend_from_slice(b"idat");
+        idat.extend_from_slice(idat_body);
+        let mut meta_payload = vec![0u8; 4]; // FullBox v=0 flags=0
+        meta_payload.extend_from_slice(&idat);
+        let meta = Meta::parse(&meta_payload).unwrap();
+        assert_eq!(meta.idat, idat_body);
     }
 
     #[test]
