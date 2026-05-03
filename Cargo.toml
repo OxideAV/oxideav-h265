@@ -37,5 +37,5 @@ oxideav-core = "0.1"
 # the existing H.265 decoder. Scaffold-grade: the box walker is
 # complete enough to locate the primary item's payload, but end-to-end
 # decode of a real HEIC is gated on encoder-side fixtures.
-default = []
+default = ["heif"]
 heif = []
