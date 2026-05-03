@@ -39,9 +39,8 @@
 //! 3. The primary item (`pitm`) is locatable.
 //! 4. We dispatch on primary item type:
 //!    * `hvc1` / `hev1` — try [`heif::decode_primary`].
-//!    * `grid`           — try [`heif::decode_primary`] (composes via
-//!                          per-tile decode + canvas paste).
-//!    * `iovl`           — recognised; not yet composited.
+//!    * `grid` — try [`heif::decode_primary`] (per-tile decode + paste).
+//!    * `iovl` — recognised; not yet composited.
 //!    * other (image sequence / metadata-only) — skipped per Tier.
 //! 5. Optional features are sniffed (alpha auxiliary item, embedded
 //!    ICC profile, dimg / cdsc / thmb iref edges) and reported.
