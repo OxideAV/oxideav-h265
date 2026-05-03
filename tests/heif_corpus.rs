@@ -83,9 +83,7 @@ fn report_only_reason(name: &str) -> &'static str {
         "still-image-with-exif" => {
             "Exif metadata item only; primary decode parity not yet verified"
         }
-        "still-image-with-xmp" => {
-            "XMP metadata item only; primary decode parity not yet verified"
-        }
+        "still-image-with-xmp" => "XMP metadata item only; primary decode parity not yet verified",
         "still-image-grid-2x2" => {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
