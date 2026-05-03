@@ -1281,7 +1281,11 @@ fn composite_grid_frames(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<Video
 /// then pasted onto a canvas of the declared `(output_width,
 /// output_height)` at its `(h_offset, v_offset)`. The canvas is filled
 /// with [`ImageOverlay::canvas_fill_rgba`] converted to YUV via the
-/// BT.709 limited-range matrix (the HEIF default colour space).
+/// matrix selected from the iovl item's `colr nclx` property (or
+/// BT.601 limited-range when no `colr` is associated — matching the
+/// corpus convention used by the bit-exact compare in
+/// `tests/heif_corpus.rs`, which itself follows the ISO/IEC 23008-12
+/// §6.5.5 default for HEIC images without an explicit colour profile).
 fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame> {
     let layer_ids = hdr.meta.iref_targets(b"dimg", iovl_id);
     if layer_ids.is_empty() {
@@ -1306,7 +1310,21 @@ fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame>
         let layer = decode_hvc_item(hdr, *lid)?;
         layers.push(layer);
     }
-    compose_overlay_frames(&overlay, &layers)
+    let iovl_colr = match hdr.meta.property_for(iovl_id, b"colr") {
+        Some(Property::Colr(c)) => Some(c.clone()),
+        _ => None,
+    };
+    let fill_matrix = FillMatrix::from_colr(iovl_colr.as_ref());
+    compose_overlay_frames_with_matrix(&overlay, &layers, fill_matrix)
+}
+
+/// Backwards-compatible shim for [`compose_overlay_frames_with_matrix`]
+/// that hard-codes BT.709 limited-range fill conversion. Retained so
+/// the older unit tests keep building unchanged; the iovl pipeline now
+/// flows through `compose_overlay_frames_with_matrix` so the canvas-
+/// fill matrix can track the iovl item's `colr nclx` property.
+fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Result<VideoFrame> {
+    compose_overlay_frames_with_matrix(overlay, layers, FillMatrix::Bt709Limited)
 }
 
 /// Composite a back-to-front sequence of HEVC-decoded layers onto a
@@ -1317,11 +1335,18 @@ fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame>
 /// outside the canvas after offsetting are clipped; areas not covered
 /// by any layer remain at the converted fill colour.
 ///
-/// The fill is BT.709-limited-range converted from the descriptor's
+/// The fill is RGB-to-YUV converted via `matrix` from the descriptor's
 /// 16-bit RGBA (alpha channel ignored — overlay composition here is
 /// straight paste, not alpha-blend; alpha auxiliary handling is the
-/// auxC / auxl path covered separately).
-fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Result<VideoFrame> {
+/// auxC / auxl path covered separately). Pick the matrix that matches
+/// what the consumer of the resulting YUV frame will assume — see
+/// [`FillMatrix::from_colr`] for the iovl convention used by
+/// [`decode_iovl_primary`].
+fn compose_overlay_frames_with_matrix(
+    overlay: &ImageOverlay,
+    layers: &[VideoFrame],
+    matrix: FillMatrix,
+) -> Result<VideoFrame> {
     if layers.is_empty() {
         return Err(Error::invalid("heif: iovl composite called with no layers"));
     }
@@ -1391,7 +1416,7 @@ fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Resu
     let r8 = (overlay.canvas_fill_rgba[0] >> 8) as u8;
     let g8 = (overlay.canvas_fill_rgba[1] >> 8) as u8;
     let b8 = (overlay.canvas_fill_rgba[2] >> 8) as u8;
-    let (y_fill, u_fill, v_fill) = bt709_limited_rgb_to_yuv(r8, g8, b8);
+    let (y_fill, u_fill, v_fill) = matrix.rgb_to_yuv(r8, g8, b8);
     // Build per-plane output buffers at the canvas size, pre-filled
     // with the fill bytes. Plane 0 = Y, plane 1 = U/Cb, plane 2 = V/Cr
     // (the only layouts produced by the HEVC decoder this round). For
@@ -1464,6 +1489,88 @@ fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Resu
         pts: layers[0].pts,
         planes: out_planes,
     })
+}
+
+/// Selector for the RGB-to-YUV matrix used to convert the iovl canvas
+/// fill into per-plane fill bytes. Mirrored from
+/// `tests/heif_corpus.rs::Matrix` — kept private to this module since
+/// only the iovl pipeline currently needs it. Promote to a public type
+/// once additional callers (e.g. monochrome / Main 10) need a
+/// matrix-aware fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FillMatrix {
+    /// BT.601 limited-range — the iovl default when no `colr nclx` is
+    /// associated with the iovl item, matching the corpus convention
+    /// used by the bit-exact compare (which itself follows the
+    /// ISO/IEC 23008-12 §6.5.5 unspecified-`colr` default and the
+    /// libwebp / libheif convention shared with oxideav-webp #253).
+    Bt601Limited,
+    Bt601Full,
+    Bt709Limited,
+    Bt709Full,
+}
+
+impl FillMatrix {
+    /// Resolve the canvas-fill matrix from the iovl item's `colr`.
+    /// Honours `nclx` `matrix_coefficients` (1 → BT.709, anything else
+    /// → BT.601) and `full_range_flag`. Falls back to BT.601 limited
+    /// when `colr` is `None` or carries an ICC profile only.
+    fn from_colr(colr: Option<&Colr>) -> Self {
+        match colr {
+            Some(Colr::Nclx {
+                matrix_coefficients,
+                full_range,
+                ..
+            }) => match (*matrix_coefficients, *full_range) {
+                (1, true) => FillMatrix::Bt709Full,
+                (1, false) => FillMatrix::Bt709Limited,
+                (_, true) => FillMatrix::Bt601Full,
+                (_, false) => FillMatrix::Bt601Limited,
+            },
+            _ => FillMatrix::Bt601Limited,
+        }
+    }
+
+    /// Convert a single 8-bit-per-channel RGB sample to (Y, U/Cb, V/Cr)
+    /// per the selected matrix. Limited-range outputs land in the
+    /// studio quantisation Y' ∈ [16,235], C ∈ [16,240]; full-range
+    /// outputs use the [0,255] mapping.
+    #[inline]
+    fn rgb_to_yuv(self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        match self {
+            FillMatrix::Bt709Limited => bt709_limited_rgb_to_yuv(r, g, b),
+            FillMatrix::Bt709Full => rgb_to_yuv_with(r, g, b, 0.2126, 0.0722, false),
+            FillMatrix::Bt601Limited => rgb_to_yuv_with(r, g, b, 0.299, 0.114, true),
+            FillMatrix::Bt601Full => rgb_to_yuv_with(r, g, b, 0.299, 0.114, false),
+        }
+    }
+}
+
+/// Generic RGB→YUV with explicit `kr` / `kb` luma weights and a
+/// `limited` flag selecting between studio quantisation and full-range
+/// quantisation. Mirrors the per-pixel formula in
+/// `tests/heif_corpus.rs::yuv_to_rgb` (inverted), so the iovl canvas-
+/// fill path round-trips through the bit-exact compare without LSB
+/// drift on grey / coloured fill regions.
+#[inline]
+fn rgb_to_yuv_with(r: u8, g: u8, b: u8, kr: f32, kb: f32, limited: bool) -> (u8, u8, u8) {
+    let kg = 1.0 - kr - kb;
+    let r = r as f32;
+    let g = g as f32;
+    let b = b as f32;
+    let y_lin = kr * r + kg * g + kb * b;
+    let cb_lin = (b - y_lin) / (2.0 * (1.0 - kb));
+    let cr_lin = (r - y_lin) / (2.0 * (1.0 - kr));
+    let (y, cb, cr) = if limited {
+        // [0,255] full → [16,235] luma, [16,240] chroma.
+        let y = 16.0 + y_lin * (219.0 / 255.0);
+        let cb = 128.0 + cb_lin * (224.0 / 255.0);
+        let cr = 128.0 + cr_lin * (224.0 / 255.0);
+        (y, cb, cr)
+    } else {
+        (y_lin, 128.0 + cb_lin, 128.0 + cr_lin)
+    };
+    (clamp_u8(y), clamp_u8(cb), clamp_u8(cr))
 }
 
 /// BT.709 limited-range RGB-to-YUV (8-bit input, 8-bit Y/U/V output).
@@ -1929,6 +2036,71 @@ mod tests {
         assert_eq!(r.planes[0].data[1], 11);
         assert_eq!(r.planes[0].data[4], 14);
         assert_eq!(r.planes[0].data[5], 15);
+    }
+
+    #[test]
+    fn fill_matrix_defaults_to_bt601_limited_when_no_colr() {
+        // The corpus YUV→RGB compare follows the libwebp / libheif
+        // convention of BT.601 limited when the file carries no
+        // explicit `colr` — `FillMatrix::from_colr(None)` must agree
+        // so the iovl canvas-fill path round-trips byte-for-byte
+        // through the bit-exact compare.
+        assert_eq!(FillMatrix::from_colr(None), FillMatrix::Bt601Limited);
+    }
+
+    #[test]
+    fn fill_matrix_honours_nclx_matrix_coefficients() {
+        let nclx_bt709 = Colr::Nclx {
+            colour_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+            full_range: false,
+        };
+        assert_eq!(
+            FillMatrix::from_colr(Some(&nclx_bt709)),
+            FillMatrix::Bt709Limited
+        );
+        let nclx_bt601 = Colr::Nclx {
+            colour_primaries: 5,
+            transfer_characteristics: 6,
+            matrix_coefficients: 6,
+            full_range: false,
+        };
+        assert_eq!(
+            FillMatrix::from_colr(Some(&nclx_bt601)),
+            FillMatrix::Bt601Limited
+        );
+        let nclx_bt709_full = Colr::Nclx {
+            colour_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+            full_range: true,
+        };
+        assert_eq!(
+            FillMatrix::from_colr(Some(&nclx_bt709_full)),
+            FillMatrix::Bt709Full
+        );
+    }
+
+    #[test]
+    fn fill_matrix_rgb_to_yuv_white_lands_on_high_luma() {
+        // Pure white round-trips to Y = 235 limited / 255 full and
+        // chroma = 128 (neutral) on every matrix.
+        for m in [
+            FillMatrix::Bt601Limited,
+            FillMatrix::Bt601Full,
+            FillMatrix::Bt709Limited,
+            FillMatrix::Bt709Full,
+        ] {
+            let (y, cb, cr) = m.rgb_to_yuv(0xFF, 0xFF, 0xFF);
+            assert_eq!(cb, 128, "matrix {m:?} cb");
+            assert_eq!(cr, 128, "matrix {m:?} cr");
+            let expected = match m {
+                FillMatrix::Bt601Limited | FillMatrix::Bt709Limited => 235,
+                FillMatrix::Bt601Full | FillMatrix::Bt709Full => 255,
+            };
+            assert_eq!(y, expected, "matrix {m:?} y");
+        }
     }
 
     #[test]

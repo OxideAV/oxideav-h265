@@ -88,7 +88,8 @@ fn report_only_reason(name: &str) -> &'static str {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
         "still-image-overlay" => {
-            "iovl canvas fill uses BT.709; corpus expected.png is BT.601 default → 1 LSB drift"
+            "promoted to BitExact in round 5 — kept here as the slot stays valid \
+             if a future fixture variant reverts the iovl colr to BT.709 explicitly"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "still-monochrome" => "HEVC monochrome (chroma_format_idc=0) not pixel-emitting",
@@ -134,17 +135,11 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
-        // Round-4 left at ReportOnly: iovl composition lands on a YUV
-        // canvas, but `compose_overlay_frames` computes its canvas fill
-        // via the BT.709 limited-range matrix (see
-        // `bt709_limited_rgb_to_yuv` in src/heif/mod.rs) while the
-        // expected.png was generated without a `colr` — so the test's
-        // YUV→RGB compare defaults to BT.601 and round-trips the grey
-        // fill 1 LSB high. Promoting requires either matching the iovl
-        // fill matrix to the corpus convention or accepting a known-
-        // bounded ±1 LSB tolerance on canvas-fill pixels; both are out
-        // of scope for round 4.
-        fixture!("still-image-overlay", ReportOnly),
+        // Round-5 promoted: iovl canvas-fill conversion now picks the
+        // matrix from the iovl item's `colr nclx` (or BT.601 limited
+        // when no `colr` is associated), matching the corpus YUV→RGB
+        // compare convention. See `FillMatrix` in src/heif/mod.rs.
+        fixture!("still-image-overlay", BitExact),
         fixture!("multi-image-burst-3", ReportOnly),
         fixture!("still-monochrome", ReportOnly),
         fixture!("still-10bit-main10", ReportOnly),
