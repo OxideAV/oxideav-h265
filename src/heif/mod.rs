@@ -93,8 +93,10 @@ pub const ITEM_TYPE_GRID: BoxType = b(b"grid");
 /// `iovl` derived item type — ISO/IEC 23008-12 §6.6.2.3.3. Layered
 /// composition of several constituent items, each with its own
 /// `(offset_x, offset_y)` placement, on a canvas filled with a 16-bit
-/// RGBA fill colour. Currently surfaced via [`Meta`] but not composed
-/// end-to-end.
+/// RGBA fill colour. Composition is implemented end-to-end by
+/// [`decode_primary`] (round 3 phase C); per-layer transformative
+/// properties (`clap` / `irot` / `imir`) are honoured because each
+/// layer is decoded via [`decode_item`].
 pub const ITEM_TYPE_IOVL: BoxType = b(b"iovl");
 
 use box_parser::{b, iter_boxes, read_u32, type_str};
@@ -691,9 +693,7 @@ pub fn decode_primary(bytes: &[u8]) -> Result<VideoFrame> {
     } else if primary_info.item_type == ITEM_TYPE_HVC1 || primary_info.item_type == ITEM_TYPE_HEV1 {
         decode_hvc_item(&hdr, primary_id)
     } else if primary_info.item_type == ITEM_TYPE_IOVL {
-        Err(Error::unsupported(
-            "heif: 'iovl' overlay-derived primary not yet composited (Phase 5)",
-        ))
+        decode_iovl_primary(&hdr, primary_id)
     } else {
         Err(Error::unsupported(format!(
             "heif: primary item type '{}' not supported",
@@ -1256,6 +1256,230 @@ fn composite_grid_frames(grid: &ImageGrid, tiles: &[VideoFrame]) -> Result<Video
     })
 }
 
+/// Decode an `iovl`-derived primary item — ISO/IEC 23008-12 §6.6.2.3.3.
+///
+/// The overlay descriptor lives in the item payload (parsed as
+/// [`ImageOverlay`]); the constituent images appear as `dimg`
+/// references *from* the overlay item, in back-to-front layer order.
+/// Each constituent is decoded via [`decode_hvc_item`] (so it inherits
+/// any of its own transformative-property chain — clap / irot / imir),
+/// then pasted onto a canvas of the declared `(output_width,
+/// output_height)` at its `(h_offset, v_offset)`. The canvas is filled
+/// with [`ImageOverlay::canvas_fill_rgba`] converted to YUV via the
+/// BT.709 limited-range matrix (the HEIF default colour space).
+fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame> {
+    let layer_ids = hdr.meta.iref_targets(b"dimg", iovl_id);
+    if layer_ids.is_empty() {
+        return Err(Error::invalid(format!(
+            "heif: iovl item {iovl_id} has no 'dimg' references"
+        )));
+    }
+    let iovl_bytes = item_bytes_in(hdr.file, &hdr.meta, iovl_id)?;
+    let overlay = ImageOverlay::parse(iovl_bytes, layer_ids.len())?;
+    let mut layers: Vec<VideoFrame> = Vec::with_capacity(layer_ids.len());
+    for (i, lid) in layer_ids.iter().enumerate() {
+        let info = hdr
+            .meta
+            .item_by_id(*lid)
+            .ok_or_else(|| Error::invalid(format!("heif: iovl layer {i} id {lid} unknown")))?;
+        if info.item_type != ITEM_TYPE_HVC1 && info.item_type != ITEM_TYPE_HEV1 {
+            return Err(Error::unsupported(format!(
+                "heif: iovl layer {i} item_type '{}' is not 'hvc1' / 'hev1'",
+                type_str(&info.item_type)
+            )));
+        }
+        let layer = decode_hvc_item(hdr, *lid)?;
+        layers.push(layer);
+    }
+    compose_overlay_frames(&overlay, &layers)
+}
+
+/// Composite a back-to-front sequence of HEVC-decoded layers onto a
+/// canvas of `(overlay.output_width, overlay.output_height)` at the
+/// per-layer `(h_offset, v_offset)` declared in the overlay
+/// descriptor. Layers must agree on plane count and per-plane chroma
+/// sub-sampling factors (those are inferred from layer 0). Pixels
+/// outside the canvas after offsetting are clipped; areas not covered
+/// by any layer remain at the converted fill colour.
+///
+/// The fill is BT.709-limited-range converted from the descriptor's
+/// 16-bit RGBA (alpha channel ignored — overlay composition here is
+/// straight paste, not alpha-blend; alpha auxiliary handling is the
+/// auxC / auxl path covered separately).
+fn compose_overlay_frames(overlay: &ImageOverlay, layers: &[VideoFrame]) -> Result<VideoFrame> {
+    if layers.is_empty() {
+        return Err(Error::invalid("heif: iovl composite called with no layers"));
+    }
+    let out_w = overlay.output_width as usize;
+    let out_h = overlay.output_height as usize;
+    if out_w == 0 || out_h == 0 {
+        return Err(Error::invalid(format!(
+            "heif: iovl output dims {}x{} contain a zero",
+            out_w, out_h
+        )));
+    }
+    let n_planes = layers[0].planes.len();
+    if n_planes == 0 {
+        return Err(Error::invalid("heif: iovl layer 0 has no planes"));
+    }
+    // Per-plane (sub_x_shift, sub_y_shift) — same derivation as the
+    // grid composer; plane 0 is luma.
+    let luma_stride = layers[0].planes[0].stride.max(1);
+    let luma_h = layers[0].planes[0].data.len() / luma_stride;
+    if luma_h == 0 {
+        return Err(Error::invalid("heif: iovl layer 0 luma plane is empty"));
+    }
+    let mut shifts: Vec<(u32, u32)> = Vec::with_capacity(n_planes);
+    for p in 0..n_planes {
+        if p == 0 {
+            shifts.push((0, 0));
+            continue;
+        }
+        let pl = &layers[0].planes[p];
+        let s = pl.stride.max(1);
+        let h = pl.data.len() / s;
+        let sx = if luma_stride == s {
+            0
+        } else if luma_stride == s * 2 {
+            1
+        } else {
+            return Err(Error::invalid(format!(
+                "heif: iovl plane {p} sub_x not 1x/2x luma"
+            )));
+        };
+        let sy = if luma_h == h {
+            0
+        } else if luma_h == h * 2 {
+            1
+        } else {
+            return Err(Error::invalid(format!(
+                "heif: iovl plane {p} sub_y not 1x/2x luma"
+            )));
+        };
+        shifts.push((sx, sy));
+    }
+    // Validate uniform plane shape across all layers.
+    for (i, layer) in layers.iter().enumerate().skip(1) {
+        if layer.planes.len() != n_planes {
+            return Err(Error::invalid(format!(
+                "heif: iovl layer {i} has {} planes != layer 0 has {}",
+                layer.planes.len(),
+                n_planes
+            )));
+        }
+    }
+    // Convert the canvas RGBA fill to per-plane fill bytes. The
+    // descriptor's RGBA components are 16-bit; we down-shift to 8-bit
+    // for the YUV packing path below (the HEVC decoder also emits
+    // 8-bit planes for the fixtures in this round). Higher bit depths
+    // are deferred — they require widening every plane to u16.
+    let r8 = (overlay.canvas_fill_rgba[0] >> 8) as u8;
+    let g8 = (overlay.canvas_fill_rgba[1] >> 8) as u8;
+    let b8 = (overlay.canvas_fill_rgba[2] >> 8) as u8;
+    let (y_fill, u_fill, v_fill) = bt709_limited_rgb_to_yuv(r8, g8, b8);
+    // Build per-plane output buffers at the canvas size, pre-filled
+    // with the fill bytes. Plane 0 = Y, plane 1 = U/Cb, plane 2 = V/Cr
+    // (the only layouts produced by the HEVC decoder this round). For
+    // single-plane layouts (monochrome) only Y_fill is used.
+    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(n_planes);
+    for p in 0..n_planes {
+        let (sx, sy) = shifts[p];
+        let pw = ceil_shift(out_w, sx);
+        let ph = ceil_shift(out_h, sy);
+        let fill = match p {
+            0 => y_fill,
+            1 => u_fill,
+            2 => v_fill,
+            _ => 0,
+        };
+        out_planes.push(VideoPlane {
+            stride: pw,
+            data: vec![fill; pw * ph],
+        });
+    }
+    // Paste each layer in declared order (back-to-front).
+    for (i, layer) in layers.iter().enumerate() {
+        let (h_off, v_off) = overlay.offsets[i];
+        for (p, plane) in layer.planes.iter().enumerate() {
+            let (sx, sy) = shifts[p];
+            let src_stride = plane.stride.max(1);
+            let src_h = plane.data.len() / src_stride;
+            // Clip the source rectangle to the part that lands inside
+            // the canvas after offsetting. All math is in luma samples
+            // first, then divided by the per-plane sub-sampling.
+            let layer_w_luma = src_stride << sx; // luma-equivalent width
+            let layer_h_luma = src_h << sy;
+            let dst_left_luma = h_off; // can be negative
+            let dst_top_luma = v_off;
+            // Compute the visible rectangle in luma coords.
+            let visible_left = dst_left_luma.max(0);
+            let visible_top = dst_top_luma.max(0);
+            let visible_right = (dst_left_luma + layer_w_luma as i32).min(out_w as i32);
+            let visible_bottom = (dst_top_luma + layer_h_luma as i32).min(out_h as i32);
+            if visible_right <= visible_left || visible_bottom <= visible_top {
+                continue; // layer is entirely outside the canvas
+            }
+            // Convert the visible rectangle into per-plane coords.
+            // For sub-sampled planes we round the destination down to
+            // the nearest sub-sample boundary so chroma samples line
+            // up with their luma neighbourhood.
+            let pl_dst_left = (visible_left as usize) >> sx;
+            let pl_dst_top = (visible_top as usize) >> sy;
+            let pl_dst_w = ((visible_right as usize) >> sx).saturating_sub(pl_dst_left);
+            let pl_dst_h = ((visible_bottom as usize) >> sy).saturating_sub(pl_dst_top);
+            if pl_dst_w == 0 || pl_dst_h == 0 {
+                continue;
+            }
+            // Source-side offset = how far into the layer the visible
+            // rectangle starts. If the layer's top-left is left/above
+            // the canvas (negative offset), the source skips that
+            // many pixels.
+            let pl_src_left = (visible_left - dst_left_luma) as usize >> sx;
+            let pl_src_top = (visible_top - dst_top_luma) as usize >> sy;
+            let dst = &mut out_planes[p];
+            let dst_stride = dst.stride;
+            for r in 0..pl_dst_h {
+                let src_off = (pl_src_top + r) * src_stride + pl_src_left;
+                let dst_off = (pl_dst_top + r) * dst_stride + pl_dst_left;
+                dst.data[dst_off..dst_off + pl_dst_w]
+                    .copy_from_slice(&plane.data[src_off..src_off + pl_dst_w]);
+            }
+        }
+    }
+    Ok(VideoFrame {
+        pts: layers[0].pts,
+        planes: out_planes,
+    })
+}
+
+/// BT.709 limited-range RGB-to-YUV (8-bit input, 8-bit Y/U/V output).
+/// Used by [`compose_overlay_frames`] to render the iovl canvas-fill
+/// RGBA into Y/Cb/Cr fill bytes that match what the HEVC layers expect.
+/// Coefficients per Rec. ITU-R BT.709 §3.5 (with the studio-range
+/// quantisation Y' ∈ [16,235], C ∈ [16,240]).
+#[inline]
+fn bt709_limited_rgb_to_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let r = r as f32;
+    let g = g as f32;
+    let b = b as f32;
+    let y = 16.0 + (0.18259 * r) + (0.61423 * g) + (0.06201 * b);
+    let cb = 128.0 + (-0.10064 * r) + (-0.33857 * g) + (0.43922 * b);
+    let cr = 128.0 + (0.43922 * r) + (-0.39895 * g) + (-0.04027 * b);
+    (clamp_u8(y), clamp_u8(cb), clamp_u8(cr))
+}
+
+#[inline]
+fn clamp_u8(v: f32) -> u8 {
+    let r = v.round();
+    if r < 0.0 {
+        0
+    } else if r > 255.0 {
+        255
+    } else {
+        r as u8
+    }
+}
+
 #[inline]
 fn ceil_shift(v: usize, s: u32) -> usize {
     if s == 0 {
@@ -1617,6 +1841,80 @@ mod tests {
         assert_eq!(r.planes[1].data, vec![101, 102]);
         assert_eq!(r.planes[2].stride, 2);
         assert_eq!(r.planes[2].data, vec![201, 202]);
+    }
+
+    #[test]
+    fn bt709_limited_grey_round_trips_to_centre_chroma() {
+        // RGB (0x40, 0x40, 0x40) is mid-grey → Cb/Cr should land near
+        // 128 (limited-range neutral) and Y near studio-mid (~80).
+        let (y, cb, cr) = bt709_limited_rgb_to_yuv(0x40, 0x40, 0x40);
+        assert!((cb as i32 - 128).abs() <= 1);
+        assert!((cr as i32 - 128).abs() <= 1);
+        // Y for mid-grey ≈ 16 + (0.18259 + 0.61423 + 0.06201) * 64 = ~71.
+        assert!(y > 60 && y < 90, "y = {y}");
+    }
+
+    #[test]
+    fn bt709_limited_pure_red_lands_on_red_chroma() {
+        // Pure red 0xFF, 0, 0: Cr should swing well above 128, Cb below.
+        let (_y, cb, cr) = bt709_limited_rgb_to_yuv(0xFF, 0, 0);
+        assert!(cr > 200, "cr = {cr}");
+        assert!(cb < 110, "cb = {cb}");
+    }
+
+    #[test]
+    fn compose_overlay_paints_fill_when_no_layer_covers_pixel() {
+        // 4x4 canvas, single 2x2 layer at (2, 2) — top-left 2x2
+        // remains the fill colour.
+        let layer = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 2,
+                data: vec![10, 10, 10, 10],
+            }],
+        };
+        let overlay = ImageOverlay {
+            version: 0,
+            flags: 0,
+            canvas_fill_rgba: [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF],
+            output_width: 4,
+            output_height: 4,
+            offsets: vec![(2, 2)],
+        };
+        let r = compose_overlay_frames(&overlay, &[layer]).unwrap();
+        // Pure-white fill → BT.709 Y near 235.
+        let (y_fill, _, _) = bt709_limited_rgb_to_yuv(0xFF, 0xFF, 0xFF);
+        assert_eq!(r.planes[0].data[0], y_fill); // top-left covered by fill
+        assert_eq!(r.planes[0].data[10], 10); // bottom-right covered by layer (row 2 col 2)
+    }
+
+    #[test]
+    fn compose_overlay_clips_layer_at_canvas_edge() {
+        // 4x4 canvas, single 4x4 layer at (-2, -2) — only the bottom-
+        // right 2x2 of the layer makes it onto the canvas.
+        let layer = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 4,
+                data: (0..16u8).collect(),
+            }],
+        };
+        let overlay = ImageOverlay {
+            version: 0,
+            flags: 0,
+            canvas_fill_rgba: [0, 0, 0, 0xFFFF],
+            output_width: 4,
+            output_height: 4,
+            offsets: vec![(-2, -2)],
+        };
+        let r = compose_overlay_frames(&overlay, &[layer]).unwrap();
+        // Visible source rectangle is (left=2, top=2, w=2, h=2) — the
+        // bottom-right 2x2 of the layer (10, 11, 14, 15) is pasted at
+        // canvas (0, 0).
+        assert_eq!(r.planes[0].data[0], 10);
+        assert_eq!(r.planes[0].data[1], 11);
+        assert_eq!(r.planes[0].data[4], 14);
+        assert_eq!(r.planes[0].data[5], 15);
     }
 
     #[test]
