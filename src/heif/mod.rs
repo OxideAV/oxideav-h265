@@ -330,9 +330,9 @@ pub fn item_bytes<'a>(file: &'a [u8], meta: &'a Meta, loc: &ItemLocation) -> Res
 /// Locate item `item_id` in `meta` and return its extent bytes via the
 /// shared cm-aware [`item_bytes`].
 pub fn item_bytes_in<'a>(file: &'a [u8], meta: &'a Meta, item_id: u32) -> Result<&'a [u8]> {
-    let loc = meta.location_by_id(item_id).ok_or_else(|| {
-        Error::invalid(format!("heif: item {item_id} missing from 'iloc'"))
-    })?;
+    let loc = meta
+        .location_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("heif: item {item_id} missing from 'iloc'")))?;
     item_bytes(file, meta, loc)
 }
 
@@ -512,7 +512,9 @@ impl ImageOverlay {
         let mut pos = 10;
         let dim_bytes = if wide { 4 } else { 2 };
         if payload.len() < pos + dim_bytes * 2 {
-            return Err(Error::invalid("heif: iovl truncated at output_width/height"));
+            return Err(Error::invalid(
+                "heif: iovl truncated at output_width/height",
+            ));
         }
         let output_width = read_var_be(payload, pos, wide)?;
         pos += dim_bytes;
@@ -590,9 +592,10 @@ fn read_var_be_signed(buf: &[u8], at: usize, wide: bool) -> Result<i32> {
 /// picture" path.
 pub fn decode_item(file: &[u8], item_id: u32) -> Result<VideoFrame> {
     let hdr = parse_header(file)?;
-    let info = hdr.meta.item_by_id(item_id).ok_or_else(|| {
-        Error::invalid(format!("heif: decode_item: id {item_id} not in 'iinf'"))
-    })?;
+    let info = hdr
+        .meta
+        .item_by_id(item_id)
+        .ok_or_else(|| Error::invalid(format!("heif: decode_item: id {item_id} not in 'iinf'")))?;
     if info.item_type != ITEM_TYPE_HVC1 && info.item_type != ITEM_TYPE_HEV1 {
         return Err(Error::unsupported(format!(
             "heif: decode_item: id {item_id} item_type '{}' is not 'hvc1' / 'hev1'",
@@ -680,9 +683,7 @@ pub fn decode_primary(bytes: &[u8]) -> Result<VideoFrame> {
         .clone();
     if primary_info.item_type == ITEM_TYPE_GRID {
         decode_grid_primary(&hdr, primary_id)
-    } else if primary_info.item_type == ITEM_TYPE_HVC1
-        || primary_info.item_type == ITEM_TYPE_HEV1
-    {
+    } else if primary_info.item_type == ITEM_TYPE_HVC1 || primary_info.item_type == ITEM_TYPE_HEV1 {
         decode_hvc_item(&hdr, primary_id)
     } else if primary_info.item_type == ITEM_TYPE_IOVL {
         Err(Error::unsupported(
@@ -711,8 +712,7 @@ fn decode_hvc_item(hdr: &HeifHeader<'_>, item_id: u32) -> Result<VideoFrame> {
     };
     let mut dec = HevcDecoder::new(CodecId::new(crate::CODEC_ID_STR));
     dec.consume_extradata(&hvcc_raw)?;
-    let packet =
-        Packet::new(0, TimeBase::new(1, 1), item_data.to_vec()).with_keyframe(true);
+    let packet = Packet::new(0, TimeBase::new(1, 1), item_data.to_vec()).with_keyframe(true);
     dec.send_packet(&packet)?;
     dec.flush()?;
     match dec.receive_frame() {

@@ -364,10 +364,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> Vec<String> {
 #[allow(dead_code)] // Wired in for the round-3+ BitExact promotion; round 2
                     // ships every fixture as ReportOnly so this helper isn't
                     // hit yet.
-fn compare_bit_exact(
-    oracle: &oxideav_core::VideoFrame,
-    actual: &oxideav_core::VideoFrame,
-) -> bool {
+fn compare_bit_exact(oracle: &oxideav_core::VideoFrame, actual: &oxideav_core::VideoFrame) -> bool {
     if oracle.planes.len() != actual.planes.len() {
         eprintln!(
             "  bit-exact: plane count {} != {}",
@@ -378,10 +375,7 @@ fn compare_bit_exact(
     }
     for (i, (a, e)) in actual.planes.iter().zip(oracle.planes.iter()).enumerate() {
         if a.stride != e.stride {
-            eprintln!(
-                "  bit-exact: plane {i} stride {} != {}",
-                a.stride, e.stride
-            );
+            eprintln!("  bit-exact: plane {i} stride {} != {}", a.stride, e.stride);
             return false;
         }
         if a.data != e.data {
