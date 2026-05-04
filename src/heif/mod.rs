@@ -1301,6 +1301,15 @@ fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame>
     let iovl_bytes = item_bytes_in(hdr.file, &hdr.meta, iovl_id)?;
     let overlay = ImageOverlay::parse(iovl_bytes, layer_ids.len())?;
     let mut layers: Vec<VideoFrame> = Vec::with_capacity(layer_ids.len());
+    // Task #346 — alongside each colour layer, decode its alpha
+    // auxiliary item (per-layer auxl iref) when present. The iovl
+    // descriptor doesn't carry alpha; per-layer alpha is the only
+    // way to express RGBA constituents in HEIF (ISO/IEC 23008-12
+    // §6.6.2.1 / §6.6.2.3.3). Without per-layer alpha blending the
+    // composer just paints the layer's full bounding rectangle
+    // opaque — which produces yellow squares where the encoder
+    // intended yellow circles, etc.
+    let mut layer_alphas: Vec<Option<VideoFrame>> = Vec::with_capacity(layer_ids.len());
     for (i, lid) in layer_ids.iter().enumerate() {
         let info = hdr
             .meta
@@ -1314,13 +1323,49 @@ fn decode_iovl_primary(hdr: &HeifHeader<'_>, iovl_id: u32) -> Result<VideoFrame>
         }
         let layer = decode_hvc_item(hdr, *lid)?;
         layers.push(layer);
+        let alpha = match find_alpha_item_id(&hdr.meta, *lid) {
+            Some(aid) => match decode_hvc_item(hdr, aid) {
+                Ok(vf) => Some(vf),
+                Err(e) => {
+                    return Err(Error::invalid(format!(
+                        "heif: iovl layer {i} (id {lid}) alpha aux {aid} decode failed: {e}"
+                    )));
+                }
+            },
+            None => None,
+        };
+        layer_alphas.push(alpha);
     }
+    // Task #346 — iovl colour-matrix selection. The canvas-fill
+    // conversion (descriptor RGBA → per-plane YUV fill bytes) MUST
+    // match the colour-space the constituent layers were encoded in,
+    // otherwise the fill regions and the layer regions of the canvas
+    // disagree on what `(Y,U,V)` means (limited-range BT.601 vs
+    // full-range BT.601 differ by ~16/255 ≈ 6% in luma, enough to
+    // shift `Y=1,U=128,V=128` from `(1,1,1)` to `(0,0,0)`).
+    //
+    // ISO/IEC 23008-12 §6.5.5 makes a HEIF image's colour
+    // interpretation pull from its `colr` property; for derived
+    // items (`iovl`, `grid`) the spec is ambiguous about whether
+    // missing colr should inherit from constituents. Real-world
+    // encoders (libheif / ImageMagick) tag layers with colr but
+    // leave the iovl bare. We follow the constituents — fall back
+    // to the first layer's `colr nclx` when the iovl item has no
+    // colr of its own. This matches the corpus convention (the
+    // oracle PNG is rendered from the layer YUV samples).
+    let layer0_colr =
+        layer_ids
+            .first()
+            .and_then(|lid| match hdr.meta.property_for(*lid, b"colr") {
+                Some(Property::Colr(c)) => Some(c.clone()),
+                _ => None,
+            });
     let iovl_colr = match hdr.meta.property_for(iovl_id, b"colr") {
         Some(Property::Colr(c)) => Some(c.clone()),
-        _ => None,
+        _ => layer0_colr,
     };
     let fill_matrix = FillMatrix::from_colr(iovl_colr.as_ref());
-    compose_overlay_frames_with_matrix(&overlay, &layers, fill_matrix)
+    compose_overlay_frames_with_matrix_and_alphas(&overlay, &layers, &layer_alphas, fill_matrix)
 }
 
 /// Backwards-compatible shim for [`compose_overlay_frames_with_matrix`]
@@ -1497,6 +1542,237 @@ fn compose_overlay_frames_with_matrix(
     })
 }
 
+/// Task #346 alpha-aware iovl composer. Falls back to
+/// [`compose_overlay_frames_with_matrix`] (straight paste) when no
+/// layer carries a per-layer alpha auxiliary; otherwise composites
+/// each layer using the per-pixel alpha from the layer's auxl
+/// (Gray8 / Gray16Le, 0 = transparent ↔ background, 255 = opaque ↔
+/// layer) **in RGB space**, not YUV space.
+///
+/// YUV-domain alpha blending is wrong: chroma channels (U, V) carry
+/// signed colour-difference values centred at 128, so a linear
+/// `α·src + (1-α)·dst` of two YUV samples doesn't match the
+/// `α·src_rgb + (1-α)·dst_rgb` you'd get if you converted the
+/// samples to RGB first, blended, and converted back. The error
+/// shows up as a colour shift at every anti-aliased alpha edge
+/// (the binary 0/255 plateau is fine — only the smooth-edge pixels
+/// are bitten).
+///
+/// Output bit depth follows layer 0's bit depth (we only support
+/// 8-bit colour planes here — 10/12-bit iovl is deferred to a later
+/// task once a higher-bit-depth iovl fixture lands).
+fn compose_overlay_frames_with_matrix_and_alphas(
+    overlay: &ImageOverlay,
+    layers: &[VideoFrame],
+    layer_alphas: &[Option<VideoFrame>],
+    matrix: FillMatrix,
+) -> Result<VideoFrame> {
+    if layer_alphas.iter().all(|a| a.is_none()) {
+        return compose_overlay_frames_with_matrix(overlay, layers, matrix);
+    }
+    if layers.is_empty() {
+        return Err(Error::invalid("heif: iovl composite called with no layers"));
+    }
+    let out_w = overlay.output_width as usize;
+    let out_h = overlay.output_height as usize;
+    if out_w == 0 || out_h == 0 {
+        return Err(Error::invalid(format!(
+            "heif: iovl output dims {}x{} contain a zero",
+            out_w, out_h
+        )));
+    }
+    let n_planes = layers[0].planes.len();
+    if n_planes == 0 {
+        return Err(Error::invalid("heif: iovl layer 0 has no planes"));
+    }
+    let luma_stride = layers[0].planes[0].stride.max(1);
+    let luma_h = layers[0].planes[0].data.len() / luma_stride;
+    if luma_h == 0 {
+        return Err(Error::invalid("heif: iovl layer 0 luma plane is empty"));
+    }
+    // Per-plane sub-sampling derived from layer 0 (same convention as
+    // [`compose_overlay_frames_with_matrix`]).
+    let mut shifts: Vec<(u32, u32)> = Vec::with_capacity(n_planes);
+    for p in 0..n_planes {
+        if p == 0 {
+            shifts.push((0, 0));
+            continue;
+        }
+        let pl = &layers[0].planes[p];
+        let s = pl.stride.max(1);
+        let h = pl.data.len() / s;
+        let sx = if luma_stride == s {
+            0
+        } else if luma_stride == s * 2 {
+            1
+        } else {
+            return Err(Error::invalid(format!(
+                "heif: iovl plane {p} sub_x not 1x/2x luma"
+            )));
+        };
+        let sy = if luma_h == h {
+            0
+        } else if luma_h == h * 2 {
+            1
+        } else {
+            return Err(Error::invalid(format!(
+                "heif: iovl plane {p} sub_y not 1x/2x luma"
+            )));
+        };
+        shifts.push((sx, sy));
+    }
+    for (i, layer) in layers.iter().enumerate().skip(1) {
+        if layer.planes.len() != n_planes {
+            return Err(Error::invalid(format!(
+                "heif: iovl layer {i} has {} planes != layer 0 has {}",
+                layer.planes.len(),
+                n_planes
+            )));
+        }
+    }
+    // RGB-domain compositing path: maintain a packed RGB canvas
+    // sized at the iovl output dimensions, paint the canvas-fill
+    // colour into it, blend each layer onto it (per-pixel α from
+    // the layer's alpha aux), then convert the final RGB back to
+    // YUV at the layer's chroma sub-sampling.
+    let r_fill = (overlay.canvas_fill_rgba[0] >> 8) as u8;
+    let g_fill = (overlay.canvas_fill_rgba[1] >> 8) as u8;
+    let b_fill = (overlay.canvas_fill_rgba[2] >> 8) as u8;
+    let mut canvas_rgb = vec![0u8; out_w * out_h * 3];
+    for px in 0..(out_w * out_h) {
+        canvas_rgb[px * 3] = r_fill;
+        canvas_rgb[px * 3 + 1] = g_fill;
+        canvas_rgb[px * 3 + 2] = b_fill;
+    }
+    for (i, layer) in layers.iter().enumerate() {
+        let (h_off, v_off) = overlay.offsets[i];
+        let layer_luma_stride = layer.planes[0].stride.max(1);
+        let layer_luma_h = layer.planes[0].data.len() / layer_luma_stride;
+        let layer_w = layer_luma_stride;
+        let layer_h = layer_luma_h;
+        // Resolve alpha — must be at luma resolution if present.
+        let alpha_plane = if let Some(ap) = layer_alphas[i].as_ref() {
+            if ap.planes.len() != 1 {
+                return Err(Error::invalid(format!(
+                    "heif: iovl layer {i} alpha aux must be 1-plane (got {})",
+                    ap.planes.len()
+                )));
+            }
+            let a_stride = ap.planes[0].stride.max(1);
+            let a_rows = ap.planes[0].data.len() / a_stride;
+            if a_stride != layer_w || a_rows != layer_h {
+                return Err(Error::invalid(format!(
+                    "heif: iovl layer {i} alpha aux dims {a_stride}x{a_rows} != \
+                     luma dims {layer_w}x{layer_h}"
+                )));
+            }
+            Some(&ap.planes[0])
+        } else {
+            None
+        };
+        // Decide sub-sampling for the colour planes (only support
+        // 1-plane luma OR 3-plane planar YUV).
+        let sub_x = if n_planes == 1 {
+            1
+        } else {
+            (1usize << shifts[1].0).max(1)
+        };
+        let sub_y = if n_planes == 1 {
+            1
+        } else {
+            (1usize << shifts[1].1).max(1)
+        };
+        let cb_stride = if n_planes >= 2 {
+            layer.planes[1].stride.max(1)
+        } else {
+            1
+        };
+        // Visible window in canvas luma coords.
+        let v_left = h_off.max(0);
+        let v_top = v_off.max(0);
+        let v_right = (h_off + layer_w as i32).min(out_w as i32);
+        let v_bottom = (v_off + layer_h as i32).min(out_h as i32);
+        if v_right <= v_left || v_bottom <= v_top {
+            continue;
+        }
+        for y in v_top..v_bottom {
+            let layer_y = (y - v_off) as usize;
+            for x in v_left..v_right {
+                let layer_x = (x - h_off) as usize;
+                // Resolve layer (Y, U, V) → RGB at luma resolution.
+                let yv = layer.planes[0].data[layer_y * layer_luma_stride + layer_x];
+                let (r_src, g_src, b_src) = if n_planes == 1 {
+                    // Monochrome layer — splat luma.
+                    (yv, yv, yv)
+                } else {
+                    let cy = layer_y / sub_y;
+                    let cx = layer_x / sub_x;
+                    let uv = layer.planes[1].data[cy * cb_stride + cx];
+                    let vrv = layer.planes[2].data[cy * cb_stride + cx];
+                    matrix.yuv_to_rgb(yv, uv, vrv)
+                };
+                let alpha = match alpha_plane {
+                    Some(ap) => ap.data[layer_y * layer_luma_stride + layer_x] as u32,
+                    None => 255u32,
+                };
+                let canvas_off = ((y as usize) * out_w + (x as usize)) * 3;
+                let r_dst = canvas_rgb[canvas_off] as u32;
+                let g_dst = canvas_rgb[canvas_off + 1] as u32;
+                let b_dst = canvas_rgb[canvas_off + 2] as u32;
+                let r_src = r_src as u32;
+                let g_src = g_src as u32;
+                let b_src = b_src as u32;
+                let blend = |s: u32, d: u32| ((s * alpha + d * (255 - alpha) + 127) / 255) as u8;
+                canvas_rgb[canvas_off] = blend(r_src, r_dst);
+                canvas_rgb[canvas_off + 1] = blend(g_src, g_dst);
+                canvas_rgb[canvas_off + 2] = blend(b_src, b_dst);
+            }
+        }
+    }
+    // Convert canvas RGB → YUV at the output sub-sampling. For the
+    // alpha-blended path we deliberately emit **4:4:4** chroma even
+    // when the layers are 4:2:0 — sub-sampling the canvas RGB to
+    // 4:2:0 would lose chroma precision at the alpha edges (where
+    // adjacent pixels alpha-blend to wildly different colours, but
+    // 2×2 RGB averaging then YUV conversion smears them together).
+    // The downstream comparator infers sub_x/sub_y from the chroma
+    // stride and handles 4:4:4 transparently. Monochrome (n_planes
+    // == 1) keeps a single luma plane.
+    let n_out_planes = if n_planes == 1 { 1 } else { 3 };
+    let mut out_planes: Vec<VideoPlane> = Vec::with_capacity(n_out_planes);
+    for _ in 0..n_out_planes {
+        out_planes.push(VideoPlane {
+            stride: out_w,
+            data: vec![0u8; out_w * out_h],
+        });
+    }
+    if n_out_planes == 1 {
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let off = (y * out_w + x) * 3;
+                let (yv, _, _) =
+                    matrix.rgb_to_yuv(canvas_rgb[off], canvas_rgb[off + 1], canvas_rgb[off + 2]);
+                out_planes[0].data[y * out_w + x] = yv;
+            }
+        }
+    } else {
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let off = (y * out_w + x) * 3;
+                let (yv, u, v) =
+                    matrix.rgb_to_yuv(canvas_rgb[off], canvas_rgb[off + 1], canvas_rgb[off + 2]);
+                out_planes[0].data[y * out_w + x] = yv;
+                out_planes[1].data[y * out_w + x] = u;
+                out_planes[2].data[y * out_w + x] = v;
+            }
+        }
+    }
+    Ok(VideoFrame {
+        pts: layers[0].pts,
+        planes: out_planes,
+    })
+}
+
 /// Selector for the RGB-to-YUV matrix used to convert the iovl canvas
 /// fill into per-plane fill bytes. Mirrored from
 /// `tests/heif_corpus.rs::Matrix` — kept private to this module since
@@ -1519,8 +1795,14 @@ enum FillMatrix {
 impl FillMatrix {
     /// Resolve the canvas-fill matrix from the iovl item's `colr`.
     /// Honours `nclx` `matrix_coefficients` (1 → BT.709, anything else
-    /// → BT.601) and `full_range_flag`. Falls back to BT.601 limited
-    /// when `colr` is `None` or carries an ICC profile only.
+    /// → BT.601) and `full_range_flag`. Falls back to BT.601 **full**
+    /// when `colr` is `None` or carries an ICC profile only — this
+    /// matches the convention modern HEIC encoders (libheif /
+    /// ImageMagick) use when they don't write a colr (full-range YUV
+    /// is the dominant profile for new content; ISO/IEC 23008-12
+    /// §6.5.5 leaves the missing-colr case implementation-defined,
+    /// so any consistent choice works as long as it matches what the
+    /// content was encoded against).
     fn from_colr(colr: Option<&Colr>) -> Self {
         match colr {
             Some(Colr::Nclx {
@@ -1533,7 +1815,7 @@ impl FillMatrix {
                 (_, true) => FillMatrix::Bt601Full,
                 (_, false) => FillMatrix::Bt601Limited,
             },
-            _ => FillMatrix::Bt601Limited,
+            _ => FillMatrix::Bt601Full,
         }
     }
 
@@ -1549,6 +1831,37 @@ impl FillMatrix {
             FillMatrix::Bt601Limited => rgb_to_yuv_with(r, g, b, 0.299, 0.114, true),
             FillMatrix::Bt601Full => rgb_to_yuv_with(r, g, b, 0.299, 0.114, false),
         }
+    }
+
+    /// Inverse of [`Self::rgb_to_yuv`] — convert (Y, U/Cb, V/Cr) back
+    /// to 8-bit RGB. Used by the alpha-aware iovl composer (task #346)
+    /// to lift each layer's YUV samples into RGB so alpha-blending
+    /// happens in a colour space where linear interpolation is
+    /// chromatically correct.
+    #[inline]
+    fn yuv_to_rgb(self, y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+        let (kr, kb, limited) = match self {
+            FillMatrix::Bt601Limited => (0.299_f32, 0.114_f32, true),
+            FillMatrix::Bt601Full => (0.299_f32, 0.114_f32, false),
+            FillMatrix::Bt709Limited => (0.2126_f32, 0.0722_f32, true),
+            FillMatrix::Bt709Full => (0.2126_f32, 0.0722_f32, false),
+        };
+        let kg = 1.0 - kr - kb;
+        let (yv, cb, cr) = if limited {
+            let yv = (y as f32 - 16.0) * (255.0 / 219.0);
+            let cb = (u as f32 - 128.0) * (255.0 / 224.0);
+            let cr = (v as f32 - 128.0) * (255.0 / 224.0);
+            (yv, cb, cr)
+        } else {
+            let yv = y as f32;
+            let cb = u as f32 - 128.0;
+            let cr = v as f32 - 128.0;
+            (yv, cb, cr)
+        };
+        let r = yv + 2.0 * (1.0 - kr) * cr;
+        let b = yv + 2.0 * (1.0 - kb) * cb;
+        let g = yv - (2.0 * kr * (1.0 - kr) / kg) * cr - (2.0 * kb * (1.0 - kb) / kg) * cb;
+        (clamp_u8(r), clamp_u8(g), clamp_u8(b))
     }
 }
 
@@ -2045,13 +2358,15 @@ mod tests {
     }
 
     #[test]
-    fn fill_matrix_defaults_to_bt601_limited_when_no_colr() {
-        // The corpus YUV→RGB compare follows the libwebp / libheif
-        // convention of BT.601 limited when the file carries no
-        // explicit `colr` — `FillMatrix::from_colr(None)` must agree
-        // so the iovl canvas-fill path round-trips byte-for-byte
-        // through the bit-exact compare.
-        assert_eq!(FillMatrix::from_colr(None), FillMatrix::Bt601Limited);
+    fn fill_matrix_defaults_to_bt601_full_when_no_colr() {
+        // Task #346 — the iovl canvas-fill matrix defaults to
+        // **BT.601 full** when no `colr` is present, matching the
+        // convention modern HEIC encoders (libheif / ImageMagick)
+        // use when they don't write colr. The previous BT.601
+        // limited default produced a luma-floor mismatch with
+        // full-range fixtures (Y=1 mapped to R=G=B=0 instead of the
+        // expected (1,1,1)).
+        assert_eq!(FillMatrix::from_colr(None), FillMatrix::Bt601Full);
     }
 
     #[test]

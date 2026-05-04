@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- heif: alpha-aware iovl compositing + matrix inheritance (task #346).
+  `decode_iovl_primary` now (a) inherits the colour matrix from
+  layer 0's `colr nclx` when the iovl item itself has none (with a
+  BT.601 full default matching libheif / ImageMagick when neither
+  has colr), and (b) decodes each layer's per-layer alpha auxiliary
+  via the `auxl` iref and blends the layers in **RGB space at 4:4:4
+  chroma**, so anti-aliased alpha edges don't lose colour precision
+  through 4:2:0 chroma averaging. `still-image-overlay` divergence
+  drops from `max |Δ|=160 across 97.3% of bytes` to `max |Δ|=44
+  across ~52%` — the residual sits in the bottom-left gradient
+  corner where the HEVC layer-0 decode itself drifts, independent
+  of iovl compositing.
 - heif_corpus: add `Tier::BitExactWithinTol(u8)` variant + re-promote
   `still-yuv444` (task #374). The 4:4:4 fixture's max |Δ|=3 across
   13.7% of bytes is colour-matrix integer-rounding LSB drift in the

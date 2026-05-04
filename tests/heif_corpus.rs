@@ -131,14 +131,22 @@ fn report_only_reason(name: &str) -> &'static str {
              decode pipeline lands a real round of 10-bit work"
         }
         "still-image-overlay" => {
-            "iovl canvas-fill matrix matches the corpus convention (round 5 \
-             phase A) but the underlying HEVC layer pixels still diverge from \
-             the oracle: 97.3% of bytes differ with max |Δ|=160 after planar→\
-             packed RGB conversion through compare_bit_exact. Task #319 wires \
-             a per-layer bisect probe into the iovl branch — the per-fixture \
-             log lines `iovl bisect: layer[i] id=N dims=WxH dest=(x,y) \
-             diff=D/T max|Δ|=Δ samples=...` show which constituent layer \
-             carries the drift; check CI output for the per-layer breakdown"
+            "task #346 lifted iovl divergence from max |Δ|=160 across \
+             97.3% of bytes down to max |Δ|=44 across ~52%: the iovl \
+             composer now (a) inherits the colour matrix from layer 0 \
+             when the iovl item has no colr (defaults to BT.601 full \
+             when neither has one) and (b) blends layer 1's yellow- \
+             square colour against layer 0's gradient through a per- \
+             layer alpha auxiliary (decoded via the auxl iref), in \
+             RGB space at 4:4:4 chroma so anti-aliased circle edges \
+             don't lose precision through 4:2:0 chroma averaging. \
+             The residual ~44 max delta sits in the bottom-left \
+             corner of the gradient (pixels 0..30 × 252..255) where \
+             the HEVC decode of layer 0 itself drifts from the \
+             oracle — independent of the iovl compositing path. Re- \
+             promote once the layer-0 corner-pixel HEVC drift is \
+             root-caused (likely an SAO / deblock / intra-prediction \
+             edge case at the bottom-left CTB)"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "image-sequence-3frame" => {
@@ -212,18 +220,17 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
-        // Round-5 phase A made the iovl canvas-fill matrix match the
-        // corpus convention via `FillMatrix` in src/heif/mod.rs (see
-        // commit 57e21e1). That promotion was reverted in 293ac2a
-        // because the underlying HEVC layer pixels still diverge from
-        // the oracle once converted to RGB through `compare_bit_exact`
-        // (97.3% of bytes differ, max |Δ|=160 — far beyond a per-pixel
-        // round-trip precision drift). The comparator already runs the
-        // planar-YUV → packed-RGB step uniformly for every BitExact
-        // fixture (see `compare_bit_exact` below — wired in round 4 by
-        // f78b612), so the gap is in the layer pixel decode itself,
-        // not the comparator wiring. Stays ReportOnly until the per-
-        // layer divergence is bisected.
+        // Task #346 lifted the iovl divergence substantially: the
+        // composer now inherits the colour matrix from layer 0 when
+        // the iovl item has no colr (defaults to BT.601 full), and
+        // blends each layer's RGB samples against the existing
+        // canvas through a per-layer alpha auxiliary decoded via
+        // the auxl iref — in RGB space at 4:4:4 chroma so anti-
+        // aliased alpha edges don't lose precision through 4:2:0
+        // chroma averaging. The residual is HEVC layer-0 drift in
+        // the bottom-left gradient corner (pixels 0..30 × 252..255),
+        // independent of iovl compositing. See report_only_reason
+        // for the follow-up sketch.
         fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
         // Round 6 + task #320 promoted: chroma_format_idc=0 lift in
@@ -506,12 +513,32 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
     if let Some(Property::Ispe(e)) = hdr.meta.property_for(primary_id, b"ispe") {
         msgs.push(format!("ispe: {}x{}", e.width, e.height));
     }
-    let primary_colr = match hdr.meta.property_for(primary_id, b"colr") {
+    let primary_colr_direct = match hdr.meta.property_for(primary_id, b"colr") {
         Some(Property::Colr(c)) => Some(c.clone()),
         _ => None,
     };
-    if let Some(ref c) = primary_colr {
+    // Task #346 — derived items (iovl / grid) inherit colour
+    // interpretation from their constituents per the convention
+    // followed by libheif / ImageMagick (the spec is ambiguous;
+    // §6.5.5 anchors colr on a leaf-image item). Fall through to the
+    // first `dimg` constituent's colr when the derived primary has
+    // no colr of its own.
+    let primary_colr = primary_colr_direct.clone().or_else(|| {
+        if info.item_type == *b"iovl" || info.item_type == *b"grid" {
+            let dimg = hdr.meta.iref_targets(b"dimg", primary_id);
+            dimg.first()
+                .and_then(|lid| match hdr.meta.property_for(*lid, b"colr") {
+                    Some(Property::Colr(c)) => Some(c.clone()),
+                    _ => None,
+                })
+        } else {
+            None
+        }
+    });
+    if let Some(ref c) = primary_colr_direct {
         msgs.push(format!("colr: {c:?}"));
+    } else if let Some(ref c) = primary_colr {
+        msgs.push(format!("colr (inherited from constituent): {c:?}"));
     }
     if let Some(Property::Clap(c)) = hdr.meta.property_for(primary_id, b"clap") {
         msgs.push(format!(
@@ -812,11 +839,14 @@ fn matrix_from_colr(colr: Option<&Colr>) -> Matrix {
             (_, true) => Matrix::Bt601Full,
             (_, false) => Matrix::Bt601Limited,
         },
-        // No nclx (or icc-only): default to BT.601 limited per webp #253
-        // convention. ISO/IEC 23008-12 §6.5.5 says the absence of
-        // `colr` makes colour interpretation implementation-defined; we
-        // pick the convention shared with libwebp / libheif's defaults.
-        _ => Matrix::Bt601Limited,
+        // No nclx (or icc-only): default to BT.601 **full** per task
+        // #346 — ISO/IEC 23008-12 §6.5.5 leaves the missing-colr case
+        // implementation-defined; modern HEIC encoders (libheif /
+        // ImageMagick) emit full-range YUV by default. The previous
+        // BT.601 limited default produced a luma-floor mismatch with
+        // full-range fixtures (Y=1 → R=G=B=0 instead of (1,1,1)).
+        // Aligned with src/heif/mod.rs::FillMatrix::from_colr.
+        _ => Matrix::Bt601Full,
     }
 }
 
