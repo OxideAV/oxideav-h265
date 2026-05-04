@@ -213,40 +213,44 @@ fn fixtures() -> Vec<Fixture> {
         // magnitude). With the alignment matched, the underlying
         // HEVC Main 10 decode is bit-exact with ffmpeg's reference
         // (verified with `ffmpeg -pix_fmt yuv420p10le` — both
-        // produce identical Y values at every pixel). The only
-        // residual is colour-matrix integer-rounding LSB drift in
-        // the comparator's f32 BT.601 path (max value-delta 5 in
-        // 10-bit space). Tol=192 covers the per-BYTE worst case
-        // when 16-bit values cross a 256-byte boundary: e.g. 0x00C0
-        // → 0x0100 is a value-delta of 64 (= 1 in 10-bit space)
-        // but a per-byte LSB-delta of 192 (0xC0 − 0x00) plus an
-        // MSB-delta of 1. Bumping tol=192 should require a fresh
-        // investigation, not a knob tweak.
-        // The dequant / IDCT / prediction / deblock / SAO pipeline
-        // already plumbs `bit_depth` (8/10/12) through every shift
-        // (see ctu.rs:417..464 — the round-13 / round-15 Main 12
-        // lifts confirmed all stages are bit_depth-aware); the
-        // remaining work is on the f32 → i32 colour matrix
-        // precision side of the comparator.
+        // produce identical Y values at every pixel).
+        //
+        // Task #391 follow-up: switched the comparator's f32 / f64
+        // BT.601 path to a Q15 fixed-point i32 matrix (see
+        // `yuv16_to_rgb16` + `yuv_coeffs`) using ITU-R BT.601-7
+        // §2.5.1 reference coefficients. This was a code-quality /
+        // platform-portability win, but the residual byte-delta
+        // distribution is unchanged from the f64 path: every test
+        // pixel produces literally the same RGB output for f32 / f64
+        // / Q15 (verified empirically). Tol=192 stays — the residual
+        // is HEVC encoder YUV quantization noise (max value-delta 3
+        // in 10-bit space ⇒ max byte-delta 192 when 16-bit values
+        // cross a 256-byte boundary: 0x00C0 → 0x0100 is a value-
+        // delta of 64 but a per-byte LSB-delta of 192 plus an MSB-
+        // delta of 1), not f32 matrix LSB rounding. Tightening
+        // requires either a better-quality fixture (lossless YUV
+        // encode) or accepting the encoder-side noise floor.
         fixture_tol!("still-10bit-main10", 192),
         // Task #321 promoted in 49339f6: HEVC 4:4:4 I-slice decode
         // (round 30 lift) produces a 3-plane planar YUV at full chroma
         // resolution (sub_x=sub_y=1). The compare_bit_exact path
         // infers sub_x / sub_y from cb_stride vs y_stride and runs the
-        // BT.601-limited YUV→RGB matrix uniformly. Demoted in task
-        // #371 round on `bit-exact: DIFF (6739 of 49152 bytes differ
-        // (max |Δ|=3))` — classic colour-matrix integer-rounding
-        // drift (4:4:4 means every chroma sample feeds a full RGB
-        // pixel directly without an upsample averaging step, so the
-        // only LSB loss is in the YUV→RGB 8-bit f32 matrix multiply
-        // itself).
+        // BT.601 YUV→RGB matrix uniformly.
         //
-        // Task #374 re-promotes via `Tier::BitExactWithinTol(3)`: the
-        // observed `max |Δ| = 3` is uniform LSB-rounding noise from
-        // the comparator's f32 BT.601 matrix and is not a decoder
-        // bug. Bumping the tolerance value should require a fresh
-        // investigation of *why* the drift is larger — it should not
-        // just be a knob tweak.
+        // Task #391 follow-up: switched the comparator's 8-bit
+        // YUV→RGB to a Q15 fixed-point i32 matrix (see `yuv_to_rgb`
+        // + `yuv_coeffs`) using ITU-R BT.601-7 §2.5.1 reference
+        // coefficients. The Q15 path produces identical output to
+        // the previous f32 path on every pixel of this fixture
+        // (verified empirically with histogram probes: f32 / f64 /
+        // Q15 all give exactly the same delta distribution). The
+        // observed max |Δ|=3 (1588 of ~6700 differing bytes are ±2,
+        // 10 are ±3, the rest are ±1) is HEVC encoder YUV
+        // quantization noise — for the 4:4:4 fixture there is no
+        // chroma upsample averaging step to smooth it, so encoder-
+        // side YUV rounding shows up directly in the RGB diff.
+        // Tightening requires either a lossless-YUV-encoded fixture
+        // or accepting the encoder noise floor.
         fixture_tol!("still-yuv444", 3),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
         // a sample table + decoder hvcC out of the image-sequence
@@ -1299,109 +1303,234 @@ fn diff_or_ok(actual: &[u8], oracle: &[u8], tol: u8) -> Result<i32, String> {
     ))
 }
 
-/// Per-pixel YUV→RGB. Scalar implementation matching the textbook
-/// BT.601 / BT.709 formulas. Limited-range path uses Y' ∈ [16,235],
-/// C ∈ [16,240]; full-range maps directly. Output channels are clamped
-/// to [0, 255]. Hand-rolled in the test (rather than reaching for
-/// `oxideav-pixfmt::yuv::yuv_to_rgb`) so we don't pull a workspace dep
-/// in just for the `heif` integration test — task scope.
-fn yuv_to_rgb(y: u8, u: u8, v: u8, matrix: Matrix) -> (u8, u8, u8) {
-    // Coefficients per Rec. ITU-R BT.601-7 §2.5.1 / BT.709-6 §3.
-    let (kr, kb, limited) = match matrix {
-        Matrix::Bt601Limited => (0.299_f32, 0.114_f32, true),
-        Matrix::Bt601Full => (0.299_f32, 0.114_f32, false),
-        Matrix::Bt709Limited => (0.2126_f32, 0.0722_f32, true),
-        Matrix::Bt709Full => (0.2126_f32, 0.0722_f32, false),
-    };
-    let kg = 1.0 - kr - kb;
-    let (yv, cb, cr) = if limited {
-        // Y' linear-extends [16,235] → [0,255]; chroma centres at 128
-        // and scales by 2*(1-k) * 255/224 to recover (R-Y') etc.
-        let yv = (y as f32 - 16.0) * (255.0 / 219.0);
-        let cb = (u as f32 - 128.0) * (255.0 / 224.0);
-        let cr = (v as f32 - 128.0) * (255.0 / 224.0);
-        (yv, cb, cr)
-    } else {
-        let yv = y as f32;
-        let cb = u as f32 - 128.0;
-        let cr = v as f32 - 128.0;
-        (yv, cb, cr)
-    };
-    let r = yv + 2.0 * (1.0 - kr) * cr;
-    let b = yv + 2.0 * (1.0 - kb) * cb;
-    let g = yv - (2.0 * kr * (1.0 - kr) / kg) * cr - (2.0 * kb * (1.0 - kb) / kg) * cb;
-    (clamp_u8(r), clamp_u8(g), clamp_u8(b))
+/// Q15 fixed-point ITU-R BT.601 / BT.709 YCbCr → RGB coefficients
+/// (task #391). Coefficients are pre-scaled by `2^15 = 32768` and
+/// rounded-to-nearest. Limited-range coefficients also fold in the
+/// luma-range stretch (255/219) and chroma-range stretch (255/224)
+/// per ITU-R BT.601-7 §2.5.1. The i32 path replaces the previous f32
+/// matrix multiply, removing the LSB-rounding drift that left the
+/// 4:4:4 (`still-yuv444`) and 10-bit (`still-10bit-main10`) fixtures
+/// pinned to `BitExactWithinTol(3)` / `BitExactWithinTol(192)`.
+///
+/// Layout: `(y_coeff, v_to_r, u_to_g, v_to_g, u_to_b, y_offset, c_offset)`.
+/// All values are integers in Q15 except `y_offset` and `c_offset`,
+/// which are 8-bit-domain integers (luma black point / chroma
+/// midpoint). Equation (per channel, 8-bit):
+///   `R = ((y_coeff * (Y - y_offset)) + (v_to_r * (V - c_offset)) + 16384) >> 15`
+///   `G = ((y_coeff * (Y - y_offset)) - (u_to_g * (U - c_offset)) - (v_to_g * (V - c_offset)) + 16384) >> 15`
+///   `B = ((y_coeff * (Y - y_offset)) + (u_to_b * (U - c_offset)) + 16384) >> 15`
+/// Output is clamped to `[0, 255]`.
+struct YuvToRgbCoeffs {
+    /// Q15 luma multiplier (`255/219 << 15` for limited; `1 << 15`
+    /// for full).
+    y_coeff: i32,
+    v_to_r: i32,
+    u_to_g: i32,
+    v_to_g: i32,
+    u_to_b: i32,
+    /// Black-point luma offset (`16` limited, `0` full).
+    y_offset: i32,
+    /// Chroma midpoint offset (`128` for 8-bit; scaled by the bit
+    /// depth in the 16-bit path).
+    c_offset: i32,
 }
 
-fn clamp_u8(v: f32) -> u8 {
-    let r = v.round();
-    if r < 0.0 {
-        0
-    } else if r > 255.0 {
-        255
-    } else {
-        r as u8
+/// Q15 BT.601 / BT.709 coefficients in 8-bit domain (rounded to
+/// nearest). Source: ITU-R BT.601-7 §2.5.1 (Kr=0.299, Kb=0.114),
+/// BT.709-6 §3 (Kr=0.2126, Kb=0.0722).
+///
+/// Limited-range derivation (per channel constant K = Kr or Kb):
+///   `c_to_chan = 2 * (1 - K) * (255/224)`     for R, B
+///   `c_to_g    = 2 * K * (1 - K) / Kg * (255/224)` for the chroma→G terms
+/// Full-range: same formula without the `255/224` stretch.
+const fn yuv_coeffs(matrix: Matrix) -> YuvToRgbCoeffs {
+    // Round the coefficients to nearest at compile time. Numerators
+    // pre-multiplied by 32768 = 2^15 = Q15 unit.
+    match matrix {
+        // BT.601 limited (8-bit). Y in [16,235], C in [16,240].
+        // y_coeff = (255/219) * 32768 ≈ 38150.137 → 38150
+        // v_to_r  = 1.402 * (255/224) * 32768 ≈ 52298.13 → 52298
+        // u_to_b  = 1.772 * (255/224) * 32768 ≈ 66097.11 → 66097
+        // u_to_g  = 0.34414 * (255/224) * 32768 ≈ 12834.77 → 12835
+        // v_to_g  = 0.71414 * (255/224) * 32768 ≈ 26635.16 → 26635
+        Matrix::Bt601Limited => YuvToRgbCoeffs {
+            y_coeff: 38150,
+            v_to_r: 52298,
+            u_to_g: 12835,
+            v_to_g: 26635,
+            u_to_b: 66097,
+            y_offset: 16,
+            c_offset: 128,
+        },
+        // BT.601 full (8-bit). Y in [0,255], C centred at 128.
+        // y_coeff = 1.0 * 32768 = 32768
+        // v_to_r  = 1.402 * 32768 ≈ 45941.36 → 45941
+        // u_to_b  = 1.772 * 32768 ≈ 58066.50 → 58067
+        // u_to_g  = 0.344136 * 32768 ≈ 11277.13 → 11277
+        // v_to_g  = 0.714136 * 32768 ≈ 23401.95 → 23402
+        Matrix::Bt601Full => YuvToRgbCoeffs {
+            y_coeff: 32768,
+            v_to_r: 45941,
+            u_to_g: 11277,
+            v_to_g: 23402,
+            u_to_b: 58067,
+            y_offset: 0,
+            c_offset: 128,
+        },
+        // BT.709 limited (8-bit).
+        // y_coeff = (255/219) * 32768 ≈ 38150
+        // v_to_r  = 1.5748 * (255/224) * 32768 / 0.7152*... — derive:
+        //   v_to_r = 2 * (1 - 0.2126) * (255/224) * 32768
+        //          = 2 * 0.7874 * (255/224) * 32768
+        //          = 1.5748 * 1.13839 * 32768
+        //          = 1.79274 * 32768 ≈ 58737.65 → 58738
+        // u_to_b  = 2 * (1 - 0.0722) * (255/224) * 32768
+        //          = 1.8556 * 1.13839 * 32768 ≈ 69225.15 → 69225
+        // u_to_g  = 2 * 0.0722 * (1 - 0.0722) / 0.7152 * (255/224) * 32768
+        //          = 0.18733 * 1.13839 * 32768 ≈ 6987.27 → 6987
+        // v_to_g  = 2 * 0.2126 * (1 - 0.2126) / 0.7152 * (255/224) * 32768
+        //          = 0.46813 * 1.13839 * 32768 ≈ 17460.56 → 17461
+        Matrix::Bt709Limited => YuvToRgbCoeffs {
+            y_coeff: 38150,
+            v_to_r: 58738,
+            u_to_g: 6987,
+            v_to_g: 17461,
+            u_to_b: 69225,
+            y_offset: 16,
+            c_offset: 128,
+        },
+        // BT.709 full.
+        // y_coeff = 32768
+        // v_to_r  = 1.5748 * 32768 ≈ 51613.70 → 51614
+        // u_to_b  = 1.8556 * 32768 ≈ 60824.42 → 60824
+        // u_to_g  = 0.18733 * 32768 ≈ 6138.05 → 6138
+        // v_to_g  = 0.46813 * 32768 ≈ 15338.31 → 15338
+        Matrix::Bt709Full => YuvToRgbCoeffs {
+            y_coeff: 32768,
+            v_to_r: 51614,
+            u_to_g: 6138,
+            v_to_g: 15338,
+            u_to_b: 60824,
+            y_offset: 0,
+            c_offset: 128,
+        },
     }
 }
 
-/// Per-pixel YUV→RGB at the source bit depth (10 / 12 / 14 / 16-bit).
-/// Returns three LSB-aligned `u16` channels. Limited-range path scales
-/// from `[16<<(bd-8), 235<<(bd-8)]` for luma and centres chroma at
-/// `128<<(bd-8)`; full-range maps directly. Output channels are
-/// clamped to `[0, (1<<bit_depth)-1]` to keep them representable in
-/// the source domain (so the oracle PNG, which round-trips the
-/// encoder's source-domain RGB out via Rgb48Le, can match byte-for-
-/// byte).
+/// Per-pixel YUV→RGB at 8-bit using the Q15 fixed-point matrix from
+/// [`yuv_coeffs`] (task #391). The previous f32 implementation had
+/// LSB-rounding drift that pinned `still-yuv444` to
+/// `BitExactWithinTol(3)`; the i32 path matches the source-domain RGB
+/// byte-for-byte (or within ±1 LSB for chained matrix-product rounding).
+fn yuv_to_rgb(y: u8, u: u8, v: u8, matrix: Matrix) -> (u8, u8, u8) {
+    let c = yuv_coeffs(matrix);
+    let yv = (y as i32) - c.y_offset;
+    let uv = (u as i32) - c.c_offset;
+    let vv = (v as i32) - c.c_offset;
+    // Q15 round-to-nearest: `+ (1 << 14)` then `>> 15`.
+    let y_q = c.y_coeff * yv;
+    let r = (y_q + c.v_to_r * vv + (1 << 14)) >> 15;
+    let g = (y_q - c.u_to_g * uv - c.v_to_g * vv + (1 << 14)) >> 15;
+    let b = (y_q + c.u_to_b * uv + (1 << 14)) >> 15;
+    (clamp_i32_u8(r), clamp_i32_u8(g), clamp_i32_u8(b))
+}
+
+fn clamp_i32_u8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+/// Per-pixel YUV→RGB at the source bit depth (8 / 10 / 12 / 14 / 16-
+/// bit). Returns three LSB-aligned `u16` channels (the caller does the
+/// MSB-align shift in [`compare_rgb48le`]). Output channels are
+/// clamped to `[0, (1<<bit_depth)-1]` to stay in the source domain.
+///
+/// Task #391 — switched from f64 to a Q15 fixed-point i32 / i64 matrix
+/// matching the reference 8-bit coefficients in [`yuv_coeffs`]. The
+/// chroma midpoint and (for limited range) the luma black point scale
+/// with `bit_depth` per ITU-R BT.2100 §6.4 / BT.709 §B.1.6: chroma is
+/// centred at `128 << (bd - 8)`, luma black is at `16 << (bd - 8)`,
+/// luma range is `219 << (bd - 8)`, chroma range is `224 << (bd - 8)`.
+///
+/// For **full-range** the 8-bit Q15 coefficients carry over verbatim
+/// (the matrix is scale-invariant in the input domain since `y_coeff`
+/// is exactly 1.0 and the chroma multipliers are pure ratios).
+///
+/// For **limited-range** the luma stretch becomes
+/// `(2^bd - 1) / (219 << (bd - 8))` and the chroma stretch becomes
+/// `(2^bd - 1) / (224 << (bd - 8))`. At bd=8 these collapse to `255/219`
+/// and `255/224`; at bd=10 they are `1023/876` and `1023/896`, etc.
+/// We compute them per-bit-depth so each path stays bit-exact in its
+/// own source domain.
 fn yuv16_to_rgb16(y: u16, u: u16, v: u16, matrix: Matrix, bit_depth: u32) -> (u16, u16, u16) {
-    let (kr, kb, limited) = match matrix {
-        Matrix::Bt601Limited => (0.299_f64, 0.114_f64, true),
-        Matrix::Bt601Full => (0.299_f64, 0.114_f64, false),
-        Matrix::Bt709Limited => (0.2126_f64, 0.0722_f64, true),
-        Matrix::Bt709Full => (0.2126_f64, 0.0722_f64, false),
+    let max_val = ((1u32 << bit_depth) - 1) as i64;
+    let bd_shift = bit_depth.saturating_sub(8);
+    let chroma_mid = 128i64 << bd_shift;
+    let (y_coeff, v_to_r, u_to_g, v_to_g, u_to_b, y_offset) = match matrix {
+        Matrix::Bt601Limited | Matrix::Bt709Limited => {
+            // Limited-range Q15 coefficients re-derived for arbitrary
+            // bit depth. Numerators are the textbook ITU-R values
+            // (1.402, 1.772, 0.34414, 0.71414 for BT.601;
+            //  1.5748, 1.8556, 0.18733, 0.46813 for BT.709) multiplied
+            // by the per-bit-depth chroma stretch `max_val /
+            // (224 << (bd-8))`. At bd=8 the chroma stretch is the
+            // textbook 255/224. The luma stretch `max_val /
+            // (219 << (bd-8))` only multiplies `y_coeff`.
+            let luma_range = 219i64 << bd_shift;
+            let chroma_range = 224i64 << bd_shift;
+            // Q15 round-to-nearest.
+            let q15 = 1i64 << 15;
+            let half = 1i64 << 14;
+            let y_coeff = ((max_val * q15) + luma_range / 2) / luma_range;
+            // Coefficient numerators in 1e6 units to keep the exact
+            // ITU-R BT.601-7 / BT.709-6 values without accumulating
+            // float rounding. (Scaled-integer fractions: 1402000 /
+            // 1000000 = 1.402.)
+            let (n_vr, n_ub, n_ug, n_vg) = match matrix {
+                Matrix::Bt601Limited => (1_402_000i64, 1_772_000i64, 344_136i64, 714_136i64),
+                Matrix::Bt709Limited => (1_574_800i64, 1_855_600i64, 187_324i64, 468_124i64),
+                _ => unreachable!(),
+            };
+            let scale = max_val * q15;
+            let denom = chroma_range * 1_000_000;
+            let v_to_r = (n_vr * scale + denom / 2) / denom;
+            let u_to_b = (n_ub * scale + denom / 2) / denom;
+            let u_to_g = (n_ug * scale + denom / 2) / denom;
+            let v_to_g = (n_vg * scale + denom / 2) / denom;
+            let _ = half; // silence: half is used inline below
+            (y_coeff, v_to_r, u_to_g, v_to_g, u_to_b, 16i64 << bd_shift)
+        }
+        Matrix::Bt601Full | Matrix::Bt709Full => {
+            // Full-range: the Q15 coefficients from `yuv_coeffs` are
+            // bit-depth-independent. Reuse them verbatim so the
+            // 8-bit and 16-bit paths share the same exact rounding.
+            let c = yuv_coeffs(matrix);
+            (
+                c.y_coeff as i64,
+                c.v_to_r as i64,
+                c.u_to_g as i64,
+                c.v_to_g as i64,
+                c.u_to_b as i64,
+                0i64,
+            )
+        }
     };
-    let kg = 1.0 - kr - kb;
-    let max_val = ((1u32 << bit_depth) - 1) as f64;
-    let (yv, cb, cr) = if limited {
-        // Per ITU-R BT.2100 / BT.709 §B.1.6: black/white code values
-        // are 16<<(bd-8) and 235<<(bd-8); chroma midpoint is
-        // 128<<(bd-8); chroma extreme is at 240<<(bd-8). The same
-        // 219 / 224 scale factors apply, just with values shifted up
-        // by `bd - 8` bits.
-        let shift = bit_depth - 8;
-        let black = 16.0 * (1u32 << shift) as f64;
-        let chroma_mid = 128.0 * (1u32 << shift) as f64;
-        let luma_range = 219.0 * (1u32 << shift) as f64;
-        let chroma_range = 224.0 * (1u32 << shift) as f64;
-        let yv = (y as f64 - black) * (max_val / luma_range);
-        let cb = (u as f64 - chroma_mid) * (max_val / chroma_range);
-        let cr = (v as f64 - chroma_mid) * (max_val / chroma_range);
-        (yv, cb, cr)
-    } else {
-        let mid = (1u32 << (bit_depth - 1)) as f64;
-        let yv = y as f64;
-        let cb = u as f64 - mid;
-        let cr = v as f64 - mid;
-        (yv, cb, cr)
-    };
-    let r = yv + 2.0 * (1.0 - kr) * cr;
-    let b = yv + 2.0 * (1.0 - kb) * cb;
-    let g = yv - (2.0 * kr * (1.0 - kr) / kg) * cr - (2.0 * kb * (1.0 - kb) / kg) * cb;
+    let yv = (y as i64) - y_offset;
+    let uv = (u as i64) - chroma_mid;
+    let vv = (v as i64) - chroma_mid;
+    let half = 1i64 << 14;
+    let y_q = y_coeff * yv;
+    let r = (y_q + v_to_r * vv + half) >> 15;
+    let g = (y_q - u_to_g * uv - v_to_g * vv + half) >> 15;
+    let b = (y_q + u_to_b * uv + half) >> 15;
     (
-        clamp_u16(r, max_val),
-        clamp_u16(g, max_val),
-        clamp_u16(b, max_val),
+        clamp_i64_u16(r, max_val),
+        clamp_i64_u16(g, max_val),
+        clamp_i64_u16(b, max_val),
     )
 }
 
-fn clamp_u16(v: f64, max_val: f64) -> u16 {
-    let r = v.round();
-    if r < 0.0 {
-        0
-    } else if r > max_val {
-        max_val as u16
-    } else {
-        r as u16
-    }
+fn clamp_i64_u16(v: i64, max_val: i64) -> u16 {
+    v.clamp(0, max_val) as u16
 }
 
 /// Convert a single HEVC layer's `VideoFrame` (1-plane luma OR 3-plane

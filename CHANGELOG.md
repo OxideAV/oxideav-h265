@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- heif_corpus: switch the comparator's f32 / f64 BT.601 / BT.709
+  matrix to a Q15 fixed-point i32 path (task #391). New helper
+  `yuv_coeffs(matrix) -> YuvToRgbCoeffs` returns 8-bit-domain Q15
+  coefficients per ITU-R BT.601-7 §2.5.1 / BT.709-6 §3 reference,
+  pre-rounded to nearest. `yuv_to_rgb` (8-bit) and `yuv16_to_rgb16`
+  (10/12/14/16-bit) now do `(coeff * sample + (1 << 14)) >> 15`
+  arithmetic in i32 / i64 instead of the previous f32 / f64
+  multiply. The 16-bit limited-range path re-derives the Q15
+  coefficients per bit depth so the luma stretch
+  `(2^bd-1)/(219<<(bd-8))` and chroma stretch
+  `(2^bd-1)/(224<<(bd-8))` stay bit-exact in the source domain.
+  Empirical histogram probes show f32 / f64 / Q15 produce the
+  identical per-pixel RGB output on every fixture in the corpus —
+  so the residual byte-deltas on `still-yuv444` (max |Δ|=3) and
+  `still-10bit-main10` (max value-delta 3 in 10-bit space ⇒ max
+  byte-delta 192 across a 256-byte boundary) are HEVC encoder YUV
+  quantization noise, not comparator precision. Tolerances stay at
+  3 / 192 respectively. The change is a code-quality / platform-
+  portability win (no f32 nondeterminism), not a delta-tightening.
 - heif_corpus: re-promote `still-10bit-main10` via
   `BitExactWithinTol(192)` (task #376). The fixture's "essentially
   uncorrelated" failure (98040 of 98304 bytes diff at max |Δ|=255)
