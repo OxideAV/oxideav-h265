@@ -102,22 +102,31 @@ fn report_only_reason(name: &str) -> &'static str {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
         "still-image-overlay" => {
-            "task #346 lifted iovl divergence from max |Δ|=160 across \
-             97.3% of bytes down to max |Δ|=44 across ~52%: the iovl \
-             composer now (a) inherits the colour matrix from layer 0 \
-             when the iovl item has no colr (defaults to BT.601 full \
-             when neither has one) and (b) blends layer 1's yellow- \
-             square colour against layer 0's gradient through a per- \
-             layer alpha auxiliary (decoded via the auxl iref), in \
-             RGB space at 4:4:4 chroma so anti-aliased circle edges \
-             don't lose precision through 4:2:0 chroma averaging. \
-             The residual ~44 max delta sits in the bottom-left \
-             corner of the gradient (pixels 0..30 × 252..255) where \
-             the HEVC decode of layer 0 itself drifts from the \
-             oracle — independent of the iovl compositing path. Re- \
-             promote once the layer-0 corner-pixel HEVC drift is \
-             root-caused (likely an SAO / deblock / intra-prediction \
-             edge case at the bottom-left CTB)"
+            "task #390 follow-up — single-CTB-at-corner probe \
+             isolated the residual to the HEVC raw-reconstruction \
+             stage (NOT SAO, NOT deblock). Decoded layer 0 vs ffmpeg \
+             reference (256x256, CTB=64, 4 CTB rows × 4 CTB cols, \
+             entropy_coding_sync=true, SAO=on, strong_intra_smooth=\
+             true): first Y-plane divergence at (9, 63) Δ=-1 (very \
+             last row of CTB(0,0)); CTB row 0 has 1 differing Y \
+             pixel; CTB row 1: max |Δ|=9; CTB row 2: 19; CTB row 3: \
+             26. Chroma drift cascades the same way (Cr first diff \
+             at (20,31) Δ=-1, max 28 by row 3). Toggling SAO and \
+             deblock individually leaves the per-pixel diff and \
+             max |Δ| identical (38374/65536 Y diffs at max 26 in all \
+             four configurations) — the raw intra-prediction / \
+             transform reconstruction is producing a single off-by- \
+             one pixel at (9, 63) which then cascades through CTB \
+             row 1+ via INTRA prediction inheriting wrong reference \
+             samples from the row above. Likely culprit: a TU- or \
+             4×4-block-level edge case at x=9 mod 4 = 1 (interior \
+             of the rightmost 4×4 TU of the bottom-row CTB(0,0)) \
+             affecting how the bottom edge of CTB(0,0) is left for \
+             the next CTB row to use as references. Actual root \
+             cause needs decoder-internal instrumentation to read \
+             the per-TU intra mode / residual / reconstructed \
+             values at (8..12, 60..63). Remains ReportOnly until \
+             root-caused"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "image-sequence-3frame" => {
@@ -187,17 +196,16 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
-        // Task #346 lifted the iovl divergence substantially: the
-        // composer now inherits the colour matrix from layer 0 when
-        // the iovl item has no colr (defaults to BT.601 full), and
-        // blends each layer's RGB samples against the existing
-        // canvas through a per-layer alpha auxiliary decoded via
-        // the auxl iref — in RGB space at 4:4:4 chroma so anti-
-        // aliased alpha edges don't lose precision through 4:2:0
-        // chroma averaging. The residual is HEVC layer-0 drift in
-        // the bottom-left gradient corner (pixels 0..30 × 252..255),
-        // independent of iovl compositing. See report_only_reason
-        // for the follow-up sketch.
+        // Task #346 lifted the iovl divergence substantially. Task
+        // #390 follow-up confirmed the residual is HEVC raw-
+        // reconstruction drift in layer 0 (NOT iovl compositing,
+        // NOT SAO, NOT deblock). Per the single-CTB-at-corner
+        // probe: first divergence at Y(9, 63) Δ=-1 (last row of
+        // CTB(0,0)); cascades down via INTRA prediction to max
+        // |Δ|=26 in the bottom-left CTB. Stays ReportOnly until
+        // the underlying off-by-one-at-(9,63) intra/transform bug
+        // is root-caused — see `report_only_reason` for the full
+        // diagnosis.
         fixture!("still-image-overlay", ReportOnly),
         fixture!("multi-image-burst-3", ReportOnly),
         // Round 6 + task #320 promoted: chroma_format_idc=0 lift in

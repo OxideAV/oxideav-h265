@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- heif_corpus: refine `still-image-overlay` ReportOnly diagnosis
+  (task #390 single-CTB-at-corner probe). After task #346 lifted
+  the iovl divergence to `max |Δ|=44 across ~52%` and identified
+  the bottom-left HEVC layer-0 corner as the residual, this round
+  isolates the offending decoder stage. Probe approach: decode
+  `still-image-overlay` layer 0 (256x256, CTB=64, profile_idc=3,
+  WPP enabled, SAO on, strong_intra_smoothing on) via
+  `heif::decode_item(heic, 1)`, dump as planar YUV, compare vs
+  `ffmpeg -i layer0.h265 -pix_fmt yuv420p` reference. Toggling
+  SAO and deblock individually (via temporary env-var hooks
+  later removed) leaves the per-pixel diff and max |Δ| identical
+  in all four configurations (38374/65536 Y diffs at max 26) —
+  the raw intra-prediction / transform reconstruction is the
+  source. First Y-plane divergence at (9, 63) Δ=-1 (very last
+  row of CTB(0,0)); CTB row 0 has 1 differing Y pixel; CTB row
+  1: max |Δ|=9; CTB row 2: 19; CTB row 3: 26. Chroma drift
+  cascades the same way (Cr first diff at (20, 31) Δ=-1, max
+  28 by row 3). Drift propagates via INTRA prediction inheriting
+  wrong reference samples from the row above. Cross-fixture
+  reproducibility verified: `single-image-with-thumbnail` (which
+  shares the exact HEVC bitstream with `still-image-overlay`'s
+  layer 0, MD5-identical) shows the IDENTICAL drift pattern, so
+  the bug is in the decoder, not specific to the iovl path.
+  Likely culprit: a TU- or 4×4-block-level edge case at the
+  rightmost 4×4 TU of CTB(0,0)'s bottom row affecting how the
+  bottom-edge samples of CTB(0,0) are left for CTB(0,1)+ to use
+  as references. Actual root cause needs decoder-internal
+  instrumentation. Stays ReportOnly until root-caused; fixture
+  table comment + `report_only_reason` updated with full probe
+  results.
 - heif_corpus: switch the comparator's f32 / f64 BT.601 / BT.709
   matrix to a Q15 fixed-point i32 path (task #391). New helper
   `yuv_coeffs(matrix) -> YuvToRgbCoeffs` returns 8-bit-domain Q15
