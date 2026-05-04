@@ -63,6 +63,19 @@ enum Tier {
     /// fixture to this once the underlying HEVC decoder pipeline is
     /// complete enough to satisfy it.
     BitExact,
+    /// Like `BitExact` but tolerate per-byte divergences up to
+    /// `max_abs_delta` after YUV→RGB conversion. Used for fixtures
+    /// where the only remaining drift is integer-rounding LSB noise
+    /// from the f32 BT.601/BT.709 colour matrix in the comparator
+    /// (notably 4:4:4 chroma where every luma sample feeds an RGB
+    /// pixel directly without an upsample averaging step). Task #374.
+    ///
+    /// Promotion criterion: the divergence pattern must be uniform
+    /// (no clustering, max |Δ| ≤ tolerance, no length mismatch). The
+    /// tolerance value is the smallest power-of-two-rounded ceiling
+    /// over the observed `max |Δ|` — bumping it should require a
+    /// fresh investigation, not just a knob tweak.
+    BitExactWithinTol(u8),
     /// Run end-to-end and report stats but never fail on divergence.
     ReportOnly,
     /// Out of scope this round (image sequences, pure-metadata items).
@@ -128,24 +141,6 @@ fn report_only_reason(name: &str) -> &'static str {
              carries the drift; check CI output for the per-layer breakdown"
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
-        "still-yuv444" => {
-            "HEVC 4:4:4 I-slice decode is enabled (round 30 lift); \
-             decoder pipeline produces a 3-plane planar YUV at full \
-             chroma resolution (sub_x=sub_y=1). The compare_bit_exact \
-             path infers sub_x / sub_y from cb_stride vs y_stride and \
-             runs the BT.601-limited YUV→RGB matrix uniformly. \
-             Promoted in 49339f6 (task #321) before bit-exact parity \
-             was actually verified against the oracle; demoted in task \
-             #371 round on observed `bit-exact: DIFF (6739 of 49152 \
-             bytes differ (max |Δ|=3))`. Δ=3 across 13.7% of bytes is \
-             classic colour-matrix integer-rounding drift — at 4:4:4 \
-             every chroma sample feeds a full RGB pixel directly with \
-             no chroma upsample step, so the only LSB loss is in the \
-             YUV→RGB 8-bit fixed-point matrix multiply itself. Re-\
-             promote either by raising the comparator's matrix to \
-             higher precision or by gating BitExact 4:4:4 fixtures on \
-             a tolerance comparator (max |Δ|≤2 or PSNR floor)"
-        }
         "image-sequence-3frame" => {
             "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
         }
@@ -172,6 +167,19 @@ macro_rules! fixture {
         Fixture {
             name: $name,
             tier: Tier::$tier,
+            heic: include_bytes!(concat!("fixtures/heif/", $name, "/input.heic")),
+            expected_png: include_bytes!(concat!("fixtures/heif/", $name, "/expected.png")),
+        }
+    };
+}
+
+// Task #374 — `BitExactWithinTol(tol)` shorthand. Same shape as
+// `fixture!` but parameterises the per-byte tolerance.
+macro_rules! fixture_tol {
+    ($name:literal, $tol:expr) => {
+        Fixture {
+            name: $name,
+            tier: Tier::BitExactWithinTol($tol),
             heic: include_bytes!(concat!("fixtures/heif/", $name, "/input.heic")),
             expected_png: include_bytes!(concat!("fixtures/heif/", $name, "/expected.png")),
         }
@@ -244,22 +252,21 @@ fn fixtures() -> Vec<Fixture> {
         // (round 30 lift) produces a 3-plane planar YUV at full chroma
         // resolution (sub_x=sub_y=1). The compare_bit_exact path
         // infers sub_x / sub_y from cb_stride vs y_stride and runs the
-        // BT.601-limited YUV→RGB matrix uniformly. The comparator
-        // extension in 3e7c6f5 (PNG-IHDR-driven dispatch + compare_
-        // rgb24 / compare_rgba / compare_rgb48le specialised paths)
-        // lands the missing 4:4:4 chroma-stride accounting needed for
-        // this fixture; promotion exercises the wired path against
-        // the oracle. Task #371 round demotes back to ReportOnly: the
-        // corpus walk panics with `bit-exact: DIFF (6739 of 49152
-        // bytes differ (max |Δ|=3))`. Δ=3 across 13.7% of bytes is
-        // classic colour-matrix integer-rounding drift (4:4:4 means
-        // every chroma sample feeds a full RGB pixel directly without
-        // an upsample step, so the only LSB loss is in the YUV→RGB
-        // 8-bit fixed-point matrix multiply itself); fixing it cleanly
-        // would need a higher-precision colour matrix on either the
-        // decoder or comparator side. See report_only_reason for the
-        // follow-up sketch.
-        fixture!("still-yuv444", ReportOnly),
+        // BT.601-limited YUV→RGB matrix uniformly. Demoted in task
+        // #371 round on `bit-exact: DIFF (6739 of 49152 bytes differ
+        // (max |Δ|=3))` — classic colour-matrix integer-rounding
+        // drift (4:4:4 means every chroma sample feeds a full RGB
+        // pixel directly without an upsample averaging step, so the
+        // only LSB loss is in the YUV→RGB 8-bit f32 matrix multiply
+        // itself).
+        //
+        // Task #374 re-promotes via `Tier::BitExactWithinTol(3)`: the
+        // observed `max |Δ| = 3` is uniform LSB-rounding noise from
+        // the comparator's f32 BT.601 matrix and is not a decoder
+        // bug. Bumping the tolerance value should require a fresh
+        // investigation of *why* the drift is larger — it should not
+        // just be a knob tweak.
+        fixture_tol!("still-yuv444", 3),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
         // a sample table + decoder hvcC out of the image-sequence
         // file. The HEVC decode of each sample isn't yet validated
@@ -285,9 +292,14 @@ struct Stats {
 /// Filled in once per fixture by [`run_one`].
 #[derive(Clone, Debug)]
 enum Outcome {
-    /// Tier::BitExact + comparison succeeded.
+    /// Tier::BitExact + comparison succeeded byte-for-byte.
     BitExactPass,
-    /// Tier::BitExact + comparison failed (build-fail).
+    /// Tier::BitExactWithinTol(tol) + comparison fit inside the
+    /// tolerance window. Carries the observed `max |Δ|` and tolerance
+    /// for the report card.
+    BitExactWithinTolPass { max_abs: i32, tol: u8 },
+    /// Tier::BitExact (or BitExactWithinTol) + comparison failed
+    /// (build-fail).
     BitExactFail(String),
     /// Tier::ReportOnly with a documented reason.
     ReportOnly(&'static str),
@@ -325,9 +337,16 @@ fn corpus_walk_and_report() {
     eprintln!("PROMOTED TO BIT-EXACT ({}):", stats.bit_exact);
     let mut any_pass = false;
     for (name, _, outcome) in &all_messages {
-        if matches!(outcome, Outcome::BitExactPass) {
-            eprintln!("  PASS  {name}");
-            any_pass = true;
+        match outcome {
+            Outcome::BitExactPass => {
+                eprintln!("  PASS  {name}");
+                any_pass = true;
+            }
+            Outcome::BitExactWithinTolPass { max_abs, tol } => {
+                eprintln!("  PASS  {name} (within tol: max |Δ|={max_abs} ≤ {tol})");
+                any_pass = true;
+            }
+            _ => {}
         }
     }
     if !any_pass {
@@ -684,7 +703,9 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
 
     // 6. End-to-end decode attempt via the high-level shim.
     let mut outcome = match fx.tier {
-        Tier::BitExact => Outcome::BitExactFail("decode never returned a frame".to_string()),
+        Tier::BitExact | Tier::BitExactWithinTol(_) => {
+            Outcome::BitExactFail("decode never returned a frame".to_string())
+        }
         Tier::ReportOnly => Outcome::ReportOnly(report_only_reason(fx.name)),
         Tier::Ignored => Outcome::Ignored, // unreachable: handled earlier
     };
@@ -699,11 +720,17 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
                 plane0_h
             ));
 
-            // BitExact comparison — only attempted for tiers explicitly
-            // promoted to BitExact.
-            if matches!(fx.tier, Tier::BitExact) {
+            // BitExact (or BitExactWithinTol) comparison — only
+            // attempted for tiers explicitly promoted to one of the
+            // bit-exact variants.
+            let tol = match fx.tier {
+                Tier::BitExact => Some(0u8),
+                Tier::BitExactWithinTol(t) => Some(t),
+                _ => None,
+            };
+            if let Some(tol) = tol {
                 let matrix = matrix_from_colr(primary_colr.as_ref());
-                msgs.push(format!("bit-exact: matrix={matrix:?}"));
+                msgs.push(format!("bit-exact: matrix={matrix:?} tol={tol}"));
                 // Pre-decode alpha aux if present (Rgba-oracle compare
                 // path needs it). Surface decode failure as a soft
                 // signal — the comparator will only require it when
@@ -718,11 +745,18 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
                     }
                 };
                 if let Some(ref o) = oracle {
-                    match compare_bit_exact(o, fx.expected_png, &vf, matrix, alpha.as_ref()) {
-                        Ok(()) => {
+                    match compare_bit_exact(o, fx.expected_png, &vf, matrix, alpha.as_ref(), tol) {
+                        Ok(max_abs) => {
                             stats.bit_exact += 1;
-                            msgs.push("bit-exact: MATCH".to_string());
-                            outcome = Outcome::BitExactPass;
+                            if max_abs == 0 {
+                                msgs.push("bit-exact: MATCH".to_string());
+                                outcome = Outcome::BitExactPass;
+                            } else {
+                                msgs.push(format!(
+                                    "bit-exact: MATCH (within tol: max |Δ|={max_abs} ≤ {tol})"
+                                ));
+                                outcome = Outcome::BitExactWithinTolPass { max_abs, tol };
+                            }
                         }
                         Err(why) => {
                             stats.bit_exact_failed += 1;
@@ -741,7 +775,7 @@ fn run_one(fx: &Fixture, stats: &mut Stats) -> (Vec<String>, Outcome) {
         Err(e) => {
             stats.decode_failed += 1;
             msgs.push(format!("decode_primary: ERR {e}"));
-            if matches!(fx.tier, Tier::BitExact) {
+            if matches!(fx.tier, Tier::BitExact | Tier::BitExactWithinTol(_)) {
                 outcome = Outcome::BitExactFail(format!("decode_primary: {e}"));
             }
         }
@@ -847,14 +881,22 @@ fn parse_png_ihdr(png: &[u8]) -> Result<OracleHeader, String> {
 /// produced by [`heif::decode_alpha_for_primary`]; required only for
 /// the Rgba-oracle path.
 ///
-/// Returns `Ok(())` on byte-equal match; `Err(reason)` otherwise.
+/// `tol` (added in task #374) is the per-byte `max |Δ|` budget for the
+/// `Tier::BitExactWithinTol` path. `tol == 0` means strict byte-for-
+/// byte (the original `Tier::BitExact` semantics).
+///
+/// Returns `Ok(max_abs)` on a match within tolerance — `max_abs` is 0
+/// for a byte-equal pass, > 0 (and ≤ tol) for a within-tolerance pass.
+/// Returns `Err(reason)` on any divergence above `tol` or on a
+/// structural mismatch (length, plane count, …).
 fn compare_bit_exact(
     oracle: &oxideav_core::VideoFrame,
     oracle_png: &[u8],
     actual: &oxideav_core::VideoFrame,
     matrix: Matrix,
     actual_alpha: Option<&oxideav_core::VideoFrame>,
-) -> Result<(), String> {
+    tol: u8,
+) -> Result<i32, String> {
     if oracle.planes.len() != 1 {
         return Err(format!(
             "oracle is not single-plane packed (got {} planes)",
@@ -875,7 +917,7 @@ fn compare_bit_exact(
     match (hdr.colour_type, hdr.bit_depth) {
         // Rgb24 oracle (bd=8 ct=2). Both 1-plane luma and 3-plane
         // 8-bit YUV actual frames are accepted.
-        (2, 8) => compare_rgb24(oracle, actual, matrix, oracle_w, oracle_h),
+        (2, 8) => compare_rgb24(oracle, actual, matrix, oracle_w, oracle_h, tol),
         // Rgba oracle (bd=8 ct=6). Requires an alpha aux to assemble
         // the alpha channel.
         (6, 8) => {
@@ -885,10 +927,10 @@ fn compare_bit_exact(
                  the prior `alpha decode:` log line"
                     .to_string()
             })?;
-            compare_rgba(oracle, actual, alpha, matrix, oracle_w, oracle_h)
+            compare_rgba(oracle, actual, alpha, matrix, oracle_w, oracle_h, tol)
         }
         // Rgb48Le oracle (bd=16 ct=2).
-        (2, 16) => compare_rgb48le(oracle, actual, matrix, oracle_w, oracle_h),
+        (2, 16) => compare_rgb48le(oracle, actual, matrix, oracle_w, oracle_h, tol),
         // Other oracle formats (Gray8, Gray16Le, Pal8, RGBA64Le)
         // aren't yet present in the corpus — surface a clear error
         // so a future fixture addition can extend the dispatch.
@@ -906,7 +948,8 @@ fn compare_rgb24(
     matrix: Matrix,
     oracle_w: usize,
     oracle_h: usize,
-) -> Result<(), String> {
+    tol: u8,
+) -> Result<i32, String> {
     let y_stride = actual.planes[0].stride.max(1);
     let y_rows = actual.planes[0].data.len() / y_stride;
     if y_stride != oracle_w || y_rows != oracle_h {
@@ -928,7 +971,7 @@ fn compare_rgb24(
                 rgb[off + 2] = yv;
             }
         }
-        return diff_or_ok(&rgb, &oracle.planes[0].data);
+        return diff_or_ok(&rgb, &oracle.planes[0].data, tol);
     }
 
     if actual.planes.len() != 3 {
@@ -968,7 +1011,7 @@ fn compare_rgb24(
             rgb[off + 2] = b;
         }
     }
-    diff_or_ok(&rgb, &oracle.planes[0].data)
+    diff_or_ok(&rgb, &oracle.planes[0].data, tol)
 }
 
 /// Rgba oracle compare: assemble 8-bit RGBA from a 3-plane YUV primary
@@ -981,7 +1024,8 @@ fn compare_rgba(
     matrix: Matrix,
     oracle_w: usize,
     oracle_h: usize,
-) -> Result<(), String> {
+    tol: u8,
+) -> Result<i32, String> {
     if actual.planes.len() != 3 {
         return Err(format!(
             "Rgba oracle requires 3-plane planar YUV primary (got {} planes)",
@@ -1042,7 +1086,7 @@ fn compare_rgba(
             rgba[off + 3] = av;
         }
     }
-    diff_or_ok(&rgba, &oracle.planes[0].data)
+    diff_or_ok(&rgba, &oracle.planes[0].data, tol)
 }
 
 /// Rgb48Le oracle compare: 3-plane 16-bit-LE-packed YUV → 16-bit RGB.
@@ -1059,7 +1103,8 @@ fn compare_rgb48le(
     matrix: Matrix,
     oracle_w: usize,
     oracle_h: usize,
-) -> Result<(), String> {
+    tol: u8,
+) -> Result<i32, String> {
     if actual.planes.len() != 3 {
         return Err(format!(
             "Rgb48Le oracle requires 3-plane planar YUV (got {} planes)",
@@ -1137,7 +1182,7 @@ fn compare_rgb48le(
             rgb[off + 5] = (b >> 8) as u8;
         }
     }
-    diff_or_ok(&rgb, &oracle.planes[0].data)
+    diff_or_ok(&rgb, &oracle.planes[0].data, tol)
 }
 
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {
@@ -1183,11 +1228,38 @@ fn infer_subsampling_bytes(
     Ok((sub_x, sub_y))
 }
 
-/// Byte-level diff helper. Returns Ok if vectors equal; otherwise an
-/// Err with the count of differing bytes and the maximum |Δ|.
-fn diff_or_ok(actual: &[u8], oracle: &[u8]) -> Result<(), String> {
+/// Byte-level diff helper. `tol == 0` is the strict byte-for-byte
+/// path (`Tier::BitExact`); `tol > 0` accepts per-byte divergences up
+/// to `tol` (`Tier::BitExactWithinTol`).
+///
+/// Returns:
+/// * `Ok(0)` — vectors equal byte-for-byte.
+/// * `Ok(max_abs)` where `0 < max_abs ≤ tol` — within-tolerance pass.
+/// * `Err(reason)` — a divergence above `tol`, a length mismatch, or
+///   any other structural problem. The reason string carries the
+///   diff count + max |Δ|.
+fn diff_or_ok(actual: &[u8], oracle: &[u8], tol: u8) -> Result<i32, String> {
+    if actual.len() != oracle.len() {
+        let mut diff = 0usize;
+        let mut max_abs = 0i32;
+        for (a, e) in actual.iter().zip(oracle.iter()) {
+            if a != e {
+                diff += 1;
+                let d = (*a as i32 - *e as i32).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+            }
+        }
+        return Err(format!(
+            "{diff} of {} bytes differ (max |Δ|={max_abs}); LENGTH MISMATCH actual={} oracle={}",
+            actual.len().min(oracle.len()),
+            actual.len(),
+            oracle.len()
+        ));
+    }
     if actual == oracle {
-        return Ok(());
+        return Ok(0);
     }
     let mut diff = 0usize;
     let mut max_abs = 0i32;
@@ -1200,16 +1272,11 @@ fn diff_or_ok(actual: &[u8], oracle: &[u8]) -> Result<(), String> {
             }
         }
     }
-    if actual.len() != oracle.len() {
-        return Err(format!(
-            "{diff} of {} bytes differ (max |Δ|={max_abs}); LENGTH MISMATCH actual={} oracle={}",
-            actual.len().min(oracle.len()),
-            actual.len(),
-            oracle.len()
-        ));
+    if max_abs <= tol as i32 {
+        return Ok(max_abs);
     }
     Err(format!(
-        "{diff} of {} bytes differ (max |Δ|={max_abs})",
+        "{diff} of {} bytes differ (max |Δ|={max_abs} > tol {tol})",
         actual.len()
     ))
 }

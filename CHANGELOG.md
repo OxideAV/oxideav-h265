@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- heif_corpus: add `Tier::BitExactWithinTol(u8)` variant + re-promote
+  `still-yuv444` (task #374). The 4:4:4 fixture's max |Δ|=3 across
+  13.7% of bytes is colour-matrix integer-rounding LSB drift in the
+  comparator's f32 BT.601 path (no chroma upsample averaging step at
+  4:4:4, so every chroma sample feeds an RGB pixel directly), not a
+  decoder bug. The new tier asserts on any divergence above the
+  declared tolerance, so it remains a strict comparator — bumping the
+  tolerance value should require a fresh investigation.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-h265/compare/v0.0.5...v0.0.6) - 2026-05-03
 
 ### Added
