@@ -129,14 +129,22 @@ fn report_only_reason(name: &str) -> &'static str {
         }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "still-yuv444" => {
-            "HEVC 4:4:4 I-slice decode is enabled (round 30 lift); decoder \
-             pipeline produces a 3-plane planar YUV at full chroma resolution \
-             (sub_x=sub_y=1). The compare_bit_exact path infers sub_x / sub_y \
-             from cb_stride vs y_stride and would compare cleanly, but bit-\
-             exact parity against the oracle PNG isn't yet validated for an \
-             arbitrary HEIF-Main-4:4:4 stream — the encoder unit tests \
-             exercise 4:4:4 round-trip at PSNR ≥ 30 dB rather than byte-\
-             exact, so a real-encoder fixture may diverge"
+            "HEVC 4:4:4 I-slice decode is enabled (round 30 lift); \
+             decoder pipeline produces a 3-plane planar YUV at full \
+             chroma resolution (sub_x=sub_y=1). The compare_bit_exact \
+             path infers sub_x / sub_y from cb_stride vs y_stride and \
+             runs the BT.601-limited YUV→RGB matrix uniformly. \
+             Promoted in 49339f6 (task #321) before bit-exact parity \
+             was actually verified against the oracle; demoted in task \
+             #371 round on observed `bit-exact: DIFF (6739 of 49152 \
+             bytes differ (max |Δ|=3))`. Δ=3 across 13.7% of bytes is \
+             classic colour-matrix integer-rounding drift — at 4:4:4 \
+             every chroma sample feeds a full RGB pixel directly with \
+             no chroma upsample step, so the only LSB loss is in the \
+             YUV→RGB 8-bit fixed-point matrix multiply itself. Re-\
+             promote either by raising the comparator's matrix to \
+             higher precision or by gating BitExact 4:4:4 fixtures on \
+             a tolerance comparator (max |Δ|≤2 or PSNR floor)"
         }
         "image-sequence-3frame" => {
             "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
@@ -232,16 +240,26 @@ fn fixtures() -> Vec<Fixture> {
         // that aren't yet wired. See report_only_reason for the
         // follow-up sketch.
         fixture!("still-10bit-main10", ReportOnly),
-        // Task #321 promotes: HEVC 4:4:4 I-slice decode (round 30 lift)
-        // produces a 3-plane planar YUV at full chroma resolution
-        // (sub_x=sub_y=1). The compare_bit_exact path infers sub_x /
-        // sub_y from cb_stride vs y_stride and runs the BT.601-limited
-        // YUV→RGB matrix uniformly. The comparator extension in 3e7c6f5
-        // (PNG-IHDR-driven dispatch + compare_rgb24 / compare_rgba /
-        // compare_rgb48le specialised paths) lands the missing 4:4:4
-        // chroma-stride accounting needed for this fixture; promotion
-        // exercises the wired path against the oracle.
-        fixture!("still-yuv444", BitExact),
+        // Task #321 promoted in 49339f6: HEVC 4:4:4 I-slice decode
+        // (round 30 lift) produces a 3-plane planar YUV at full chroma
+        // resolution (sub_x=sub_y=1). The compare_bit_exact path
+        // infers sub_x / sub_y from cb_stride vs y_stride and runs the
+        // BT.601-limited YUV→RGB matrix uniformly. The comparator
+        // extension in 3e7c6f5 (PNG-IHDR-driven dispatch + compare_
+        // rgb24 / compare_rgba / compare_rgb48le specialised paths)
+        // lands the missing 4:4:4 chroma-stride accounting needed for
+        // this fixture; promotion exercises the wired path against
+        // the oracle. Task #371 round demotes back to ReportOnly: the
+        // corpus walk panics with `bit-exact: DIFF (6739 of 49152
+        // bytes differ (max |Δ|=3))`. Δ=3 across 13.7% of bytes is
+        // classic colour-matrix integer-rounding drift (4:4:4 means
+        // every chroma sample feeds a full RGB pixel directly without
+        // an upsample step, so the only LSB loss is in the YUV→RGB
+        // 8-bit fixed-point matrix multiply itself); fixing it cleanly
+        // would need a higher-precision colour matrix on either the
+        // decoder or comparator side. See report_only_reason for the
+        // follow-up sketch.
+        fixture!("still-yuv444", ReportOnly),
         // Round-5 promoted: moov/trak/mdia/minf/stbl walker now lifts
         // a sample table + decoder hvcC out of the image-sequence
         // file. The HEVC decode of each sample isn't yet validated
