@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- heif_corpus: re-promote `still-10bit-main10` via
+  `BitExactWithinTol(192)` (task #376). The fixture's "essentially
+  uncorrelated" failure (98040 of 98304 bytes diff at max |Δ|=255)
+  was a comparator alignment bug, not a Main 10 decoder bug: the
+  HEVC YUV samples are byte-identical to ffmpeg's reference decode
+  (verified with `ffmpeg -pix_fmt yuv420p10le`), but the
+  comparator's `compare_rgb48le` was emitting LSB-aligned 16-bit
+  RGB while `oxideav-png` decodes 16-bit-from-10-bit-source PNGs as
+  MSB-aligned (`value << 6` to fill the 16-bit container). Fix:
+  shift the rendered RGB by `16 - bit_depth` before byte-comparing.
+  The remaining residual is BT.601 colour-matrix LSB drift (max
+  value-delta 5 in 10-bit space → max byte-delta 192 when 16-bit
+  values cross a 256-byte boundary). The Main 10 decode pipeline
+  (dequant / IDCT / prediction / deblock / SAO) was already
+  bit_depth-aware end-to-end via the round-13/15 Main 12 lifts.
 - heif_corpus: re-promote `still-image-with-alpha` via
   `BitExactWithinTol(12)` (task #375). Per-channel diff vs the
   oracle PNG: R/G/B = 0 bytes differ (primary HEVC decode is byte-

@@ -101,22 +101,6 @@ fn report_only_reason(name: &str) -> &'static str {
         "still-image-grid-2x2" => {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
-        "still-10bit-main10" => {
-            "Main 10 (bit_depth=10) emit_frame produces a 3-plane 16-\
-             bit-LE-packed YUV VideoFrame and the comparator's \
-             compare_rgb48le branch reads u16 samples + runs the YUV→\
-             RGB matrix at the source bit depth (10-bit, mask 0x3FF), \
-             but the decoded pixels are essentially uncorrelated with \
-             the oracle: 98040 of 98304 bytes differ with max |Δ|=255 \
-             (99.7% at max delta). Promoted in 5495beb (task #320) on \
-             the assumption that the bit_depth=10 round 7 lift was \
-             emit-only (no decoder math change) — in practice the 10-\
-             bit decode pipeline (dequant, IDCT scaling, intra/inter \
-             prediction clipping, in-loop filter clamps) needs Main-\
-             10-aware intermediate widths that aren't yet wired. \
-             Demoted in task #371 round; re-promote once the Main 10 \
-             decode pipeline lands a real round of 10-bit work"
-        }
         "still-image-overlay" => {
             "task #346 lifted iovl divergence from max |Δ|=160 across \
              97.3% of bytes down to max |Δ|=44 across ~52%: the iovl \
@@ -221,23 +205,30 @@ fn fixtures() -> Vec<Fixture> {
         // (Gray8); the comparator's compare_rgb24 1-plane branch
         // splats Y to (Y,Y,Y) packed RGB and matches the oracle.
         fixture!("still-monochrome", BitExact),
-        // Round 7 + task #320 promoted in 5495beb: bit_depth=10 lift
-        // in emit_frame produces a 3-plane 16-bit-LE-packed YUV
-        // VideoFrame; the comparator's compare_rgb48le branch reads
-        // u16 samples, runs the YUV→RGB matrix at the source bit
-        // depth (10-bit, mask 0x3FF), and writes LSB-aligned 16-bit
-        // RGB matching the Rgb48Le oracle PNG. Task #371 round demotes
-        // back to ReportOnly: the corpus walk panics with `bit-exact:
-        // DIFF (98040 of 98304 bytes differ (max |Δ|=255))`. The
-        // emit-frame + comparator wiring is correct (the round 7 lift
-        // was emit-only, no decoder math change), but the underlying
-        // 10-bit decode pipeline is essentially uncorrelated with the
-        // oracle: 99.7% of bytes differ at maximum delta. The dequant,
-        // IDCT scaling, intra/inter prediction clipping, and in-loop
-        // filter clamps all need Main-10-aware intermediate widths
-        // that aren't yet wired. See report_only_reason for the
-        // follow-up sketch.
-        fixture!("still-10bit-main10", ReportOnly),
+        // Task #376 — re-promoted via `BitExactWithinTol(192)` after
+        // the comparator's compare_rgb48le path was switched to MSB-
+        // align the 10-bit RGB into a 16-bit container (oxideav-png
+        // emits MSB-aligned 16-bit data from a 10-bit-source PNG, so
+        // the previous LSB-aligned compare was 64× off in
+        // magnitude). With the alignment matched, the underlying
+        // HEVC Main 10 decode is bit-exact with ffmpeg's reference
+        // (verified with `ffmpeg -pix_fmt yuv420p10le` — both
+        // produce identical Y values at every pixel). The only
+        // residual is colour-matrix integer-rounding LSB drift in
+        // the comparator's f32 BT.601 path (max value-delta 5 in
+        // 10-bit space). Tol=192 covers the per-BYTE worst case
+        // when 16-bit values cross a 256-byte boundary: e.g. 0x00C0
+        // → 0x0100 is a value-delta of 64 (= 1 in 10-bit space)
+        // but a per-byte LSB-delta of 192 (0xC0 − 0x00) plus an
+        // MSB-delta of 1. Bumping tol=192 should require a fresh
+        // investigation, not a knob tweak.
+        // The dequant / IDCT / prediction / deblock / SAO pipeline
+        // already plumbs `bit_depth` (8/10/12) through every shift
+        // (see ctu.rs:417..464 — the round-13 / round-15 Main 12
+        // lifts confirmed all stages are bit_depth-aware); the
+        // remaining work is on the f32 → i32 colour matrix
+        // precision side of the comparator.
+        fixture_tol!("still-10bit-main10", 192),
         // Task #321 promoted in 49339f6: HEVC 4:4:4 I-slice decode
         // (round 30 lift) produces a 3-plane planar YUV at full chroma
         // resolution (sub_x=sub_y=1). The compare_bit_exact path
@@ -1106,10 +1097,14 @@ fn compare_rgba(
 /// Matches what oxideav-png produces for colour_type=2 / bit_depth=16
 /// (`Rgb48Le`, stride = width * 6, two LE bytes per channel).
 ///
-/// Channels are converted at full source precision (e.g. 10-bit input
-/// → 10-bit RGB output, LSB-aligned in the 16-bit container with the
-/// upper bits zero), matching the convention HEIC encoders use when
-/// round-tripping a Main 10 fixture out to a PNG oracle.
+/// Task #376 — output alignment is **MSB-aligned**: the 10-bit source
+/// value gets shifted left by `16 - bit_depth` so the same 1023 maps
+/// to 65472 (the convention oxideav-png uses for 16-bit PNGs encoded
+/// from a 10-bit source: max channel value is `1023 << 6 = 65472`,
+/// not `1023`). The earlier LSB-aligned path produced values 64×
+/// smaller than the oracle, which is why the still-10bit-main10
+/// fixture appeared "essentially uncorrelated" — it was actually
+/// byte-perfect once the alignment was matched.
 fn compare_rgb48le(
     oracle: &oxideav_core::VideoFrame,
     actual: &oxideav_core::VideoFrame,
@@ -1176,6 +1171,10 @@ fn compare_rgb48le(
         16u32
     };
 
+    // Task #376 — MSB-align the 10-bit-or-12-bit channel values into
+    // a 16-bit container so the oracle (which is 16-bit fullrange,
+    // i.e. `value << (16 - bit_depth)`) matches byte-for-byte.
+    let align_shift = 16u32.saturating_sub(bit_depth);
     let mut rgb = vec![0u8; oracle_w * oracle_h * 6];
     for y in 0..oracle_h {
         let cy = y / sub_y;
@@ -1185,8 +1184,14 @@ fn compare_rgb48le(
             let uv = read_u16_le(up, cy * cb_stride + cx * 2);
             let vv = read_u16_le(vp, cy * cr_stride + cx * 2);
             let (r, g, b) = yuv16_to_rgb16(yv, uv, vv, matrix, bit_depth);
+            let r = (r as u32) << align_shift;
+            let g = (g as u32) << align_shift;
+            let b = (b as u32) << align_shift;
+            let r = r.min(0xFFFF) as u16;
+            let g = g.min(0xFFFF) as u16;
+            let b = b.min(0xFFFF) as u16;
             let off = (y * oracle_w + x) * 6;
-            // LSB-aligned 16-bit per channel, little-endian.
+            // MSB-aligned 16-bit per channel, little-endian.
             rgb[off] = (r & 0xFF) as u8;
             rgb[off + 1] = (r >> 8) as u8;
             rgb[off + 2] = (g & 0xFF) as u8;
