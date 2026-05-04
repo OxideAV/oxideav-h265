@@ -36,6 +36,12 @@ fn main() {
                     sps.log2_diff_max_min_luma_transform_block_size,
                 );
                 println!(
+                    "  log2_min_luma_cb={} log2_diff_max_min_luma_cb={} ctb_size={}",
+                    sps.log2_min_luma_coding_block_size_minus3 + 3,
+                    sps.log2_diff_max_min_luma_coding_block_size,
+                    sps.ctb_size(),
+                );
+                println!(
                     "  chroma_format_idc={} amp={} sao={} strong_intra_smoothing={} mvp={} scaling_list={}",
                     sps.chroma_format_idc,
                     sps.amp_enabled_flag,
@@ -77,6 +83,7 @@ fn main() {
                     pps.tiles_enabled_flag,
                     pps.entropy_coding_sync_enabled_flag,
                 );
+                println!("  diff_cu_qp_delta_depth={}", pps.diff_cu_qp_delta_depth,);
             }
             _ => {}
         }
