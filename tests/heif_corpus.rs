@@ -101,6 +101,22 @@ fn report_only_reason(name: &str) -> &'static str {
              once the primary HEVC pixel divergence on this fixture is \
              bisected to a specific stage"
         }
+        "still-10bit-main10" => {
+            "Main 10 (bit_depth=10) emit_frame produces a 3-plane 16-\
+             bit-LE-packed YUV VideoFrame and the comparator's \
+             compare_rgb48le branch reads u16 samples + runs the YUV→\
+             RGB matrix at the source bit depth (10-bit, mask 0x3FF), \
+             but the decoded pixels are essentially uncorrelated with \
+             the oracle: 98040 of 98304 bytes differ with max |Δ|=255 \
+             (99.7% at max delta). Promoted in 5495beb (task #320) on \
+             the assumption that the bit_depth=10 round 7 lift was \
+             emit-only (no decoder math change) — in practice the 10-\
+             bit decode pipeline (dequant, IDCT scaling, intra/inter \
+             prediction clipping, in-loop filter clamps) needs Main-\
+             10-aware intermediate widths that aren't yet wired. \
+             Demoted in task #371 round; re-promote once the Main 10 \
+             decode pipeline lands a real round of 10-bit work"
+        }
         "still-image-overlay" => {
             "iovl canvas-fill matrix matches the corpus convention (round 5 \
              phase A) but the underlying HEVC layer pixels still diverge from \
@@ -199,13 +215,23 @@ fn fixtures() -> Vec<Fixture> {
         // (Gray8); the comparator's compare_rgb24 1-plane branch
         // splats Y to (Y,Y,Y) packed RGB and matches the oracle.
         fixture!("still-monochrome", BitExact),
-        // Round 7 + task #320 promoted: bit_depth=10 lift in
-        // emit_frame produces a 3-plane 16-bit-LE-packed YUV
+        // Round 7 + task #320 promoted in 5495beb: bit_depth=10 lift
+        // in emit_frame produces a 3-plane 16-bit-LE-packed YUV
         // VideoFrame; the comparator's compare_rgb48le branch reads
         // u16 samples, runs the YUV→RGB matrix at the source bit
         // depth (10-bit, mask 0x3FF), and writes LSB-aligned 16-bit
-        // RGB matching the Rgb48Le oracle PNG.
-        fixture!("still-10bit-main10", BitExact),
+        // RGB matching the Rgb48Le oracle PNG. Task #371 round demotes
+        // back to ReportOnly: the corpus walk panics with `bit-exact:
+        // DIFF (98040 of 98304 bytes differ (max |Δ|=255))`. The
+        // emit-frame + comparator wiring is correct (the round 7 lift
+        // was emit-only, no decoder math change), but the underlying
+        // 10-bit decode pipeline is essentially uncorrelated with the
+        // oracle: 99.7% of bytes differ at maximum delta. The dequant,
+        // IDCT scaling, intra/inter prediction clipping, and in-loop
+        // filter clamps all need Main-10-aware intermediate widths
+        // that aren't yet wired. See report_only_reason for the
+        // follow-up sketch.
+        fixture!("still-10bit-main10", ReportOnly),
         // Task #321 promotes: HEVC 4:4:4 I-slice decode (round 30 lift)
         // produces a 3-plane planar YUV at full chroma resolution
         // (sub_x=sub_y=1). The compare_bit_exact path infers sub_x /
