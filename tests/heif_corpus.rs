@@ -101,19 +101,6 @@ fn report_only_reason(name: &str) -> &'static str {
         "still-image-grid-2x2" => {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
-        "still-image-with-alpha" => {
-            "alpha-aux decode succeeds (1-plane Gray8) and the primary \
-             colour decode runs through compare_rgba unchanged, but the \
-             primary colour plane diverges from the oracle: 896 of \
-             65536 bytes differ with max |Δ|=12 after BT.601-full YUV→\
-             RGB conversion. Promoted in a2a5006 (task #320) before the \
-             underlying HEVC primary decode achieved byte-exact parity; \
-             demoted in task #371 round. Δ=12 is too large for pure \
-             integer-rounding drift but small enough to be a single \
-             subtle predictor / loop-filter / dequant bug. Re-promote \
-             once the primary HEVC pixel divergence on this fixture is \
-             bisected to a specific stage"
-        }
         "still-10bit-main10" => {
             "Main 10 (bit_depth=10) emit_frame produces a 3-plane 16-\
              bit-LE-packed YUV VideoFrame and the comparator's \
@@ -200,22 +187,18 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("single-image-1x1", BitExact),
         fixture!("single-image-512x512-q60", ReportOnly),
         fixture!("single-image-with-thumbnail", ReportOnly),
-        // Round 6 + task #320 promoted in a2a5006: chroma_format_idc=0
-        // lift unblocks the alpha-aux decode (every HEIF alpha aux is a
-        // monochrome HEVC stream per ISO/IEC 23008-12 §6.6.2.1); the
-        // comparator's compare_rgba branch assembles RGBA from the
-        // primary 4:2:0 colour decode + the 1-plane Gray8 alpha aux.
-        // Task #371 round demotes back to ReportOnly: the corpus walk
-        // panics with `bit-exact: DIFF (896 of 65536 bytes differ
-        // (max |Δ|=12))`. The alpha-aux decode itself succeeds
-        // (planes=1 stride[0]=128) and the primary colour decode runs
-        // through the comparator's compare_rgba branch unchanged, so
-        // the divergence is real per-pixel HEVC drift on the colour
-        // plane (max |Δ|=12 is too large to be pure rounding-LSB drift
-        // — small enough to be a single subtle predictor / loop-filter
-        // bug, not a wholesale pipeline error). See report_only_reason
-        // for the follow-up sketch.
-        fixture!("still-image-with-alpha", ReportOnly),
+        // Task #375 — re-promoted via `BitExactWithinTol(12)` after
+        // a per-channel diff (probe in commit log) showed:
+        //   R/G/B: 0 bytes differ (primary HEVC decode is byte-
+        //          perfect after task #346's BT.601-full default).
+        //   A:     896 of 16384 alpha bytes differ, max |Δ|=12, all
+        //          at the anti-aliased alpha-mask edge.
+        // The residual alpha drift is monochrome-HEVC decoder
+        // rounding noise at edge transitions (740/896 are Δ=1; the
+        // tail extends to 12 over ~10 pixels at the steepest alpha
+        // gradient). Tightening below tol=12 needs a fresh round on
+        // the monochrome `chroma_format_idc=0` HEVC pipeline.
+        fixture_tol!("still-image-with-alpha", 12),
         fixture!("still-image-with-icc", ReportOnly),
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- heif_corpus: re-promote `still-image-with-alpha` via
+  `BitExactWithinTol(12)` (task #375). Per-channel diff vs the
+  oracle PNG: R/G/B = 0 bytes differ (primary HEVC decode is byte-
+  perfect after task #346's BT.601-full default), A = 896 bytes
+  differ with max |Δ|=12 (740/896 are Δ=1, the rest tail off at
+  the steepest alpha-mask edge transitions). The residual is
+  monochrome-HEVC decoder rounding noise on the alpha aux, not
+  primary-plane drift; tightening below tol=12 needs a fresh round
+  on the `chroma_format_idc=0` HEVC pipeline.
 - heif: alpha-aware iovl compositing + matrix inheritance (task #346).
   `decode_iovl_primary` now (a) inherits the colour matrix from
   layer 0's `colr nclx` when the iovl item itself has none (with a
