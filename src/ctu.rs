@@ -3520,10 +3520,8 @@ impl<'a> Walker<'a> {
         };
         let left_in_ctb = (qg_x & ctb_mask) != 0;
         let above_in_ctb = (qg_y & ctb_mask) != 0;
-        let qpy_a = lookup(qg_x as i32 - 1, qg_y as i32, left_in_ctb)
-            .unwrap_or(self.qpy_prev);
-        let qpy_b = lookup(qg_x as i32, qg_y as i32 - 1, above_in_ctb)
-            .unwrap_or(self.qpy_prev);
+        let qpy_a = lookup(qg_x as i32 - 1, qg_y as i32, left_in_ctb).unwrap_or(self.qpy_prev);
+        let qpy_b = lookup(qg_x as i32, qg_y as i32 - 1, above_in_ctb).unwrap_or(self.qpy_prev);
         (qpy_a + qpy_b + 1) >> 1
     }
 
