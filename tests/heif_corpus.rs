@@ -101,33 +101,6 @@ fn report_only_reason(name: &str) -> &'static str {
         "still-image-grid-2x2" => {
             "grid composition lands; bit-exact tile-boundary parity not yet verified"
         }
-        "still-image-overlay" => {
-            "task #390 follow-up — single-CTB-at-corner probe \
-             isolated the residual to the HEVC raw-reconstruction \
-             stage (NOT SAO, NOT deblock). Decoded layer 0 vs ffmpeg \
-             reference (256x256, CTB=64, 4 CTB rows × 4 CTB cols, \
-             entropy_coding_sync=true, SAO=on, strong_intra_smooth=\
-             true): first Y-plane divergence at (9, 63) Δ=-1 (very \
-             last row of CTB(0,0)); CTB row 0 has 1 differing Y \
-             pixel; CTB row 1: max |Δ|=9; CTB row 2: 19; CTB row 3: \
-             26. Chroma drift cascades the same way (Cr first diff \
-             at (20,31) Δ=-1, max 28 by row 3). Toggling SAO and \
-             deblock individually leaves the per-pixel diff and \
-             max |Δ| identical (38374/65536 Y diffs at max 26 in all \
-             four configurations) — the raw intra-prediction / \
-             transform reconstruction is producing a single off-by- \
-             one pixel at (9, 63) which then cascades through CTB \
-             row 1+ via INTRA prediction inheriting wrong reference \
-             samples from the row above. Likely culprit: a TU- or \
-             4×4-block-level edge case at x=9 mod 4 = 1 (interior \
-             of the rightmost 4×4 TU of the bottom-row CTB(0,0)) \
-             affecting how the bottom edge of CTB(0,0) is left for \
-             the next CTB row to use as references. Actual root \
-             cause needs decoder-internal instrumentation to read \
-             the per-TU intra mode / residual / reconstructed \
-             values at (8..12, 60..63). Remains ReportOnly until \
-             root-caused"
-        }
         "multi-image-burst-3" => "multiple still items; primary decode parity not yet verified",
         "image-sequence-3frame" => {
             "moov walker lifts sample table + hvcC; per-sample HEVC decode parity not yet verified"
@@ -196,17 +169,24 @@ fn fixtures() -> Vec<Fixture> {
         fixture!("still-image-with-exif", ReportOnly),
         fixture!("still-image-with-xmp", ReportOnly),
         fixture!("still-image-grid-2x2", ReportOnly),
-        // Task #346 lifted the iovl divergence substantially. Task
-        // #390 follow-up confirmed the residual is HEVC raw-
-        // reconstruction drift in layer 0 (NOT iovl compositing,
-        // NOT SAO, NOT deblock). Per the single-CTB-at-corner
-        // probe: first divergence at Y(9, 63) Δ=-1 (last row of
-        // CTB(0,0)); cascades down via INTRA prediction to max
-        // |Δ|=26 in the bottom-left CTB. Stays ReportOnly until
-        // the underlying off-by-one-at-(9,63) intra/transform bug
-        // is root-caused — see `report_only_reason` for the full
-        // diagnosis.
-        fixture!("still-image-overlay", ReportOnly),
+        // Task #390: re-promoted via BitExactWithinTol(2) after the
+        // WPP qPY_PREV reset + CTB-boundary qpy fallback fix landed.
+        // The "first divergence at Y(9, 63) Δ=-1" symptom was the
+        // deblock filter exposing a single off-by-one in CTB(0,
+        // row=1)'s reconstruction; pre-filter, every CTB *after* a
+        // WPP row-sync was being decoded with the wrong qPY_PRED
+        // because (a) qpy_prev wasn't reset to SliceQpY at WPP row
+        // start (HEVC §8.6.1 step 1, third bullet), and (b)
+        // compute_qpy_pred was reading the above-CTB grid value
+        // instead of falling back to qPY_PREV at the CTB boundary
+        // (§8.6.1 step 2/3, ctbAddrA/B != CtbAddrInTs forces the
+        // qPY_PREV fallback). The two fixes together flip the iovl
+        // primary item's HEVC YUV planes to byte-exact ffmpeg
+        // parity (verified MD5-equal against `ffmpeg -pix_fmt
+        // yuv420p`); the residual ≤2 byte deltas in the RGBA
+        // expected.png comparison are from the YUV→RGB matrix +
+        // iovl alpha-blend rounding, not HEVC drift.
+        fixture_tol!("still-image-overlay", 2),
         fixture!("multi-image-burst-3", ReportOnly),
         // Round 6 + task #320 promoted: chroma_format_idc=0 lift in
         // emit_monochrome_frame produces a 1-plane luma VideoFrame

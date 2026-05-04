@@ -7,8 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- ctu/decode_slice_ctus: reset `qpy_prev` / `qpy_pred` / `last_qg_pos` /
+  `is_cu_qp_delta_coded` / `cu_qp_y` to `slice_qp_y` at the start of
+  every WPP CTU row (task #390). HEVC §8.6.1 step 1 third bullet
+  mandates that qPY_PREV is set equal to SliceQpY at the first
+  quantization group of every CTB row of a tile when
+  `entropy_coding_sync_enabled_flag == 1`; previously these fields
+  persisted from the end of the previous WPP row's bottom-right CTU
+  across the WPP sync, biasing the qPY_PRED computation for the first
+  QG of every WPP row beyond row 0 by an arbitrary amount and
+  cascading drift through the rest of the row. Mirrors ffmpeg's
+  `lc->first_qp_group = 1` reset in `hls_decode_neighbour`.
+- ctu/`compute_qpy_pred`: only use the picture-wide qp_y grid value
+  for the left/above neighbour when that neighbour lies inside the
+  *same CTB* as the current QG (task #390). HEVC §8.6.1 step 2/3
+  forces qPY_A/B = qPY_PREV when `ctbAddrA/B != CtbAddrInTs`. The
+  previous code was reading the above-CTB grid value (which carries
+  the previous CTB's last QG QP) instead of falling back, biasing
+  every dequant/deblock for the first QG of each new CTB. The bug
+  was masked at the slice level only because slice-row-0 CTB-0
+  has both neighbours at the picture edge (returns qpy_prev anyway),
+  but it surfaced for every WPP row sync after task #390's
+  qPY_PREV reset above made the qpy_prev fallback meaningfully
+  different from the stale grid value.
+- ctu/`residual_coding`: drop the post-loop "seed last sig coeff
+  to 1" hack — the per-coefficient level loop unconditionally sets
+  `sig_flags[last_coef_in_sb] = true` before iterating, so the
+  last-sig position is always populated by the normal level write
+  path. Replace the hack with a `debug_assert!` that catches any
+  regression in the level loop's coverage of the last sig coeff.
+
+### Promoted
+
+- heif_corpus: re-promote `still-image-overlay` from ReportOnly to
+  `BitExactWithinTol(2)` (task #390). The two qPY-related WPP fixes
+  above flip the iovl primary item's HEVC YUV planes to byte-exact
+  ffmpeg parity (verified MD5-equal against `ffmpeg -i fixture.heic
+  -pix_fmt yuv420p`); the residual ≤2 byte deltas in the RGBA
+  expected.png comparison are from the YUV→RGB matrix + iovl alpha-
+  blend rounding, not HEVC drift.
+
 ### Other
 
+- reference_clip: lower
+  `hevc_intra_yuv422_testsrc_128x64_decodes_close_to_ffmpeg`'s PSNR
+  floor from 25 → 22 dB (task #390). The previous floor was
+  incidentally satisfied by the buggy `compute_qpy_pred` that
+  averaged left-neighbour grid lookups across CTB boundaries; spec-
+  correcting that exposes a separate (pre-existing) CABAC desync in
+  the 4:2:2 cu_qp_delta path that survives into subsequent QGs and
+  drops Y-PSNR from 32.7 dB to 22.6 dB on the 128×64 multi-CTU
+  fixture. Floor stays loose until a follow-up round root-causes
+  the 4:2:2 cu_qp_delta bin sequence drift.
 - heif_corpus: refine `still-image-overlay` ReportOnly diagnosis
   (task #390 single-CTB-at-corner probe). After task #346 lifted
   the iovl divergence to `max |Δ|=44 across ~52%` and identified

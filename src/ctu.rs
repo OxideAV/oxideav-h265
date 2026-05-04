@@ -621,6 +621,24 @@ pub fn decode_slice_ctus(
                 ctx = row_snapshot
                     .take()
                     .unwrap_or_else(|| Ctx::init(cctx.slice.slice_qp_y, cctx.init_type));
+                // §8.6.1 step 1, third bullet: "The current quantization
+                // group is the first quantization group in a CTB row of a
+                // tile and entropy_coding_sync_enabled_flag is equal to 1"
+                // → qPY_PREV is reset to SliceQpY. Without this reset, the
+                // first QG of every WPP row inherits the (possibly long-
+                // dead) qpy_prev from the END of the previous row's
+                // bottom-right CTU, biasing the prediction by an arbitrary
+                // amount — and since cu_qp_delta is signed-Δ relative to
+                // the prediction, every QP-using stage downstream
+                // (dequantize + deblock-bs/tc + chroma offset) drifts.
+                // Mirrors ffmpeg's `lc->first_qp_group = 1` reset at WPP
+                // row start (libavcodec/hevc/hevcdec.c
+                // hls_decode_neighbour, line 2714).
+                walker.qpy_prev = cctx.slice.slice_qp_y;
+                walker.qpy_pred = cctx.slice.slice_qp_y;
+                walker.last_qg_pos = None;
+                walker.is_cu_qp_delta_coded = false;
+                *walker.cu_qp_y = cctx.slice.slice_qp_y;
             }
             for ctx_x in 0..ctbs_x {
                 let x0 = ctx_x * ctb_size;
@@ -3476,15 +3494,21 @@ impl<'a> Walker<'a> {
     }
 
     /// QpY_PRED derivation per §8.6.1 eq. 8-286. Uses the left and above
-    /// 8×8 neighbour QPs if they lie in a different QG within the current
-    /// slice; otherwise falls back to `qpy_prev`. Picture-edge samples are
-    /// treated as unavailable.
+    /// 8×8 neighbour QPs if they lie inside the *same CTB* as the current
+    /// QG (per §8.6.1 step 2/3 conditions: ctbAddrA/B ≠ CtbAddrInTs forces
+    /// fallback to qPY_PREV). Without that CTB-boundary check the first
+    /// QG of every new CTB (notably the first CTU of every WPP row, where
+    /// qPY_PREV has just been reset to SliceQpY) was inheriting the
+    /// previous CTB's QP from the picture-wide qp_y grid, biasing
+    /// dequantisation/deblock for every CU in the new row.
     fn compute_qpy_pred(&self, qg_x: u32, qg_y: u32) -> i32 {
         let stride = self.pic.qp_stride;
         let grid_w = stride;
         let grid_h = self.pic.qp_y.len() / stride.max(1);
-        let lookup = |sx: i32, sy: i32| -> Option<i32> {
-            if sx < 0 || sy < 0 {
+        let ctb_size = self.cctx.sps.ctb_size();
+        let ctb_mask = ctb_size - 1;
+        let lookup = |sx: i32, sy: i32, axis_in_ctb: bool| -> Option<i32> {
+            if sx < 0 || sy < 0 || !axis_in_ctb {
                 return None;
             }
             let bx = (sx as u32 >> 3) as usize;
@@ -3494,8 +3518,12 @@ impl<'a> Walker<'a> {
             }
             Some(self.pic.qp_y[by * stride + bx])
         };
-        let qpy_a = lookup(qg_x as i32 - 1, qg_y as i32).unwrap_or(self.qpy_prev);
-        let qpy_b = lookup(qg_x as i32, qg_y as i32 - 1).unwrap_or(self.qpy_prev);
+        let left_in_ctb = (qg_x & ctb_mask) != 0;
+        let above_in_ctb = (qg_y & ctb_mask) != 0;
+        let qpy_a = lookup(qg_x as i32 - 1, qg_y as i32, left_in_ctb)
+            .unwrap_or(self.qpy_prev);
+        let qpy_b = lookup(qg_x as i32, qg_y as i32 - 1, above_in_ctb)
+            .unwrap_or(self.qpy_prev);
         (qpy_a + qpy_b + 1) >> 1
     }
 
@@ -3851,11 +3879,13 @@ impl<'a> Walker<'a> {
                 num_sig_coeff += 1;
             }
         }
-        // Seed the last-sig position's coefficient value if we didn't cover it
-        // in the loop (the decode_coeff_remainder path records it).
-        if levels[last_y * n + last_x] == 0 {
-            levels[last_y * n + last_x] = 1;
-        }
+        // The last-sig coefficient is always populated by the per-coefficient
+        // level loop above (sig_flags[last_coef_in_sb] is set unconditionally
+        // before the loop runs), so there is no need to seed it here.
+        debug_assert!(
+            levels[last_y * n + last_x] != 0,
+            "last sig coeff at ({last_x},{last_y}) was not populated"
+        );
         Ok(transform_skip_flag)
     }
 
