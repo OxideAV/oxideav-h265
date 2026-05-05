@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-h265/compare/v0.0.6...v0.0.7) - 2026-05-04
+
+### Fixed
+
+- *(clippy)* collapse identical else-if arms + heif_corpus test lints
+
+### Other
+
+- lift entire 14-fixture HEIF/HEIC corpus to BitExact (task #418)
+- rustfmt cleanup of compute_qpy_pred lookups (task #390 follow-up)
+- fix WPP qPY_PREV reset + same-CTB qpy_pred fallback (task #390)
+- refine still-image-overlay diagnosis via single-CTB-at-corner probe ([#390](https://github.com/OxideAV/oxideav-h265/pull/390))
+- switch comparator to Q15 fixed-point i32 BT.601/BT.709 matrix ([#391](https://github.com/OxideAV/oxideav-h265/pull/391))
+- re-promote still-10bit-main10 (BitExactWithinTol 192, task #376)
+- re-promote still-image-with-alpha (BitExactWithinTol 12, task #375)
+- alpha-aware iovl + matrix inheritance (task #346)
+- add Tier::BitExactWithinTol + re-promote still-yuv444 (task #374)
+- demote still-yuv444 to ReportOnly (task #371)
+- demote still-10bit-main10 to ReportOnly (task #371)
+- demote still-image-with-alpha to ReportOnly (task #371)
+- bisect still-image-overlay per-layer divergence (task #319)
+- promote still-yuv444 to BitExact (task #321)
+- promote still-10bit-main10 to BitExact (task #320)
+- promote still-image-with-alpha to BitExact (task #320)
+- promote still-monochrome to BitExact (task #320)
+- extend compare_bit_exact for 1-plane luma + 16-bit YUV (task #320)
+- round 8 — HEVC 4:4:4 (chroma_format_idc=3) status check (task #302)
+- round 7 — HEVC Main 10 (10-bit) status check (task #301)
+- round 6 — HEVC monochrome (chroma_format_idc=0) lift (task #300)
+- refresh stale still-image-overlay round-5 promotion notes
+
 ### Promoted
 
 - heif_corpus: lift the entire 14-fixture HEIF/HEIC corpus to BitExact
