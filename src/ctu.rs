@@ -399,11 +399,11 @@ pub fn decode_slice_ctus(
             "h265 pixel decode supports 4:0:0, 4:2:0, 4:2:2, and 4:4:4 only",
         ));
     }
-    if cfi == 3 && cctx.slice.slice_type != SliceType::I {
-        return Err(Error::unsupported(
-            "h265 pixel decode at 4:4:4 supports I slices only",
-        ));
-    }
+    // Round 33: 4:4:4 inter (P/B slices) is now supported via the HBD/4:4:4
+    // encoder path. `motion_compensate_pb` already handles sub_x=sub_y=1
+    // correctly (chroma MV = luma MV, chroma TB co-located at (x0, y0)).
+    // The former gate here was a placeholder pending a P/B encoder to test
+    // against; it is now removed.
     if cfi == 0 && cctx.slice.slice_type != SliceType::I {
         return Err(Error::unsupported(
             "h265 pixel decode at 4:0:0 (monochrome) supports I slices only",

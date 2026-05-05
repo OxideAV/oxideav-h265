@@ -256,10 +256,62 @@ fn main444_ffmpeg_cross_decode_psnr() {
 }
 
 #[test]
-fn main444_rejects_mini_gop_two() {
-    // 8-bit 4:4:4 + mini_gop=2 (B slices) should fail at construction
-    // time since the B-slice writer only supports 4:2:0.
+fn main444_mini_gop_two_roundtrip() {
+    // Round 33: 8-bit 4:4:4 mini_gop=2 (I-P-B sequence) should produce a
+    // valid self-decodable stream with PSNR ≥ 25 dB.
+    let w = 64u32;
+    let h = 64u32;
+    let params = p444_params(w, h);
+    let mut enc = HevcEncoder::from_params_with_mini_gop(&params, 2)
+        .expect("Main 4:4:4 mini_gop=2 should be accepted in round 33");
+
+    let frames: Vec<VideoFrame> = (0..3).map(|_| make_p444_gradient_frame(w, h)).collect();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone()))
+            .expect("send frame");
+    }
+    enc.flush().expect("flush");
+
+    let mut pkts = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => pkts.push(p),
+            Err(_) => break,
+        }
+    }
+    assert!(pkts.len() >= 2, "expected at least IDR + P/B packets");
+
+    let mut dec = HevcDecoder::new(CodecId::new("h265"));
+    for pkt in &pkts {
+        dec.send_packet(pkt).expect("send packet to decoder");
+    }
+    let mut decoded = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => decoded.push(v),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        !decoded.is_empty(),
+        "decoder should produce at least one frame"
+    );
+    let psnr = psnr_y_p444(&frames[0], &decoded[0], w, h);
+    eprintln!("main444 mini_gop=2 IDR psnr_y={psnr:.2} dB");
+    assert!(
+        psnr > 25.0,
+        "main444 mini_gop=2 IDR PSNR too low: {psnr:.2}"
+    );
+}
+
+#[test]
+fn main444_mini_gop_two_accepts_construction() {
+    // Verify that construction succeeds for 8-bit 4:4:4 mini_gop=2 (round 33).
     let params = p444_params(64, 64);
     let res = HevcEncoder::from_params_with_mini_gop(&params, 2);
-    assert!(res.is_err(), "Main 4:4:4 should reject mini_gop=2 for now");
+    assert!(
+        res.is_ok(),
+        "Main 4:4:4 mini_gop=2 should be accepted in round 33"
+    );
 }

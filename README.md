@@ -377,11 +377,23 @@ decodable by ffmpeg's libavcodec hevc and by our own decoder.
   every input frame at 4:4:4 + 12-bit is emitted as an IDR
   (`mini_gop > 1` is rejected at construction time). 4:4:4 P/B
   remains out of scope.
+* **Round 33: HBD P/B encode + 4:4:4 P/B encode** — lifts the
+  `mini_gop > 1` rejection for 10-bit (`Yuv420P10Le`) and 12-bit
+  (`Yuv420P12Le`) 4:2:0, and for 8-bit 4:4:4 (`Yuv444P`).
+  New writers: `p_slice_writer_hbd`, `b_slice_writer_hbd` (u16,
+  QP' = SliceQpY + 6×(bit_depth−8)), `p_slice_writer_444`,
+  `b_slice_writer_444` (u8, SubWidthC=SubHeightC=1, chroma MV =
+  luma MV, 16×16 chroma TBs at (x0, y0)). All four are AMVP-only
+  (no merge/B_Skip). The IDR reference is seeded from source pixels
+  (lossless proxy). 4:4:4 inter decode gate in `ctu::decode_ctus`
+  also lifted (`motion_compensate_pb` handles sub_x=sub_y=1
+  correctly). HBD 4:4:4 (Yuv444P10Le / Yuv444P12Le) mini_gop > 1
+  deferred. SAO encoder-side RDO and deblock auto-disable remain
+  pending.
 * **Pending:** AMP / rectangular partitions (Nx2N / 2NxN), weighted
   bi-pred, mini-GOP > 2 (B-pyramid), `mvd_l1_zero_flag` optimisation,
-  10-bit / 12-bit P/B-slice encode (currently the high-bit-depth emit
-  paths are IDR-only), 4:4:4 P/B-slice encode (the 4:4:4 emit paths
-  are currently IDR-only).
+  SAO per-CTU BO/EO RDO, deblock `deblocking_filter_disabled_flag`
+  auto-derive, HBD 4:4:4 P/B-slice encode.
 
 ## HEIF / HEIC still images
 

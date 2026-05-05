@@ -25,9 +25,13 @@ use oxideav_core::{
 };
 
 use crate::encoder::b_slice_writer::build_b_slice_with_reconstruction;
+use crate::encoder::b_slice_writer_444::build_b_slice_444;
+use crate::encoder::b_slice_writer_hbd::build_b_slice_hbd;
 use crate::encoder::p_slice_writer::{
     build_p_slice_with_reconstruction, build_p_slice_with_reconstruction_delta, ReferenceFrame,
 };
+use crate::encoder::p_slice_writer_444::{build_p_slice_444, ReferenceFrame444};
+use crate::encoder::p_slice_writer_hbd::{build_p_slice_hbd, read_hbd_sample, ReferenceFrame16};
 use crate::encoder::params::{
     build_pps_nal, build_sps_nal, build_vps_nal_with_bit_depth, build_vps_nal_with_profile,
     EncoderConfig,
@@ -59,7 +63,12 @@ pub struct HevcEncoder {
     frame_count: u32,
     /// Last reconstruction retained as the L0 reference for the next P frame.
     last_recon: Option<ReferenceFrame>,
-    /// POC of the picture in `last_recon` (display-order POC).
+    /// Last HBD (10/12-bit 4:2:0) reconstruction for the P/B slice writers.
+    last_recon_hbd: Option<ReferenceFrame16>,
+    /// Last 4:4:4 8-bit reconstruction for the 4:4:4 P/B slice writers.
+    last_recon_444: Option<ReferenceFrame444>,
+    /// POC of the picture in `last_recon` / `last_recon_hbd` / `last_recon_444`
+    /// (display-order POC).
     last_recon_poc: u32,
     /// Mini-GOP size (1 = P-only, 2 = I-P-B-P-B with one B between each
     /// pair of P/I anchor frames).
@@ -118,22 +127,14 @@ impl HevcEncoder {
                 "h265 encoder: mini_gop_size must be 1 or 2 (got {mini_gop})"
             )));
         }
-        if bit_depth == 10 && mini_gop > 1 {
+        // Round 33: HBD (10/12-bit 4:2:0) and 4:4:4 (8-bit) mini_gop=2 is
+        // now fully supported via the new HBD and 4:4:4 P/B slice writers.
+        // 4:4:4 + HBD (Yuv444P10Le / Yuv444P12Le) with mini_gop > 1 remains
+        // keyframe-only for now.
+        if chroma_format_idc == 3 && bit_depth > 8 && mini_gop > 1 {
             return Err(Error::unsupported(
-                "h265 encoder: Main 10 (Yuv420P10Le) only supports mini_gop_size = 1 \
-                 (and currently emits keyframe-only — P/B at 10 bit is a follow-up)",
-            ));
-        }
-        if bit_depth == 12 && mini_gop > 1 {
-            return Err(Error::unsupported(
-                "h265 encoder: Main 12 (Yuv420P12Le) only supports mini_gop_size = 1 \
-                 (and currently emits keyframe-only — P/B at 12 bit is a follow-up)",
-            ));
-        }
-        if chroma_format_idc == 3 && mini_gop > 1 {
-            return Err(Error::unsupported(
-                "h265 encoder: Main 4:4:4 (Yuv444P) only supports mini_gop_size = 1 \
-                 (currently keyframe-only — P/B at 4:4:4 is a follow-up)",
+                "h265 encoder: Main 4:4:4 10/12-bit (Yuv444P10Le/Yuv444P12Le) only supports \
+                 mini_gop_size = 1 — HBD 4:4:4 P/B is a follow-up",
             ));
         }
         let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
@@ -179,6 +180,8 @@ impl HevcEncoder {
             vps_sps_pps,
             frame_count: 0,
             last_recon: None,
+            last_recon_hbd: None,
+            last_recon_444: None,
             last_recon_poc: 0,
             mini_gop_size: mini_gop,
             pending_b: None,
@@ -193,65 +196,76 @@ impl HevcEncoder {
         data.extend_from_slice(&self.vps_sps_pps);
         match (self.cfg.bit_depth, self.cfg.chroma_format_idc) {
             (8, 3) => {
-                // Main 4:4:4 IDR — see `slice_writer_main444`. Keyframe
-                // only at 4:4:4; we do not cache a reconstruction since
-                // P/B at 4:4:4 is not yet implemented.
+                // Main 4:4:4 IDR. Round 33: seed `last_recon_444` from the
+                // IDR source frame (lossless proxy — the IDR writer does not
+                // yet return a reconstruction).
                 let nal = build_idr_slice_nal_main444_8(&self.cfg, frame);
                 data.extend_from_slice(&nal);
+                let w = self.cfg.width as usize;
+                let h = self.cfg.height as usize;
+                let src_y = frame.planes[0].data[..w * h].to_vec();
+                let src_cb = frame.planes[1].data[..w * h].to_vec();
+                let src_cr = frame.planes[2].data[..w * h].to_vec();
+                self.last_recon_444 = Some(ReferenceFrame444::new(
+                    self.cfg.width,
+                    self.cfg.height,
+                    src_y,
+                    src_cb,
+                    src_cr,
+                ));
                 self.last_recon = None;
+                self.last_recon_hbd = None;
                 self.last_recon_poc = 0;
             }
             (10, 3) => {
-                // Main 4:4:4 10 IDR — see `slice_writer_main444_10`.
-                // Combines the 4:4:4 chroma topology of the round-30
-                // 8-bit 4:4:4 path with the 10-bit precision of the
-                // round-25 Main 10 writer. Keyframe only — no
-                // reconstruction is cached since P/B at 4:4:4 is a
-                // follow-up.
+                // Main 4:4:4 10 IDR — keyframe only (HBD 4:4:4 P/B deferred).
                 let nal = build_idr_slice_nal_main444_10(&self.cfg, frame);
                 data.extend_from_slice(&nal);
                 self.last_recon = None;
+                self.last_recon_hbd = None;
+                self.last_recon_444 = None;
                 self.last_recon_poc = 0;
             }
             (12, 3) => {
-                // Main 4:4:4 12 IDR — see `slice_writer_main444_12`.
-                // Combines the 4:4:4 chroma topology of the round-30
-                // 8-bit 4:4:4 path with the 12-bit precision of the
-                // round-26 Main 12 writer (Qp'Y = Qp'Cb = Qp'Cr =
-                // 26 + 24 = 50 at default QP 26). Keyframe only — no
-                // reconstruction is cached since P/B at 4:4:4 is a
-                // follow-up.
+                // Main 4:4:4 12 IDR — keyframe only (HBD 4:4:4 P/B deferred).
                 let nal = build_idr_slice_nal_main444_12(&self.cfg, frame);
                 data.extend_from_slice(&nal);
                 self.last_recon = None;
+                self.last_recon_hbd = None;
+                self.last_recon_444 = None;
                 self.last_recon_poc = 0;
             }
             (12, _) => {
-                // Main 12 IDR — see `slice_writer_main12`. We do NOT cache
-                // a P-slice reference since 12-bit P/B is not yet
-                // implemented; every frame this encoder emits at 12-bit
-                // is currently a keyframe.
+                // Main 12 IDR. Round 33: seed `last_recon_hbd` from the IDR
+                // source frame (lossless proxy). The IDR writer does not yet
+                // return a u16 reconstruction, so we use the source pixels
+                // as the reference for the next P/B slice. The quantisation
+                // error from IDR-to-P is absorbed by the inter residual.
                 let nal = build_idr_slice_nal_main12(&self.cfg, frame);
                 data.extend_from_slice(&nal);
+                let recon_hbd = seed_hbd_ref_from_source(frame, self.cfg.width, self.cfg.height);
+                self.last_recon_hbd = Some(recon_hbd);
                 self.last_recon = None;
+                self.last_recon_444 = None;
                 self.last_recon_poc = 0;
             }
             (10, _) => {
-                // Main 10 IDR — see `slice_writer_main10`. We do NOT cache a
-                // P-slice reference since 10-bit P/B is not yet implemented;
-                // every frame this encoder emits at 10-bit is currently a
-                // keyframe (the GOP gate forces an IDR every `GOP_SIZE` frames
-                // in 8-bit mode; in 10-bit mode the next non-keyframe will
-                // surface `Error::Unsupported` in `send_frame`).
+                // Main 10 IDR. Round 33: seed `last_recon_hbd` from the IDR
+                // source frame (lossless proxy).
                 let nal = build_idr_slice_nal_main10(&self.cfg, frame);
                 data.extend_from_slice(&nal);
+                let recon_hbd = seed_hbd_ref_from_source(frame, self.cfg.width, self.cfg.height);
+                self.last_recon_hbd = Some(recon_hbd);
                 self.last_recon = None;
+                self.last_recon_444 = None;
                 self.last_recon_poc = 0;
             }
             _ => {
                 let (nal, recon) = build_idr_slice_nal_with_reconstruction(&self.cfg, frame);
                 data.extend_from_slice(&nal);
                 self.last_recon = Some(recon);
+                self.last_recon_hbd = None;
+                self.last_recon_444 = None;
                 self.last_recon_poc = 0;
             }
         }
@@ -262,30 +276,58 @@ impl HevcEncoder {
         pkt
     }
 
-    /// Emit a P-slice referencing `self.last_recon`. `display_poc` is the
-    /// frame's display-order POC; the frame index inside the GOP is the
-    /// same value because the GOP starts at display POC 0.
+    /// Emit a P-slice referencing the appropriate reconstruction buffer.
+    /// `display_poc` is the frame's display-order POC.
     fn emit_p(&mut self, frame: &VideoFrame, display_poc: u32) -> Packet {
-        let ref_frame = self.last_recon.clone().expect("P-slice without ref");
         let delta_l0 = self.last_recon_poc as i32 - display_poc as i32;
-        let (nal, recon) = if delta_l0 == -1 {
-            // Default delta = -1 path keeps the original P-only emission
-            // byte-for-byte identical (regression guard for the existing
-            // P-slice / cross-decode tests).
-            build_p_slice_with_reconstruction(&self.cfg, frame, display_poc, &ref_frame)
-        } else {
-            build_p_slice_with_reconstruction_delta(
-                &self.cfg,
-                frame,
-                display_poc,
-                delta_l0,
-                &ref_frame,
-            )
+        let nal: Vec<u8> = match (self.cfg.bit_depth, self.cfg.chroma_format_idc) {
+            (bd, 1) if bd > 8 => {
+                // HBD 4:2:0 (10 or 12 bit)
+                let ref_frame = self
+                    .last_recon_hbd
+                    .clone()
+                    .expect("HBD P-slice without ref");
+                let (nal, recon) =
+                    build_p_slice_hbd(&self.cfg, frame, display_poc, delta_l0, &ref_frame);
+                self.last_recon_hbd = Some(recon);
+                self.last_recon = None;
+                nal
+            }
+            (8, 3) => {
+                // 8-bit 4:4:4
+                let ref_frame = self
+                    .last_recon_444
+                    .clone()
+                    .expect("4:4:4 P-slice without ref");
+                let (nal, recon) =
+                    build_p_slice_444(&self.cfg, frame, display_poc, delta_l0, &ref_frame);
+                self.last_recon_444 = Some(recon);
+                self.last_recon = None;
+                nal
+            }
+            _ => {
+                // 8-bit 4:2:0 (default)
+                let ref_frame = self.last_recon.clone().expect("P-slice without ref");
+                let (nal, recon) = if delta_l0 == -1 {
+                    // Default delta = -1 path keeps the original P-only emission
+                    // byte-for-byte identical (regression guard).
+                    build_p_slice_with_reconstruction(&self.cfg, frame, display_poc, &ref_frame)
+                } else {
+                    build_p_slice_with_reconstruction_delta(
+                        &self.cfg,
+                        frame,
+                        display_poc,
+                        delta_l0,
+                        &ref_frame,
+                    )
+                };
+                self.last_recon = Some(recon);
+                nal
+            }
         };
+        self.last_recon_poc = display_poc;
         let mut data: Vec<u8> = Vec::with_capacity(nal.len() + 16);
         data.extend_from_slice(&nal);
-        self.last_recon = Some(recon);
-        self.last_recon_poc = display_poc;
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = frame.pts;
         pkt.dts = frame.pts;
@@ -294,27 +336,57 @@ impl HevcEncoder {
     }
 
     /// Emit a B-slice. `b_frame` is the held-back source; `b_poc` is its
-    /// display-order POC (between the L0 ref and the just-emitted P/I
-    /// anchor's POC). `l0` and `l1` are the reconstructions used for
-    /// motion compensation.
+    /// display-order POC. `l0_poc` / `l1_poc` are the POCs of L0 and L1
+    /// references. `l0_8bit` / `l0_hbd` / `l0_444` carry the pre-P-emit
+    /// L0 reconstruction for whichever path is active; `l1` is taken from
+    /// `self.last_recon*` (set by the just-emitted P anchor).
+    #[allow(clippy::too_many_arguments)]
     fn emit_b(
         &mut self,
         b_frame: &VideoFrame,
         b_poc: u32,
         l0_poc: u32,
         l1_poc: u32,
-        l0: &ReferenceFrame,
-        l1: &ReferenceFrame,
+        l0_8bit: Option<ReferenceFrame>,
+        l0_hbd: Option<ReferenceFrame16>,
+        l0_444: Option<ReferenceFrame444>,
     ) -> Packet {
         let delta_l0 = l0_poc as i32 - b_poc as i32; // negative
         let delta_l1 = l1_poc as i32 - b_poc as i32; // positive
-        let (nal, _recon) = build_b_slice_with_reconstruction(
-            &self.cfg, b_frame, b_poc, delta_l0, delta_l1, l0, l1,
-        );
-        // The B-frame is non-reference (TrailR is fine here per spec; we
-        // don't store its reconstruction back into `last_recon` because
-        // the next anchor P-slice already has its own L0 = the previous
-        // anchor's reconstruction).
+        let nal: Vec<u8> = match (self.cfg.bit_depth, self.cfg.chroma_format_idc) {
+            (bd, 1) if bd > 8 => {
+                // HBD 4:2:0
+                let l0 = l0_hbd.expect("HBD B-slice: missing L0 ref");
+                let l1 = self
+                    .last_recon_hbd
+                    .clone()
+                    .expect("HBD B-slice: missing L1 ref");
+                let (nal, _recon) =
+                    build_b_slice_hbd(&self.cfg, b_frame, b_poc, delta_l0, delta_l1, &l0, &l1);
+                nal
+            }
+            (8, 3) => {
+                // 8-bit 4:4:4
+                let l0 = l0_444.expect("4:4:4 B-slice: missing L0 ref");
+                let l1 = self
+                    .last_recon_444
+                    .clone()
+                    .expect("4:4:4 B-slice: missing L1 ref");
+                let (nal, _recon) =
+                    build_b_slice_444(&self.cfg, b_frame, b_poc, delta_l0, delta_l1, &l0, &l1);
+                nal
+            }
+            _ => {
+                // 8-bit 4:2:0
+                let l0 = l0_8bit.expect("B-slice: missing L0 ref");
+                let l1 = self.last_recon.clone().expect("B-slice: missing L1 ref");
+                let (nal, _recon) = build_b_slice_with_reconstruction(
+                    &self.cfg, b_frame, b_poc, delta_l0, delta_l1, &l0, &l1,
+                );
+                nal
+            }
+        };
+        // The B-frame is non-reference; we don't store its reconstruction.
         let mut data: Vec<u8> = Vec::with_capacity(nal.len() + 16);
         data.extend_from_slice(&nal);
         let mut pkt = Packet::new(0, self.time_base, data);
@@ -344,7 +416,14 @@ impl Encoder for HevcEncoder {
         }
 
         let display_poc = self.frame_count;
-        let is_keyframe = display_poc % GOP_SIZE == 0 || self.last_recon.is_none();
+        // A frame is a keyframe if it's at a GOP boundary OR if we have no
+        // reconstruction to reference yet. The "no reconstruction" check
+        // must cover all three reference flavours so HBD / 4:4:4 paths
+        // that don't use `last_recon` still force an IDR on the first frame.
+        let have_ref = self.last_recon.is_some()
+            || self.last_recon_hbd.is_some()
+            || self.last_recon_444.is_some();
+        let is_keyframe = display_poc % GOP_SIZE == 0 || !have_ref;
 
         if is_keyframe {
             // IDR resets the GOP. Any pending B (shouldn't happen if the
@@ -354,7 +433,7 @@ impl Encoder for HevcEncoder {
             let pkt = self.emit_idr(vf);
             self.pending.push_back(pkt);
         } else if self.mini_gop_size == 1 {
-            // P-only path — encode immediately referencing last_recon.
+            // P-only path — encode immediately referencing last_recon*.
             let pkt = self.emit_p(vf, display_poc);
             self.pending.push_back(pkt);
         } else {
@@ -367,22 +446,20 @@ impl Encoder for HevcEncoder {
                 // This is the next P-anchor. Emit it FIRST so the
                 // intervening B-frame can reference it as L1.
                 let p_poc = display_poc;
-                // Stash the B-frame (if any) before we mutate last_recon.
+                // Stash the B-frame (if any) before we mutate last_recon*.
                 let pending_b = self.pending_b.take();
                 let l0_poc = self.last_recon_poc;
-                let l0_for_b = self.last_recon.clone();
+                // Clone the pre-P L0 refs for each flavour.
+                let l0_8bit = self.last_recon.clone();
+                let l0_hbd = self.last_recon_hbd.clone();
+                let l0_444 = self.last_recon_444.clone();
                 let p_pkt = self.emit_p(vf, p_poc);
                 self.pending.push_back(p_pkt);
                 // Now emit the held B-frame referencing the previous
-                // anchor (L0) and the just-emitted P (L1).
+                // anchor (L0) and the just-emitted P (L1 = current last_recon*).
                 if let Some((b_frame, b_poc)) = pending_b {
-                    let l0 = l0_for_b.expect("B-slice without L0 ref");
-                    let l1 = self
-                        .last_recon
-                        .as_ref()
-                        .expect("B-slice without L1 ref")
-                        .clone();
-                    let b_pkt = self.emit_b(&b_frame, b_poc, l0_poc, p_poc, &l0, &l1);
+                    let b_pkt =
+                        self.emit_b(&b_frame, b_poc, l0_poc, p_poc, l0_8bit, l0_hbd, l0_444);
                     self.pending.push_back(b_pkt);
                 }
             } else {
@@ -418,4 +495,36 @@ impl Encoder for HevcEncoder {
         self.eof = true;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `ReferenceFrame16` seeded from the source `VideoFrame` pixels
+/// (packed LE-16). Used to initialise the HBD P/B reference from an IDR
+/// frame whose writer does not yet return a u16 reconstruction.
+fn seed_hbd_ref_from_source(frame: &VideoFrame, width: u32, height: u32) -> ReferenceFrame16 {
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+    let mut y = Vec::with_capacity(w * h);
+    for yy in 0..h {
+        for xx in 0..w {
+            y.push(read_hbd_sample(&src_y.data, src_y.stride, xx, yy));
+        }
+    }
+    let mut cb = Vec::with_capacity(cw * ch);
+    let mut cr = Vec::with_capacity(cw * ch);
+    for yy in 0..ch {
+        for xx in 0..cw {
+            cb.push(read_hbd_sample(&src_cb.data, src_cb.stride, xx, yy));
+            cr.push(read_hbd_sample(&src_cr.data, src_cr.stride, xx, yy));
+        }
+    }
+    ReferenceFrame16::new(width, height, y, cb, cr)
 }

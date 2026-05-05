@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 33: HBD (10-bit / 12-bit 4:2:0) P-slice and B-slice encoder — `p_slice_writer_hbd`, `b_slice_writer_hbd`; lifts the `mini_gop > 1` rejection for `Yuv420P10Le` / `Yuv420P12Le`. Reference frame stored as u16 (`ReferenceFrame16`) seeded from IDR source.
+- Round 33: 8-bit 4:4:4 P-slice and B-slice encoder — `p_slice_writer_444`, `b_slice_writer_444`; lifts the `chroma_format_idc == 3 && mini_gop > 1` rejection for `Yuv444P`. Reference frame stored as u8 (`ReferenceFrame444`) at full luma resolution (SubWidthC = SubHeightC = 1, chroma MV = luma MV).
+- Round 33: 4:4:4 inter decode unblocked — removed `SliceType != I` gate in `ctu::decode_ctus`; `motion_compensate_pb` already handles `sub_x = sub_y = 1` correctly.
+- New integration tests: `main10_mini_gop_two_roundtrip`, `main12_mini_gop_two_roundtrip`, `main444_mini_gop_two_roundtrip` (replace former "rejects" tests).
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-h265/compare/v0.0.6...v0.0.7) - 2026-05-04
 
 ### Fixed
