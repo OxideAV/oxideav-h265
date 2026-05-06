@@ -281,11 +281,8 @@ fn main10_mini_gop_two_roundtrip() {
     enc.flush().expect("flush");
 
     let mut pkts = Vec::new();
-    loop {
-        match enc.receive_packet() {
-            Ok(p) => pkts.push(p),
-            Err(_) => break,
-        }
+    while let Ok(p) = enc.receive_packet() {
+        pkts.push(p);
     }
     // IDR access unit has 4 NALs; P and B are single NALs.
     assert!(pkts.len() >= 2, "expected at least IDR + P/B packets");
