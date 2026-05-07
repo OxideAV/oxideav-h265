@@ -2685,13 +2685,27 @@ impl<'a> Walker<'a> {
         if cbf_luma != 0 {
             self.add_residual_plane(engine, ctx, x0, y0, log2_tb, true)?;
         }
-        // Chroma TB placement, matching §7.3.8.11 and the intra path:
-        //   log2_tb > 2: chroma TB co-located at (x0/2, y0/2), size log2_tb-1.
-        //   log2_tb == 2 && blk_idx == 3: emit one 4x4 chroma TB at the
-        //     4×4-parent base covering all 4 luma 4×4 siblings.
-        if log2_tb > 2 {
-            let cx = x0 / 2;
-            let cy = y0 / 2;
+        // Chroma TB placement, matching §7.3.8.10 transform_unit and the
+        // intra path:
+        //   log2_tb > 2: chroma TB co-located at (x0/SubWidthC,
+        //     y0/SubHeightC), size log2_tb-1. For 4:2:2 (cat == 2) the
+        //     chroma plane is full-height (SubHeightC == 1), so the
+        //     residual must be placed at chroma_y = y0, not y0/2 — the
+        //     latter writes into a different stripe than where
+        //     `motion_compensate_pb` deposited the chroma prediction
+        //     (it correctly used `y0/sub_height_c`). Mismatch was a
+        //     content-dependent miscount that masquerades as CABAC
+        //     drift on textured 4:2:2 P-slices because the residual is
+        //     applied to an unrelated chroma stripe.
+        //   log2_tb == 2 && blk_idx == 3: emit one chroma TB at the
+        //     4×4-parent base covering all 4 luma 4×4 siblings, again
+        //     using SubWidthC / SubHeightC for the placement.
+        let sub_x = self.cctx.sps.sub_width_c();
+        let sub_y = self.cctx.sps.sub_height_c();
+        let cat_here = self.cctx.sps.chroma_array_type();
+        if log2_tb > 2 && cat_here != 0 {
+            let cx = x0 / sub_x;
+            let cy = y0 / sub_y;
             let chroma_log2 = log2_tb - 1;
             if cbf_cb != 0 {
                 self.add_residual_plane(engine, ctx, cx, cy, chroma_log2, false)?;
@@ -2699,9 +2713,9 @@ impl<'a> Walker<'a> {
             if cbf_cr != 0 {
                 self.add_residual_plane_cr(engine, ctx, cx, cy, chroma_log2)?;
             }
-        } else if blk_idx == 3 {
-            let cx = x_base / 2;
-            let cy = y_base / 2;
+        } else if blk_idx == 3 && cat_here != 0 {
+            let cx = x_base / sub_x;
+            let cy = y_base / sub_y;
             if cbf_cb != 0 {
                 self.add_residual_plane(engine, ctx, cx, cy, 2, false)?;
             }

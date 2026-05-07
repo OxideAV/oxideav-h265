@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Round 33: 8-bit 4:4:4 P-slice and B-slice encoder — `p_slice_writer_444`, `b_slice_writer_444`; lifts the `chroma_format_idc == 3 && mini_gop > 1` rejection for `Yuv444P`. Reference frame stored as u8 (`ReferenceFrame444`) at full luma resolution (SubWidthC = SubHeightC = 1, chroma MV = luma MV).
 - Round 33: 4:4:4 inter decode unblocked — removed `SliceType != I` gate in `ctu::decode_ctus`; `motion_compensate_pb` already handles `sub_x = sub_y = 1` correctly.
 - New integration tests: `main10_mini_gop_two_roundtrip`, `main12_mini_gop_two_roundtrip`, `main444_mini_gop_two_roundtrip` (replace former "rejects" tests).
+- Task #427 regression: `profile4_main422_10bit_docs_fixture_decodes` — wires the curated `docs/video/h265/fixtures/main-422-10bit/` Profile-4 (Main 4:2:2 10) Annex-B fixture into the decode-shape test set. Pins that the basic 4:2:2 P-slice CABAC residual decode path completes without `Error::Invalid` on a profile_idc=4 / chroma_format_idc=2 / bit_depth=10 stream and produces two 32×32 frames with full-height chroma planes.
+
+### Fixed
+
+- ctu/`transform_tree_inter_inner` chroma TB residual placement: use `SubHeightC` (1 for 4:2:2, 2 for 4:2:0) for the chroma-y origin instead of a hard-coded `/ 2`. `motion_compensate_pb` already used `y0 / sub_height_c()` for the chroma prediction stripe; the inter leaf was adding the residual at `y0 / 2`, writing into a different stripe than the prediction for 4:2:2 streams. Pre-fix this misplacement was masked because subsequent CUs' predictions clobbered the wrong stripe; the placement is now spec-aligned (§7.3.8.10 transform_unit chroma TB origin) and matches the intra path's already-correct `cy = y0 / sub_y` formula. (task #427 part — addresses the easy-to-fix component; the deeper multi-QG / multi-CTU 4:2:2 cu_qp_delta CABAC bin sequence drift remains docs-blocked under task #444.)
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-h265/compare/v0.0.6...v0.0.7) - 2026-05-04
 

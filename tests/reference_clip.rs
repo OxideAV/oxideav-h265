@@ -4263,3 +4263,91 @@ fn hevc_b_slice_low_motion_merge_audit() {
         "B-slice low-motion merge-audit PSNR below 30 dB floor: {psnr:.2} dB"
     );
 }
+
+/// Task #427 regression — Profile-4 (Main 4:2:2 10) Annex-B fixture
+/// from `docs/video/h265/fixtures/main-422-10bit/`. Two-frame IDR + P
+/// at 10-bit 4:2:2 (`profile_idc=4`, `chroma_format_idc=2`,
+/// `bit_depth_y=bit_depth_c=10`) — exercises the 4:2:2 P/B inter
+/// CABAC residual decode path that is the focus of #427.
+///
+/// The fixture is curated as docs (clean-room + sha256-pinned
+/// `expected.yuv`), so we don't shell out to ffmpeg; the assertion is
+/// that the decoder produces 2 video frames at 32×32 yuv422p10le
+/// without raising an error. CABAC desync surfaces as either an
+/// `Error::Invalid` from a residual-coding overflow or as a frame
+/// shape mismatch — both are caught here.
+///
+/// PSNR-tight bit-exactness against `expected.yuv` is deferred until
+/// the multi-QG / multi-CTU 4:2:2 cu_qp_delta path lands (task #444 —
+/// docs-blocked on a clean-room CABAC trace). This test exists to
+/// pin the basic Profile-4 decode pipeline shape.
+#[test]
+fn profile4_main422_10bit_docs_fixture_decodes() {
+    let fixture = "../../docs/video/h265/fixtures/main-422-10bit/input.hevc";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+    let Some(data) = read_fixture(&path.to_string_lossy()) else {
+        return;
+    };
+    let mut dec = HevcDecoder::new(oxideav_core::CodecId::new(CODEC_ID_STR));
+    let pkt = Packet::new(0, TimeBase::new(1, 25), data);
+    if let Err(Error::Unsupported(msg)) = dec.send_packet(&pkt) {
+        eprintln!("Profile-4 docs fixture not yet in scope: {msg}");
+        return;
+    }
+    let mut frames: Vec<oxideav_core::VideoFrame> = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Video(vf)) => frames.push(vf),
+            Ok(_) => break,
+            Err(Error::NeedMore) => break,
+            Err(Error::Unsupported(msg)) => {
+                eprintln!("Profile-4 docs fixture surfaced Unsupported: {msg}");
+                return;
+            }
+            Err(e) => panic!("Profile-4 docs fixture decode error: {e:?}"),
+        }
+    }
+    assert_eq!(
+        frames.len(),
+        2,
+        "Profile-4 fixture is two-frame IDR + P; got {}",
+        frames.len()
+    );
+    // Each plane is 16-bit packed little-endian (yuv422p10le).
+    // 32x32 luma → 32 stride * 32 rows * 2 bytes/sample = 2048 bytes.
+    // 16x32 chroma → 16 stride * 32 rows * 2 = 1024 bytes per chroma
+    // plane. The decoder may use a wider stride for alignment, so we
+    // only assert plane[0] (luma) holds at least 32 rows of 32-pixel
+    // samples and the chroma planes hold at least 32 rows.
+    for (i, vf) in frames.iter().enumerate() {
+        assert_eq!(
+            vf.planes.len(),
+            3,
+            "frame {i}: expected 3 planes (Y, Cb, Cr) for 4:2:2"
+        );
+        assert!(
+            vf.planes[0].stride >= 32 * 2,
+            "frame {i}: luma stride {} < 32*2",
+            vf.planes[0].stride
+        );
+        assert!(
+            vf.planes[0].data.len() >= vf.planes[0].stride * 32,
+            "frame {i}: luma plane truncated"
+        );
+        // 4:2:2 chroma is full-height (32 rows) and half-width (16
+        // chroma samples = 32 bytes).
+        assert!(
+            vf.planes[1].stride >= 16 * 2,
+            "frame {i}: Cb stride {} < 16*2 (4:2:2 expected)",
+            vf.planes[1].stride
+        );
+        assert!(
+            vf.planes[1].data.len() >= vf.planes[1].stride * 32,
+            "frame {i}: Cb plane truncated (4:2:2 full-height expected)"
+        );
+        assert!(
+            vf.planes[2].data.len() >= vf.planes[2].stride * 32,
+            "frame {i}: Cr plane truncated (4:2:2 full-height expected)"
+        );
+    }
+}
