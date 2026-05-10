@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h265/compare/v0.0.7...v0.0.8) - 2026-05-07
+
+### Other
+
+- fix 4:2:2 inter chroma residual y-placement (task #427)
+- drop stale REGISTRARS / with_all_features intra-doc links
+- clippy::while_let_loop fix (CI gate)
+- drop dead `linkme` dep
+- clippy::while_let_loop fix (CI gate)
+- h265 encoder round 33: HBD P/B + 4:4:4 P/B (60→75%)
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-h265/pull/502))
+
 ### Added
 
 - Round 33: HBD (10-bit / 12-bit 4:2:0) P-slice and B-slice encoder — `p_slice_writer_hbd`, `b_slice_writer_hbd`; lifts the `mini_gop > 1` rejection for `Yuv420P10Le` / `Yuv420P12Le`. Reference frame stored as u16 (`ReferenceFrame16`) seeded from IDR source.
