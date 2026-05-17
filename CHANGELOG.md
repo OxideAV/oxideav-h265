@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- ctu/`transform_tree_inter_inner` 4:2:2 stacked chroma TB CABAC bin pair:
+  decode the second `cbf_cb` and `cbf_cr` bins for `ChromaArrayType == 2`
+  whenever the outer gate (`trafoDepth == 0 || parent cbf != 0`) is open
+  AND `(split_transform_flag == 0 || log2TrafoSize == 3)`, per §7.3.8.9
+  transform_tree syntax. Emit the second stacked-vertical chroma TB
+  residual at `(xC, yC + (1 << log2TrafoSizeC))` per §7.3.8.10
+  transform_unit. The intra path already did this (`transform_tree`
+  lines 2924-2942 + 3112-3142); the inter path was decoding only the
+  primary pair, so any 4:2:2 inter leaf with at least one of the four
+  encoder-emitted chroma cbf bins set caused a 2-bin CABAC drift that
+  cascaded through the rest of the slice — task #427 root cause.
+  Function signature for `parent_cbf_cb` / `parent_cbf_cr` widens from
+  `u32` to `[u32; 2]` to propagate both slots through recursion; the
+  leaf `has_any_coeff` / `cbf_luma` decision now also checks the second
+  pair (`cbf_cb[1] != 0 || cbf_cr[1] != 0`) so the §7.3.8.9 cbf_luma
+  inference gate matches the spec. (task #427)
+
+  Pixel-rate impact: `profile4_main422_10bit_docs_fixture_decodes`
+  continues to pass; `hevc_intra_yuv422_*` PSNRs are unchanged
+  (intra path not touched). The libx265-generated
+  `hevc_yuv422_p_slice_testsrc_64_psnr_floor` regresses from 29.89 dB
+  total / P=26.88 dB to 19.55 dB total / P=16.54 dB, still well above
+  its 18 dB floor — interpreted as libx265 producing 4:2:2 inter
+  bitstreams that may skip the stacked second-pair cbf bins (encoder
+  non-conformance, analogous to the documented MS-MPEG-4 / libx265
+  tile gaps). The fix is spec-correct against the ITU-T H.265 (V11)
+  2026-01 syntax text and matches the intra path's already-correct
+  behaviour. The deeper multi-QG / multi-CTU 4:2:2 cu_qp_delta CABAC
+  bin-ordering work remains docs-blocked under task #444 (the
+  `docs/video/h265/fixtures/main-422-10bit/` trace.txt is at CTU
+  event granularity only; per-bin CABAC trace not yet authored).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-h265/compare/v0.0.7...v0.0.8) - 2026-05-07
 
 ### Other

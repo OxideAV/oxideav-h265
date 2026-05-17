@@ -163,7 +163,14 @@ signalled (§8.5.3.3.4).
   supported for I, P, and B slices. The 4:2:2 inter path applies
   §8.5.3.2.10 chroma MV derivation
   (`mvCLX[1] = mvLX[1] * 2 / SubHeightC`) so the same `chroma_mc` /
-  `chroma_mc_hp` covers both layouts.
+  `chroma_mc_hp` covers both layouts. `transform_tree` on inter
+  4:2:2 leaves emits the spec-mandated stacked-vertical chroma TB
+  pair (`cbf_cb[0]`, `cbf_cb[1]`, `cbf_cr[0]`, `cbf_cr[1]` at
+  CABAC + cb[0]/cb[1]/cr[0]/cr[1] residual blocks at
+  `(xC, yC + (1<<log2TrafoSizeC))`) per §7.3.8.9 / §7.3.8.10,
+  matching the intra path. The deeper multi-QG / multi-CTU
+  cu_qp_delta drift (task #444) is docs-blocked on a per-bin
+  CABAC trace.
 * **4:4:4 (`chroma_format_idc=3`)** is supported on I-slices (round 30
   for 8-bit, round 31 for 10-bit, round 32 for 12-bit).
   `transform_tree` honours the §7.3.8.10 `log2TrafoSizeC = max(2,

@@ -2432,9 +2432,21 @@ impl<'a> Walker<'a> {
     ) -> Result<()> {
         // At the root the "parent" cbf_cb / cbf_cr are treated as 1 so the
         // conditional at tr_depth == 0 still opens. xBase/yBase start at
-        // the CU origin; blkIdx starts at 0.
+        // the CU origin; blkIdx starts at 0. Pass the parent cbf for both
+        // the primary chroma TB and the 4:2:2 stacked-vertical second TB.
         self.transform_tree_inter_inner(
-            engine, ctx, x0, y0, x0, y0, log2_tb, tr_depth, 0, 1, 1, part_mode,
+            engine,
+            ctx,
+            x0,
+            y0,
+            x0,
+            y0,
+            log2_tb,
+            tr_depth,
+            0,
+            [1, 1],
+            [1, 1],
+            part_mode,
         )
     }
 
@@ -2450,8 +2462,8 @@ impl<'a> Walker<'a> {
         log2_tb: u32,
         tr_depth: u32,
         blk_idx: u32,
-        parent_cbf_cb: u32,
-        parent_cbf_cr: u32,
+        parent_cbf_cb: [u32; 2],
+        parent_cbf_cr: [u32; 2],
         part_mode: InterPart,
     ) -> Result<()> {
         // §7.3.8.9 transform_tree syntax + §7.4.9.8 semantics:
@@ -2542,25 +2554,45 @@ impl<'a> Walker<'a> {
         // For monochrome (ChromaArrayType == 0) the spec inhibits both
         // cbf_cb and cbf_cr — the transform_unit only carries luma — so
         // we skip the CABAC decode and inherit 0.
+        //
+        // For 4:2:2 (ChromaArrayType == 2) the spec emits TWO chroma cbf
+        // pairs at each transform_tree level when the outer gate
+        // (trafoDepth == 0 || parent cbf != 0) is open AND
+        // (split_transform_flag == 0 || log2TrafoSize == 3) — i.e., at
+        // a leaf node or at the smallest chroma-capable level. The
+        // second pair refers to the stacked-vertical chroma TB at
+        // (x0, y0 + (1 << (log2TrafoSize − 1))). Pre-fix the inter
+        // path only decoded the first pair, so any 4:2:2 inter leaf
+        // with at least one of the four cbf bins emitted by the
+        // encoder caused a 2-bin CABAC drift that propagated through
+        // the rest of the slice — task #427 root cause.
         let cat_here = self.cctx.sps.chroma_array_type();
         let chroma_here = log2_tb > 2 && cat_here != 0;
         let cbf_ctx_inc = tr_depth.min(4) as usize;
-        let cbf_cb_node = if chroma_here && (tr_depth == 0 || parent_cbf_cb != 0) {
-            engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
-        } else if chroma_here || cat_here == 0 {
-            0
-        } else {
-            // Below 8×8 we inherit the parent's cbf for purposes of the
-            // final-block chroma emission (§7.3.8.9 else-branch condition).
-            parent_cbf_cb
-        };
-        let cbf_cr_node = if chroma_here && (tr_depth == 0 || parent_cbf_cr != 0) {
-            engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc])
-        } else if chroma_here || cat_here == 0 {
-            0
-        } else {
-            parent_cbf_cr
-        };
+        let mut cbf_cb_node: [u32; 2] = [0, 0];
+        let mut cbf_cr_node: [u32; 2] = [0, 0];
+        if chroma_here {
+            let outer_gate_cb = tr_depth == 0 || parent_cbf_cb[0] != 0;
+            if outer_gate_cb {
+                cbf_cb_node[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+                if cat_here == 2 && (split == 0 || log2_tb == 3) {
+                    cbf_cb_node[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+                }
+            }
+            let outer_gate_cr = tr_depth == 0 || parent_cbf_cr[0] != 0;
+            if outer_gate_cr {
+                cbf_cr_node[0] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+                if cat_here == 2 && (split == 0 || log2_tb == 3) {
+                    cbf_cr_node[1] = engine.decode_bin(&mut ctx.cbf_cb_cr[cbf_ctx_inc]);
+                }
+            }
+        } else if cat_here != 0 {
+            // log2_tb == 2: chroma cbfs at this depth aren't decoded;
+            // both inherit from the parent (used by the final-block
+            // chroma emission gate in the leaf below).
+            cbf_cb_node = parent_cbf_cb;
+            cbf_cr_node = parent_cbf_cr;
+        }
 
         if split == 1 {
             let sub = 1u32 << (log2_tb - 1);
@@ -2629,17 +2661,19 @@ impl<'a> Walker<'a> {
         // §7.3.8.9 cbf_luma is decoded only when any of:
         //   * CuPredMode == MODE_INTRA (always for intra CUs),
         //   * trafoDepth != 0 (a split happened — leaf of a split tree),
-        //   * cbf_cb != 0 || cbf_cr != 0.
+        //   * cbf_cb != 0 || cbf_cr != 0 (either the primary or the 4:2:2
+        //     stacked second pair).
         // Otherwise (inter root, unsplit, no chroma coeffs) rqt_root_cbf=1
         // forces cbf_luma = 1 by inference: otherwise the tree would be
         // empty which contradicts rqt_root_cbf=1.
+        let any_cbf_chroma = cbf_cb[0] != 0 || cbf_cr[0] != 0 || cbf_cb[1] != 0 || cbf_cr[1] != 0;
         let cbf_luma_inc = if tr_depth == 0 { 1usize } else { 0usize };
-        let cbf_luma = if tr_depth == 0 && cbf_cb == 0 && cbf_cr == 0 {
+        let cbf_luma = if tr_depth == 0 && !any_cbf_chroma {
             1
         } else {
             engine.decode_bin(&mut ctx.cbf_luma[cbf_luma_inc])
         };
-        let has_any_coeff = cbf_luma != 0 || cbf_cb != 0 || cbf_cr != 0;
+        let has_any_coeff = cbf_luma != 0 || any_cbf_chroma;
         if has_any_coeff && self.cctx.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
             let mut prefix = 0u32;
             let max_prefix = 5u32;
@@ -2687,40 +2721,56 @@ impl<'a> Walker<'a> {
         }
         // Chroma TB placement, matching §7.3.8.10 transform_unit and the
         // intra path:
-        //   log2_tb > 2: chroma TB co-located at (x0/SubWidthC,
-        //     y0/SubHeightC), size log2_tb-1. For 4:2:2 (cat == 2) the
-        //     chroma plane is full-height (SubHeightC == 1), so the
-        //     residual must be placed at chroma_y = y0, not y0/2 — the
-        //     latter writes into a different stripe than where
-        //     `motion_compensate_pb` deposited the chroma prediction
-        //     (it correctly used `y0/sub_height_c`). Mismatch was a
-        //     content-dependent miscount that masquerades as CABAC
-        //     drift on textured 4:2:2 P-slices because the residual is
-        //     applied to an unrelated chroma stripe.
-        //   log2_tb == 2 && blk_idx == 3: emit one chroma TB at the
+        //   log2_tb > 2: primary chroma TB co-located at
+        //     (x0/SubWidthC, y0/SubHeightC), size log2_tb-1. For 4:2:2
+        //     (cat == 2) the chroma plane is full-height (SubHeightC == 1)
+        //     and the spec stacks a SECOND chroma TB of the same size at
+        //     (xC, yC + chroma_step) where chroma_step = 1<<log2TrafoSizeC.
+        //     The per-tIdx loop below emits both TBs in the spec-mandated
+        //     order: cb[0], cb[1], cr[0], cr[1]. Pre-fix this path only
+        //     emitted cb[0] / cr[0], drifting the CABAC bin position by
+        //     up to 2 chroma residual blocks per 4:2:2 inter leaf with at
+        //     least one stacked-cbf bit set (task #427).
+        //   log2_tb == 2 && blk_idx == 3: emit chroma TB(s) at the
         //     4×4-parent base covering all 4 luma 4×4 siblings, again
-        //     using SubWidthC / SubHeightC for the placement.
+        //     using SubWidthC / SubHeightC for the placement. For 4:2:2
+        //     there are still two stacked 4×4 chroma TBs per cb / cr.
         let sub_x = self.cctx.sps.sub_width_c();
         let sub_y = self.cctx.sps.sub_height_c();
         let cat_here = self.cctx.sps.chroma_array_type();
+        let chroma_passes: usize = if cat_here == 2 { 2 } else { 1 };
         if log2_tb > 2 && cat_here != 0 {
             let cx = x0 / sub_x;
             let cy = y0 / sub_y;
             let chroma_log2 = log2_tb - 1;
-            if cbf_cb != 0 {
-                self.add_residual_plane(engine, ctx, cx, cy, chroma_log2, false)?;
+            let chroma_step = 1u32 << chroma_log2;
+            for (t, &flag) in cbf_cb.iter().enumerate().take(chroma_passes) {
+                if flag != 0 {
+                    let cby = cy + (t as u32) * chroma_step;
+                    self.add_residual_plane(engine, ctx, cx, cby, chroma_log2, false)?;
+                }
             }
-            if cbf_cr != 0 {
-                self.add_residual_plane_cr(engine, ctx, cx, cy, chroma_log2)?;
+            for (t, &flag) in cbf_cr.iter().enumerate().take(chroma_passes) {
+                if flag != 0 {
+                    let cby = cy + (t as u32) * chroma_step;
+                    self.add_residual_plane_cr(engine, ctx, cx, cby, chroma_log2)?;
+                }
             }
         } else if blk_idx == 3 && cat_here != 0 {
             let cx = x_base / sub_x;
             let cy = y_base / sub_y;
-            if cbf_cb != 0 {
-                self.add_residual_plane(engine, ctx, cx, cy, 2, false)?;
+            let chroma_step = 4u32; // 1 << log2TrafoSizeC == 1 << 2 == 4
+            for (t, &flag) in cbf_cb.iter().enumerate().take(chroma_passes) {
+                if flag != 0 {
+                    let cby = cy + (t as u32) * chroma_step;
+                    self.add_residual_plane(engine, ctx, cx, cby, 2, false)?;
+                }
             }
-            if cbf_cr != 0 {
-                self.add_residual_plane_cr(engine, ctx, cx, cy, 2)?;
+            for (t, &flag) in cbf_cr.iter().enumerate().take(chroma_passes) {
+                if flag != 0 {
+                    let cby = cy + (t as u32) * chroma_step;
+                    self.add_residual_plane_cr(engine, ctx, cx, cby, 2)?;
+                }
             }
         }
         Ok(())
