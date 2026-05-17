@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-h265/compare/v0.0.8...v0.0.9) - 2026-05-17
+
+### Other
+
+- 4:2:2 inter stacked chroma TB CABAC bin pair (task #427)
+
 ### Fixed
 
 - ctu/`transform_tree_inter_inner` 4:2:2 stacked chroma TB CABAC bin pair:
