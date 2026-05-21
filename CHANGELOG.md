@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 2 (2026-05-22)
+
+- MSB-first `BitReader` with `u(n)` and 0-th-order
+  unsigned-Exp-Golomb `ue(v)` (§9.2) descriptors; `skip(n)` to
+  bit-walk over not-yet-materialised fields without parsing them.
+- §7.3.2.1 `HevcVps` structural parse — `vps_video_parameter_set_id`
+  (u4), `vps_base_layer_internal_flag` / `vps_base_layer_available_flag`,
+  `vps_max_layers_minus1` (u6), `vps_max_sub_layers_minus1` (u3 with
+  the §7.4.3.1 0..=6 range check), `vps_temporal_id_nesting_flag`,
+  `vps_reserved_0xffff_16bits` validation (rejects any value other
+  than `0xFFFF`), the §7.3.3 `profile_tier_level()` walk, and the
+  per-sub-layer DPB / reorder / latency `ue(v)` triple loop with
+  ordering-info-present-flag propagation.
+- §7.3.3 `ProfileTierLevel` — materialises
+  `general_profile_space` / `_tier_flag` / `_profile_idc` /
+  `_level_idc` and the per-sub-layer
+  `sub_layer_profile_present_flag` / `_level_present_flag` gates
+  plus `sub_layer_level_idc[i]`. The constraint-flag / reserved-zero
+  blocks are walked structurally (their bit width is fixed at 43
+  bits regardless of the inner conditional branch per the
+  `/* not affected by this condition */` note in the syntax table)
+  so subsequent VPS fields land on the right bit boundary.
+- 17 new unit tests: bit-reader `u(n)` MSB-first packing /
+  cross-byte read / `u(0)` zero-consume / `u(32)` full word /
+  end-of-buffer / too-many-bits / skip / `ue(v)` codewords 0..=6
+  per Table 9-2 / single-bit zero / leading-zero-overrun;
+  VPS fixture parse (against
+  `docs/video/h265/fixtures/tiny-i-only-16x16-main/input.hevc` — the
+  on-wire bytes are inlined into the test, no I/O); end-to-end VPS
+  parse via the Annex B walker; reserved-field mismatch rejection;
+  truncated-RBSP rejection; emulation-prevention round-trip equality;
+  hand-assembled two-sub-layer ordering-info-present-flag=1 parse;
+  hand-assembled ordering-info-present-flag=0 propagation parse.
+
 ### Added — clean-room rebuild round 1 (2026-05-20)
 
 - Annex B byte-stream walker: `NalIter`, `collect_nal_units`,
@@ -43,7 +77,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- VPS/SPS/PPS semantic parse (§7.3.2.x). RBSP-stop-bit handling.
+- SPS/PPS semantic parse (§7.3.2.2, §7.3.2.3). RBSP-stop-bit
+  handling.
+- VPS tail: `vps_max_layer_id`, `vps_num_layer_sets_minus1`,
+  `layer_id_included_flag` matrix, `vps_timing_info_present_flag`,
+  HRD parameters, `vps_extension_data_flag`.
 - Slice header parse.
 - CABAC remains blocked on docs #444 (`cu_qp_delta` +
   `last_sig_coeff` multi-QG / multi-CTU 4:2:2 trace gap).
