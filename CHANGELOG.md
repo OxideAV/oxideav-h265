@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 3 (2026-05-22)
+
+- §7.3.2.2 `SeqParameterSet` structural parse — `sps_video_parameter_set_id`
+  (u4), `sps_max_sub_layers_minus1` (u3, 0..=6 range-checked),
+  `sps_temporal_id_nesting_flag`, the §7.3.3 `profile_tier_level()`
+  re-walk, `sps_seq_parameter_set_id` (ue(v), 0..=15),
+  `chroma_format_idc` (ue(v), 0..=3), `separate_colour_plane_flag`
+  (parsed only when `chroma_format_idc == 3`),
+  `pic_width_in_luma_samples` / `pic_height_in_luma_samples` (ue(v),
+  non-zero per §7.4.3.2), `conformance_window_flag` + the four
+  `conf_win_{left,right,top,bottom}_offset` ue(v) values,
+  `bit_depth_{luma,chroma}_minus8` (ue(v), 0..=8 range-checked),
+  `log2_max_pic_order_cnt_lsb_minus4` (ue(v), 0..=12), the
+  per-sub-layer DPB / reorder / latency triple loop with
+  ordering-info-present-flag propagation (§7.4.3.2.1),
+  `log2_min_luma_coding_block_size_minus3`,
+  `log2_diff_max_min_luma_coding_block_size`,
+  `log2_min_luma_transform_block_size_minus2`,
+  `log2_diff_max_min_luma_transform_block_size`,
+  `max_transform_hierarchy_depth_{inter,intra}`,
+  `scaling_list_enabled_flag` (rejected when set; `scaling_list_data()`
+  deferred), `amp_enabled_flag`, `sample_adaptive_offset_enabled_flag`.
+- Convenience derivations: `bit_depth_luma()`, `bit_depth_chroma()`,
+  `log2_min_cb_size()`, `log2_ctb_size()`, `log2_min_tb_size()` —
+  the field combinations §7.4.3.2.1 calls `BitDepthY`, `BitDepthC`,
+  `MinCbLog2SizeY`, `CtbLog2SizeY`, `MinTbLog2SizeY`.
+- 8 new unit tests: fixture parse against the SPS RBSP from
+  `docs/video/h265/fixtures/tiny-i-only-16x16-main/input.hevc`
+  (cross-checked against `trace.txt`); end-to-end VPS+SPS parse via
+  the Annex B walker; emulation-prevention-strip equivalence;
+  truncated-RBSP rejection; hand-assembled `chroma_format_idc == 3`
+  + conformance-window 10-bit 4:4:4 path; hand-assembled
+  `sub_layer_ordering_info_present_flag == 0` propagation across
+  two sub-layers; `scaling_list_enabled_flag == 1` rejection;
+  `chroma_format_idc == 4` out-of-range rejection.
+
 ### Added — clean-room rebuild round 2 (2026-05-22)
 
 - MSB-first `BitReader` with `u(n)` and 0-th-order
@@ -77,8 +113,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- SPS/PPS semantic parse (§7.3.2.2, §7.3.2.3). RBSP-stop-bit
-  handling.
+- PPS semantic parse (§7.3.2.3). RBSP-stop-bit handling.
+- SPS tail: `pcm_*` block, `num_short_term_ref_pic_sets` +
+  `st_ref_pic_set()`, long-term-ref tables,
+  `sps_temporal_mvp_enabled_flag`,
+  `strong_intra_smoothing_enabled_flag`, VUI parameters,
+  `sps_extension_*_flag` tail.
+- `scaling_list_data()` (§7.3.4) — currently rejected when
+  `scaling_list_enabled_flag == 1`.
 - VPS tail: `vps_max_layer_id`, `vps_num_layer_sets_minus1`,
   `layer_id_included_flag` matrix, `vps_timing_info_present_flag`,
   HRD parameters, `vps_extension_data_flag`.

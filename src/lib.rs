@@ -5,11 +5,13 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 land the Annex B NAL-unit byte-stream walker, the
-//! §7.3.1.2 NAL header parse, and the §7.3.2.1 VPS structural parse
-//! (including a §7.3.3 profile_tier_level walk). SPS/PPS semantic
-//! parse, slice decode, and CABAC are *not* implemented yet; the
-//! public decoder and encoder entry points still return
+//! Rounds 1 + 2 + 3 land the Annex B NAL-unit byte-stream walker, the
+//! §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural parse
+//! (with a §7.3.3 profile_tier_level walk), and the §7.3.2.2 SPS
+//! structural parse (up to and including
+//! `sample_adaptive_offset_enabled_flag`). PPS semantic parse,
+//! slice decode, and CABAC are *not* implemented yet; the public
+//! decoder and encoder entry points still return
 //! [`Error::NotImplemented`].
 //!
 //! ## What works today
@@ -28,9 +30,22 @@
 //!   the §7.3.3 profile_tier_level walk (general profile + level +
 //!   per-sub-layer present-flag gates and `sub_layer_level_idc`), and
 //!   the per-sub-layer DPB / reorder / latency triple loop.
+//! * §7.3.2.2 [`sps::SeqParameterSet`] — vps-id back-reference,
+//!   max-sub-layers / nesting flag, the §7.3.3 PTL re-walk,
+//!   `chroma_format_idc` / `separate_colour_plane_flag`,
+//!   `pic_width_in_luma_samples` / `pic_height_in_luma_samples`,
+//!   conformance-window quad, `bit_depth_{luma,chroma}_minus8`,
+//!   `log2_max_pic_order_cnt_lsb_minus4`, the per-sub-layer
+//!   DPB / reorder / latency triple loop, the four
+//!   `log2_*_block_size{_minus_2,_minus_3,_diff_max_min}` fields,
+//!   `max_transform_hierarchy_depth_{inter,intra}`,
+//!   `scaling_list_enabled_flag`, `amp_enabled_flag`,
+//!   `sample_adaptive_offset_enabled_flag`. Scaling-list data
+//!   (§7.3.4) and the trailing PCM / RPS / VUI / extension tail are
+//!   deferred to a later round.
 //!
-//! See [`nal`] for the byte-stream walker entry points and [`vps`]
-//! for the parsed VPS structure.
+//! See [`nal`] for the byte-stream walker entry points, [`vps`] for
+//! the parsed VPS structure, and [`sps`] for the parsed SPS.
 
 #![warn(missing_debug_implementations)]
 
@@ -38,10 +53,12 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod nal;
+pub mod sps;
 pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
+pub use sps::{ConformanceWindow, SeqParameterSet, SpsError};
 pub use vps::{HevcVps, ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
 
 /// Crate-local error type. The decoder and encoder paths still
@@ -60,6 +77,9 @@ pub enum Error {
     /// A VPS-parser error surfaced through the top-level entry
     /// points.
     Vps(VpsError),
+    /// An SPS-parser error surfaced through the top-level entry
+    /// points.
+    Sps(SpsError),
 }
 
 impl core::fmt::Display for Error {
@@ -68,6 +88,7 @@ impl core::fmt::Display for Error {
             Self::NotImplemented => f.write_str("oxideav-h265: decoder/encoder not wired up yet"),
             Self::Nal(e) => write!(f, "oxideav-h265 NAL error: {e}"),
             Self::Vps(e) => write!(f, "oxideav-h265 VPS error: {e}"),
+            Self::Sps(e) => write!(f, "oxideav-h265 SPS error: {e}"),
         }
     }
 }
@@ -83,6 +104,12 @@ impl From<NalError> for Error {
 impl From<VpsError> for Error {
     fn from(e: VpsError) -> Self {
         Self::Vps(e)
+    }
+}
+
+impl From<SpsError> for Error {
+    fn from(e: SpsError) -> Self {
+        Self::Sps(e)
     }
 }
 

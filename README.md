@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 2 (2026-05-22).** The prior implementation was
+**Clean-room rebuild — round 3 (2026-05-22).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,10 +14,10 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 2 adds the
-VPS structural parse (§7.3.2.1) and the profile-tier-level walk
-(§7.3.3) on top of round 1's Annex B / NAL-header foundation;
-SPS/PPS semantic parse, slice decode, and CABAC remain unimplemented.
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 3 adds the SPS
+structural parse (§7.3.2.2) on top of round 2's VPS / profile-tier-level
+(§7.3.2.1 + §7.3.3) and round 1's Annex B / NAL-header foundation; PPS
+semantic parse, slice decode, and CABAC remain unimplemented.
 
 ## Scope so far
 
@@ -37,14 +37,40 @@ SPS/PPS semantic parse, slice decode, and CABAC remain unimplemented.
   present-flag gates + `sub_layer_level_idc`), and the per-sub-layer
   DPB / reorder / latency `ue(v)` triple loop with
   ordering-info-present-flag propagation.
+* §7.3.2.2 [`SeqParameterSet`] — `sps_video_parameter_set_id`,
+  `sps_max_sub_layers_minus1` / `sps_temporal_id_nesting_flag`, the
+  §7.3.3 PTL re-walk, `sps_seq_parameter_set_id`, `chroma_format_idc`
+  / `separate_colour_plane_flag`, `pic_width_in_luma_samples` /
+  `pic_height_in_luma_samples`, `conformance_window_flag` + the four
+  `conf_win_*_offset` `ue(v)` values, `bit_depth_luma_minus8` /
+  `bit_depth_chroma_minus8`, `log2_max_pic_order_cnt_lsb_minus4`,
+  the per-sub-layer DPB / reorder / latency triple loop,
+  `log2_min_luma_coding_block_size_minus3`,
+  `log2_diff_max_min_luma_coding_block_size`,
+  `log2_min_luma_transform_block_size_minus2`,
+  `log2_diff_max_min_luma_transform_block_size`,
+  `max_transform_hierarchy_depth_{inter,intra}`,
+  `scaling_list_enabled_flag`, `amp_enabled_flag`,
+  `sample_adaptive_offset_enabled_flag`. The trailing PCM / RPS /
+  VUI / extension tail and `scaling_list_data()` itself are deferred
+  to a later round (the round-3 parser refuses
+  `scaling_list_enabled_flag == 1`).
 
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
-[`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`].
+[`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
+[`SeqParameterSet::parse`].
 
 ## Not yet implemented
 
-* SPS/PPS semantic parse (§7.3.2.2, §7.3.2.3)
+* PPS semantic parse (§7.3.2.3)
+* SPS tail: `pcm_*` block, `num_short_term_ref_pic_sets` +
+  `st_ref_pic_set()`, `long_term_ref_pics_present_flag` +
+  long-term-ref tables, `sps_temporal_mvp_enabled_flag`,
+  `strong_intra_smoothing_enabled_flag`, VUI parameters,
+  `sps_extension_*_flag` tail and Range-Extension / SCC payloads.
+* `scaling_list_data()` (§7.3.4) — round 3 errors out when
+  `scaling_list_enabled_flag == 1`.
 * VPS tail: `vps_max_layer_id`, layer-set inclusion matrix,
   `vps_timing_info_present_flag`, HRD parameters,
   `vps_extension_data_flag`.
