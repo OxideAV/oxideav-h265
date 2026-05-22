@@ -6,6 +6,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 4 (2026-05-22)
+
+- §7.3.2.2 SPS tail past `sample_adaptive_offset_enabled_flag`:
+  - `pcm_enabled_flag` + the `pcm_*` block (`PcmInfo`):
+    `pcm_sample_bit_depth_luma_minus1` / `_chroma_minus1` (4-bit
+    each, validated against the `BitDepthY` / `BitDepthC` derived
+    from the earlier `bit_depth_*_minus8` fields per equations
+    7-25 / 7-26), `log2_min_pcm_luma_coding_block_size_minus3`,
+    `log2_diff_max_min_pcm_luma_coding_block_size`,
+    `pcm_loop_filter_disabled_flag`.
+  - `num_short_term_ref_pic_sets` (ue(v), 0..=64 per §7.4.3.2) +
+    `Vec<ShortTermRefPicSet>` populated by the §7.3.7 parser. Both
+    forms are materialised: the explicit
+    `num_negative_pics` / `num_positive_pics` /
+    `delta_poc_s{0,1}_minus1[i]` / `used_by_curr_pic_s{0,1}_flag[i]`
+    form, and the inter-RPS-prediction form
+    (`inter_ref_pic_set_prediction_flag`, `delta_idx_minus1`,
+    `delta_rps_sign`, `abs_delta_rps_minus1`, plus the
+    `used_by_curr_pic_flag[j]` / `use_delta_flag[j]` arrays of
+    length `NumDeltaPocs[RefRpsIdx] + 1`). `RefRpsIdx` chains
+    through the preceding RPS list per §7.4.8;
+    `delta_idx_minus1` is only signalled when
+    `stRpsIdx == num_short_term_ref_pic_sets` (the slice-header
+    in-line form is handled by inferring 0 for SPS entries).
+    `use_delta_flag[j]` is inferred to 1 when
+    `used_by_curr_pic_flag[j] == 1` per §7.4.8.
+  - `long_term_ref_pics_present_flag` block:
+    `num_long_term_ref_pics_sps` (0..=32) +
+    `Vec<LongTermRefPicEntry>` carrying `lt_ref_pic_poc_lsb_sps[i]`
+    (parsed as `u(log2_max_pic_order_cnt_lsb_minus4 + 4)`) +
+    `used_by_curr_pic_lt_sps_flag[i]`.
+  - `sps_temporal_mvp_enabled_flag` (u1).
+  - `strong_intra_smoothing_enabled_flag` (u1).
+  - `vui_parameters_present_flag` (u1) — when set, the VUI body
+    plus the trailing `sps_extension_present_flag` and any
+    extension payload + `rbsp_trailing_bits()` are surfaced as
+    a single `OpaqueTail { bytes, start_bit_in_first_byte }`.
+  - `sps_extension_present_flag` (u1) — known precisely when the
+    VUI gate is 0. When set, the extension flag block plus any
+    extension body and the RBSP trailer are surfaced as
+    `OpaqueTail`.
+- Convenience derivation `max_pic_order_cnt_lsb()` returning
+  `1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)` per §7.4.3.2.1.
+- 8 new unit tests: `pcm_enabled` happy path; PCM-depth-exceeds-luma
+  rejection; one explicit short-term RPS; inter-RPS-prediction
+  short-term RPS chaining; long-term-ref-pic block; opaque VUI tail
+  capture; opaque extension tail capture; clean tail (both flags
+  off, no opaque). Total test count: 42 (was 34).
+- Fixture `parses_tiny_fixture_sps` extended to assert every newly-parsed
+  tail field against
+  `docs/video/h265/fixtures/tiny-i-only-16x16-main/trace.txt`
+  (pcm_enabled=0, num_short_term_ref_pic_sets=0,
+  long_term_ref_pics=0, temporal_mvp=1, strong_intra_smoothing=1,
+  vui present).
+
 ### Added — clean-room rebuild round 3 (2026-05-22)
 
 - §7.3.2.2 `SeqParameterSet` structural parse — `sps_video_parameter_set_id`
@@ -114,11 +169,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Next
 
 - PPS semantic parse (§7.3.2.3). RBSP-stop-bit handling.
-- SPS tail: `pcm_*` block, `num_short_term_ref_pic_sets` +
-  `st_ref_pic_set()`, long-term-ref tables,
-  `sps_temporal_mvp_enabled_flag`,
-  `strong_intra_smoothing_enabled_flag`, VUI parameters,
-  `sps_extension_*_flag` tail.
+- VUI parameters (§E.2.1) — currently surfaced as opaque bytes.
+- SPS extension bodies (Range Extension, Multilayer, 3D, SCC) —
+  currently surfaced as opaque bytes alongside the VUI tail.
 - `scaling_list_data()` (§7.3.4) — currently rejected when
   `scaling_list_enabled_flag == 1`.
 - VPS tail: `vps_max_layer_id`, `vps_num_layer_sets_minus1`,

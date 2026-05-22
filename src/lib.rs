@@ -5,13 +5,14 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 + 3 land the Annex B NAL-unit byte-stream walker, the
-//! §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural parse
-//! (with a §7.3.3 profile_tier_level walk), and the §7.3.2.2 SPS
-//! structural parse (up to and including
-//! `sample_adaptive_offset_enabled_flag`). PPS semantic parse,
-//! slice decode, and CABAC are *not* implemented yet; the public
-//! decoder and encoder entry points still return
+//! Rounds 1 + 2 + 3 + 4 land the Annex B NAL-unit byte-stream walker,
+//! the §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural parse
+//! (with a §7.3.3 profile_tier_level walk), and the full §7.3.2.2 SPS
+//! parse (through the `vui_parameters_present_flag` /
+//! `sps_extension_present_flag` gates, with the VUI body and any
+//! extension payload surfaced as an opaque-bytes tail). PPS semantic
+//! parse, slice decode, and CABAC are *not* implemented yet; the
+//! public decoder and encoder entry points still return
 //! [`Error::NotImplemented`].
 //!
 //! ## What works today
@@ -40,9 +41,19 @@
 //!   `log2_*_block_size{_minus_2,_minus_3,_diff_max_min}` fields,
 //!   `max_transform_hierarchy_depth_{inter,intra}`,
 //!   `scaling_list_enabled_flag`, `amp_enabled_flag`,
-//!   `sample_adaptive_offset_enabled_flag`. Scaling-list data
-//!   (§7.3.4) and the trailing PCM / RPS / VUI / extension tail are
-//!   deferred to a later round.
+//!   `sample_adaptive_offset_enabled_flag`, the [`sps::PcmInfo`] block
+//!   gated by `pcm_enabled_flag`, the
+//!   `num_short_term_ref_pic_sets` ue(v) + per-set
+//!   [`sps::ShortTermRefPicSet`] (§7.3.7, both explicit and
+//!   inter-RPS-prediction forms), the
+//!   `long_term_ref_pics_present_flag` block plus
+//!   [`sps::LongTermRefPicEntry`] table, the
+//!   `sps_temporal_mvp_enabled_flag` /
+//!   `strong_intra_smoothing_enabled_flag` pair, and the
+//!   `vui_parameters_present_flag` / `sps_extension_present_flag`
+//!   gates whose bodies are surfaced as [`sps::OpaqueTail`].
+//!   Scaling-list data (§7.3.4) is still deferred — the parser
+//!   refuses `scaling_list_enabled_flag == 1`.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, and [`sps`] for the parsed SPS.
@@ -58,7 +69,11 @@ pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
-pub use sps::{ConformanceWindow, SeqParameterSet, SpsError};
+pub use sps::{
+    ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,
+    ShortTermRefPicSet, SpsError, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
+    HEVC_MAX_RPS_PICS,
+};
 pub use vps::{HevcVps, ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
 
 /// Crate-local error type. The decoder and encoder paths still

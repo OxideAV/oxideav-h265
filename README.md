@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 3 (2026-05-22).** The prior implementation was
+**Clean-room rebuild — round 4 (2026-05-22).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,10 +14,17 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 3 adds the SPS
-structural parse (§7.3.2.2) on top of round 2's VPS / profile-tier-level
-(§7.3.2.1 + §7.3.3) and round 1's Annex B / NAL-header foundation; PPS
-semantic parse, slice decode, and CABAC remain unimplemented.
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 4 finishes the
+SPS RBSP body — PCM block, short-term reference picture sets
+(§7.3.7), the long-term reference picture table, the
+`sps_temporal_mvp_enabled_flag` / `strong_intra_smoothing_enabled_flag`
+pair, and the `vui_parameters_present_flag` /
+`sps_extension_present_flag` gates (with VUI body and extension
+payloads surfaced as opaque-bytes tails) — on top of round 3's
+structural prefix, round 2's VPS / profile-tier-level
+(§7.3.2.1 + §7.3.3), and round 1's Annex B / NAL-header foundation.
+PPS semantic parse, slice decode, scaling-list data, and CABAC
+remain unimplemented.
 
 ## Scope so far
 
@@ -51,10 +58,22 @@ semantic parse, slice decode, and CABAC remain unimplemented.
   `log2_diff_max_min_luma_transform_block_size`,
   `max_transform_hierarchy_depth_{inter,intra}`,
   `scaling_list_enabled_flag`, `amp_enabled_flag`,
-  `sample_adaptive_offset_enabled_flag`. The trailing PCM / RPS /
-  VUI / extension tail and `scaling_list_data()` itself are deferred
-  to a later round (the round-3 parser refuses
-  `scaling_list_enabled_flag == 1`).
+  `sample_adaptive_offset_enabled_flag`, the `pcm_*` block gated
+  by `pcm_enabled_flag`, `num_short_term_ref_pic_sets` + the per-set
+  [`ShortTermRefPicSet`] (§7.3.7 — both the explicit
+  `num_negative_pics` / `num_positive_pics` form and the
+  inter-RPS-prediction form, with `RefRpsIdx` chained through the
+  preceding RPS list per §7.4.8), `long_term_ref_pics_present_flag`
+  + the [`LongTermRefPicEntry`] table (`u(v)` POC-LSB width per
+  `log2_max_pic_order_cnt_lsb_minus4 + 4`),
+  `sps_temporal_mvp_enabled_flag`,
+  `strong_intra_smoothing_enabled_flag`, and the
+  `vui_parameters_present_flag` / `sps_extension_present_flag`
+  gates. The VUI body and any extension payload are surfaced as
+  [`OpaqueTail`] (raw RBSP bytes from the cut-off byte through the
+  buffer end, with the start-bit offset). `scaling_list_data()`
+  itself is still deferred — the parser refuses
+  `scaling_list_enabled_flag == 1`.
 
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
@@ -64,13 +83,12 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 ## Not yet implemented
 
 * PPS semantic parse (§7.3.2.3)
-* SPS tail: `pcm_*` block, `num_short_term_ref_pic_sets` +
-  `st_ref_pic_set()`, `long_term_ref_pics_present_flag` +
-  long-term-ref tables, `sps_temporal_mvp_enabled_flag`,
-  `strong_intra_smoothing_enabled_flag`, VUI parameters,
-  `sps_extension_*_flag` tail and Range-Extension / SCC payloads.
-* `scaling_list_data()` (§7.3.4) — round 3 errors out when
+* `scaling_list_data()` (§7.3.4) — round 4 still errors out when
   `scaling_list_enabled_flag == 1`.
+* VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
+  the parsed SPS struct.
+* SPS extension bodies (Range Extension, Multilayer Annex F,
+  3D Annex I, SCC) — likewise surfaced as opaque bytes.
 * VPS tail: `vps_max_layer_id`, layer-set inclusion matrix,
   `vps_timing_info_present_flag`, HRD parameters,
   `vps_extension_data_flag`.
