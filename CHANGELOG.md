@@ -6,6 +6,69 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 7 (2026-05-24)
+
+- §7.3.6.1 non-IDR POC + reference-picture-set block — the
+  `slice_segment_header()` sub-block gated by
+  `nal_unit_type != IDR_W_RADL && nal_unit_type != IDR_N_LP`, closing
+  the opaque tail previously surfaced for non-IDR I-slice segments:
+  - `slice_pic_order_cnt_lsb` (`u(v)`, width
+    `log2_max_pic_order_cnt_lsb_minus4 + 4`, range
+    0..=`MaxPicOrderCntLsb − 1`).
+  - `short_term_ref_pic_set_sps_flag` (`u(1)`), with the §7.4.7.1
+    constraint that the value shall be 0 when
+    `num_short_term_ref_pic_sets == 0`.
+  - In-line `st_ref_pic_set(num_short_term_ref_pic_sets)` (§7.3.7)
+    when `short_term_ref_pic_set_sps_flag == 0`, exposed via a new
+    `ShortTermRefPicSet::parse_slice_inline(&mut BitReader, &SeqParameterSet)`
+    public entry point that wraps the existing per-set parser with the
+    SPS context (`stRpsIdx == num_short_term_ref_pic_sets`, `all_rps =
+    sps.short_term_ref_pic_sets`).
+  - `short_term_ref_pic_set_idx` (`u(v)`, width
+    `Ceil(Log2(num_short_term_ref_pic_sets))`) when
+    `short_term_ref_pic_set_sps_flag == 1 && num_short_term_ref_pic_sets > 1`
+    (inferred to 0 otherwise).
+  - The long-term-ref-pic block gated by
+    `sps.long_term_ref_pics_present_flag`: `num_long_term_sps`
+    (`ue(v)`, bounded by `num_long_term_ref_pics_sps`),
+    `num_long_term_pics` (`ue(v)`), and the per-entry
+    `lt_idx_sps[i]` (`u(v)`, width
+    `Ceil(Log2(num_long_term_ref_pics_sps))`) /
+    `poc_lsb_lt[i]` + `used_by_curr_pic_lt_flag[i]` /
+    `delta_poc_msb_present_flag[i]` /
+    `delta_poc_msb_cycle_lt[i]` (`ue(v)`) loop. The §7.4.7.1
+    inferences (`num_long_term_sps == 0`, `delta_poc_msb_cycle_lt ==
+    0`) are applied for absent fields, and a defensive 16-entry
+    ceiling on `num_long_term_pics` (matching the
+    §7.4.3.2.1 DPB-size bound) prevents a pathological encoder from
+    forcing an unbounded allocation.
+- `SliceLongTermRefPic` + `SliceLongTermRefPicSource` (public) carry
+  the per-entry source (SPS-indexed vs in-slice signalling) and the
+  delta-POC-MSB cycle.
+- `SliceSegmentHeader` gains `slice_pic_order_cnt_lsb`,
+  `short_term_ref_pic_set_sps_flag`, `inline_short_term_ref_pic_set`,
+  `short_term_ref_pic_set_idx`, `num_long_term_sps`,
+  `num_long_term_pics`, and `long_term_ref_pics` fields. The opaque
+  tail is now populated *only* for the P/B reference-list /
+  weighted-prediction body (round 8 target); independent I-slice
+  segments — IDR and non-IDR alike — parse all the way through
+  `byte_alignment()`.
+- `SliceError::InlineShortTermRpsParse(SpsError)` wraps SPS-layer
+  failures from the in-line `st_ref_pic_set` parse, with truncation
+  and bit-stream errors flattened back into `SliceError::Truncated` /
+  `SliceError::Bitstream` so the public surface stays predictable.
+- 4 new unit tests (total 65, was 61): hand-assembled non-IDR I-slice
+  CRA header with the in-line zero-pic short-term RPS;
+  SPS-resident short-term RPS with a single SPS entry (index inferred);
+  SPS-resident with multiple entries (`short_term_ref_pic_set_idx`
+  `u(v)` width = `Ceil(Log2(N))`); long-term-ref-pic block with one
+  SPS-indexed + one in-slice entry plus a `delta_poc_msb_cycle_lt`;
+  rejection of `short_term_ref_pic_set_sps_flag == 1` when
+  `num_short_term_ref_pic_sets == 0`. The previously-deferred
+  `defers_non_idr_poc_block` test was rewritten in place rather than
+  ignored — its old premise (non-IDR slice surfaces an opaque tail) is
+  exactly what this round eliminates.
+
 ### Added — clean-room rebuild round 6 (2026-05-24)
 
 - §7.3.6.1 `SliceSegmentHeader` structural parse — the

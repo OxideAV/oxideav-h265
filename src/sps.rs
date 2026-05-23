@@ -798,6 +798,32 @@ impl OpaqueTail {
 }
 
 impl ShortTermRefPicSet {
+    /// Parse the in-line slice-header `st_ref_pic_set( num_short_term_ref_pic_sets )`
+    /// per §7.3.6.1 / §7.3.7.
+    ///
+    /// This is the entry point the slice-header parser uses when
+    /// `short_term_ref_pic_set_sps_flag == 0`: the picture's short-term
+    /// RPS is constructed *inline* in the slice header at index
+    /// `stRpsIdx == num_short_term_ref_pic_sets`, with the SPS's
+    /// pre-existing list ([`SeqParameterSet::short_term_ref_pic_sets`])
+    /// supplying `all_rps` for the §7.4.8 `RefRpsIdx` derivation.
+    ///
+    /// `br` must be positioned at the first bit of `st_ref_pic_set()`.
+    /// On success the reader is advanced past the structure; on a
+    /// truncation or range-check failure the reader state is undefined.
+    pub fn parse_slice_inline(
+        br: &mut BitReader<'_>,
+        sps: &SeqParameterSet,
+    ) -> Result<Self, SpsError> {
+        Self::parse(
+            br,
+            sps.num_short_term_ref_pic_sets,
+            sps.num_short_term_ref_pic_sets,
+            sps.short_term_ref_pic_sets.last(),
+            &sps.short_term_ref_pic_sets,
+        )
+    }
+
     /// Parse one `st_ref_pic_set( stRpsIdx )` per §7.3.7.
     ///
     /// * `st_rps_idx` is `stRpsIdx`.
