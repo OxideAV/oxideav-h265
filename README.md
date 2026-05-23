@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 6 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 7 (2026-05-24).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,20 +14,28 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 6 adds the
-§7.3.6.1 slice-segment-header parse — the `slice_segment_header()`
-syntax structure for an independent slice segment, taking the
-activated SPS + PPS as context (field widths and presence gates are
-SPS/PPS-derived). Independent **I-slice IDR** segments parse end to end
-through `byte_alignment()` (including `slice_qp_delta`, the chroma QP
-offsets, the deblocking override block, the loop-filter-across-slices
-gate, the entry-point-offset block, and the header extension). The two
-bodies that need decoded-picture-buffer state — the non-IDR POC /
-reference-picture-set block and the P/B reference-list /
-weighted-prediction sub-structures — are surfaced as an opaque-bytes
-tail. It builds on round 5's §7.3.2.3.1 PPS parse, round 4's complete
-SPS RBSP body — PCM block, short-term reference picture sets (§7.3.7),
-the long-term reference picture table, the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 7 closes the
+**non-IDR POC + reference-picture-set block** of §7.3.6.1: the
+slice-segment-header parser now materialises `slice_pic_order_cnt_lsb`
+(`u(v)`, width `log2_max_pic_order_cnt_lsb_minus4 + 4`),
+`short_term_ref_pic_set_sps_flag`, either the in-line
+`st_ref_pic_set(num_short_term_ref_pic_sets)` (re-entered through the
+now-public `ShortTermRefPicSet::parse`) or the SPS-resident
+`short_term_ref_pic_set_idx` (`u(v)`, width
+`Ceil( Log2( num_short_term_ref_pic_sets ) )`), and the per-entry
+long-term reference picture block (`num_long_term_sps`,
+`num_long_term_pics`, and the array of
+[`SliceLongTermRefEntry`] carrying `lt_idx_sps` / `poc_lsb_lt` /
+`used_by_curr_pic_lt_flag` / `delta_poc_msb_present_flag` /
+`delta_poc_msb_cycle_lt`). Round 7 therefore parses **every independent
+I-slice segment — IDR and non-IDR alike — end to end through
+`byte_alignment()`**; the P/B reference-list / weighted-prediction
+sub-structures (§7.3.6.2 / §7.3.6.3) remain surfaced as an
+opaque-bytes tail because they need DPB-derived `NumPicTotalCurr` /
+`RefPicList` state. It builds on round 6's IDR-only slice-header
+parse, round 5's §7.3.2.3.1 PPS parse, round 4's complete SPS RBSP
+body — PCM block, short-term reference picture sets (§7.3.7), the
+long-term reference picture table, the
 `sps_temporal_mvp_enabled_flag` / `strong_intra_smoothing_enabled_flag`
 pair, and the VUI / extension gates — round 3's structural prefix,
 round 2's VPS / profile-tier-level (§7.3.2.1 + §7.3.3), and round 1's
@@ -118,26 +126,38 @@ CABAC remain unimplemented.
   `dependent_slice_segment_flag` + `slice_segment_address` (`u(v)`,
   width `Ceil( Log2( PicSizeInCtbsY ) )`); for independent segments the
   `slice_reserved_flag[]` block, [`SliceType`] (Table 7-7),
-  `pic_output_flag`, `colour_plane_id`,
-  `slice_temporal_mvp_enabled_flag`, and the SAO luma / chroma gates.
-  Independent I-slice IDR segments parse end to end through
-  `byte_alignment()`: `slice_qp_delta` (`se(v)`), the chroma QP
-  offsets, the deblocking override block ([`SliceDeblocking`]),
+  `pic_output_flag`, `colour_plane_id`, then the **non-IDR POC +
+  reference-picture-set block**: `slice_pic_order_cnt_lsb` (`u(v)`,
+  width `log2_max_pic_order_cnt_lsb_minus4 + 4`),
+  `short_term_ref_pic_set_sps_flag`, either the in-line
+  `st_ref_pic_set( num_short_term_ref_pic_sets )` (re-entered via the
+  now-public [`ShortTermRefPicSet::parse`] — exposed at
+  `SeqParameterSet::short_term_ref_pic_sets.last()` as the chain
+  starting point) or `short_term_ref_pic_set_idx` (`u(v)`, width
+  `Ceil( Log2( num_short_term_ref_pic_sets ) )`), and the per-entry
+  long-term reference picture block ([`SliceLongTermRefEntry`] —
+  `lt_idx_sps`, `poc_lsb_lt`, `used_by_curr_pic_lt_flag`,
+  `delta_poc_msb_present_flag`, `delta_poc_msb_cycle_lt`); then
+  `slice_temporal_mvp_enabled_flag` and the SAO luma / chroma gates.
+  Independent I-slice segments — IDR **and** non-IDR — parse end to
+  end through `byte_alignment()`: `slice_qp_delta` (`se(v)`), the
+  chroma QP offsets, the deblocking override block
+  ([`SliceDeblocking`]),
   `slice_loop_filter_across_slices_enabled_flag`, the
   entry-point-offset block ([`EntryPointOffsets`]), and the
-  header-extension block; [`SliceSegmentHeader::byte_offset_to_slice_data`]
-  reports where `slice_segment_data()` begins, and
-  [`SliceSegmentHeader::slice_qp_y`] applies equation 7-54. The §7.4.7.1
-  inference rules are applied to absent fields. The non-IDR POC /
-  reference-picture-set block and the P/B reference-list /
-  weighted-prediction sub-structures (which need DPB state) are
-  surfaced as an [`OpaqueTail`] rather than decoded.
+  header-extension block;
+  [`SliceSegmentHeader::byte_offset_to_slice_data`] reports where
+  `slice_segment_data()` begins, and
+  [`SliceSegmentHeader::slice_qp_y`] applies equation 7-54. The
+  §7.4.7.1 inference rules are applied to absent fields. Only the
+  P/B reference-list / weighted-prediction sub-structures (which need
+  DPB state) are surfaced as an [`OpaqueTail`] rather than decoded.
 
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
 [`SeqParameterSet::parse`], [`PicParameterSet::parse`],
-[`SliceSegmentHeader::parse`].
+[`SliceSegmentHeader::parse`], [`ShortTermRefPicSet::parse`].
 
 ## Not yet implemented
 
@@ -156,14 +176,11 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 * VPS tail: `vps_max_layer_id`, layer-set inclusion matrix,
   `vps_timing_info_present_flag`, HRD parameters,
   `vps_extension_data_flag`.
-* Slice header (§7.3.6.1) deferred bodies: the non-IDR POC /
-  reference-picture-set block (`slice_pic_order_cnt_lsb`,
-  `short_term_ref_pic_set_sps_flag`, the inline `st_ref_pic_set()`,
-  the long-term block) and the P/B `ref_pic_lists_modification()`
-  (§7.3.6.2) / `pred_weight_table()` (§7.3.6.3) sub-structures —
-  currently surfaced as an opaque tail; both need the SPS short-term-RPS
-  parser exposed publicly and DPB-derived `NumPicTotalCurr` /
-  `RefPicList` state.
+* Slice header (§7.3.6.1) deferred bodies: the P/B
+  `ref_pic_lists_modification()` (§7.3.6.2) and `pred_weight_table()`
+  (§7.3.6.3) sub-structures — currently surfaced as an opaque tail;
+  these need DPB-derived `NumPicTotalCurr` / `RefPicList` state to
+  compute the variable-width fields.
 * Slice data (§7.3.8)
 * CABAC entropy coding (§9.3) — blocked on the docs `cu_qp_delta`
   + `last_sig_coeff` multi-QG / multi-CTU 4:2:2 trace gap.

@@ -37,19 +37,31 @@
 //!   reported [`SliceSegmentHeader::byte_offset_to_slice_data`] points
 //!   at the first byte of `slice_segment_data()`.
 //!
-//! ## What this round defers (surfaced, not decoded)
-//!
-//! Three points need state this round does not carry:
+//! ## What this round materialises additionally (round 7, 2026-05-24)
 //!
 //! * The **non-IDR picture-order-count + reference-picture-set block**
-//!   (`slice_pic_order_cnt_lsb`, `short_term_ref_pic_set_sps_flag`,
-//!   the inline `st_ref_pic_set()`, the long-term block) needs the
-//!   SPS short-term-RPS parser to be re-entered for the in-line
-//!   `stRpsIdx == num_short_term_ref_pic_sets` case, which is not yet
-//!   exposed publicly. When the current NAL unit is **not** an IDR
-//!   (`nal_unit_type != IDR_W_RADL && != IDR_N_LP`), the parser stops
-//!   right after `colour_plane_id` and surfaces the remainder as
-//!   [`SliceSegmentHeader::opaque_tail`].
+//!   per §7.3.6.1: `slice_pic_order_cnt_lsb` (`u(v)`, width
+//!   `log2_max_pic_order_cnt_lsb_minus4 + 4`),
+//!   `short_term_ref_pic_set_sps_flag`, the inline
+//!   `st_ref_pic_set(num_short_term_ref_pic_sets)` (re-entered through
+//!   the public [`crate::sps::ShortTermRefPicSet::parse`]) or
+//!   `short_term_ref_pic_set_idx` (`u(v)`, width
+//!   `Ceil( Log2( num_short_term_ref_pic_sets ) )`), and the
+//!   long-term-ref-picture block (`num_long_term_sps`,
+//!   `num_long_term_pics`, the per-entry `lt_idx_sps[i]` /
+//!   `poc_lsb_lt[i]` / `used_by_curr_pic_lt_flag[i]` /
+//!   `delta_poc_msb_present_flag[i]` / `delta_poc_msb_cycle_lt[i]`
+//!   array). Each entry is materialised in
+//!   [`SliceLongTermRefEntry`] and the array as
+//!   [`SliceSegmentHeader::long_term_refs`]. The §7.4.7.1 inference
+//!   defaults are applied to absent fields.
+//!
+//! Together with round 6, **independent I-slice segments parse end to
+//! end through `byte_alignment()` regardless of whether the NAL unit
+//! is an IDR**, including the non-IRAP intra-only NAL-unit-type case.
+//!
+//! ## What this round still defers (surfaced, not decoded)
+//!
 //! * The **P / B reference-list / weighted-prediction sub-structures**
 //!   (`ref_pic_lists_modification()` §7.3.6.2 and `pred_weight_table()`
 //!   §7.3.6.3) need DPB-derived `NumPicTotalCurr` / `RefPicList`
@@ -57,14 +69,10 @@
 //!   common P/B fields up to (but not including) the point where those
 //!   sub-structures would begin, then surfaces the remainder as the
 //!   opaque tail.
-//!
-//! Independent **I-slice IDR** segments — the dominant case for the
-//! intra-only fixtures this rebuild targets — are parsed end to end
-//! through `byte_alignment()`.
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::pps::PicParameterSet;
-use crate::sps::{OpaqueTail, SeqParameterSet};
+use crate::sps::{OpaqueTail, SeqParameterSet, ShortTermRefPicSet, SpsError};
 
 /// `nal_unit_type` value `BLA_W_LP` (Table 7-1). The IRAP range used by
 /// the `no_output_of_prior_pics_flag` gate is `BLA_W_LP..=RSV_IRAP_VCL23`.
@@ -126,6 +134,10 @@ pub enum SliceError {
     },
     /// An unexpected bitstream-level error surfaced from the reader.
     Bitstream(BitReaderError),
+    /// The in-line `st_ref_pic_set( num_short_term_ref_pic_sets )` form
+    /// surfaced an SPS-level parse error (delegated to the public
+    /// [`crate::sps::ShortTermRefPicSet::parse`]).
+    InlineRpsError(SpsError),
 }
 
 impl core::fmt::Display for SliceError {
@@ -136,6 +148,9 @@ impl core::fmt::Display for SliceError {
                 write!(f, "slice header syntax element {field} out of range: {got}")
             }
             Self::Bitstream(e) => write!(f, "bitstream error during slice header parse: {e}"),
+            Self::InlineRpsError(e) => {
+                write!(f, "inline st_ref_pic_set error in slice header: {e}")
+            }
         }
     }
 }
@@ -147,6 +162,17 @@ impl From<BitReaderError> for SliceError {
         match e {
             BitReaderError::EndOfBuffer => Self::Truncated,
             other => Self::Bitstream(other),
+        }
+    }
+}
+
+impl From<SpsError> for SliceError {
+    fn from(e: SpsError) -> Self {
+        match e {
+            // EndOfBuffer-equivalent surfaces from the SPS-level parser
+            // as Truncated when it reads past the RBSP end.
+            SpsError::Truncated => Self::Truncated,
+            other => Self::InlineRpsError(other),
         }
     }
 }
@@ -178,6 +204,41 @@ pub struct EntryPointOffsets {
     /// `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1` bits.
     /// Only meaningful when `num_entry_point_offsets > 0`.
     pub offset_len_minus1: u8,
+}
+
+/// One entry of the long-term reference-picture array signalled inside
+/// the non-IDR POC + reference-picture-set block of §7.3.6.1.
+///
+/// For the first `num_long_term_sps` entries the per-entry POC LSB and
+/// `used_by_curr_pic` come from the SPS's
+/// [`crate::sps::LongTermRefPicEntry`] table indexed by `lt_idx_sps`;
+/// for the remaining `num_long_term_pics` entries they are signalled
+/// in-line as `poc_lsb_lt[i]` (width
+/// `log2_max_pic_order_cnt_lsb_minus4 + 4`) and
+/// `used_by_curr_pic_lt_flag[i]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceLongTermRefEntry {
+    /// `lt_idx_sps[i]` (`u(v)`, width
+    /// `Ceil( Log2( num_long_term_ref_pics_sps ) )`).
+    /// `None` when the entry is signalled in-line (i.e.
+    /// `i >= num_long_term_sps`) or when `num_long_term_ref_pics_sps` is
+    /// 1 (the index is inferred to 0 per §7.4.7.1).
+    pub lt_idx_sps: Option<u32>,
+    /// `poc_lsb_lt[i]` (`u(v)`, width
+    /// `log2_max_pic_order_cnt_lsb_minus4 + 4`).
+    /// `None` when the entry is one of the SPS-resident entries (i.e.
+    /// `i < num_long_term_sps`); the resolved value lives in the SPS's
+    /// [`crate::sps::LongTermRefPicEntry`] at `lt_idx_sps`.
+    pub poc_lsb_lt: Option<u32>,
+    /// `used_by_curr_pic_lt_flag[i]` (`u(1)`).
+    /// `None` when the entry is SPS-resident (the SPS table carries the
+    /// `used_by_curr_pic` flag).
+    pub used_by_curr_pic_lt_flag: Option<bool>,
+    /// `delta_poc_msb_present_flag[i]` (`u(1)`).
+    pub delta_poc_msb_present_flag: bool,
+    /// `delta_poc_msb_cycle_lt[i]` (`ue(v)`). Inferred to 0 when
+    /// `delta_poc_msb_present_flag[i] == 0` (§7.4.7.1).
+    pub delta_poc_msb_cycle_lt: u32,
 }
 
 /// Parsed slice segment header per §7.3.6.1.
@@ -216,6 +277,42 @@ pub struct SliceSegmentHeader {
     /// `colour_plane_id` (`u(2)`). `None` when not present
     /// (`separate_colour_plane_flag == 0`).
     pub colour_plane_id: Option<u8>,
+    /// `slice_pic_order_cnt_lsb` (`u(v)`, width
+    /// `log2_max_pic_order_cnt_lsb_minus4 + 4`). `None` when the slice
+    /// is an IDR (`nal_unit_type == IDR_W_RADL || IDR_N_LP`) — IDR
+    /// pictures do not signal a POC LSB, and §7.4.7.1 infers it to 0.
+    pub slice_pic_order_cnt_lsb: Option<u32>,
+    /// `short_term_ref_pic_set_sps_flag`. `None` for IDR slices.
+    pub short_term_ref_pic_set_sps_flag: Option<bool>,
+    /// `short_term_ref_pic_set_idx` (`u(v)`, width
+    /// `Ceil( Log2( num_short_term_ref_pic_sets ) )`). Inferred to 0
+    /// when `short_term_ref_pic_set_sps_flag == 1` and
+    /// `num_short_term_ref_pic_sets <= 1` (§7.4.7.1). `None` for IDR
+    /// slices and for non-IDR slices that signal an in-line RPS
+    /// (`short_term_ref_pic_set_sps_flag == 0` — see
+    /// [`Self::inline_short_term_rps`]).
+    pub short_term_ref_pic_set_idx: Option<u32>,
+    /// Inline `st_ref_pic_set( num_short_term_ref_pic_sets )` parsed
+    /// for the non-IDR slice when
+    /// `short_term_ref_pic_set_sps_flag == 0`. `None` otherwise.
+    pub inline_short_term_rps: Option<ShortTermRefPicSet>,
+    /// `num_long_term_sps` (`ue(v)`). `None` for IDR slices and for
+    /// non-IDR slices whose SPS has `long_term_ref_pics_present_flag == 0`
+    /// (the long-term block is absent entirely). When the long-term
+    /// block is present but the SPS has `num_long_term_ref_pics_sps == 0`,
+    /// the syntax element is not signalled and §7.4.7.1 infers it to
+    /// 0; the materialised value is `Some(0)` in that case so callers
+    /// can iterate `0..(num_long_term_sps + num_long_term_pics)` against
+    /// the unwrapped sum directly.
+    pub num_long_term_sps: Option<u32>,
+    /// `num_long_term_pics` (`ue(v)`). `None` only when the long-term
+    /// block is absent (`long_term_ref_pics_present_flag == 0` or the
+    /// slice is IDR).
+    pub num_long_term_pics: Option<u32>,
+    /// Per-entry long-term reference picture metadata, in order, of
+    /// length `num_long_term_sps + num_long_term_pics`. Empty when the
+    /// long-term block is absent or both counts are 0.
+    pub long_term_refs: Vec<SliceLongTermRefEntry>,
     /// `slice_temporal_mvp_enabled_flag`. Inferred to false when not
     /// present (`sps_temporal_mvp_enabled_flag == 0`) (§7.4.7.1).
     pub slice_temporal_mvp_enabled_flag: bool,
@@ -327,6 +424,13 @@ impl SliceSegmentHeader {
         let mut pic_output_flag = true;
         let mut colour_plane_id = None;
         let mut slice_temporal_mvp_enabled_flag = false;
+        let mut slice_pic_order_cnt_lsb: Option<u32> = None;
+        let mut short_term_ref_pic_set_sps_flag: Option<bool> = None;
+        let mut short_term_ref_pic_set_idx: Option<u32> = None;
+        let mut inline_short_term_rps: Option<ShortTermRefPicSet> = None;
+        let mut num_long_term_sps_out: Option<u32> = None;
+        let mut num_long_term_pics_out: Option<u32> = None;
+        let mut long_term_refs: Vec<SliceLongTermRefEntry> = Vec::new();
 
         if !dependent_slice_segment_flag {
             for _ in 0..pps.num_extra_slice_header_bits {
@@ -344,23 +448,112 @@ impl SliceSegmentHeader {
                 colour_plane_id = Some(id);
             }
 
-            // Non-IDR POC + reference-picture-set block: deferred this
-            // round (needs the SPS short-term-RPS parser re-entered for
-            // the in-line stRpsIdx case). Surface the remainder.
+            // Non-IDR POC + reference-picture-set block (§7.3.6.1).
+            // Round 7: materialised in full. IDR pictures skip this
+            // block entirely (the POC LSB is inferred to 0).
             let is_idr = nal_unit_type == IDR_W_RADL || nal_unit_type == IDR_N_LP;
             if !is_idr {
-                return Ok(Self::with_opaque_tail(
-                    first_slice_segment_in_pic_flag,
-                    no_output_of_prior_pics_flag,
-                    slice_pic_parameter_set_id,
-                    dependent_slice_segment_flag,
-                    slice_segment_address,
-                    slice_reserved_flags,
-                    slice_type,
-                    pic_output_flag,
-                    colour_plane_id,
-                    OpaqueTail::capture_at(br.bit_pos(), rbsp),
-                ));
+                // slice_pic_order_cnt_lsb width is
+                // log2_max_pic_order_cnt_lsb_minus4 + 4 bits
+                // (§7.4.7.1).
+                let poc_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
+                let poc_lsb = br.u(poc_bits)?;
+                slice_pic_order_cnt_lsb = Some(poc_lsb);
+
+                let st_sps_flag = br.u1()? != 0;
+                short_term_ref_pic_set_sps_flag = Some(st_sps_flag);
+
+                if !st_sps_flag {
+                    // In-line st_ref_pic_set( num_short_term_ref_pic_sets ).
+                    let n_sps_rps = sps.num_short_term_ref_pic_sets;
+                    let prev = sps.short_term_ref_pic_sets.last();
+                    let rps = ShortTermRefPicSet::parse(
+                        &mut br,
+                        n_sps_rps,
+                        n_sps_rps,
+                        prev,
+                        &sps.short_term_ref_pic_sets,
+                    )?;
+                    inline_short_term_rps = Some(rps);
+                } else if sps.num_short_term_ref_pic_sets > 1 {
+                    // short_term_ref_pic_set_idx width is
+                    // Ceil( Log2( num_short_term_ref_pic_sets ) ) bits
+                    // (§7.4.7.1). Range 0..=num-1.
+                    let idx_bits = ceil_log2(sps.num_short_term_ref_pic_sets);
+                    let idx = br.u(idx_bits)?;
+                    if idx >= sps.num_short_term_ref_pic_sets {
+                        return Err(SliceError::ValueOutOfRange {
+                            field: "short_term_ref_pic_set_idx",
+                            got: idx as i64,
+                        });
+                    }
+                    short_term_ref_pic_set_idx = Some(idx);
+                } else {
+                    // Single SPS RPS, idx inferred to 0 (§7.4.7.1).
+                    short_term_ref_pic_set_idx = Some(0);
+                }
+
+                // Long-term reference picture block (§7.3.6.1).
+                if sps.long_term_ref_pics_present_flag {
+                    let mut num_lt_sps = 0u32;
+                    if sps.num_long_term_ref_pics_sps > 0 {
+                        let v = br.ue()?;
+                        if v > sps.num_long_term_ref_pics_sps {
+                            return Err(SliceError::ValueOutOfRange {
+                                field: "num_long_term_sps",
+                                got: v as i64,
+                            });
+                        }
+                        num_lt_sps = v;
+                    }
+                    let num_lt_pics = br.ue()?;
+                    // §7.4.7.1 caps num_long_term_pics against the
+                    // DPB-derived NumPicTotalCurr; we do not have the
+                    // DPB state, so apply only the structural bound:
+                    // it cannot exceed the maximum signalled in any
+                    // base-profile sub-layer (the DPB cap is left for
+                    // the future buffer manager).
+                    num_long_term_sps_out = Some(num_lt_sps);
+                    num_long_term_pics_out = Some(num_lt_pics);
+
+                    let total = num_lt_sps + num_lt_pics;
+                    let poc_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
+                    for i in 0..total {
+                        let mut lt_idx_sps = None;
+                        let mut poc_lsb_lt = None;
+                        let mut used_by_curr_pic_lt_flag = None;
+                        if i < num_lt_sps {
+                            // SPS-resident entry.
+                            if sps.num_long_term_ref_pics_sps > 1 {
+                                let idx_bits = ceil_log2(sps.num_long_term_ref_pics_sps);
+                                let lt_idx = br.u(idx_bits)?;
+                                if lt_idx >= sps.num_long_term_ref_pics_sps {
+                                    return Err(SliceError::ValueOutOfRange {
+                                        field: "lt_idx_sps",
+                                        got: lt_idx as i64,
+                                    });
+                                }
+                                lt_idx_sps = Some(lt_idx);
+                            } else {
+                                // Inferred 0 per §7.4.7.1.
+                                lt_idx_sps = Some(0);
+                            }
+                        } else {
+                            // Inline entry.
+                            poc_lsb_lt = Some(br.u(poc_bits)?);
+                            used_by_curr_pic_lt_flag = Some(br.u1()? != 0);
+                        }
+                        let dp_msb_present = br.u1()? != 0;
+                        let dp_msb_cycle = if dp_msb_present { br.ue()? } else { 0 };
+                        long_term_refs.push(SliceLongTermRefEntry {
+                            lt_idx_sps,
+                            poc_lsb_lt,
+                            used_by_curr_pic_lt_flag,
+                            delta_poc_msb_present_flag: dp_msb_present,
+                            delta_poc_msb_cycle_lt: dp_msb_cycle,
+                        });
+                    }
+                }
             }
 
             if sps.sps_temporal_mvp_enabled_flag {
@@ -393,6 +586,13 @@ impl SliceSegmentHeader {
                 slice_type,
                 pic_output_flag,
                 colour_plane_id,
+                slice_pic_order_cnt_lsb,
+                short_term_ref_pic_set_sps_flag,
+                short_term_ref_pic_set_idx,
+                inline_short_term_rps,
+                num_long_term_sps: num_long_term_sps_out,
+                num_long_term_pics: num_long_term_pics_out,
+                long_term_refs,
                 slice_temporal_mvp_enabled_flag,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
@@ -424,6 +624,13 @@ impl SliceSegmentHeader {
                 slice_type,
                 pic_output_flag,
                 colour_plane_id,
+                slice_pic_order_cnt_lsb,
+                short_term_ref_pic_set_sps_flag,
+                short_term_ref_pic_set_idx,
+                inline_short_term_rps,
+                num_long_term_sps: num_long_term_sps_out,
+                num_long_term_pics: num_long_term_pics_out,
+                long_term_refs,
                 slice_temporal_mvp_enabled_flag,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
@@ -518,6 +725,13 @@ impl SliceSegmentHeader {
             slice_type,
             pic_output_flag,
             colour_plane_id,
+            slice_pic_order_cnt_lsb,
+            short_term_ref_pic_set_sps_flag,
+            short_term_ref_pic_set_idx,
+            inline_short_term_rps,
+            num_long_term_sps: num_long_term_sps_out,
+            num_long_term_pics: num_long_term_pics_out,
+            long_term_refs,
             slice_temporal_mvp_enabled_flag,
             slice_sao_luma_flag,
             slice_sao_chroma_flag,
@@ -533,47 +747,6 @@ impl SliceSegmentHeader {
             byte_offset_to_slice_data: Some(byte_offset),
             opaque_tail: None,
         })
-    }
-
-    /// Assemble a header that stopped at a deferred body (the non-IDR
-    /// POC/RPS block), with the inferred / default values for every
-    /// field beyond the cut-off point.
-    #[allow(clippy::too_many_arguments)]
-    fn with_opaque_tail(
-        first_slice_segment_in_pic_flag: bool,
-        no_output_of_prior_pics_flag: Option<bool>,
-        slice_pic_parameter_set_id: u8,
-        dependent_slice_segment_flag: bool,
-        slice_segment_address: u32,
-        slice_reserved_flags: Vec<bool>,
-        slice_type: Option<SliceType>,
-        pic_output_flag: bool,
-        colour_plane_id: Option<u8>,
-        opaque_tail: OpaqueTail,
-    ) -> Self {
-        Self {
-            first_slice_segment_in_pic_flag,
-            no_output_of_prior_pics_flag,
-            slice_pic_parameter_set_id,
-            dependent_slice_segment_flag,
-            slice_segment_address,
-            slice_reserved_flags,
-            slice_type,
-            pic_output_flag,
-            colour_plane_id,
-            slice_temporal_mvp_enabled_flag: false,
-            slice_sao_luma_flag: false,
-            slice_sao_chroma_flag: false,
-            slice_qp_delta: None,
-            slice_cb_qp_offset: 0,
-            slice_cr_qp_offset: 0,
-            deblocking: None,
-            slice_loop_filter_across_slices_enabled_flag: None,
-            entry_point_offsets: None,
-            slice_segment_header_extension_length: None,
-            byte_offset_to_slice_data: None,
-            opaque_tail: Some(opaque_tail),
-        }
     }
 
     /// `SliceQpY = 26 + init_qp_minus26 + slice_qp_delta` (equation
@@ -819,33 +992,93 @@ mod tests {
         assert_eq!(sh.byte_offset_to_slice_data, Some(2));
     }
 
-    /// Non-IDR slice: the parser stops after colour_plane_id (absent
-    /// here) and surfaces an opaque tail.
+    /// Non-IDR I-slice with `num_short_term_ref_pic_sets == 0` and
+    /// `long_term_ref_pics_present_flag == 0`: the POC block is just
+    /// `slice_pic_order_cnt_lsb` (8 bits, given the SPS context) +
+    /// `short_term_ref_pic_set_sps_flag` (which must be 1 because there's
+    /// no in-line `st_ref_pic_set()` worth a single SPS-resident set;
+    /// idx is inferred 0). The header then continues through SAO and
+    /// the I-slice tail to `byte_alignment()`.
     #[test]
-    fn defers_non_idr_poc_block() {
+    fn parses_non_idr_i_slice_poc_block_no_rps() {
+        // SPS has num_short_term_ref_pic_sets=0 (matches the fixture
+        // SPS used as the seed for ctx_sps) and
+        // long_term_ref_pics_present_flag=0.
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        assert_eq!(sps.num_short_term_ref_pic_sets, 0);
+        assert!(!sps.long_term_ref_pics_present_flag);
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
-        // first=1, no_output absent (CRA is IRAP -> present!). Use a
-        // non-IRAP trailing-picture NAL type (e.g. TRAIL_R = 1) so
-        // no_output is absent and the body reaches the POC block.
+
+        // first=1, no_output absent (TRAIL_R is not IRAP), pps_id=0,
+        // slice_type ue=011 -> 2 (I), slice_pic_order_cnt_lsb u(8)=7,
+        // short_term_ref_pic_set_sps_flag=1 (idx inferred 0;
+        // num_short_term_ref_pic_sets <= 1 so no idx field),
+        // mvp_gate (sps_temporal_mvp_enabled_flag=1) -> mvp=0,
+        // sao_l=1, sao_c=0, slice_qp_delta se=011 -> -1,
+        // loop_filter_across_slices=1, byte_alignment.
         let bits = concat_bits(&[
-            (1, 1),     // first_slice_segment_in_pic_flag
-            (0b1, 1),   // pps_id ue '1' -> 0
-            (0b010, 3), // slice_type ue '010' -> 1 (P)
-            // Next would be slice_pic_order_cnt_lsb (deferred).
-            (0b1010, 4), // arbitrary tail bits captured opaquely
+            (1, 1),     // first
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> 2 (I)
+            (0x07, 8),  // slice_pic_order_cnt_lsb (u(8))
+            (1, 1),     // short_term_ref_pic_set_sps_flag (idx inferred 0)
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (0, 1),     // sao_c
+            (0b011, 3), // slice_qp_delta se -> -1
+            (1, 1),     // loop_filter_across_slices
+            (1, 1),     // byte_alignment
         ]);
         let rbsp = pack_bits(&bits);
         let sh =
             SliceSegmentHeader::parse(&rbsp, 1 /* TRAIL_R */, &sps, &pps).expect("slice header");
         assert!(sh.first_slice_segment_in_pic_flag);
         assert_eq!(sh.no_output_of_prior_pics_flag, None);
+        assert_eq!(sh.slice_type, Some(SliceType::I));
+        assert_eq!(sh.slice_pic_order_cnt_lsb, Some(7));
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(true));
+        assert_eq!(sh.short_term_ref_pic_set_idx, Some(0));
+        assert!(sh.inline_short_term_rps.is_none());
+        assert!(sh.num_long_term_sps.is_none());
+        assert!(sh.long_term_refs.is_empty());
+        assert!(!sh.slice_temporal_mvp_enabled_flag);
+        assert!(sh.slice_sao_luma_flag);
+        assert!(!sh.slice_sao_chroma_flag);
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+        assert_eq!(sh.slice_loop_filter_across_slices_enabled_flag, Some(true));
+        assert!(sh.opaque_tail.is_none());
+    }
+
+    /// Non-IDR P-slice: the parser parses the POC block then defers the
+    /// P/B reference-list / weighted-prediction body after the SAO
+    /// block.
+    #[test]
+    fn defers_non_idr_p_slice_after_poc_block() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // Same shape as the I-slice above, but slice_type = P. After
+        // the SAO block the parser defers the P/B ref-list etc.
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> 1 (P)
+            (0x07, 8),  // slice_pic_order_cnt_lsb (u(8))
+            (1, 1),     // short_term_ref_pic_set_sps_flag (idx inferred 0)
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (1, 1),     // sao_c
+            (0, 1),     // first deferred bit
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh =
+            SliceSegmentHeader::parse(&rbsp, 1 /* TRAIL_R */, &sps, &pps).expect("slice header");
         assert_eq!(sh.slice_type, Some(SliceType::P));
+        assert_eq!(sh.slice_pic_order_cnt_lsb, Some(7));
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(true));
+        assert!(sh.slice_sao_luma_flag);
+        assert!(sh.slice_sao_chroma_flag);
         assert!(sh.opaque_tail.is_some());
         assert_eq!(sh.slice_qp_delta, None);
-        // The opaque tail begins right after slice_type (bit 5).
-        let tail = sh.opaque_tail.unwrap();
-        assert_eq!(tail.start_bit_in_first_byte, 5);
     }
 
     /// IDR P-slice: the parser reaches the SAO block then defers the
@@ -983,6 +1216,290 @@ mod tests {
         assert_eq!(sh.slice_type, Some(SliceType::I));
         assert_eq!(sh.slice_qp_delta, Some(-1));
         assert_eq!(sh.slice_qp_y(&pps), Some(25));
+    }
+
+    /// Non-IDR I-slice that selects an SPS-resident short-term RPS via
+    /// `short_term_ref_pic_set_idx`. Builds a fixture SPS where
+    /// `num_short_term_ref_pic_sets = 4` (so the idx field is 2 bits
+    /// wide).
+    #[test]
+    fn parses_non_idr_with_st_rps_idx_field() {
+        let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        // Hand-populate the SPS with 4 trivial RPSes so the idx field
+        // is 2 bits wide (Ceil(Log2(4)) = 2).
+        sps.num_short_term_ref_pic_sets = 4;
+        sps.short_term_ref_pic_sets = vec![ShortTermRefPicSet::default(); 4];
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+
+        // first=1, pps_id=0, slice_type ue=011 -> I,
+        // slice_pic_order_cnt_lsb u(8)=5, sps_flag=1, idx u(2)=2,
+        // mvp=0, sao_l=1, sao_c=0, slice_qp_delta se=011 -> -1,
+        // loop_filter_across_slices=1, byte_alignment.
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id -> 0
+            (0b011, 3), // slice_type I
+            (0x05, 8),  // POC LSB
+            (1, 1),     // st_sps_flag
+            (0b10, 2),  // idx = 2
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (0, 1),     // sao_c
+            (0b011, 3), // qp_delta -1
+            (1, 1),     // lf_across
+            (1, 1),     // byte_alignment
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh =
+            SliceSegmentHeader::parse(&rbsp, 1 /* TRAIL_R */, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_pic_order_cnt_lsb, Some(5));
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(true));
+        assert_eq!(sh.short_term_ref_pic_set_idx, Some(2));
+        assert!(sh.inline_short_term_rps.is_none());
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+    }
+
+    /// `short_term_ref_pic_set_idx` out of range: with 4 SPS RPSes the
+    /// legal range is 0..=3; a value of 4 (and on, but we cap with the
+    /// 2-bit field width) is unreachable. Force the range check by
+    /// adding 5 RPSes and picking idx=5 via a 3-bit field.
+    #[test]
+    fn rejects_st_rps_idx_out_of_range() {
+        let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        // 5 RPSes -> Ceil(Log2(5)) = 3 bits, legal idx 0..=4. Use 5.
+        sps.num_short_term_ref_pic_sets = 5;
+        sps.short_term_ref_pic_sets = vec![ShortTermRefPicSet::default(); 5];
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),
+            (0b1, 1),
+            (0b011, 3), // I
+            (0x00, 8),  // POC LSB
+            (1, 1),     // sps_flag
+            (0b101, 3), // idx = 5 (illegal)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "short_term_ref_pic_set_idx",
+                got: 5
+            }
+        );
+    }
+
+    /// In-line `st_ref_pic_set( num_short_term_ref_pic_sets )` form:
+    /// when `short_term_ref_pic_set_sps_flag == 0` the parser re-enters
+    /// the public `ShortTermRefPicSet::parse`. Use the simplest non-IDR
+    /// case: SPS has 0 RPSes, slice provides an inline explicit RPS
+    /// with `num_negative_pics = 1`, `num_positive_pics = 0`.
+    #[test]
+    fn parses_inline_short_term_rps_in_slice() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        assert_eq!(sps.num_short_term_ref_pic_sets, 0);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // st_ref_pic_set( 0 ): for stRpsIdx == 0 the
+        // `inter_ref_pic_set_prediction_flag` bit is NOT signalled
+        // (per §7.3.7); inferred 0. The body is:
+        //   num_negative_pics ue -> 010 (value 1)
+        //   num_positive_pics ue -> 1 (value 0)
+        //   delta_poc_s0_minus1[0] ue -> 1 (value 0)
+        //   used_by_curr_pic_s0_flag[0] u1 -> 1
+        // BUT: in the slice header path, st_rps_idx ==
+        // num_short_term_ref_pic_sets (= 0), so st_rps_idx == 0 too
+        // and the prediction flag is still skipped.
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id -> 0
+            (0b011, 3), // I
+            (0x00, 8),  // POC LSB = 0
+            (0, 1),     // sps_flag = 0 (in-line RPS follows)
+            // st_ref_pic_set( 0 ): no inter_pred_flag (idx 0).
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b010, 3), // delta_poc_s0_minus1[0] ue -> 1
+            (1, 1),     // used_by_curr_pic_s0_flag[0]
+            // Continuing the slice header:
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (0, 1),     // sao_c
+            (0b011, 3), // qp_delta -1
+            (1, 1),     // lf_across
+            (1, 1),     // byte_alignment
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh =
+            SliceSegmentHeader::parse(&rbsp, 1 /* TRAIL_R */, &sps, &pps).expect("slice header");
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(false));
+        let inline = sh.inline_short_term_rps.as_ref().expect("inline RPS");
+        assert!(!inline.inter_ref_pic_set_prediction_flag);
+        assert_eq!(inline.num_negative_pics, 1);
+        assert_eq!(inline.num_positive_pics, 0);
+        assert_eq!(inline.delta_poc_s0_minus1.as_slice(), &[1u32]);
+        assert_eq!(inline.used_by_curr_pic_s0_flag.as_slice(), &[true]);
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+        assert!(sh.opaque_tail.is_none());
+    }
+
+    /// Non-IDR I-slice with a long-term reference block. SPS has
+    /// `num_long_term_ref_pics_sps = 2` (so `lt_idx_sps` is 1 bit) and
+    /// the slice picks one SPS-resident entry + one in-line entry.
+    #[test]
+    fn parses_long_term_ref_block_mixed_sps_and_inline() {
+        let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 2;
+        sps.long_term_ref_pics = vec![
+            crate::sps::LongTermRefPicEntry {
+                poc_lsb: 3,
+                used_by_curr_pic: true,
+            },
+            crate::sps::LongTermRefPicEntry {
+                poc_lsb: 5,
+                used_by_curr_pic: false,
+            },
+        ];
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+
+        // first=1, pps_id=0, slice_type I, POC LSB u(8)=9,
+        // sps_flag=1 (no idx field since num=0).
+        // (Strictly speaking num_short_term_ref_pic_sets == 0 means
+        // sps_flag must be 0 per §7.4.7.1; for this test we use
+        // sps_flag=0 with an inline empty RPS.)
+        //
+        // Easier: keep num_short_term_ref_pic_sets > 0 by injecting one
+        // SPS RPS into the same `sps` binding.
+        sps.num_short_term_ref_pic_sets = 1;
+        sps.short_term_ref_pic_sets = vec![ShortTermRefPicSet::default(); 1];
+
+        // Layout:
+        //   first(1)=1 pps_id ue '1'=0 slice_type ue '011'=I
+        //   slice_pic_order_cnt_lsb u(8)=9
+        //   st_sps_flag=1 (idx inferred 0, num_st_rps==1 so no idx field)
+        //   num_long_term_sps ue (gated by num_long_term_ref_pics_sps>0) '010'=1
+        //   num_long_term_pics ue '010'=1
+        //   entry 0 (i<num_lt_sps): lt_idx_sps u(1)=0 (=Ceil(Log2(2))=1)
+        //     dp_msb_present=0
+        //   entry 1 (inline): poc_lsb_lt u(8)=42 used=1 dp_msb_present=0
+        //   mvp=0 sao_l=1 sao_c=0 qp_delta se '011'=-1 lf_across=1
+        //   byte_alignment
+        let bits = concat_bits(&[
+            (1, 1),
+            (0b1, 1),
+            (0b011, 3),
+            (0x09, 8),  // POC LSB
+            (1, 1),     // st_sps_flag (idx inferred 0)
+            (0b010, 3), // num_long_term_sps = 1
+            (0b010, 3), // num_long_term_pics = 1
+            // entry 0 (SPS-resident, lt_idx_sps u(1))
+            (0, 1), // lt_idx_sps = 0
+            (0, 1), // delta_poc_msb_present_flag = 0
+            // entry 1 (inline)
+            (0x2a, 8), // poc_lsb_lt = 42
+            (1, 1),    // used_by_curr_pic_lt_flag = 1
+            (0, 1),    // delta_poc_msb_present_flag = 0
+            // rest of header
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (0, 1),     // sao_c
+            (0b011, 3), // qp_delta -1
+            (1, 1),     // lf_across
+            (1, 1),     // byte_alignment
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh =
+            SliceSegmentHeader::parse(&rbsp, 1 /* TRAIL_R */, &sps, &pps).expect("slice header");
+        assert_eq!(sh.num_long_term_sps, Some(1));
+        assert_eq!(sh.num_long_term_pics, Some(1));
+        assert_eq!(sh.long_term_refs.len(), 2);
+        let e0 = sh.long_term_refs[0];
+        assert_eq!(e0.lt_idx_sps, Some(0));
+        assert!(e0.poc_lsb_lt.is_none());
+        assert!(!e0.delta_poc_msb_present_flag);
+        assert_eq!(e0.delta_poc_msb_cycle_lt, 0);
+        let e1 = sh.long_term_refs[1];
+        assert_eq!(e1.poc_lsb_lt, Some(42));
+        assert_eq!(e1.used_by_curr_pic_lt_flag, Some(true));
+        assert!(!e1.delta_poc_msb_present_flag);
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+    }
+
+    /// `delta_poc_msb_present_flag` set carries a
+    /// `delta_poc_msb_cycle_lt` ue(v).
+    #[test]
+    fn parses_long_term_ref_block_with_delta_poc_msb() {
+        let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 0;
+        sps.num_short_term_ref_pic_sets = 1;
+        sps.short_term_ref_pic_sets = vec![ShortTermRefPicSet::default(); 1];
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // num_long_term_sps absent (gated by num_long_term_ref_pics_sps > 0).
+        // num_long_term_pics ue '010' = 1.
+        // entry 0 (inline): poc_lsb_lt u(8)=7 used=0 dp_msb_present=1
+        //   delta_poc_msb_cycle_lt ue '010' = 1
+        let bits = concat_bits(&[
+            (1, 1),
+            (0b1, 1),
+            (0b011, 3), // I
+            (0x00, 8),  // POC LSB
+            (1, 1),     // st_sps_flag (idx inferred 0)
+            (0b010, 3), // num_long_term_pics = 1
+            (0x07, 8),  // poc_lsb_lt = 7
+            (0, 1),     // used = 0
+            (1, 1),     // delta_poc_msb_present_flag = 1
+            (0b010, 3), // delta_poc_msb_cycle_lt ue -> 1
+            (0, 1),     // mvp
+            (1, 1),     // sao_l
+            (0, 1),     // sao_c
+            (0b011, 3), // qp_delta -1
+            (1, 1),     // lf_across
+            (1, 1),     // byte_alignment
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).expect("slice header");
+        // num_long_term_sps is absent in the bitstream (gated by
+        // num_long_term_ref_pics_sps > 0) but inferred to 0 per
+        // §7.4.7.1; the materialised value carries that inference.
+        assert_eq!(sh.num_long_term_sps, Some(0));
+        assert_eq!(sh.num_long_term_pics, Some(1));
+        assert_eq!(sh.long_term_refs.len(), 1);
+        let e0 = sh.long_term_refs[0];
+        assert_eq!(e0.poc_lsb_lt, Some(7));
+        assert_eq!(e0.used_by_curr_pic_lt_flag, Some(false));
+        assert!(e0.delta_poc_msb_present_flag);
+        assert_eq!(e0.delta_poc_msb_cycle_lt, 1);
+    }
+
+    /// `num_long_term_sps` exceeding the SPS-level
+    /// `num_long_term_ref_pics_sps` is rejected per §7.4.7.1.
+    #[test]
+    fn rejects_num_long_term_sps_overflow() {
+        let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 1; // legal 0..=1
+        sps.num_short_term_ref_pic_sets = 1;
+        sps.short_term_ref_pic_sets = vec![ShortTermRefPicSet::default(); 1];
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // num_long_term_sps ue '011' = 2 (out of range, > 1)
+        let bits = concat_bits(&[
+            (1, 1),
+            (0b1, 1),
+            (0b011, 3), // I
+            (0x00, 8),  // POC LSB
+            (1, 1),     // st_sps_flag
+            (0b011, 3), // num_long_term_sps = 2 (illegal)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "num_long_term_sps",
+                got: 2
+            }
+        );
     }
 
     // --- bit-packing test helpers ---

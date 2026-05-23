@@ -5,7 +5,7 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 + 3 + 4 + 5 + 6 land the Annex B NAL-unit byte-stream
+//! Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 land the Annex B NAL-unit byte-stream
 //! walker, the §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural
 //! parse (with a §7.3.3 profile_tier_level walk), the full §7.3.2.2
 //! SPS parse (through the `vui_parameters_present_flag` /
@@ -15,11 +15,17 @@
 //! `pps_extension_present_flag`, including the tiles and
 //! deblocking-control blocks; the PPS extension bodies are surfaced as
 //! an opaque tail), and the §7.3.6.1 slice-segment-header parse
-//! (independent I-slice IDR segments end to end; the non-IDR POC/RPS
-//! block and the P/B reference-list / weighted-prediction
-//! sub-structures are surfaced as an opaque tail). Slice data and
-//! CABAC are *not* implemented yet; the public decoder and encoder
-//! entry points still return [`Error::NotImplemented`].
+//! (independent I-slice segments — IDR **and** non-IDR — end to end,
+//! including the non-IDR POC + reference-picture-set block per round 7:
+//! `slice_pic_order_cnt_lsb`, `short_term_ref_pic_set_sps_flag`, the
+//! in-line `st_ref_pic_set(num_short_term_ref_pic_sets)` (re-entered
+//! through the now-public [`sps::ShortTermRefPicSet::parse`]) or the
+//! `short_term_ref_pic_set_idx`, and the per-entry long-term reference
+//! picture array; the P/B reference-list / weighted-prediction
+//! sub-structures (§7.3.6.2 / §7.3.6.3) are still surfaced as an
+//! opaque tail). Slice data and CABAC are *not* implemented yet; the
+//! public decoder and encoder entry points still return
+//! [`Error::NotImplemented`].
 //!
 //! ## What works today
 //!
@@ -79,11 +85,20 @@
 //!   taking the activated SPS + PPS as context (the
 //!   `slice_segment_address` and `slice_pic_order_cnt_lsb` widths plus
 //!   the SAO / MVP / tiles gates are SPS/PPS-derived). Independent
-//!   I-slice IDR segments parse end to end through `byte_alignment()`;
-//!   the non-IDR POC / reference-picture-set block and the P/B
-//!   reference-list / weighted-prediction sub-structures are surfaced
-//!   as an [`sps::OpaqueTail`]. The §7.4.7.1 inference rules are
-//!   applied to absent fields.
+//!   I-slice segments — IDR **and** non-IDR — parse end to end through
+//!   `byte_alignment()`. The non-IDR POC + reference-picture-set block
+//!   is materialised: `slice_pic_order_cnt_lsb` (`u(v)`),
+//!   `short_term_ref_pic_set_sps_flag`, either the in-line
+//!   `st_ref_pic_set(num_short_term_ref_pic_sets)` (via the now-public
+//!   [`sps::ShortTermRefPicSet::parse`]) or
+//!   `short_term_ref_pic_set_idx` (`u(v)`, width
+//!   `Ceil( Log2( num_short_term_ref_pic_sets ) )`), and the per-entry
+//!   long-term reference picture block ([`slice::SliceLongTermRefEntry`]
+//!   — `lt_idx_sps[i]` / `poc_lsb_lt[i]` / `used_by_curr_pic_lt_flag[i]`
+//!   / `delta_poc_msb_present_flag[i]` / `delta_poc_msb_cycle_lt[i]`).
+//!   The P/B reference-list / weighted-prediction sub-structures are
+//!   still surfaced as an [`sps::OpaqueTail`]. The §7.4.7.1 inference
+//!   rules are applied to absent fields.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
@@ -105,8 +120,8 @@ pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use slice::{
-    EntryPointOffsets, SliceDeblocking, SliceError, SliceSegmentHeader, SliceType, BLA_W_LP,
-    IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
+    EntryPointOffsets, SliceDeblocking, SliceError, SliceLongTermRefEntry, SliceSegmentHeader,
+    SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,

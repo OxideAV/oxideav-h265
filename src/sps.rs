@@ -808,7 +808,11 @@ impl ShortTermRefPicSet {
     ///   `delta_idx_minus1` (i.e. `stRpsIdx < num_short_term_ref_pic_sets`).
     /// * `all_rps` is the full list of RPSes parsed so far; the
     ///   §7.4.8 `RefRpsIdx` computation indexes into it.
-    fn parse(
+    ///
+    /// The slice-segment-header parser (§7.3.6.1) re-enters this routine
+    /// for the in-line `stRpsIdx == num_short_term_ref_pic_sets` form,
+    /// passing the activated SPS's full list of RPSes as `all_rps`.
+    pub fn parse(
         br: &mut BitReader<'_>,
         st_rps_idx: u32,
         num_short_term_ref_pic_sets: u32,

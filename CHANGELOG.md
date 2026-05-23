@@ -6,6 +6,74 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 7 (2026-05-24)
+
+- §7.3.6.1 non-IDR POC + reference-picture-set block in
+  `SliceSegmentHeader::parse`. The slice-segment-header parser now
+  materialises the body that round 6 surfaced opaquely for any
+  non-IDR slice:
+  - `slice_pic_order_cnt_lsb` (`u(v)`, width
+    `log2_max_pic_order_cnt_lsb_minus4 + 4`) per §7.4.7.1.
+  - `short_term_ref_pic_set_sps_flag` (`u(1)`).
+  - When `short_term_ref_pic_set_sps_flag == 0`, the in-line
+    `st_ref_pic_set( num_short_term_ref_pic_sets )` is parsed by
+    re-entering `ShortTermRefPicSet::parse` (now `pub`) with
+    `stRpsIdx = num_short_term_ref_pic_sets` and the SPS-resident
+    RPS list as the chain context. The parsed RPS is materialised
+    on `SliceSegmentHeader::inline_short_term_rps`.
+  - When `short_term_ref_pic_set_sps_flag == 1`, the SPS-resident
+    index is signalled as `short_term_ref_pic_set_idx` (`u(v)`,
+    width `Ceil( Log2( num_short_term_ref_pic_sets ) )`) and
+    range-checked against `num_short_term_ref_pic_sets`. When
+    `num_short_term_ref_pic_sets <= 1`, the field is absent and
+    inferred to 0 per §7.4.7.1.
+  - Long-term reference picture block, gated by
+    `long_term_ref_pics_present_flag`:
+    - `num_long_term_sps` (`ue(v)`), gated by
+      `num_long_term_ref_pics_sps > 0`; range-checked against
+      `num_long_term_ref_pics_sps`. Inferred to 0 when absent.
+    - `num_long_term_pics` (`ue(v)`).
+    - For each of the `num_long_term_sps + num_long_term_pics`
+      entries, a `SliceLongTermRefEntry` carrying
+      `lt_idx_sps[i]` (SPS-resident, `u(v)` of width
+      `Ceil( Log2( num_long_term_ref_pics_sps ) )` —
+      range-checked, inferred 0 when `num_long_term_ref_pics_sps <= 1`)
+      or the in-line `poc_lsb_lt[i]` (`u(v)`, width
+      `log2_max_pic_order_cnt_lsb_minus4 + 4`) +
+      `used_by_curr_pic_lt_flag[i]`; plus
+      `delta_poc_msb_present_flag[i]` and (when set)
+      `delta_poc_msb_cycle_lt[i]` (`ue(v)`, inferred 0 when
+      absent per §7.4.7.1).
+- `ShortTermRefPicSet::parse` is now `pub` (was crate-private). The
+  signature is unchanged: callers pass `stRpsIdx`,
+  `num_short_term_ref_pic_sets`, the previous-RPS reference, and the
+  list of all preceding RPSes (for the §7.4.8 `RefRpsIdx` chain).
+- Top-level `SliceLongTermRefEntry` re-export and a new
+  `SliceError::InlineRpsError(SpsError)` variant for SPS-level
+  errors surfaced by the in-line RPS path; the `EndOfBuffer`-equivalent
+  `SpsError::Truncated` is mapped through to `SliceError::Truncated`
+  so the existing truncated-RBSP test remains accurate.
+- Independent **non-IDR I slices** now parse end to end through
+  `byte_alignment()`, joining round 6's IDR I-slice coverage.
+- 8 net new unit tests (total 68, was 61; round 6's `defers_non_idr_poc_block` is replaced by the round-7 non-IDR end-to-end test):
+  - Non-IDR I-slice with `num_short_term_ref_pic_sets == 0` and
+    `long_term_ref_pics_present_flag == 0`, end-to-end through
+    `byte_alignment()` (the previous round-6 "defers opaquely" test
+    is replaced).
+  - Non-IDR P-slice POC block parsed, P/B body still deferred.
+  - `short_term_ref_pic_set_idx` `u(v)` field width (2 bits for
+    `num_short_term_ref_pic_sets == 4`).
+  - `short_term_ref_pic_set_idx` out-of-range rejection
+    (value 5 with `num_short_term_ref_pic_sets == 5`).
+  - In-line `st_ref_pic_set( num_short_term_ref_pic_sets )` parsed
+    (`num_negative_pics = 1`, one `delta_poc_s0_minus1`).
+  - Long-term block with one SPS-resident + one in-line entry
+    (mixed `lt_idx_sps` vs `poc_lsb_lt`).
+  - Long-term block with `delta_poc_msb_present_flag == 1`
+    carrying a `delta_poc_msb_cycle_lt` `ue(v)` payload.
+  - `num_long_term_sps` overflow rejection (value 2 with
+    `num_long_term_ref_pics_sps == 1`).
+
 ### Added — clean-room rebuild round 6 (2026-05-24)
 
 - §7.3.6.1 `SliceSegmentHeader` structural parse — the
