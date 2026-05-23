@@ -142,6 +142,28 @@ impl<'a> BitReader<'a> {
         Ok((1u32 << leading_zero_bits) - 1 + suffix)
     }
 
+    /// Read a 0-th-order signed Exp-Golomb code (the `se(v)`
+    /// descriptor). Per ITU-T Rec. H.265 §9.2.2: read a `ue(v)`
+    /// `codeNum`, then map it to a signed value per Table 9-3 as
+    /// `(-1)^(codeNum + 1) * Ceil(codeNum / 2)` — `codeNum` 0 → 0,
+    /// 1 → +1, 2 → -1, 3 → +2, 4 → -2, …
+    pub fn se(&mut self) -> Result<i32, BitReaderError> {
+        let code_num = self.ue()?;
+        // Ceil(codeNum / 2) without overflow: (codeNum + 1) / 2.
+        let magnitude = ((code_num as i64) + 1) / 2;
+        let value = if code_num % 2 == 0 {
+            // Even codeNum (0, 2, 4, …) maps to a non-positive value
+            // (0, -1, -2, …).
+            -magnitude
+        } else {
+            // Odd codeNum (1, 3, 5, …) maps to a positive value.
+            magnitude
+        };
+        // `value` is bounded by ±2^31 because `ue()` caps `codeNum`
+        // at `2^32 - 2`, whose mapped magnitude is `2^31 - 1`.
+        i32::try_from(value).map_err(|_| BitReaderError::ExpGolombOverflow)
+    }
+
     /// Current bit position from the start of the buffer.
     pub fn bit_pos(&self) -> usize {
         self.bit_pos
@@ -243,6 +265,27 @@ mod tests {
         let mut br = BitReader::new(&buf);
         br.skip(8).unwrap();
         assert_eq!(br.u(8).unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn se_table_9_3() {
+        // Per H.265 §9.2.2 Table 9-3, codeNum → se(v) value:
+        //   0 → 0, 1 → +1, 2 → -1, 3 → +2, 4 → -2, 5 → +3, 6 → -3.
+        // codeNum is itself ue(v); reuse the codewords 0..=6 packing
+        // from `ue_table_b9_2` (bits 1 010 011 00100 00101 00110 00111).
+        let buf = [0xA6, 0x42, 0x98, 0xE0];
+        let mut br = BitReader::new(&buf);
+        let got: Vec<i32> = (0..7).map(|_| br.se().unwrap()).collect();
+        assert_eq!(got, vec![0, 1, -1, 2, -2, 3, -3]);
+    }
+
+    #[test]
+    fn se_zero_is_single_one_bit() {
+        // codeNum 0 ('1') maps to value 0 and consumes one bit.
+        let buf = [0b1000_0000];
+        let mut br = BitReader::new(&buf);
+        assert_eq!(br.se().unwrap(), 0);
+        assert_eq!(br.bit_pos(), 1);
     }
 
     #[test]

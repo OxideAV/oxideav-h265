@@ -780,9 +780,16 @@ impl OpaqueTail {
     /// Capture all RBSP bytes from the byte holding the next un-read
     /// bit through end-of-buffer.
     fn capture(br: &BitReader<'_>, rbsp: &[u8]) -> Self {
-        let pos = br.bit_pos();
-        let byte_index = pos / 8;
-        let bit_in_byte = (pos % 8) as u8;
+        Self::capture_at(br.bit_pos(), rbsp)
+    }
+
+    /// Capture all RBSP bytes from the byte holding the bit at
+    /// `bit_pos` (counted MSB-first from the start of `rbsp`) through
+    /// end-of-buffer. Used by both the SPS VUI / extension tail and the
+    /// [`crate::pps::PicParameterSet`] extension tail.
+    pub fn capture_at(bit_pos: usize, rbsp: &[u8]) -> Self {
+        let byte_index = bit_pos / 8;
+        let bit_in_byte = (bit_pos % 8) as u8;
         Self {
             bytes: rbsp[byte_index..].to_vec(),
             start_bit_in_first_byte: bit_in_byte,

@@ -6,6 +6,67 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 5 (2026-05-24)
+
+- §7.3.2.3.1 `PicParameterSet` structural parse — the full general
+  `pic_parameter_set_rbsp()` body through `pps_extension_present_flag`:
+  - `pps_pic_parameter_set_id` (ue(v), 0..=63) +
+    `pps_seq_parameter_set_id` (ue(v), 0..=15).
+  - The slice-header gates `dependent_slice_segments_enabled_flag`,
+    `output_flag_present_flag`, `num_extra_slice_header_bits` (u3, not
+    range-checked per §7.4.3.3.1 "decoders shall allow any value"),
+    `sign_data_hiding_enabled_flag`, `cabac_init_present_flag`.
+  - `num_ref_idx_l0_default_active_minus1` /
+    `num_ref_idx_l1_default_active_minus1` (ue(v), 0..=14).
+  - `init_qp_minus26` (se(v)) range-checked against the loosest legal
+    bound −74..=25; `init_qp_in_range(bit_depth_luma_minus8)` re-checks
+    against the exact §7.4.3.3.1 lower bound −( 26 + QpBdOffsetY ) once
+    the active SPS bit depth is known.
+  - `constrained_intra_pred_flag`, `transform_skip_enabled_flag`,
+    `cu_qp_delta_enabled_flag` + `diff_cu_qp_delta_depth` (inferred 0
+    when disabled), `pps_cb_qp_offset` / `pps_cr_qp_offset` (se(v),
+    −12..=12), `pps_slice_chroma_qp_offsets_present_flag`,
+    `weighted_pred_flag`, `weighted_bipred_flag`,
+    `transquant_bypass_enabled_flag`.
+  - `tiles_enabled_flag` + `entropy_coding_sync_enabled_flag`, and the
+    tiles block (`TileInfo`): `num_tile_columns_minus1` /
+    `num_tile_rows_minus1`, `uniform_spacing_flag`, and the
+    `column_width_minus1[]` / `row_height_minus1[]` arrays when
+    `uniform_spacing_flag == 0`, plus
+    `loop_filter_across_tiles_enabled_flag`. When `tiles_enabled_flag`
+    is 0 the §7.4.3.3.1 single-tile inference (one column, one row,
+    uniform spacing, loop filter across tiles enabled) is materialised.
+  - `pps_loop_filter_across_slices_enabled_flag` and the
+    deblocking-filter-control block (`DeblockingFilterControl`):
+    `deblocking_filter_override_enabled_flag`,
+    `pps_deblocking_filter_disabled_flag`, and `pps_beta_offset_div2` /
+    `pps_tc_offset_div2` (se(v), −6..=6) when the filter is not
+    disabled; absent-control inference applied per §7.4.3.3.1.
+  - `pps_scaling_list_data_present_flag` — **rejected** with
+    `PpsError::ScalingListUnsupported` when 1 (shared deferral with the
+    SPS scaling-list path).
+  - `lists_modification_present_flag`,
+    `log2_parallel_merge_level_minus2`,
+    `slice_segment_header_extension_present_flag`,
+    `pps_extension_present_flag` — when set, the four extension flags,
+    their bodies, and `rbsp_trailing_bits()` are surfaced as a shared
+    `sps::OpaqueTail` via the new public `OpaqueTail::capture_at`.
+- `BitReader::se()` — 0-th-order signed Exp-Golomb (the se(v)
+  descriptor) per §9.2.2 Table 9-3: codeNum k → (−1)^(k+1)·Ceil(k/2).
+- Convenience derivations on `PicParameterSet`: `init_qp()`,
+  `num_ref_idx_l{0,1}_default_active()`, `num_tile_{columns,rows}()`,
+  `log2_par_mrg_level()`.
+- Top-level `Error::Pps(PpsError)` variant + `From<PpsError>`.
+- 10 new unit tests (total 52, was 42): se(v) Table-9-3 mapping +
+  single-bit-zero on `BitReader`; the fixture PPS parse cross-checked
+  against `docs/video/h265/fixtures/tiny-i-only-16x16-main/trace.txt`
+  (line 3); end-to-end PPS parse via the Annex B walker; a
+  hand-assembled tiles + deblocking-control PPS (non-uniform spacing,
+  non-zero β / tC offsets); opaque PPS-extension tail capture;
+  `pps_scaling_list_data_present_flag == 1` rejection;
+  `pps_pic_parameter_set_id > 63` rejection; truncated-RBSP rejection;
+  SPS-bit-depth-aware `init_qp_in_range` check.
+
 ### Added — clean-room rebuild round 4 (2026-05-22)
 
 - §7.3.2.2 SPS tail past `sample_adaptive_offset_enabled_flag`:
@@ -168,12 +229,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- PPS semantic parse (§7.3.2.3). RBSP-stop-bit handling.
+- Slice segment header parse (§7.3.6.1).
+- PPS range / SCC extensions (§7.3.2.3.2 / §7.3.2.3.3) — currently
+  surfaced as opaque bytes when `pps_extension_present_flag == 1`.
 - VUI parameters (§E.2.1) — currently surfaced as opaque bytes.
 - SPS extension bodies (Range Extension, Multilayer, 3D, SCC) —
   currently surfaced as opaque bytes alongside the VUI tail.
 - `scaling_list_data()` (§7.3.4) — currently rejected when
-  `scaling_list_enabled_flag == 1`.
+  `scaling_list_enabled_flag == 1` /
+  `pps_scaling_list_data_present_flag == 1`.
 - VPS tail: `vps_max_layer_id`, `vps_num_layer_sets_minus1`,
   `layer_id_included_flag` matrix, `vps_timing_info_present_flag`,
   HRD parameters, `vps_extension_data_flag`.

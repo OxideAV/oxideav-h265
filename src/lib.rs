@@ -5,14 +5,17 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 + 3 + 4 land the Annex B NAL-unit byte-stream walker,
-//! the §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural parse
-//! (with a §7.3.3 profile_tier_level walk), and the full §7.3.2.2 SPS
-//! parse (through the `vui_parameters_present_flag` /
+//! Rounds 1 + 2 + 3 + 4 + 5 land the Annex B NAL-unit byte-stream
+//! walker, the §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural
+//! parse (with a §7.3.3 profile_tier_level walk), the full §7.3.2.2
+//! SPS parse (through the `vui_parameters_present_flag` /
 //! `sps_extension_present_flag` gates, with the VUI body and any
-//! extension payload surfaced as an opaque-bytes tail). PPS semantic
-//! parse, slice decode, and CABAC are *not* implemented yet; the
-//! public decoder and encoder entry points still return
+//! extension payload surfaced as an opaque-bytes tail), and the
+//! §7.3.2.3.1 PPS parse (full general body through
+//! `pps_extension_present_flag`, including the tiles and
+//! deblocking-control blocks; the PPS extension bodies are surfaced as
+//! an opaque tail). Slice decode and CABAC are *not* implemented yet;
+//! the public decoder and encoder entry points still return
 //! [`Error::NotImplemented`].
 //!
 //! ## What works today
@@ -54,9 +57,24 @@
 //!   gates whose bodies are surfaced as [`sps::OpaqueTail`].
 //!   Scaling-list data (§7.3.4) is still deferred — the parser
 //!   refuses `scaling_list_enabled_flag == 1`.
+//! * §7.3.2.3.1 [`pps::PicParameterSet`] — the full general
+//!   `pic_parameter_set_rbsp()` body: the `pps_*_id` pair, the
+//!   slice-header gates, `init_qp_minus26` (`se(v)`), the chroma QP
+//!   offsets, the tiles block ([`pps::TileInfo`] — column/row counts
+//!   plus the explicit `column_width_minus1[]` / `row_height_minus1[]`
+//!   arrays when `uniform_spacing_flag == 0`), the
+//!   deblocking-filter-control block ([`pps::DeblockingFilterControl`]),
+//!   `lists_modification_present_flag`,
+//!   `log2_parallel_merge_level_minus2`, and the
+//!   `pps_extension_present_flag` gate (extension bodies surfaced as a
+//!   shared [`sps::OpaqueTail`]). `pps_scaling_list_data_present_flag
+//!   == 1` is refused alongside the SPS scaling-list deferral. The
+//!   §7.4.3.3.1 inference rules are applied so absent conditional
+//!   fields carry their effective value.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
-//! the parsed VPS structure, and [`sps`] for the parsed SPS.
+//! the parsed VPS structure, [`sps`] for the parsed SPS, and [`pps`]
+//! for the parsed PPS.
 
 #![warn(missing_debug_implementations)]
 
@@ -64,11 +82,13 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod nal;
+pub mod pps;
 pub mod sps;
 pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
+pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,
     ShortTermRefPicSet, SpsError, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
@@ -95,6 +115,9 @@ pub enum Error {
     /// An SPS-parser error surfaced through the top-level entry
     /// points.
     Sps(SpsError),
+    /// A PPS-parser error surfaced through the top-level entry
+    /// points.
+    Pps(PpsError),
 }
 
 impl core::fmt::Display for Error {
@@ -104,6 +127,7 @@ impl core::fmt::Display for Error {
             Self::Nal(e) => write!(f, "oxideav-h265 NAL error: {e}"),
             Self::Vps(e) => write!(f, "oxideav-h265 VPS error: {e}"),
             Self::Sps(e) => write!(f, "oxideav-h265 SPS error: {e}"),
+            Self::Pps(e) => write!(f, "oxideav-h265 PPS error: {e}"),
         }
     }
 }
@@ -125,6 +149,12 @@ impl From<VpsError> for Error {
 impl From<SpsError> for Error {
     fn from(e: SpsError) -> Self {
         Self::Sps(e)
+    }
+}
+
+impl From<PpsError> for Error {
+    fn from(e: PpsError) -> Self {
+        Self::Pps(e)
     }
 }
 
