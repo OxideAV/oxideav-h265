@@ -5,18 +5,21 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 + 3 + 4 + 5 land the Annex B NAL-unit byte-stream
+//! Rounds 1 + 2 + 3 + 4 + 5 + 6 land the Annex B NAL-unit byte-stream
 //! walker, the §7.3.1.2 NAL header parse, the §7.3.2.1 VPS structural
 //! parse (with a §7.3.3 profile_tier_level walk), the full §7.3.2.2
 //! SPS parse (through the `vui_parameters_present_flag` /
 //! `sps_extension_present_flag` gates, with the VUI body and any
-//! extension payload surfaced as an opaque-bytes tail), and the
+//! extension payload surfaced as an opaque-bytes tail), the
 //! §7.3.2.3.1 PPS parse (full general body through
 //! `pps_extension_present_flag`, including the tiles and
 //! deblocking-control blocks; the PPS extension bodies are surfaced as
-//! an opaque tail). Slice decode and CABAC are *not* implemented yet;
-//! the public decoder and encoder entry points still return
-//! [`Error::NotImplemented`].
+//! an opaque tail), and the §7.3.6.1 slice-segment-header parse
+//! (independent I-slice IDR segments end to end; the non-IDR POC/RPS
+//! block and the P/B reference-list / weighted-prediction
+//! sub-structures are surfaced as an opaque tail). Slice data and
+//! CABAC are *not* implemented yet; the public decoder and encoder
+//! entry points still return [`Error::NotImplemented`].
 //!
 //! ## What works today
 //!
@@ -71,10 +74,21 @@
 //!   == 1` is refused alongside the SPS scaling-list deferral. The
 //!   §7.4.3.3.1 inference rules are applied so absent conditional
 //!   fields carry their effective value.
+//! * §7.3.6.1 [`slice::SliceSegmentHeader`] — the
+//!   `slice_segment_header()` parse for an independent slice segment,
+//!   taking the activated SPS + PPS as context (the
+//!   `slice_segment_address` and `slice_pic_order_cnt_lsb` widths plus
+//!   the SAO / MVP / tiles gates are SPS/PPS-derived). Independent
+//!   I-slice IDR segments parse end to end through `byte_alignment()`;
+//!   the non-IDR POC / reference-picture-set block and the P/B
+//!   reference-list / weighted-prediction sub-structures are surfaced
+//!   as an [`sps::OpaqueTail`]. The §7.4.7.1 inference rules are
+//!   applied to absent fields.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
-//! the parsed VPS structure, [`sps`] for the parsed SPS, and [`pps`]
-//! for the parsed PPS.
+//! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
+//! for the parsed PPS, and [`crate::slice`] for the parsed slice
+//! header.
 
 #![warn(missing_debug_implementations)]
 
@@ -83,12 +97,17 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod nal;
 pub mod pps;
+pub mod slice;
 pub mod sps;
 pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
+pub use slice::{
+    EntryPointOffsets, SliceDeblocking, SliceError, SliceSegmentHeader, SliceType, BLA_W_LP,
+    IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
+};
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,
     ShortTermRefPicSet, SpsError, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
@@ -118,6 +137,9 @@ pub enum Error {
     /// A PPS-parser error surfaced through the top-level entry
     /// points.
     Pps(PpsError),
+    /// A slice-segment-header-parser error surfaced through the
+    /// top-level entry points.
+    Slice(SliceError),
 }
 
 impl core::fmt::Display for Error {
@@ -128,6 +150,7 @@ impl core::fmt::Display for Error {
             Self::Vps(e) => write!(f, "oxideav-h265 VPS error: {e}"),
             Self::Sps(e) => write!(f, "oxideav-h265 SPS error: {e}"),
             Self::Pps(e) => write!(f, "oxideav-h265 PPS error: {e}"),
+            Self::Slice(e) => write!(f, "oxideav-h265 slice header error: {e}"),
         }
     }
 }
@@ -155,6 +178,12 @@ impl From<SpsError> for Error {
 impl From<PpsError> for Error {
     fn from(e: PpsError) -> Self {
         Self::Pps(e)
+    }
+}
+
+impl From<SliceError> for Error {
+    fn from(e: SliceError) -> Self {
+        Self::Slice(e)
     }
 }
 

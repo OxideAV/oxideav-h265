@@ -6,6 +6,88 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 6 (2026-05-24)
+
+- §7.3.6.1 `SliceSegmentHeader` structural parse — the
+  `slice_segment_header()` syntax structure for an independent slice
+  segment, taking the activated SPS + PPS as parse context (several
+  field widths and presence gates are SPS/PPS-derived):
+  - `first_slice_segment_in_pic_flag`, `no_output_of_prior_pics_flag`
+    (only present in the IRAP NAL-unit-type range
+    `BLA_W_LP..=RSV_IRAP_VCL23`), `slice_pic_parameter_set_id` (ue(v),
+    0..=63).
+  - For non-first segments: `dependent_slice_segment_flag` (only when
+    `dependent_slice_segments_enabled_flag`) and `slice_segment_address`
+    (u(v), width `Ceil( Log2( PicSizeInCtbsY ) )`, range-checked
+    against `PicSizeInCtbsY`).
+  - For independent segments: the `slice_reserved_flag[]` block
+    (`num_extra_slice_header_bits` flags), `slice_type` (Table 7-7,
+    rejected outside 0..=2), `pic_output_flag` (only when
+    `output_flag_present_flag`; inferred 1 otherwise), `colour_plane_id`
+    (only when `separate_colour_plane_flag`),
+    `slice_temporal_mvp_enabled_flag` (only when
+    `sps_temporal_mvp_enabled_flag`).
+  - SAO block: `slice_sao_luma_flag` + `slice_sao_chroma_flag`
+    (the latter gated on `ChromaArrayType != 0`).
+  - I-slice tail through `byte_alignment()`: `slice_qp_delta` (se(v)),
+    `slice_c{b,r}_qp_offset` (se(v), −12..=12, gated by
+    `pps_slice_chroma_qp_offsets_present_flag`), the deblocking-filter
+    override block (`SliceDeblocking` — `deblocking_filter_override_flag`
+    / `slice_deblocking_filter_disabled_flag` /
+    `slice_beta_offset_div2` / `slice_tc_offset_div2`, se(v), −6..=6,
+    with the §7.4.7.1 PPS-inference defaults applied when absent),
+    `slice_loop_filter_across_slices_enabled_flag` (with its
+    SAO/deblock gate), the entry-point-offset block
+    (`EntryPointOffsets` — `num_entry_point_offsets` /
+    `offset_len_minus1` 0..=31 / skipped `entry_point_offset_minus1[]`)
+    when `tiles_enabled_flag || entropy_coding_sync_enabled_flag`, and
+    the slice-segment-header extension block. `byte_alignment()` is
+    consumed and `byte_offset_to_slice_data` reports where
+    `slice_segment_data()` begins.
+  - Convenience `slice_qp_y(pps)` = `26 + init_qp_minus26 +
+    slice_qp_delta` (equation 7-54).
+- Two deferred bodies are surfaced as an `sps::OpaqueTail` rather than
+  decoded, because they need state this round does not carry:
+  - The non-IDR picture-order-count + reference-picture-set block
+    (needs the SPS short-term-RPS parser re-entered for the in-line
+    `stRpsIdx == num_short_term_ref_pic_sets` case) — the parser stops
+    after `colour_plane_id` when `nal_unit_type` is not
+    `IDR_W_RADL` / `IDR_N_LP`.
+  - The P/B reference-list-modification (§7.3.6.2) / weighted-prediction
+    (§7.3.6.3) sub-structures (need DPB-derived `NumPicTotalCurr` /
+    `RefPicList`) — the parser stops after the SAO block when
+    `slice_type` is P or B.
+- Top-level `Error::Slice(SliceError)` variant + `From<SliceError>`.
+  Public `SliceType`, `SliceDeblocking`, `EntryPointOffsets`, and the
+  `BLA_W_LP` / `IDR_W_RADL` / `IDR_N_LP` / `RSV_IRAP_VCL23` Table-7-1
+  constants.
+- 9 new unit tests (total 61, was 52): Table-7-7 `slice_type` mapping +
+  `is_inter`; `Ceil( Log2( N ) )` width table; a hand-assembled
+  independent I-slice IDR header parsed end-to-end through
+  `byte_alignment()` (SliceQpY=25); the non-IDR POC-block deferral
+  (opaque tail); the P/B ref-list deferral (opaque tail); a non-first
+  dependent slice segment (`slice_segment_address` u(2)); end-to-end
+  parse via the Annex B walker; truncated-RBSP rejection;
+  `slice_type > 2` rejection.
+
+### Note — tiny-fixture slice trace inconsistency (docs gap)
+
+- `docs/video/h265/fixtures/tiny-i-only-16x16-main/trace.txt`'s
+  `SLICE_HEADER` line reports `temporal_mvp=0 sao_c=1 slice_qp_delta=-1`,
+  but its own `SPS` line (and this crate's verified SPS parse) has
+  `sps_temporal_mvp_enabled_flag=1`, so per §7.3.6.1
+  `slice_temporal_mvp_enabled_flag` **is** present. Parsing the real
+  slice NAL bytes with mvp present yields `sao_c=0 slice_qp_delta=0` and
+  an invalid `byte_alignment()` pad (`1 0 0 0`); parsing with mvp absent
+  yields the trace's `sao_c=1 slice_qp_delta=-1` and a clean byte-aligned
+  pad. The slice bits are therefore self-consistent only with
+  `sps_temporal_mvp_enabled_flag=0`, contradicting the SPS line. Because
+  the fixture's SPS and slice are mutually inconsistent, the round-6
+  slice tests use hand-assembled bit vectors instead of asserting the
+  fixture slice's exact fields. Recommend the docs collaborator
+  regenerate the tiny fixture's trace (or confirm the SPS↔slice
+  mismatch is an x265-encoder/instrumentation artefact).
+
 ### Added — clean-room rebuild round 5 (2026-05-24)
 
 - §7.3.2.3.1 `PicParameterSet` structural parse — the full general

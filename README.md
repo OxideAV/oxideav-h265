@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 5 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 6 (2026-05-24).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,19 +14,24 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 5 adds the
-§7.3.2.3.1 PPS parse — the full general `pic_parameter_set_rbsp()`
-body through `pps_extension_present_flag`, including the tiles block
-(column/row counts plus explicit `column_width_minus1[]` /
-`row_height_minus1[]` arrays) and the deblocking-filter-control block,
-with the §7.4.3.3.1 inference rules applied to absent fields and PPS
-extension bodies surfaced as an opaque-bytes tail. It builds on
-round 4's complete SPS RBSP body — PCM block, short-term reference
-picture sets (§7.3.7), the long-term reference picture table, the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 6 adds the
+§7.3.6.1 slice-segment-header parse — the `slice_segment_header()`
+syntax structure for an independent slice segment, taking the
+activated SPS + PPS as context (field widths and presence gates are
+SPS/PPS-derived). Independent **I-slice IDR** segments parse end to end
+through `byte_alignment()` (including `slice_qp_delta`, the chroma QP
+offsets, the deblocking override block, the loop-filter-across-slices
+gate, the entry-point-offset block, and the header extension). The two
+bodies that need decoded-picture-buffer state — the non-IDR POC /
+reference-picture-set block and the P/B reference-list /
+weighted-prediction sub-structures — are surfaced as an opaque-bytes
+tail. It builds on round 5's §7.3.2.3.1 PPS parse, round 4's complete
+SPS RBSP body — PCM block, short-term reference picture sets (§7.3.7),
+the long-term reference picture table, the
 `sps_temporal_mvp_enabled_flag` / `strong_intra_smoothing_enabled_flag`
 pair, and the VUI / extension gates — round 3's structural prefix,
 round 2's VPS / profile-tier-level (§7.3.2.1 + §7.3.3), and round 1's
-Annex B / NAL-header foundation. Slice decode, scaling-list data, and
+Annex B / NAL-header foundation. Slice data, scaling-list data, and
 CABAC remain unimplemented.
 
 ## Scope so far
@@ -105,11 +110,34 @@ CABAC remain unimplemented.
   ([`PpsError::ScalingListUnsupported`]) alongside the SPS scaling-list
   deferral. The signed-Exp-Golomb `se(v)` descriptor (§9.2.2) was
   added to [`BitReader`] for the PPS QP / deblocking-offset fields.
+* §7.3.6.1 [`SliceSegmentHeader`] — the `slice_segment_header()` parse
+  for an independent slice segment, taking the activated SPS + PPS as
+  context: `first_slice_segment_in_pic_flag`,
+  `no_output_of_prior_pics_flag` (IRAP-range only),
+  `slice_pic_parameter_set_id`; for non-first segments
+  `dependent_slice_segment_flag` + `slice_segment_address` (`u(v)`,
+  width `Ceil( Log2( PicSizeInCtbsY ) )`); for independent segments the
+  `slice_reserved_flag[]` block, [`SliceType`] (Table 7-7),
+  `pic_output_flag`, `colour_plane_id`,
+  `slice_temporal_mvp_enabled_flag`, and the SAO luma / chroma gates.
+  Independent I-slice IDR segments parse end to end through
+  `byte_alignment()`: `slice_qp_delta` (`se(v)`), the chroma QP
+  offsets, the deblocking override block ([`SliceDeblocking`]),
+  `slice_loop_filter_across_slices_enabled_flag`, the
+  entry-point-offset block ([`EntryPointOffsets`]), and the
+  header-extension block; [`SliceSegmentHeader::byte_offset_to_slice_data`]
+  reports where `slice_segment_data()` begins, and
+  [`SliceSegmentHeader::slice_qp_y`] applies equation 7-54. The §7.4.7.1
+  inference rules are applied to absent fields. The non-IDR POC /
+  reference-picture-set block and the P/B reference-list /
+  weighted-prediction sub-structures (which need DPB state) are
+  surfaced as an [`OpaqueTail`] rather than decoded.
 
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
-[`SeqParameterSet::parse`], [`PicParameterSet::parse`].
+[`SeqParameterSet::parse`], [`PicParameterSet::parse`],
+[`SliceSegmentHeader::parse`].
 
 ## Not yet implemented
 
@@ -128,7 +156,15 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 * VPS tail: `vps_max_layer_id`, layer-set inclusion matrix,
   `vps_timing_info_present_flag`, HRD parameters,
   `vps_extension_data_flag`.
-* Slice header parse (§7.3.6) and slice data (§7.3.8)
+* Slice header (§7.3.6.1) deferred bodies: the non-IDR POC /
+  reference-picture-set block (`slice_pic_order_cnt_lsb`,
+  `short_term_ref_pic_set_sps_flag`, the inline `st_ref_pic_set()`,
+  the long-term block) and the P/B `ref_pic_lists_modification()`
+  (§7.3.6.2) / `pred_weight_table()` (§7.3.6.3) sub-structures —
+  currently surfaced as an opaque tail; both need the SPS short-term-RPS
+  parser exposed publicly and DPB-derived `NumPicTotalCurr` /
+  `RefPicList` state.
+* Slice data (§7.3.8)
 * CABAC entropy coding (§9.3) — blocked on the docs `cu_qp_delta`
   + `last_sig_coeff` multi-QG / multi-CTU 4:2:2 trace gap.
 * Intra / inter prediction, transform, in-loop filters (deblock /
