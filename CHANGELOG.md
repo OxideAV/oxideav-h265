@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h265/releases/tag/v0.0.8) - 2026-05-23
+
+### Other
+
+- round 7: §7.3.6.1 non-IDR POC + RPS block in slice-segment-header
+- round 6: §7.3.6.1 slice-segment-header structural parse
+- round 5: §7.3.2.3.1 PPS parse + BitReader::se()
+- round 4: §7.3.2.2 SPS tail — PCM / RPS / long-term ref / MVP / smoothing / opaque VUI+ext
+- round 3: §7.3.2.2 SPS structural parse up to SAO-enabled flag
+- round 2: §7.3.2.1 VPS structural parse + §7.3.3 profile-tier-level walk
+- round 1: Annex B NAL walker + §7.3.1.2 header parse
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added — clean-room rebuild round 7 (2026-05-24)
 
 - §7.3.6.1 non-IDR POC + reference-picture-set block in
