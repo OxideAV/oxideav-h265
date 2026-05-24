@@ -71,6 +71,14 @@
 //!   §7.4.5 `ScalingList[sizeId][matrixId][i]` coefficient arrays are
 //!   derived (default tables + prediction inference); see
 //!   [`scaling_list::ScalingListData`].
+//! * §6.5.3 [`scan::up_right_diagonal`] — the up-right diagonal scan
+//!   order (equation 6-11), and §7.4.5
+//!   [`scaling_list::ScalingListData::scaling_factors`] expanding the
+//!   flat scaling lists into the two-dimensional
+//!   `ScalingFactor[sizeId][matrixId][x][y]` quantization matrices
+//!   (equations 7-44..7-51: the diagonal scatter, the 2x / 4x block
+//!   replication, the DC `[0][0]` override, and the
+//!   `ChromaArrayType == 3` 32x32-chroma derivation).
 //! * §7.3.2.3.1 [`pps::PicParameterSet`] — the full general
 //!   `pic_parameter_set_rbsp()` body: the `pps_*_id` pair, the
 //!   slice-header gates, `init_qp_minus26` (`se(v)`), the chroma QP
@@ -119,6 +127,7 @@ pub mod bitreader;
 pub mod nal;
 pub mod pps;
 pub mod scaling_list;
+pub mod scan;
 pub mod slice;
 pub mod sps;
 pub mod vps;
@@ -127,9 +136,10 @@ pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use scaling_list::{
-    ScalingListData, ScalingListError, ScalingListMatrix, MAX_COEF_NUM, NUM_MATRIX_IDS,
-    NUM_SIZE_IDS,
+    ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,
+    MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS,
 };
+pub use scan::{up_right_diagonal, ScanPos};
 pub use slice::{
     EntryPointOffsets, SliceDeblocking, SliceError, SliceLongTermRefPic, SliceLongTermRefPicSource,
     SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,

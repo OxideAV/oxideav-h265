@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 7 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 9 (2026-05-24).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,24 +14,25 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 8 lands the
-§7.3.4 `scaling_list_data()` parse plus the §7.4.5
-`ScalingList[sizeId][matrixId][i]` derivation. For each of the 24
-(`sizeId`, `matrixId`) slots the parser reads
-`scaling_list_pred_mode_flag` and either copies a reference list
-(`scaling_list_pred_matrix_id_delta` → the §7.4.5 default list when
-the delta is 0, equation 7-42/7-43 otherwise) or reads an explicit
-delta-coded list (the running `nextCoef` accumulator modulo 256, with
-the `scaling_list_dc_coef_minus8` DC coefficient for `sizeId > 1`).
-The default 4x4 / 8x8 tables (Tables 7-5 / 7-6) are transcribed, and
-the §7.4.5 range checks (`scaling_list_pred_matrix_id_delta` bound,
-`scaling_list_dc_coef_minus8 ∈ [−7, 247]`, coefficient `> 0`) are
-enforced. The structure is wired into both the SPS
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 9 lands the
+§6.5.3 up-right diagonal scan order (equation 6-11) and the §7.4.5
+`ScalingFactor[sizeId][matrixId][x][y]` 2-D quantization-matrix
+derivation (equations 7-44..7-51), building on round 8's §7.3.4
+`scaling_list_data()` parse + flat `ScalingList[sizeId][matrixId][i]`
+lists. `ScalingListData::scaling_factors(ChromaArrayType)` scatters
+each flat coefficient to the `(x, y)` cell the up-right diagonal scan
+maps it to (`ScanOrder[2][0]` for the 4x4 list, `ScanOrder[3][0]` for
+every 8x8-based list), replicates each entry into a 2x2 (16x16) or 4x4
+(32x32) block, applies the DC-coefficient `[0][0]` override
+(equations 7-47 / 7-49 / 7-51), and — only when `ChromaArrayType == 3`
+— derives the 32x32 chroma matrices (matrixId 1, 2, 4, 5) from the
+16x16 lists (equations 7-50 / 7-51). Round 8 had landed the §7.3.4
+parse plus the flat-list derivation (default 4x4 / 8x8 Tables 7-5 /
+7-6, the `scaling_list_pred_matrix_id_delta` reference-list copy of
+equations 7-42 / 7-43, the explicit delta-coded form's `nextCoef`
+accumulator, and the §7.4.5 range checks), wired into both the SPS
 (`sps_scaling_list_data_present_flag`) and PPS
-(`pps_scaling_list_data_present_flag`) paths, which previously refused
-to parse when scaling lists were signalled. The up-right-diagonal scan
-into the two-dimensional `ScalingFactor` array (equations 7-44..7-51,
-needing the §6.5.3 `ScanOrder`) is a follow-up. It builds on round 7's
+(`pps_scaling_list_data_present_flag`) paths. It builds on round 7's
 non-IDR POC + reference-picture-set slice sub-block, round 6's
 slice-header parse, round 5's §7.3.2.3.1 PPS parse, round 4's complete
 SPS RBSP body — PCM block, short-term reference picture sets (§7.3.7),
@@ -131,8 +132,20 @@ data and CABAC remain unimplemented.
   (running `nextCoef` accumulator modulo 256 with the
   `scaling_list_dc_coef_minus8` DC coefficient for `sizeId > 1`), and
   the default 4x4 / 8x8 tables (Tables 7-5 / 7-6). The §7.4.5 range
-  checks are enforced ([`ScalingListError`]). The diagonal scan into
-  the 2-D `ScalingFactor` array (equations 7-44..7-51) is a follow-up.
+  checks are enforced ([`ScalingListError`]).
+  [`ScalingListData::scaling_factors`] expands the flat lists into the
+  two-dimensional `ScalingFactor[sizeId][matrixId][x][y]` quantization
+  matrices (equations 7-44..7-51): each flat coefficient is scattered
+  to the `(x, y)` cell given by the §6.5.3 up-right diagonal scan, with
+  the 2x / 4x block replication for the 16x16 / 32x32 sizes, the
+  DC-coefficient `[0][0]` override (equations 7-47 / 7-49 / 7-51), and
+  the `ChromaArrayType == 3` 32x32-chroma derivation from the 16x16
+  lists (equations 7-50 / 7-51).
+* §6.5.3 [`up_right_diagonal`] — the up-right diagonal scan order
+  (equation 6-11), the `ScanOrder[log2BlockSize][0]` entry the §7.4.5
+  `ScalingFactor` derivation reads (4x4 and 8x8 blocks). The
+  horizontal / vertical / traverse scans (§6.5.4..§6.5.6) are deferred
+  to the residual-coding path.
 * §7.3.6.1 [`SliceSegmentHeader`] — the `slice_segment_header()` parse
   for an independent slice segment, taking the activated SPS + PPS as
   context: `first_slice_segment_in_pic_flag`,
@@ -174,11 +187,10 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 
 ## Not yet implemented
 
-* The §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]` 2-D array
-  (equations 7-44..7-51) — the parse + flat-list derivation
-  ([`ScalingListData`]) is done, but the up-right-diagonal scan into
-  the 2-D quantization matrices (needing the §6.5.3 `ScanOrder`)
-  remains.
+* The §6.5.4..§6.5.6 horizontal / vertical / traverse scan orders
+  (equations 6-12..6-14) — only the §6.5.3 up-right diagonal scan
+  ([`up_right_diagonal`]), the form the §7.4.5 `ScalingFactor`
+  derivation needs, is built; the others belong to residual coding.
 * VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
   the parsed SPS struct.
 * SPS extension bodies (Range Extension, Multilayer Annex F,

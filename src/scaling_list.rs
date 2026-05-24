@@ -18,14 +18,18 @@
 //! This module parses that structure and derives the flat
 //! `ScalingList[sizeId][matrixId][i]` coefficient arrays plus the
 //! per-slot DC coefficients, applying the §7.4.5 default-list and
-//! prediction-inference rules (equations 7-42 and 7-43). The
-//! up-right-diagonal scan into the two-dimensional `ScalingFactor`
-//! array (equations 7-44..7-51, requiring §6.5.3 `ScanOrder`) is left
-//! to a follow-up; this module stops at the flat per-`i` lists, which
-//! is the form the SPS/PPS parse needs to no longer reject scaling
-//! lists.
+//! prediction-inference rules (equations 7-42 and 7-43).
+//!
+//! [`ScalingListData::scaling_factors`] then expands the flat lists
+//! into the two-dimensional `ScalingFactor[sizeId][matrixId][x][y]`
+//! quantization matrices (§7.4.5 equations 7-44..7-51), placing each
+//! flat coefficient at the `(x, y)` cell given by the §6.5.3 up-right
+//! diagonal scan order ([`crate::scan`]) and applying the
+//! `2x`/`4x` block-upsampling for the 16x16 / 32x32 sizes plus the
+//! DC-coefficient `[0][0]` override.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::scan::up_right_diagonal;
 
 /// Number of `sizeId` values (4x4, 8x8, 16x16, 32x32) — §7.4.5
 /// Table 7-3.
@@ -286,6 +290,175 @@ impl ScalingListData {
 
         Ok(Self { lists })
     }
+
+    /// Derive the §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]`
+    /// quantization matrices (equations 7-44..7-51) from the parsed
+    /// flat lists.
+    ///
+    /// `chroma_array_type` is the §7.4.3.2.1 `ChromaArrayType`
+    /// (`separate_colour_plane_flag ? 0 : chroma_format_idc`). It only
+    /// affects the 32x32 chroma matrices: equations 7-50 / 7-51 derive
+    /// `ScalingFactor[3][matrixId]` for `matrixId ∈ {1, 2, 4, 5}` from
+    /// the corresponding 16x16 lists (`ScalingList[2][matrixId]`) **only
+    /// when `ChromaArrayType == 3`** (4:4:4). For other chroma formats
+    /// those 32x32 chroma matrices are not used, and they are left as
+    /// all-zero so a consumer that reads one signals its own bug.
+    pub fn scaling_factors(&self, chroma_array_type: u8) -> ScalingFactors {
+        // ScanOrder[2][0] — up-right diagonal scan of a 4x4 block
+        // (16 positions); ScanOrder[3][0] — of an 8x8 block (64).
+        let scan_4 = up_right_diagonal(4);
+        let scan_8 = up_right_diagonal(8);
+
+        let mut out = ScalingFactors {
+            factors: core::array::from_fn(|size_id| {
+                let dim = 1usize << (2 + size_id); // 4, 8, 16, 32
+                core::array::from_fn(|_matrix_id| ScalingFactorMatrix {
+                    dim: dim as u8,
+                    coef: vec![0u16; dim * dim],
+                })
+            }),
+        };
+
+        for matrix_id in 0..NUM_MATRIX_IDS {
+            // 4x4 (sizeId 0) — equation 7-44: place ScalingList[0][m][i]
+            // at (ScanOrder[2][0][i][0], ScanOrder[2][0][i][1]).
+            place(
+                &mut out.factors[0][matrix_id],
+                &self.lists[0][matrix_id].coef,
+                &scan_4,
+                1,
+            );
+
+            // 8x8 (sizeId 1) — equation 7-45: 8x8 scan, no upsampling.
+            place(
+                &mut out.factors[1][matrix_id],
+                &self.lists[1][matrix_id].coef,
+                &scan_8,
+                1,
+            );
+
+            // 16x16 (sizeId 2) — equation 7-46: 8x8 scan, each entry
+            // replicated into a 2x2 block. Then 7-47 overrides [0][0]
+            // with the DC coefficient.
+            place(
+                &mut out.factors[2][matrix_id],
+                &self.lists[2][matrix_id].coef,
+                &scan_8,
+                2,
+            );
+            set_dc(
+                &mut out.factors[2][matrix_id],
+                self.lists[2][matrix_id].dc_coef,
+            );
+        }
+
+        // 32x32 (sizeId 3) — only matrixId 0 (intra Y) and 3 (inter Y)
+        // are signalled (the `matrixId += 3` step). Equation 7-48 uses
+        // the 8x8 scan with each entry replicated into a 4x4 block,
+        // 7-49 overrides [0][0] with the DC coefficient.
+        for &matrix_id in &[0usize, 3usize] {
+            place(
+                &mut out.factors[3][matrix_id],
+                &self.lists[3][matrix_id].coef,
+                &scan_8,
+                4,
+            );
+            set_dc(
+                &mut out.factors[3][matrix_id],
+                self.lists[3][matrix_id].dc_coef,
+            );
+        }
+
+        // 32x32 chroma (matrixId 1, 2, 4, 5) — equations 7-50 / 7-51,
+        // applicable only for ChromaArrayType == 3 (4:4:4). The flat
+        // list comes from the 16x16 (sizeId 2) list of the same
+        // matrixId, and the DC coefficient also from sizeId 2.
+        if chroma_array_type == 3 {
+            for &matrix_id in &[1usize, 2usize, 4usize, 5usize] {
+                place(
+                    &mut out.factors[3][matrix_id],
+                    &self.lists[2][matrix_id].coef,
+                    &scan_8,
+                    4,
+                );
+                set_dc(
+                    &mut out.factors[3][matrix_id],
+                    self.lists[2][matrix_id].dc_coef,
+                );
+            }
+        }
+
+        out
+    }
+}
+
+/// Scatter a flat scaling list into a `ScalingFactor` matrix along the
+/// up-right diagonal `scan`, replicating each coefficient into a
+/// `rep`x`rep` block (`rep == 1` for 4x4 / 8x8, 2 for 16x16, 4 for
+/// 32x32 — the `x * rep + k` / `y * rep + j` indexing of equations
+/// 7-46 / 7-48 / 7-50).
+fn place(
+    matrix: &mut ScalingFactorMatrix,
+    coef: &[u16],
+    scan: &[crate::scan::ScanPos],
+    rep: usize,
+) {
+    let dim = matrix.dim as usize;
+    for (i, value) in coef.iter().copied().enumerate() {
+        let pos = scan[i];
+        let bx = pos.x as usize * rep;
+        let by = pos.y as usize * rep;
+        for j in 0..rep {
+            for k in 0..rep {
+                let x = bx + k;
+                let y = by + j;
+                matrix.coef[y * dim + x] = value;
+            }
+        }
+    }
+}
+
+/// Override `ScalingFactor[sizeId][matrixId][0][0]` with the DC
+/// coefficient (equations 7-47 / 7-49 / 7-51).
+fn set_dc(matrix: &mut ScalingFactorMatrix, dc_coef: u16) {
+    matrix.coef[0] = dc_coef;
+}
+
+/// One derived §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]`
+/// quantization matrix, stored row-major (`coef[y * dim + x]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalingFactorMatrix {
+    /// Side length of the (square) matrix: 4, 8, 16, or 32 — `1 << (2 +
+    /// sizeId)`.
+    pub dim: u8,
+    /// The `dim * dim` scaling factors, row-major: the value at column
+    /// `x`, row `y` is `coef[y * dim + x]`.
+    pub coef: Vec<u16>,
+}
+
+impl ScalingFactorMatrix {
+    /// `ScalingFactor[..][..][x][y]` — the scaling factor at column `x`
+    /// (horizontal), row `y` (vertical). Panics if `x` or `y` is `>=
+    /// dim`.
+    #[inline]
+    pub fn at(&self, x: usize, y: usize) -> u16 {
+        let dim = self.dim as usize;
+        assert!(x < dim && y < dim, "ScalingFactor index out of range");
+        self.coef[y * dim + x]
+    }
+}
+
+/// The full set of §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]`
+/// quantization matrices, derived from a [`ScalingListData`] via
+/// [`ScalingListData::scaling_factors`].
+///
+/// The 32x32 chroma matrices (`factors[3][1]`, `[3][2]`, `[3][4]`,
+/// `[3][5]`) are all-zero unless `ChromaArrayType == 3`; see
+/// [`ScalingListData::scaling_factors`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalingFactors {
+    /// `[sizeId][matrixId]` — the derived quantization matrices.
+    pub factors: [[ScalingFactorMatrix; NUM_MATRIX_IDS]; NUM_SIZE_IDS],
 }
 
 #[cfg(test)]
@@ -578,6 +751,184 @@ mod tests {
         assert_eq!(
             ScalingListData::parse(&mut br).unwrap_err(),
             ScalingListError::Truncated
+        );
+    }
+
+    /// Parse the all-default `scaling_list_data()` and derive its
+    /// `ScalingFactor` matrices.
+    fn all_default_factors(chroma_array_type: u8) -> ScalingFactors {
+        let buf = pack(&all_default_bits());
+        let mut br = BitReader::new(&buf);
+        ScalingListData::parse(&mut br)
+            .unwrap()
+            .scaling_factors(chroma_array_type)
+    }
+
+    /// 4x4 (sizeId 0) `ScalingFactor` matrices are 4x4, and — since the
+    /// default 4x4 list is flat 16 — every cell is 16 (equation 7-44).
+    /// Also exercises the [`ScalingFactorMatrix::at`] accessor.
+    #[test]
+    fn factor_4x4_default_all_16() {
+        let f = all_default_factors(1);
+        for m in 0..NUM_MATRIX_IDS {
+            let mat = &f.factors[0][m];
+            assert_eq!(mat.dim, 4);
+            assert_eq!(mat.coef.len(), 16);
+            assert!(mat.coef.iter().all(|&c| c == 16));
+            assert_eq!(mat.at(2, 3), 16);
+        }
+    }
+
+    /// 8x8 (sizeId 1) default intra `ScalingFactor` is the 8x8 intra
+    /// table scattered along the up-right diagonal scan (equation 7-45).
+    /// Spot-check the diagonal placement: `ScalingList[1][0][i]` lands
+    /// at `(ScanOrder[3][0][i][0], ScanOrder[3][0][i][1])`.
+    #[test]
+    fn factor_8x8_intra_follows_diagonal_scan() {
+        let f = all_default_factors(1);
+        let mat = &f.factors[1][0];
+        assert_eq!(mat.dim, 8);
+        let scan = crate::scan::up_right_diagonal(8);
+        for (i, &expected) in DEFAULT_8X8_INTRA.iter().enumerate() {
+            let p = scan[i];
+            assert_eq!(
+                mat.at(p.x as usize, p.y as usize),
+                expected,
+                "8x8 intra coef i={i} misplaced"
+            );
+        }
+        // i = 0 maps to (0, 0): the first table entry is 16.
+        assert_eq!(mat.at(0, 0), DEFAULT_8X8_INTRA[0]);
+    }
+
+    /// 16x16 (sizeId 2) uses the 8x8 scan with each entry replicated
+    /// into a 2x2 block (equation 7-46), then the DC coefficient
+    /// overrides `[0][0]` (equation 7-47). Build an explicit list with
+    /// DC = +4 ⇒ `dc_coef = 12`, which also seeds `next_coef`; with all
+    /// deltas 0 every flat list coef is 12, so the whole matrix is 12 —
+    /// confirming both the 2x2 replication blankets the grid and the DC
+    /// override lands on `[0][0]`. A second slot (DC = 0, delta seeds an
+    /// i=0 coef of 8) separates the DC override from the list body.
+    #[test]
+    fn factor_16x16_replicates_2x2_and_dc_override() {
+        // Default sizeId 0 and 1.
+        let mut bits = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..6 {
+                bits.push((0, 1));
+                bits.extend(ue(0));
+            }
+        }
+        // sizeId 2, matrixId 0: explicit, DC = +4 (dc_coef 12), deltas 0
+        // ⇒ every flat coef = 12 (next_coef seeds from the DC value).
+        bits.push((1, 1));
+        bits.extend(se(4));
+        for _ in 0..64 {
+            bits.extend(se(0));
+        }
+        // sizeId 2, matrixId 1: explicit, DC = -8+? -> use dc=0 so
+        // dc_coef = 8, then a first delta of 0 ⇒ list coef 8 throughout;
+        // the DC override is then a no-op (8 == 8) — but matrixId 2 sets
+        // DC -1 to separate the override from the list body.
+        bits.push((1, 1));
+        bits.extend(se(0)); // dc_coef 8
+        for _ in 0..64 {
+            bits.extend(se(0));
+        }
+        // sizeId 2, matrixId 2: explicit, DC = -1 (dc_coef 7) but list
+        // body driven to 8 (next_coef seeds at 7, first delta +1 ⇒ 8).
+        bits.push((1, 1));
+        bits.extend(se(-1)); // dc_coef 7
+        bits.extend(se(1)); // i=0: next_coef 7+1 = 8
+        for _ in 1..64 {
+            bits.extend(se(0)); // remaining deltas 0 ⇒ all 8
+        }
+        // sizeId 2, matrixId 3..5 default; sizeId 3 matrixId 0/3 default.
+        for _ in 3..6 {
+            bits.push((0, 1));
+            bits.extend(ue(0));
+        }
+        for _ in 0..2 {
+            bits.push((0, 1));
+            bits.extend(ue(0));
+        }
+        let buf = pack(&bits);
+        let mut br = BitReader::new(&buf);
+        let data = ScalingListData::parse(&mut br).unwrap();
+        let f = data.scaling_factors(1);
+
+        // matrixId 0: DC seeds list, all 12.
+        let mat0 = &f.factors[2][0];
+        assert_eq!(mat0.dim, 16);
+        assert_eq!(mat0.coef.len(), 256);
+        assert!(mat0.coef.iter().all(|&c| c == 12));
+
+        // matrixId 2: list body 8, DC override 7 at [0][0] only — proves
+        // the override is isolated to the single corner cell while the
+        // 2x2 replication blankets the rest with the list value.
+        let mat2 = &f.factors[2][2];
+        assert_eq!(mat2.at(0, 0), 7);
+        assert_eq!(mat2.at(1, 0), 8);
+        assert_eq!(mat2.at(0, 1), 8);
+        assert_eq!(mat2.at(1, 1), 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                assert_eq!(mat2.at(x, y), 8, "cell ({x},{y})");
+            }
+        }
+    }
+
+    /// 32x32 (sizeId 3) only derives matrixId 0 (intra Y) and 3
+    /// (inter Y) for non-4:4:4 chroma; each 8x8-scan entry replicates
+    /// into a 4x4 block (equation 7-48) and the DC overrides [0][0]
+    /// (7-49). The chroma matrices (1,2,4,5) stay all-zero.
+    #[test]
+    fn factor_32x32_replicates_4x4_chroma_zero_when_not_444() {
+        let f = all_default_factors(1); // ChromaArrayType 1 (4:2:0)
+        let intra = &f.factors[3][0];
+        assert_eq!(intra.dim, 32);
+        assert_eq!(intra.coef.len(), 1024);
+        // Default DC is 8; the i=0 list coef is 16, so the (1..4, 0)
+        // cells in the top-left 4x4 block are 16 while [0][0] is 8.
+        assert_eq!(intra.at(0, 0), 8);
+        assert_eq!(intra.at(1, 0), 16);
+        assert_eq!(intra.at(3, 3), 16);
+        // Inter Y (matrixId 3) is also derived.
+        assert_eq!(f.factors[3][3].at(1, 0), 16);
+        // Chroma matrices are untouched (all-zero) for ChromaArrayType
+        // != 3.
+        for &m in &[1usize, 2, 4, 5] {
+            assert!(f.factors[3][m].coef.iter().all(|&c| c == 0));
+        }
+    }
+
+    /// With `ChromaArrayType == 3` (4:4:4) the 32x32 chroma matrices
+    /// (matrixId 1, 2, 4, 5) are derived from the 16x16 (sizeId 2)
+    /// lists of the same matrixId (equations 7-50 / 7-51), so they are
+    /// no longer all-zero.
+    #[test]
+    fn factor_32x32_chroma_derived_when_444() {
+        let f = all_default_factors(3);
+        for &m in &[1usize, 2, 4, 5] {
+            let mat = &f.factors[3][m];
+            assert_eq!(mat.dim, 32);
+            // Derived from the default 16x16 list (intra for m<3, inter
+            // otherwise) ⇒ not all-zero; DC default 8 at [0][0].
+            assert!(mat.coef.iter().any(|&c| c != 0));
+            assert_eq!(mat.at(0, 0), 8);
+        }
+        // The chroma 32x32 matrix matches the 16x16 luma-scan placement
+        // of the same matrixId's 8x8 default table, replicated 4x4.
+        let mat = &f.factors[3][1];
+        let scan = crate::scan::up_right_diagonal(8);
+        // i=1 (intra default table entry) lands at scan[1] scaled by 4.
+        let p = scan[1];
+        assert_eq!(
+            mat.at(p.x as usize * 4, p.y as usize * 4),
+            DEFAULT_8X8_INTRA[1]
         );
     }
 }

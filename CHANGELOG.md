@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 9 (2026-05-24)
+
+- §6.5.3 up-right diagonal scan order (equation 6-11), in a new `scan`
+  module ([`up_right_diagonal`] / [`ScanPos`]): a direct transcription
+  of the 6-11 pseudocode, returning `diagScan[ sPos ]` for a
+  `blkSize`x`blkSize` block. This is the `ScanOrder[log2BlockSize][0]`
+  entry the §7.4.5 `ScalingFactor` derivation reads (4x4 and 8x8
+  blocks). The §6.5.4..§6.5.6 horizontal / vertical / traverse scans
+  are deferred to the residual-coding path.
+- §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]` 2-D
+  quantization-matrix derivation (equations 7-44..7-51), via the new
+  [`ScalingListData::scaling_factors`] /
+  [`ScalingFactors`] / [`ScalingFactorMatrix`]:
+  - 4x4 (equation 7-44) and 8x8 (7-45): each flat
+    `ScalingList[sizeId][matrixId][i]` coefficient is placed at the
+    `(ScanOrder[·][0][i][0], ScanOrder[·][0][i][1])` cell — `ScanOrder[2][0]`
+    (4x4 block, 16 positions) for `sizeId == 0`, `ScanOrder[3][0]`
+    (8x8 block, 64 positions) for `sizeId == 1`.
+  - 16x16 (7-46): the 8x8-scan placement with each entry replicated
+    into a 2x2 block (`x * 2 + k`, `y * 2 + j`), then the DC
+    coefficient overrides `[0][0]` (7-47).
+  - 32x32 (7-48): the 8x8-scan placement with each entry replicated
+    into a 4x4 block (`x * 4 + k`, `y * 4 + j`) for `matrixId` 0 (intra
+    Y) and 3 (inter Y) — the only slots the `matrixId += 3` step
+    signals — then the DC override (7-49).
+  - 32x32 chroma (7-50 / 7-51): when `ChromaArrayType == 3` (4:4:4),
+    `matrixId` 1, 2, 4, 5 are derived from the 16x16 (`sizeId == 2`)
+    lists of the same `matrixId`, 4x4-replicated, with the sizeId-2 DC
+    override. For other chroma formats those matrices are left all-zero
+    (they are not used).
+  - `ScalingFactorMatrix` is stored row-major (`coef[y * dim + x]`)
+    with a `dim` side length (4 / 8 / 16 / 32) and an `at(x, y)`
+    accessor.
+- 9 new unit tests (total 84, was 75): the §6.5.3 scan for 4x4 / 2x2
+  blocks (hand-derived coordinate lists), the permutation invariant for
+  the 4x4 / 8x8 blocks, and the 8x8 diagonal-ordering invariant; the
+  4x4 all-16 `ScalingFactor`, the 8x8-intra diagonal-scan placement
+  against Table 7-6, the 16x16 2x2 replication + isolated DC override,
+  the 32x32 4x4 replication with the chroma matrices all-zero for
+  non-4:4:4, and the 32x32-chroma derivation for `ChromaArrayType == 3`.
+
 ### Added — clean-room rebuild round 8 (2026-05-24)
 
 - §7.3.4 `scaling_list_data()` parse + §7.4.5
