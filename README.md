@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 10 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 11 (2026-05-24).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,30 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 10 completes the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 11 lands the
+§9.3 CABAC arithmetic decoding engine as a standalone module
+([`cabac`]): the §9.3.2.6 engine-register initialization
+(`ivlCurrRange = 510`, `ivlOffset = read_bits(9)`, with the spec's
+"`ivlOffset` shall not equal 510 or 511" constraint enforced); the
+§9.3.2.2 context-variable initialization (equations 9-4..9-6, with
+[`ContextModel::init`] taking an 8-bit `initValue` and `SliceQpY`)
+plus the §9.3.2.2 `initType` selector (equation 9-7,
+[`init_type`]); the §9.3.4.3.2 `DecodeDecision` primitive with the
+Table 9-52 `rangeTabLps[64][4]` interval split and the §9.3.4.3.2.2
+Table 9-53 (`transIdxLps` / `transIdxMps`) state transition; the
+§9.3.4.3.3 renormalization loop (`RenormD`); the §9.3.4.3.4
+`DecodeBypass` equal-probability bin plus a `decode_bypass_bits(n)`
+MSB-first helper; the §9.3.4.3.5 `DecodeTerminate` decision-before-
+termination (`end_of_slice_segment_flag` / `end_of_subset_one_bit` /
+`pcm_flag`); and the §9.3.4.3.6 aligned-bypass alignment hook
+(`ivlCurrRange = 256` before `coeff_abs_level_remaining[ ]` /
+`coeff_sign_flag[ ]`). The engine is the gateway to slice-data
+decode — every §7.3.8 syntax element is read through these four
+primitives — and ships independently of the §9.3.4.2 per-syntax-
+element binarization / context-index derivation, which sits one
+layer up in the slice-data parser (still blocked on the docs
+trace gap for `cu_qp_delta` + `last_sig_coeff` multi-QG / 4:2:2).
+Round 10 completed the
 §6.5 scan-order family — the §6.5.4 horizontal (equation 6-12), §6.5.5
 vertical (equation 6-13), and §6.5.6 traverse (equation 6-14,
 boustrophedon) scans now join round 9's §6.5.3 up-right diagonal — and
@@ -195,11 +218,35 @@ data and CABAC remain unimplemented.
   reference-list / weighted-prediction sub-structures (which need DPB
   state) are surfaced as an [`OpaqueTail`] rather than decoded.
 
+* §9.3 [`cabac`] — the CABAC arithmetic decoding engine as a
+  standalone module: [`CabacEngine::new`] initializes the §9.3.2.6
+  registers (`ivlCurrRange = 510`, `ivlOffset = read_bits(9)`, with
+  the spec's "ivlOffset shall not equal 510 or 511" constraint
+  enforced) over a positioned [`BitReader`]; [`ContextModel::init`]
+  derives a `(pStateIdx, valMps)` pair from an 8-bit `initValue` and
+  `SliceQpY` per equations 9-4..9-6, with the §9.3.2.2 `initType`
+  selector (equation 9-7) exposed as the free function [`init_type`];
+  [`CabacEngine::decode_decision`] implements §9.3.4.3.2 with the
+  Table 9-52 `rangeTabLps[64][4]` quantized-range split, the
+  §9.3.4.3.2.2 Table 9-53 state transition, and the §9.3.4.3.3
+  `RenormD` loop; [`CabacEngine::decode_bypass`] /
+  [`CabacEngine::decode_bypass_bits`] implement §9.3.4.3.4 (the
+  helper accumulates `n` bins MSB-first);
+  [`CabacEngine::decode_terminate`] implements §9.3.4.3.5
+  (`end_of_slice_segment_flag` / `end_of_subset_one_bit` / `pcm_flag`,
+  the `ctxTable == 0`, `ctxIdx == 0` decision before termination); and
+  [`CabacEngine::align`] implements §9.3.4.3.6 (the `ivlCurrRange =
+  256` alignment hook prior to aligned bypass decoding for
+  `coeff_abs_level_remaining[ ]` / `coeff_sign_flag[ ]`). The
+  Table 9-52 / Table 9-53 values are transcribed directly from the
+  H.265 specification.
+
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
 [`SeqParameterSet::parse`], [`PicParameterSet::parse`],
-[`SliceSegmentHeader::parse`], [`scan_order`].
+[`SliceSegmentHeader::parse`], [`scan_order`],
+[`CabacEngine::new`].
 
 ## Not yet implemented
 
@@ -221,9 +268,18 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `NumPicTotalCurr` / `RefPicList` state. The non-IDR POC /
   reference-picture-set block (which previously sat under this bullet)
   is fully decoded as of round 7.
-* Slice data (§7.3.8)
-* CABAC entropy coding (§9.3) — blocked on the docs `cu_qp_delta`
-  + `last_sig_coeff` multi-QG / multi-CTU 4:2:2 trace gap.
+* Slice data (§7.3.8) — the slice-data syntax-element walk that
+  drives the CABAC engine. Needs the §9.3.4.2 per-syntax-element
+  binarization / context-index derivation (which selects the
+  `ctxTable` / `ctxIdx` for each bin) and the §7.3.8.1..§7.3.8.12
+  parse loops.
+* §9.3.4.2 per-syntax-element binarization / context-index
+  derivation — blocked on the docs `cu_qp_delta` + `last_sig_coeff`
+  multi-QG / multi-CTU 4:2:2 trace gap. (The §9.3 arithmetic decode
+  engine itself — DecodeDecision / DecodeBypass / DecodeTerminate
+  / RenormD / alignment — is implemented as of round 11; it sits
+  one layer below the binarization tables and is not affected by
+  the trace gap.)
 * Intra / inter prediction, transform, in-loop filters (deblock /
   SAO), DPB management.
 * Encoder.

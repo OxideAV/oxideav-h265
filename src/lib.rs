@@ -5,6 +5,18 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
+//! Round 11 lands the §9.3 CABAC arithmetic decoding engine
+//! ([`cabac::CabacEngine`] / [`cabac::ContextModel`] / [`cabac::init_type`]):
+//! the §9.3.2.6 engine-register init, the §9.3.2.2 context-variable init
+//! (equations 9-4..9-7), the §9.3.4.3.2 DecodeDecision primitive (with
+//! the Table 9-52 / Table 9-53 LPS-range / state-transition tables), the
+//! §9.3.4.3.3 RenormD loop, the §9.3.4.3.4 DecodeBypass primitive (with
+//! an MSB-first `decode_bypass_bits(n)` helper), the §9.3.4.3.5
+//! DecodeTerminate primitive, and the §9.3.4.3.6 aligned-bypass
+//! alignment hook. The engine ships standalone — independent of the
+//! §9.3.4.2 per-syntax-element binarization / context-index derivation
+//! that the slice-data parser still needs.
+//!
 //! Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 land the Annex B NAL-unit
 //! byte-stream walker, the §7.3.1.2 NAL header parse, the §7.3.2.1
 //! VPS structural parse (with a §7.3.3 profile_tier_level walk), the
@@ -131,6 +143,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
+pub mod cabac;
 pub mod nal;
 pub mod pps;
 pub mod scaling_list;
@@ -140,6 +153,7 @@ pub mod sps;
 pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
+pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use scaling_list::{

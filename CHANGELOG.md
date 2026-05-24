@@ -6,6 +6,65 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 11 (2026-05-24)
+
+- §9.3 CABAC arithmetic decoding engine as a new standalone module
+  (`cabac`):
+  - §9.3.2.6 engine-register initialization: `CabacEngine::new`
+    consumes a `BitReader` positioned at the first bit of
+    `slice_segment_data()`, sets `ivlCurrRange = 510`, and reads the
+    9-bit initial `ivlOffset` — enforcing the spec's "the bitstream
+    shall not contain data that result in a value of ivlOffset being
+    equal to 510 or 511" constraint as `CabacError::InvalidInitOffset`.
+    `CabacEngine::init_engine` re-initializes the registers in place
+    (the `pcm_flag == 1` re-init path).
+  - §9.3.2.2 context-variable initialization: `ContextModel::init`
+    evaluates equations 9-4..9-6 — `slopeIdx` / `offsetIdx`,
+    `m = slopeIdx * 5 − 45`, `n = ( offsetIdx << 3 ) − 16`, then
+    `preCtxState = Clip3( 1, 126, ( ( m * Clip3( 0, 51, SliceQpY ) ) >> 4 ) + n )`,
+    with `valMps` / `pStateIdx` split. The §9.3.2.2 `initType`
+    selector (equation 9-7) is exposed as the free function
+    `init_type(slice_type, cabac_init_flag)`. `ContextModel::terminate_state`
+    yields the §9.3.2.2 NOTE 2 non-adapting `(pStateIdx = 63,
+    valMps = 0)` state.
+  - §9.3.4.3.2 `DecodeDecision`: `CabacEngine::decode_decision`
+    derives `qRangeIdx = ( ivlCurrRange >> 6 ) & 3`, looks up
+    `ivlLpsRange` in the Table 9-52 `rangeTabLps[64][4]`, performs
+    the LPS / MPS branch on `ivlOffset`, applies the §9.3.4.3.2.2
+    state transition (Table 9-53 `transIdxLps` / `transIdxMps`, with
+    the `pStateIdx == 0` LPS path flipping `valMps`), and invokes
+    `RenormD`. Mutates the supplied `ContextModel` in place.
+  - §9.3.4.3.3 `RenormD` renormalization loop, internal to the
+    engine: while `ivlCurrRange < 256`, double the range and shift
+    one fresh `read_bits(1)` into `ivlOffset`.
+  - §9.3.4.3.4 `DecodeBypass`: `CabacEngine::decode_bypass` shifts a
+    fresh bit into `ivlOffset` and compares it to `ivlCurrRange`,
+    returning the equal-probability bin. `decode_bypass_bits(n)` is a
+    convenience wrapper that accumulates `n` bypass bins MSB-first
+    into a `u32` (the common fixed-length bypass pattern).
+  - §9.3.4.3.5 `DecodeTerminate`: `CabacEngine::decode_terminate`
+    decrements `ivlCurrRange` by 2, returns 1 if `ivlOffset >=
+    ivlCurrRange` (no renormalization — decoding is terminated) and
+    otherwise returns 0 with renormalization. This is the
+    `end_of_slice_segment_flag` / `end_of_subset_one_bit` /
+    `pcm_flag` decision (ctxTable = 0, ctxIdx = 0).
+  - §9.3.4.3.6 alignment process prior to aligned bypass decoding:
+    `CabacEngine::align` sets `ivlCurrRange = 256` (the
+    pre-`coeff_abs_level_remaining[ ]` / `coeff_sign_flag[ ]` hook);
+    `ivlOffset` and the bit reader are untouched.
+- 20 new `cabac` unit tests: equation 9-7 truth table; equations
+  9-4..9-6 worked examples at boundary `initValue` / `SliceQpY`
+  combinations (negative-slope path, high `initValue`, sub-zero QP
+  clipping); §9.3.2.2 NOTE 2 terminate-state values; Table 9-52
+  corner / monotonicity checks; Table 9-53 transition bounds + LPS /
+  MPS monotonicity; §9.3.2.6 engine-init bit consumption and the
+  forbidden 510 / 511 rejection; bypass MSB-first bit accumulation
+  and the `offset >= range` path; terminate one / zero / no-renorm
+  paths; alignment register set; `DecodeDecision` MPS-no-renorm and
+  LPS-with-renorm paths (including the `pStateIdx == 0` MPS flip);
+  an all-zero-stream MPS-state-walk integration check; and an
+  end-of-buffer surfacing test.
+
 ### Added — clean-room rebuild round 10 (2026-05-24)
 
 - The remaining three §6.5 scan-order initialization processes, joining
