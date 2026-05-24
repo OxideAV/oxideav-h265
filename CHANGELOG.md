@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 10 (2026-05-24)
+
+- The remaining three §6.5 scan-order initialization processes, joining
+  round 9's §6.5.3 up-right diagonal scan in the `scan` module:
+  - §6.5.4 horizontal scan ([`horizontal`], equation 6-12) — a plain
+    raster walk, `scanIdx == 1`.
+  - §6.5.5 vertical scan ([`vertical`], equation 6-13) — the transpose
+    of the horizontal scan (column by column), `scanIdx == 2`.
+  - §6.5.6 traverse scan ([`traverse`], equation 6-14) — a
+    boustrophedon (serpentine) raster, even rows left-to-right and odd
+    rows right-to-left, `scanIdx == 3`.
+- The §7.4.2 `ScanOrder[log2BlockSize][scanIdx]` accessor
+  ([`scan_order`] / [`ScanIdx`] / [`ScanOrderError`]): dispatches to the
+  §6.5.3..§6.5.6 process for the requested block size and scan index,
+  enforcing the table's populated ranges — `log2BlockSize` 0..=3 for the
+  diagonal / horizontal / vertical scans, 2..=5 for the traverse scan.
+  This is the table the residual-coding path (§7.3.8.11 / §9.3.4.2.4)
+  selects per transform block.
+- 13 new byte-exact `scan` tests: hand-derived 4x4 / 2x2 expected
+  coordinate vectors for each new scan, permutation / transpose /
+  odd-row-reversal invariants across the populated block sizes, the
+  `scan_order` dispatch-vs-builder equivalence, and the
+  out-of-range rejection per §7.4.2.
+
 ### Added — clean-room rebuild round 9 (2026-05-24)
 
 - §6.5.3 up-right diagonal scan order (equation 6-11), in a new `scan`

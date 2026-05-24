@@ -71,9 +71,16 @@
 //!   §7.4.5 `ScalingList[sizeId][matrixId][i]` coefficient arrays are
 //!   derived (default tables + prediction inference); see
 //!   [`scaling_list::ScalingListData`].
-//! * §6.5.3 [`scan::up_right_diagonal`] — the up-right diagonal scan
-//!   order (equation 6-11), and §7.4.5
-//!   [`scaling_list::ScalingListData::scaling_factors`] expanding the
+//! * §6.5 [`scan`] — all four scan-order initialization processes plus
+//!   the §7.4.2 [`scan::scan_order`] `ScanOrder[log2BlockSize][scanIdx]`
+//!   accessor: [`scan::up_right_diagonal`] (§6.5.3, equation 6-11),
+//!   [`scan::horizontal`] (§6.5.4, equation 6-12),
+//!   [`scan::vertical`] (§6.5.5, equation 6-13), and
+//!   [`scan::traverse`] (§6.5.6, equation 6-14, the boustrophedon
+//!   raster). [`scan::scan_order`] enforces §7.4.2's populated ranges
+//!   (`log2BlockSize` 0..=3 for diagonal / horizontal / vertical, 2..=5
+//!   for traverse). §7.4.5
+//!   [`scaling_list::ScalingListData::scaling_factors`] expands the
 //!   flat scaling lists into the two-dimensional
 //!   `ScalingFactor[sizeId][matrixId][x][y]` quantization matrices
 //!   (equations 7-44..7-51: the diagonal scatter, the 2x / 4x block
@@ -139,7 +146,9 @@ pub use scaling_list::{
     ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,
     MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS,
 };
-pub use scan::{up_right_diagonal, ScanPos};
+pub use scan::{
+    horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
+};
 pub use slice::{
     EntryPointOffsets, SliceDeblocking, SliceError, SliceLongTermRefPic, SliceLongTermRefPicSource,
     SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,

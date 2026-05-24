@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 9 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 10 (2026-05-24).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,15 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 9 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 10 completes the
+§6.5 scan-order family — the §6.5.4 horizontal (equation 6-12), §6.5.5
+vertical (equation 6-13), and §6.5.6 traverse (equation 6-14,
+boustrophedon) scans now join round 9's §6.5.3 up-right diagonal — and
+adds the §7.4.2 `ScanOrder[log2BlockSize][scanIdx]` accessor
+(`scan_order`) with its populated-range checks (`log2BlockSize` 0..=3
+for diagonal / horizontal / vertical, 2..=5 for traverse), the form the
+residual-coding path (§7.3.8.11 / §9.3.4.2.4) selects per block. Round 9
+landed the
 §6.5.3 up-right diagonal scan order (equation 6-11) and the §7.4.5
 `ScalingFactor[sizeId][matrixId][x][y]` 2-D quantization-matrix
 derivation (equations 7-44..7-51), building on round 8's §7.3.4
@@ -141,11 +149,19 @@ data and CABAC remain unimplemented.
   DC-coefficient `[0][0]` override (equations 7-47 / 7-49 / 7-51), and
   the `ChromaArrayType == 3` 32x32-chroma derivation from the 16x16
   lists (equations 7-50 / 7-51).
-* §6.5.3 [`up_right_diagonal`] — the up-right diagonal scan order
-  (equation 6-11), the `ScanOrder[log2BlockSize][0]` entry the §7.4.5
-  `ScalingFactor` derivation reads (4x4 and 8x8 blocks). The
-  horizontal / vertical / traverse scans (§6.5.4..§6.5.6) are deferred
-  to the residual-coding path.
+* §6.5 [`scan`] — all four scan-order initialization processes plus
+  the §7.4.2 [`scan_order`] `ScanOrder[log2BlockSize][scanIdx]`
+  accessor: [`up_right_diagonal`] (§6.5.3, equation 6-11),
+  [`horizontal`] (§6.5.4, equation 6-12), [`vertical`] (§6.5.5,
+  equation 6-13), and [`traverse`] (§6.5.6, equation 6-14 — the
+  boustrophedon raster: even rows left-to-right, odd rows
+  right-to-left). [`ScanIdx`] is the §7.4.2 selector (0 diagonal /
+  1 horizontal / 2 vertical / 3 traverse) and [`scan_order`] enforces
+  the table's populated ranges — `log2BlockSize` 0..=3 for the
+  diagonal / horizontal / vertical scans, 2..=5 for the traverse scan
+  ([`ScanOrderError`]). The §7.4.5 `ScalingFactor` derivation reads
+  `ScanOrder[2][0]` (4x4) and `ScanOrder[3][0]` (8x8); the residual
+  coding path (§7.3.8.11 / §9.3.4.2.4) reads the full table.
 * §7.3.6.1 [`SliceSegmentHeader`] — the `slice_segment_header()` parse
   for an independent slice segment, taking the activated SPS + PPS as
   context: `first_slice_segment_in_pic_flag`,
@@ -183,14 +199,10 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
 [`SeqParameterSet::parse`], [`PicParameterSet::parse`],
-[`SliceSegmentHeader::parse`].
+[`SliceSegmentHeader::parse`], [`scan_order`].
 
 ## Not yet implemented
 
-* The §6.5.4..§6.5.6 horizontal / vertical / traverse scan orders
-  (equations 6-12..6-14) — only the §6.5.3 up-right diagonal scan
-  ([`up_right_diagonal`]), the form the §7.4.5 `ScalingFactor`
-  derivation needs, is built; the others belong to residual coding.
 * VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
   the parsed SPS struct.
 * SPS extension bodies (Range Extension, Multilayer Annex F,
