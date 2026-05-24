@@ -5,7 +5,7 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 land the Annex B NAL-unit
+//! Rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 land the Annex B NAL-unit
 //! byte-stream walker, the §7.3.1.2 NAL header parse, the §7.3.2.1
 //! VPS structural parse (with a §7.3.3 profile_tier_level walk), the
 //! full §7.3.2.2 SPS parse (through the `vui_parameters_present_flag`
@@ -14,14 +14,18 @@
 //! §7.3.2.3.1 PPS parse (full general body through
 //! `pps_extension_present_flag`, including the tiles and
 //! deblocking-control blocks; the PPS extension bodies are surfaced as
-//! an opaque tail), and the §7.3.6.1 slice-segment-header parse —
-//! independent I-slice IDR segments end to end (round 6), and now
-//! (round 7) independent **non-IDR I-slice** segments through the
-//! §7.3.6.1 POC + short-term-RPS + long-term-RPS block end to end as
-//! well. The P/B reference-list / weighted-prediction sub-structures
-//! are still surfaced as an opaque tail. Slice data and CABAC are
-//! *not* implemented yet; the public decoder and encoder entry points
-//! still return [`Error::NotImplemented`].
+//! an opaque tail), the §7.3.6.1 slice-segment-header parse —
+//! independent I-slice IDR segments end to end (round 6), and
+//! independent **non-IDR I-slice** segments through the §7.3.6.1 POC +
+//! short-term-RPS + long-term-RPS block end to end (round 7) — and
+//! now (round 8) the §7.3.4 `scaling_list_data()` parse with the
+//! §7.4.5 `ScalingList[sizeId][matrixId][i]` derivation, wired into
+//! both the SPS (`sps_scaling_list_data_present_flag`) and PPS
+//! (`pps_scaling_list_data_present_flag`) paths. The P/B
+//! reference-list / weighted-prediction sub-structures are still
+//! surfaced as an opaque tail. Slice data and CABAC are *not*
+//! implemented yet; the public decoder and encoder entry points still
+//! return [`Error::NotImplemented`].
 //!
 //! ## What works today
 //!
@@ -48,7 +52,9 @@
 //!   DPB / reorder / latency triple loop, the four
 //!   `log2_*_block_size{_minus_2,_minus_3,_diff_max_min}` fields,
 //!   `max_transform_hierarchy_depth_{inter,intra}`,
-//!   `scaling_list_enabled_flag`, `amp_enabled_flag`,
+//!   `scaling_list_enabled_flag` (with the nested
+//!   `sps_scaling_list_data_present_flag` / [`scaling_list::ScalingListData`]
+//!   §7.3.4 block), `amp_enabled_flag`,
 //!   `sample_adaptive_offset_enabled_flag`, the [`sps::PcmInfo`] block
 //!   gated by `pcm_enabled_flag`, the
 //!   `num_short_term_ref_pic_sets` ue(v) + per-set
@@ -60,8 +66,11 @@
 //!   `strong_intra_smoothing_enabled_flag` pair, and the
 //!   `vui_parameters_present_flag` / `sps_extension_present_flag`
 //!   gates whose bodies are surfaced as [`sps::OpaqueTail`].
-//!   Scaling-list data (§7.3.4) is still deferred — the parser
-//!   refuses `scaling_list_enabled_flag == 1`.
+//!   The §7.3.4 `scaling_list_data()` block — when
+//!   `sps_scaling_list_data_present_flag == 1` — is parsed and the
+//!   §7.4.5 `ScalingList[sizeId][matrixId][i]` coefficient arrays are
+//!   derived (default tables + prediction inference); see
+//!   [`scaling_list::ScalingListData`].
 //! * §7.3.2.3.1 [`pps::PicParameterSet`] — the full general
 //!   `pic_parameter_set_rbsp()` body: the `pps_*_id` pair, the
 //!   slice-header gates, `init_qp_minus26` (`se(v)`), the chroma QP
@@ -72,10 +81,12 @@
 //!   `lists_modification_present_flag`,
 //!   `log2_parallel_merge_level_minus2`, and the
 //!   `pps_extension_present_flag` gate (extension bodies surfaced as a
-//!   shared [`sps::OpaqueTail`]). `pps_scaling_list_data_present_flag
-//!   == 1` is refused alongside the SPS scaling-list deferral. The
-//!   §7.4.3.3.1 inference rules are applied so absent conditional
-//!   fields carry their effective value.
+//!   shared [`sps::OpaqueTail`]). When
+//!   `pps_scaling_list_data_present_flag == 1` the §7.3.4
+//!   `scaling_list_data()` block is parsed into
+//!   [`scaling_list::ScalingListData`]. The §7.4.3.3.1 inference rules
+//!   are applied so absent conditional fields carry their effective
+//!   value.
 //! * §7.3.6.1 [`slice::SliceSegmentHeader`] — the
 //!   `slice_segment_header()` parse for an independent slice segment,
 //!   taking the activated SPS + PPS as context (the
@@ -107,6 +118,7 @@ use oxideav_core::RuntimeContext;
 pub mod bitreader;
 pub mod nal;
 pub mod pps;
+pub mod scaling_list;
 pub mod slice;
 pub mod sps;
 pub mod vps;
@@ -114,6 +126,10 @@ pub mod vps;
 pub use bitreader::{BitReader, BitReaderError};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
+pub use scaling_list::{
+    ScalingListData, ScalingListError, ScalingListMatrix, MAX_COEF_NUM, NUM_MATRIX_IDS,
+    NUM_SIZE_IDS,
+};
 pub use slice::{
     EntryPointOffsets, SliceDeblocking, SliceError, SliceLongTermRefPic, SliceLongTermRefPicSource,
     SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,

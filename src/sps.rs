@@ -10,9 +10,11 @@
 //! The VUI body and the per-extension `sps_*_extension( )` syntax
 //! structures are not materialised in this round.
 //!
-//! Scaling-list data (§7.3.4) is still rejected when
-//! `scaling_list_enabled_flag == 1`; that block is deferred to a
-//! later round.
+//! When `scaling_list_enabled_flag == 1` and
+//! `sps_scaling_list_data_present_flag == 1`, the §7.3.4
+//! `scaling_list_data()` block is parsed via the shared
+//! [`crate::scaling_list`] module; otherwise the §7.4.5 default lists
+//! apply.
 //!
 //! ## Layout summary
 //!
@@ -50,7 +52,11 @@
 //! max_transform_hierarchy_depth_inter             ue(v)
 //! max_transform_hierarchy_depth_intra             ue(v)
 //! scaling_list_enabled_flag                        u(1)
-//!   /* deferred when 1 — `scaling_list_data()` not yet parsed */
+//!   if( scaling_list_enabled_flag ) {
+//!     sps_scaling_list_data_present_flag            u(1)
+//!     if( sps_scaling_list_data_present_flag )
+//!       scaling_list_data( )                        /* §7.3.4 */
+//!   }
 //! amp_enabled_flag                                 u(1)
 //! sample_adaptive_offset_enabled_flag              u(1)
 //! pcm_enabled_flag                                 u(1)
@@ -103,11 +109,12 @@
 //!   itself bounded at 16 because `MaxDpbSize` per §A.4.2 is 16).
 //! * `delta_poc_s0_minus1` / `delta_poc_s1_minus1` /
 //!   `abs_delta_rps_minus1` range 0..=2^15-1.
-//! * `scaling_list_enabled_flag == 1` is **rejected** with
-//!   [`SpsError::ScalingListUnsupported`]; `scaling_list_data()` is
-//!   a deferred parse target.
+//! * `sps_scaling_list_data_present_flag == 1` triggers a §7.3.4
+//!   `scaling_list_data()` parse into [`ScalingListData`] via the
+//!   shared [`crate::scaling_list`] module.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::scaling_list::{ScalingListData, ScalingListError};
 use crate::vps::{ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
 
 /// Maximum number of short-term reference picture sets an SPS may
@@ -139,10 +146,8 @@ pub enum SpsError {
         /// re-cast at the call site).
         got: u32,
     },
-    /// `scaling_list_enabled_flag == 1` was encountered. The
-    /// scaling-list block (§7.3.4) is a deferred parse target; the
-    /// fixture corpus this round targets has the flag off.
-    ScalingListUnsupported,
+    /// A `scaling_list_data()` parse (§7.3.4) from the SPS failed.
+    ScalingList(ScalingListError),
     /// An unexpected bitstream-level error surfaced from the reader.
     Bitstream(BitReaderError),
     /// A `profile_tier_level()` parse from the §7.3.3 walk failed.
@@ -156,9 +161,7 @@ impl core::fmt::Display for SpsError {
             Self::ValueOutOfRange { field, got } => {
                 write!(f, "SPS syntax element {field} out of range: {got}")
             }
-            Self::ScalingListUnsupported => {
-                f.write_str("SPS has scaling_list_enabled_flag == 1; scaling-list parse deferred")
-            }
+            Self::ScalingList(e) => write!(f, "scaling-list error during SPS parse: {e}"),
             Self::Bitstream(e) => write!(f, "bitstream error during SPS parse: {e}"),
             Self::Ptl(e) => write!(f, "profile_tier_level error during SPS parse: {e}"),
         }
@@ -184,6 +187,19 @@ impl From<VpsError> for SpsError {
             Self::Truncated
         } else {
             Self::Ptl(e)
+        }
+    }
+}
+
+impl From<ScalingListError> for SpsError {
+    fn from(e: ScalingListError) -> Self {
+        // Flatten truncation / raw-reader faults to the SPS-level
+        // equivalents so the public surface stays predictable; carry
+        // the structured scaling-list faults through as-is.
+        match e {
+            ScalingListError::Truncated => Self::Truncated,
+            ScalingListError::Bitstream(b) => Self::Bitstream(b),
+            other => Self::ScalingList(other),
         }
     }
 }
@@ -381,10 +397,19 @@ pub struct SeqParameterSet {
     pub max_transform_hierarchy_depth_inter: u8,
     /// `max_transform_hierarchy_depth_intra` (`ue(v)`).
     pub max_transform_hierarchy_depth_intra: u8,
-    /// `scaling_list_enabled_flag`. Round 4 still errors out when
-    /// this is 1; the `scaling_list_data()` parser is a separate
-    /// follow-up.
+    /// `scaling_list_enabled_flag` (§7.3.2.2). When set, the SPS
+    /// either carries an explicit [`Self::scaling_list_data`] (when
+    /// `sps_scaling_list_data_present_flag == 1`) or the §7.4.5 default
+    /// scaling lists apply.
     pub scaling_list_enabled_flag: bool,
+    /// `sps_scaling_list_data_present_flag` (§7.3.2.2). Inferred to
+    /// `false` (the §7.4.5 default lists apply) when
+    /// `scaling_list_enabled_flag == 0`.
+    pub sps_scaling_list_data_present_flag: bool,
+    /// The parsed §7.3.4 `scaling_list_data()` structure when
+    /// `sps_scaling_list_data_present_flag == 1`; `None` otherwise (the
+    /// §7.4.5 default lists apply).
+    pub scaling_list_data: Option<ScalingListData>,
     /// `amp_enabled_flag` — asymmetric motion partitions.
     pub amp_enabled_flag: bool,
     /// `sample_adaptive_offset_enabled_flag` — SPS-level gate for
@@ -570,9 +595,18 @@ impl SeqParameterSet {
         let max_transform_hierarchy_depth_intra = br.ue()? as u8;
 
         let scaling_list_enabled_flag = br.u1()? != 0;
+        let mut sps_scaling_list_data_present_flag = false;
+        let mut scaling_list_data = None;
         if scaling_list_enabled_flag {
-            // §7.3.4 scaling_list_data() — deferred to a future round.
-            return Err(SpsError::ScalingListUnsupported);
+            // §7.3.2.2: when scaling_list_enabled_flag == 1, an inner
+            // sps_scaling_list_data_present_flag gates the explicit
+            // scaling_list_data() structure (§7.3.4). When the inner
+            // flag is 0 the default scaling lists (§7.4.5 Tables 7-5 /
+            // 7-6) apply, so the SPS still parses.
+            sps_scaling_list_data_present_flag = br.u1()? != 0;
+            if sps_scaling_list_data_present_flag {
+                scaling_list_data = Some(ScalingListData::parse(br)?);
+            }
         }
 
         let amp_enabled_flag = br.u1()? != 0;
@@ -724,6 +758,8 @@ impl SeqParameterSet {
             max_transform_hierarchy_depth_inter,
             max_transform_hierarchy_depth_intra,
             scaling_list_enabled_flag,
+            sps_scaling_list_data_present_flag,
+            scaling_list_data,
             amp_enabled_flag,
             sample_adaptive_offset_enabled_flag,
             pcm_enabled_flag,
@@ -1391,18 +1427,19 @@ mod tests {
         assert!(sps.strong_intra_smoothing_enabled_flag);
     }
 
-    /// Hand-assembled SPS that signals
-    /// `scaling_list_enabled_flag == 1` — the parser must refuse this
-    /// with [`SpsError::ScalingListUnsupported`].
-    #[test]
-    fn rejects_scaling_list_enabled() {
+    /// SPS prefix bits identical to `synthesised_prefix_bits()` but
+    /// stopping just *before* `scaling_list_enabled_flag` (i.e. after
+    /// `max_transform_hierarchy_depth_intra`). Round 8 scaling-list
+    /// tests append their own scaling_list block + the amp/sao bits +
+    /// the SPS tail.
+    fn synthesised_prefix_before_scaling_list() -> String {
         let mut s = String::new();
         s += "0000"; // vps_id
-        s += "000";
-        s += "1";
-        s += "00";
-        s += "0";
-        s += "00001";
+        s += "000"; // max_sub_layers_minus1
+        s += "1"; // nesting flag
+        s += "00"; // profile_space
+        s += "0"; // tier
+        s += "00001"; // profile_idc
         for _ in 0..32 {
             s += "0";
         }
@@ -1411,30 +1448,96 @@ mod tests {
             s += "0";
         }
         s += "0";
-        s += "00011110";
-        s += "1";
-        s += "010";
-        s += "000010001";
-        s += "000010001";
-        s += "0";
-        s += "1";
-        s += "1";
-        s += "00101";
-        s += "1";
-        s += "1";
-        s += "1";
-        s += "1";
-        s += "1";
-        s += "010";
-        s += "1";
-        s += "011";
-        s += "1";
-        s += "1";
-        // scaling_list_enabled = 1
-        s += "1";
+        s += "00011110"; // level=30
+        s += "1"; // sps_id=0
+        s += "010"; // chroma_format_idc=1
+        s += "000010001"; // width=16
+        s += "000010001"; // height=16
+        s += "0"; // conf_win=0
+        s += "1"; // bd_luma=0
+        s += "1"; // bd_chroma=0
+        s += "00101"; // log2_max_poc_lsb_minus4=4
+        s += "1"; // ordering present=1
+        s += "1"; // dpb=0
+        s += "1"; // reorder=0
+        s += "1"; // latency=0
+        s += "1"; // log2_min_cb_minus3=0
+        s += "010"; // log2_diff=1
+        s += "1"; // log2_min_tb_minus2=0
+        s += "011"; // log2_diff_tb=2
+        s += "1"; // max_transform_depth_inter=0
+        s += "1"; // max_transform_depth_intra=0
+        s
+    }
+
+    /// SPS tail bits from `amp_enabled` through the stop bit, matching
+    /// the round-4 minimal tail (sao=1, pcm=0, num_short_term_rps=0,
+    /// long_term=0, temporal_mvp=1, strong_intra_smoothing=1, vui=0,
+    /// extension=0, stop=1).
+    fn synthesised_tail_after_scaling_list() -> String {
+        let mut s = String::new();
+        s += "0"; // amp_enabled=0
+        s += "1"; // sao_enabled=1
+        s += "0"; // pcm_enabled=0
+        s += "1"; // num_short_term_ref_pic_sets ue=0
+        s += "0"; // long_term_ref_pics=0
+        s += "1"; // temporal_mvp=1
+        s += "1"; // strong_intra_smoothing=1
+        s += "0"; // vui=0
+        s += "0"; // sps_extension_present=0
+        s += "1"; // stop bit
+        s
+    }
+
+    /// `scaling_list_enabled_flag == 1` with
+    /// `sps_scaling_list_data_present_flag == 0`: per §7.4.5 the
+    /// default scaling lists apply and the SPS parses end to end with
+    /// no explicit [`ScalingListData`].
+    #[test]
+    fn scaling_list_enabled_default_lists() {
+        let mut s = synthesised_prefix_before_scaling_list();
+        s += "1"; // scaling_list_enabled = 1
+        s += "0"; // sps_scaling_list_data_present_flag = 0
+        s += &synthesised_tail_after_scaling_list();
         let bytes = bits_to_bytes(&s);
-        let err = SeqParameterSet::parse(&bytes).unwrap_err();
-        assert_eq!(err, SpsError::ScalingListUnsupported);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        assert!(sps.scaling_list_enabled_flag);
+        assert!(!sps.sps_scaling_list_data_present_flag);
+        assert!(sps.scaling_list_data.is_none());
+    }
+
+    /// `scaling_list_enabled_flag == 1` with
+    /// `sps_scaling_list_data_present_flag == 1`: the SPS carries an
+    /// explicit `scaling_list_data()` (§7.3.4). Here every one of the
+    /// 24 slots signals pred_mode=0, delta=0 (use the default list), so
+    /// the parsed lists equal the §7.4.5 default tables.
+    #[test]
+    fn scaling_list_enabled_explicit_all_default() {
+        let mut s = synthesised_prefix_before_scaling_list();
+        s += "1"; // scaling_list_enabled = 1
+        s += "1"; // sps_scaling_list_data_present_flag = 1
+                  // scaling_list_data(): 24 slots, each pred_mode=0
+                  // ('0') + scaling_list_pred_matrix_id_delta ue=0 ('1').
+                  // sizeId 0/1/2 each 6 slots; sizeId 3 only 2 slots.
+        for size_id in 0..4 {
+            let step = if size_id == 3 { 3 } else { 1 };
+            let mut m = 0;
+            while m < 6 {
+                s += "0"; // scaling_list_pred_mode_flag = 0
+                s += "1"; // scaling_list_pred_matrix_id_delta ue = 0
+                m += step;
+            }
+        }
+        s += &synthesised_tail_after_scaling_list();
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        assert!(sps.scaling_list_enabled_flag);
+        assert!(sps.sps_scaling_list_data_present_flag);
+        let data = sps.scaling_list_data.expect("scaling_list_data present");
+        // 4x4 default = all 16.
+        assert_eq!(data.lists[0][0].coef, vec![16u16; 16]);
+        // 8x8 inter default for matrixId 3.
+        assert_eq!(data.lists[1][3].coef[63], 91);
     }
 
     /// `chroma_format_idc` is u-Exp-Golomb so on-wire codeNum 4 would

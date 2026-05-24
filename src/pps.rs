@@ -10,11 +10,12 @@
 //! the conditionally-signalled fields are applied so the parsed struct
 //! always carries the effective value.
 //!
-//! Two bodies are deferred and surfaced rather than decoded:
+//! One body is parsed via the shared `scaling_list` module; one is
+//! surfaced rather than decoded:
 //!
-//! * `pps_scaling_list_data_present_flag == 1` is **rejected** with
-//!   [`PpsError::ScalingListUnsupported`]; the `scaling_list_data()`
-//!   parser (§7.3.4) is a shared follow-up with the SPS path.
+//! * `pps_scaling_list_data_present_flag == 1` triggers a §7.3.4
+//!   `scaling_list_data()` parse into [`ScalingListData`] (shared with
+//!   the SPS path).
 //! * When `pps_extension_present_flag == 1` the four extension flags,
 //!   their bodies (`pps_range_extension()` etc.), and the trailing
 //!   `rbsp_trailing_bits()` are surfaced as a single [`OpaqueTail`]
@@ -69,7 +70,8 @@
 //!   }
 //! }
 //! pps_scaling_list_data_present_flag                 u(1)
-//!   /* rejected when 1 — scaling_list_data() deferred */
+//!   if( pps_scaling_list_data_present_flag )
+//!     scaling_list_data( )                           /* §7.3.4 */
 //! lists_modification_present_flag                    u(1)
 //! log2_parallel_merge_level_minus2                  ue(v)
 //! slice_segment_header_extension_present_flag        u(1)
@@ -92,6 +94,7 @@
 //! * `pps_beta_offset_div2` / `pps_tc_offset_div2` range −6..=6.
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::scaling_list::{ScalingListData, ScalingListError};
 use crate::sps::OpaqueTail;
 
 /// Errors that can arise while parsing a PPS RBSP.
@@ -108,11 +111,8 @@ pub enum PpsError {
         /// `se(v)` elements).
         got: i64,
     },
-    /// `pps_scaling_list_data_present_flag == 1` was encountered. The
-    /// scaling-list block (§7.3.4) is a deferred parse target shared
-    /// with the SPS path; the fixture corpus this round targets has
-    /// the flag off.
-    ScalingListUnsupported,
+    /// A `scaling_list_data()` parse (§7.3.4) from the PPS failed.
+    ScalingList(ScalingListError),
     /// An unexpected bitstream-level error surfaced from the reader.
     Bitstream(BitReaderError),
 }
@@ -124,9 +124,7 @@ impl core::fmt::Display for PpsError {
             Self::ValueOutOfRange { field, got } => {
                 write!(f, "PPS syntax element {field} out of range: {got}")
             }
-            Self::ScalingListUnsupported => f.write_str(
-                "PPS has pps_scaling_list_data_present_flag == 1; scaling-list parse deferred",
-            ),
+            Self::ScalingList(e) => write!(f, "scaling-list error during PPS parse: {e}"),
             Self::Bitstream(e) => write!(f, "bitstream error during PPS parse: {e}"),
         }
     }
@@ -139,6 +137,18 @@ impl From<BitReaderError> for PpsError {
         match e {
             BitReaderError::EndOfBuffer => Self::Truncated,
             other => Self::Bitstream(other),
+        }
+    }
+}
+
+impl From<ScalingListError> for PpsError {
+    fn from(e: ScalingListError) -> Self {
+        // Flatten truncation / raw-reader faults to the PPS-level
+        // equivalents; carry structured scaling-list faults as-is.
+        match e {
+            ScalingListError::Truncated => Self::Truncated,
+            ScalingListError::Bitstream(b) => Self::Bitstream(b),
+            other => Self::ScalingList(other),
         }
     }
 }
@@ -258,9 +268,12 @@ pub struct PicParameterSet {
     /// Deblocking-filter-control values, carrying §7.4.3.3.1 inferred
     /// defaults when the control block is absent.
     pub deblocking: DeblockingFilterControl,
-    /// `pps_scaling_list_data_present_flag`. Round 5 rejects the parse
-    /// when this is 1; the `scaling_list_data()` parser is deferred.
+    /// `pps_scaling_list_data_present_flag` (§7.3.2.3.1). When set, the
+    /// PPS carries an explicit [`Self::scaling_list_data`].
     pub pps_scaling_list_data_present_flag: bool,
+    /// The parsed §7.3.4 `scaling_list_data()` structure when
+    /// `pps_scaling_list_data_present_flag == 1`; `None` otherwise.
+    pub scaling_list_data: Option<ScalingListData>,
     /// `lists_modification_present_flag`.
     pub lists_modification_present_flag: bool,
     /// `log2_parallel_merge_level_minus2` (`ue(v)`).
@@ -455,12 +468,12 @@ impl PicParameterSet {
         };
 
         let pps_scaling_list_data_present_flag = br.u1()? != 0;
-        if pps_scaling_list_data_present_flag {
-            // scaling_list_data() (§7.3.4) is a deferred parse target
-            // shared with the SPS path; reject rather than misalign the
-            // subsequent fields.
-            return Err(PpsError::ScalingListUnsupported);
-        }
+        let scaling_list_data = if pps_scaling_list_data_present_flag {
+            // scaling_list_data() (§7.3.4), shared with the SPS path.
+            Some(ScalingListData::parse(br)?)
+        } else {
+            None
+        };
 
         let lists_modification_present_flag = br.u1()? != 0;
         let log2_parallel_merge_level_minus2 = br.ue()?;
@@ -506,6 +519,7 @@ impl PicParameterSet {
             deblocking_filter_control_present_flag,
             deblocking,
             pps_scaling_list_data_present_flag,
+            scaling_list_data,
             lists_modification_present_flag,
             log2_parallel_merge_level_minus2,
             slice_segment_header_extension_present_flag,
@@ -789,22 +803,42 @@ mod tests {
         assert!(!tail.bytes.is_empty());
     }
 
-    /// `pps_scaling_list_data_present_flag == 1` is rejected
-    /// (scaling_list_data parse deferred).
+    /// `pps_scaling_list_data_present_flag == 1` parses an explicit
+    /// `scaling_list_data()` (§7.3.4). Here every one of the 24 slots
+    /// signals pred_mode=0, delta=0 (use the §7.4.5 default list), so
+    /// the parsed lists equal the default tables and the PPS continues
+    /// through the rest of the body.
     #[test]
-    fn rejects_scaling_list_present() {
+    fn parses_scaling_list_present() {
         let mut bits = minimal_pps_prefix_bits_until_scaling_list();
-        // pps_scaling_list_data_present_flag = 1
-        bits += "1";
-        bits += "1"; // a stop bit so the buffer isn't empty
+        bits += "1"; // pps_scaling_list_data_present_flag = 1
+                     // scaling_list_data(): 24 slots, each '0' (pred_mode
+                     // = 0) + '1' (scaling_list_pred_matrix_id_delta ue
+                     // = 0). sizeId 0/1/2 each 6 slots; sizeId 3 only 2.
+        for size_id in 0..4 {
+            let step = if size_id == 3 { 3 } else { 1 };
+            let mut m = 0;
+            while m < 6 {
+                bits += "0";
+                bits += "1";
+                m += step;
+            }
+        }
+        // Remainder of the PPS body.
+        bits += "0"; // lists_modification_present_flag
+        bits += "1"; // log2_parallel_merge_level_minus2 ue = 0
+        bits += "0"; // slice_segment_header_extension_present_flag
+        bits += "0"; // pps_extension_present_flag
+        bits += "1"; // rbsp stop bit
         while bits.len() % 8 != 0 {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
-        assert_eq!(
-            PicParameterSet::parse(&rbsp),
-            Err(PpsError::ScalingListUnsupported)
-        );
+        let pps = PicParameterSet::parse(&rbsp).expect("scaling-list PPS parse");
+        assert!(pps.pps_scaling_list_data_present_flag);
+        let data = pps.scaling_list_data.expect("scaling_list_data present");
+        assert_eq!(data.lists[0][0].coef, vec![16u16; 16]);
+        assert_eq!(data.lists[1][0].coef[63], 115); // 8x8 intra default tail
     }
 
     /// `pps_pic_parameter_set_id` out of range (> 63) is rejected.

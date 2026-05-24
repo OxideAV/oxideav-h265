@@ -6,6 +6,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 8 (2026-05-24)
+
+- §7.3.4 `scaling_list_data()` parse + §7.4.5
+  `ScalingList[sizeId][matrixId][i]` derivation, in a new
+  `scaling_list` module ([`ScalingListData`]):
+  - For each of the 24 (`sizeId`, `matrixId`) slots,
+    `scaling_list_pred_mode_flag` (`u(1)`) selects between a predicted
+    list and an explicit list.
+  - Predicted: `scaling_list_pred_matrix_id_delta` (`ue(v)`) with the
+    §7.4.5 range check (`matrixId` for `sizeId <= 2`, `matrixId / 3`
+    for `sizeId == 3`). Delta 0 infers the §7.4.5 default list;
+    otherwise `refMatrixId = matrixId − delta * (sizeId == 3 ? 3 : 1)`
+    (equation 7-42) and the reference list (with its DC coefficient) is
+    copied (equation 7-43).
+  - Explicit: the running `nextCoef` accumulator, seeded at 8 and
+    updated as `(nextCoef + scaling_list_delta_coef + 256) % 256`
+    (§7.3.4), with `scaling_list_dc_coef_minus8` (`se(v)`) read first
+    for `sizeId > 1` (range −7..=247) supplying the DC coefficient.
+  - The default 4x4 / 8x8 intra/inter tables (Tables 7-5 / 7-6) are
+    transcribed; `coefNum = Min(64, 1 << (4 + (sizeId << 1)))`.
+  - Conformance checks: `scaling_list_pred_matrix_id_delta` bound,
+    `scaling_list_dc_coef_minus8 ∈ [−7, 247]`, and derived coefficient
+    `> 0`, each surfaced through [`ScalingListError`].
+- The block is wired into both the SPS
+  (`sps_scaling_list_data_present_flag`, nested under
+  `scaling_list_enabled_flag`) and the PPS
+  (`pps_scaling_list_data_present_flag`) parse paths, replacing the
+  previous outright refusals (`SpsError::ScalingListUnsupported` /
+  `PpsError::ScalingListUnsupported` removed in favour of
+  `SpsError::ScalingList` / `PpsError::ScalingList`). When
+  `scaling_list_enabled_flag == 1` but
+  `sps_scaling_list_data_present_flag == 0`, the SPS now parses (the
+  §7.4.5 default lists apply) — previously it was rejected.
+- `SeqParameterSet` gains `sps_scaling_list_data_present_flag` and
+  `scaling_list_data`; `PicParameterSet` gains `scaling_list_data`.
+- 10 new unit tests (total 75, was 65): all-default lists matching
+  Tables 7-5 / 7-6; `coefNum` per `sizeId`; explicit flat 4x4 list;
+  explicit 16x16 list with a DC coefficient; prediction copying a
+  reference list; and rejections for out-of-range
+  `scaling_list_pred_matrix_id_delta`, non-positive coefficient,
+  out-of-range DC coefficient, and truncation — plus the SPS
+  default-list / explicit-list and PPS explicit-list integration
+  tests. The previous `rejects_scaling_list_enabled` SPS test and
+  `rejects_scaling_list_present` PPS test were rewritten in place (not
+  ignored) to assert the new parse-through behaviour.
+
 ### Added — clean-room rebuild round 7 (2026-05-24)
 
 - §7.3.6.1 non-IDR POC + reference-picture-set block — the

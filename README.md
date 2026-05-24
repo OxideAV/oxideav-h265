@@ -14,31 +14,36 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 7 closes the
-§7.3.6.1 non-IDR POC + reference-picture-set sub-block:
-`slice_pic_order_cnt_lsb` (`u(v)`, width
-`log2_max_pic_order_cnt_lsb_minus4 + 4`),
-`short_term_ref_pic_set_sps_flag` with the §7.4.7.1 cross-check, the
-in-line `st_ref_pic_set(num_short_term_ref_pic_sets)` parse (via the
-new `ShortTermRefPicSet::parse_slice_inline` public entry point),
-`short_term_ref_pic_set_idx` (`u(v)` width
-`Ceil(Log2(num_short_term_ref_pic_sets))`), and the full long-term-ref-pic
-block — per-entry SPS-indexed (`lt_idx_sps[i]`) vs in-slice
-(`poc_lsb_lt[i]` + `used_by_curr_pic_lt_flag[i]`) signalling plus
-`delta_poc_msb_present_flag[i]` and `delta_poc_msb_cycle_lt[i]`. As a
-result, **all** independent I-slice segments — IDR (round 6) and
-non-IDR (round 7) — now parse end to end through `byte_alignment()`;
-only the P/B reference-list / weighted-prediction sub-structures
-(§7.3.6.2 / §7.3.6.3, both DPB-derived) remain surfaced as an opaque
-tail. It builds on round 6's slice-header parse, round 5's §7.3.2.3.1
-PPS parse, round 4's complete SPS RBSP body — PCM block, short-term
-reference picture sets (§7.3.7), the long-term reference picture
-table, the `sps_temporal_mvp_enabled_flag` /
-`strong_intra_smoothing_enabled_flag` pair, and the VUI / extension
-gates — round 3's structural prefix, round 2's VPS /
-profile-tier-level (§7.3.2.1 + §7.3.3), and round 1's Annex B /
-NAL-header foundation. Slice data, scaling-list data, and CABAC remain
-unimplemented.
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 8 lands the
+§7.3.4 `scaling_list_data()` parse plus the §7.4.5
+`ScalingList[sizeId][matrixId][i]` derivation. For each of the 24
+(`sizeId`, `matrixId`) slots the parser reads
+`scaling_list_pred_mode_flag` and either copies a reference list
+(`scaling_list_pred_matrix_id_delta` → the §7.4.5 default list when
+the delta is 0, equation 7-42/7-43 otherwise) or reads an explicit
+delta-coded list (the running `nextCoef` accumulator modulo 256, with
+the `scaling_list_dc_coef_minus8` DC coefficient for `sizeId > 1`).
+The default 4x4 / 8x8 tables (Tables 7-5 / 7-6) are transcribed, and
+the §7.4.5 range checks (`scaling_list_pred_matrix_id_delta` bound,
+`scaling_list_dc_coef_minus8 ∈ [−7, 247]`, coefficient `> 0`) are
+enforced. The structure is wired into both the SPS
+(`sps_scaling_list_data_present_flag`) and PPS
+(`pps_scaling_list_data_present_flag`) paths, which previously refused
+to parse when scaling lists were signalled. The up-right-diagonal scan
+into the two-dimensional `ScalingFactor` array (equations 7-44..7-51,
+needing the §6.5.3 `ScanOrder`) is a follow-up. It builds on round 7's
+non-IDR POC + reference-picture-set slice sub-block, round 6's
+slice-header parse, round 5's §7.3.2.3.1 PPS parse, round 4's complete
+SPS RBSP body — PCM block, short-term reference picture sets (§7.3.7),
+the long-term reference picture table, the
+`sps_temporal_mvp_enabled_flag` / `strong_intra_smoothing_enabled_flag`
+pair, and the VUI / extension gates — round 3's structural prefix,
+round 2's VPS / profile-tier-level (§7.3.2.1 + §7.3.3), and round 1's
+Annex B / NAL-header foundation. All independent I-slice segments (IDR
+and non-IDR) parse end to end through `byte_alignment()`; only the P/B
+reference-list / weighted-prediction sub-structures (§7.3.6.2 /
+§7.3.6.3, both DPB-derived) remain surfaced as an opaque tail. Slice
+data and CABAC remain unimplemented.
 
 ## Scope so far
 
@@ -85,9 +90,11 @@ unimplemented.
   `vui_parameters_present_flag` / `sps_extension_present_flag`
   gates. The VUI body and any extension payload are surfaced as
   [`OpaqueTail`] (raw RBSP bytes from the cut-off byte through the
-  buffer end, with the start-bit offset). `scaling_list_data()`
-  itself is still deferred — the parser refuses
-  `scaling_list_enabled_flag == 1`.
+  buffer end, with the start-bit offset). When
+  `scaling_list_enabled_flag == 1` and
+  `sps_scaling_list_data_present_flag == 1`, the §7.3.4
+  `scaling_list_data()` block is parsed into [`ScalingListData`]
+  (otherwise the §7.4.5 default lists apply).
 * §7.3.2.3.1 [`PicParameterSet`] — the full general
   `pic_parameter_set_rbsp()` body: `pps_pic_parameter_set_id` /
   `pps_seq_parameter_set_id`, the slice-header gates
@@ -111,11 +118,21 @@ unimplemented.
   `slice_segment_header_extension_present_flag`, and the
   `pps_extension_present_flag` gate (extension bodies surfaced as a
   shared [`OpaqueTail`]). The §7.4.3.3.1 inference rules are applied so
-  absent conditional fields carry their effective value, and
-  `pps_scaling_list_data_present_flag == 1` is refused
-  ([`PpsError::ScalingListUnsupported`]) alongside the SPS scaling-list
-  deferral. The signed-Exp-Golomb `se(v)` descriptor (§9.2.2) was
-  added to [`BitReader`] for the PPS QP / deblocking-offset fields.
+  absent conditional fields carry their effective value, and when
+  `pps_scaling_list_data_present_flag == 1` the §7.3.4
+  `scaling_list_data()` block is parsed into [`ScalingListData`]. The
+  signed-Exp-Golomb `se(v)` descriptor (§9.2.2) was added to
+  [`BitReader`] for the PPS QP / deblocking-offset fields.
+* §7.3.4 [`ScalingListData`] — the `scaling_list_data()` syntax
+  structure plus the §7.4.5 `ScalingList[sizeId][matrixId][i]`
+  derivation: per-slot `scaling_list_pred_mode_flag`, the
+  `scaling_list_pred_matrix_id_delta` reference-list / default-list
+  selection (equations 7-42 / 7-43), the explicit delta-coded form
+  (running `nextCoef` accumulator modulo 256 with the
+  `scaling_list_dc_coef_minus8` DC coefficient for `sizeId > 1`), and
+  the default 4x4 / 8x8 tables (Tables 7-5 / 7-6). The §7.4.5 range
+  checks are enforced ([`ScalingListError`]). The diagonal scan into
+  the 2-D `ScalingFactor` array (equations 7-44..7-51) is a follow-up.
 * §7.3.6.1 [`SliceSegmentHeader`] — the `slice_segment_header()` parse
   for an independent slice segment, taking the activated SPS + PPS as
   context: `first_slice_segment_in_pic_flag`,
@@ -157,10 +174,11 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 
 ## Not yet implemented
 
-* `scaling_list_data()` (§7.3.4) — both the SPS and PPS paths still
-  error out when their scaling-list-present flags are set
-  (`scaling_list_enabled_flag == 1` /
-  `pps_scaling_list_data_present_flag == 1`).
+* The §7.4.5 `ScalingFactor[sizeId][matrixId][x][y]` 2-D array
+  (equations 7-44..7-51) — the parse + flat-list derivation
+  ([`ScalingListData`]) is done, but the up-right-diagonal scan into
+  the 2-D quantization matrices (needing the §6.5.3 `ScanOrder`)
+  remains.
 * VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
   the parsed SPS struct.
 * SPS extension bodies (Range Extension, Multilayer Annex F,
