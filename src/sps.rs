@@ -116,6 +116,7 @@
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::scaling_list::{ScalingListData, ScalingListError};
 use crate::vps::{ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
+use crate::vui::{VuiError, VuiParameters};
 
 /// Maximum number of short-term reference picture sets an SPS may
 /// carry. Per §7.4.3.2 the field is bounded at 64 inclusive.
@@ -152,6 +153,8 @@ pub enum SpsError {
     Bitstream(BitReaderError),
     /// A `profile_tier_level()` parse from the §7.3.3 walk failed.
     Ptl(VpsError),
+    /// A `vui_parameters()` parse (§E.2.1) from the SPS tail failed.
+    Vui(VuiError),
 }
 
 impl core::fmt::Display for SpsError {
@@ -164,6 +167,19 @@ impl core::fmt::Display for SpsError {
             Self::ScalingList(e) => write!(f, "scaling-list error during SPS parse: {e}"),
             Self::Bitstream(e) => write!(f, "bitstream error during SPS parse: {e}"),
             Self::Ptl(e) => write!(f, "profile_tier_level error during SPS parse: {e}"),
+            Self::Vui(e) => write!(f, "vui_parameters error during SPS parse: {e}"),
+        }
+    }
+}
+
+impl From<VuiError> for SpsError {
+    fn from(e: VuiError) -> Self {
+        // Surface the inner reader-truncation directly so callers can
+        // distinguish "ran off the end mid-VUI" from other VUI faults.
+        match e {
+            VuiError::Truncated => Self::Truncated,
+            VuiError::Bitstream(b) => Self::Bitstream(b),
+            other => Self::Vui(other),
         }
     }
 }
@@ -438,16 +454,16 @@ pub struct SeqParameterSet {
     /// `strong_intra_smoothing_enabled_flag`.
     pub strong_intra_smoothing_enabled_flag: bool,
     /// `vui_parameters_present_flag`. When true, the
-    /// `vui_parameters( )` body plus everything after it (including
-    /// the `sps_extension_present_flag`, any extension bodies, and
-    /// the RBSP trailing bits) is surfaced as
-    /// [`Self::opaque_tail`].
+    /// `vui_parameters( )` body is decoded into [`Self::vui_parameters`]
+    /// (§E.2.1) and parsing continues to the
+    /// `sps_extension_present_flag`.
     pub vui_parameters_present_flag: bool,
-    /// `sps_extension_present_flag`. Only known when
-    /// [`Self::vui_parameters_present_flag`] is false; otherwise
-    /// inferred to false until the VUI body is parsed. When true,
-    /// the extension flags plus their bodies and the RBSP trailing
-    /// bits are surfaced as [`Self::opaque_tail`].
+    /// Decoded `vui_parameters( )` body (§E.2.1); `Some` iff
+    /// [`Self::vui_parameters_present_flag`] is true.
+    pub vui_parameters: Option<VuiParameters>,
+    /// `sps_extension_present_flag`. When true, the extension flags
+    /// plus their bodies and the RBSP trailing bits are surfaced as
+    /// [`Self::opaque_tail`].
     pub sps_extension_present_flag: bool,
     /// Opaque suffix of the SPS RBSP. Populated when a tail body
     /// (VUI or extension) is signalled but not parsed in this round,
@@ -700,16 +716,19 @@ impl SeqParameterSet {
 
         let vui_parameters_present_flag = br.u1()? != 0;
 
-        let (sps_extension_present_flag, opaque_tail) = if vui_parameters_present_flag {
-            // VUI body is not yet parsed; everything from here onward
-            // (including the eventual sps_extension_present_flag, any
-            // extension bodies, and the rbsp_trailing_bits) is surfaced
-            // as an opaque tail. `sps_extension_present_flag` is left
-            // false in the parsed struct since we genuinely don't know
-            // it without decoding the VUI body.
-            let tail = OpaqueTail::capture(br, rbsp);
-            (false, Some(tail))
-        } else if br.bits_left() == 0 {
+        // §E.2.1: when the gate is set, decode the vui_parameters( )
+        // body in place. The nested hrd_parameters( 1,
+        // sps_max_sub_layers_minus1 ) call (§E.2.2) reuses the shared
+        // HRD parser. After the VUI body the bitstream continues to the
+        // sps_extension_present_flag, so we fall through to the common
+        // extension-flag handling below.
+        let vui_parameters = if vui_parameters_present_flag {
+            Some(VuiParameters::parse(br, max_sub_layers_minus1)?)
+        } else {
+            None
+        };
+
+        let (sps_extension_present_flag, opaque_tail) = if br.bits_left() == 0 {
             // The fixture corpus encoders sometimes elide the
             // sps_extension_present_flag if no extension is signalled
             // and the rbsp_trailing_bits happens to land on a byte
@@ -772,6 +791,7 @@ impl SeqParameterSet {
             sps_temporal_mvp_enabled_flag,
             strong_intra_smoothing_enabled_flag,
             vui_parameters_present_flag,
+            vui_parameters,
             sps_extension_present_flag,
             opaque_tail,
         })
@@ -1035,6 +1055,34 @@ mod tests {
         out
     }
 
+    /// Helper: encode `v` as a fixed-width `u(n)` bit string (MSB-first).
+    fn u_bits(v: u64, n: u32) -> String {
+        let mut s = String::with_capacity(n as usize);
+        for i in (0..n).rev() {
+            s.push(if (v >> i) & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    }
+
+    /// Helper: encode `v` as a 0-th-order unsigned Exp-Golomb `ue(v)`
+    /// code (§9.2). `codeNum = v`, so the bitstring is
+    /// `leadingZeroBits` zeros, a `1`, then the `leadingZeroBits`-bit
+    /// remainder of `v + 1`.
+    fn ue_bits(v: u64) -> String {
+        let code = v + 1;
+        let num_bits = 64 - code.leading_zeros();
+        let leading_zeros = num_bits - 1;
+        let mut s = String::new();
+        for _ in 0..leading_zeros {
+            s.push('0');
+        }
+        // The leading `1` of `code` plus the remaining bits form the
+        // suffix; emitting all `num_bits` of `code` MSB-first gives
+        // exactly "1" followed by the `leading_zeros`-bit remainder.
+        s += &u_bits(code, num_bits);
+        s
+    }
+
     /// Prefix of bits that get every SPS hand-assembled fixture through
     /// the structural header up to (but not including) the round-4 tail.
     /// `chroma_format_idc=1, width=16, height=16, conf_win=0, bit_depths=0,
@@ -1169,15 +1217,44 @@ mod tests {
         assert!(sps.long_term_ref_pics.is_empty());
         assert!(sps.sps_temporal_mvp_enabled_flag);
         assert!(sps.strong_intra_smoothing_enabled_flag);
-        // The fixture's libx265 encode signals a VUI, so the parser
-        // captures everything after `vui_parameters_present_flag` as an
-        // opaque tail. We don't introspect its contents here — that is
-        // the next round's work — but we do verify the capture happened
-        // and starts mid-byte (the VUI body never lands on a clean byte
-        // boundary in this fixture).
+        // The fixture's libx265 encode signals a VUI; the §E.2.1 body is
+        // now fully decoded (no opaque tail remains). The decoded values
+        // are a real-bitstream cross-check of the VUI parser: a 1:1
+        // (square) sample aspect ratio, a video-signal-type block with
+        // the colour description elided (so the §E.2.1 inference defaults
+        // of 2 apply to the colour triple), and a 25 fps timing block
+        // (vui_num_units_in_tick=1, vui_time_scale=25) with no nested
+        // hrd_parameters().
         assert!(sps.vui_parameters_present_flag);
-        let tail = sps.opaque_tail.as_ref().expect("opaque VUI tail");
-        assert!(!tail.bytes.is_empty());
+        let vui = sps.vui_parameters.as_ref().expect("decoded VUI");
+        assert!(vui.aspect_ratio_info_present_flag);
+        assert_eq!(vui.aspect_ratio_info.unwrap().aspect_ratio_idc, 1);
+        assert!(!vui.overscan_info_present_flag);
+        assert!(vui.video_signal_type_present_flag);
+        let vst = vui.video_signal_type.unwrap();
+        assert_eq!(vst.video_format, 5);
+        assert!(!vst.video_full_range_flag);
+        assert!(!vst.colour_description_present_flag);
+        assert_eq!(vst.colour_primaries, 2);
+        assert_eq!(vst.transfer_characteristics, 2);
+        assert_eq!(vst.matrix_coeffs, 2);
+        assert!(!vui.chroma_loc_info_present_flag);
+        assert!(!vui.neutral_chroma_indication_flag);
+        assert!(!vui.field_seq_flag);
+        assert!(!vui.frame_field_info_present_flag);
+        assert!(!vui.default_display_window_flag);
+        assert!(vui.vui_timing_info_present_flag);
+        let timing = vui.vui_timing_info.as_ref().unwrap();
+        assert_eq!(timing.num_units_in_tick, 1);
+        assert_eq!(timing.time_scale, 25);
+        assert!(!timing.poc_proportional_to_timing_flag);
+        assert!(!timing.hrd_parameters_present_flag);
+        assert!(timing.hrd_parameters.is_none());
+        assert!(!vui.bitstream_restriction_flag);
+        // The VUI consumes the bitstream cleanly: no SPS extension and
+        // no opaque tail remain.
+        assert!(!sps.sps_extension_present_flag);
+        assert!(sps.opaque_tail.is_none());
     }
 
     /// End-to-end: pull the SPS NAL out of the raw Annex B stream
@@ -1770,10 +1847,12 @@ mod tests {
         assert!(!sps.long_term_ref_pics[1].used_by_curr_pic);
     }
 
-    /// SPS with `vui_parameters_present_flag == 1`: the parser must
-    /// surface everything after the VUI gate as an opaque tail.
-    #[test]
-    fn captures_vui_opaque_tail() {
+    /// Prefix bits that carry an SPS through the structural header to
+    /// the `vui_parameters_present_flag = 1` gate, ready for VUI body
+    /// bits to be appended. `max_sub_layers_minus1` is 0 in the
+    /// synthesised prefix, so a nested `hrd_parameters( 1, 0 )` walks a
+    /// single sub-layer.
+    fn vui_prefix_bits() -> String {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
@@ -1781,21 +1860,287 @@ mod tests {
         s += "1"; // temporal_mvp = 1
         s += "1"; // strong_intra_smoothing = 1
         s += "1"; // vui_parameters_present_flag = 1
-                  // synthetic opaque body (8 bits) + stop bit + pad
-        s += "10101010";
-        s += "1"; // trailing stop bit (treated as part of opaque tail)
+        s
+    }
+
+    /// SPS with `vui_parameters_present_flag == 1` and a minimal VUI in
+    /// which every present-flag is 0. Confirms the §E.2.1 inference
+    /// defaults are surfaced and the body is consumed (no opaque tail).
+    #[test]
+    fn decodes_minimal_vui_all_flags_clear() {
+        let mut s = vui_prefix_bits();
+        s += "0"; // aspect_ratio_info_present_flag
+        s += "0"; // overscan_info_present_flag
+        s += "0"; // video_signal_type_present_flag
+        s += "0"; // chroma_loc_info_present_flag
+        s += "0"; // neutral_chroma_indication_flag
+        s += "0"; // field_seq_flag
+        s += "0"; // frame_field_info_present_flag
+        s += "0"; // default_display_window_flag
+        s += "0"; // vui_timing_info_present_flag
+        s += "0"; // bitstream_restriction_flag
+        s += "0"; // sps_extension_present_flag
+        s += "1"; // rbsp stop bit
 
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         assert!(sps.vui_parameters_present_flag);
+        let vui = sps.vui_parameters.as_ref().expect("decoded VUI");
+        assert!(!vui.aspect_ratio_info_present_flag);
+        assert!(vui.aspect_ratio_info.is_none());
+        assert!(!vui.overscan_info_present_flag);
+        assert!(vui.overscan_appropriate_flag.is_none());
+        assert!(!vui.video_signal_type_present_flag);
+        assert!(vui.video_signal_type.is_none());
+        // §E.2.1 inference defaults via the effective accessor.
+        let vst = vui.effective_video_signal_type();
+        assert_eq!(vst.video_format, 5);
+        assert!(!vst.video_full_range_flag);
+        assert_eq!(vst.colour_primaries, 2);
+        assert_eq!(vst.transfer_characteristics, 2);
+        assert_eq!(vst.matrix_coeffs, 2);
+        assert!(!vui.chroma_loc_info_present_flag);
+        assert_eq!(
+            vui.effective_chroma_loc_info(),
+            crate::vui::ChromaLocInfo::default()
+        );
+        assert!(!vui.neutral_chroma_indication_flag);
+        assert!(!vui.field_seq_flag);
+        assert!(!vui.frame_field_info_present_flag);
+        assert!(!vui.default_display_window_flag);
+        assert!(vui.default_display_window.is_none());
+        assert!(!vui.vui_timing_info_present_flag);
+        assert!(vui.vui_timing_info.is_none());
+        assert!(!vui.bitstream_restriction_flag);
+        // §E.2.1 bitstream_restriction inference defaults.
+        let br = vui.effective_bitstream_restriction();
+        assert!(!br.tiles_fixed_structure_flag);
+        assert!(br.motion_vectors_over_pic_boundaries_flag);
+        assert_eq!(br.min_spatial_segmentation_idc, 0);
+        assert_eq!(br.max_bits_per_min_cu_denom, 1);
+        assert_eq!(br.log2_max_mv_length_horizontal, 15);
+        assert_eq!(br.log2_max_mv_length_vertical, 15);
+        // Clean consume.
         assert!(!sps.sps_extension_present_flag);
-        let tail = sps.opaque_tail.expect("opaque VUI tail");
-        assert!(!tail.bytes.is_empty());
-        // start_bit_in_first_byte is within [0, 7]; we don't pin its
-        // exact value here because the synthesised prefix varies in
-        // length across rounds and the test exists to confirm the tail
-        // was captured at all.
-        assert!(tail.start_bit_in_first_byte < 8);
+        assert!(sps.opaque_tail.is_none());
+    }
+
+    /// SPS with a fully-populated VUI exercising every sub-block:
+    /// EXTENDED_SAR aspect ratio, overscan, video_signal_type with the
+    /// colour-description triple, chroma_loc_info, the field/frame
+    /// indications, the default display window, the timing block with a
+    /// nested `hrd_parameters( 1, 0 )`, and the bitstream-restriction
+    /// block. Every field is decoded and cross-checked.
+    #[test]
+    fn decodes_full_vui_every_subblock() {
+        let mut s = vui_prefix_bits();
+
+        // aspect_ratio_info_present_flag = 1, EXTENDED_SAR (255) with
+        // sar_width=16, sar_height=9.
+        s += "1";
+        s += &u_bits(255, 8); // aspect_ratio_idc = EXTENDED_SAR
+        s += &u_bits(16, 16); // sar_width
+        s += &u_bits(9, 16); // sar_height
+
+        // overscan_info_present_flag = 1, overscan_appropriate_flag = 1.
+        s += "1";
+        s += "1";
+
+        // video_signal_type_present_flag = 1.
+        s += "1";
+        s += &u_bits(1, 3); // video_format = 1 (PAL)
+        s += "1"; // video_full_range_flag = 1
+        s += "1"; // colour_description_present_flag = 1
+        s += &u_bits(9, 8); // colour_primaries = 9 (BT.2020)
+        s += &u_bits(16, 8); // transfer_characteristics = 16 (PQ)
+        s += &u_bits(9, 8); // matrix_coeffs = 9 (BT.2020 NCL)
+
+        // chroma_loc_info_present_flag = 1, top=2, bottom=2.
+        s += "1";
+        s += &ue_bits(2);
+        s += &ue_bits(2);
+
+        // neutral_chroma_indication_flag, field_seq_flag,
+        // frame_field_info_present_flag.
+        s += "1"; // neutral_chroma_indication_flag = 1
+        s += "0"; // field_seq_flag = 0
+        s += "1"; // frame_field_info_present_flag = 1
+
+        // default_display_window_flag = 1, offsets 1/2/3/4.
+        s += "1";
+        s += &ue_bits(1);
+        s += &ue_bits(2);
+        s += &ue_bits(3);
+        s += &ue_bits(4);
+
+        // vui_timing_info_present_flag = 1.
+        s += "1";
+        s += &u_bits(1001, 32); // vui_num_units_in_tick
+        s += &u_bits(30_000, 32); // vui_time_scale (29.97 fps)
+        s += "1"; // vui_poc_proportional_to_timing_flag = 1
+        s += &ue_bits(7); // vui_num_ticks_poc_diff_one_minus1 = 7
+        s += "1"; // vui_hrd_parameters_present_flag = 1
+                  // hrd_parameters( 1, 0 ): commonInfPresentFlag = 1.
+        s += "0"; // nal_hrd_parameters_present_flag = 0
+        s += "0"; // vcl_hrd_parameters_present_flag = 0
+                  // both gates clear → no sub_pic / bit-rate-scale block.
+                  // initial_cpb_removal_delay_length_minus1 etc. are also
+                  // gated on has-any-hrd, so the common block ends here.
+                  // Per-sub-layer loop (i = 0..=0):
+        s += "1"; // fixed_pic_rate_general_flag[0] = 1
+                  //   → fixed_pic_rate_within_cvs_flag[0] inferred 1
+        s += &ue_bits(5); // elemental_duration_in_tc_minus1[0] = 5
+                          //   low_delay_hrd_flag = 0 (not present) →
+                          //   cpb_cnt_minus1[0] read:
+        s += &ue_bits(0); // cpb_cnt_minus1[0] = 0
+                          // no NAL/VCL sub-layer hrd bodies (both gates 0).
+
+        // bitstream_restriction_flag = 1.
+        s += "1";
+        s += "1"; // tiles_fixed_structure_flag = 1
+        s += "0"; // motion_vectors_over_pic_boundaries_flag = 0
+        s += "1"; // restricted_ref_pic_lists_flag = 1
+        s += &ue_bits(100); // min_spatial_segmentation_idc = 100
+        s += &ue_bits(4); // max_bytes_per_pic_denom = 4
+        s += &ue_bits(2); // max_bits_per_min_cu_denom = 2
+        s += &ue_bits(10); // log2_max_mv_length_horizontal = 10
+        s += &ue_bits(11); // log2_max_mv_length_vertical = 11
+
+        s += "0"; // sps_extension_present_flag = 0
+        s += "1"; // rbsp stop bit
+
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let vui = sps.vui_parameters.as_ref().expect("decoded VUI");
+
+        // aspect_ratio_info
+        assert!(vui.aspect_ratio_info_present_flag);
+        let ar = vui.aspect_ratio_info.unwrap();
+        assert_eq!(ar.aspect_ratio_idc, crate::vui::EXTENDED_SAR);
+        assert_eq!(ar.sar_width, 16);
+        assert_eq!(ar.sar_height, 9);
+
+        // overscan
+        assert!(vui.overscan_info_present_flag);
+        assert_eq!(vui.overscan_appropriate_flag, Some(true));
+
+        // video_signal_type + colour_description
+        assert!(vui.video_signal_type_present_flag);
+        let vst = vui.video_signal_type.unwrap();
+        assert_eq!(vst.video_format, 1);
+        assert!(vst.video_full_range_flag);
+        assert!(vst.colour_description_present_flag);
+        assert_eq!(vst.colour_primaries, 9);
+        assert_eq!(vst.transfer_characteristics, 16);
+        assert_eq!(vst.matrix_coeffs, 9);
+
+        // chroma_loc_info
+        assert!(vui.chroma_loc_info_present_flag);
+        let cl = vui.chroma_loc_info.unwrap();
+        assert_eq!(cl.chroma_sample_loc_type_top_field, 2);
+        assert_eq!(cl.chroma_sample_loc_type_bottom_field, 2);
+
+        // single-bit indications
+        assert!(vui.neutral_chroma_indication_flag);
+        assert!(!vui.field_seq_flag);
+        assert!(vui.frame_field_info_present_flag);
+
+        // default_display_window
+        assert!(vui.default_display_window_flag);
+        let dw = vui.default_display_window.unwrap();
+        assert_eq!(dw.left_offset, 1);
+        assert_eq!(dw.right_offset, 2);
+        assert_eq!(dw.top_offset, 3);
+        assert_eq!(dw.bottom_offset, 4);
+
+        // vui_timing_info + nested hrd_parameters
+        assert!(vui.vui_timing_info_present_flag);
+        let timing = vui.vui_timing_info.as_ref().unwrap();
+        assert_eq!(timing.num_units_in_tick, 1001);
+        assert_eq!(timing.time_scale, 30_000);
+        assert!(timing.poc_proportional_to_timing_flag);
+        assert_eq!(timing.num_ticks_poc_diff_one_minus1, Some(7));
+        assert!(timing.hrd_parameters_present_flag);
+        let hrd = timing.hrd_parameters.as_ref().expect("nested HRD");
+        assert_eq!(hrd.max_num_sub_layers_minus1, 0);
+        let common = hrd.common.as_ref().expect("hrd common info");
+        assert!(!common.nal_hrd_parameters_present_flag);
+        assert!(!common.vcl_hrd_parameters_present_flag);
+        assert_eq!(hrd.sub_layers.len(), 1);
+        let sl = &hrd.sub_layers[0];
+        assert!(sl.fixed_pic_rate_general_flag);
+        assert!(sl.fixed_pic_rate_within_cvs_flag);
+        assert_eq!(sl.elemental_duration_in_tc_minus1, Some(5));
+        assert_eq!(sl.cpb_cnt_minus1, 0);
+        assert!(sl.nal_hrd.is_none());
+        assert!(sl.vcl_hrd.is_none());
+
+        // bitstream_restriction
+        assert!(vui.bitstream_restriction_flag);
+        let bsr = vui.bitstream_restriction.unwrap();
+        assert!(bsr.tiles_fixed_structure_flag);
+        assert!(!bsr.motion_vectors_over_pic_boundaries_flag);
+        assert!(bsr.restricted_ref_pic_lists_flag);
+        assert_eq!(bsr.min_spatial_segmentation_idc, 100);
+        assert_eq!(bsr.max_bytes_per_pic_denom, 4);
+        assert_eq!(bsr.max_bits_per_min_cu_denom, 2);
+        assert_eq!(bsr.log2_max_mv_length_horizontal, 10);
+        assert_eq!(bsr.log2_max_mv_length_vertical, 11);
+
+        // Clean consume.
+        assert!(!sps.sps_extension_present_flag);
+        assert!(sps.opaque_tail.is_none());
+    }
+
+    /// `chroma_sample_loc_type_top_field > 5` is illegal per §E.2.1.
+    #[test]
+    fn rejects_chroma_sample_loc_type_out_of_range() {
+        let mut s = vui_prefix_bits();
+        s += "0"; // aspect_ratio_info_present_flag
+        s += "0"; // overscan_info_present_flag
+        s += "0"; // video_signal_type_present_flag
+        s += "1"; // chroma_loc_info_present_flag = 1
+        s += &ue_bits(6); // chroma_sample_loc_type_top_field = 6 (illegal)
+        s += &ue_bits(0);
+        // Remaining bits are unreachable; pad so the byte buffer is valid.
+        s += "00000000";
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).expect_err("must reject");
+        assert_eq!(
+            err,
+            SpsError::Vui(VuiError::ValueOutOfRange {
+                field: "chroma_sample_loc_type_top_field",
+                got: 6,
+            })
+        );
+    }
+
+    /// `vui_num_units_in_tick == 0` is illegal per §E.2.1 ("shall be
+    /// greater than 0").
+    #[test]
+    fn rejects_zero_vui_num_units_in_tick() {
+        let mut s = vui_prefix_bits();
+        s += "0"; // aspect_ratio_info_present_flag
+        s += "0"; // overscan_info_present_flag
+        s += "0"; // video_signal_type_present_flag
+        s += "0"; // chroma_loc_info_present_flag
+        s += "0"; // neutral_chroma_indication_flag
+        s += "0"; // field_seq_flag
+        s += "0"; // frame_field_info_present_flag
+        s += "0"; // default_display_window_flag
+        s += "1"; // vui_timing_info_present_flag = 1
+        s += &u_bits(0, 32); // vui_num_units_in_tick = 0 (illegal)
+        s += &u_bits(25, 32); // vui_time_scale
+        s += "00000000"; // pad (unreachable)
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).expect_err("must reject");
+        assert_eq!(
+            err,
+            SpsError::Vui(VuiError::ValueOutOfRange {
+                field: "vui_num_units_in_tick",
+                got: 0,
+            })
+        );
     }
 
     /// SPS with `sps_extension_present_flag == 1`: parser must surface

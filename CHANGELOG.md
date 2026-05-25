@@ -6,6 +6,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 14 (2026-05-25)
+
+- §E.2.1 `vui_parameters()` body decoded into a typed `vui` module,
+  replacing the opaque tail previously surfaced after
+  `vui_parameters_present_flag`:
+  - `vui::VuiParameters` with `Option`-wrapped sub-blocks gated on
+    their present flags: `AspectRatioInfo` (`aspect_ratio_idc` `u(8)`
+    plus the `EXTENDED_SAR` `sar_width` / `sar_height` `u(16)` pair),
+    overscan, `VideoSignalType` (`video_format` `u(3)`,
+    `video_full_range_flag`, and the nested
+    `colour_description_present_flag` triple `colour_primaries` /
+    `transfer_characteristics` / `matrix_coeffs` `u(8)`),
+    `ChromaLocInfo` (`chroma_sample_loc_type_{top,bottom}_field`
+    `ue(v)` range-checked at 0..=5), the
+    `neutral_chroma_indication_flag` / `field_seq_flag` /
+    `frame_field_info_present_flag` bits, `DefaultDisplayWindow`
+    (four `ue(v)` offsets), `VuiTimingInfo`
+    (`vui_num_units_in_tick` / `vui_time_scale` `u(32)` each enforced
+    `> 0`, `vui_poc_proportional_to_timing_flag` +
+    `vui_num_ticks_poc_diff_one_minus1`, and the nested
+    `hrd_parameters( 1, sps_max_sub_layers_minus1 )` call reusing the
+    `hrd` module), and `BitstreamRestriction`
+    (`min_spatial_segmentation_idc` 0..=4095,
+    `max_bytes_per_pic_denom` / `max_bits_per_min_cu_denom` 0..=16,
+    `log2_max_mv_length_{horizontal,vertical}` 0..=15).
+  - §E.2.1 inference defaults exposed through
+    `VuiParameters::effective_video_signal_type` (video_format 5,
+    colour triple 2), `effective_chroma_loc_info` (0/0),
+    `effective_bitstream_restriction`
+    (`motion_vectors_over_pic_boundaries_flag` 1,
+    `max_bits_per_min_cu_denom` 1, `log2_max_mv_length_*` 15).
+  - `SeqParameterSet` gains a `vui_parameters: Option<VuiParameters>`
+    field; when `vui_parameters_present_flag == 1` the body is decoded
+    in place and parsing continues to `sps_extension_present_flag`
+    (the opaque tail is now only used for the extension payload).
+    Cross-checked against the libx265 `tiny-i-only-16x16-main`
+    fixture, which decodes to a 1:1 SAR, a colour-description-elided
+    video-signal-type block, and a 25 fps timing block with no opaque
+    tail remaining.
+  - New `SpsError::Vui` / `VuiError` variants; per-field hand-built
+    bitstream tests plus the EXTENDED_SAR + nested-HRD full-VUI case.
+
 ### Added — clean-room rebuild round 13 (2026-05-25)
 
 - §E.2.2 / §E.2.3 `hrd_parameters()` and `sub_layer_hrd_parameters()`

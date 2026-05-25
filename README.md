@@ -192,9 +192,12 @@ data and CABAC remain unimplemented.
   `sps_temporal_mvp_enabled_flag`,
   `strong_intra_smoothing_enabled_flag`, and the
   `vui_parameters_present_flag` / `sps_extension_present_flag`
-  gates. The VUI body and any extension payload are surfaced as
-  [`OpaqueTail`] (raw RBSP bytes from the cut-off byte through the
-  buffer end, with the start-bit offset). When
+  gates. When `vui_parameters_present_flag == 1` the §E.2.1
+  `vui_parameters()` body is decoded into [`VuiParameters`] (see
+  below) and parsing continues to `sps_extension_present_flag`; any
+  remaining SPS extension payload is surfaced as [`OpaqueTail`] (raw
+  RBSP bytes from the cut-off byte through the buffer end, with the
+  start-bit offset). When
   `scaling_list_enabled_flag == 1` and
   `sps_scaling_list_data_present_flag == 1`, the §7.3.4
   `scaling_list_data()` block is parsed into [`ScalingListData`]
@@ -313,6 +316,30 @@ data and CABAC remain unimplemented.
   Table 9-52 / Table 9-53 values are transcribed directly from the
   H.265 specification.
 
+* §E.2.1 [`VuiParameters`] — the full `vui_parameters()` body decoded
+  from the SPS tail into `Option`-wrapped sub-blocks gated on their
+  present flags: [`AspectRatioInfo`] (`aspect_ratio_idc` `u(8)` plus
+  the [`EXTENDED_SAR`] `sar_width` / `sar_height` `u(16)` pair),
+  overscan, [`VideoSignalType`] (`video_format` `u(3)`,
+  `video_full_range_flag`, and the nested colour-description triple
+  `colour_primaries` / `transfer_characteristics` / `matrix_coeffs`
+  `u(8)`), [`ChromaLocInfo`] (`chroma_sample_loc_type_{top,bottom}_field`
+  `ue(v)` range-checked 0..=5), the `neutral_chroma_indication_flag` /
+  `field_seq_flag` / `frame_field_info_present_flag` bits,
+  [`DefaultDisplayWindow`] (four `ue(v)` offsets), [`VuiTimingInfo`]
+  (`vui_num_units_in_tick` / `vui_time_scale` `u(32)` each enforced
+  `> 0`, the `vui_poc_proportional_to_timing_flag` +
+  `vui_num_ticks_poc_diff_one_minus1` pair, and the nested
+  `hrd_parameters( 1, sps_max_sub_layers_minus1 )` call reusing the
+  [`HrdParameters`] decoder), and [`BitstreamRestriction`]
+  (`min_spatial_segmentation_idc` 0..=4095, `max_bytes_per_pic_denom`
+  / `max_bits_per_min_cu_denom` 0..=16,
+  `log2_max_mv_length_{horizontal,vertical}` 0..=15). The §E.2.1
+  inference defaults are exposed through the `effective_*` accessors
+  (`video_format` 5 / colour triple 2,
+  `motion_vectors_over_pic_boundaries_flag` 1,
+  `max_bits_per_min_cu_denom` 1, `log2_max_mv_length_*` 15).
+
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
@@ -322,8 +349,6 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 
 ## Not yet implemented
 
-* VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
-  the parsed SPS struct.
 * SPS extension bodies (Range Extension, Multilayer Annex F,
   3D Annex I, SCC) — likewise surfaced as opaque bytes.
 * PPS extension bodies (`pps_range_extension()`,

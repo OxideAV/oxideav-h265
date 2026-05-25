@@ -164,6 +164,7 @@ pub mod scan;
 pub mod slice;
 pub mod sps;
 pub mod vps;
+pub mod vui;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
@@ -192,6 +193,11 @@ pub use sps::{
 pub use vps::{
     HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsError, VpsTimingInfo,
     HEVC_MAX_SUB_LAYERS, HEVC_VPS_MAX_NUM_LAYERS, HEVC_VPS_MAX_NUM_LAYER_SETS,
+};
+pub use vui::{
+    AspectRatioInfo, BitstreamRestriction, ChromaLocInfo, DefaultDisplayWindow, VideoSignalType,
+    VuiError, VuiParameters, VuiTimingInfo, EXTENDED_SAR, HEVC_MAX_CHROMA_SAMPLE_LOC_TYPE,
+    HEVC_MAX_DENOM, HEVC_MAX_LOG2_MV_LENGTH, HEVC_MAX_MIN_SPATIAL_SEGMENTATION_IDC,
 };
 
 /// Crate-local error type. The decoder and encoder paths still
