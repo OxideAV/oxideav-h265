@@ -1,12 +1,16 @@
 //! Video Parameter Set (VPS) parser per ITU-T Rec. H.265 §7.3.2.1.
 //!
-//! Round-2 scope: parse the *structural* prefix of a VPS RBSP up to
-//! and including the per-sub-layer ordering-info loop. The trailing
-//! `vps_max_layer_id` / `vps_num_layer_sets_minus1` / HRD / extension
-//! tail is parsed only to the extent needed to find the start of the
-//! ordering info — the layer-set inclusion matrix, VUI timing block,
-//! HRD parameters, and `vps_extension_data_flag` tail are **not** yet
-//! materialised on [`HevcVps`].
+//! Parses the VPS RBSP through the layer-set inclusion matrix and the
+//! VPS timing-info block (including `vps_num_units_in_tick` /
+//! `vps_time_scale` / `vps_poc_proportional_to_timing_flag` /
+//! `vps_num_ticks_poc_diff_one_minus1` and the `vps_num_hrd_parameters`
+//! count). The per-HRD `hrd_parameters()` bodies (§E.2.2) are *not*
+//! yet decoded: if `vps_num_hrd_parameters > 0`, the remainder of the
+//! RBSP (the HRD bodies, `vps_extension_flag`, any
+//! `vps_extension_data_flag` payload, and `rbsp_trailing_bits()`) is
+//! surfaced as an [`crate::sps::OpaqueTail`]; otherwise the parser
+//! continues into `vps_extension_flag`, capturing the extension-flag
+//! payload (when 1) as the opaque tail in the same way.
 //!
 //! The profile-tier-level subroutine of §7.3.3 is also parsed
 //! structurally: the bit positions are walked but only the leading
@@ -35,16 +39,47 @@
 //!   vps_max_num_reorder_pics[i]         ue(v)
 //!   vps_max_latency_increase_plus1[i]   ue(v)
 //! }
-//! ...                                          /* tail not parsed yet */
+//! vps_max_layer_id                       u(6)
+//! vps_num_layer_sets_minus1             ue(v)
+//! for( i = 1; i <= vps_num_layer_sets_minus1; i++ )
+//!   for( j = 0; j <= vps_max_layer_id; j++ )
+//!     layer_id_included_flag[i][j]       u(1)
+//! vps_timing_info_present_flag           u(1)
+//! if( vps_timing_info_present_flag ) {
+//!   vps_num_units_in_tick               u(32)
+//!   vps_time_scale                      u(32)
+//!   vps_poc_proportional_to_timing_flag  u(1)
+//!   if( vps_poc_proportional_to_timing_flag )
+//!     vps_num_ticks_poc_diff_one_minus1 ue(v)
+//!   vps_num_hrd_parameters              ue(v)
+//!   /* per-HRD bodies + vps_extension_flag tail surfaced as opaque */
+//! }
+//! /* if vps_num_hrd_parameters == 0 (or no timing info): */
+//! vps_extension_flag                     u(1)
+//! /* extension payload + rbsp_trailing_bits() surfaced as opaque */
 //! ```
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::sps::OpaqueTail;
 
 /// Maximum number of sub-layers an HEVC stream may declare.
 /// `vps_max_sub_layers_minus1` is u(3), so the count is bounded at 7
 /// in the bitstream; this constant is reused by [`HevcVps`] as the
 /// fixed-size capacity for per-sub-layer arrays.
 pub const HEVC_MAX_SUB_LAYERS: usize = 7;
+
+/// Maximum number of layer IDs the VPS layer-set inclusion matrix may
+/// span. `vps_max_layer_id` is u(6), so the maximum signalled value is
+/// 63; the inclusion matrix column count is `vps_max_layer_id + 1`,
+/// which is bounded at 64.
+pub const HEVC_VPS_MAX_NUM_LAYERS: usize = 64;
+
+/// Upper bound on `vps_num_layer_sets_minus1`. Per §7.4.3.1
+/// `vps_num_layer_sets_minus1` shall be in the range 0..=1023, so
+/// the layer-set count is bounded at 1024. This crate's parser caps
+/// the value here to keep an aberrantly-encoded stream from forcing a
+/// 4 MB allocation (the legal max would already be ~64 KB).
+pub const HEVC_VPS_MAX_NUM_LAYER_SETS: usize = 1024;
 
 /// Errors that can arise while parsing a VPS RBSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,7 +253,52 @@ pub struct SubLayerOrderingInfo {
     pub max_latency_increase_plus1: u32,
 }
 
-/// Parsed Video Parameter Set per §7.3.2.1 (structural prefix only).
+/// One per-layer-set row of the §7.3.2.1
+/// `layer_id_included_flag[i][j]` matrix. `flags[j]` is the
+/// `layer_id_included_flag[i][j]` value for layer-set `i` and
+/// `nuh_layer_id == j`, with `0 <= j <= vps_max_layer_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerIdInclusionRow {
+    /// `layer_id_included_flag[i][0..=vps_max_layer_id]`.
+    pub flags: Vec<bool>,
+}
+
+/// VPS timing-info block per §7.3.2.1, when
+/// `vps_timing_info_present_flag == 1`. The `hrd_parameters()` bodies
+/// indexed by `vps_num_hrd_parameters` are *not* decoded; consult
+/// [`HevcVps::opaque_tail`] for the remaining RBSP bytes when
+/// [`Self::num_hrd_parameters`] is non-zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpsTimingInfo {
+    /// `vps_num_units_in_tick` (`u(32)`). Spec constraint: shall be
+    /// > 0.
+    pub num_units_in_tick: u32,
+    /// `vps_time_scale` (`u(32)`). Spec constraint: shall be > 0.
+    pub time_scale: u32,
+    /// `vps_poc_proportional_to_timing_flag` (`u(1)`).
+    pub poc_proportional_to_timing_flag: bool,
+    /// `vps_num_ticks_poc_diff_one_minus1` (`ue(v)`), only present
+    /// when `poc_proportional_to_timing_flag` is set. Spec range
+    /// 0..=2^32 - 2 (the `ue(v)` codec ceiling).
+    pub num_ticks_poc_diff_one_minus1: Option<u32>,
+    /// `vps_num_hrd_parameters` (`ue(v)`). When non-zero, the
+    /// corresponding `hrd_parameters()` bodies — and everything after
+    /// them — are surfaced as [`HevcVps::opaque_tail`] rather than
+    /// decoded. Spec constraint: 0..=`vps_num_layer_sets_minus1 + 1`.
+    pub num_hrd_parameters: u32,
+}
+
+/// Parsed Video Parameter Set per §7.3.2.1.
+///
+/// The structural prefix (through the per-sub-layer ordering loop) is
+/// fully materialised; the layer-set inclusion matrix and the
+/// optional VPS timing-info block follow. When
+/// `vps_timing_info_present_flag == 1` and `vps_num_hrd_parameters >
+/// 0`, the per-HRD `hrd_parameters()` payloads + `vps_extension_flag`
+/// tail are not decoded — they are surfaced as [`Self::opaque_tail`].
+/// Otherwise the parser reads `vps_extension_flag` and, when set,
+/// surfaces the `vps_extension_data_flag` payload (plus
+/// `rbsp_trailing_bits()`) as the opaque tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HevcVps {
     /// `vps_video_parameter_set_id` (4 bits, range 0..=15).
@@ -245,6 +325,42 @@ pub struct HevcVps {
     /// Per-sub-layer DPB / reorder / latency triples. Indices outside
     /// `0..=max_sub_layers_minus1` are zero-initialised.
     pub sub_layer_ordering_info: [SubLayerOrderingInfo; HEVC_MAX_SUB_LAYERS],
+    /// `vps_max_layer_id` (`u(6)`, range 0..=62). The inclusion-matrix
+    /// column count is `value + 1`.
+    pub max_layer_id: u8,
+    /// `vps_num_layer_sets_minus1` (`ue(v)`, range 0..=1023). The
+    /// number of layer sets signalled by the inclusion matrix is
+    /// `value + 1`; layer set 0 is implicit and not signalled in the
+    /// matrix.
+    pub num_layer_sets_minus1: u16,
+    /// `layer_id_included_flag[i][j]` matrix. The outer index is
+    /// `i = 1..=num_layer_sets_minus1`, stored at offset `i - 1`
+    /// (layer set 0 is implicit per §7.4.3.1). Each inner row has
+    /// length `max_layer_id + 1`.
+    pub layer_id_included_flag: Vec<LayerIdInclusionRow>,
+    /// `vps_timing_info_present_flag`. Discriminates whether
+    /// [`Self::timing_info`] is populated.
+    pub timing_info_present_flag: bool,
+    /// Parsed [`VpsTimingInfo`] when [`Self::timing_info_present_flag`]
+    /// is set; `None` otherwise.
+    pub timing_info: Option<VpsTimingInfo>,
+    /// `vps_extension_flag`. `None` when the parser stopped before
+    /// reading it because [`VpsTimingInfo::num_hrd_parameters`] was
+    /// non-zero (the per-HRD payloads are surfaced as the opaque tail
+    /// instead, and the `vps_extension_flag` lives inside that tail).
+    pub vps_extension_flag: Option<bool>,
+    /// Opaque suffix of the RBSP. Populated when the parser stops
+    /// before the `rbsp_trailing_bits()`:
+    ///
+    /// * `Some` when [`VpsTimingInfo::num_hrd_parameters`] is non-zero
+    ///   (the per-HRD `hrd_parameters()` payloads, `vps_extension_flag`,
+    ///   any extension data, and `rbsp_trailing_bits()` are all
+    ///   surfaced here).
+    /// * `Some` when `vps_extension_flag == 1` (the
+    ///   `vps_extension_data_flag` payload and the
+    ///   `rbsp_trailing_bits()` are surfaced here).
+    /// * `None` otherwise.
+    pub opaque_tail: Option<OpaqueTail>,
 }
 
 impl HevcVps {
@@ -254,10 +370,10 @@ impl HevcVps {
     /// [`crate::nal::NalUnit`]).
     pub fn parse(rbsp: &[u8]) -> Result<Self, VpsError> {
         let mut br = BitReader::new(rbsp);
-        Self::parse_inner(&mut br)
+        Self::parse_inner(&mut br, rbsp)
     }
 
-    fn parse_inner(br: &mut BitReader<'_>) -> Result<Self, VpsError> {
+    fn parse_inner(br: &mut BitReader<'_>, rbsp: &[u8]) -> Result<Self, VpsError> {
         let vps_id = br.u(4)? as u8;
         let base_layer_internal_flag = br.u1()? != 0;
         let base_layer_available_flag = br.u1()? != 0;
@@ -311,6 +427,114 @@ impl HevcVps {
             }
         }
 
+        // vps_max_layer_id u(6) — range 0..=62 per §7.4.3.1. u(6) can
+        // encode 63, which the spec marks as reserved; we accept the
+        // value but the count `max_layer_id + 1` is capped at 64
+        // (HEVC_VPS_MAX_NUM_LAYERS).
+        let max_layer_id = br.u(6)? as u8;
+
+        // vps_num_layer_sets_minus1 ue(v) — range 0..=1023.
+        let num_layer_sets_minus1_raw = br.ue()?;
+        if num_layer_sets_minus1_raw as usize >= HEVC_VPS_MAX_NUM_LAYER_SETS {
+            return Err(VpsError::ValueOutOfRange {
+                field: "vps_num_layer_sets_minus1",
+                got: num_layer_sets_minus1_raw,
+            });
+        }
+        let num_layer_sets_minus1 = num_layer_sets_minus1_raw as u16;
+
+        // Layer-set inclusion matrix. The for-loop in the spec starts
+        // at i = 1 (layer set 0 is the base set, not signalled), so the
+        // signalled-row count is `num_layer_sets_minus1`. Each row has
+        // `max_layer_id + 1` u(1) flags.
+        let row_width = max_layer_id as usize + 1;
+        let signalled_rows = num_layer_sets_minus1 as usize;
+        let mut layer_id_included_flag = Vec::with_capacity(signalled_rows);
+        for _ in 0..signalled_rows {
+            let mut row = Vec::with_capacity(row_width);
+            for _ in 0..row_width {
+                row.push(br.u1()? != 0);
+            }
+            layer_id_included_flag.push(LayerIdInclusionRow { flags: row });
+        }
+
+        // vps_timing_info_present_flag u(1).
+        let timing_info_present_flag = br.u1()? != 0;
+        let mut opaque_tail = None;
+        let mut vps_extension_flag = None;
+        let timing_info = if timing_info_present_flag {
+            // §E.2.1 / §7.3.2.1: num_units_in_tick and time_scale are
+            // both u(32) and "shall be greater than 0" per the
+            // semantics text — enforced here so a zeroed-out stream
+            // doesn't silently divide by zero downstream.
+            let num_units_in_tick = br.u(32)?;
+            if num_units_in_tick == 0 {
+                return Err(VpsError::ValueOutOfRange {
+                    field: "vps_num_units_in_tick",
+                    got: 0,
+                });
+            }
+            let time_scale = br.u(32)?;
+            if time_scale == 0 {
+                return Err(VpsError::ValueOutOfRange {
+                    field: "vps_time_scale",
+                    got: 0,
+                });
+            }
+            let poc_proportional_to_timing_flag = br.u1()? != 0;
+            let num_ticks_poc_diff_one_minus1 = if poc_proportional_to_timing_flag {
+                Some(br.ue()?)
+            } else {
+                None
+            };
+            let num_hrd_parameters = br.ue()?;
+            // Spec range: 0..=vps_num_layer_sets_minus1 + 1. Bound the
+            // value as a sanity check so a malformed stream cannot
+            // force an unbounded loop downstream.
+            if num_hrd_parameters > num_layer_sets_minus1 as u32 + 1 {
+                return Err(VpsError::ValueOutOfRange {
+                    field: "vps_num_hrd_parameters",
+                    got: num_hrd_parameters,
+                });
+            }
+            let info = VpsTimingInfo {
+                num_units_in_tick,
+                time_scale,
+                poc_proportional_to_timing_flag,
+                num_ticks_poc_diff_one_minus1,
+                num_hrd_parameters,
+            };
+            // When HRD entries are signalled, defer the
+            // hrd_parameters() bodies + the trailing
+            // vps_extension_flag / extension_data / rbsp_trailing_bits
+            // to the opaque tail (this parser does not decode §E.2.2
+            // hrd_parameters yet).
+            if num_hrd_parameters > 0 {
+                opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
+            }
+            Some(info)
+        } else {
+            None
+        };
+
+        // vps_extension_flag is only read when the opaque tail did
+        // not already swallow it (i.e. when num_hrd_parameters == 0
+        // or timing-info was absent).
+        if opaque_tail.is_none() {
+            let flag = br.u1()? != 0;
+            vps_extension_flag = Some(flag);
+            // When the extension flag is 1, surface the
+            // vps_extension_data_flag run + the rbsp_trailing_bits()
+            // as the opaque tail rather than decoding them — this
+            // parser does not consume the trailing bits, so an
+            // extension-flag of 0 also stops here (the
+            // rbsp_trailing_bits are not on the parsed-struct
+            // surface).
+            if flag {
+                opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
+            }
+        }
+
         Ok(Self {
             vps_id,
             base_layer_internal_flag,
@@ -321,6 +545,13 @@ impl HevcVps {
             ptl,
             sub_layer_ordering_info_present_flag,
             sub_layer_ordering_info,
+            max_layer_id,
+            num_layer_sets_minus1,
+            layer_id_included_flag,
+            timing_info_present_flag,
+            timing_info,
+            vps_extension_flag,
+            opaque_tail,
         })
     }
 }
@@ -499,6 +730,11 @@ mod tests {
         push("1"); // ue=0 (max_dec_pic_buffering_minus1[1])
         push("1"); // ue=0 (max_num_reorder_pics[1])
         push("1"); // ue=0 (max_latency_increase_plus1[1])
+                   // VPS tail (round 12 — fully parsed):
+        push("000000"); // vps_max_layer_id = 0 (single layer)
+        push("1"); // vps_num_layer_sets_minus1 ue=0 (just layer set 0)
+        push("0"); // vps_timing_info_present_flag = 0
+        push("0"); // vps_extension_flag = 0
 
         // Pad with zeros to next byte boundary and pack.
         while bits.len() % 8 != 0 {
@@ -531,6 +767,13 @@ mod tests {
             assert_eq!(vps.sub_layer_ordering_info[i].max_num_reorder_pics, 0);
             assert_eq!(vps.sub_layer_ordering_info[i].max_latency_increase_plus1, 0);
         }
+        // Tail decoded as expected.
+        assert_eq!(vps.max_layer_id, 0);
+        assert_eq!(vps.num_layer_sets_minus1, 0);
+        assert!(!vps.timing_info_present_flag);
+        assert!(vps.timing_info.is_none());
+        assert_eq!(vps.vps_extension_flag, Some(false));
+        assert!(vps.opaque_tail.is_none());
     }
 
     #[test]
@@ -568,6 +811,11 @@ mod tests {
         push("011"); // max_dec_pic_buffering_minus1[1] = 2
         push("1"); // max_num_reorder_pics[1] = 0
         push("1"); // max_latency_increase_plus1[1] = 0
+                   // VPS tail (round 12 — fully parsed):
+        push("000000"); // vps_max_layer_id = 0
+        push("1"); // vps_num_layer_sets_minus1 ue=0
+        push("0"); // vps_timing_info_present_flag = 0
+        push("0"); // vps_extension_flag = 0
 
         while bits.len() % 8 != 0 {
             bits.push(0);
@@ -590,6 +838,224 @@ mod tests {
         assert_eq!(
             vps.sub_layer_ordering_info[0].max_dec_pic_buffering_minus1,
             2
+        );
+        assert_eq!(vps.max_layer_id, 0);
+        assert_eq!(vps.num_layer_sets_minus1, 0);
+        assert!(!vps.timing_info_present_flag);
+    }
+
+    /// Hand-assembled minimal VPS that exercises the new tail: a
+    /// single extra layer set + a timing-info block with
+    /// `poc_proportional_to_timing_flag == 1` + zero HRDs +
+    /// `vps_extension_flag == 0`.
+    #[test]
+    fn parses_layer_set_matrix_and_timing_info() {
+        let mut bits = Vec::<u8>::new();
+        let mut push = |s: &str| {
+            for c in s.chars() {
+                if c == '0' || c == '1' {
+                    bits.push((c as u8) - b'0');
+                }
+            }
+        };
+        // Minimal prefix: single sub-layer, base Main profile, level 30.
+        push("0000"); // vps_id
+        push("1"); // base_layer_internal_flag
+        push("1"); // base_layer_available_flag
+        push("000000"); // max_layers_minus1
+        push("000"); // max_sub_layers_minus1 = 0
+        push("1"); // temporal_id_nesting_flag
+        push("1111111111111111"); // reserved
+        push("00"); // profile_space
+        push("0"); // tier_flag
+        push("00001"); // profile_idc = 1
+        push(&"0".repeat(32)); // compat flags
+        push("1000"); // prog/interlaced/non_packed/frame_only
+        push(&"0".repeat(43));
+        push("0");
+        push("00011110"); // level_idc = 30
+        push("1"); // sub_layer_ordering_info_present_flag = 1
+        push("1"); // ue=0 (max_dec_pic_buffering_minus1[0])
+        push("1"); // ue=0 (max_num_reorder_pics[0])
+        push("1"); // ue=0 (max_latency_increase_plus1[0])
+                   // Tail:
+        push("000001"); // vps_max_layer_id = 1 (so row width 2)
+        push("010"); // vps_num_layer_sets_minus1 ue=1 (one signalled row)
+                     // layer_id_included_flag[1][0..=1]: pick 1, 0
+        push("10");
+        push("1"); // vps_timing_info_present_flag = 1
+                   // num_units_in_tick = 1001 (NTSC-ish denominator)
+        for i in (0..32).rev() {
+            let b = (1001u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        // time_scale = 60000
+        for i in (0..32).rev() {
+            let b = (60000u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        push("1"); // poc_proportional_to_timing_flag = 1
+        push("1"); // num_ticks_poc_diff_one_minus1 ue=0
+        push("1"); // num_hrd_parameters ue=0 (no HRDs — keeps tail parseable)
+        push("0"); // vps_extension_flag = 0
+
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        let mut bytes = Vec::with_capacity(bits.len() / 8);
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for &bit in chunk {
+                b = (b << 1) | bit;
+            }
+            bytes.push(b);
+        }
+        let vps = HevcVps::parse(&bytes).expect("VPS parse");
+        assert_eq!(vps.max_layer_id, 1);
+        assert_eq!(vps.num_layer_sets_minus1, 1);
+        assert_eq!(vps.layer_id_included_flag.len(), 1);
+        assert_eq!(vps.layer_id_included_flag[0].flags, vec![true, false]);
+        assert!(vps.timing_info_present_flag);
+        let ti = vps.timing_info.as_ref().expect("timing info present");
+        assert_eq!(ti.num_units_in_tick, 1001);
+        assert_eq!(ti.time_scale, 60000);
+        assert!(ti.poc_proportional_to_timing_flag);
+        assert_eq!(ti.num_ticks_poc_diff_one_minus1, Some(0));
+        assert_eq!(ti.num_hrd_parameters, 0);
+        assert_eq!(vps.vps_extension_flag, Some(false));
+        assert!(vps.opaque_tail.is_none());
+    }
+
+    /// Tail with `vps_num_hrd_parameters > 0` — the parser must
+    /// surface the per-HRD payload + extension tail as the opaque
+    /// suffix rather than try to decode `hrd_parameters()`.
+    #[test]
+    fn captures_hrd_payload_as_opaque_tail() {
+        let mut bits = Vec::<u8>::new();
+        let mut push = |s: &str| {
+            for c in s.chars() {
+                if c == '0' || c == '1' {
+                    bits.push((c as u8) - b'0');
+                }
+            }
+        };
+        push("0000");
+        push("1");
+        push("1");
+        push("000000");
+        push("000"); // max_sub_layers_minus1 = 0
+        push("1");
+        push("1111111111111111");
+        push("00");
+        push("0");
+        push("00001");
+        push(&"0".repeat(32));
+        push("1000");
+        push(&"0".repeat(43));
+        push("0");
+        push("00011110"); // level_idc
+        push("1"); // sub_layer_ordering_info_present_flag = 1
+        push("1");
+        push("1");
+        push("1");
+        // Tail:
+        push("000000"); // max_layer_id = 0
+        push("1"); // num_layer_sets_minus1 ue=0
+        push("1"); // timing_info_present_flag = 1
+        for i in (0..32).rev() {
+            let b = (1u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        for i in (0..32).rev() {
+            let b = (30u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        push("0"); // poc_proportional_to_timing_flag = 0
+        push("010"); // num_hrd_parameters ue=1 → opaque tail trigger
+                     // Following bytes (hrd_parameters + vps_extension_flag +
+                     // rbsp_trailing_bits) are arbitrary opaque content.
+                     // Stamp the next byte with an identifiable pattern.
+        push("10101010");
+        push("11110000");
+        push("10000000"); // rbsp_trailing_bits 1-stop with zeros
+
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        let mut bytes = Vec::with_capacity(bits.len() / 8);
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for &bit in chunk {
+                b = (b << 1) | bit;
+            }
+            bytes.push(b);
+        }
+        let vps = HevcVps::parse(&bytes).expect("VPS parse");
+        let ti = vps.timing_info.as_ref().expect("timing info present");
+        assert_eq!(ti.num_hrd_parameters, 1);
+        assert!(!ti.poc_proportional_to_timing_flag);
+        // The opaque tail must be populated because we deferred HRD
+        // decoding. vps_extension_flag was NOT read by the parser
+        // (it lives inside the opaque tail).
+        assert!(vps.opaque_tail.is_some());
+        assert_eq!(vps.vps_extension_flag, None);
+    }
+
+    /// `vps_num_units_in_tick == 0` is forbidden by the §E.2.1 /
+    /// §7.3.2.1 semantics text.
+    #[test]
+    fn rejects_zero_num_units_in_tick() {
+        let mut bits = Vec::<u8>::new();
+        let mut push = |s: &str| {
+            for c in s.chars() {
+                if c == '0' || c == '1' {
+                    bits.push((c as u8) - b'0');
+                }
+            }
+        };
+        push("0000");
+        push("1");
+        push("1");
+        push("000000");
+        push("000");
+        push("1");
+        push("1111111111111111");
+        push("00");
+        push("0");
+        push("00001");
+        push(&"0".repeat(32));
+        push("1000");
+        push(&"0".repeat(43));
+        push("0");
+        push("00011110");
+        push("1");
+        push("1");
+        push("1");
+        push("1");
+        push("000000");
+        push("1");
+        push("1"); // timing_info_present_flag = 1
+        push(&"0".repeat(32)); // num_units_in_tick = 0  → invalid
+        push(&"0".repeat(32)); // time_scale (unread)
+
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        let mut bytes = Vec::with_capacity(bits.len() / 8);
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for &bit in chunk {
+                b = (b << 1) | bit;
+            }
+            bytes.push(b);
+        }
+        let err = HevcVps::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            VpsError::ValueOutOfRange {
+                field: "vps_num_units_in_tick",
+                got: 0
+            }
         );
     }
 }

@@ -6,6 +6,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 12 (2026-05-25)
+
+- §7.3.2.1 VPS tail through the optional VPS timing-info block:
+  - `vps_max_layer_id` (`u(6)`) and `vps_num_layer_sets_minus1`
+    (`ue(v)`, range 0..=1023, capped at
+    `HEVC_VPS_MAX_NUM_LAYER_SETS = 1024` for allocation safety) added
+    to `HevcVps`.
+  - `layer_id_included_flag[i][j]` inclusion matrix decoded as one
+    `LayerIdInclusionRow` per signalled layer set (the spec's
+    `i = 1..=vps_num_layer_sets_minus1` loop; layer set 0 is implicit
+    per §7.4.3.1, so the matrix has `num_layer_sets_minus1` rows of
+    `max_layer_id + 1` flags each).
+  - `vps_timing_info_present_flag` block surfaced as
+    `Option<VpsTimingInfo>`: `vps_num_units_in_tick` /
+    `vps_time_scale` (`u(32)` both, with the §E.2.1 / §7.3.2.1 "shall
+    be greater than 0" semantics enforced as
+    `VpsError::ValueOutOfRange`), `vps_poc_proportional_to_timing_flag`
+    + the optional `vps_num_ticks_poc_diff_one_minus1` `ue(v)`, and
+    the `vps_num_hrd_parameters` `ue(v)` count (bounded at
+    `vps_num_layer_sets_minus1 + 1` per §7.4.3.1).
+  - `vps_extension_flag` decoded into `Option<bool>` (None when the
+    parser stopped before reading it because
+    `vps_num_hrd_parameters > 0` deferred the rest of the RBSP to the
+    opaque tail).
+  - `HevcVps::opaque_tail: Option<OpaqueTail>` populated when the
+    parser defers HRD bodies (`num_hrd_parameters > 0`) or extension
+    data (`vps_extension_flag == 1`); the opaque tail reuses
+    `sps::OpaqueTail::capture_at(bit_pos, rbsp)` so the surface
+    matches the SPS / PPS opaque-tail convention.
+- Public re-exports: `LayerIdInclusionRow`, `VpsTimingInfo`,
+  `HEVC_VPS_MAX_NUM_LAYERS`, `HEVC_VPS_MAX_NUM_LAYER_SETS` added to
+  the crate root.
+- Tests: three new VPS tail tests
+  (`parses_layer_set_matrix_and_timing_info`,
+  `captures_hrd_payload_as_opaque_tail`,
+  `rejects_zero_num_units_in_tick`); two existing handwritten VPS
+  tests extended to feed the now-required tail bits. Test count
+  115 → 118.
+
 ### Added — clean-room rebuild round 11 (2026-05-24)
 
 - §9.3 CABAC arithmetic decoding engine as a new standalone module

@@ -5,7 +5,19 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
-//! Round 11 lands the §9.3 CABAC arithmetic decoding engine
+//! Round 12 finishes the §7.3.2.1 VPS tail through the optional VPS
+//! timing-info block ([`vps::HevcVps`] now carries `max_layer_id`,
+//! `num_layer_sets_minus1`, the `layer_id_included_flag[][]`
+//! inclusion matrix as [`vps::LayerIdInclusionRow`] rows, the
+//! `vps_timing_info_present_flag` block as [`vps::VpsTimingInfo`] —
+//! `u(32)` `num_units_in_tick` / `time_scale`,
+//! `poc_proportional_to_timing_flag` +
+//! `num_ticks_poc_diff_one_minus1`, and `num_hrd_parameters` — plus
+//! `vps_extension_flag`); per-HRD `hrd_parameters()` bodies and the
+//! extension-data payload are surfaced as
+//! [`vps::HevcVps::opaque_tail`].
+//!
+//! Round 11 landed the §9.3 CABAC arithmetic decoding engine
 //! ([`cabac::CabacEngine`] / [`cabac::ContextModel`] / [`cabac::init_type`]):
 //! the §9.3.2.6 engine-register init, the §9.3.2.2 context-variable init
 //! (equations 9-4..9-7), the §9.3.4.3.2 DecodeDecision primitive (with
@@ -172,7 +184,10 @@ pub use sps::{
     ShortTermRefPicSet, SpsError, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
     HEVC_MAX_RPS_PICS,
 };
-pub use vps::{HevcVps, ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
+pub use vps::{
+    HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsError, VpsTimingInfo,
+    HEVC_MAX_SUB_LAYERS, HEVC_VPS_MAX_NUM_LAYERS, HEVC_VPS_MAX_NUM_LAYER_SETS,
+};
 
 /// Crate-local error type. The decoder and encoder paths still
 /// return [`Error::NotImplemented`] while the clean-room rebuild

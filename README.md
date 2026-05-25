@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 11 (2026-05-24).** The prior implementation was
+**Clean-room rebuild — round 12 (2026-05-25).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,27 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 11 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 12 finishes the
+§7.3.2.1 VPS tail through the optional VPS timing-info block: the
+`vps_max_layer_id` (`u(6)`) and `vps_num_layer_sets_minus1` (`ue(v)`,
+range 0..=1023, capped at `HEVC_VPS_MAX_NUM_LAYER_SETS = 1024`)
+fields, the
+`layer_id_included_flag[1..=num_layer_sets_minus1][0..=max_layer_id]`
+inclusion matrix (one row per signalled layer set; layer set 0 is
+implicit per §7.4.3.1), and the `vps_timing_info_present_flag` block
+([`VpsTimingInfo`] — `vps_num_units_in_tick` / `vps_time_scale` both
+`u(32)` with the §E.2.1 / §7.3.2.1 "shall be > 0" semantics enforced,
+the `vps_poc_proportional_to_timing_flag` gate with the optional
+`vps_num_ticks_poc_diff_one_minus1` `ue(v)`, and the
+`vps_num_hrd_parameters` `ue(v)` count bounded at
+`vps_num_layer_sets_minus1 + 1`). When `vps_num_hrd_parameters > 0`,
+the per-HRD `hrd_parameters()` payloads, `vps_extension_flag`, any
+`vps_extension_data_flag` run, and `rbsp_trailing_bits()` are surfaced
+as a single [`OpaqueTail`] (`HevcVps::opaque_tail`); otherwise the
+parser continues into `vps_extension_flag` and, when 1, captures the
+same opaque suffix. The §E.2.2 `hrd_parameters()` body itself is the
+next bite.
+Round 11 landed the
 §9.3 CABAC arithmetic decoding engine as a standalone module
 ([`cabac`]): the §9.3.2.6 engine-register initialization
 (`ivlCurrRange = 510`, `ivlOffset = read_bits(9)`, with the spec's
@@ -92,9 +112,22 @@ data and CABAC remain unimplemented.
   base-layer / max-layers / sub-layers / temporal-nesting flags,
   `vps_reserved_0xffff_16bits` validation, the §7.3.3
   profile-tier-level walk (general profile + level + per-sub-layer
-  present-flag gates + `sub_layer_level_idc`), and the per-sub-layer
+  present-flag gates + `sub_layer_level_idc`), the per-sub-layer
   DPB / reorder / latency `ue(v)` triple loop with
-  ordering-info-present-flag propagation.
+  ordering-info-present-flag propagation, `vps_max_layer_id` /
+  `vps_num_layer_sets_minus1` + the
+  `layer_id_included_flag[i][j]` inclusion matrix (one
+  [`LayerIdInclusionRow`] per signalled layer set), the
+  `vps_timing_info_present_flag` block ([`VpsTimingInfo`] — the
+  `u(32)` `vps_num_units_in_tick` / `vps_time_scale` pair with the
+  spec's "shall be > 0" semantics enforced, the
+  `vps_poc_proportional_to_timing_flag` gate +
+  `vps_num_ticks_poc_diff_one_minus1`, and the
+  `vps_num_hrd_parameters` count), and the `vps_extension_flag` gate.
+  When `vps_num_hrd_parameters > 0` (per-HRD bodies + extension tail)
+  or when `vps_extension_flag == 1` (extension-data run +
+  `rbsp_trailing_bits()`), the remaining RBSP is surfaced as an
+  [`OpaqueTail`] (`HevcVps::opaque_tail`).
 * §7.3.2.2 [`SeqParameterSet`] — `sps_video_parameter_set_id`,
   `sps_max_sub_layers_minus1` / `sps_temporal_id_nesting_flag`, the
   §7.3.3 PTL re-walk, `sps_seq_parameter_set_id`, `chroma_format_idc`
@@ -258,9 +291,12 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `pps_multilayer_extension()`, `pps_3d_extension()`,
   `pps_scc_extension()`) — surfaced as opaque bytes when
   `pps_extension_present_flag == 1`.
-* VPS tail: `vps_max_layer_id`, layer-set inclusion matrix,
-  `vps_timing_info_present_flag`, HRD parameters,
-  `vps_extension_data_flag`.
+* VPS HRD parameters body (§E.2.2 `hrd_parameters()`) and the
+  `vps_extension_data_flag` extension payload — the `u(32)`
+  timing-info head, `vps_num_hrd_parameters` count, and
+  `vps_extension_flag` itself are decoded (round 12); the per-HRD
+  bodies + extension data are surfaced as
+  [`HevcVps::opaque_tail`] when present.
 * Slice header (§7.3.6.1) deferred body: the P/B
   `ref_pic_lists_modification()` (§7.3.6.2) /
   `pred_weight_table()` (§7.3.6.3) sub-structures — surfaced as an
