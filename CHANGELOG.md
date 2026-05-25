@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 14 (2026-05-25)
+
+- §E.2.1 `vui_parameters()` body decoded as a new `vui` module
+  (`vui::VuiParameters`), replacing the opaque SPS VUI tail:
+  - aspect-ratio info (`aspect_ratio_idc` `u(8)` + the `EXTENDED_SAR`
+    `sar_width` / `sar_height` `u(16)` pair), overscan,
+    `video_signal_type` (`video_format` / `video_full_range_flag` +
+    the `ColourDescription` `colour_primaries` /
+    `transfer_characteristics` / `matrix_coeffs` triple), chroma-loc
+    info (`chroma_sample_loc_type_{top,bottom}_field` 0..=5
+    range-checked), the neutral-chroma / field-seq / frame-field
+    flags, the `DefaultDisplayWindow` offset quad.
+  - `VuiTimingInfo`: `u(32)` `vui_num_units_in_tick` /
+    `vui_time_scale` enforced `> 0` per §E.3.1, the POC-proportional
+    flag + `vui_num_ticks_poc_diff_one_minus1`, and the nested §E.2.3
+    `hrd_parameters( 1, sps_max_sub_layers_minus1 )` call reusing the
+    existing `HrdParameters` parser.
+  - `BitstreamRestriction` with the §E.3.1
+    `min_spatial_segmentation_idc` 0..=4095, `max_bytes_per_pic_denom`
+    / `max_bits_per_min_cu_denom` 0..=16, and
+    `log2_max_mv_length_{horizontal,vertical}` 0..=15 range-checks.
+- SPS RBSP parse now decodes the VUI body inline rather than
+  capturing it as the opaque tail:
+  - `SeqParameterSet::vui_parameters: Option<VuiParameters>` populated
+    when `vui_parameters_present_flag == 1`; parsing then continues to
+    `sps_extension_present_flag` in both paths.
+  - `SeqParameterSet::opaque_tail` now populated only for the
+    `sps_extension_present_flag == 1` extension payload +
+    `rbsp_trailing_bits()` suffix.
+  - `SpsError::Vui` variant added to surface `VuiError` failures while
+    preserving the single-pattern `Truncated` handler.
+- Public re-exports: `BitstreamRestriction`, `ColourDescription`,
+  `DefaultDisplayWindow`, `VideoSignalType`, `VuiError`,
+  `VuiParameters`, `VuiTimingInfo`, `EXTENDED_SAR` added to the crate
+  root; `Error::Vui` variant added.
+- Tests: 18 new `vui` per-field tests plus the SPS-level
+  `decodes_vui_then_continues_to_extension_flag` /
+  `decodes_vui_then_captures_extension_tail`; the tiny libx265
+  fixture test now asserts the decoded VUI (1:1 SAR, video_format 5,
+  1/25 timing) instead of an opaque tail. Test count 130 → 146.
+
 ### Added — clean-room rebuild round 13 (2026-05-25)
 
 - §E.2.2 / §E.2.3 `hrd_parameters()` and `sub_layer_hrd_parameters()`

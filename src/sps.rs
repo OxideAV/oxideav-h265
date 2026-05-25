@@ -1,14 +1,15 @@
 //! Sequence Parameter Set (SPS) parser per ITU-T Rec. H.265 §7.3.2.2.
 //!
-//! Round-4 scope: parse the full SPS RBSP body through the
-//! `strong_intra_smoothing_enabled_flag` field and the
-//! `vui_parameters_present_flag` / `sps_extension_present_flag` gates.
-//! When either gate is set, the trailing bytes (VUI body and/or
-//! extension payload and/or RBSP trailing bits) are surfaced as an
-//! **opaque tail**: a copy of the still-unparsed RBSP bytes plus the
-//! bit offset within the first byte at which the opaque tail begins.
-//! The VUI body and the per-extension `sps_*_extension( )` syntax
-//! structures are not materialised in this round.
+//! Scope: parse the full SPS RBSP body through the
+//! `strong_intra_smoothing_enabled_flag` field, the
+//! `vui_parameters_present_flag` gate (whose §E.2.1
+//! `vui_parameters()` body is decoded into [`crate::vui::VuiParameters`]),
+//! and the `sps_extension_present_flag` gate. When the extension gate
+//! is set, the trailing bytes (extension payload + RBSP trailing
+//! bits) are surfaced as an **opaque tail**: a copy of the
+//! still-unparsed RBSP bytes plus the bit offset within the first
+//! byte at which the opaque tail begins. The per-extension
+//! `sps_*_extension( )` syntax structures are not materialised yet.
 //!
 //! When `scaling_list_enabled_flag == 1` and
 //! `sps_scaling_list_data_present_flag == 1`, the §7.3.4
@@ -81,9 +82,10 @@
 //! sps_temporal_mvp_enabled_flag                    u(1)
 //! strong_intra_smoothing_enabled_flag              u(1)
 //! vui_parameters_present_flag                      u(1)
-//!   /* opaque tail begins here when 1 */
+//! if( vui_parameters_present_flag )
+//!   vui_parameters( )                              /* §E.2.1 */
 //! sps_extension_present_flag                       u(1)
-//!   /* opaque tail begins here when 1 (and vui flag was 0) */
+//!   /* opaque tail begins here when 1 */
 //! ```
 //!
 //! Validity checks performed here, sourced from §7.4.3.2:
@@ -116,6 +118,7 @@
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::scaling_list::{ScalingListData, ScalingListError};
 use crate::vps::{ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
+use crate::vui::{VuiError, VuiParameters};
 
 /// Maximum number of short-term reference picture sets an SPS may
 /// carry. Per §7.4.3.2 the field is bounded at 64 inclusive.
@@ -152,6 +155,8 @@ pub enum SpsError {
     Bitstream(BitReaderError),
     /// A `profile_tier_level()` parse from the §7.3.3 walk failed.
     Ptl(VpsError),
+    /// A `vui_parameters()` parse (§E.2.1) from the SPS failed.
+    Vui(VuiError),
 }
 
 impl core::fmt::Display for SpsError {
@@ -164,6 +169,7 @@ impl core::fmt::Display for SpsError {
             Self::ScalingList(e) => write!(f, "scaling-list error during SPS parse: {e}"),
             Self::Bitstream(e) => write!(f, "bitstream error during SPS parse: {e}"),
             Self::Ptl(e) => write!(f, "profile_tier_level error during SPS parse: {e}"),
+            Self::Vui(e) => write!(f, "vui_parameters error during SPS parse: {e}"),
         }
     }
 }
@@ -200,6 +206,19 @@ impl From<ScalingListError> for SpsError {
             ScalingListError::Truncated => Self::Truncated,
             ScalingListError::Bitstream(b) => Self::Bitstream(b),
             other => Self::ScalingList(other),
+        }
+    }
+}
+
+impl From<VuiError> for SpsError {
+    fn from(e: VuiError) -> Self {
+        // Flatten truncation / raw-reader faults to the SPS-level
+        // equivalents so the public surface stays predictable; carry
+        // the structured VUI faults through as-is.
+        match e {
+            VuiError::Truncated => Self::Truncated,
+            VuiError::Bitstream(b) => Self::Bitstream(b),
+            other => Self::Vui(other),
         }
     }
 }
@@ -437,25 +456,26 @@ pub struct SeqParameterSet {
     pub sps_temporal_mvp_enabled_flag: bool,
     /// `strong_intra_smoothing_enabled_flag`.
     pub strong_intra_smoothing_enabled_flag: bool,
-    /// `vui_parameters_present_flag`. When true, the
-    /// `vui_parameters( )` body plus everything after it (including
-    /// the `sps_extension_present_flag`, any extension bodies, and
-    /// the RBSP trailing bits) is surfaced as
-    /// [`Self::opaque_tail`].
+    /// `vui_parameters_present_flag`. When true, the §E.2.1
+    /// `vui_parameters( )` body is decoded into
+    /// [`Self::vui_parameters`] and parsing continues to
+    /// `sps_extension_present_flag`.
     pub vui_parameters_present_flag: bool,
-    /// `sps_extension_present_flag`. Only known when
-    /// [`Self::vui_parameters_present_flag`] is false; otherwise
-    /// inferred to false until the VUI body is parsed. When true,
-    /// the extension flags plus their bodies and the RBSP trailing
-    /// bits are surfaced as [`Self::opaque_tail`].
+    /// Parsed §E.2.1 `vui_parameters()` body when
+    /// [`Self::vui_parameters_present_flag`] is true; `None`
+    /// otherwise.
+    pub vui_parameters: Option<VuiParameters>,
+    /// `sps_extension_present_flag`. Read in both the VUI-present and
+    /// VUI-absent paths now that the VUI body is fully decoded. When
+    /// true, the extension flags plus their bodies and the RBSP
+    /// trailing bits are surfaced as [`Self::opaque_tail`].
     pub sps_extension_present_flag: bool,
-    /// Opaque suffix of the SPS RBSP. Populated when a tail body
-    /// (VUI or extension) is signalled but not parsed in this round,
-    /// or when the parser stops at the end of the structural prefix.
-    /// `None` when the SPS ended cleanly after
-    /// `sps_extension_present_flag == 0` (in which case only the
-    /// `rbsp_trailing_bits()` byte remains and it is consumed
-    /// implicitly).
+    /// Opaque suffix of the SPS RBSP. Populated when the SPS
+    /// extension block (`sps_extension_present_flag == 1`) is
+    /// signalled but not parsed in this round. `None` when the SPS
+    /// ended cleanly after `sps_extension_present_flag == 0` (in
+    /// which case only the `rbsp_trailing_bits()` byte remains and it
+    /// is consumed implicitly).
     pub opaque_tail: Option<OpaqueTail>,
 }
 
@@ -699,17 +719,18 @@ impl SeqParameterSet {
         let strong_intra_smoothing_enabled_flag = br.u1()? != 0;
 
         let vui_parameters_present_flag = br.u1()? != 0;
+        // §E.2.1: the vui_parameters() body is decoded in full when
+        // signalled, with the nested hrd_parameters( 1,
+        // sps_max_sub_layers_minus1 ) call taking the SPS-level
+        // maxNumSubLayersMinus1. Parsing then continues to
+        // sps_extension_present_flag in both paths.
+        let vui_parameters = if vui_parameters_present_flag {
+            Some(VuiParameters::parse(br, max_sub_layers_minus1)?)
+        } else {
+            None
+        };
 
-        let (sps_extension_present_flag, opaque_tail) = if vui_parameters_present_flag {
-            // VUI body is not yet parsed; everything from here onward
-            // (including the eventual sps_extension_present_flag, any
-            // extension bodies, and the rbsp_trailing_bits) is surfaced
-            // as an opaque tail. `sps_extension_present_flag` is left
-            // false in the parsed struct since we genuinely don't know
-            // it without decoding the VUI body.
-            let tail = OpaqueTail::capture(br, rbsp);
-            (false, Some(tail))
-        } else if br.bits_left() == 0 {
+        let (sps_extension_present_flag, opaque_tail) = if br.bits_left() == 0 {
             // The fixture corpus encoders sometimes elide the
             // sps_extension_present_flag if no extension is signalled
             // and the rbsp_trailing_bits happens to land on a byte
@@ -772,6 +793,7 @@ impl SeqParameterSet {
             sps_temporal_mvp_enabled_flag,
             strong_intra_smoothing_enabled_flag,
             vui_parameters_present_flag,
+            vui_parameters,
             sps_extension_present_flag,
             opaque_tail,
         })
@@ -1169,15 +1191,40 @@ mod tests {
         assert!(sps.long_term_ref_pics.is_empty());
         assert!(sps.sps_temporal_mvp_enabled_flag);
         assert!(sps.strong_intra_smoothing_enabled_flag);
-        // The fixture's libx265 encode signals a VUI, so the parser
-        // captures everything after `vui_parameters_present_flag` as an
-        // opaque tail. We don't introspect its contents here — that is
-        // the next round's work — but we do verify the capture happened
-        // and starts mid-byte (the VUI body never lands on a clean byte
-        // boundary in this fixture).
+        // The fixture's libx265 encode signals a §E.2.1 VUI body. It
+        // decodes to a square (1:1) sample aspect ratio, an
+        // unspecified-but-present video_signal_type, and a timing-info
+        // block of vui_num_units_in_tick = 1 / vui_time_scale = 25
+        // (25 fps) with neither HRD nor bitstream restriction. After
+        // the VUI the SPS ends cleanly: sps_extension_present_flag == 0
+        // and only the rbsp_trailing_bits() remain, so no opaque tail
+        // is captured.
         assert!(sps.vui_parameters_present_flag);
-        let tail = sps.opaque_tail.as_ref().expect("opaque VUI tail");
-        assert!(!tail.bytes.is_empty());
+        let vui = sps.vui_parameters.as_ref().expect("VUI body");
+        assert!(vui.aspect_ratio_info_present_flag);
+        assert_eq!(vui.aspect_ratio_idc, 1); // 1:1 square
+        assert!(vui.sar_width.is_none());
+        assert!(!vui.overscan_info_present_flag);
+        assert!(vui.video_signal_type_present_flag);
+        let vst = vui.video_signal_type.as_ref().expect("video signal type");
+        assert_eq!(vst.video_format, 5); // unspecified
+        assert!(!vst.video_full_range_flag);
+        assert!(vst.colour_description.is_none());
+        assert!(!vui.chroma_loc_info_present_flag);
+        assert!(!vui.neutral_chroma_indication_flag);
+        assert!(!vui.field_seq_flag);
+        assert!(!vui.frame_field_info_present_flag);
+        assert!(!vui.default_display_window_flag);
+        assert!(vui.vui_timing_info_present_flag);
+        let ti = vui.timing_info.as_ref().expect("timing info");
+        assert_eq!(ti.num_units_in_tick, 1);
+        assert_eq!(ti.time_scale, 25);
+        assert!(!ti.poc_proportional_to_timing_flag);
+        assert!(!ti.hrd_parameters_present_flag);
+        assert!(!vui.bitstream_restriction_flag);
+        // No extension, no opaque tail.
+        assert!(!sps.sps_extension_present_flag);
+        assert!(sps.opaque_tail.is_none());
     }
 
     /// End-to-end: pull the SPS NAL out of the raw Annex B stream
@@ -1770,10 +1817,13 @@ mod tests {
         assert!(!sps.long_term_ref_pics[1].used_by_curr_pic);
     }
 
-    /// SPS with `vui_parameters_present_flag == 1`: the parser must
-    /// surface everything after the VUI gate as an opaque tail.
+    /// SPS with `vui_parameters_present_flag == 1`: the parser now
+    /// decodes the §E.2.1 `vui_parameters()` body in full and
+    /// continues to `sps_extension_present_flag`. Here the VUI is the
+    /// minimal all-flags-off body (ten `u(1)` flags), so no opaque
+    /// tail is captured.
     #[test]
-    fn captures_vui_opaque_tail() {
+    fn decodes_vui_then_continues_to_extension_flag() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
@@ -1781,21 +1831,67 @@ mod tests {
         s += "1"; // temporal_mvp = 1
         s += "1"; // strong_intra_smoothing = 1
         s += "1"; // vui_parameters_present_flag = 1
-                  // synthetic opaque body (8 bits) + stop bit + pad
-        s += "10101010";
-        s += "1"; // trailing stop bit (treated as part of opaque tail)
+                  // vui_parameters(): ten flags all 0 (minimal body)
+        s += "0000000000";
+        s += "0"; // sps_extension_present_flag = 0
+        s += "1"; // rbsp stop bit
 
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         assert!(sps.vui_parameters_present_flag);
+        let vui = sps.vui_parameters.as_ref().expect("VUI body");
+        assert!(!vui.aspect_ratio_info_present_flag);
+        assert!(!vui.overscan_info_present_flag);
+        assert!(!vui.video_signal_type_present_flag);
+        assert!(!vui.chroma_loc_info_present_flag);
+        assert!(!vui.vui_timing_info_present_flag);
+        assert!(!vui.bitstream_restriction_flag);
         assert!(!sps.sps_extension_present_flag);
-        let tail = sps.opaque_tail.expect("opaque VUI tail");
+        assert!(sps.opaque_tail.is_none());
+    }
+
+    /// SPS with `vui_parameters_present_flag == 1` whose VUI signals a
+    /// timing-info block, followed by `sps_extension_present_flag == 1`
+    /// — the extension body after the (now fully decoded) VUI is
+    /// surfaced as an opaque tail.
+    #[test]
+    fn decodes_vui_then_captures_extension_tail() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm_enabled_flag = 0
+        s += "1"; // num_short_term_ref_pic_sets = 0
+        s += "0"; // long_term = 0
+        s += "1"; // temporal_mvp = 1
+        s += "1"; // strong_intra_smoothing = 1
+        s += "1"; // vui_parameters_present_flag = 1
+                  // vui_parameters():
+        s += "0"; // aspect_ratio_info_present_flag = 0
+        s += "0"; // overscan_info_present_flag = 0
+        s += "0"; // video_signal_type_present_flag = 0
+        s += "0"; // chroma_loc_info_present_flag = 0
+        s += "0"; // neutral_chroma_indication_flag = 0
+        s += "0"; // field_seq_flag = 0
+        s += "0"; // frame_field_info_present_flag = 0
+        s += "0"; // default_display_window_flag = 0
+        s += "1"; // vui_timing_info_present_flag = 1
+        s += "00000000000000000000000000000001"; // vui_num_units_in_tick = 1
+        s += "00000000000000000000000000011001"; // vui_time_scale = 25
+        s += "0"; // vui_poc_proportional_to_timing_flag = 0
+        s += "0"; // vui_hrd_parameters_present_flag = 0
+        s += "0"; // bitstream_restriction_flag = 0
+                  // sps_extension_present_flag = 1 → opaque extension tail
+        s += "1";
+        s += "00000000"; // opaque extension bytes
+        s += "1"; // rbsp stop bit
+
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let vui = sps.vui_parameters.as_ref().expect("VUI body");
+        let ti = vui.timing_info.as_ref().expect("timing info");
+        assert_eq!(ti.num_units_in_tick, 1);
+        assert_eq!(ti.time_scale, 25);
+        assert!(sps.sps_extension_present_flag);
+        let tail = sps.opaque_tail.as_ref().expect("opaque extension tail");
         assert!(!tail.bytes.is_empty());
-        // start_bit_in_first_byte is within [0, 7]; we don't pin its
-        // exact value here because the synthesised prefix varies in
-        // length across rounds and the test exists to confirm the tail
-        // was captured at all.
-        assert!(tail.start_bit_in_first_byte < 8);
     }
 
     /// SPS with `sps_extension_present_flag == 1`: parser must surface

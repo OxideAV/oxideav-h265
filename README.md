@@ -167,6 +167,25 @@ data and CABAC remain unimplemented.
   per-CPB array ([`CpbEntry`]) with the §E.3.3 monotonicity
   constraints enforced inline; and the §7.3.2.1 `cprms_present_flag[i]
   == 0` inheritance of common-info gates from the previous entry.
+* §E.2.1 [`VuiParameters`] — the full `vui_parameters()` body:
+  aspect-ratio info (`aspect_ratio_idc` + the [`EXTENDED_SAR`]
+  `sar_width` / `sar_height` `u(16)` pair), overscan, the
+  [`VideoSignalType`] block (`video_format` / `video_full_range_flag`
+  + the [`ColourDescription`] `colour_primaries` /
+  `transfer_characteristics` / `matrix_coeffs` triple), chroma-loc
+  info (`chroma_sample_loc_type_{top,bottom}_field` 0..=5
+  range-checked), the neutral-chroma / field-seq / frame-field flags,
+  the [`DefaultDisplayWindow`] offset quad, the [`VuiTimingInfo`]
+  block (`u(32)` `vui_num_units_in_tick` / `vui_time_scale` enforced
+  `> 0` per §E.3.1, POC-proportional flag +
+  `vui_num_ticks_poc_diff_one_minus1`, and the nested §E.2.3
+  `hrd_parameters( 1, sps_max_sub_layers_minus1 )` call reusing
+  [`HrdParameters`]), and the [`BitstreamRestriction`] block (with
+  the §E.3.1 `min_spatial_segmentation_idc` 0..=4095,
+  `max_bytes_per_pic_denom` / `max_bits_per_min_cu_denom` 0..=16, and
+  `log2_max_mv_length_{horizontal,vertical}` 0..=15 range-checks).
+  Validated against the libx265 tiny-fixture VUI (1:1 SAR, 25 fps
+  timing).
 * §7.3.2.2 [`SeqParameterSet`] — `sps_video_parameter_set_id`,
   `sps_max_sub_layers_minus1` / `sps_temporal_id_nesting_flag`, the
   §7.3.3 PTL re-walk, `sps_seq_parameter_set_id`, `chroma_format_idc`
@@ -190,11 +209,12 @@ data and CABAC remain unimplemented.
   + the [`LongTermRefPicEntry`] table (`u(v)` POC-LSB width per
   `log2_max_pic_order_cnt_lsb_minus4 + 4`),
   `sps_temporal_mvp_enabled_flag`,
-  `strong_intra_smoothing_enabled_flag`, and the
-  `vui_parameters_present_flag` / `sps_extension_present_flag`
-  gates. The VUI body and any extension payload are surfaced as
-  [`OpaqueTail`] (raw RBSP bytes from the cut-off byte through the
-  buffer end, with the start-bit offset). When
+  `strong_intra_smoothing_enabled_flag`, the
+  `vui_parameters_present_flag` gate whose §E.2.1 `vui_parameters()`
+  body is decoded into [`VuiParameters`] (see below), and the
+  `sps_extension_present_flag` gate (extension payload surfaced as
+  an [`OpaqueTail`] — raw RBSP bytes from the cut-off byte through
+  the buffer end, with the start-bit offset). When
   `scaling_list_enabled_flag == 1` and
   `sps_scaling_list_data_present_flag == 1`, the §7.3.4
   `scaling_list_data()` block is parsed into [`ScalingListData`]
@@ -322,8 +342,6 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 
 ## Not yet implemented
 
-* VUI parameters (§E.2.1) — currently surfaced as opaque bytes on
-  the parsed SPS struct.
 * SPS extension bodies (Range Extension, Multilayer Annex F,
   3D Annex I, SCC) — likewise surfaced as opaque bytes.
 * PPS extension bodies (`pps_range_extension()`,

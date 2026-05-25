@@ -87,9 +87,15 @@
 //!   `long_term_ref_pics_present_flag` block plus
 //!   [`sps::LongTermRefPicEntry`] table, the
 //!   `sps_temporal_mvp_enabled_flag` /
-//!   `strong_intra_smoothing_enabled_flag` pair, and the
-//!   `vui_parameters_present_flag` / `sps_extension_present_flag`
-//!   gates whose bodies are surfaced as [`sps::OpaqueTail`].
+//!   `strong_intra_smoothing_enabled_flag` pair, the
+//!   `vui_parameters_present_flag` gate whose §E.2.1
+//!   `vui_parameters()` body is decoded into [`vui::VuiParameters`]
+//!   (aspect-ratio / EXTENDED_SAR, overscan, video-signal-type +
+//!   colour-description, chroma-loc, default-display-window, the
+//!   `vui_timing_info` block — `u(32)` num_units_in_tick / time_scale
+//!   plus the nested §E.2.3 `hrd_parameters()` call — and
+//!   bitstream-restriction), and the `sps_extension_present_flag`
+//!   gate whose extension body is surfaced as [`sps::OpaqueTail`].
 //!   The §7.3.4 `scaling_list_data()` block — when
 //!   `sps_scaling_list_data_present_flag == 1` — is parsed and the
 //!   §7.4.5 `ScalingList[sizeId][matrixId][i]` coefficient arrays are
@@ -164,6 +170,7 @@ pub mod scan;
 pub mod slice;
 pub mod sps;
 pub mod vps;
+pub mod vui;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
@@ -192,6 +199,10 @@ pub use sps::{
 pub use vps::{
     HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsError, VpsTimingInfo,
     HEVC_MAX_SUB_LAYERS, HEVC_VPS_MAX_NUM_LAYERS, HEVC_VPS_MAX_NUM_LAYER_SETS,
+};
+pub use vui::{
+    BitstreamRestriction, ColourDescription, DefaultDisplayWindow, VideoSignalType, VuiError,
+    VuiParameters, VuiTimingInfo, EXTENDED_SAR,
 };
 
 /// Crate-local error type. The decoder and encoder paths still
@@ -222,6 +233,9 @@ pub enum Error {
     /// An `hrd_parameters()` parser error surfaced through the
     /// top-level entry points.
     Hrd(HrdError),
+    /// A `vui_parameters()` parser error surfaced through the
+    /// top-level entry points.
+    Vui(VuiError),
 }
 
 impl core::fmt::Display for Error {
@@ -234,6 +248,7 @@ impl core::fmt::Display for Error {
             Self::Pps(e) => write!(f, "oxideav-h265 PPS error: {e}"),
             Self::Slice(e) => write!(f, "oxideav-h265 slice header error: {e}"),
             Self::Hrd(e) => write!(f, "oxideav-h265 hrd error: {e}"),
+            Self::Vui(e) => write!(f, "oxideav-h265 vui error: {e}"),
         }
     }
 }
@@ -273,6 +288,12 @@ impl From<SliceError> for Error {
 impl From<HrdError> for Error {
     fn from(e: HrdError) -> Self {
         Self::Hrd(e)
+    }
+}
+
+impl From<VuiError> for Error {
+    fn from(e: VuiError) -> Self {
+        Self::Vui(e)
     }
 }
 
