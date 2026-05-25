@@ -150,6 +150,15 @@
 //!   weighted-prediction sub-structures are still surfaced as an
 //!   [`sps::OpaqueTail`]. The §7.4.7.1 inference rules are applied to
 //!   absent fields.
+//! * §7.3.6.2 [`slice::RefPicListsModification`] — the
+//!   `ref_pic_lists_modification()` syntax structure as a standalone
+//!   parser, callable once the §7.4.7.2 `NumPicTotalCurr` derivation
+//!   is wired through the slice path. The parser walks the
+//!   `ref_pic_list_modification_flag_lX` `u(1)` gates and the
+//!   `list_entry_lX[]` `u(v)` loops (each entry
+//!   `Ceil( Log2( NumPicTotalCurr ) )` bits wide and range-checked
+//!   per §7.4.7.2); the implicit `RefPicListTempX` derivation of
+//!   §8.3.4 stays the consumer's responsibility.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
@@ -188,8 +197,9 @@ pub use scan::{
     horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
 };
 pub use slice::{
-    EntryPointOffsets, SliceDeblocking, SliceError, SliceLongTermRefPic, SliceLongTermRefPicSource,
-    SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
+    EntryPointOffsets, RefPicListsModification, SliceDeblocking, SliceError, SliceLongTermRefPic,
+    SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL,
+    RSV_IRAP_VCL23,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,

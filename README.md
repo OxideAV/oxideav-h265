@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 13 (2026-05-25).** The prior implementation was
+**Clean-room rebuild — round 15 (2026-05-26).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,29 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 13 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 15 lands the
+§7.3.6.2 `ref_pic_lists_modification()` syntax structure as a
+standalone parser ([`RefPicListsModification::parse`]): the
+`ref_pic_list_modification_flag_l0` `u(1)` gate, the
+`list_entry_l0[ 0 .. num_ref_idx_l0_active_minus1 ]` `u(v)` loop with
+the per-entry width set to `Ceil( Log2( NumPicTotalCurr ) )` bits
+(§7.4.7.2) and each value range-checked to `0 ..=
+NumPicTotalCurr - 1`, the B-slice-gated `ref_pic_list_modification_flag_l1`
+`u(1)` plus the matching `list_entry_l1[]` loop, and the up-front
+preconditions that reject `SliceType::I` calls (the §7.3.6.1 gate
+sits inside the inter-slice branch), `NumPicTotalCurr <= 1` (the
+§7.3.6.1 gate guarantees `> 1` at the call site), and
+`num_ref_idx_lX_active_minus1 > 14` (the §7.4.7.1 cap on
+`num_ref_idx_lX_active_minus1`). The implicit `RefPicListTempX`
+derivation of §8.3.4 stays the consumer's responsibility; the parser
+materialises only the on-wire syntax elements.
+[`slice::SliceSegmentHeader::parse`] still surfaces the inter-slice
+tail as an [`sps::OpaqueTail`] — the in-place call site needs the
+§7.4.7.2 `NumPicTotalCurr` derivation (DPB-driven), which is the
+next round's primitive.
+Round 14 had landed the
+§E.2.1 `vui_parameters()` body as a typed [`VuiParameters`] (see
+"Scope so far" below). Round 13 had landed the
 §E.2.2 / §E.2.3 `hrd_parameters()` and `sub_layer_hrd_parameters()`
 bodies as a new `hrd` module ([`HrdParameters`] / [`HrdCommonInfo`] /
 [`SubLayerHrd`] / [`SubLayerHrdParameters`] / [`CpbEntry`] /
@@ -308,7 +330,28 @@ data and CABAC remain unimplemented.
   [`SliceSegmentHeader::slice_qp_y`] applies equation 7-54. The
   §7.4.7.1 inference rules are applied to absent fields. The P/B
   reference-list / weighted-prediction sub-structures (which need DPB
-  state) are surfaced as an [`OpaqueTail`] rather than decoded.
+  state) are surfaced as an [`OpaqueTail`] rather than decoded; the
+  §7.3.6.2 syntax structure itself is implemented as a standalone
+  parser ([`RefPicListsModification`], see below).
+
+* §7.3.6.2 [`RefPicListsModification`] — the
+  `ref_pic_lists_modification()` syntax structure as a standalone
+  parser, callable by a future round once the §7.4.7.2
+  `NumPicTotalCurr` derivation is wired through the slice parser.
+  [`RefPicListsModification::parse`] takes the active
+  `slice_type` / `num_ref_idx_l0_active_minus1` /
+  `num_ref_idx_l1_active_minus1` / `NumPicTotalCurr` and walks
+  the `ref_pic_list_modification_flag_l0` gate + the
+  `list_entry_l0[0..=num_ref_idx_l0_active_minus1]` `u(v)` loop
+  (each entry `Ceil( Log2( NumPicTotalCurr ) )` bits wide and
+  range-checked at `<= NumPicTotalCurr - 1` per §7.4.7.2), then —
+  for B slices only — the `ref_pic_list_modification_flag_l1`
+  gate + its `list_entry_l1[]` loop. The parser rejects
+  preconditions that the §7.3.6.1 call site would have filtered
+  (`SliceType::I` and `NumPicTotalCurr <= 1`) and the
+  §7.4.7.1 `num_ref_idx_lX_active_minus1 > 14` cap. The implicit
+  `RefPicListTempX` derivation of §8.3.4 stays the consumer's
+  responsibility; this struct surfaces only the on-wire syntax.
 
 * §9.3 [`cabac`] — the CABAC arithmetic decoding engine as a
   standalone module: [`CabacEngine::new`] initializes the §9.3.2.6
@@ -337,8 +380,8 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
 [`SeqParameterSet::parse`], [`PicParameterSet::parse`],
-[`SliceSegmentHeader::parse`], [`scan_order`],
-[`CabacEngine::new`].
+[`SliceSegmentHeader::parse`], [`RefPicListsModification::parse`],
+[`scan_order`], [`CabacEngine::new`].
 
 ## Not yet implemented
 
@@ -354,11 +397,16 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `hrd_parameters()` bodies are now fully decoded (round 13).
 * Slice header (§7.3.6.1) deferred body: the P/B
   `ref_pic_lists_modification()` (§7.3.6.2) /
-  `pred_weight_table()` (§7.3.6.3) sub-structures — surfaced as an
-  opaque tail for P/B slice headers; need DPB-derived
-  `NumPicTotalCurr` / `RefPicList` state. The non-IDR POC /
-  reference-picture-set block (which previously sat under this bullet)
-  is fully decoded as of round 7.
+  `pred_weight_table()` (§7.3.6.3) sub-structures — `SliceSegmentHeader::parse`
+  still surfaces these as an opaque tail for P/B slice headers
+  because the §7.3.6.1 in-place call site needs DPB-derived
+  `NumPicTotalCurr` / `RefPicList` state. The §7.3.6.2 syntax
+  structure itself is decoded by the standalone
+  [`RefPicListsModification::parse`] (round 15); the in-place
+  integration is the next round's primitive once the §7.4.7.2
+  `NumPicTotalCurr` derivation is wired through the slice parser.
+  The non-IDR POC / reference-picture-set block (which previously sat
+  under this bullet) is fully decoded as of round 7.
 * Slice data (§7.3.8) — the slice-data syntax-element walk that
   drives the CABAC engine. Needs the §9.3.4.2 per-syntax-element
   binarization / context-index derivation (which selects the

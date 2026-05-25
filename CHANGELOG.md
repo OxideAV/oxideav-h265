@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 15 (2026-05-26)
+
+- §7.3.6.2 `ref_pic_lists_modification()` syntax structure decoded by
+  a new standalone parser ([`slice::RefPicListsModification::parse`]):
+  - `ref_pic_list_modification_flag_l0` `u(1)` gate +
+    `list_entry_l0[ 0 .. num_ref_idx_l0_active_minus1 ]` `u(v)` loop
+    (each entry `Ceil( Log2( NumPicTotalCurr ) )` bits wide per
+    §7.4.7.2) with each value range-checked to
+    `0 ..= NumPicTotalCurr - 1`.
+  - B-slice-gated `ref_pic_list_modification_flag_l1` `u(1)` +
+    matching `list_entry_l1[ 0 .. num_ref_idx_l1_active_minus1 ]`
+    `u(v)` loop (same width / range check).
+  - Up-front precondition checks rejecting `SliceType::I` calls (the
+    §7.3.6.1 gate sits inside the inter-slice branch),
+    `NumPicTotalCurr <= 1` (the §7.3.6.1 gate guarantees `> 1` at the
+    in-place call site), and `num_ref_idx_lX_active_minus1 > 14` (the
+    §7.4.7.1 cap on the per-list active count).
+- `slice::RefPicListsModification` re-exported from the crate root
+  for downstream callers.
+- `slice::SliceSegmentHeader::parse` still defers the in-place
+  call: the §7.3.6.1 invocation `if( lists_modification_present_flag
+  && NumPicTotalCurr > 1 ) ref_pic_lists_modification( )` is gated by
+  the DPB-derived `NumPicTotalCurr` (§7.4.7.2), which is the next
+  round's primitive. The standalone parser unblocks that round.
+- 12 spec-pinned unit tests covering: P-slice L0-only and L0-implicit
+  cases, B-slice both-lists and L0-implicit-L1-explicit and
+  both-flags-zero cases, the `list_entry_lX > NumPicTotalCurr - 1`
+  range checks for both L0 and L1, the `SliceType::I`,
+  `NumPicTotalCurr <= 1`, and `num_ref_idx_lX_active_minus1 > 14`
+  precondition rejections, the maximum-active-index (15-entry) case,
+  a `Ceil( Log2( N ) )` per-entry width check across
+  `N in { 2, 3, 4, 5, 8, 9, 16 }`, and a truncated-RBSP path.
+
 ### Added — clean-room rebuild round 14 (2026-05-25)
 
 - §E.2.1 `vui_parameters()` body decoded as a new `vui` module

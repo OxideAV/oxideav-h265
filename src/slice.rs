@@ -56,7 +56,12 @@
 //!   values. When `slice_type` is P or B the parser materialises the
 //!   common P/B fields up to (but not including) the point where those
 //!   sub-structures would begin, then surfaces the remainder as the
-//!   opaque tail.
+//!   opaque tail. The §7.3.6.2 syntax structure itself is implemented
+//!   as a standalone parser ([`RefPicListsModification::parse`]) so a
+//!   future round that wires up the §7.4.7.2 `NumPicTotalCurr`
+//!   derivation can decode the reference-picture-list-modification
+//!   block in place; the implicit `RefPicListTempX` derivation of
+//!   §8.3.4 stays the consumer's responsibility.
 //!
 //! Independent **I-slice IDR** segments — the dominant case for the
 //! intra-only fixtures this rebuild targets — are parsed end to end
@@ -234,6 +239,164 @@ pub struct EntryPointOffsets {
     /// `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1` bits.
     /// Only meaningful when `num_entry_point_offsets > 0`.
     pub offset_len_minus1: u8,
+}
+
+/// Parsed `ref_pic_lists_modification()` syntax structure
+/// (ITU-T Rec. H.265 §7.3.6.2 / §7.4.7.2).
+///
+/// The structure is signalled in the slice header when
+/// `lists_modification_present_flag == 1 && NumPicTotalCurr > 1`
+/// (§7.3.6.1 gate). It carries a per-list "explicit list" override of
+/// the implicit `RefPicList0` / `RefPicList1` derivation of §8.3.4: the
+/// `list_entry_lX[i]` value is the index of the reference picture in
+/// `RefPicListTempX` to place at position `i` of `RefPicListX`. The
+/// `RefPicListTempX` derivation itself is part of §8.3.4 (DPB-driven)
+/// and is **not** performed by this parser — this struct surfaces only
+/// the on-wire syntax elements and applies the §7.4.7.2 inference and
+/// range checks.
+///
+/// Width of each `list_entry_lX[i]` is `Ceil( Log2( NumPicTotalCurr ) )`
+/// bits and the value must be in `0 ..= NumPicTotalCurr - 1`
+/// (§7.4.7.2). When `ref_pic_list_modification_flag_lX == 0` the
+/// corresponding entry list is empty; the implicit derivation of
+/// §8.3.4 applies (each `list_entry_lX[i]` is inferred to 0 per the
+/// §7.4.7.2 paragraph "When the syntax element list_entry_lX[i] is
+/// not present in the slice header, it is inferred to be equal to 0",
+/// but the inference is exercised by §8.3.4, not surfaced here).
+///
+/// The list-1 fields are present only when `slice_type == B`
+/// (§7.3.6.2 syntax). For a P slice the `list_entry_l1` vector is
+/// always empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefPicListsModification {
+    /// `ref_pic_list_modification_flag_l0` (`u(1)`).
+    pub ref_pic_list_modification_flag_l0: bool,
+    /// `list_entry_l0[i]` for `i = 0 ..= num_ref_idx_l0_active_minus1`.
+    /// Empty when `ref_pic_list_modification_flag_l0 == 0`.
+    pub list_entry_l0: Vec<u32>,
+    /// `ref_pic_list_modification_flag_l1` (`u(1)`). `None` when the
+    /// slice is not a B slice (the field is not signalled).
+    pub ref_pic_list_modification_flag_l1: Option<bool>,
+    /// `list_entry_l1[i]` for `i = 0 ..= num_ref_idx_l1_active_minus1`.
+    /// Empty for P slices and when `ref_pic_list_modification_flag_l1
+    /// == 0`.
+    pub list_entry_l1: Vec<u32>,
+}
+
+impl RefPicListsModification {
+    /// Parse `ref_pic_lists_modification()` (§7.3.6.2) from the current
+    /// bit position of `br`.
+    ///
+    /// * `slice_type` — the active slice type. Per §7.3.6.2 the L1
+    ///   block (`ref_pic_list_modification_flag_l1` /
+    ///   `list_entry_l1[]`) is only signalled for B slices. For an
+    ///   I slice the structure is never present at all (the §7.3.6.1
+    ///   gate `lists_modification_present_flag && NumPicTotalCurr > 1`
+    ///   sits inside the inter-slice `slice_type != I` branch), so
+    ///   the parser rejects `SliceType::I` up front.
+    /// * `num_ref_idx_l0_active_minus1` — the *active* value (after
+    ///   the `num_ref_idx_active_override_flag` override, falling back
+    ///   to `num_ref_idx_l0_default_active_minus1` from the PPS). Per
+    ///   §7.4.7.1 the value is in `0 ..= 14`.
+    /// * `num_ref_idx_l1_active_minus1` — same, for L1; ignored for P
+    ///   slices.
+    /// * `num_pic_total_curr` — `NumPicTotalCurr` (§7.4.7.2 /
+    ///   equation 7-57). The caller derives it from the active RPS;
+    ///   the §7.3.6.1 gate guarantees `num_pic_total_curr > 1` at the
+    ///   point of call. This parser rejects `num_pic_total_curr <= 1`
+    ///   (the §7.3.6.1 gate would have prevented the call); a call
+    ///   with `num_pic_total_curr == 0` would also imply a bitstream
+    ///   conformance failure per §7.4.7.1 ("when the current picture
+    ///   contains a P or B slice, the value of NumPicTotalCurr shall
+    ///   not be equal to 0"). Each `list_entry_lX[i]` is read as
+    ///   `u(v)` of width `Ceil( Log2( num_pic_total_curr ) )` bits
+    ///   and range-checked against `num_pic_total_curr - 1`.
+    pub fn parse(
+        br: &mut BitReader<'_>,
+        slice_type: SliceType,
+        num_ref_idx_l0_active_minus1: u8,
+        num_ref_idx_l1_active_minus1: u8,
+        num_pic_total_curr: u32,
+    ) -> Result<Self, SliceError> {
+        if slice_type == SliceType::I {
+            return Err(SliceError::ValueOutOfRange {
+                field: "ref_pic_lists_modification/slice_type",
+                got: 2,
+            });
+        }
+        if num_pic_total_curr <= 1 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "ref_pic_lists_modification/NumPicTotalCurr",
+                got: num_pic_total_curr as i64,
+            });
+        }
+        // §7.4.7.1 ranges `num_ref_idx_lX_active_minus1` at 0..=14;
+        // defensively cap the per-list loop length so a corrupted call
+        // can't drive an unbounded allocation. (The cap matches the
+        // spec maximum; a value above 14 would be rejected by the
+        // §7.4.7.1 slice-header parse before reaching here.)
+        if num_ref_idx_l0_active_minus1 > 14 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l0_active_minus1",
+                got: num_ref_idx_l0_active_minus1 as i64,
+            });
+        }
+        if slice_type == SliceType::B && num_ref_idx_l1_active_minus1 > 14 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l1_active_minus1",
+                got: num_ref_idx_l1_active_minus1 as i64,
+            });
+        }
+
+        let entry_bits = ceil_log2(num_pic_total_curr);
+        let max_entry = num_pic_total_curr - 1;
+
+        let ref_pic_list_modification_flag_l0 = br.u1()? != 0;
+        let mut list_entry_l0: Vec<u32> = Vec::new();
+        if ref_pic_list_modification_flag_l0 {
+            let n = num_ref_idx_l0_active_minus1 as u32 + 1;
+            list_entry_l0.reserve(n as usize);
+            for _ in 0..n {
+                let v = br.u(entry_bits)?;
+                if v > max_entry {
+                    return Err(SliceError::ValueOutOfRange {
+                        field: "list_entry_l0",
+                        got: v as i64,
+                    });
+                }
+                list_entry_l0.push(v);
+            }
+        }
+
+        let (ref_pic_list_modification_flag_l1, list_entry_l1) = if slice_type == SliceType::B {
+            let flag = br.u1()? != 0;
+            let mut entries: Vec<u32> = Vec::new();
+            if flag {
+                let n = num_ref_idx_l1_active_minus1 as u32 + 1;
+                entries.reserve(n as usize);
+                for _ in 0..n {
+                    let v = br.u(entry_bits)?;
+                    if v > max_entry {
+                        return Err(SliceError::ValueOutOfRange {
+                            field: "list_entry_l1",
+                            got: v as i64,
+                        });
+                    }
+                    entries.push(v);
+                }
+            }
+            (Some(flag), entries)
+        } else {
+            (None, Vec::new())
+        };
+
+        Ok(Self {
+            ref_pic_list_modification_flag_l0,
+            list_entry_l0,
+            ref_pic_list_modification_flag_l1,
+            list_entry_l1,
+        })
+    }
 }
 
 /// Parsed slice segment header per §7.3.6.1.
@@ -1404,6 +1567,321 @@ mod tests {
         assert_eq!(sh.slice_type, Some(SliceType::I));
         assert_eq!(sh.slice_qp_delta, Some(-1));
         assert_eq!(sh.slice_qp_y(&pps), Some(25));
+    }
+
+    // --- §7.3.6.2 ref_pic_lists_modification() ---
+
+    /// Hand-build a `ref_pic_lists_modification()` RBSP and parse it for
+    /// a P slice with the modification flag set and a single L0 entry.
+    /// `NumPicTotalCurr == 2` so the per-entry width is
+    /// `Ceil(Log2(2)) == 1` bit. With `num_ref_idx_l0_active_minus1 ==
+    /// 0` the loop reads exactly one `list_entry_l0`. The bits are:
+    ///   `ref_pic_list_modification_flag_l0` (1) = 1
+    ///   `list_entry_l0[0]` (u(1)) = 1
+    /// (B-only L1 fields are absent for a P slice.)
+    #[test]
+    fn parses_p_slice_l0_only_modification() {
+        let bits = concat_bits(&[(1, 1), (1, 1)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(
+            &mut br,
+            SliceType::P,
+            0, /* num_ref_idx_l0_active_minus1 */
+            0, /* num_ref_idx_l1_active_minus1 (ignored for P) */
+            2, /* NumPicTotalCurr */
+        )
+        .expect("ref_pic_lists_modification");
+
+        assert!(m.ref_pic_list_modification_flag_l0);
+        assert_eq!(m.list_entry_l0, vec![1]);
+        // P slice: list-1 fields absent.
+        assert!(m.ref_pic_list_modification_flag_l1.is_none());
+        assert!(m.list_entry_l1.is_empty());
+        // Exactly 2 bits consumed.
+        assert_eq!(br.bit_pos(), 2);
+    }
+
+    /// B slice with both list-0 and list-1 modifications active.
+    /// `NumPicTotalCurr == 4` so the per-entry width is
+    /// `Ceil(Log2(4)) == 2` bits. With both `num_ref_idx_lX_active_minus1
+    /// == 1` each list contributes 2 entries.
+    ///   flag_l0 (1)=1
+    ///   list_entry_l0[0] u(2)=0b10=2
+    ///   list_entry_l0[1] u(2)=0b00=0
+    ///   flag_l1 (1)=1
+    ///   list_entry_l1[0] u(2)=0b01=1
+    ///   list_entry_l1[1] u(2)=0b11=3
+    /// Total = 1 + 2 + 2 + 1 + 2 + 2 = 10 bits.
+    #[test]
+    fn parses_b_slice_both_lists_modification() {
+        let bits = concat_bits(&[
+            (1, 1),    // ref_pic_list_modification_flag_l0
+            (0b10, 2), // list_entry_l0[0] = 2
+            (0b00, 2), // list_entry_l0[1] = 0
+            (1, 1),    // ref_pic_list_modification_flag_l1
+            (0b01, 2), // list_entry_l1[0] = 1
+            (0b11, 2), // list_entry_l1[1] = 3
+        ]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(&mut br, SliceType::B, 1, 1, 4).expect("parse");
+
+        assert!(m.ref_pic_list_modification_flag_l0);
+        assert_eq!(m.list_entry_l0, vec![2, 0]);
+        assert_eq!(m.ref_pic_list_modification_flag_l1, Some(true));
+        assert_eq!(m.list_entry_l1, vec![1, 3]);
+        assert_eq!(br.bit_pos(), 10);
+    }
+
+    /// B slice where the L0 modification flag is 0 (implicit
+    /// derivation): the L0 entry list is empty, and the L1 flag is
+    /// read immediately after. `NumPicTotalCurr == 3` so per-entry
+    /// width is `Ceil(Log2(3)) == 2` bits.
+    ///   flag_l0 (1)=0
+    ///   flag_l1 (1)=1
+    ///   list_entry_l1[0] u(2)=0b10=2
+    /// 4 bits total; the parser must NOT have consumed any L0 entries.
+    #[test]
+    fn parses_b_slice_l0_implicit_l1_explicit() {
+        let bits = concat_bits(&[(0, 1), (1, 1), (0b10, 2)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(&mut br, SliceType::B, 0, 0, 3).expect("parse");
+
+        assert!(!m.ref_pic_list_modification_flag_l0);
+        assert!(m.list_entry_l0.is_empty());
+        assert_eq!(m.ref_pic_list_modification_flag_l1, Some(true));
+        assert_eq!(m.list_entry_l1, vec![2]);
+        assert_eq!(br.bit_pos(), 4);
+    }
+
+    /// Both flags zero: a minimal degenerate case where the entire
+    /// structure is two bits and produces empty entry lists.
+    #[test]
+    fn parses_b_slice_both_flags_zero() {
+        let bits = concat_bits(&[(0, 1), (0, 1)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(&mut br, SliceType::B, 0, 0, 2).expect("parse");
+
+        assert!(!m.ref_pic_list_modification_flag_l0);
+        assert!(m.list_entry_l0.is_empty());
+        assert_eq!(m.ref_pic_list_modification_flag_l1, Some(false));
+        assert!(m.list_entry_l1.is_empty());
+        assert_eq!(br.bit_pos(), 2);
+    }
+
+    /// P slice with `flag_l0 == 0`: exactly one bit consumed, no list
+    /// entries, and no L1 fields present.
+    #[test]
+    fn parses_p_slice_l0_implicit() {
+        let bits = concat_bits(&[(0, 1)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(&mut br, SliceType::P, 14, 14, 5).expect("parse");
+
+        assert!(!m.ref_pic_list_modification_flag_l0);
+        assert!(m.list_entry_l0.is_empty());
+        assert!(m.ref_pic_list_modification_flag_l1.is_none());
+        assert!(m.list_entry_l1.is_empty());
+        assert_eq!(br.bit_pos(), 1);
+    }
+
+    /// §7.4.7.2 range check: `list_entry_l0[i]` must be
+    /// `< NumPicTotalCurr`. With `NumPicTotalCurr == 3` the per-entry
+    /// width is 2 bits, so the value `3` (0b11) is legally encodable
+    /// but is rejected by the range check.
+    #[test]
+    fn list_entry_l0_value_must_be_less_than_num_pic_total_curr() {
+        let bits = concat_bits(&[
+            (1, 1),    // flag_l0
+            (0b11, 2), // list_entry_l0[0] = 3 — illegal: must be <= 2
+        ]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, 3)
+            .expect_err("out-of-range entry must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "list_entry_l0",
+                got: 3,
+            }
+        );
+    }
+
+    /// §7.4.7.2 range check for L1: same rule, exercised through the
+    /// B-slice branch.
+    #[test]
+    fn list_entry_l1_value_must_be_less_than_num_pic_total_curr() {
+        // NumPicTotalCurr=2 → entry width=1 bit, max value=1. Send a
+        // legal L0 (flag=0) then an explicit L1 (flag=1, entry=1 OK,
+        // then we cannot encode 2 in 1 bit so use a 3-curr setup
+        // instead to exercise the range check.)
+        // Use NumPicTotalCurr=3 (2-bit entries) so 0b11=3 is illegal.
+        let bits = concat_bits(&[
+            (0, 1),    // flag_l0
+            (1, 1),    // flag_l1
+            (0b11, 2), // list_entry_l1[0] = 3 — illegal
+        ]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::B, 0, 0, 3)
+            .expect_err("out-of-range L1 entry must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "list_entry_l1",
+                got: 3,
+            }
+        );
+    }
+
+    /// The §7.3.6.2 structure is only signalled for inter slices. The
+    /// parser rejects an I-slice call up front rather than reading any
+    /// bits (the bitreader position must stay at 0).
+    #[test]
+    fn rejects_i_slice_call() {
+        let rbsp = [0xFFu8; 4];
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::I, 0, 0, 2)
+            .expect_err("I-slice call must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "ref_pic_lists_modification/slice_type",
+                got: 2,
+            }
+        );
+        assert_eq!(br.bit_pos(), 0);
+    }
+
+    /// The §7.3.6.1 gate guarantees `NumPicTotalCurr > 1`. The parser
+    /// rejects a call with `NumPicTotalCurr <= 1` (a defensive
+    /// pre-condition).
+    #[test]
+    fn rejects_num_pic_total_curr_le_1() {
+        let rbsp = [0xFFu8; 4];
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, 1)
+            .expect_err("NumPicTotalCurr <= 1 must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "ref_pic_lists_modification/NumPicTotalCurr",
+                got: 1,
+            }
+        );
+        assert_eq!(br.bit_pos(), 0);
+
+        let mut br2 = BitReader::new(&rbsp);
+        let err2 = RefPicListsModification::parse(&mut br2, SliceType::B, 0, 0, 0)
+            .expect_err("NumPicTotalCurr == 0 must error");
+        assert_eq!(
+            err2,
+            SliceError::ValueOutOfRange {
+                field: "ref_pic_lists_modification/NumPicTotalCurr",
+                got: 0,
+            }
+        );
+    }
+
+    /// `num_ref_idx_l0_active_minus1` is constrained to 0..=14 by
+    /// §7.4.7.1. The parser rejects a call that violates that bound,
+    /// matching the precondition documented on
+    /// [`RefPicListsModification::parse`].
+    #[test]
+    fn rejects_num_ref_idx_l0_out_of_range() {
+        let rbsp = [0xFFu8; 4];
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::P, 15, 0, 2)
+            .expect_err("num_ref_idx_l0_active_minus1 > 14 must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l0_active_minus1",
+                got: 15,
+            }
+        );
+    }
+
+    /// Same check for L1, exercised through the B-slice branch (the
+    /// L1 bound is only validated for B slices).
+    #[test]
+    fn rejects_num_ref_idx_l1_out_of_range() {
+        let rbsp = [0xFFu8; 4];
+        let mut br = BitReader::new(&rbsp);
+        let err = RefPicListsModification::parse(&mut br, SliceType::B, 0, 15, 2)
+            .expect_err("num_ref_idx_l1_active_minus1 > 14 must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l1_active_minus1",
+                got: 15,
+            }
+        );
+    }
+
+    /// Maximum-active-index case: 15 entries per list (the §7.4.7.1
+    /// cap, `num_ref_idx_lX_active_minus1 == 14`), with
+    /// `NumPicTotalCurr == 8` (3-bit entries). Bit accounting:
+    ///   flag_l0 (1) + 15 * 3 = 46 bits for the L0 portion.
+    /// The P slice has no L1 fields, so the test verifies the parser
+    /// reads exactly 46 bits.
+    #[test]
+    fn max_active_minus1_p_slice_l0() {
+        let mut fields: Vec<(u32, u8)> = vec![(1, 1)]; // flag_l0 = 1
+        for i in 0..15u32 {
+            // entry value = i mod 8 ∈ 0..=7, fits in 3 bits, in range.
+            fields.push((i % 8, 3));
+        }
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let m = RefPicListsModification::parse(&mut br, SliceType::P, 14, 0, 8).expect("parse");
+        assert!(m.ref_pic_list_modification_flag_l0);
+        assert_eq!(m.list_entry_l0.len(), 15);
+        for (i, &v) in m.list_entry_l0.iter().enumerate() {
+            assert_eq!(v, (i as u32) % 8);
+        }
+        assert_eq!(br.bit_pos(), 1 + 15 * 3);
+    }
+
+    /// `Ceil(Log2(N))` width: confirm the per-entry width matches the
+    /// §7.4.7.2 formula for a representative set of `NumPicTotalCurr`
+    /// values by reading exactly the expected bit count from a flag=1
+    /// L0 with a single entry.
+    #[test]
+    fn entry_width_matches_ceil_log2() {
+        // (num_pic_total_curr, expected_bits_per_entry)
+        let cases: &[(u32, u8)] = &[(2, 1), (3, 2), (4, 2), (5, 3), (8, 3), (9, 4), (16, 4)];
+        for &(curr, w) in cases {
+            // bit layout: flag_l0=1 then list_entry_l0[0]=0
+            let mut bits: Vec<u8> = vec![1];
+            bits.resize(1 + w as usize, 0);
+            let rbsp = pack_bits(&bits);
+            let mut br = BitReader::new(&rbsp);
+            let m =
+                RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, curr).expect("parse");
+            assert_eq!(m.list_entry_l0, vec![0]);
+            assert_eq!(br.bit_pos(), 1 + w as usize, "curr={curr} width={w}");
+        }
+    }
+
+    /// Truncated RBSP: the parser surfaces [`SliceError::Truncated`]
+    /// if the buffer runs out mid-element.
+    #[test]
+    fn truncated_buffer_surfaces_truncated_error() {
+        // flag_l0=1 declared but no bits remain for list_entry_l0[0].
+        let bits: Vec<u8> = vec![1];
+        let rbsp = pack_bits(&bits); // one byte: 0b1000_0000
+                                     // Restrict the reader to the first bit only.
+        let buf = &rbsp[..0]; // zero bytes; even flag_l0 fails
+        let mut br = BitReader::new(buf);
+        let err = RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, 4)
+            .expect_err("empty buffer must error");
+        assert_eq!(err, SliceError::Truncated);
     }
 
     // --- bit-packing test helpers ---
