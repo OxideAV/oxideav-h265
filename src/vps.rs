@@ -4,13 +4,14 @@
 //! VPS timing-info block (including `vps_num_units_in_tick` /
 //! `vps_time_scale` / `vps_poc_proportional_to_timing_flag` /
 //! `vps_num_ticks_poc_diff_one_minus1` and the `vps_num_hrd_parameters`
-//! count). The per-HRD `hrd_parameters()` bodies (§E.2.2) are *not*
-//! yet decoded: if `vps_num_hrd_parameters > 0`, the remainder of the
-//! RBSP (the HRD bodies, `vps_extension_flag`, any
-//! `vps_extension_data_flag` payload, and `rbsp_trailing_bits()`) is
-//! surfaced as an [`crate::sps::OpaqueTail`]; otherwise the parser
-//! continues into `vps_extension_flag`, capturing the extension-flag
-//! payload (when 1) as the opaque tail in the same way.
+//! count). The per-HRD `hrd_parameters()` bodies (§E.2.2) are decoded
+//! as a vector of [`crate::hrd::VpsHrdEntry`] values (one per
+//! `vps_num_hrd_parameters`), with the §E.2.3 sub-layer HRD payloads
+//! folded into each entry's [`crate::hrd::SubLayerHrd`]. The
+//! `vps_extension_flag` follows the HRD loop; when 1, the
+//! `vps_extension_data_flag` run + `rbsp_trailing_bits()` are surfaced
+//! as an [`crate::sps::OpaqueTail`] for callers that want the raw
+//! bytes.
 //!
 //! The profile-tier-level subroutine of §7.3.3 is also parsed
 //! structurally: the bit positions are walked but only the leading
@@ -52,14 +53,18 @@
 //!   if( vps_poc_proportional_to_timing_flag )
 //!     vps_num_ticks_poc_diff_one_minus1 ue(v)
 //!   vps_num_hrd_parameters              ue(v)
-//!   /* per-HRD bodies + vps_extension_flag tail surfaced as opaque */
+//!   for( i = 0; i < vps_num_hrd_parameters; i++ ) {
+//!     hrd_layer_set_idx[i]              ue(v)
+//!     if( i > 0 ) cprms_present_flag[i] u(1)
+//!     hrd_parameters( cprms_present_flag[i], vps_max_sub_layers_minus1 )  /* §E.2.2 */
+//!   }
 //! }
-//! /* if vps_num_hrd_parameters == 0 (or no timing info): */
 //! vps_extension_flag                     u(1)
 //! /* extension payload + rbsp_trailing_bits() surfaced as opaque */
 //! ```
 
 use crate::bitreader::{BitReader, BitReaderError};
+use crate::hrd::{HrdError, VpsHrdEntry};
 use crate::sps::OpaqueTail;
 
 /// Maximum number of sub-layers an HEVC stream may declare.
@@ -102,6 +107,10 @@ pub enum VpsError {
     },
     /// An unexpected bitstream-level error surfaced from the reader.
     Bitstream(BitReaderError),
+    /// An `hrd_parameters()` body inside the VPS HRD loop was malformed.
+    /// Propagated up from [`crate::hrd::HrdError`] so a caller that
+    /// only looks at [`VpsError`] still sees the failure.
+    Hrd(HrdError),
 }
 
 impl core::fmt::Display for VpsError {
@@ -116,6 +125,7 @@ impl core::fmt::Display for VpsError {
                 write!(f, "syntax element {field} out of range: {got}")
             }
             Self::Bitstream(e) => write!(f, "bitstream error during VPS parse: {e}"),
+            Self::Hrd(e) => write!(f, "hrd_parameters() error inside VPS: {e}"),
         }
     }
 }
@@ -127,6 +137,19 @@ impl From<BitReaderError> for VpsError {
         match e {
             BitReaderError::EndOfBuffer => Self::Truncated,
             other => Self::Bitstream(other),
+        }
+    }
+}
+
+impl From<HrdError> for VpsError {
+    fn from(e: HrdError) -> Self {
+        // Surface a bitstream-truncation reported through the HRD path
+        // as the VPS-level Truncated variant so callers can keep their
+        // single-pattern truncation handler. Any other HRD failure mode
+        // is opaque to the VPS — preserve it verbatim.
+        match e {
+            HrdError::Truncated => Self::Truncated,
+            other => Self::Hrd(other),
         }
     }
 }
@@ -265,9 +288,10 @@ pub struct LayerIdInclusionRow {
 
 /// VPS timing-info block per §7.3.2.1, when
 /// `vps_timing_info_present_flag == 1`. The `hrd_parameters()` bodies
-/// indexed by `vps_num_hrd_parameters` are *not* decoded; consult
-/// [`HevcVps::opaque_tail`] for the remaining RBSP bytes when
-/// [`Self::num_hrd_parameters`] is non-zero.
+/// indexed by `vps_num_hrd_parameters` are decoded as
+/// [`HevcVps::hrd_parameters`] entries; consult
+/// [`Self::num_hrd_parameters`] for the count and
+/// [`HevcVps::hrd_parameters`] for the bodies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpsTimingInfo {
     /// `vps_num_units_in_tick` (`u(32)`). Spec constraint: shall be
@@ -281,10 +305,10 @@ pub struct VpsTimingInfo {
     /// when `poc_proportional_to_timing_flag` is set. Spec range
     /// 0..=2^32 - 2 (the `ue(v)` codec ceiling).
     pub num_ticks_poc_diff_one_minus1: Option<u32>,
-    /// `vps_num_hrd_parameters` (`ue(v)`). When non-zero, the
-    /// corresponding `hrd_parameters()` bodies — and everything after
-    /// them — are surfaced as [`HevcVps::opaque_tail`] rather than
-    /// decoded. Spec constraint: 0..=`vps_num_layer_sets_minus1 + 1`.
+    /// `vps_num_hrd_parameters` (`ue(v)`). The corresponding
+    /// `hrd_parameters()` bodies are decoded into
+    /// [`HevcVps::hrd_parameters`]. Spec constraint:
+    /// 0..=`vps_num_layer_sets_minus1 + 1`.
     pub num_hrd_parameters: u32,
 }
 
@@ -294,11 +318,10 @@ pub struct VpsTimingInfo {
 /// fully materialised; the layer-set inclusion matrix and the
 /// optional VPS timing-info block follow. When
 /// `vps_timing_info_present_flag == 1` and `vps_num_hrd_parameters >
-/// 0`, the per-HRD `hrd_parameters()` payloads + `vps_extension_flag`
-/// tail are not decoded — they are surfaced as [`Self::opaque_tail`].
-/// Otherwise the parser reads `vps_extension_flag` and, when set,
-/// surfaces the `vps_extension_data_flag` payload (plus
-/// `rbsp_trailing_bits()`) as the opaque tail.
+/// 0`, the per-HRD `hrd_parameters()` payloads are decoded into
+/// [`Self::hrd_parameters`]. The parser then reads `vps_extension_flag`
+/// and, when set, surfaces the `vps_extension_data_flag` payload (plus
+/// `rbsp_trailing_bits()`) as [`Self::opaque_tail`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HevcVps {
     /// `vps_video_parameter_set_id` (4 bits, range 0..=15).
@@ -344,22 +367,19 @@ pub struct HevcVps {
     /// Parsed [`VpsTimingInfo`] when [`Self::timing_info_present_flag`]
     /// is set; `None` otherwise.
     pub timing_info: Option<VpsTimingInfo>,
-    /// `vps_extension_flag`. `None` when the parser stopped before
-    /// reading it because [`VpsTimingInfo::num_hrd_parameters`] was
-    /// non-zero (the per-HRD payloads are surfaced as the opaque tail
-    /// instead, and the `vps_extension_flag` lives inside that tail).
-    pub vps_extension_flag: Option<bool>,
-    /// Opaque suffix of the RBSP. Populated when the parser stops
-    /// before the `rbsp_trailing_bits()`:
-    ///
-    /// * `Some` when [`VpsTimingInfo::num_hrd_parameters`] is non-zero
-    ///   (the per-HRD `hrd_parameters()` payloads, `vps_extension_flag`,
-    ///   any extension data, and `rbsp_trailing_bits()` are all
-    ///   surfaced here).
-    /// * `Some` when `vps_extension_flag == 1` (the
-    ///   `vps_extension_data_flag` payload and the
-    ///   `rbsp_trailing_bits()` are surfaced here).
-    /// * `None` otherwise.
+    /// Per-`hrd_parameters()` entries from the §7.3.2.1 loop, one per
+    /// `vps_num_hrd_parameters`. Length equals
+    /// `timing_info.num_hrd_parameters` when timing info is present,
+    /// and 0 otherwise.
+    pub hrd_parameters: Vec<VpsHrdEntry>,
+    /// `vps_extension_flag`. Always populated now that the per-HRD
+    /// bodies are decoded inline; the parser unconditionally reads this
+    /// `u(1)` after the HRD loop completes.
+    pub vps_extension_flag: bool,
+    /// Opaque suffix of the RBSP. Populated when `vps_extension_flag ==
+    /// 1`: the `vps_extension_data_flag` payload and the
+    /// `rbsp_trailing_bits()` are surfaced here for callers that want
+    /// the raw bytes. `None` otherwise.
     pub opaque_tail: Option<OpaqueTail>,
 }
 
@@ -461,7 +481,7 @@ impl HevcVps {
         // vps_timing_info_present_flag u(1).
         let timing_info_present_flag = br.u1()? != 0;
         let mut opaque_tail = None;
-        let mut vps_extension_flag = None;
+        let mut hrd_parameters: Vec<VpsHrdEntry> = Vec::new();
         let timing_info = if timing_info_present_flag {
             // §E.2.1 / §7.3.2.1: num_units_in_tick and time_scale are
             // both u(32) and "shall be greater than 0" per the
@@ -504,35 +524,36 @@ impl HevcVps {
                 num_ticks_poc_diff_one_minus1,
                 num_hrd_parameters,
             };
-            // When HRD entries are signalled, defer the
-            // hrd_parameters() bodies + the trailing
-            // vps_extension_flag / extension_data / rbsp_trailing_bits
-            // to the opaque tail (this parser does not decode §E.2.2
-            // hrd_parameters yet).
-            if num_hrd_parameters > 0 {
-                opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
+            // Decode the per-HRD entries inline per §7.3.2.1:
+            //
+            //   for( i = 0; i < vps_num_hrd_parameters; i++ ) {
+            //     hrd_layer_set_idx[ i ]              ue(v)
+            //     if( i > 0 ) cprms_present_flag[ i ]  u(1)
+            //     hrd_parameters( cprms_present_flag[ i ], vps_max_sub_layers_minus1 )
+            //   }
+            //
+            // The per-HRD body (§E.2.2) lives in the `crate::hrd`
+            // module — the `cprms_present_flag` inheritance chain is
+            // walked here so each entry sees the previous entry's
+            // common-info gates when its own flag is 0.
+            for i in 0..num_hrd_parameters {
+                let prev = hrd_parameters.last();
+                let entry = VpsHrdEntry::parse(br, i, max_sub_layers_minus1_raw, prev)?;
+                hrd_parameters.push(entry);
             }
             Some(info)
         } else {
             None
         };
 
-        // vps_extension_flag is only read when the opaque tail did
-        // not already swallow it (i.e. when num_hrd_parameters == 0
-        // or timing-info was absent).
-        if opaque_tail.is_none() {
-            let flag = br.u1()? != 0;
-            vps_extension_flag = Some(flag);
-            // When the extension flag is 1, surface the
-            // vps_extension_data_flag run + the rbsp_trailing_bits()
-            // as the opaque tail rather than decoding them — this
-            // parser does not consume the trailing bits, so an
-            // extension-flag of 0 also stops here (the
-            // rbsp_trailing_bits are not on the parsed-struct
-            // surface).
-            if flag {
-                opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
-            }
+        // vps_extension_flag u(1) — always read now that the per-HRD
+        // bodies are decoded inline above. When set, the
+        // vps_extension_data_flag run plus rbsp_trailing_bits() are
+        // surfaced as the opaque tail (this parser does not interpret
+        // the extension payload).
+        let vps_extension_flag = br.u1()? != 0;
+        if vps_extension_flag {
+            opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
         }
 
         Ok(Self {
@@ -550,6 +571,7 @@ impl HevcVps {
             layer_id_included_flag,
             timing_info_present_flag,
             timing_info,
+            hrd_parameters,
             vps_extension_flag,
             opaque_tail,
         })
@@ -772,8 +794,9 @@ mod tests {
         assert_eq!(vps.num_layer_sets_minus1, 0);
         assert!(!vps.timing_info_present_flag);
         assert!(vps.timing_info.is_none());
-        assert_eq!(vps.vps_extension_flag, Some(false));
+        assert!(!vps.vps_extension_flag);
         assert!(vps.opaque_tail.is_none());
+        assert!(vps.hrd_parameters.is_empty());
     }
 
     #[test]
@@ -922,15 +945,16 @@ mod tests {
         assert!(ti.poc_proportional_to_timing_flag);
         assert_eq!(ti.num_ticks_poc_diff_one_minus1, Some(0));
         assert_eq!(ti.num_hrd_parameters, 0);
-        assert_eq!(vps.vps_extension_flag, Some(false));
+        assert!(!vps.vps_extension_flag);
         assert!(vps.opaque_tail.is_none());
+        assert!(vps.hrd_parameters.is_empty());
     }
 
-    /// Tail with `vps_num_hrd_parameters > 0` — the parser must
-    /// surface the per-HRD payload + extension tail as the opaque
-    /// suffix rather than try to decode `hrd_parameters()`.
+    /// Tail with `vps_num_hrd_parameters == 1` — the parser must
+    /// decode the §E.2.2 `hrd_parameters()` body inline rather than
+    /// surface it as the opaque tail.
     #[test]
-    fn captures_hrd_payload_as_opaque_tail() {
+    fn parses_hrd_payload_inline() {
         let mut bits = Vec::<u8>::new();
         let mut push = |s: &str| {
             for c in s.chars() {
@@ -971,13 +995,21 @@ mod tests {
             push(if b == 1 { "1" } else { "0" });
         }
         push("0"); // poc_proportional_to_timing_flag = 0
-        push("010"); // num_hrd_parameters ue=1 → opaque tail trigger
-                     // Following bytes (hrd_parameters + vps_extension_flag +
-                     // rbsp_trailing_bits) are arbitrary opaque content.
-                     // Stamp the next byte with an identifiable pattern.
-        push("10101010");
-        push("11110000");
-        push("10000000"); // rbsp_trailing_bits 1-stop with zeros
+        push("010"); // num_hrd_parameters ue=1
+                     // HRD entry i=0:
+        push("1"); // hrd_layer_set_idx ue=0
+                   // cprms_present_flag not signalled (i == 0); inferred 1
+                   // hrd_parameters( 1, 0 ):
+        push("0"); // nal_hrd_parameters_present_flag
+        push("0"); // vcl_hrd_parameters_present_flag
+                   // (nal | vcl) = 0 → no common-info inner block
+                   // sub-layer i=0:
+        push("1"); // fixed_pic_rate_general_flag = 1 → within_cvs inferred 1
+        push("1"); // elemental_duration_in_tc_minus1 ue=0
+                   // low_delay not signalled, inferred 0
+        push("1"); // cpb_cnt_minus1 ue=0
+                   // no NAL/VCL HRD bodies (gates = 0)
+        push("0"); // vps_extension_flag = 0
 
         while bits.len() % 8 != 0 {
             bits.push(0);
@@ -994,11 +1026,25 @@ mod tests {
         let ti = vps.timing_info.as_ref().expect("timing info present");
         assert_eq!(ti.num_hrd_parameters, 1);
         assert!(!ti.poc_proportional_to_timing_flag);
-        // The opaque tail must be populated because we deferred HRD
-        // decoding. vps_extension_flag was NOT read by the parser
-        // (it lives inside the opaque tail).
-        assert!(vps.opaque_tail.is_some());
-        assert_eq!(vps.vps_extension_flag, None);
+        // The HRD body is now decoded inline, not surfaced as the
+        // opaque tail. vps_extension_flag is read after the HRD loop.
+        assert_eq!(vps.hrd_parameters.len(), 1);
+        let entry = &vps.hrd_parameters[0];
+        assert_eq!(entry.hrd_layer_set_idx, 0);
+        assert!(entry.cprms_present_flag);
+        let common = entry.hrd.common.as_ref().expect("common present");
+        assert!(!common.nal_hrd_parameters_present_flag);
+        assert!(!common.vcl_hrd_parameters_present_flag);
+        assert_eq!(entry.hrd.sub_layers.len(), 1);
+        let sl = &entry.hrd.sub_layers[0];
+        assert!(sl.fixed_pic_rate_general_flag);
+        assert!(sl.fixed_pic_rate_within_cvs_flag);
+        assert_eq!(sl.elemental_duration_in_tc_minus1, Some(0));
+        assert_eq!(sl.cpb_cnt_minus1, 0);
+        assert!(sl.nal_hrd.is_none());
+        assert!(sl.vcl_hrd.is_none());
+        assert!(!vps.vps_extension_flag);
+        assert!(vps.opaque_tail.is_none());
     }
 
     /// `vps_num_units_in_tick == 0` is forbidden by the §E.2.1 /
@@ -1057,5 +1103,129 @@ mod tests {
                 got: 0
             }
         );
+    }
+
+    /// `vps_num_hrd_parameters == 2` with the second entry's
+    /// `cprms_present_flag[1] == 0` — common-info gates inherit from
+    /// entry 0 per §7.4.3.1.
+    #[test]
+    fn parses_two_hrd_entries_with_cprms_inheritance() {
+        let mut bits = Vec::<u8>::new();
+        let mut push = |s: &str| {
+            for c in s.chars() {
+                if c == '0' || c == '1' {
+                    bits.push((c as u8) - b'0');
+                }
+            }
+        };
+        // Same prefix as parses_layer_set_matrix_and_timing_info but
+        // with two layer sets (so num_hrd_parameters can be 2).
+        push("0000"); // vps_id
+        push("1");
+        push("1");
+        push("000000");
+        push("000"); // max_sub_layers_minus1 = 0
+        push("1");
+        push("1111111111111111");
+        push("00");
+        push("0");
+        push("00001"); // profile_idc = 1
+        push(&"0".repeat(32));
+        push("1000");
+        push(&"0".repeat(43));
+        push("0");
+        push("00011110"); // level_idc = 30
+        push("1"); // sub_layer_ordering_info_present_flag = 1
+        push("1");
+        push("1");
+        push("1");
+        push("000000"); // max_layer_id = 0
+        push("011"); // vps_num_layer_sets_minus1 ue=2 → 3 layer sets, room for 3 HRDs
+                     // layer_id_included_flag[1..=2][0..=0]: two rows of one bit each
+        push("1");
+        push("1");
+        push("1"); // timing_info_present_flag = 1
+        for i in (0..32).rev() {
+            let b = (1u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        for i in (0..32).rev() {
+            let b = (30u32 >> i) & 1;
+            push(if b == 1 { "1" } else { "0" });
+        }
+        push("0"); // poc_proportional_to_timing_flag = 0
+        push("011"); // num_hrd_parameters ue=2
+
+        // HRD entry i=0: hrd_layer_set_idx=0, cprms inferred 1.
+        push("1"); // hrd_layer_set_idx ue=0
+                   // hrd_parameters( 1, 0 ):
+        push("1"); // nal_hrd_parameters_present_flag = 1
+        push("0"); // vcl
+        push("0"); // sub_pic_hrd_params_present_flag = 0
+                   // bit_rate_scale / cpb_size_scale u(4) each
+        push("0000");
+        push("0000");
+        // initial / au / dpb_output u(5) each
+        push("10111");
+        push("10111");
+        push("10111");
+        // sub-layer i=0:
+        push("1"); // fixed_pic_rate_general = 1
+        push("1"); // elemental_duration_in_tc_minus1 ue=0
+                   // cpb_cnt_minus1 ue=0
+        push("1");
+        // NAL HRD body: CpbCnt = 1
+        push("1"); // bit_rate_value_minus1 ue=0
+        push("1"); // cpb_size_value_minus1 ue=0
+        push("1"); // cbr_flag[0] = 1
+
+        // HRD entry i=1: hrd_layer_set_idx ue=1 ("010"), cprms_present_flag = 0
+        push("010"); // hrd_layer_set_idx = 1
+        push("0"); // cprms_present_flag[1] = 0 → inherit entry 0's common info
+                   // hrd_parameters( 0, 0 ): no common info read; gates
+                   // inherited (nal = true).
+                   // sub-layer i=0:
+        push("1"); // fixed_pic_rate_general = 1
+        push("1"); // elemental_duration_in_tc_minus1 ue=0
+                   // cpb_cnt_minus1 ue=0
+        push("1");
+        push("1"); // bit_rate_value_minus1 ue=0
+        push("1"); // cpb_size_value_minus1 ue=0
+        push("0"); // cbr_flag = 0
+
+        push("0"); // vps_extension_flag = 0
+
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        let mut bytes = Vec::with_capacity(bits.len() / 8);
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for &bit in chunk {
+                b = (b << 1) | bit;
+            }
+            bytes.push(b);
+        }
+        let vps = HevcVps::parse(&bytes).expect("VPS parse");
+        assert_eq!(vps.hrd_parameters.len(), 2);
+        let e0 = &vps.hrd_parameters[0];
+        assert_eq!(e0.hrd_layer_set_idx, 0);
+        assert!(e0.cprms_present_flag);
+        let common = e0.hrd.common.as_ref().expect("entry 0 common");
+        assert!(common.nal_hrd_parameters_present_flag);
+        assert_eq!(e0.hrd.sub_layers[0].nal_hrd.as_ref().unwrap().cpb.len(), 1);
+
+        let e1 = &vps.hrd_parameters[1];
+        assert_eq!(e1.hrd_layer_set_idx, 1);
+        assert!(!e1.cprms_present_flag);
+        // common is None (cprms_present_flag = 0), but the inherited
+        // gates from entry 0 still drove the per-sub-layer NAL HRD body.
+        assert!(e1.hrd.common.is_none());
+        let nal = e1.hrd.sub_layers[0]
+            .nal_hrd
+            .as_ref()
+            .expect("nal inherited via cprms");
+        assert_eq!(nal.cpb.len(), 1);
+        assert!(!nal.cpb[0].cbr_flag);
     }
 }

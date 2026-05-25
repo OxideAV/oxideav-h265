@@ -6,6 +6,73 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 13 (2026-05-25)
+
+- §E.2.2 / §E.2.3 `hrd_parameters()` and `sub_layer_hrd_parameters()`
+  bodies as a new `hrd` module:
+  - `hrd::HrdParameters` decoded with full common-info gating
+    (`nal_hrd_parameters_present_flag`,
+    `vcl_hrd_parameters_present_flag`,
+    `sub_pic_hrd_params_present_flag`, the conditional `u(8)` /
+    `u(5)` / `u(4)` / `u(5)` length / scale block from §E.2.2),
+    `commonInfPresentFlag = 0` inheritance from a previous entry's
+    `HrdCommonInfo`, and the per-sub-layer loop
+    (`fixed_pic_rate_general_flag[i]`,
+    `fixed_pic_rate_within_cvs_flag[i]` with the §E.3.2 "general == 1
+    ⇒ within_cvs := 1" inference, `elemental_duration_in_tc_minus1[i]`
+    `ue(v)` range-checked at 0..=2047,
+    `low_delay_hrd_flag[i]`, and `cpb_cnt_minus1[i]` `ue(v)`
+    range-checked at 0..=31 with the §E.3.2 "inferred to 0" path when
+    `low_delay_hrd_flag[i] == 1`).
+  - `hrd::SubLayerHrdParameters` decoded per §E.2.3 with the
+    monotonic-progression constraints from §E.3.3 enforced inline
+    (`bit_rate_value_minus1[i]` strictly increasing,
+    `cpb_size_value_minus1[i]` monotonic non-increasing, and the
+    sub-pic `bit_rate_du_value_minus1[i]` /
+    `cpb_size_du_value_minus1[i]` variants gated on
+    `sub_pic_hrd_params_present_flag`).
+  - `hrd::VpsHrdEntry` wraps each entry of the §7.3.2.1 VPS HRD loop
+    (`hrd_layer_set_idx[i]` `ue(v)` with the
+    `vps_num_layer_sets_minus1 + 1` ceiling, the per-index
+    `cprms_present_flag[i]` `u(1)` for `i > 0` with the implicit `1`
+    inference for `i == 0`, and the body itself).
+- VPS RBSP parse now decodes the per-HRD bodies inline rather than
+  capturing them as the opaque tail:
+  - `HevcVps::hrd_parameters: Vec<VpsHrdEntry>` populated when
+    `vps_timing_info_present_flag == 1` and `vps_num_hrd_parameters >
+    0`, with `cprms_present_flag[i] == 0` inheritance walked through
+    the previously-parsed entry's `HrdCommonInfo`.
+  - `HevcVps::vps_extension_flag` is now an unconditional `bool` (was
+    `Option<bool>`); the parser always reads it after the HRD loop
+    completes.
+  - `HevcVps::opaque_tail` now populated only for the
+    `vps_extension_flag == 1` extension-data + `rbsp_trailing_bits()`
+    suffix (the per-HRD-body deferral is gone).
+  - `VpsError::Hrd` variant added to surface `HrdError` failures
+    inside the VPS HRD loop while preserving the single-pattern
+    `Truncated` handler.
+- Public re-exports: `CpbEntry`, `HrdCommonInfo`, `HrdError`,
+  `HrdParameters`, `SubLayerHrd`, `SubLayerHrdParameters`,
+  `VpsHrdEntry`, `HEVC_MAX_CPB_CNT`,
+  `HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1` added to the crate root;
+  `Error::Hrd` variant added.
+- Tests: 12 new tests
+  (`hrd::parses_minimal_common_info_one_sub_layer`,
+  `hrd::parses_nal_hrd_with_sub_pic_and_two_cpbs`,
+  `hrd::rejects_non_increasing_bit_rate_value`,
+  `hrd::rejects_elemental_duration_above_2047`,
+  `hrd::rejects_cpb_cnt_above_31`,
+  `hrd::low_delay_infers_cpb_cnt_zero`,
+  `hrd::cprms_zero_inherits_previous_common_info`,
+  `hrd::vps_hrd_entry_skips_cprms_for_index_zero`,
+  `hrd::vps_hrd_entry_reads_cprms_for_nonzero_index`,
+  `hrd::cprms_zero_without_previous_yields_no_hrd_bodies`,
+  `hrd::parses_three_sub_layers`,
+  `vps::parses_two_hrd_entries_with_cprms_inheritance`); the round-12
+  `captures_hrd_payload_as_opaque_tail` was repurposed into
+  `parses_hrd_payload_inline` and now asserts the per-HRD body is
+  decoded rather than captured. Test count 118 → 130.
+
 ### Added — clean-room rebuild round 12 (2026-05-25)
 
 - §7.3.2.1 VPS tail through the optional VPS timing-info block:

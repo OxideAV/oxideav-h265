@@ -156,6 +156,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bitreader;
 pub mod cabac;
+pub mod hrd;
 pub mod nal;
 pub mod pps;
 pub mod scaling_list;
@@ -166,6 +167,10 @@ pub mod vps;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
+pub use hrd::{
+    CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
+    VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
+};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use scaling_list::{
@@ -214,6 +219,9 @@ pub enum Error {
     /// A slice-segment-header-parser error surfaced through the
     /// top-level entry points.
     Slice(SliceError),
+    /// An `hrd_parameters()` parser error surfaced through the
+    /// top-level entry points.
+    Hrd(HrdError),
 }
 
 impl core::fmt::Display for Error {
@@ -225,6 +233,7 @@ impl core::fmt::Display for Error {
             Self::Sps(e) => write!(f, "oxideav-h265 SPS error: {e}"),
             Self::Pps(e) => write!(f, "oxideav-h265 PPS error: {e}"),
             Self::Slice(e) => write!(f, "oxideav-h265 slice header error: {e}"),
+            Self::Hrd(e) => write!(f, "oxideav-h265 hrd error: {e}"),
         }
     }
 }
@@ -258,6 +267,12 @@ impl From<PpsError> for Error {
 impl From<SliceError> for Error {
     fn from(e: SliceError) -> Self {
         Self::Slice(e)
+    }
+}
+
+impl From<HrdError> for Error {
+    fn from(e: HrdError) -> Self {
+        Self::Hrd(e)
     }
 }
 
