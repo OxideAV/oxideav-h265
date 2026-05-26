@@ -6,6 +6,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 19 (2026-05-26)
+
+- §7.3.6.1 inter-slice `mvd_l1_zero_flag` / `cabac_init_flag` /
+  `collocated_from_l0_flag` / `collocated_ref_idx` block decoded
+  in-place when `pps.lists_modification_present_flag == 0` (the
+  outer `if(... && NumPicTotalCurr > 1)` short-circuit makes the
+  `ref_pic_lists_modification()` block statically absent, so the
+  DPB-derived §7.4.7.2 `NumPicTotalCurr` is not yet needed). Four
+  new `Option`-typed fields on `SliceSegmentHeader` carry the
+  values plus the §7.4.7.1 inferences:
+  `mvd_l1_zero_flag` (B slices only); `cabac_init_flag` (signalled
+  iff `pps.cabac_init_present_flag == 1`, else inferred `false`);
+  `collocated_from_l0_flag` (signalled for B + `mvp`, else inferred
+  `true` for P + `mvp`); `collocated_ref_idx` (signalled when the
+  active list has > 1 entry, range-checked against
+  `num_ref_idx_lX_active_minus1`, else inferred `0`). The deferred
+  P/B opaque tail now begins at the §7.3.6.1 weighted-pred-table
+  gate (`pred_weight_table()` when `weighted_pred_flag` /
+  `weighted_bipred_flag` applies). When
+  `pps.lists_modification_present_flag == 1` the parser still
+  defers at the `ref_pic_lists_modification()` gate (its
+  `NumPicTotalCurr` derivation needs §7.4.8 inter-RPS-prediction
+  resolution that this round does not wire in). Seven new
+  `slice::tests` units cover the no-mvp B-slice mvd walk, the
+  P-slice cabac-init walk, the P-slice mvp + inferred
+  `collocated_from_l0_flag` paths (single-ref inferred `ref_idx`
+  and multi-ref signalled `ref_idx`), the B-slice
+  `collocated_from_l0_flag == 0` L1 path, the
+  `collocated_ref_idx > num_ref_idx_lX_active_minus1` range
+  failure, and the `lists_modification_present_flag == 1` defer
+  path. The pre-round `defers_pb_ref_list_body` test is updated
+  to assert the §7.4.7.1 `cabac_init_flag` inference (`Some(false)`)
+  and the absent-collocated state in addition to the existing
+  opaque-tail bit position.
+
 ### Added — clean-room rebuild round 18 (2026-05-26)
 
 - §7.3.6.1 inter-slice prelude decoded in place: the

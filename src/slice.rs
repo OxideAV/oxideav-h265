@@ -61,7 +61,15 @@
 //!   future round that wires up the §7.4.7.2 `NumPicTotalCurr`
 //!   derivation can decode the reference-picture-list-modification
 //!   block in place; the implicit `RefPicListTempX` derivation of
-//!   §8.3.4 stays the consumer's responsibility.
+//!   §8.3.4 stays the consumer's responsibility. When
+//!   `pps.lists_modification_present_flag == 0` the modification block
+//!   is statically absent (the §7.3.6.1 `if(... && NumPicTotalCurr > 1)`
+//!   short-circuit applies independent of any DPB state); the parser
+//!   in that case continues into the §7.3.6.1
+//!   `mvd_l1_zero_flag` / `cabac_init_flag` /
+//!   `collocated_from_l0_flag` / `collocated_ref_idx` block in-place
+//!   and surfaces those four fields, then defers at the weighted-pred
+//!   gate.
 //!
 //! Independent **I-slice IDR** segments — the dominant case for the
 //! intra-only fixtures this rebuild targets — are parsed end to end
@@ -1295,6 +1303,37 @@ pub struct SliceSegmentHeader {
     /// minus1` per §7.4.7.1. `None` when the slice is not B or the
     /// parser stopped before reaching this point.
     pub num_ref_idx_l1_active_minus1: Option<u8>,
+    /// `mvd_l1_zero_flag` (§7.3.6.1). `u(1)`, present only for B slices.
+    /// `None` for I / P slices, dependent slice segments, and headers
+    /// whose parse stopped before the inter-slice mvd block (either at
+    /// the `ref_pic_lists_modification()` gate when
+    /// `pps.lists_modification_present_flag == 1`, or at any earlier
+    /// deferral point).
+    pub mvd_l1_zero_flag: Option<bool>,
+    /// `cabac_init_flag` (§7.3.6.1). `u(1)`, present only when
+    /// `pps.cabac_init_present_flag == 1`; inferred to `false`
+    /// otherwise per §7.4.7.1. `None` for I slices, dependent slice
+    /// segments, and headers whose parse stopped before the inter-slice
+    /// cabac-init point.
+    pub cabac_init_flag: Option<bool>,
+    /// `collocated_from_l0_flag` (§7.3.6.1). `u(1)`, present only when
+    /// `slice_temporal_mvp_enabled_flag == 1 && slice_type == B`.
+    /// Inferred to `true` when absent (per §7.4.7.1, "When
+    /// `collocated_from_l0_flag` is not present, it is inferred to be
+    /// equal to 1"). `None` when the slice is I, when the parse
+    /// stopped before this point, or when
+    /// `slice_temporal_mvp_enabled_flag == 0` (the field has no
+    /// meaning).
+    pub collocated_from_l0_flag: Option<bool>,
+    /// `collocated_ref_idx` (§7.3.6.1). `ue(v)`, present only when
+    /// `slice_temporal_mvp_enabled_flag == 1` and the relevant active
+    /// list has more than one entry (specifically:
+    /// `(collocated_from_l0_flag && num_ref_idx_l0_active_minus1 > 0)
+    /// || (!collocated_from_l0_flag && num_ref_idx_l1_active_minus1 >
+    /// 0)`). Inferred to `0` when absent per §7.4.7.1. `None` when the
+    /// slice is I, when the parse stopped before this point, or when
+    /// `slice_temporal_mvp_enabled_flag == 0`.
+    pub collocated_ref_idx: Option<u32>,
     /// `slice_qp_delta` (`se(v)`). `None` when the parser stopped before
     /// reaching it (a deferred non-IDR or P/B body).
     pub slice_qp_delta: Option<i32>,
@@ -1516,6 +1555,10 @@ impl SliceSegmentHeader {
                 num_ref_idx_active_override_flag: None,
                 num_ref_idx_l0_active_minus1: None,
                 num_ref_idx_l1_active_minus1: None,
+                mvd_l1_zero_flag: None,
+                cabac_init_flag: None,
+                collocated_from_l0_flag: None,
+                collocated_ref_idx: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1579,13 +1622,160 @@ impl SliceSegmentHeader {
             (None, None, None)
         };
 
-        // P / B reference-list-modification, mvd, cabac-init,
-        // collocated, weighted prediction, merge-cand, integer-mv:
-        // deferred this round (needs DPB-derived NumPicTotalCurr /
-        // RefPicList). Surface the remainder when the slice is inter —
-        // now AFTER the override / num_ref_idx block, so the captured
-        // opaque tail begins at `ref_pic_lists_modification()` (when
-        // signalled) or `mvd_l1_zero_flag` (when not).
+        // §7.3.6.1 inter-slice continuation: after the
+        // `num_ref_idx_active_override_flag` block, the spec emits
+        //   if( lists_modification_present_flag && NumPicTotalCurr > 1 )
+        //       ref_pic_lists_modification( )
+        //   if( slice_type == B )           mvd_l1_zero_flag      u(1)
+        //   if( cabac_init_present_flag )   cabac_init_flag       u(1)
+        //   if( slice_temporal_mvp_enabled_flag ) {
+        //       if( slice_type == B )       collocated_from_l0_flag  u(1)   (else inferred 1, §7.4.7.1)
+        //       if( ( collocated_from_l0_flag && num_ref_idx_l0_active_minus1 > 0 ) ||
+        //           ( !collocated_from_l0_flag && num_ref_idx_l1_active_minus1 > 0 ) )
+        //           collocated_ref_idx     ue(v)                          (else inferred 0)
+        //   }
+        // followed by the weighted-pred-table gate.
+        //
+        // The `ref_pic_lists_modification()` gate consumes the
+        // §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57), which
+        // requires running the full §7.4.8 inter-RPS-prediction step
+        // for an inter-predicted RPS. This round materialises the
+        // mvd / cabac-init / collocated block only when the
+        // modification block is statically absent, i.e. when
+        // `pps.lists_modification_present_flag == 0`. With the gate
+        // off the `if(... && NumPicTotalCurr > 1)` short-circuit
+        // applies without needing the derivation, so the bit stream
+        // advances straight to `mvd_l1_zero_flag` (or, when neither B
+        // nor cabac-init nor temporal MVP is in play, to the
+        // weighted-pred gate with zero bits consumed). When
+        // `lists_modification_present_flag == 1` the parser still
+        // defers — the opaque tail in that case begins at the
+        // `ref_pic_lists_modification()` block.
+        if st.is_inter() && pps.lists_modification_present_flag {
+            return Ok(Self {
+                first_slice_segment_in_pic_flag,
+                no_output_of_prior_pics_flag,
+                slice_pic_parameter_set_id,
+                dependent_slice_segment_flag,
+                slice_segment_address,
+                slice_reserved_flags,
+                slice_type,
+                pic_output_flag,
+                colour_plane_id,
+                slice_pic_order_cnt_lsb,
+                short_term_ref_pic_set_sps_flag,
+                inline_short_term_ref_pic_set,
+                short_term_ref_pic_set_idx,
+                num_long_term_sps,
+                num_long_term_pics,
+                long_term_ref_pics,
+                slice_temporal_mvp_enabled_flag,
+                slice_sao_luma_flag,
+                slice_sao_chroma_flag,
+                num_ref_idx_active_override_flag,
+                num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1,
+                mvd_l1_zero_flag: None,
+                cabac_init_flag: None,
+                collocated_from_l0_flag: None,
+                collocated_ref_idx: None,
+                slice_qp_delta: None,
+                slice_cb_qp_offset: 0,
+                slice_cr_qp_offset: 0,
+                deblocking: None,
+                slice_loop_filter_across_slices_enabled_flag: None,
+                entry_point_offsets: None,
+                slice_segment_header_extension_length: None,
+                byte_offset_to_slice_data: None,
+                opaque_tail: Some(OpaqueTail::capture_at(br.bit_pos(), rbsp)),
+            });
+        }
+
+        // §7.3.6.1 inter-slice mvd / cabac-init / collocated block —
+        // reached only when `slice_type` is P or B and the
+        // `ref_pic_lists_modification()` block is statically absent
+        // (`pps.lists_modification_present_flag == 0`, which makes the
+        // §7.3.6.1 outer `if(... && NumPicTotalCurr > 1)` false
+        // unconditionally). For an I slice the entire block is absent
+        // and the four fields stay `None`.
+        let (mvd_l1_zero_flag, cabac_init_flag, collocated_from_l0_flag, collocated_ref_idx) =
+            if st.is_inter() {
+                // §7.3.6.1 `if( slice_type == B ) mvd_l1_zero_flag u(1)`.
+                let mvd_l1_zero = if matches!(st, SliceType::B) {
+                    Some(br.u1()? != 0)
+                } else {
+                    None
+                };
+
+                // §7.3.6.1 `if( cabac_init_present_flag ) cabac_init_flag
+                // u(1)`. §7.4.7.1: inferred to 0 when absent.
+                let cabac_init = if pps.cabac_init_present_flag {
+                    Some(br.u1()? != 0)
+                } else {
+                    Some(false)
+                };
+
+                // §7.3.6.1 temporal-MVP block.
+                let (coll_from_l0, coll_ref_idx) = if slice_temporal_mvp_enabled_flag {
+                    // `if( slice_type == B ) collocated_from_l0_flag u(1)`,
+                    // else §7.4.7.1 inference to 1.
+                    let from_l0 = if matches!(st, SliceType::B) {
+                        br.u1()? != 0
+                    } else {
+                        true
+                    };
+
+                    // §7.3.6.1: `collocated_ref_idx` is present iff the
+                    // active list (selected by `collocated_from_l0_flag`)
+                    // has more than one entry. §7.4.7.1: inferred to 0
+                    // when absent. Both `num_ref_idx_lX_active_minus1`
+                    // values are `Some(_)` at this point (the override
+                    // block populated them for every inter slice, and L1
+                    // is populated for B slices).
+                    let n0 = num_ref_idx_l0_active_minus1.expect("L0 active populated for inter");
+                    let needs_ref_idx = if from_l0 {
+                        n0 > 0
+                    } else {
+                        // !from_l0 implies slice_type == B (an I/P slice
+                        // takes the inferred `true` branch). For a B slice
+                        // L1 is signalled by the override block.
+                        let n1 = num_ref_idx_l1_active_minus1.expect("L1 active populated for B");
+                        n1 > 0
+                    };
+                    let ref_idx = if needs_ref_idx {
+                        let raw = br.ue()?;
+                        let max = if from_l0 {
+                            n0 as u32
+                        } else {
+                            num_ref_idx_l1_active_minus1.unwrap() as u32
+                        };
+                        if raw > max {
+                            return Err(SliceError::ValueOutOfRange {
+                                field: "collocated_ref_idx",
+                                got: raw as i64,
+                            });
+                        }
+                        raw
+                    } else {
+                        0
+                    };
+
+                    (Some(from_l0), Some(ref_idx))
+                } else {
+                    (None, None)
+                };
+
+                (mvd_l1_zero, cabac_init, coll_from_l0, coll_ref_idx)
+            } else {
+                (None, None, None, None)
+            };
+
+        // P / B `pred_weight_table()` + merge-candidate + integer-MV +
+        // slice_qp_delta tail still deferred (the weighted-prediction
+        // table needs the per-i §7.3.6.3 outer-gate decisions, the
+        // five_minus_max_num_merge_cand block depends on it, and the
+        // SCC use_integer_mv_flag is gated on a PPS SCC extension this
+        // crate does not surface). Defer at the weighted-pred gate.
         if st.is_inter() {
             return Ok(Self {
                 first_slice_segment_in_pic_flag,
@@ -1610,6 +1800,10 @@ impl SliceSegmentHeader {
                 num_ref_idx_active_override_flag,
                 num_ref_idx_l0_active_minus1,
                 num_ref_idx_l1_active_minus1,
+                mvd_l1_zero_flag,
+                cabac_init_flag,
+                collocated_from_l0_flag,
+                collocated_ref_idx,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1714,6 +1908,10 @@ impl SliceSegmentHeader {
             num_ref_idx_active_override_flag,
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
+            mvd_l1_zero_flag: None,
+            cabac_init_flag: None,
+            collocated_from_l0_flag: None,
+            collocated_ref_idx: None,
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,
             slice_cr_qp_offset,
@@ -2319,18 +2517,21 @@ mod tests {
 
     /// IDR P-slice with `num_ref_idx_active_override_flag == 0`: the
     /// parser reads the override flag, infers
-    /// `num_ref_idx_l0_active_minus1` from the PPS default, and then
-    /// defers the remaining P/B reference-list-modification /
-    /// weighted-prediction body. The deferred opaque tail now begins
-    /// at the `ref_pic_lists_modification()` gate (one bit AFTER the
-    /// SAO block).
+    /// `num_ref_idx_l0_active_minus1` from the PPS default, then
+    /// traverses the §7.3.6.1 mvd / cabac-init / collocated block.
+    /// With `pps.lists_modification_present_flag == 0` the
+    /// `ref_pic_lists_modification()` block is absent unconditionally;
+    /// with `slice_type == P` `mvd_l1_zero_flag` is absent; with
+    /// `pps.cabac_init_present_flag == 0` the cabac-init bit is absent
+    /// (inferred to `false`); with `slice_temporal_mvp_enabled_flag ==
+    /// 0` the collocated block is absent. Zero further bits are
+    /// consumed past the override flag, so the opaque tail begins at
+    /// the weighted-prediction-table gate one bit after the override
+    /// flag (byte 1, bit 1).
     #[test]
     fn defers_pb_ref_list_body() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
-        // first=1, no_output(IRAP)=0, pps_id=0, slice_type=P,
-        // (mvp gate off), sao_l, sao_c, num_ref_idx_active_override=0,
-        // then the deferred body (ref_pic_lists_modification gate etc.).
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR is IRAP)
@@ -2354,10 +2555,17 @@ mod tests {
             Some(pps.num_ref_idx_l0_default_active_minus1)
         );
         assert_eq!(sh.num_ref_idx_l1_active_minus1, None);
+        // §7.3.6.1 mvd / cabac-init / collocated walk for this gate
+        // combination: mvd absent (P), cabac inferred false, collocated
+        // absent (mvp off).
+        assert_eq!(sh.mvd_l1_zero_flag, None);
+        assert_eq!(sh.cabac_init_flag, Some(false));
+        assert_eq!(sh.collocated_from_l0_flag, None);
+        assert_eq!(sh.collocated_ref_idx, None);
         assert!(sh.opaque_tail.is_some());
         assert_eq!(sh.slice_qp_delta, None);
-        // Opaque tail begins after the override flag at bit 9
-        // (byte 1, bit 1).
+        // Opaque tail begins at the weighted-pred gate one bit after
+        // the override flag (byte 1, bit 1).
         let tail = sh.opaque_tail.unwrap();
         assert_eq!(tail.start_bit_in_first_byte, 1);
     }
@@ -2446,6 +2654,222 @@ mod tests {
             sh.num_ref_idx_l1_active_minus1,
             Some(pps.num_ref_idx_l1_default_active_minus1)
         );
+    }
+
+    /// IDR B-slice with `pps.lists_modification_present_flag == 0`
+    /// (default for `TINY_PPS_RBSP`): the §7.3.6.1 mvd / cabac-init /
+    /// collocated block is walked in-place. With
+    /// `pps.cabac_init_present_flag == 0` (default) the cabac-init bit
+    /// is absent (inferred `false` per §7.4.7.1); with
+    /// `slice_temporal_mvp_enabled_flag == 0` the collocated block is
+    /// absent. `mvd_l1_zero_flag` is the only bit consumed past the
+    /// override block.
+    #[test]
+    fn parses_b_slice_mvd_l1_zero_walk_no_mvp() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b1, 1),   // slice_type -> B
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b010, 3), // num_ref_idx_l0_active_minus1 ue -> 1
+            (0b010, 3), // num_ref_idx_l1_active_minus1 ue -> 1
+            (1, 1),     // mvd_l1_zero_flag = 1
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.mvd_l1_zero_flag, Some(true));
+        // cabac_init_present_flag == 0 → inferred 0 per §7.4.7.1.
+        assert_eq!(sh.cabac_init_flag, Some(false));
+        // mvp off → entire collocated block absent.
+        assert_eq!(sh.collocated_from_l0_flag, None);
+        assert_eq!(sh.collocated_ref_idx, None);
+        assert!(sh.opaque_tail.is_some());
+    }
+
+    /// IDR P-slice with `pps.cabac_init_present_flag == 1`: the cabac-
+    /// init bit is signalled (P slice still walks the gate, even though
+    /// `mvd_l1_zero_flag` is absent). With `mvp == 0` the collocated
+    /// block is absent.
+    #[test]
+    fn parses_p_slice_cabac_init_walk() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.cabac_init_present_flag = true;
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            (1, 1),     // cabac_init_flag = 1
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        // P slice → mvd absent.
+        assert_eq!(sh.mvd_l1_zero_flag, None);
+        assert_eq!(sh.cabac_init_flag, Some(true));
+        // mvp off → entire collocated block absent.
+        assert_eq!(sh.collocated_from_l0_flag, None);
+        assert_eq!(sh.collocated_ref_idx, None);
+    }
+
+    /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 0`
+    /// (single L0 entry): §7.4.7.1 infers `collocated_from_l0_flag = 1`
+    /// (no bit consumed since slice_type != B) and the
+    /// `collocated_ref_idx` field is absent (only signalled when the
+    /// active list has more than one entry).
+    #[test]
+    fn parses_p_slice_temporal_mvp_single_ref_collocated_inferred() {
+        // mvp = true via the ctx_sps argument.
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // slice_temporal_mvp_enabled_flag = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b1, 1),   // num_ref_idx_l0_active_minus1 ue -> 0
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert!(sh.slice_temporal_mvp_enabled_flag);
+        // P slice + mvp on: §7.4.7.1 infers collocated_from_l0 = 1.
+        assert_eq!(sh.collocated_from_l0_flag, Some(true));
+        // L0 has a single entry (active_minus1 == 0) → ref_idx absent,
+        // inferred to 0.
+        assert_eq!(sh.collocated_ref_idx, Some(0));
+    }
+
+    /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 2`
+    /// (three L0 entries): `collocated_from_l0_flag` is inferred to 1
+    /// (P slice) and `collocated_ref_idx` is signalled `ue(v)`.
+    #[test]
+    fn parses_p_slice_temporal_mvp_collocated_ref_idx_signalled() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // slice_temporal_mvp_enabled_flag = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b011, 3), // num_ref_idx_l0_active_minus1 ue -> 2
+            (0b010, 3), // collocated_ref_idx ue -> 1
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(2));
+        // P slice + mvp on: §7.4.7.1 infers collocated_from_l0 = 1.
+        assert_eq!(sh.collocated_from_l0_flag, Some(true));
+        assert_eq!(sh.collocated_ref_idx, Some(1));
+    }
+
+    /// IDR B-slice with `mvp == 1`, `collocated_from_l0_flag = 0` (L1
+    /// path), and an L1 with more than one entry: `collocated_ref_idx`
+    /// indexes L1.
+    #[test]
+    fn parses_b_slice_temporal_mvp_collocated_from_l1() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b1, 1),   // slice_type -> B
+            (1, 1),     // slice_temporal_mvp_enabled_flag = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b1, 1),   // num_ref_idx_l0_active_minus1 ue -> 0
+            (0b010, 3), // num_ref_idx_l1_active_minus1 ue -> 1
+            (0, 1),     // mvd_l1_zero_flag = 0
+            (0, 1),     // collocated_from_l0_flag = 0
+            (0b010, 3), // collocated_ref_idx ue -> 1
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.mvd_l1_zero_flag, Some(false));
+        assert_eq!(sh.collocated_from_l0_flag, Some(false));
+        // L1 active_minus1 == 1 → 2 entries; ref_idx = 1 indexes the
+        // second entry, in range.
+        assert_eq!(sh.collocated_ref_idx, Some(1));
+    }
+
+    /// `collocated_ref_idx` overflow check: a value > the active
+    /// `num_ref_idx_lX_active_minus1` is a §7.4.7.1 range failure.
+    #[test]
+    fn rejects_collocated_ref_idx_above_active_minus1() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // mvp = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // override = 1
+            (0b010, 3), // L0 active_minus1 = 1 (-> 2 entries, valid range 0..=1)
+            (0b011, 3), // collocated_ref_idx ue -> 2 (out of range)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "collocated_ref_idx",
+                got: 2,
+            }
+        );
+    }
+
+    /// When `pps.lists_modification_present_flag == 1` the parser still
+    /// defers at the `ref_pic_lists_modification()` gate — the
+    /// `NumPicTotalCurr` derivation is not yet wired in. The mvd /
+    /// cabac-init / collocated fields stay `None`.
+    #[test]
+    fn defers_when_lists_modification_present_flag_set() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.lists_modification_present_flag = true;
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            (0b1, 1),   // first deferred bit (ref_pic_lists_modification gate)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.num_ref_idx_active_override_flag, Some(false));
+        assert_eq!(sh.mvd_l1_zero_flag, None);
+        assert_eq!(sh.cabac_init_flag, None);
+        assert_eq!(sh.collocated_from_l0_flag, None);
+        assert_eq!(sh.collocated_ref_idx, None);
+        assert!(sh.opaque_tail.is_some());
     }
 
     /// `num_ref_idx_l0_active_minus1 > 14` is a range failure (§7.4.7.1).

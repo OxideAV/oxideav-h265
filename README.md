@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 18 (2026-05-26).** The prior implementation was
+**Clean-room rebuild — round 19 (2026-05-26).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,33 +14,51 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 18 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 19 lands the
+§7.3.6.1 in-place inter-slice
+`mvd_l1_zero_flag` / `cabac_init_flag` /
+`collocated_from_l0_flag` / `collocated_ref_idx` block (the four
+syntax elements that immediately follow `num_ref_idx_lX_active_minus1`
+and the `ref_pic_lists_modification()` gate). When
+`pps.lists_modification_present_flag == 0` the outer
+`if(... && NumPicTotalCurr > 1)` short-circuit makes
+`ref_pic_lists_modification()` statically absent, so the parser walks
+the next four fields in place without needing the §7.4.7.2
+`NumPicTotalCurr` derivation. `mvd_l1_zero_flag` is signalled only
+for B slices; `cabac_init_flag` is signalled when
+`pps.cabac_init_present_flag == 1` and otherwise inferred to `false`
+per §7.4.7.1; `collocated_from_l0_flag` is signalled for B + `mvp`
+and otherwise inferred to `true` for P + `mvp`; `collocated_ref_idx`
+is signalled when the active list selected by `collocated_from_l0_flag`
+has more than one entry (range-checked against the active
+`num_ref_idx_lX_active_minus1`), otherwise inferred to `0`. Four new
+`Option`-typed accessors —
+[`SliceSegmentHeader::mvd_l1_zero_flag`],
+[`SliceSegmentHeader::cabac_init_flag`],
+[`SliceSegmentHeader::collocated_from_l0_flag`] and
+[`SliceSegmentHeader::collocated_ref_idx`] — surface the values.
+The deferred P/B opaque tail now begins at the weighted-prediction
+table gate (`pred_weight_table()`); when
+`pps.lists_modification_present_flag == 1` the parser still defers at
+the `ref_pic_lists_modification()` gate because its
+`NumPicTotalCurr` derivation needs the §7.4.8 inter-RPS-prediction
+step that this round does not wire in. The remaining inter-slice tail
+(`ref_pic_lists_modification()` wiring under `NumPicTotalCurr`,
+`pred_weight_table()` wiring, `five_minus_max_num_merge_cand`,
+`use_integer_mv_flag`, the QP-offset / deblocking / loop-filter tail)
+remains the next round's target — the standalone parsers
+[`RefPicListsModification::parse`] / [`PredWeightTable::parse`] /
+[`NumPicTotalCurrInputs::compute`] are already callable.
+Round 18 had landed the
 §7.3.6.1 in-place inter-slice prelude — the
 `num_ref_idx_active_override_flag` `u(1)` and the
 `num_ref_idx_l0_active_minus1` / (B-only) `num_ref_idx_l1_active_minus1`
-`ue(v)` block that follows the SAO gates for P / B slices. The
-§7.4.7.1 inference rule is applied: when the override flag is 0 the
-parser fills both per-list values from
+`ue(v)` block that follows the SAO gates for P / B slices, including
+the §7.4.7.1 inference rule (when the override flag is 0 the per-list
+values come from
 [`PicParameterSet::num_ref_idx_l0_default_active_minus1`] /
-[`PicParameterSet::num_ref_idx_l1_default_active_minus1`]; when it is
-1 the explicit `ue(v)` values are read and range-checked at 0..=14.
-P slices leave the L1 value `None` (the field is absent from the
-syntax). The three new accessors
-[`SliceSegmentHeader::num_ref_idx_active_override_flag`],
-[`SliceSegmentHeader::num_ref_idx_l0_active_minus1`] and
-[`SliceSegmentHeader::num_ref_idx_l1_active_minus1`] (each typed as
-`Option`) surface the values, and the deferred P/B opaque tail now
-begins one or four bits later — at the
-`ref_pic_lists_modification()` gate (when
-`lists_modification_present_flag && NumPicTotalCurr > 1`) or
-`mvd_l1_zero_flag`. The remaining inter-slice tail
-(`ref_pic_lists_modification` wiring, `mvd_l1_zero_flag`,
-`cabac_init_flag`, `collocated_from_l0_flag` / `collocated_ref_idx`,
-`pred_weight_table` wiring, `five_minus_max_num_merge_cand`,
-`use_integer_mv_flag`, the QP-offset / deblocking / loop-filter tail)
-remains the next round's target — the standalone parsers
-[`RefPicListsModification::parse`] /
-[`PredWeightTable::parse`] are already callable.
+[`PicParameterSet::num_ref_idx_l1_default_active_minus1`]) and the
+0..=14 range check on the explicit values.
 Round 17 had landed the
 §7.3.6.3 `pred_weight_table()` syntax structure as a standalone parser
 ([`PredWeightTable::parse`]). Round 16 lands the
@@ -380,10 +398,16 @@ data and CABAC remain unimplemented.
   `num_ref_idx_l1_active_minus1` (B only) `ue(v)` block (§7.3.6.1),
   with the §7.4.7.1 inference rule filling both values from the PPS
   defaults when the override flag is 0; values are range-checked at
-  0..=14. The remaining inter-slice tail
-  (`ref_pic_lists_modification()` wiring, `pred_weight_table()`
-  wiring, `mvd_l1_zero_flag`, `cabac_init_flag`,
-  `collocated_from_l0_flag` / `collocated_ref_idx`,
+  0..=14. When `pps.lists_modification_present_flag == 0` the parser
+  continues in-place into the §7.3.6.1 mvd / cabac-init / collocated
+  block: `mvd_l1_zero_flag` (B only), `cabac_init_flag` (signalled
+  iff `pps.cabac_init_present_flag == 1`, else inferred `false`),
+  `collocated_from_l0_flag` (signalled iff `mvp && slice_type == B`,
+  else inferred `true`), and `collocated_ref_idx` (signalled iff
+  `mvp` and the active list has > 1 entry, else inferred `0`,
+  range-checked against `num_ref_idx_lX_active_minus1`). The remaining
+  inter-slice tail (`ref_pic_lists_modification()` wiring under
+  `NumPicTotalCurr`, `pred_weight_table()` wiring,
   `five_minus_max_num_merge_cand`, `use_integer_mv_flag`, the
   QP-offset / deblocking / loop-filter tail) stays surfaced as
   [`SliceSegmentHeader::opaque_tail`].
