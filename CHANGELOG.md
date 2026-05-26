@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 20 (2026-05-27)
+
+- §7.3.6.1 inter-slice `five_minus_max_num_merge_cand` (`ue(v)`) decoded
+  in place when the §7.3.6.3 `pred_weight_table()` gate is statically
+  absent, i.e. when neither `(pps.weighted_pred_flag && slice_type == P)`
+  nor `(pps.weighted_bipred_flag && slice_type == B)` holds. The wire
+  value is range-checked at 0..=4 (the derived `MaxNumMergeCand =
+  5 - five_minus_max_num_merge_cand` must lie in 1..=5 per §7.4.7.1
+  equation 7-53). A new `SliceSegmentHeader::five_minus_max_num_merge_cand`
+  field surfaces the raw value, and a new `max_num_merge_cand()`
+  accessor returns the derived value. The SCC `use_integer_mv_flag`
+  (gated on `motion_vector_resolution_control_idc == 2`) is statically
+  absent because the PPS SCC extension is not yet surfaced (§7.4.7.1:
+  when not present, `motion_vector_resolution_control_idc` is inferred
+  to 0). With the merge-candidate leaf landed and the SCC integer-MV
+  bit statically absent, the parser now walks the entire inter-slice
+  header through the shared I-slice tail — `slice_qp_delta` (`se(v)`),
+  the chroma QP offsets, the deblocking override block, the
+  loop-filter-across-slices flag, the entry-point-offset block, the
+  slice-segment-header extension block, and `byte_alignment()` — and
+  reports a non-`None` `byte_offset_to_slice_data`, with
+  `opaque_tail == None`. When the weighted-pred gate IS statically
+  present (either of the two conditions above holds), the parser keeps
+  deferring at the gate, the four `mvd_l1_zero_flag` /
+  `cabac_init_flag` / `collocated_from_l0_flag` / `collocated_ref_idx`
+  fields stay populated as in round 19, and `opaque_tail` captures the
+  bit position of the `pred_weight_table()` block. Three new
+  `slice::tests` units cover the full P-slice walk through
+  `byte_alignment()`, the full B-slice walk with temporal MVP +
+  collocated_ref_idx, and the `five_minus_max_num_merge_cand > 4` range
+  failure. The six pre-round inter-slice tests that exercised the
+  mvd / cabac / collocated walk are updated to set
+  `pps.weighted_pred_flag = true` (P) or `pps.weighted_bipred_flag =
+  true` (B) so they continue to assert the defer-at-weighted-pred
+  behaviour now that the no-weighted-pred path walks through.
+
 ### Added — clean-room rebuild round 19 (2026-05-26)
 
 - §7.3.6.1 inter-slice `mvd_l1_zero_flag` / `cabac_init_flag` /

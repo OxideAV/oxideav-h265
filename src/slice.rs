@@ -1334,6 +1334,17 @@ pub struct SliceSegmentHeader {
     /// slice is I, when the parse stopped before this point, or when
     /// `slice_temporal_mvp_enabled_flag == 0`.
     pub collocated_ref_idx: Option<u32>,
+    /// `five_minus_max_num_merge_cand` (§7.3.6.1). `ue(v)`, present only
+    /// for P/B slices, immediately after the optional
+    /// `pred_weight_table()`. §7.4.7.1: the derived
+    /// `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand` shall be in
+    /// the range 1..=5 — i.e. the wire value is in 0..=4. `None` for I
+    /// slices, dependent slice segments, and headers whose parse stopped
+    /// before this point (currently: the parse defers at the
+    /// `pred_weight_table()` gate when either
+    /// `pps.weighted_pred_flag && slice_type == P` or
+    /// `pps.weighted_bipred_flag && slice_type == B` is true).
+    pub five_minus_max_num_merge_cand: Option<u32>,
     /// `slice_qp_delta` (`se(v)`). `None` when the parser stopped before
     /// reaching it (a deferred non-IDR or P/B body).
     pub slice_qp_delta: Option<i32>,
@@ -1559,6 +1570,7 @@ impl SliceSegmentHeader {
                 cabac_init_flag: None,
                 collocated_from_l0_flag: None,
                 collocated_ref_idx: None,
+                five_minus_max_num_merge_cand: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1679,6 +1691,7 @@ impl SliceSegmentHeader {
                 cabac_init_flag: None,
                 collocated_from_l0_flag: None,
                 collocated_ref_idx: None,
+                five_minus_max_num_merge_cand: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1770,13 +1783,18 @@ impl SliceSegmentHeader {
                 (None, None, None, None)
             };
 
-        // P / B `pred_weight_table()` + merge-candidate + integer-MV +
-        // slice_qp_delta tail still deferred (the weighted-prediction
-        // table needs the per-i §7.3.6.3 outer-gate decisions, the
-        // five_minus_max_num_merge_cand block depends on it, and the
-        // SCC use_integer_mv_flag is gated on a PPS SCC extension this
-        // crate does not surface). Defer at the weighted-pred gate.
-        if st.is_inter() {
+        // §7.3.6.1 P / B `pred_weight_table()` gate. The table is
+        // signalled iff either `(weighted_pred_flag && slice_type == P)`
+        // or `(weighted_bipred_flag && slice_type == B)`. When the table
+        // is statically absent at the gate the parser walks straight
+        // past it into the merge-candidate block; when it is present the
+        // body needs the per-i §7.3.6.3 outer-gate decisions
+        // (`pic_layer_id != nuh_layer_id || PicOrderCnt(...)`) which are
+        // a DPB-derived input the slice parser does not yet thread
+        // through, so the parser defers at the weighted-pred gate.
+        let weighted_pred_table_present = (pps.weighted_pred_flag && matches!(st, SliceType::P))
+            || (pps.weighted_bipred_flag && matches!(st, SliceType::B));
+        if weighted_pred_table_present {
             return Ok(Self {
                 first_slice_segment_in_pic_flag,
                 no_output_of_prior_pics_flag,
@@ -1804,6 +1822,7 @@ impl SliceSegmentHeader {
                 cabac_init_flag,
                 collocated_from_l0_flag,
                 collocated_ref_idx,
+                five_minus_max_num_merge_cand: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1816,8 +1835,33 @@ impl SliceSegmentHeader {
             });
         }
 
-        // I-slice tail: slice_qp_delta + chroma QP offsets + deblocking
-        // override + loop-filter-across-slices.
+        // §7.3.6.1 `five_minus_max_num_merge_cand` (ue(v)), signalled
+        // for every inter slice immediately after the (optional)
+        // pred_weight_table(). §7.4.7.1 derives
+        // `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand`, with
+        // the conformance constraint `1 <= MaxNumMergeCand <= 5` —
+        // i.e. the wire value lies in 0..=4. The SCC
+        // `use_integer_mv_flag` (gated on
+        // `motion_vector_resolution_control_idc == 2`) is statically
+        // absent because the PPS SCC extension is not surfaced by this
+        // crate yet (§7.4.7.1: when not present,
+        // `motion_vector_resolution_control_idc` is inferred to 0).
+        let five_minus_max_num_merge_cand = if st.is_inter() {
+            let v = br.ue()?;
+            if v > 4 {
+                return Err(SliceError::ValueOutOfRange {
+                    field: "five_minus_max_num_merge_cand",
+                    got: v as i64,
+                });
+            }
+            Some(v)
+        } else {
+            None
+        };
+
+        // Slice QP / chroma QP / deblocking / loop-filter / entry-points
+        // tail (§7.3.6.1) — shared by I, P and B independent slice
+        // segments.
         let slice_qp_delta = br.se()?;
 
         let mut slice_cb_qp_offset = 0i8;
@@ -1908,10 +1952,11 @@ impl SliceSegmentHeader {
             num_ref_idx_active_override_flag,
             num_ref_idx_l0_active_minus1,
             num_ref_idx_l1_active_minus1,
-            mvd_l1_zero_flag: None,
-            cabac_init_flag: None,
-            collocated_from_l0_flag: None,
-            collocated_ref_idx: None,
+            mvd_l1_zero_flag,
+            cabac_init_flag,
+            collocated_from_l0_flag,
+            collocated_ref_idx,
+            five_minus_max_num_merge_cand,
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,
             slice_cr_qp_offset,
@@ -1931,6 +1976,17 @@ impl SliceSegmentHeader {
     /// deferred body); `pps` supplies `init_qp_minus26`.
     pub fn slice_qp_y(&self, pps: &PicParameterSet) -> Option<i32> {
         self.slice_qp_delta.map(|d| 26 + pps.init_qp_minus26 + d)
+    }
+
+    /// `MaxNumMergeCand` per §7.4.7.1 equation 7-53:
+    /// `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand`. Returns
+    /// `None` for I slices (the field is absent) and for headers whose
+    /// parse stopped before the merge-candidate block. The derived
+    /// value is guaranteed to lie in 1..=5 — `Self::parse` rejects an
+    /// out-of-range wire value at decode time.
+    pub fn max_num_merge_cand(&self) -> Option<u8> {
+        self.five_minus_max_num_merge_cand
+            .map(|v| 5u8.saturating_sub(v as u8))
     }
 }
 
@@ -2515,23 +2571,23 @@ mod tests {
         );
     }
 
-    /// IDR P-slice with `num_ref_idx_active_override_flag == 0`: the
-    /// parser reads the override flag, infers
-    /// `num_ref_idx_l0_active_minus1` from the PPS default, then
-    /// traverses the §7.3.6.1 mvd / cabac-init / collocated block.
-    /// With `pps.lists_modification_present_flag == 0` the
-    /// `ref_pic_lists_modification()` block is absent unconditionally;
-    /// with `slice_type == P` `mvd_l1_zero_flag` is absent; with
-    /// `pps.cabac_init_present_flag == 0` the cabac-init bit is absent
-    /// (inferred to `false`); with `slice_temporal_mvp_enabled_flag ==
-    /// 0` the collocated block is absent. Zero further bits are
-    /// consumed past the override flag, so the opaque tail begins at
-    /// the weighted-prediction-table gate one bit after the override
-    /// flag (byte 1, bit 1).
+    /// IDR P-slice with `num_ref_idx_active_override_flag == 0` and
+    /// `pps.weighted_pred_flag == 1`: the parser reads the override
+    /// flag, infers `num_ref_idx_l0_active_minus1` from the PPS
+    /// default, traverses the §7.3.6.1 mvd / cabac-init / collocated
+    /// block (with `mvd` absent for P, `cabac_init_flag` inferred
+    /// `false` per §7.4.7.1, and the collocated block absent because
+    /// `slice_temporal_mvp_enabled_flag == 0`), and then defers at
+    /// the §7.3.6.3 `pred_weight_table()` gate because the table is
+    /// statically present (`weighted_pred_flag && slice_type == P`).
+    /// Zero further bits are consumed past the override flag, so the
+    /// opaque tail begins at the weighted-prediction-table gate one
+    /// bit after the override flag (byte 1, bit 1).
     #[test]
     fn defers_pb_ref_list_body() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR is IRAP)
@@ -2562,6 +2618,9 @@ mod tests {
         assert_eq!(sh.cabac_init_flag, Some(false));
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
+        // Defer at the weighted-pred-table gate (statically present
+        // for this slice).
+        assert_eq!(sh.five_minus_max_num_merge_cand, None);
         assert!(sh.opaque_tail.is_some());
         assert_eq!(sh.slice_qp_delta, None);
         // Opaque tail begins at the weighted-pred gate one bit after
@@ -2574,11 +2633,13 @@ mod tests {
     /// explicitly signalled `num_ref_idx_l0_active_minus1 == 1`. P
     /// slices never signal L1; verify the parser materialises the
     /// override flag and the explicit L0 value, leaves L1 absent, and
-    /// defers the rest.
+    /// defers at the §7.3.6.3 `pred_weight_table()` gate (kept present
+    /// here via `pps.weighted_pred_flag = true`).
     #[test]
     fn parses_pb_override_with_explicit_l0() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2600,11 +2661,16 @@ mod tests {
 
     /// IDR B-slice with `num_ref_idx_active_override_flag == 1`:
     /// verifies that both `num_ref_idx_l0_active_minus1` and
-    /// `num_ref_idx_l1_active_minus1` are read for a B slice.
+    /// `num_ref_idx_l1_active_minus1` are read for a B slice. The
+    /// `mvd_l1_zero_flag` / collocated walk is exercised so the bit
+    /// stream reaches the §7.3.6.3 `pred_weight_table()` gate (kept
+    /// present here via `pps.weighted_bipred_flag = true`) where the
+    /// parser defers.
     #[test]
     fn parses_b_slice_override_with_both_lists() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_bipred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2615,7 +2681,8 @@ mod tests {
             (1, 1),     // num_ref_idx_active_override_flag = 1
             (0b011, 3), // num_ref_idx_l0_active_minus1 ue(v) -> 2
             (0b010, 3), // num_ref_idx_l1_active_minus1 ue(v) -> 1
-            (0b1, 1),   // first deferred bit, captured opaquely
+            (1, 1),     // mvd_l1_zero_flag = 1
+            (0b1, 1),   // first deferred bit (weighted-pred gate)
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2627,11 +2694,15 @@ mod tests {
     }
 
     /// IDR B-slice with `num_ref_idx_active_override_flag == 0`: §7.4.7.1
-    /// must infer BOTH L0 and L1 defaults from the PPS.
+    /// must infer BOTH L0 and L1 defaults from the PPS. The parser
+    /// reads through the mvd / cabac / collocated block and defers at
+    /// the §7.3.6.3 `pred_weight_table()` gate (kept present here via
+    /// `pps.weighted_bipred_flag = true`).
     #[test]
     fn b_slice_override_zero_infers_both_defaults() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_bipred_flag = true;
         let bits = concat_bits(&[
             (1, 1),   // first
             (0, 1),   // no_output (IDR)
@@ -2640,7 +2711,8 @@ mod tests {
             (1, 1),   // sao_luma
             (1, 1),   // sao_chroma
             (0, 1),   // num_ref_idx_active_override_flag = 0
-            (0b1, 1), // first deferred bit, captured opaquely
+            (1, 1),   // mvd_l1_zero_flag = 1
+            (0b1, 1), // first deferred bit (weighted-pred gate)
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2667,7 +2739,8 @@ mod tests {
     #[test]
     fn parses_b_slice_mvd_l1_zero_walk_no_mvp() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_bipred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2701,6 +2774,7 @@ mod tests {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         pps.cabac_init_present_flag = true;
+        pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2731,7 +2805,8 @@ mod tests {
     fn parses_p_slice_temporal_mvp_single_ref_collocated_inferred() {
         // mvp = true via the ctx_sps argument.
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2760,7 +2835,8 @@ mod tests {
     #[test]
     fn parses_p_slice_temporal_mvp_collocated_ref_idx_signalled() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2788,7 +2864,8 @@ mod tests {
     #[test]
     fn parses_b_slice_temporal_mvp_collocated_from_l1() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
-        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_bipred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR)
@@ -2870,6 +2947,136 @@ mod tests {
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
         assert!(sh.opaque_tail.is_some());
+    }
+
+    /// IDR P-slice that walks the full inter-slice tail through
+    /// `byte_alignment()` because the §7.3.6.3 `pred_weight_table()`
+    /// gate is statically absent (`pps.weighted_pred_flag == 0`,
+    /// inherited from `TINY_PPS_RBSP`). After the override block, the
+    /// parser walks past `mvd_l1_zero_flag` (absent for P) and
+    /// `cabac_init_flag` (absent + inferred `false` because
+    /// `pps.cabac_init_present_flag == 0`), past the collocated block
+    /// (absent because `slice_temporal_mvp_enabled_flag == 0`), reads
+    /// `five_minus_max_num_merge_cand`, then the I-slice-shared tail
+    /// (`slice_qp_delta` + chroma QP + deblocking + loop-filter +
+    /// entry-points + extension + byte_alignment). The `use_integer_mv_flag`
+    /// SCC bit is statically absent because the PPS SCC extension is
+    /// not surfaced (motion_vector_resolution_control_idc inferred 0).
+    #[test]
+    fn parses_p_slice_full_inter_tail_no_weighted_pred() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // Sanity: TINY_PPS keeps the weighted-pred gate statically off.
+        assert!(!pps.weighted_pred_flag);
+        assert!(!pps.weighted_bipred_flag);
+        assert!(!pps.cabac_init_present_flag);
+        assert!(!pps.lists_modification_present_flag);
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            // (no mvd / cabac_init / collocated bits — all inferred)
+            (0b010, 3), // five_minus_max_num_merge_cand ue -> 1
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag = 1
+            (1, 1),     // byte_alignment '1' bit (rest are 0 to byte boundary)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::P));
+        // §7.4.7.1 inference: P override == 0 → L0 from PPS default.
+        assert_eq!(
+            sh.num_ref_idx_l0_active_minus1,
+            Some(pps.num_ref_idx_l0_default_active_minus1)
+        );
+        assert_eq!(sh.num_ref_idx_l1_active_minus1, None);
+        assert_eq!(sh.mvd_l1_zero_flag, None);
+        assert_eq!(sh.cabac_init_flag, Some(false));
+        assert_eq!(sh.collocated_from_l0_flag, None);
+        assert_eq!(sh.collocated_ref_idx, None);
+        // five_minus_max_num_merge_cand = 1 → MaxNumMergeCand = 4.
+        assert_eq!(sh.five_minus_max_num_merge_cand, Some(1));
+        assert_eq!(sh.max_num_merge_cand(), Some(4));
+        assert_eq!(sh.slice_qp_delta, Some(0));
+        assert_eq!(sh.slice_loop_filter_across_slices_enabled_flag, Some(true));
+        // Tail walked to byte_alignment; no opaque suffix.
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// IDR B-slice walking the full inter-slice tail through
+    /// `byte_alignment()` with `pps.weighted_bipred_flag == 0`:
+    /// exercises the B-only `mvd_l1_zero_flag` bit and the temporal-MVP
+    /// `collocated_from_l0_flag` signalling, then walks straight to
+    /// `five_minus_max_num_merge_cand` and the shared I-slice tail.
+    #[test]
+    fn parses_b_slice_full_inter_tail_with_mvp() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b1, 1),   // slice_type ue -> B
+            (1, 1),     // slice_temporal_mvp_enabled_flag = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b010, 3), // num_ref_idx_l0_active_minus1 ue -> 1
+            (0b1, 1),   // num_ref_idx_l1_active_minus1 ue -> 0
+            (0, 1),     // mvd_l1_zero_flag = 0
+            // cabac_init_flag absent (cabac_init_present_flag == 0).
+            (1, 1),     // collocated_from_l0_flag = 1
+            (0b010, 3), // collocated_ref_idx ue -> 1 (L0 has 2 entries, in range)
+            (0b1, 1),   // five_minus_max_num_merge_cand ue -> 0
+            (0b011, 3), // slice_qp_delta se -> -1
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag = 1
+            (1, 1),     // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::B));
+        assert!(sh.slice_temporal_mvp_enabled_flag);
+        assert_eq!(sh.mvd_l1_zero_flag, Some(false));
+        assert_eq!(sh.collocated_from_l0_flag, Some(true));
+        assert_eq!(sh.collocated_ref_idx, Some(1));
+        assert_eq!(sh.five_minus_max_num_merge_cand, Some(0));
+        assert_eq!(sh.max_num_merge_cand(), Some(5));
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+        assert!(sh.opaque_tail.is_none());
+    }
+
+    /// `five_minus_max_num_merge_cand > 4` is a §7.4.7.1 conformance
+    /// violation (the derived `MaxNumMergeCand` would fall below 1).
+    /// Encode wire value 5 as ue(v) = `0b00110` (5 bits).
+    #[test]
+    fn rejects_five_minus_max_num_merge_cand_above_4() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            // mvd / cabac / collocated all inferred absent.
+            ue_codeword(5), // five_minus_max_num_merge_cand = 5 (illegal)
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "five_minus_max_num_merge_cand",
+                got: 5,
+            }
+        );
     }
 
     /// `num_ref_idx_l0_active_minus1 > 14` is a range failure (§7.4.7.1).
