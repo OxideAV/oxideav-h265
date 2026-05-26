@@ -176,6 +176,24 @@
 //!   in-slice entries). The F.7.4.7.2 multilayer-extension form
 //!   (equation F-56) is reachable through
 //!   [`slice::NumPicTotalCurrInputs::with_multilayer_extension`].
+//! * §7.3.6.3 [`slice::PredWeightTable`] — the
+//!   `pred_weight_table()` syntax structure as a standalone parser.
+//!   The parser walks the `luma_log2_weight_denom` /
+//!   `delta_chroma_log2_weight_denom` denominators, the two flag passes
+//!   (`luma_weight_lX_flag[i]` + `chroma_weight_lX_flag[i]`), and the
+//!   per-reference delta block (`delta_luma_weight_lX[i]` /
+//!   `luma_offset_lX[i]` / `delta_chroma_weight_lX[i][j]` /
+//!   `delta_chroma_offset_lX[i][j]`), applying the §7.4.7.3 range
+//!   bounds + the per-i §7.3.6.3 outer-gate (`pic_layer_id !=
+//!   nuh_layer_id || PicOrderCnt(RefPicListX[i]) !=
+//!   PicOrderCnt(CurrPic)`) decision supplied by the caller, the
+//!   `ChromaLog2WeightDenom ∈ 0..=7` derived range, and the
+//!   `sumWeightLXFlags ≤ 24` conformance cap.
+//!   [`slice::PredWeightTable::luma_weight_l0`] /
+//!   [`slice::PredWeightTable::chroma_weight_l0`] (mirrored for L1)
+//!   resolve each derived `LumaWeightLX[i]` /
+//!   `ChromaWeightLX[i][j]`; [`slice::PredWeightTable::chroma_offset_l0`]
+//!   (mirrored) applies equation 7-58 for `ChromaOffsetLX[i][j]`.
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
@@ -214,7 +232,8 @@ pub use scan::{
     horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
 };
 pub use slice::{
-    EntryPointOffsets, NumPicTotalCurrInputs, RefPicListsModification, SliceDeblocking, SliceError,
+    EntryPointOffsets, NumPicTotalCurrInputs, PredWeightEntry, PredWeightTable,
+    PredWeightTableInputs, RefPicListsModification, SliceDeblocking, SliceError,
     SliceLongTermRefPic, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP,
     IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
 };

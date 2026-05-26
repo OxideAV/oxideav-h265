@@ -401,6 +401,36 @@ data and CABAC remain unimplemented.
   IDR-`nal_unit_type` slices skip the short-term / long-term loops
   and the `NumActiveRefLayerPics` summand is added at the end.
 
+* §7.3.6.3 [`PredWeightTable`] — the `pred_weight_table()` syntax
+  structure as a standalone parser, callable by a future round once
+  the §7.3.6.1 in-place call site is wired up.
+  [`PredWeightTable::parse`] reads `luma_log2_weight_denom`
+  (range 0..=7) and, when `ChromaArrayType != 0`,
+  `delta_chroma_log2_weight_denom` with the derived
+  `ChromaLog2WeightDenom ∈ 0..=7` range check, then performs the two
+  flag passes (`luma_weight_lX_flag[i]` and, when chroma is present,
+  `chroma_weight_lX_flag[i]`) and the per-reference delta block
+  (`delta_luma_weight_lX[i]` / `luma_offset_lX[i]` plus the chroma
+  `delta_chroma_weight_lX[i][j]` / `delta_chroma_offset_lX[i][j]`
+  pairs), enforcing every §7.4.7.3 range bound including the
+  bit-depth-dependent luma/chroma offset bounds parameterised by
+  [`PredWeightTableInputs::high_precision_offsets_enabled_flag`] and
+  the SPS bit depths. For B slices the L1 block is mirrored after
+  L0. The §7.4.7.3 conformance `sumWeightLXFlags ≤ 24` cap is
+  enforced. The §7.3.6.3 outer-gate (`pic_layer_id != nuh_layer_id ||
+  PicOrderCnt(RefPicListX[i]) != PicOrderCnt(CurrPic)`) per-i
+  decision is supplied by the caller through
+  [`PredWeightTableInputs::signal_luma_l0`] /
+  [`PredWeightTableInputs::signal_chroma_l0`] (mirrored for L1); the
+  [`PredWeightTableInputs::base_profile`] constructor leaves all four
+  `None` (every position gated `true`), the universal base-profile
+  single-layer case. Accessor methods
+  [`PredWeightTable::luma_weight_l0`] (mirrored for L1),
+  [`PredWeightTable::chroma_weight_l0`] (mirrored) and
+  [`PredWeightTable::chroma_offset_l0`] (mirrored, equation 7-58)
+  resolve the §7.4.7.3 derived variables `LumaWeightLX[i]`,
+  `ChromaWeightLX[i][j]` and `ChromaOffsetLX[i][j]`.
+
 * §9.3 [`cabac`] — the CABAC arithmetic decoding engine as a
   standalone module: [`CabacEngine::new`] initializes the §9.3.2.6
   registers (`ivlCurrRange = 510`, `ivlOffset = read_bits(9)`, with
@@ -450,11 +480,17 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   for P/B slice headers because the §7.3.6.1 in-place call site has
   not yet been re-entered. The §7.3.6.2 syntax structure itself is
   decoded by the standalone [`RefPicListsModification::parse`]
-  (round 15) and the §7.4.7.2 `NumPicTotalCurr` derivation is
-  available as [`NumPicTotalCurrInputs::compute`] (round 16); a
-  future round threads both together at the §7.3.6.1 call site (the
-  full inter-slice body also needs `pred_weight_table()` and the
-  remaining handful of post-RPS flags + slice-data offset).
+  (round 15), the §7.4.7.2 `NumPicTotalCurr` derivation is
+  available as [`NumPicTotalCurrInputs::compute`] (round 16), and
+  the §7.3.6.3 `pred_weight_table()` syntax structure is decoded by
+  the standalone [`PredWeightTable::parse`] (round 17); a future
+  round threads all three together at the §7.3.6.1 call site (the
+  full inter-slice body also needs the
+  `num_ref_idx_active_override_flag` / `num_ref_idx_lX_active_minus1`
+  override block, `mvd_l1_zero_flag`, `cabac_init_flag`,
+  `collocated_from_l0_flag` / `collocated_ref_idx`,
+  `five_minus_max_num_merge_cand`, the `use_integer_mv_flag` SCC
+  closing flag, and the QP-offset / deblocking / loop-filter tail).
   The non-IDR POC / reference-picture-set block (which previously sat
   under this bullet) is fully decoded as of round 7.
 * Slice data (§7.3.8) — the slice-data syntax-element walk that

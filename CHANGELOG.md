@@ -6,6 +6,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 17 (2026-05-26)
+
+- §7.3.6.3 `pred_weight_table()` syntax structure as a new standalone
+  parser ([`slice::PredWeightTable`]). The parser takes a
+  [`slice::PredWeightTableInputs`] descriptor carrying the active
+  `slice_type`, the post-override `num_ref_idx_lX_active_minus1`
+  cardinalities, the SPS's `ChromaArrayType` + bit depths and the
+  range-extension `high_precision_offsets_enabled_flag`, plus per-i
+  override slices for the §7.3.6.3 outer-gate (`pic_layer_id !=
+  nuh_layer_id || PicOrderCnt(RefPicListX[i]) != PicOrderCnt(CurrPic)`)
+  decision. [`slice::PredWeightTableInputs::base_profile`] covers the
+  common single-layer base-profile case (every gate `true`,
+  `high_precision_offsets_enabled_flag == false`).
+  [`slice::PredWeightTable::parse`] reads
+  `luma_log2_weight_denom` (`ue(v)`, range 0..=7) and, when chroma is
+  present, `delta_chroma_log2_weight_denom` (`se(v)`) with the derived
+  `ChromaLog2WeightDenom ∈ 0..=7` range check; then performs the two
+  flag passes (luma and chroma) and the per-reference delta block
+  (`delta_luma_weight_lX[i]` ∈ −128..=127, `luma_offset_lX[i]` ∈
+  `−WpOffsetHalfRangeY ..= WpOffsetHalfRangeY − 1`,
+  `delta_chroma_weight_lX[i][j]` ∈ −128..=127,
+  `delta_chroma_offset_lX[i][j]` ∈
+  `−4 * WpOffsetHalfRangeC ..= 4 * WpOffsetHalfRangeC − 1`). For B
+  slices the L1 block is mirrored after L0. The §7.4.7.3 conformance
+  cap `sumWeightLXFlags ≤ 24` is enforced (P: L0 only; B: L0+L1).
+  Accessor methods [`slice::PredWeightTable::luma_weight_l0`] (mirrored
+  for L1), [`slice::PredWeightTable::chroma_weight_l0`] (mirrored) and
+  [`slice::PredWeightTable::chroma_offset_l0`] (mirrored, equation
+  7-58) apply the §7.4.7.3 derivations for `LumaWeightLX[i]`,
+  `ChromaWeightLX[i][j]` and `ChromaOffsetLX[i][j]` (including the
+  §7.4.7.3 inferred values when the per-i flag is `false`).
+  [`slice::PredWeightEntry`] groups the per-reference syntax elements
+  in their unresolved on-wire form for audit.
+- Module-level documentation extended with a §7.3.6.3 bullet covering
+  the new `PredWeightTable` parser, the per-i outer-gate threading and
+  the §7.4.7.3 derived-variable accessors.
+- 11 new unit tests covering: a monochrome (`ChromaArrayType == 0`)
+  P-slice single-reference parse with `LumaWeightL0[0]` derivation, a
+  4:2:0 P-slice single-reference parse with chroma derivations
+  (including equation 7-58 `ChromaOffsetL0[0][j]`), a B-slice
+  "all flags zero" minimal-content case with inferred derived
+  variables, range failures for `luma_log2_weight_denom > 7`, derived
+  `ChromaLog2WeightDenom > 7`, `delta_luma_weight_l0[i] > 127` and
+  `luma_offset_l0[i] > 127` at 8-bit, an acceptance test for
+  `luma_offset_l0[i] == 200` at `high_precision_offsets_enabled_flag
+  == true` + `BitDepthY == 10`, an outer-gate suppression test that
+  verifies the gated-off luma-flag bit is not consumed and the
+  delta is inferred to 0, a precondition test rejecting an
+  `signal_luma_l0` slice with the wrong length, an I-slice rejection
+  test, and a `sumWeightL0Flags > 24` conformance test.
+
 ### Added — clean-room rebuild round 16 (2026-05-26)
 
 - §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57) as a new

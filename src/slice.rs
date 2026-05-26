@@ -608,6 +608,602 @@ impl<'a> NumPicTotalCurrInputs<'a> {
     }
 }
 
+/// Per-list weighted-prediction entry for one reference picture in
+/// [`PredWeightTable`] (one entry per `i = 0 ..= num_ref_idx_lX_active_minus1`).
+///
+/// Fields are the raw §7.3.6.3 syntax elements, kept in unresolved form
+/// so the caller can both audit the on-wire bits and compute the
+/// §7.4.7.3 derived variables `LumaWeightLX[i]`,
+/// `ChromaWeightLX[i][j]`, `ChromaOffsetLX[i][j]` through the
+/// helper methods on [`PredWeightTable`] (which also apply the
+/// §7.4.7.3 inference rules for the absent fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PredWeightEntry {
+    /// `luma_weight_lX_flag[i]` (`u(1)`). Inferred to `false` when the
+    /// §7.3.6.3 outer gate (`pic_layer_id != nuh_layer_id ||
+    /// PicOrderCnt(RefPicListX[i]) != PicOrderCnt(CurrPic)`) is `false`
+    /// for this `i` — for a base-profile single-layer slice the gate is
+    /// always `true`, so this flag is always signalled.
+    pub luma_weight_flag: bool,
+    /// `chroma_weight_lX_flag[i]` (`u(1)`). Absent (inferred `false`)
+    /// when `ChromaArrayType == 0` or when the outer gate is `false`
+    /// for this `i`.
+    pub chroma_weight_flag: bool,
+    /// `delta_luma_weight_lX[i]` (`se(v)`, range −128..=127). Inferred
+    /// to `0` when [`Self::luma_weight_flag`] is `false`.
+    pub delta_luma_weight: i32,
+    /// `luma_offset_lX[i]` (`se(v)`, range
+    /// `−WpOffsetHalfRangeY ..= WpOffsetHalfRangeY − 1`). Inferred to
+    /// `0` when [`Self::luma_weight_flag`] is `false`.
+    pub luma_offset: i32,
+    /// `delta_chroma_weight_lX[i][j]` (`se(v)`, range −128..=127) for
+    /// `j = 0 (Cb), 1 (Cr)`. Both inferred to `0` when
+    /// [`Self::chroma_weight_flag`] is `false`.
+    pub delta_chroma_weight: [i32; 2],
+    /// `delta_chroma_offset_lX[i][j]` (`se(v)`, range
+    /// `−4 * WpOffsetHalfRangeC ..= 4 * WpOffsetHalfRangeC − 1`) for
+    /// `j = 0 (Cb), 1 (Cr)`. Both inferred to `0` when
+    /// [`Self::chroma_weight_flag`] is `false`.
+    pub delta_chroma_offset: [i32; 2],
+}
+
+/// Parsed `pred_weight_table()` syntax structure (ITU-T Rec. H.265
+/// §7.3.6.3 / §7.4.7.3).
+///
+/// The structure is signalled in the slice header when
+/// `(weighted_pred_flag && slice_type == P) ||
+/// (weighted_bipred_flag && slice_type == B)` (§7.3.6.1 gate). It
+/// carries per-reference weighting factors and additive offsets that
+/// §8.5.3.3.4.3 applies to the inter-prediction samples produced from
+/// each `RefPicListX[i]`.
+///
+/// ### Outer §7.3.6.3 gate
+///
+/// Each `luma_weight_lX_flag[i]` and `chroma_weight_lX_flag[i]` syntax
+/// element is wrapped in a conditional:
+///
+/// ```text
+///   if( pic_layer_id( RefPicListX[ i ] ) != nuh_layer_id ||
+///       PicOrderCnt( RefPicListX[ i ] ) != PicOrderCnt( CurrPic ) )
+///       luma_weight_lX_flag[ i ]   u(1)
+/// ```
+///
+/// — the flag is only signalled when the reference is a *different
+/// picture* (i.e. either an inter-layer reference or a temporal
+/// reference). For a base-profile single-layer slice every active
+/// reference is temporal, so the gate is universally `true` and every
+/// flag is signalled. For inter-layer / SCC self-reference cases the
+/// gate is `false` for some `i`, and the parser must skip the
+/// corresponding flag bit and infer it to `0` (§7.4.7.3 "When
+/// luma_weight_lX_flag[ i ] is not present, it is inferred to be equal
+/// to 0").
+///
+/// The caller resolves the DPB-driven gate and passes the per-i
+/// boolean decisions through [`PredWeightTableInputs::signal_luma_l0`]
+/// / [`PredWeightTableInputs::signal_chroma_l0`] /
+/// [`PredWeightTableInputs::signal_luma_l1`] /
+/// [`PredWeightTableInputs::signal_chroma_l1`]; the default
+/// [`PredWeightTableInputs::base_profile`] constructor leaves them all
+/// `true` (the base-profile case).
+///
+/// ### Derived variables
+///
+/// Per §7.4.7.3 the on-wire deltas combine with the per-list
+/// `..._log2_weight_denom` to produce the actual weighting factors and
+/// offsets the §8.5.3.3.4.3 inter-prediction process consumes:
+///
+/// * `ChromaLog2WeightDenom = luma_log2_weight_denom +
+///   delta_chroma_log2_weight_denom` (range 0..=7).
+/// * `LumaWeightLX[i] = (1 << luma_log2_weight_denom) +
+///   delta_luma_weight_lX[i]` when the luma flag is set, else inferred
+///   to `1 << luma_log2_weight_denom`.
+/// * `ChromaWeightLX[i][j] = (1 << ChromaLog2WeightDenom) +
+///   delta_chroma_weight_lX[i][j]` when the chroma flag is set, else
+///   inferred to `1 << ChromaLog2WeightDenom`.
+/// * `ChromaOffsetLX[i][j]` per equation 7-58 (a clipped expression
+///   parameterised by `WpOffsetHalfRangeC` and `ChromaLog2WeightDenom`).
+///
+/// The accessor methods on this struct apply those derivations.
+///
+/// ### Conformance check
+///
+/// §7.4.7.3 closes with the `sumWeightLXFlags` cap: for a P slice
+/// `sumWeightL0Flags ≤ 24`; for a B slice
+/// `sumWeightL0Flags + sumWeightL1Flags ≤ 24` where each
+/// `sumWeightLXFlags = Σ ( luma_weight_lX_flag[i] +
+/// 2 * chroma_weight_lX_flag[i] )`. The parser computes this sum and
+/// enforces the cap.
+///
+/// ### Range checks
+///
+/// * `luma_log2_weight_denom` ∈ 0..=7.
+/// * `luma_log2_weight_denom + delta_chroma_log2_weight_denom` ∈ 0..=7
+///   (the variable `ChromaLog2WeightDenom`).
+/// * `delta_luma_weight_lX[i]` ∈ −128..=127 when the luma flag is set.
+/// * `luma_offset_lX[i]` ∈ `−WpOffsetHalfRangeY ..= WpOffsetHalfRangeY − 1`
+///   when the luma flag is set.
+/// * `delta_chroma_weight_lX[i][j]` ∈ −128..=127 when the chroma flag
+///   is set.
+/// * `delta_chroma_offset_lX[i][j]` ∈
+///   `−4 * WpOffsetHalfRangeC ..= 4 * WpOffsetHalfRangeC − 1` when the
+///   chroma flag is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredWeightTable {
+    /// `luma_log2_weight_denom` (`ue(v)`, range 0..=7).
+    pub luma_log2_weight_denom: u8,
+    /// `delta_chroma_log2_weight_denom` (`se(v)`). Absent (and
+    /// inferred to 0 per §7.4.7.3) when `ChromaArrayType == 0`.
+    pub delta_chroma_log2_weight_denom: i32,
+    /// L0 per-reference entries, length
+    /// `num_ref_idx_l0_active_minus1 + 1`.
+    pub entries_l0: Vec<PredWeightEntry>,
+    /// L1 per-reference entries, length
+    /// `num_ref_idx_l1_active_minus1 + 1` for B slices. Empty for P
+    /// slices (the §7.3.6.3 `if( slice_type == B )` gate suppresses
+    /// every L1 syntax element).
+    pub entries_l1: Vec<PredWeightEntry>,
+}
+
+/// Inputs to [`PredWeightTable::parse`].
+///
+/// Carries every value the parser needs to derive field widths,
+/// presence gates, range bounds and the per-i §7.3.6.3 outer-gate
+/// decisions. The [`Self::base_profile`] constructor covers the common
+/// case (single-layer base profile, `high_precision_offsets_enabled_flag
+/// == 0`, every per-i gate `true`); the other setters carry the
+/// extension-specific knobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredWeightTableInputs<'a> {
+    /// Active `slice_type` (the L1 syntax block is suppressed for P).
+    pub slice_type: SliceType,
+    /// Active `num_ref_idx_l0_active_minus1` after the
+    /// `num_ref_idx_active_override_flag` override (range 0..=14 per
+    /// §7.4.7.1).
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Active `num_ref_idx_l1_active_minus1`. Ignored for P slices.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// `ChromaArrayType` per §7.4.2.2. When `0` (monochrome or
+    /// separate-colour-plane) the entire chroma sub-block is absent.
+    pub chroma_array_type: u8,
+    /// `high_precision_offsets_enabled_flag` from the SPS range
+    /// extension (§7.4.3.2.2 / equations 7-33 / 7-34). Inferred to
+    /// `false` when the SPS range extension is not signalled.
+    pub high_precision_offsets_enabled_flag: bool,
+    /// `BitDepthY` from the SPS (§7.4.3.2.1), used by
+    /// `WpOffsetHalfRangeY` when [`Self::high_precision_offsets_enabled_flag`]
+    /// is `true`. Ignored otherwise (`WpOffsetHalfRangeY = 128`).
+    pub bit_depth_y: u8,
+    /// `BitDepthC` from the SPS (§7.4.3.2.1), used by
+    /// `WpOffsetHalfRangeC` when [`Self::high_precision_offsets_enabled_flag`]
+    /// is `true`. Ignored otherwise (`WpOffsetHalfRangeC = 128`).
+    pub bit_depth_c: u8,
+    /// Per-i outer-gate decision for `luma_weight_l0_flag[i]`. When
+    /// `None`, every position is treated as gated `true`
+    /// (base-profile case). When `Some(slice)`, length must equal
+    /// `num_ref_idx_l0_active_minus1 + 1` and `slice[i] == false`
+    /// suppresses the corresponding flag bit (inferred to `0`).
+    pub signal_luma_l0: Option<&'a [bool]>,
+    /// Same as [`Self::signal_luma_l0`] for `chroma_weight_l0_flag[i]`.
+    pub signal_chroma_l0: Option<&'a [bool]>,
+    /// Same as [`Self::signal_luma_l0`] for `luma_weight_l1_flag[i]`
+    /// (B slices only).
+    pub signal_luma_l1: Option<&'a [bool]>,
+    /// Same as [`Self::signal_luma_l0`] for `chroma_weight_l1_flag[i]`
+    /// (B slices only).
+    pub signal_chroma_l1: Option<&'a [bool]>,
+}
+
+impl<'a> PredWeightTableInputs<'a> {
+    /// Base-profile single-layer constructor: every per-i §7.3.6.3
+    /// outer-gate decision is `true`, `high_precision_offsets_enabled_flag
+    /// == false`. The caller supplies only the slice-type, the active
+    /// ref-list cardinalities, and the activated SPS's
+    /// `ChromaArrayType` + bit depths.
+    pub fn base_profile(
+        slice_type: SliceType,
+        num_ref_idx_l0_active_minus1: u8,
+        num_ref_idx_l1_active_minus1: u8,
+        chroma_array_type: u8,
+        bit_depth_y: u8,
+        bit_depth_c: u8,
+    ) -> Self {
+        Self {
+            slice_type,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+            chroma_array_type,
+            high_precision_offsets_enabled_flag: false,
+            bit_depth_y,
+            bit_depth_c,
+            signal_luma_l0: None,
+            signal_chroma_l0: None,
+            signal_luma_l1: None,
+            signal_chroma_l1: None,
+        }
+    }
+
+    /// `WpOffsetHalfRangeY` per equation 7-33.
+    fn wp_offset_half_range_y(&self) -> i32 {
+        let shift = if self.high_precision_offsets_enabled_flag {
+            (self.bit_depth_y as i32) - 1
+        } else {
+            7
+        };
+        1i32 << shift
+    }
+
+    /// `WpOffsetHalfRangeC` per equation 7-34.
+    fn wp_offset_half_range_c(&self) -> i32 {
+        let shift = if self.high_precision_offsets_enabled_flag {
+            (self.bit_depth_c as i32) - 1
+        } else {
+            7
+        };
+        1i32 << shift
+    }
+}
+
+impl PredWeightTable {
+    /// Parse `pred_weight_table()` (§7.3.6.3) from the current bit
+    /// position of `br`. See [`PredWeightTableInputs`] for the per-call
+    /// inputs and the base-profile constructor.
+    ///
+    /// The parser:
+    ///
+    /// 1. Reads `luma_log2_weight_denom` (`ue(v)`, range 0..=7).
+    /// 2. When `chroma_array_type != 0`, reads
+    ///    `delta_chroma_log2_weight_denom` (`se(v)`) and validates the
+    ///    derived `ChromaLog2WeightDenom` ∈ 0..=7.
+    /// 3. Reads the L0 luma-flag pass, applying the per-i outer-gate
+    ///    decision from [`PredWeightTableInputs::signal_luma_l0`].
+    /// 4. When `chroma_array_type != 0`, reads the L0 chroma-flag
+    ///    pass with the matching gate slice.
+    /// 5. Reads the L0 per-reference delta block: for each `i` where
+    ///    the flag is set, reads `delta_luma_weight_l0[i]` +
+    ///    `luma_offset_l0[i]`; when the chroma flag is set, reads
+    ///    `delta_chroma_weight_l0[i][j]` + `delta_chroma_offset_l0[i][j]`
+    ///    for `j ∈ {0, 1}`.
+    /// 6. For B slices, mirrors steps 3–5 for L1.
+    /// 7. Validates the §7.4.7.3 `sumWeightLXFlags ≤ 24` cap.
+    ///
+    /// Each delta is range-checked per §7.4.7.3; range failures
+    /// surface as [`SliceError::ValueOutOfRange`].
+    pub fn parse(
+        br: &mut BitReader<'_>,
+        inputs: &PredWeightTableInputs<'_>,
+    ) -> Result<Self, SliceError> {
+        if inputs.slice_type == SliceType::I {
+            return Err(SliceError::ValueOutOfRange {
+                field: "pred_weight_table/slice_type",
+                got: 2,
+            });
+        }
+        if inputs.num_ref_idx_l0_active_minus1 > 14 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l0_active_minus1",
+                got: inputs.num_ref_idx_l0_active_minus1 as i64,
+            });
+        }
+        if inputs.slice_type == SliceType::B && inputs.num_ref_idx_l1_active_minus1 > 14 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l1_active_minus1",
+                got: inputs.num_ref_idx_l1_active_minus1 as i64,
+            });
+        }
+
+        let n_l0 = inputs.num_ref_idx_l0_active_minus1 as usize + 1;
+        let n_l1 = if inputs.slice_type == SliceType::B {
+            inputs.num_ref_idx_l1_active_minus1 as usize + 1
+        } else {
+            0
+        };
+        validate_signal_slice("signal_luma_l0", inputs.signal_luma_l0, n_l0)?;
+        validate_signal_slice("signal_chroma_l0", inputs.signal_chroma_l0, n_l0)?;
+        validate_signal_slice("signal_luma_l1", inputs.signal_luma_l1, n_l1)?;
+        validate_signal_slice("signal_chroma_l1", inputs.signal_chroma_l1, n_l1)?;
+
+        let chroma_present = inputs.chroma_array_type != 0;
+
+        let luma_log2_weight_denom_u = br.ue()?;
+        if luma_log2_weight_denom_u > 7 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "luma_log2_weight_denom",
+                got: luma_log2_weight_denom_u as i64,
+            });
+        }
+        let luma_log2_weight_denom = luma_log2_weight_denom_u as u8;
+
+        let delta_chroma_log2_weight_denom: i32 = if chroma_present {
+            let v = br.se()?;
+            let chroma_denom = luma_log2_weight_denom as i32 + v;
+            if !(0..=7).contains(&chroma_denom) {
+                return Err(SliceError::ValueOutOfRange {
+                    field: "ChromaLog2WeightDenom",
+                    got: chroma_denom as i64,
+                });
+            }
+            v
+        } else {
+            0
+        };
+
+        // L0: parse the two flag passes (luma, then chroma when
+        // chroma is present), then the per-reference delta block.
+        let entries_l0 = parse_pred_weight_list(
+            br,
+            n_l0,
+            chroma_present,
+            inputs.signal_luma_l0,
+            inputs.signal_chroma_l0,
+            inputs.wp_offset_half_range_y(),
+            inputs.wp_offset_half_range_c(),
+            "l0",
+        )?;
+
+        // L1: B slices only.
+        let entries_l1 = if inputs.slice_type == SliceType::B {
+            parse_pred_weight_list(
+                br,
+                n_l1,
+                chroma_present,
+                inputs.signal_luma_l1,
+                inputs.signal_chroma_l1,
+                inputs.wp_offset_half_range_y(),
+                inputs.wp_offset_half_range_c(),
+                "l1",
+            )?
+        } else {
+            Vec::new()
+        };
+
+        // §7.4.7.3 sumWeightLXFlags cap: ≤ 24 per list contribution.
+        let sum_l0 = sum_weight_flags(&entries_l0);
+        if inputs.slice_type == SliceType::P && sum_l0 > 24 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "sumWeightL0Flags",
+                got: sum_l0 as i64,
+            });
+        }
+        if inputs.slice_type == SliceType::B {
+            let sum_l1 = sum_weight_flags(&entries_l1);
+            if sum_l0 + sum_l1 > 24 {
+                return Err(SliceError::ValueOutOfRange {
+                    field: "sumWeightL0Flags+sumWeightL1Flags",
+                    got: (sum_l0 + sum_l1) as i64,
+                });
+            }
+        }
+
+        Ok(Self {
+            luma_log2_weight_denom,
+            delta_chroma_log2_weight_denom,
+            entries_l0,
+            entries_l1,
+        })
+    }
+
+    /// `ChromaLog2WeightDenom = luma_log2_weight_denom +
+    /// delta_chroma_log2_weight_denom` per §7.4.7.3. Returns `0` when
+    /// the chroma sub-block was absent (`ChromaArrayType == 0`); the
+    /// derivation is moot in that case.
+    pub fn chroma_log2_weight_denom(&self) -> u8 {
+        // The parser's range check on `ChromaLog2WeightDenom ∈ 0..=7`
+        // guarantees the sum fits in a `u8`.
+        (self.luma_log2_weight_denom as i32 + self.delta_chroma_log2_weight_denom) as u8
+    }
+
+    /// `LumaWeightL0[i]` per §7.4.7.3: `(1 << luma_log2_weight_denom)
+    /// + delta_luma_weight_l0[i]` when the flag is set, else
+    /// inferred to `1 << luma_log2_weight_denom`.
+    pub fn luma_weight_l0(&self, i: usize) -> Option<i32> {
+        self.entries_l0
+            .get(i)
+            .map(|e| self.luma_weight_value(e.luma_weight_flag, e.delta_luma_weight))
+    }
+
+    /// `LumaWeightL1[i]` per §7.4.7.3.
+    pub fn luma_weight_l1(&self, i: usize) -> Option<i32> {
+        self.entries_l1
+            .get(i)
+            .map(|e| self.luma_weight_value(e.luma_weight_flag, e.delta_luma_weight))
+    }
+
+    /// `ChromaWeightL0[i][j]` per §7.4.7.3.
+    pub fn chroma_weight_l0(&self, i: usize, j: usize) -> Option<i32> {
+        let e = self.entries_l0.get(i)?;
+        let v = *e.delta_chroma_weight.get(j)?;
+        Some(self.chroma_weight_value(e.chroma_weight_flag, v))
+    }
+
+    /// `ChromaWeightL1[i][j]` per §7.4.7.3.
+    pub fn chroma_weight_l1(&self, i: usize, j: usize) -> Option<i32> {
+        let e = self.entries_l1.get(i)?;
+        let v = *e.delta_chroma_weight.get(j)?;
+        Some(self.chroma_weight_value(e.chroma_weight_flag, v))
+    }
+
+    /// `ChromaOffsetL0[i][j]` per §7.4.7.3 equation 7-58.
+    pub fn chroma_offset_l0(&self, i: usize, j: usize, wp_offset_half_range_c: i32) -> Option<i32> {
+        let e = self.entries_l0.get(i)?;
+        if !e.chroma_weight_flag {
+            return Some(0);
+        }
+        let delta_off = *e.delta_chroma_offset.get(j)?;
+        let chroma_w = self.chroma_weight_value(true, *e.delta_chroma_weight.get(j)?);
+        Some(chroma_offset_eq_7_58(
+            wp_offset_half_range_c,
+            delta_off,
+            chroma_w,
+            self.chroma_log2_weight_denom(),
+        ))
+    }
+
+    /// `ChromaOffsetL1[i][j]` per §7.4.7.3 equation 7-58.
+    pub fn chroma_offset_l1(&self, i: usize, j: usize, wp_offset_half_range_c: i32) -> Option<i32> {
+        let e = self.entries_l1.get(i)?;
+        if !e.chroma_weight_flag {
+            return Some(0);
+        }
+        let delta_off = *e.delta_chroma_offset.get(j)?;
+        let chroma_w = self.chroma_weight_value(true, *e.delta_chroma_weight.get(j)?);
+        Some(chroma_offset_eq_7_58(
+            wp_offset_half_range_c,
+            delta_off,
+            chroma_w,
+            self.chroma_log2_weight_denom(),
+        ))
+    }
+
+    fn luma_weight_value(&self, flag: bool, delta: i32) -> i32 {
+        let base = 1i32 << self.luma_log2_weight_denom;
+        if flag {
+            base + delta
+        } else {
+            base
+        }
+    }
+
+    fn chroma_weight_value(&self, flag: bool, delta: i32) -> i32 {
+        let base = 1i32 << self.chroma_log2_weight_denom();
+        if flag {
+            base + delta
+        } else {
+            base
+        }
+    }
+}
+
+/// Verify the caller-supplied per-i gate slice has the expected length.
+fn validate_signal_slice(
+    field: &'static str,
+    slice: Option<&[bool]>,
+    expected: usize,
+) -> Result<(), SliceError> {
+    match slice {
+        None => Ok(()),
+        Some(s) if s.len() == expected => Ok(()),
+        Some(s) => Err(SliceError::ValueOutOfRange {
+            field,
+            got: s.len() as i64,
+        }),
+    }
+}
+
+/// Parse one per-list (L0 or L1) sub-block of §7.3.6.3.
+#[allow(clippy::too_many_arguments)]
+fn parse_pred_weight_list(
+    br: &mut BitReader<'_>,
+    n: usize,
+    chroma_present: bool,
+    signal_luma: Option<&[bool]>,
+    signal_chroma: Option<&[bool]>,
+    wp_off_half_y: i32,
+    wp_off_half_c: i32,
+    list_tag: &'static str,
+) -> Result<Vec<PredWeightEntry>, SliceError> {
+    let mut entries: Vec<PredWeightEntry> = (0..n).map(|_| PredWeightEntry::default()).collect();
+
+    // Luma flag pass.
+    for (i, e) in entries.iter_mut().enumerate() {
+        let signalled = signal_luma.map(|s| s[i]).unwrap_or(true);
+        e.luma_weight_flag = if signalled { br.u1()? != 0 } else { false };
+    }
+
+    // Chroma flag pass — present only when ChromaArrayType != 0.
+    if chroma_present {
+        for (i, e) in entries.iter_mut().enumerate() {
+            let signalled = signal_chroma.map(|s| s[i]).unwrap_or(true);
+            e.chroma_weight_flag = if signalled { br.u1()? != 0 } else { false };
+        }
+    }
+
+    // Per-reference delta block.
+    for (i, e) in entries.iter_mut().enumerate() {
+        if e.luma_weight_flag {
+            let d = br.se()?;
+            if !(-128..=127).contains(&d) {
+                return Err(SliceError::ValueOutOfRange {
+                    field: if list_tag == "l0" {
+                        "delta_luma_weight_l0"
+                    } else {
+                        "delta_luma_weight_l1"
+                    },
+                    got: d as i64,
+                });
+            }
+            e.delta_luma_weight = d;
+
+            let off = br.se()?;
+            if off < -wp_off_half_y || off > wp_off_half_y - 1 {
+                return Err(SliceError::ValueOutOfRange {
+                    field: if list_tag == "l0" {
+                        "luma_offset_l0"
+                    } else {
+                        "luma_offset_l1"
+                    },
+                    got: off as i64,
+                });
+            }
+            e.luma_offset = off;
+        }
+        if e.chroma_weight_flag {
+            for j in 0..2 {
+                let d = br.se()?;
+                if !(-128..=127).contains(&d) {
+                    return Err(SliceError::ValueOutOfRange {
+                        field: if list_tag == "l0" {
+                            "delta_chroma_weight_l0"
+                        } else {
+                            "delta_chroma_weight_l1"
+                        },
+                        got: d as i64,
+                    });
+                }
+                e.delta_chroma_weight[j] = d;
+
+                let off = br.se()?;
+                if off < -4 * wp_off_half_c || off > 4 * wp_off_half_c - 1 {
+                    return Err(SliceError::ValueOutOfRange {
+                        field: if list_tag == "l0" {
+                            "delta_chroma_offset_l0"
+                        } else {
+                            "delta_chroma_offset_l1"
+                        },
+                        got: off as i64,
+                    });
+                }
+                e.delta_chroma_offset[j] = off;
+            }
+        }
+        let _ = i; // silence the unused-`i` when iter_mut().enumerate() is mixed with explicit loop
+    }
+
+    Ok(entries)
+}
+
+/// §7.4.7.3 closing summand:
+/// `sumWeightLXFlags = Σ luma_weight_lX_flag[i] + 2 * chroma_weight_lX_flag[i]`.
+fn sum_weight_flags(entries: &[PredWeightEntry]) -> u32 {
+    entries
+        .iter()
+        .map(|e| u32::from(e.luma_weight_flag) + 2 * u32::from(e.chroma_weight_flag))
+        .sum()
+}
+
+/// §7.4.7.3 equation 7-58 for `ChromaOffsetLX[i][j]`. Extracted as a
+/// free function so [`PredWeightTable::chroma_offset_l0`] /
+/// [`PredWeightTable::chroma_offset_l1`] share the implementation.
+fn chroma_offset_eq_7_58(
+    wp_off_half_c: i32,
+    delta_chroma_offset: i32,
+    chroma_weight: i32,
+    chroma_log2_weight_denom: u8,
+) -> i32 {
+    let raw = wp_off_half_c + delta_chroma_offset
+        - ((wp_off_half_c * chroma_weight) >> chroma_log2_weight_denom);
+    raw.clamp(-wp_off_half_c, wp_off_half_c - 1)
+}
+
 /// Parsed slice segment header per §7.3.6.1.
 ///
 /// Fields that this round defers (the non-IDR POC/RPS block, the P/B
@@ -2377,6 +2973,428 @@ mod tests {
         };
         let inputs = NumPicTotalCurrInputs::from_explicit_short_term_rps(&rps_two, &lt).unwrap();
         assert_eq!(inputs.compute(), 2, "gate fires at 2");
+    }
+
+    // --- §7.3.6.3 pred_weight_table() ---
+
+    /// Build the `ue(v)` codeword for a value `v` (Table 9-3). Returns
+    /// `(value, width_in_bits)` ready for [`concat_bits`].
+    fn ue_codeword(v: u32) -> (u32, u8) {
+        let plus1 = v + 1;
+        let m = 32 - plus1.leading_zeros() - 1; // floor(log2(v+1))
+        let width = (2 * m + 1) as u8;
+        (plus1, width)
+    }
+
+    /// `se(v)` codeword: map signed to unsigned per the §9.2.1 inverse
+    /// of Table 9-3 (`codeNum = 2*|v| - (v > 0 ? 1 : 0)`), then encode
+    /// the result as an `ue(v)`.
+    fn se_codeword(v: i32) -> (u32, u8) {
+        let code_num: u32 = if v <= 0 {
+            (2 * (-v)) as u32
+        } else {
+            (2 * v - 1) as u32
+        };
+        ue_codeword(code_num)
+    }
+
+    /// Minimal monochrome P-slice case (`ChromaArrayType == 0` so no
+    /// chroma fields are signalled): one reference, `luma_weight_l0_flag
+    /// == 1`, `delta_luma_weight_l0[0] == 5`, `luma_offset_l0[0] == 0`.
+    ///
+    /// Bit layout:
+    /// ```text
+    ///   luma_log2_weight_denom              ue(v) = 2     -> 0b011  (3 bits)
+    ///   luma_weight_l0_flag[0]              u(1)  = 1     -> 0b1    (1 bit)
+    ///   delta_luma_weight_l0[0]             se(v) = 5     -> codeNum=9, ue(v)=0b0001010 (7 bits)
+    ///   luma_offset_l0[0]                   se(v) = 0     -> codeNum=0, ue(v)=0b1       (1 bit)
+    /// ```
+    /// total = 3 + 1 + 7 + 1 = 12 bits.
+    #[test]
+    fn parses_monochrome_p_slice_single_ref() {
+        let mut fields = vec![ue_codeword(2)]; // luma_log2_weight_denom
+        fields.push((1, 1)); // luma_weight_l0_flag[0]
+        fields.push(se_codeword(5)); // delta_luma_weight_l0[0]
+        fields.push(se_codeword(0)); // luma_offset_l0[0]
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(
+            SliceType::P,
+            0,
+            0,
+            /*ChromaArrayType*/ 0,
+            8,
+            8,
+        );
+        let pwt = PredWeightTable::parse(&mut br, &inputs).expect("parse");
+
+        assert_eq!(pwt.luma_log2_weight_denom, 2);
+        assert_eq!(pwt.delta_chroma_log2_weight_denom, 0); // absent → inferred 0
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert!(pwt.entries_l0[0].luma_weight_flag);
+        assert!(!pwt.entries_l0[0].chroma_weight_flag); // monochrome
+        assert_eq!(pwt.entries_l0[0].delta_luma_weight, 5);
+        assert_eq!(pwt.entries_l0[0].luma_offset, 0);
+        assert!(pwt.entries_l1.is_empty());
+        // 12 bits consumed.
+        assert_eq!(br.bit_pos(), 12);
+        // Derived: LumaWeightL0[0] = (1 << 2) + 5 = 9
+        assert_eq!(pwt.luma_weight_l0(0), Some(9));
+    }
+
+    /// P-slice with `ChromaArrayType == 1` (4:2:0), one reference,
+    /// every flag = 1. Verifies the chroma sub-block parses and the
+    /// derived `ChromaLog2WeightDenom`, `ChromaWeightL0[0][j]` and
+    /// `ChromaOffsetL0[0][j]` resolve correctly.
+    ///
+    /// Bit layout:
+    /// ```text
+    ///   luma_log2_weight_denom              ue(v) = 1   -> 0b010
+    ///   delta_chroma_log2_weight_denom      se(v) = 1   -> codeNum=1, ue(v)=0b010
+    ///   luma_weight_l0_flag[0]              u(1)  = 1
+    ///   chroma_weight_l0_flag[0]            u(1)  = 1
+    ///   delta_luma_weight_l0[0]             se(v) = -3  -> codeNum=6, ue(v)=0b00111
+    ///   luma_offset_l0[0]                   se(v) = 7   -> codeNum=13, ue(v)=0b0001110
+    ///   delta_chroma_weight_l0[0][0]        se(v) = 0   -> 0b1
+    ///   delta_chroma_offset_l0[0][0]        se(v) = 2   -> codeNum=3, ue(v)=0b00100
+    ///   delta_chroma_weight_l0[0][1]        se(v) = 0   -> 0b1
+    ///   delta_chroma_offset_l0[0][1]        se(v) = -1  -> codeNum=2, ue(v)=0b011
+    /// ```
+    #[test]
+    fn parses_p_slice_420_single_ref_with_chroma() {
+        let mut fields = vec![ue_codeword(1)];
+        fields.push(se_codeword(1));
+        fields.push((1, 1)); // luma_weight_l0_flag
+        fields.push((1, 1)); // chroma_weight_l0_flag
+        fields.push(se_codeword(-3));
+        fields.push(se_codeword(7));
+        fields.push(se_codeword(0));
+        fields.push(se_codeword(2));
+        fields.push(se_codeword(0));
+        fields.push(se_codeword(-1));
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, 0, 0, 1, 8, 8);
+        let pwt = PredWeightTable::parse(&mut br, &inputs).expect("parse");
+
+        assert_eq!(pwt.luma_log2_weight_denom, 1);
+        assert_eq!(pwt.delta_chroma_log2_weight_denom, 1);
+        assert_eq!(pwt.chroma_log2_weight_denom(), 2);
+        assert_eq!(pwt.entries_l0[0].delta_luma_weight, -3);
+        assert_eq!(pwt.entries_l0[0].luma_offset, 7);
+        assert_eq!(pwt.entries_l0[0].delta_chroma_weight, [0, 0]);
+        assert_eq!(pwt.entries_l0[0].delta_chroma_offset, [2, -1]);
+        // Derived: LumaWeightL0[0] = (1 << 1) + (-3) = -1
+        assert_eq!(pwt.luma_weight_l0(0), Some(-1));
+        // ChromaWeightL0[0][j] = (1 << 2) + 0 = 4 for j ∈ {0, 1}
+        assert_eq!(pwt.chroma_weight_l0(0, 0), Some(4));
+        assert_eq!(pwt.chroma_weight_l0(0, 1), Some(4));
+        // Equation 7-58 with WpOffsetHalfRangeC = 128:
+        //   raw_j0 = 128 + 2 - ((128 * 4) >> 2) = 130 - 128 = 2
+        //   raw_j1 = 128 + (-1) - 128 = -1
+        assert_eq!(pwt.chroma_offset_l0(0, 0, 128), Some(2));
+        assert_eq!(pwt.chroma_offset_l0(0, 1, 128), Some(-1));
+    }
+
+    /// B-slice with `ChromaArrayType == 1`, one ref per list, all flags
+    /// off (the minimal-content B case). Verifies the L1 block is
+    /// reached and the chroma flag pass is read on both lists; absent
+    /// deltas remain at 0; derived `LumaWeightLX[0]` inferred to
+    /// `1 << luma_log2_weight_denom`.
+    ///
+    /// Bit layout (denoms then four flag bits, all 0; L1 mirrors L0):
+    /// ```text
+    ///   luma_log2_weight_denom              ue(v) = 0  -> 0b1
+    ///   delta_chroma_log2_weight_denom      se(v) = 0  -> 0b1
+    ///   luma_weight_l0_flag[0]              u(1)  = 0
+    ///   chroma_weight_l0_flag[0]            u(1)  = 0
+    ///   luma_weight_l1_flag[0]              u(1)  = 0
+    ///   chroma_weight_l1_flag[0]            u(1)  = 0
+    /// ```
+    /// 2 bits denoms + 4 bits flags = 6 bits.
+    #[test]
+    fn parses_b_slice_all_flags_zero() {
+        let mut fields = vec![ue_codeword(0), se_codeword(0)];
+        fields.push((0, 1));
+        fields.push((0, 1));
+        fields.push((0, 1));
+        fields.push((0, 1));
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::B, 0, 0, 1, 8, 8);
+        let pwt = PredWeightTable::parse(&mut br, &inputs).expect("parse");
+
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert_eq!(pwt.entries_l1.len(), 1);
+        assert!(!pwt.entries_l0[0].luma_weight_flag);
+        assert!(!pwt.entries_l1[0].chroma_weight_flag);
+        // No deltas were signalled; absent values inferred to 0.
+        assert_eq!(pwt.entries_l0[0].delta_luma_weight, 0);
+        assert_eq!(pwt.entries_l1[0].delta_chroma_offset, [0, 0]);
+        // Derived LumaWeightLX[0] = (1 << 0) + 0 = 1 (inferred form).
+        assert_eq!(pwt.luma_weight_l0(0), Some(1));
+        assert_eq!(pwt.luma_weight_l1(0), Some(1));
+        // ChromaOffsetLX[i][j] inferred to 0 when chroma_weight_flag == 0.
+        assert_eq!(pwt.chroma_offset_l0(0, 0, 128), Some(0));
+        assert_eq!(pwt.chroma_offset_l1(0, 1, 128), Some(0));
+        assert_eq!(br.bit_pos(), 6);
+    }
+
+    /// `luma_log2_weight_denom > 7` is a range failure (§7.4.7.3).
+    /// `ue(v)` value 8 encodes as `0b0001001` (7 bits).
+    #[test]
+    fn rejects_luma_log2_weight_denom_above_7() {
+        let bits = concat_bits(&[ue_codeword(8)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, 0, 0, 0, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "luma_log2_weight_denom",
+                got: 8,
+            }
+        );
+    }
+
+    /// `ChromaLog2WeightDenom = luma_log2_weight_denom +
+    /// delta_chroma_log2_weight_denom` ∈ 0..=7 (§7.4.7.3). Encode
+    /// `luma_log2_weight_denom == 3, delta_chroma_log2_weight_denom ==
+    /// 5` → derived = 8, must error.
+    #[test]
+    fn rejects_derived_chroma_log2_weight_denom_above_7() {
+        let bits = concat_bits(&[ue_codeword(3), se_codeword(5)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, 0, 0, 1, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "ChromaLog2WeightDenom",
+                got: 8,
+            }
+        );
+    }
+
+    /// `delta_luma_weight_l0[i]` ∉ −128..=127 must error (§7.4.7.3).
+    /// `se(v)` value 128 encodes via codeNum = 255 → ue(v) is 15 bits
+    /// long; pack it and verify the parser surfaces ValueOutOfRange.
+    #[test]
+    fn rejects_delta_luma_weight_l0_above_127() {
+        let mut fields = vec![ue_codeword(0)];
+        fields.push((1, 1)); // luma_weight_l0_flag = 1
+        fields.push(se_codeword(128)); // out of range
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, 0, 0, 0, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "delta_luma_weight_l0",
+                got: 128,
+            }
+        );
+    }
+
+    /// `luma_offset_l0[i]` ∈ `−128..=127` for base profile (8 bits, no
+    /// high-precision offsets). Encode value 128 → range failure.
+    #[test]
+    fn rejects_luma_offset_l0_above_127_at_8_bit() {
+        let mut fields = vec![ue_codeword(0)];
+        fields.push((1, 1)); // flag = 1
+        fields.push(se_codeword(0)); // delta_luma_weight = 0 (in range)
+        fields.push(se_codeword(128)); // luma_offset = 128 out of range
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, 0, 0, 0, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "luma_offset_l0",
+                got: 128,
+            }
+        );
+    }
+
+    /// `high_precision_offsets_enabled_flag == true` widens
+    /// `WpOffsetHalfRangeY` from `1 << 7 = 128` to
+    /// `1 << (BitDepthY - 1)`. With `BitDepthY == 10` the new range is
+    /// `−512..=511`. Encode `luma_offset_l0 == 200` (was out-of-range
+    /// at 8-bit, in-range at 10-bit high-precision) and verify parse
+    /// succeeds.
+    #[test]
+    fn accepts_luma_offset_in_high_precision_range() {
+        let mut fields = vec![ue_codeword(0)];
+        fields.push((1, 1));
+        fields.push(se_codeword(0));
+        fields.push(se_codeword(200));
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs {
+            slice_type: SliceType::P,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            chroma_array_type: 0,
+            high_precision_offsets_enabled_flag: true,
+            bit_depth_y: 10,
+            bit_depth_c: 10,
+            signal_luma_l0: None,
+            signal_chroma_l0: None,
+            signal_luma_l1: None,
+            signal_chroma_l1: None,
+        };
+        let pwt = PredWeightTable::parse(&mut br, &inputs).expect("parse");
+        assert_eq!(pwt.entries_l0[0].luma_offset, 200);
+    }
+
+    /// §7.3.6.3 outer gate: when the caller passes
+    /// `signal_luma_l0[i] == false`, the corresponding flag bit is NOT
+    /// consumed from the bitstream and the parsed flag is inferred to
+    /// `false`. Build a two-ref P slice with `signal_luma_l0 = [false,
+    /// true]`: only one luma-flag bit is present (the second), and
+    /// the parser must read exactly the right bits.
+    ///
+    /// Bit layout (monochrome, n_l0=2):
+    /// ```text
+    ///   luma_log2_weight_denom            ue(v) = 0  -> 0b1     (1)
+    ///   luma_weight_l0_flag[1]            u(1)  = 1            (1)
+    ///   delta_luma_weight_l0[1]           se(v) = 4  -> codeNum=7, ue(v)=0b0001000 (7)
+    ///   luma_offset_l0[1]                 se(v) = 0  -> 0b1     (1)
+    /// ```
+    /// Total = 10 bits.
+    #[test]
+    fn outer_gate_suppresses_per_i_flag_bits() {
+        let mut fields = vec![ue_codeword(0)];
+        fields.push((1, 1)); // luma_weight_l0_flag[1]
+        fields.push(se_codeword(4)); // delta_luma_weight_l0[1]
+        fields.push(se_codeword(0));
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+
+        let gate_l0 = [false, true];
+        let inputs = PredWeightTableInputs {
+            slice_type: SliceType::P,
+            num_ref_idx_l0_active_minus1: 1,
+            num_ref_idx_l1_active_minus1: 0,
+            chroma_array_type: 0,
+            high_precision_offsets_enabled_flag: false,
+            bit_depth_y: 8,
+            bit_depth_c: 8,
+            signal_luma_l0: Some(&gate_l0),
+            signal_chroma_l0: None,
+            signal_luma_l1: None,
+            signal_chroma_l1: None,
+        };
+        let pwt = PredWeightTable::parse(&mut br, &inputs).expect("parse");
+        assert_eq!(pwt.entries_l0.len(), 2);
+        assert!(!pwt.entries_l0[0].luma_weight_flag); // gated off → inferred 0
+        assert!(pwt.entries_l0[1].luma_weight_flag);
+        assert_eq!(pwt.entries_l0[1].delta_luma_weight, 4);
+        // Position 0's deltas remain at the inferred default (0).
+        assert_eq!(pwt.entries_l0[0].delta_luma_weight, 0);
+        assert_eq!(pwt.entries_l0[0].luma_offset, 0);
+        // Bit accounting matches the expected layout.
+        assert_eq!(br.bit_pos(), 10);
+    }
+
+    /// Per-i gate slice length mismatch is a precondition failure.
+    #[test]
+    fn rejects_signal_slice_length_mismatch() {
+        let bits = concat_bits(&[ue_codeword(0)]);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let gate_too_short = [true]; // num_ref_idx_l0_active_minus1 + 1 == 2
+        let inputs = PredWeightTableInputs {
+            slice_type: SliceType::P,
+            num_ref_idx_l0_active_minus1: 1,
+            num_ref_idx_l1_active_minus1: 0,
+            chroma_array_type: 0,
+            high_precision_offsets_enabled_flag: false,
+            bit_depth_y: 8,
+            bit_depth_c: 8,
+            signal_luma_l0: Some(&gate_too_short),
+            signal_chroma_l0: None,
+            signal_luma_l1: None,
+            signal_chroma_l1: None,
+        };
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "signal_luma_l0",
+                got: 1,
+            }
+        );
+    }
+
+    /// Rejects an I-slice call (the §7.3.6.1 gate
+    /// `weighted_pred_flag && slice_type == P` /
+    /// `weighted_bipred_flag && slice_type == B` excludes I slices).
+    #[test]
+    fn rejects_i_slice_call_pwt() {
+        let rbsp = [0xFFu8; 4];
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::I, 0, 0, 0, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "pred_weight_table/slice_type",
+                got: 2,
+            }
+        );
+        assert_eq!(br.bit_pos(), 0);
+    }
+
+    /// §7.4.7.3 conformance: for a P slice, `sumWeightL0Flags ≤ 24`.
+    /// Each entry contributes up to 3 (luma=1, chroma=2), so 9 entries
+    /// with both flags set sum to 27, breaching the cap. Build the
+    /// minimal P-slice case with 9 entries (`num_ref_idx_l0_active_minus1
+    /// = 8`) and verify the parser rejects.
+    #[test]
+    fn rejects_sum_weight_l0_above_24() {
+        let mut fields = vec![ue_codeword(0), se_codeword(0)];
+        let n = 9usize;
+        // 9 luma_weight_l0_flag bits, all 1
+        for _ in 0..n {
+            fields.push((1, 1));
+        }
+        // 9 chroma_weight_l0_flag bits, all 1
+        for _ in 0..n {
+            fields.push((1, 1));
+        }
+        // Per-entry deltas (luma + chroma): delta=0, offset=0
+        for _ in 0..n {
+            fields.push(se_codeword(0)); // delta_luma_weight
+            fields.push(se_codeword(0)); // luma_offset
+            for _ in 0..2 {
+                fields.push(se_codeword(0)); // delta_chroma_weight
+                fields.push(se_codeword(0)); // delta_chroma_offset
+            }
+        }
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let mut br = BitReader::new(&rbsp);
+        let inputs = PredWeightTableInputs::base_profile(SliceType::P, (n - 1) as u8, 0, 1, 8, 8);
+        let err = PredWeightTable::parse(&mut br, &inputs).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "sumWeightL0Flags",
+                got: 27,
+            }
+        );
     }
 
     // --- bit-packing test helpers ---
