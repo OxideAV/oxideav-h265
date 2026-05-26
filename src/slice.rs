@@ -1278,6 +1278,23 @@ pub struct SliceSegmentHeader {
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag`. Inferred to false when not present.
     pub slice_sao_chroma_flag: bool,
+    /// `num_ref_idx_active_override_flag` (§7.3.6.1). `None` for I
+    /// slices (the field is absent — `slice_type == 2`) and for
+    /// dependent slice segments. Read as `u(1)` immediately after the
+    /// SAO block for P / B slices.
+    pub num_ref_idx_active_override_flag: Option<bool>,
+    /// `num_ref_idx_l0_active_minus1` (§7.3.6.1, range 0..=14). For P
+    /// / B slices, signalled when `num_ref_idx_active_override_flag ==
+    /// 1` and otherwise inferred to `pps.num_ref_idx_l0_default_active_
+    /// minus1` per §7.4.7.1. `None` when the slice is I or the parser
+    /// stopped before reaching this point.
+    pub num_ref_idx_l0_active_minus1: Option<u8>,
+    /// `num_ref_idx_l1_active_minus1` (§7.3.6.1, range 0..=14). For B
+    /// slices, signalled when `num_ref_idx_active_override_flag == 1`
+    /// and otherwise inferred to `pps.num_ref_idx_l1_default_active_
+    /// minus1` per §7.4.7.1. `None` when the slice is not B or the
+    /// parser stopped before reaching this point.
+    pub num_ref_idx_l1_active_minus1: Option<u8>,
     /// `slice_qp_delta` (`se(v)`). `None` when the parser stopped before
     /// reaching it (a deferred non-IDR or P/B body).
     pub slice_qp_delta: Option<i32>,
@@ -1496,6 +1513,9 @@ impl SliceSegmentHeader {
                 slice_temporal_mvp_enabled_flag,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
+                num_ref_idx_active_override_flag: None,
+                num_ref_idx_l0_active_minus1: None,
+                num_ref_idx_l1_active_minus1: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1508,11 +1528,64 @@ impl SliceSegmentHeader {
             });
         }
 
-        // P / B reference-list, mvd, cabac-init, collocated, weighted
-        // prediction, merge-cand, integer-mv: deferred this round
-        // (needs DPB-derived NumPicTotalCurr / RefPicList). Surface the
-        // remainder when the slice is inter.
+        // §7.3.6.1: for P / B slices, the SAO block is immediately
+        // followed by the `num_ref_idx_active_override_flag` /
+        // `num_ref_idx_lX_active_minus1` block. This is the in-place
+        // prerequisite for the later `ref_pic_lists_modification()`
+        // call (its `list_entry_lX[]` loop indexes `0..=
+        // num_ref_idx_lX_active_minus1`). The §7.4.7.1 inference rule
+        // fills both `num_ref_idx_lX_active_minus1` values from the PPS
+        // defaults when the override flag is 0; both values are capped
+        // at 14.
         let st = slice_type.expect("independent slice has a slice_type");
+        let (
+            num_ref_idx_active_override_flag,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+        ) = if st.is_inter() {
+            let override_flag = br.u1()? != 0;
+            let (n0, n1) = if override_flag {
+                let n0 = br.ue()?;
+                if n0 > 14 {
+                    return Err(SliceError::ValueOutOfRange {
+                        field: "num_ref_idx_l0_active_minus1",
+                        got: n0 as i64,
+                    });
+                }
+                let n1 = if matches!(st, SliceType::B) {
+                    let v = br.ue()?;
+                    if v > 14 {
+                        return Err(SliceError::ValueOutOfRange {
+                            field: "num_ref_idx_l1_active_minus1",
+                            got: v as i64,
+                        });
+                    }
+                    Some(v as u8)
+                } else {
+                    None
+                };
+                (n0 as u8, n1)
+            } else {
+                // §7.4.7.1 inference defaults from the PPS.
+                let n1 = if matches!(st, SliceType::B) {
+                    Some(pps.num_ref_idx_l1_default_active_minus1)
+                } else {
+                    None
+                };
+                (pps.num_ref_idx_l0_default_active_minus1, n1)
+            };
+            (Some(override_flag), Some(n0), n1)
+        } else {
+            (None, None, None)
+        };
+
+        // P / B reference-list-modification, mvd, cabac-init,
+        // collocated, weighted prediction, merge-cand, integer-mv:
+        // deferred this round (needs DPB-derived NumPicTotalCurr /
+        // RefPicList). Surface the remainder when the slice is inter —
+        // now AFTER the override / num_ref_idx block, so the captured
+        // opaque tail begins at `ref_pic_lists_modification()` (when
+        // signalled) or `mvd_l1_zero_flag` (when not).
         if st.is_inter() {
             return Ok(Self {
                 first_slice_segment_in_pic_flag,
@@ -1534,6 +1607,9 @@ impl SliceSegmentHeader {
                 slice_temporal_mvp_enabled_flag,
                 slice_sao_luma_flag,
                 slice_sao_chroma_flag,
+                num_ref_idx_active_override_flag,
+                num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1635,6 +1711,9 @@ impl SliceSegmentHeader {
             slice_temporal_mvp_enabled_flag,
             slice_sao_luma_flag,
             slice_sao_chroma_flag,
+            num_ref_idx_active_override_flag,
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,
             slice_cr_qp_offset,
@@ -2238,15 +2317,20 @@ mod tests {
         );
     }
 
-    /// IDR P-slice: the parser reaches the SAO block then defers the
-    /// P/B reference-list / weighted-prediction body.
+    /// IDR P-slice with `num_ref_idx_active_override_flag == 0`: the
+    /// parser reads the override flag, infers
+    /// `num_ref_idx_l0_active_minus1` from the PPS default, and then
+    /// defers the remaining P/B reference-list-modification /
+    /// weighted-prediction body. The deferred opaque tail now begins
+    /// at the `ref_pic_lists_modification()` gate (one bit AFTER the
+    /// SAO block).
     #[test]
     fn defers_pb_ref_list_body() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         // first=1, no_output(IRAP)=0, pps_id=0, slice_type=P,
-        // (mvp gate off), sao_l, sao_c, then num_ref_idx_active_override
-        // begins (deferred).
+        // (mvp gate off), sao_l, sao_c, num_ref_idx_active_override=0,
+        // then the deferred body (ref_pic_lists_modification gate etc.).
         let bits = concat_bits(&[
             (1, 1),     // first
             (0, 1),     // no_output (IDR is IRAP)
@@ -2254,18 +2338,141 @@ mod tests {
             (0b010, 3), // slice_type -> P
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
-            (0b1, 1),   // first deferred P/B bit, captured opaquely
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            (0b1, 1),   // first deferred bit, captured opaquely
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
         assert_eq!(sh.slice_type, Some(SliceType::P));
         assert!(sh.slice_sao_luma_flag);
         assert!(sh.slice_sao_chroma_flag);
+        // §7.4.7.1 inference: P slice with override == 0 picks up the
+        // PPS default for L0 and leaves L1 absent.
+        assert_eq!(sh.num_ref_idx_active_override_flag, Some(false));
+        assert_eq!(
+            sh.num_ref_idx_l0_active_minus1,
+            Some(pps.num_ref_idx_l0_default_active_minus1)
+        );
+        assert_eq!(sh.num_ref_idx_l1_active_minus1, None);
         assert!(sh.opaque_tail.is_some());
         assert_eq!(sh.slice_qp_delta, None);
-        // Opaque tail begins after sao_chroma (bit 8 = byte 1, bit 0).
+        // Opaque tail begins after the override flag at bit 9
+        // (byte 1, bit 1).
         let tail = sh.opaque_tail.unwrap();
-        assert_eq!(tail.start_bit_in_first_byte, 0);
+        assert_eq!(tail.start_bit_in_first_byte, 1);
+    }
+
+    /// IDR P-slice with `num_ref_idx_active_override_flag == 1` and an
+    /// explicitly signalled `num_ref_idx_l0_active_minus1 == 1`. P
+    /// slices never signal L1; verify the parser materialises the
+    /// override flag and the explicit L0 value, leaves L1 absent, and
+    /// defers the rest.
+    #[test]
+    fn parses_pb_override_with_explicit_l0() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b010, 3), // slice_type -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b010, 3), // num_ref_idx_l0_active_minus1 ue(v) -> 1
+            (0b1, 1),   // first deferred bit, captured opaquely
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.num_ref_idx_active_override_flag, Some(true));
+        assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(1));
+        assert_eq!(sh.num_ref_idx_l1_active_minus1, None);
+        assert!(sh.opaque_tail.is_some());
+    }
+
+    /// IDR B-slice with `num_ref_idx_active_override_flag == 1`:
+    /// verifies that both `num_ref_idx_l0_active_minus1` and
+    /// `num_ref_idx_l1_active_minus1` are read for a B slice.
+    #[test]
+    fn parses_b_slice_override_with_both_lists() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id -> 0
+            (0b1, 1),   // slice_type ue(v) -> 0 (B)
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (1, 1),     // num_ref_idx_active_override_flag = 1
+            (0b011, 3), // num_ref_idx_l0_active_minus1 ue(v) -> 2
+            (0b010, 3), // num_ref_idx_l1_active_minus1 ue(v) -> 1
+            (0b1, 1),   // first deferred bit, captured opaquely
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::B));
+        assert_eq!(sh.num_ref_idx_active_override_flag, Some(true));
+        assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(2));
+        assert_eq!(sh.num_ref_idx_l1_active_minus1, Some(1));
+        assert!(sh.opaque_tail.is_some());
+    }
+
+    /// IDR B-slice with `num_ref_idx_active_override_flag == 0`: §7.4.7.1
+    /// must infer BOTH L0 and L1 defaults from the PPS.
+    #[test]
+    fn b_slice_override_zero_infers_both_defaults() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),   // first
+            (0, 1),   // no_output (IDR)
+            (0b1, 1), // pps_id -> 0
+            (0b1, 1), // slice_type -> B
+            (1, 1),   // sao_luma
+            (1, 1),   // sao_chroma
+            (0, 1),   // num_ref_idx_active_override_flag = 0
+            (0b1, 1), // first deferred bit, captured opaquely
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::B));
+        assert_eq!(sh.num_ref_idx_active_override_flag, Some(false));
+        assert_eq!(
+            sh.num_ref_idx_l0_active_minus1,
+            Some(pps.num_ref_idx_l0_default_active_minus1)
+        );
+        assert_eq!(
+            sh.num_ref_idx_l1_active_minus1,
+            Some(pps.num_ref_idx_l1_default_active_minus1)
+        );
+    }
+
+    /// `num_ref_idx_l0_active_minus1 > 14` is a range failure (§7.4.7.1).
+    /// Encode value 15 as ue(v) = `0b000010000` (9 bits).
+    #[test]
+    fn rejects_num_ref_idx_l0_active_minus1_above_14() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        let bits = concat_bits(&[
+            (1, 1),          // first
+            (0, 1),          // no_output (IDR)
+            (0b1, 1),        // pps_id -> 0
+            (0b010, 3),      // slice_type -> P
+            (1, 1),          // sao_luma
+            (1, 1),          // sao_chroma
+            (1, 1),          // num_ref_idx_active_override_flag = 1
+            ue_codeword(15), // num_ref_idx_l0_active_minus1 = 15 -> illegal
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "num_ref_idx_l0_active_minus1",
+                got: 15,
+            }
+        );
     }
 
     /// Non-first dependent slice segment: dependent flag + address are

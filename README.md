@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 16 (2026-05-26).** The prior implementation was
+**Clean-room rebuild — round 18 (2026-05-26).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,36 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 16 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 18 lands the
+§7.3.6.1 in-place inter-slice prelude — the
+`num_ref_idx_active_override_flag` `u(1)` and the
+`num_ref_idx_l0_active_minus1` / (B-only) `num_ref_idx_l1_active_minus1`
+`ue(v)` block that follows the SAO gates for P / B slices. The
+§7.4.7.1 inference rule is applied: when the override flag is 0 the
+parser fills both per-list values from
+[`PicParameterSet::num_ref_idx_l0_default_active_minus1`] /
+[`PicParameterSet::num_ref_idx_l1_default_active_minus1`]; when it is
+1 the explicit `ue(v)` values are read and range-checked at 0..=14.
+P slices leave the L1 value `None` (the field is absent from the
+syntax). The three new accessors
+[`SliceSegmentHeader::num_ref_idx_active_override_flag`],
+[`SliceSegmentHeader::num_ref_idx_l0_active_minus1`] and
+[`SliceSegmentHeader::num_ref_idx_l1_active_minus1`] (each typed as
+`Option`) surface the values, and the deferred P/B opaque tail now
+begins one or four bits later — at the
+`ref_pic_lists_modification()` gate (when
+`lists_modification_present_flag && NumPicTotalCurr > 1`) or
+`mvd_l1_zero_flag`. The remaining inter-slice tail
+(`ref_pic_lists_modification` wiring, `mvd_l1_zero_flag`,
+`cabac_init_flag`, `collocated_from_l0_flag` / `collocated_ref_idx`,
+`pred_weight_table` wiring, `five_minus_max_num_merge_cand`,
+`use_integer_mv_flag`, the QP-offset / deblocking / loop-filter tail)
+remains the next round's target — the standalone parsers
+[`RefPicListsModification::parse`] /
+[`PredWeightTable::parse`] are already callable.
+Round 17 had landed the
+§7.3.6.3 `pred_weight_table()` syntax structure as a standalone parser
+([`PredWeightTable::parse`]). Round 16 lands the
 §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57), the explicit
 follow-up to round 15's standalone `RefPicListsModification` parser.
 The new [`NumPicTotalCurrInputs`] builder takes the per-position
@@ -345,6 +374,19 @@ data and CABAC remain unimplemented.
   discriminating SPS-indexed vs in-slice signalling and
   `delta_poc_msb_present_flag` / `delta_poc_msb_cycle_lt`),
   `slice_temporal_mvp_enabled_flag`, and the SAO luma / chroma gates.
+  For P / B slices the SAO block is followed in-place by the
+  `num_ref_idx_active_override_flag` `u(1)` and the
+  `num_ref_idx_l0_active_minus1` (P / B) /
+  `num_ref_idx_l1_active_minus1` (B only) `ue(v)` block (§7.3.6.1),
+  with the §7.4.7.1 inference rule filling both values from the PPS
+  defaults when the override flag is 0; values are range-checked at
+  0..=14. The remaining inter-slice tail
+  (`ref_pic_lists_modification()` wiring, `pred_weight_table()`
+  wiring, `mvd_l1_zero_flag`, `cabac_init_flag`,
+  `collocated_from_l0_flag` / `collocated_ref_idx`,
+  `five_minus_max_num_merge_cand`, `use_integer_mv_flag`, the
+  QP-offset / deblocking / loop-filter tail) stays surfaced as
+  [`SliceSegmentHeader::opaque_tail`].
   Independent I-slice segments — IDR and non-IDR alike — parse end to
   end through `byte_alignment()`: `slice_qp_delta` (`se(v)`), the
   chroma QP offsets, the deblocking override block
@@ -484,13 +526,13 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   available as [`NumPicTotalCurrInputs::compute`] (round 16), and
   the §7.3.6.3 `pred_weight_table()` syntax structure is decoded by
   the standalone [`PredWeightTable::parse`] (round 17); a future
-  round threads all three together at the §7.3.6.1 call site (the
-  full inter-slice body also needs the
+  round threads all three together at the §7.3.6.1 call site. The
   `num_ref_idx_active_override_flag` / `num_ref_idx_lX_active_minus1`
-  override block, `mvd_l1_zero_flag`, `cabac_init_flag`,
-  `collocated_from_l0_flag` / `collocated_ref_idx`,
+  override block that opens the inter-slice tail is decoded in place
+  as of round 18, so the remaining work is `mvd_l1_zero_flag`,
+  `cabac_init_flag`, `collocated_from_l0_flag` / `collocated_ref_idx`,
   `five_minus_max_num_merge_cand`, the `use_integer_mv_flag` SCC
-  closing flag, and the QP-offset / deblocking / loop-filter tail).
+  closing flag, and the QP-offset / deblocking / loop-filter tail.
   The non-IDR POC / reference-picture-set block (which previously sat
   under this bullet) is fully decoded as of round 7.
 * Slice data (§7.3.8) — the slice-data syntax-element walk that

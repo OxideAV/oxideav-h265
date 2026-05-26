@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 18 (2026-05-26)
+
+- §7.3.6.1 inter-slice prelude decoded in place: the
+  `num_ref_idx_active_override_flag` `u(1)` and (when set) the
+  `num_ref_idx_l0_active_minus1` `ue(v)` and (B slices only)
+  `num_ref_idx_l1_active_minus1` `ue(v)` values now sit on the
+  `SliceSegmentHeader` as three new `Option`-typed fields. The §7.4.7.1
+  inference rule fills the per-list values from the PPS defaults when
+  the override flag is 0; explicit values are range-checked at 0..=14.
+  The deferred P/B opaque tail now begins immediately after the
+  override block (at the `ref_pic_lists_modification()` gate when
+  signalled, otherwise at `mvd_l1_zero_flag`), so a future round that
+  threads the §7.3.6.2 + §7.4.7.2 + §7.3.6.3 pieces in place starts
+  from the right bit position with the correct
+  `num_ref_idx_lX_active_minus1` values already in hand. Four new
+  unit tests in `slice::tests` cover the inferred-defaults P-slice
+  path, the explicit-L0-only P-slice path, the B-slice
+  `[L0, L1]` explicit path, the B-slice inferred-defaults path, and
+  the `num_ref_idx_l0_active_minus1 > 14` range failure. The pre-round
+  `defers_pb_ref_list_body` test is rewritten to encode the new
+  override = 0 bit and check the now-correct opaque-tail start.
+
 ### Added — clean-room rebuild round 17 (2026-05-26)
 
 - §7.3.6.3 `pred_weight_table()` syntax structure as a new standalone
