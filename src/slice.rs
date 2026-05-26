@@ -228,6 +228,33 @@ pub enum SliceLongTermRefPicSource {
     },
 }
 
+impl SliceLongTermRefPic {
+    /// Resolve `UsedByCurrPicLt[i]` for this entry per §7.4.7.1:
+    ///
+    /// > `UsedByCurrPicLt[ i ]` is set equal to
+    /// > `used_by_curr_pic_lt_sps_flag[ lt_idx_sps[ i ] ]` when the
+    /// > entry's source is the SPS table, and to
+    /// > `used_by_curr_pic_lt_flag[ i ]` when the entry is signalled
+    /// > directly in the slice header.
+    ///
+    /// Returns `None` when [`SliceLongTermRefPicSource::Sps`] points at
+    /// an index that is out of range of `sps.long_term_ref_pics`
+    /// (a bitstream-conformance failure — the SPS-resident table must
+    /// cover every `lt_idx_sps[i]` value).
+    pub fn used_by_curr_pic_lt(&self, sps: &SeqParameterSet) -> Option<bool> {
+        match self.source {
+            SliceLongTermRefPicSource::Sps { lt_idx_sps } => sps
+                .long_term_ref_pics
+                .get(lt_idx_sps as usize)
+                .map(|entry| entry.used_by_curr_pic),
+            SliceLongTermRefPicSource::InSlice {
+                used_by_curr_pic_lt_flag,
+                ..
+            } => Some(used_by_curr_pic_lt_flag),
+        }
+    }
+}
+
 /// One entry-point offset entry (`tiles_enabled_flag ||
 /// entropy_coding_sync_enabled_flag`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +423,188 @@ impl RefPicListsModification {
             ref_pic_list_modification_flag_l1,
             list_entry_l1,
         })
+    }
+}
+
+/// Inputs to the §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57).
+///
+/// `NumPicTotalCurr` counts the reference pictures in the current
+/// slice's RPS state that are flagged as *used by the current
+/// picture* — i.e. eligible for entry into `RefPicListTemp0` /
+/// `RefPicListTemp1`. The §7.3.6.1 gate
+/// `lists_modification_present_flag && NumPicTotalCurr > 1` consumes
+/// the derivation to decide whether the inter-slice header carries a
+/// `ref_pic_lists_modification()` block, and the per-entry width of
+/// that block's `list_entry_lX[i]` (`Ceil( Log2( NumPicTotalCurr ) )`,
+/// §7.4.7.2) consumes the value directly.
+///
+/// The four `UsedByCurrPic*` slices supplied by the caller are the
+/// resolved per-position state of the active RPS:
+///
+/// * `used_by_curr_pic_s0` — `UsedByCurrPicS0[ CurrRpsIdx ][ i ]` for
+///   `i = 0 .. NumNegativePics[ CurrRpsIdx ]`.
+/// * `used_by_curr_pic_s1` — `UsedByCurrPicS1[ CurrRpsIdx ][ i ]` for
+///   `i = 0 .. NumPositivePics[ CurrRpsIdx ]`.
+/// * `used_by_curr_pic_lt` — `UsedByCurrPicLt[ i ]` for
+///   `i = 0 .. num_long_term_sps + num_long_term_pics`. The §7.4.7.1
+///   selector ("SPS-resident → `used_by_curr_pic_lt_sps_flag[
+///   lt_idx_sps[ i ] ]`; in-slice → `used_by_curr_pic_lt_flag[ i ]`")
+///   is applied by the caller; [`SliceLongTermRefPic::used_by_curr_pic_lt`]
+///   does the per-entry resolution against the active SPS.
+///
+/// For the explicit (non-inter-RPS-predicted) short-term RPS form, the
+/// `S0` / `S1` slices come directly from
+/// [`ShortTermRefPicSet::used_by_curr_pic_s0_flag`] /
+/// [`ShortTermRefPicSet::used_by_curr_pic_s1_flag`] and the
+/// [`Self::from_explicit_short_term_rps`] builder is provided. For the
+/// inter-RPS-prediction form the §7.4.8 derivation (equations
+/// 7-58..7-66) must be run first; the result of that derivation is
+/// then handed to [`Self::from_used_flags`].
+///
+/// The remaining inputs:
+///
+/// * `pps_curr_pic_ref_enabled_flag` — §7.4.7.2 closing-clause flag,
+///   from the SCC extension of the active PPS. Inferred to `false`
+///   when the SCC PPS is not signalled (§7.4.3.3.1.4).
+/// * `nal_unit_type` — used only by the F.7.4.7.2 multilayer-extension
+///   variant of equation 7-57 (`F-56`): when the multilayer extension
+///   applies and the current picture is IDR (`IDR_W_RADL` /
+///   `IDR_N_LP`), the short-term and long-term loops are skipped
+///   entirely. For base §7.4.7.2 the value is unused because every
+///   IDR slice already has zero short-term and long-term entries.
+/// * `num_active_ref_layer_pics` — F.7.4.7.2 `NumActiveRefLayerPics`
+///   (the count of active inter-layer reference pictures for the
+///   current slice, §F.7.4.7.1). Set to `0` for base §7.4.7.2.
+///
+/// The `nal_unit_type` IDR gate and `num_active_ref_layer_pics`
+/// contribution are only applied when [`Self::multilayer_extension`]
+/// is `true` (forward-compat for the multilayer scaffold; left
+/// `false` by every base-profile call site).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumPicTotalCurrInputs<'a> {
+    /// Per-position `UsedByCurrPicS0[ CurrRpsIdx ][ i ]` flags.
+    pub used_by_curr_pic_s0: &'a [bool],
+    /// Per-position `UsedByCurrPicS1[ CurrRpsIdx ][ i ]` flags.
+    pub used_by_curr_pic_s1: &'a [bool],
+    /// Per-position `UsedByCurrPicLt[ i ]` flags, length
+    /// `num_long_term_sps + num_long_term_pics`.
+    pub used_by_curr_pic_lt: &'a [bool],
+    /// `pps_curr_pic_ref_enabled_flag` (§7.4.3.3.1.4 SCC PPS). Inferred
+    /// to `false` when not signalled.
+    pub pps_curr_pic_ref_enabled_flag: bool,
+    /// `nal_unit_type` of the slice's NAL unit (Table 7-1). Consumed
+    /// only when [`Self::multilayer_extension`] is `true`.
+    pub nal_unit_type: u8,
+    /// F.7.4.7.2 `NumActiveRefLayerPics` (the §F.7.4.7.1 inter-layer
+    /// active count). Consumed only when [`Self::multilayer_extension`]
+    /// is `true`.
+    pub num_active_ref_layer_pics: u32,
+    /// Forward-compat toggle: when `true`, equation `F-56` of
+    /// F.7.4.7.2 is applied instead of equation 7-57 of §7.4.7.2
+    /// (the short-term / long-term loops are skipped for IDR
+    /// `nal_unit_type`, and `NumActiveRefLayerPics` is added at the
+    /// end). Every base-profile call site leaves this `false`.
+    pub multilayer_extension: bool,
+}
+
+impl<'a> NumPicTotalCurrInputs<'a> {
+    /// Build the inputs from already-resolved per-position
+    /// `UsedByCurrPic*` slices. The caller is responsible for having
+    /// run the §7.4.8 inter-RPS-prediction derivation if the active
+    /// short-term RPS uses the predicted form.
+    pub fn from_used_flags(
+        used_by_curr_pic_s0: &'a [bool],
+        used_by_curr_pic_s1: &'a [bool],
+        used_by_curr_pic_lt: &'a [bool],
+    ) -> Self {
+        Self {
+            used_by_curr_pic_s0,
+            used_by_curr_pic_s1,
+            used_by_curr_pic_lt,
+            pps_curr_pic_ref_enabled_flag: false,
+            nal_unit_type: 0,
+            num_active_ref_layer_pics: 0,
+            multilayer_extension: false,
+        }
+    }
+
+    /// Build the inputs from an *explicit-form* short-term RPS, where
+    /// the `UsedByCurrPicS0` / `UsedByCurrPicS1` arrays are the
+    /// SPS-signalled `used_by_curr_pic_sX_flag` arrays themselves
+    /// (§7.4.8 equations 7-65 / 7-66). Returns `None` when the RPS
+    /// uses inter-prediction (`inter_ref_pic_set_prediction_flag ==
+    /// 1`) — the §7.4.8 derivation must be run first and the result
+    /// passed to [`Self::from_used_flags`].
+    pub fn from_explicit_short_term_rps(
+        curr_rps: &'a ShortTermRefPicSet,
+        used_by_curr_pic_lt: &'a [bool],
+    ) -> Option<Self> {
+        if curr_rps.inter_ref_pic_set_prediction_flag {
+            return None;
+        }
+        Some(Self::from_used_flags(
+            &curr_rps.used_by_curr_pic_s0_flag,
+            &curr_rps.used_by_curr_pic_s1_flag,
+            used_by_curr_pic_lt,
+        ))
+    }
+
+    /// Set [`Self::pps_curr_pic_ref_enabled_flag`] (builder).
+    pub fn with_pps_curr_pic_ref_enabled(mut self, flag: bool) -> Self {
+        self.pps_curr_pic_ref_enabled_flag = flag;
+        self
+    }
+
+    /// Set the multilayer-extension trio (builder).
+    pub fn with_multilayer_extension(
+        mut self,
+        nal_unit_type: u8,
+        num_active_ref_layer_pics: u32,
+    ) -> Self {
+        self.multilayer_extension = true;
+        self.nal_unit_type = nal_unit_type;
+        self.num_active_ref_layer_pics = num_active_ref_layer_pics;
+        self
+    }
+
+    /// Compute `NumPicTotalCurr` per equation 7-57 (base §7.4.7.2) or
+    /// equation `F-56` (F.7.4.7.2 multilayer extension), depending on
+    /// [`Self::multilayer_extension`].
+    ///
+    /// The base equation 7-57:
+    ///
+    /// ```text
+    /// NumPicTotalCurr = 0
+    /// for i in 0..NumNegativePics[CurrRpsIdx]:
+    ///     if UsedByCurrPicS0[CurrRpsIdx][i]:                       NumPicTotalCurr++
+    /// for i in 0..NumPositivePics[CurrRpsIdx]:
+    ///     if UsedByCurrPicS1[CurrRpsIdx][i]:                       NumPicTotalCurr++
+    /// for i in 0..(num_long_term_sps + num_long_term_pics):
+    ///     if UsedByCurrPicLt[i]:                                   NumPicTotalCurr++
+    /// if pps_curr_pic_ref_enabled_flag:                            NumPicTotalCurr++
+    /// ```
+    ///
+    /// The multilayer variant `F-56` skips the short-term and
+    /// long-term loops entirely for IDR `nal_unit_type` values
+    /// (`IDR_W_RADL` / `IDR_N_LP`), then adds `NumActiveRefLayerPics`
+    /// after the `pps_curr_pic_ref_enabled_flag` step.
+    pub fn compute(&self) -> u32 {
+        let is_idr = self.nal_unit_type == IDR_W_RADL || self.nal_unit_type == IDR_N_LP;
+        let skip_temporal_loops = self.multilayer_extension && is_idr;
+
+        let mut n: u32 = 0;
+        if !skip_temporal_loops {
+            n += self.used_by_curr_pic_s0.iter().filter(|&&v| v).count() as u32;
+            n += self.used_by_curr_pic_s1.iter().filter(|&&v| v).count() as u32;
+            n += self.used_by_curr_pic_lt.iter().filter(|&&v| v).count() as u32;
+        }
+        if self.pps_curr_pic_ref_enabled_flag {
+            n += 1;
+        }
+        if self.multilayer_extension {
+            n += self.num_active_ref_layer_pics;
+        }
+        n
     }
 }
 
@@ -1069,6 +1278,7 @@ fn consume_byte_alignment(br: &mut BitReader<'_>) -> Result<usize, SliceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sps::LongTermRefPicEntry;
 
     /// Build a minimal SPS for slice-header parsing context. Only the
     /// fields the slice parser reads are populated meaningfully; the
@@ -1882,6 +2092,291 @@ mod tests {
         let err = RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, 4)
             .expect_err("empty buffer must error");
         assert_eq!(err, SliceError::Truncated);
+    }
+
+    // --- §7.4.7.2 NumPicTotalCurr derivation ---
+
+    /// Equation 7-57 with only short-term entries: two negative pics
+    /// both used (`UsedByCurrPicS0 = [1, 1]`), one positive pic not
+    /// used (`UsedByCurrPicS1 = [0]`), and no long-term entries.
+    /// Expected: `NumPicTotalCurr = 2`.
+    #[test]
+    fn num_pic_total_curr_short_term_only() {
+        let s0 = [true, true];
+        let s1 = [false];
+        let lt: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt);
+        assert_eq!(inputs.compute(), 2);
+    }
+
+    /// Equation 7-57 with a mix of S0, S1 and long-term entries
+    /// flagged "used by current pic". Hand-derived: 2 S0 ones (3
+    /// flags, 2 set) + 1 S1 one (2 flags, 1 set) + 2 LT ones (3 flags,
+    /// 2 set) = 5.
+    #[test]
+    fn num_pic_total_curr_mixed_short_and_long_term() {
+        let s0 = [true, false, true];
+        let s1 = [true, false];
+        let lt = [true, false, true];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt);
+        assert_eq!(inputs.compute(), 5);
+    }
+
+    /// Equation 7-57 with `pps_curr_pic_ref_enabled_flag == 1` adding
+    /// the final `NumPicTotalCurr++`. With zero short-term and zero
+    /// long-term contributions, the value is exactly 1 (the IBC /
+    /// self-reference case the SCC PPS flag enables).
+    #[test]
+    fn num_pic_total_curr_curr_pic_ref_only() {
+        let s0: [bool; 0] = [];
+        let s1: [bool; 0] = [];
+        let lt: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt)
+            .with_pps_curr_pic_ref_enabled(true);
+        assert_eq!(inputs.compute(), 1);
+    }
+
+    /// Equation 7-57 with every contributing source: 1 S0 + 1 S1 +
+    /// 1 LT + `pps_curr_pic_ref_enabled_flag` = 4.
+    #[test]
+    fn num_pic_total_curr_all_contributors() {
+        let s0 = [true];
+        let s1 = [true];
+        let lt = [true];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt)
+            .with_pps_curr_pic_ref_enabled(true);
+        assert_eq!(inputs.compute(), 4);
+    }
+
+    /// Empty short-term RPS + empty long-term + no SCC self-ref =
+    /// `NumPicTotalCurr == 0`. The §7.4.7.1 conformance rule "when
+    /// the current picture contains a P or B slice, the value of
+    /// NumPicTotalCurr shall not be equal to 0" is the consumer's
+    /// responsibility — this primitive returns the literal
+    /// equation-7-57 value.
+    #[test]
+    fn num_pic_total_curr_zero_when_nothing_contributes() {
+        let s0: [bool; 0] = [];
+        let s1: [bool; 0] = [];
+        let lt: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt);
+        assert_eq!(inputs.compute(), 0);
+    }
+
+    /// Build a short-term RPS in *explicit* form with three negative
+    /// and two positive pics, then derive `NumPicTotalCurr` via
+    /// [`NumPicTotalCurrInputs::from_explicit_short_term_rps`].
+    /// Negative used flags `[1, 0, 1]` + positive `[1, 1]` + no LT =
+    /// 2 + 2 + 0 = 4.
+    #[test]
+    fn num_pic_total_curr_from_explicit_rps_builder() {
+        let rps = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: false,
+            num_negative_pics: 3,
+            num_positive_pics: 2,
+            delta_poc_s0_minus1: vec![0, 1, 2],
+            used_by_curr_pic_s0_flag: vec![true, false, true],
+            delta_poc_s1_minus1: vec![0, 1],
+            used_by_curr_pic_s1_flag: vec![true, true],
+            ..Default::default()
+        };
+        let lt: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_explicit_short_term_rps(&rps, &lt)
+            .expect("explicit RPS yields builder");
+        assert_eq!(inputs.compute(), 4);
+    }
+
+    /// The explicit-RPS builder refuses an inter-RPS-predicted RPS:
+    /// the §7.4.8 derivation (equations 7-58..7-66) must run first to
+    /// resolve the per-position `UsedByCurrPicSX` arrays, and the
+    /// result fed through [`NumPicTotalCurrInputs::from_used_flags`].
+    #[test]
+    fn num_pic_total_curr_from_explicit_rps_rejects_inter_prediction() {
+        let rps = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: true,
+            ..Default::default()
+        };
+        let lt: [bool; 0] = [];
+        assert!(NumPicTotalCurrInputs::from_explicit_short_term_rps(&rps, &lt).is_none());
+    }
+
+    /// §7.4.7.1 / §7.4.7.2 long-term resolution:
+    /// [`SliceLongTermRefPic::used_by_curr_pic_lt`] reads the SPS
+    /// table when the entry is `Sps { lt_idx_sps }`, and the in-slice
+    /// flag when the entry is `InSlice { used_by_curr_pic_lt_flag }`.
+    /// Construct an SPS with two LT entries (`[used=1, used=0]`) and
+    /// verify the SPS lookup; then verify the in-slice form.
+    #[test]
+    fn used_by_curr_pic_lt_resolves_sps_table_and_in_slice() {
+        let mut sps = ctx_sps(1, false, false, false, 16, 16, 0, 0, 4);
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 2;
+        sps.long_term_ref_pics = vec![
+            LongTermRefPicEntry {
+                poc_lsb: 0,
+                used_by_curr_pic: true,
+            },
+            LongTermRefPicEntry {
+                poc_lsb: 1,
+                used_by_curr_pic: false,
+            },
+        ];
+
+        let sps_entry_used = SliceLongTermRefPic {
+            source: SliceLongTermRefPicSource::Sps { lt_idx_sps: 0 },
+            delta_poc_msb_present_flag: false,
+            delta_poc_msb_cycle_lt: 0,
+        };
+        assert_eq!(sps_entry_used.used_by_curr_pic_lt(&sps), Some(true));
+
+        let sps_entry_unused = SliceLongTermRefPic {
+            source: SliceLongTermRefPicSource::Sps { lt_idx_sps: 1 },
+            delta_poc_msb_present_flag: false,
+            delta_poc_msb_cycle_lt: 0,
+        };
+        assert_eq!(sps_entry_unused.used_by_curr_pic_lt(&sps), Some(false));
+
+        let in_slice_used = SliceLongTermRefPic {
+            source: SliceLongTermRefPicSource::InSlice {
+                poc_lsb_lt: 7,
+                used_by_curr_pic_lt_flag: true,
+            },
+            delta_poc_msb_present_flag: false,
+            delta_poc_msb_cycle_lt: 0,
+        };
+        assert_eq!(in_slice_used.used_by_curr_pic_lt(&sps), Some(true));
+
+        // Out-of-range SPS index surfaces `None`.
+        let sps_oob = SliceLongTermRefPic {
+            source: SliceLongTermRefPicSource::Sps { lt_idx_sps: 99 },
+            delta_poc_msb_present_flag: false,
+            delta_poc_msb_cycle_lt: 0,
+        };
+        assert_eq!(sps_oob.used_by_curr_pic_lt(&sps), None);
+    }
+
+    /// End-to-end: build the long-term ref list a §7.3.6.1 slice
+    /// header would carry (one SPS-resident `used == 1` entry + one
+    /// in-slice `used == 0` entry + one in-slice `used == 1` entry),
+    /// resolve each entry's `UsedByCurrPicLt[i]`, and feed the bool
+    /// vector through equation 7-57. With empty short-term sets the
+    /// result is 2.
+    #[test]
+    fn num_pic_total_curr_from_resolved_slice_long_term_list() {
+        let mut sps = ctx_sps(1, false, false, false, 16, 16, 0, 0, 4);
+        sps.long_term_ref_pics_present_flag = true;
+        sps.num_long_term_ref_pics_sps = 1;
+        sps.long_term_ref_pics = vec![LongTermRefPicEntry {
+            poc_lsb: 0,
+            used_by_curr_pic: true,
+        }];
+
+        let slice_lt = [
+            SliceLongTermRefPic {
+                source: SliceLongTermRefPicSource::Sps { lt_idx_sps: 0 },
+                delta_poc_msb_present_flag: false,
+                delta_poc_msb_cycle_lt: 0,
+            },
+            SliceLongTermRefPic {
+                source: SliceLongTermRefPicSource::InSlice {
+                    poc_lsb_lt: 4,
+                    used_by_curr_pic_lt_flag: false,
+                },
+                delta_poc_msb_present_flag: false,
+                delta_poc_msb_cycle_lt: 0,
+            },
+            SliceLongTermRefPic {
+                source: SliceLongTermRefPicSource::InSlice {
+                    poc_lsb_lt: 8,
+                    used_by_curr_pic_lt_flag: true,
+                },
+                delta_poc_msb_present_flag: false,
+                delta_poc_msb_cycle_lt: 0,
+            },
+        ];
+        let used_lt: Vec<bool> = slice_lt
+            .iter()
+            .map(|e| e.used_by_curr_pic_lt(&sps).expect("in-range"))
+            .collect();
+        let s0: [bool; 0] = [];
+        let s1: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &used_lt);
+        assert_eq!(inputs.compute(), 2);
+    }
+
+    /// F.7.4.7.2 multilayer-extension form (equation `F-56`): when
+    /// the slice's `nal_unit_type` is IDR, the short-term and
+    /// long-term loops are SKIPPED entirely, so the count starts at 0
+    /// and only `pps_curr_pic_ref_enabled_flag` + the
+    /// `NumActiveRefLayerPics` summand contribute. Feed
+    /// `used_by_curr_pic_*` flags that would each contribute 1 under
+    /// equation 7-57 — they must be ignored.
+    #[test]
+    fn num_pic_total_curr_multilayer_skips_temporal_loops_for_idr() {
+        let s0 = [true];
+        let s1 = [true];
+        let lt = [true];
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt)
+            .with_multilayer_extension(IDR_W_RADL, 3);
+        // Skipped loops contribute 0; pps_curr_pic_ref_enabled = false;
+        // NumActiveRefLayerPics = 3.
+        assert_eq!(inputs.compute(), 3);
+
+        // Same inputs but flipping the SCC self-ref flag: +1 = 4.
+        let inputs = NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt)
+            .with_pps_curr_pic_ref_enabled(true)
+            .with_multilayer_extension(IDR_N_LP, 3);
+        assert_eq!(inputs.compute(), 4);
+    }
+
+    /// F.7.4.7.2 multilayer-extension form for a *non-IDR* slice: the
+    /// short-term and long-term loops are NOT skipped, so the count
+    /// matches the base-spec 7-57 result plus
+    /// `NumActiveRefLayerPics`.
+    /// 1 (S0) + 1 (S1) + 1 (LT) + 2 (NumActiveRefLayerPics) = 5.
+    #[test]
+    fn num_pic_total_curr_multilayer_keeps_loops_for_non_idr() {
+        let s0 = [true];
+        let s1 = [true];
+        let lt = [true];
+        // TRAIL_N (Table 7-1 value 0) is not IDR.
+        let inputs =
+            NumPicTotalCurrInputs::from_used_flags(&s0, &s1, &lt).with_multilayer_extension(0, 2);
+        assert_eq!(inputs.compute(), 5);
+    }
+
+    /// §7.3.6.1 gate sanity: `NumPicTotalCurr > 1` is the condition
+    /// under which the slice header signals `ref_pic_lists_modification()`.
+    /// Compose an explicit-form RPS that would yield exactly 1 (one
+    /// `UsedByCurrPicS0` flag set, nothing else) and confirm
+    /// `NumPicTotalCurr == 1` — the §7.3.6.1 gate would not fire.
+    /// Then compose one that yields 2 (two flags set) and confirm the
+    /// gate would fire. This is a derivation cross-check, not a
+    /// parser invocation.
+    #[test]
+    fn num_pic_total_curr_drives_section_7_3_6_1_gate() {
+        let rps_one = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: false,
+            num_negative_pics: 1,
+            num_positive_pics: 0,
+            delta_poc_s0_minus1: vec![0],
+            used_by_curr_pic_s0_flag: vec![true],
+            ..Default::default()
+        };
+        let lt: [bool; 0] = [];
+        let inputs = NumPicTotalCurrInputs::from_explicit_short_term_rps(&rps_one, &lt).unwrap();
+        assert_eq!(inputs.compute(), 1, "gate should not fire at 1");
+
+        let rps_two = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: false,
+            num_negative_pics: 2,
+            num_positive_pics: 0,
+            delta_poc_s0_minus1: vec![0, 1],
+            used_by_curr_pic_s0_flag: vec![true, true],
+            ..Default::default()
+        };
+        let inputs = NumPicTotalCurrInputs::from_explicit_short_term_rps(&rps_two, &lt).unwrap();
+        assert_eq!(inputs.compute(), 2, "gate fires at 2");
     }
 
     // --- bit-packing test helpers ---

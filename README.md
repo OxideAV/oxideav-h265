@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 15 (2026-05-26).** The prior implementation was
+**Clean-room rebuild — round 16 (2026-05-26).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,32 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 15 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 16 lands the
+§7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57), the explicit
+follow-up to round 15's standalone `RefPicListsModification` parser.
+The new [`NumPicTotalCurrInputs`] builder takes the per-position
+`UsedByCurrPicS0` / `UsedByCurrPicS1` / `UsedByCurrPicLt` flags from
+the active short-term RPS plus the slice's long-term ref list, plus
+the `pps_curr_pic_ref_enabled_flag` closing clause, and returns the
+typed `NumPicTotalCurr: u32`. A
+[`NumPicTotalCurrInputs::from_explicit_short_term_rps`] convenience
+constructor pulls the `S0` / `S1` slices straight off a
+[`ShortTermRefPicSet`] in explicit form (the inter-RPS-predicted
+form requires the §7.4.8 derivation to run first; the builder
+returns `None` and the caller threads through
+[`NumPicTotalCurrInputs::from_used_flags`]). A
+[`SliceLongTermRefPic::used_by_curr_pic_lt`] helper resolves each
+`UsedByCurrPicLt[i]` per §7.4.7.1 — SPS-table lookup for `Sps
+{ lt_idx_sps }` entries, direct flag for `InSlice` entries. The
+F.7.4.7.2 multilayer-extension form (equation F-56) is wired through
+a `with_multilayer_extension(nal_unit_type, num_active_ref_layer_pics)`
+builder method, so when the multilayer profile becomes active the
+IDR short-/long-term-loop skip plus the `NumActiveRefLayerPics`
+summand land without further surface change. The §7.3.6.1 in-place
+wiring of round 15's standalone `RefPicListsModification` parser
+remains the next round's target — the derivation itself is no
+longer the blocker.
+Round 15 had landed the
 §7.3.6.2 `ref_pic_lists_modification()` syntax structure as a
 standalone parser ([`RefPicListsModification::parse`]): the
 `ref_pic_list_modification_flag_l0` `u(1)` gate, the
@@ -31,9 +56,10 @@ sits inside the inter-slice branch), `NumPicTotalCurr <= 1` (the
 derivation of §8.3.4 stays the consumer's responsibility; the parser
 materialises only the on-wire syntax elements.
 [`slice::SliceSegmentHeader::parse`] still surfaces the inter-slice
-tail as an [`sps::OpaqueTail`] — the in-place call site needs the
-§7.4.7.2 `NumPicTotalCurr` derivation (DPB-driven), which is the
-next round's primitive.
+tail as an [`sps::OpaqueTail`] — the in-place call site is now
+unblocked but the §7.3.6.1 inter-slice body parse (pred-weight-table
++ five-or-six-more-flags + slice-data offset) is itself a separate
+round's worth of work.
 Round 14 had landed the
 §E.2.1 `vui_parameters()` body as a typed [`VuiParameters`] (see
 "Scope so far" below). Round 13 had landed the
@@ -353,6 +379,28 @@ data and CABAC remain unimplemented.
   `RefPicListTempX` derivation of §8.3.4 stays the consumer's
   responsibility; this struct surfaces only the on-wire syntax.
 
+* §7.4.7.2 [`NumPicTotalCurrInputs`] — the `NumPicTotalCurr`
+  derivation (equation 7-57) as a small typed builder. The caller
+  supplies the per-position `UsedByCurrPicS0` / `UsedByCurrPicS1` /
+  `UsedByCurrPicLt` flags from the active short-term RPS plus the
+  slice's long-term ref list and the
+  `pps_curr_pic_ref_enabled_flag` (inferred to `false` until the SCC
+  PPS extension is materialised); [`NumPicTotalCurrInputs::compute`]
+  returns the typed `NumPicTotalCurr: u32`.
+  [`NumPicTotalCurrInputs::from_explicit_short_term_rps`] pulls the
+  `S0` / `S1` slices directly off a [`ShortTermRefPicSet`] in
+  explicit form (the inter-RPS-prediction form returns `None`; the
+  §7.4.8 derivation must be run first and the result threaded
+  through [`NumPicTotalCurrInputs::from_used_flags`]). The
+  [`SliceLongTermRefPic::used_by_curr_pic_lt`] helper resolves each
+  long-term entry's `UsedByCurrPicLt[i]` per §7.4.7.1: SPS-table
+  lookup for `Sps { lt_idx_sps }` entries, direct flag for in-slice
+  entries. The F.7.4.7.2 multilayer-extension form (equation F-56)
+  is reachable through
+  [`NumPicTotalCurrInputs::with_multilayer_extension`] —
+  IDR-`nal_unit_type` slices skip the short-term / long-term loops
+  and the `NumActiveRefLayerPics` summand is added at the end.
+
 * §9.3 [`cabac`] — the CABAC arithmetic decoding engine as a
   standalone module: [`CabacEngine::new`] initializes the §9.3.2.6
   registers (`ivlCurrRange = 510`, `ivlOffset = read_bits(9)`, with
@@ -397,14 +445,16 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `hrd_parameters()` bodies are now fully decoded (round 13).
 * Slice header (§7.3.6.1) deferred body: the P/B
   `ref_pic_lists_modification()` (§7.3.6.2) /
-  `pred_weight_table()` (§7.3.6.3) sub-structures — `SliceSegmentHeader::parse`
-  still surfaces these as an opaque tail for P/B slice headers
-  because the §7.3.6.1 in-place call site needs DPB-derived
-  `NumPicTotalCurr` / `RefPicList` state. The §7.3.6.2 syntax
-  structure itself is decoded by the standalone
-  [`RefPicListsModification::parse`] (round 15); the in-place
-  integration is the next round's primitive once the §7.4.7.2
-  `NumPicTotalCurr` derivation is wired through the slice parser.
+  `pred_weight_table()` (§7.3.6.3) sub-structures —
+  `SliceSegmentHeader::parse` still surfaces these as an opaque tail
+  for P/B slice headers because the §7.3.6.1 in-place call site has
+  not yet been re-entered. The §7.3.6.2 syntax structure itself is
+  decoded by the standalone [`RefPicListsModification::parse`]
+  (round 15) and the §7.4.7.2 `NumPicTotalCurr` derivation is
+  available as [`NumPicTotalCurrInputs::compute`] (round 16); a
+  future round threads both together at the §7.3.6.1 call site (the
+  full inter-slice body also needs `pred_weight_table()` and the
+  remaining handful of post-RPS flags + slice-data offset).
   The non-IDR POC / reference-picture-set block (which previously sat
   under this bullet) is fully decoded as of round 7.
 * Slice data (§7.3.8) — the slice-data syntax-element walk that

@@ -152,13 +152,30 @@
 //!   absent fields.
 //! * §7.3.6.2 [`slice::RefPicListsModification`] — the
 //!   `ref_pic_lists_modification()` syntax structure as a standalone
-//!   parser, callable once the §7.4.7.2 `NumPicTotalCurr` derivation
-//!   is wired through the slice path. The parser walks the
+//!   parser. The parser walks the
 //!   `ref_pic_list_modification_flag_lX` `u(1)` gates and the
 //!   `list_entry_lX[]` `u(v)` loops (each entry
 //!   `Ceil( Log2( NumPicTotalCurr ) )` bits wide and range-checked
 //!   per §7.4.7.2); the implicit `RefPicListTempX` derivation of
 //!   §8.3.4 stays the consumer's responsibility.
+//! * §7.4.7.2 [`slice::NumPicTotalCurrInputs`] — the
+//!   `NumPicTotalCurr` derivation (equation 7-57) as a small typed
+//!   builder taking the per-position `UsedByCurrPicS0` /
+//!   `UsedByCurrPicS1` / `UsedByCurrPicLt` flags from the active
+//!   short-term RPS + the slice's long-term ref list and the
+//!   `pps_curr_pic_ref_enabled_flag` closing-clause flag, returning
+//!   the typed `NumPicTotalCurr: u32`. A
+//!   [`slice::NumPicTotalCurrInputs::from_explicit_short_term_rps`]
+//!   convenience constructor sources `S0` / `S1` straight off an
+//!   explicit-form [`sps::ShortTermRefPicSet`]; the
+//!   inter-RPS-prediction form needs the §7.4.8 derivation to run
+//!   first.
+//!   [`slice::SliceLongTermRefPic::used_by_curr_pic_lt`] resolves
+//!   each long-term entry's `UsedByCurrPicLt[i]` per §7.4.7.1
+//!   (SPS-table lookup for SPS-resident entries, direct flag for
+//!   in-slice entries). The F.7.4.7.2 multilayer-extension form
+//!   (equation F-56) is reachable through
+//!   [`slice::NumPicTotalCurrInputs::with_multilayer_extension`].
 //!
 //! See [`nal`] for the byte-stream walker entry points, [`vps`] for
 //! the parsed VPS structure, [`sps`] for the parsed SPS, [`pps`]
@@ -197,9 +214,9 @@ pub use scan::{
     horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
 };
 pub use slice::{
-    EntryPointOffsets, RefPicListsModification, SliceDeblocking, SliceError, SliceLongTermRefPic,
-    SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL,
-    RSV_IRAP_VCL23,
+    EntryPointOffsets, NumPicTotalCurrInputs, RefPicListsModification, SliceDeblocking, SliceError,
+    SliceLongTermRefPic, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP,
+    IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,

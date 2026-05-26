@@ -6,6 +6,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 16 (2026-05-26)
+
+- §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57) as a new
+  typed builder ([`slice::NumPicTotalCurrInputs`]):
+  - [`slice::NumPicTotalCurrInputs::from_used_flags`] takes
+    pre-resolved per-position `UsedByCurrPicS0` / `UsedByCurrPicS1` /
+    `UsedByCurrPicLt` slices; [`slice::NumPicTotalCurrInputs::compute`]
+    returns the typed `NumPicTotalCurr: u32`.
+  - [`slice::NumPicTotalCurrInputs::from_explicit_short_term_rps`]
+    sources the `S0` / `S1` slices straight off an explicit-form
+    [`sps::ShortTermRefPicSet`] (equations 7-65 / 7-66); returns
+    `None` for inter-RPS-predicted RPS sets (the §7.4.8 derivation
+    must run first).
+  - Builder methods
+    [`slice::NumPicTotalCurrInputs::with_pps_curr_pic_ref_enabled`]
+    (the SCC PPS closing-clause flag — inferred `false` until the
+    SCC PPS extension is materialised) and
+    [`slice::NumPicTotalCurrInputs::with_multilayer_extension`]
+    (the F.7.4.7.2 equation `F-56` form — IDR `nal_unit_type` skips
+    the short-term / long-term loops; `NumActiveRefLayerPics` is
+    added at the end).
+- §7.4.7.1 long-term resolution helper
+  ([`slice::SliceLongTermRefPic::used_by_curr_pic_lt`]) — looks up
+  `used_by_curr_pic_lt_sps_flag[ lt_idx_sps[i] ]` for
+  SPS-resident entries against `sps.long_term_ref_pics`, and returns
+  `used_by_curr_pic_lt_flag[i]` for in-slice entries. Returns `None`
+  when the SPS-table index is out of range (bitstream-conformance
+  failure).
+- Public re-export: [`slice::NumPicTotalCurrInputs`] added to the
+  crate root.
+- [`slice::SliceSegmentHeader::parse`] still surfaces the inter-slice
+  tail as an opaque tail — the §7.3.6.1 in-place call site is now
+  unblocked (round 15's `RefPicListsModification::parse` + this
+  round's `NumPicTotalCurr` derivation are both in place) but the
+  full inter-slice body parse (the `pred_weight_table()` + the
+  remaining handful of post-RPS flags + the slice-data offset) is a
+  separate round's worth of work.
+- 12 spec-pinned unit tests:
+  `num_pic_total_curr_short_term_only`,
+  `num_pic_total_curr_mixed_short_and_long_term`,
+  `num_pic_total_curr_curr_pic_ref_only`,
+  `num_pic_total_curr_all_contributors`,
+  `num_pic_total_curr_zero_when_nothing_contributes`,
+  `num_pic_total_curr_from_explicit_rps_builder`,
+  `num_pic_total_curr_from_explicit_rps_rejects_inter_prediction`,
+  `used_by_curr_pic_lt_resolves_sps_table_and_in_slice`,
+  `num_pic_total_curr_from_resolved_slice_long_term_list`,
+  `num_pic_total_curr_multilayer_skips_temporal_loops_for_idr`,
+  `num_pic_total_curr_multilayer_keeps_loops_for_non_idr`,
+  `num_pic_total_curr_drives_section_7_3_6_1_gate`. Test count
+  160 → 172.
+
 ### Added — clean-room rebuild round 15 (2026-05-26)
 
 - §7.3.6.2 `ref_pic_lists_modification()` syntax structure decoded by
