@@ -6,6 +6,70 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 21 (2026-05-27)
+
+- §7.3.6.3 `pred_weight_table()` decoded **in place** at the §7.3.6.1
+  slice-header call site (closing the last r20 deferral point for the
+  universal base-profile single-layer case). When the §7.3.6.1 outer
+  gate is statically present
+  (`(pps.weighted_pred_flag && slice_type == P)` or
+  `(pps.weighted_bipred_flag && slice_type == B)`), the parser
+  constructs a `PredWeightTableInputs::base_profile` from the
+  post-override `num_ref_idx_lX_active_minus1`, the SPS-derived
+  `ChromaArrayType` (per §7.4.2.2: `chroma_format_idc` unless
+  `separate_colour_plane_flag == 1`), and the SPS bit depths, then
+  invokes the standalone [`PredWeightTable::parse`] (round 17) and
+  continues through the rest of the inter-slice tail to
+  `byte_alignment()`. The base-profile constructor treats every per-i
+  §7.3.6.3 outer-gate decision
+  (`pic_layer_id != nuh_layer_id ||
+  PicOrderCnt(RefPicListX[i]) != PicOrderCnt(CurrPic)`) as `true`,
+  which is the universal correct value for any single-layer slice:
+  every active reference in a single-layer stream is an earlier-POC
+  temporal picture (i.e. a different picture). The per-i gate slots
+  stay open on `PredWeightTableInputs` for the eventual SCC
+  self-reference / inter-layer ref-layer cases, which will be threaded
+  through this call site once the SPS multilayer / SCC extensions are
+  surfaced (currently they are surfaced as opaque tails). A new
+  `SliceSegmentHeader::pred_weight_table: Option<PredWeightTable>`
+  field exposes the decoded table (`None` for I slices, dependent
+  slice segments, for headers whose parse stopped at a prior
+  deferral, and when the gate is statically absent). §7.4.7.3 range
+  failures inside the in-place parse propagate directly out of
+  `SliceSegmentHeader::parse` as `SliceError::ValueOutOfRange`.
+
+- With the in-place call site wired up, every weighted-pred-gated
+  P / B independent slice segment in the crate's currently surfaced
+  configuration (no SPS range / multilayer / SCC extensions) now
+  parses end to end through `byte_alignment()`. The
+  `SliceSegmentHeader::opaque_tail` deferral remains only for the
+  `pps.lists_modification_present_flag == 1` path, where the
+  §7.3.6.2 `ref_pic_lists_modification()` body still needs the
+  §7.4.7.2 `NumPicTotalCurr` derivation threaded through the slice
+  parser (the next round's target).
+
+### Changed — clean-room rebuild round 21 (2026-05-27)
+
+- The eight pre-round `slice::tests` units that exercised the
+  post-override walk with `pps.weighted_pred_flag = true` or
+  `pps.weighted_bipred_flag = true` are updated to consume their
+  `pred_weight_table()` bodies in place (minimal "all flags off"
+  payloads sized per the active `num_ref_idx_lX_active_minus1`)
+  and assert `opaque_tail.is_none()`. The deferred-at-PWT-gate
+  scenario no longer exists for these tests.
+
+- Three new `slice::tests` units cover the in-place behaviour: the
+  universal base-profile P-slice walk with a non-trivial
+  `delta_luma_weight_l0` (verifies the §7.4.7.3 derived
+  `LumaWeightL0[0] = (1 << 2) + 5 = 9` via
+  `PredWeightTable::luma_weight_l0`); a B-slice walk with an L1
+  chroma sub-block + non-trivial `delta_chroma_weight_l1` /
+  `delta_chroma_offset_l1` (verifies the equation 7-58
+  `ChromaOffsetL1[0][j]` derivation with `WpOffsetHalfRangeC = 128`);
+  and a `delta_luma_weight_l0 = 128` range-failure propagation test
+  (the in-place call site surfaces the same
+  `SliceError::ValueOutOfRange` as the standalone parser).
+
 ### Added — clean-room rebuild round 20 (2026-05-27)
 
 - §7.3.6.1 inter-slice `five_minus_max_num_merge_cand` (`ue(v)`) decoded

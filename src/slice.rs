@@ -1345,6 +1345,23 @@ pub struct SliceSegmentHeader {
     /// `pps.weighted_pred_flag && slice_type == P` or
     /// `pps.weighted_bipred_flag && slice_type == B` is true).
     pub five_minus_max_num_merge_cand: Option<u32>,
+    /// Decoded `pred_weight_table()` (§7.3.6.3) when the §7.3.6.1 outer
+    /// gate is statically present
+    /// (`(pps.weighted_pred_flag && slice_type == P) ||
+    /// (pps.weighted_bipred_flag && slice_type == B)`). `None` when the
+    /// outer gate is statically absent (the table is not signalled), for
+    /// I slices, for dependent slice segments, and for headers whose
+    /// parse stopped before this point.
+    ///
+    /// The in-place call uses the base-profile single-layer assumption
+    /// for every per-i §7.3.6.3 outer-gate decision (universally `true`)
+    /// — see [`PredWeightTableInputs::base_profile`]. Single-layer base
+    /// profile is the only configuration this crate currently surfaces;
+    /// the multilayer Annex F / SCC self-reference cases need the SPS
+    /// range / multilayer / SCC extensions and the DPB to be wired up,
+    /// at which point the in-place call site here will be widened to
+    /// thread per-i gate decisions through.
+    pub pred_weight_table: Option<PredWeightTable>,
     /// `slice_qp_delta` (`se(v)`). `None` when the parser stopped before
     /// reaching it (a deferred non-IDR or P/B body).
     pub slice_qp_delta: Option<i32>,
@@ -1571,6 +1588,7 @@ impl SliceSegmentHeader {
                 collocated_from_l0_flag: None,
                 collocated_ref_idx: None,
                 five_minus_max_num_merge_cand: None,
+                pred_weight_table: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1692,6 +1710,7 @@ impl SliceSegmentHeader {
                 collocated_from_l0_flag: None,
                 collocated_ref_idx: None,
                 five_minus_max_num_merge_cand: None,
+                pred_weight_table: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
@@ -1785,55 +1804,46 @@ impl SliceSegmentHeader {
 
         // §7.3.6.1 P / B `pred_weight_table()` gate. The table is
         // signalled iff either `(weighted_pred_flag && slice_type == P)`
-        // or `(weighted_bipred_flag && slice_type == B)`. When the table
-        // is statically absent at the gate the parser walks straight
-        // past it into the merge-candidate block; when it is present the
-        // body needs the per-i §7.3.6.3 outer-gate decisions
-        // (`pic_layer_id != nuh_layer_id || PicOrderCnt(...)`) which are
-        // a DPB-derived input the slice parser does not yet thread
-        // through, so the parser defers at the weighted-pred gate.
+        // or `(weighted_bipred_flag && slice_type == B)`. When the gate
+        // is statically absent the parser walks straight past it into
+        // the merge-candidate block; when it is present the standalone
+        // [`PredWeightTable::parse`] is invoked in place with the
+        // base-profile single-layer assumption (every per-i §7.3.6.3
+        // outer gate `true` — see [`PredWeightTableInputs::base_profile`]).
+        // This is the only single-layer configuration this crate
+        // currently surfaces: the SPS range / multilayer / SCC
+        // extensions are not yet wired through, so the bit-depth
+        // arguments fall back to the SPS `BitDepthY` / `BitDepthC`
+        // (`WpOffsetHalfRangeY` = `WpOffsetHalfRangeC` = 128 per §7.4.7.3
+        // because `high_precision_offsets_enabled_flag` defaults to 0).
+        // The per-i outer-gate decisions, when needed for the
+        // multilayer-extension / SCC self-reference cases, will be
+        // threaded through here once those extensions are surfaced.
         let weighted_pred_table_present = (pps.weighted_pred_flag && matches!(st, SliceType::P))
             || (pps.weighted_bipred_flag && matches!(st, SliceType::B));
-        if weighted_pred_table_present {
-            return Ok(Self {
-                first_slice_segment_in_pic_flag,
-                no_output_of_prior_pics_flag,
-                slice_pic_parameter_set_id,
-                dependent_slice_segment_flag,
-                slice_segment_address,
-                slice_reserved_flags,
-                slice_type,
-                pic_output_flag,
-                colour_plane_id,
-                slice_pic_order_cnt_lsb,
-                short_term_ref_pic_set_sps_flag,
-                inline_short_term_ref_pic_set,
-                short_term_ref_pic_set_idx,
-                num_long_term_sps,
-                num_long_term_pics,
-                long_term_ref_pics,
-                slice_temporal_mvp_enabled_flag,
-                slice_sao_luma_flag,
-                slice_sao_chroma_flag,
-                num_ref_idx_active_override_flag,
-                num_ref_idx_l0_active_minus1,
-                num_ref_idx_l1_active_minus1,
-                mvd_l1_zero_flag,
-                cabac_init_flag,
-                collocated_from_l0_flag,
-                collocated_ref_idx,
-                five_minus_max_num_merge_cand: None,
-                slice_qp_delta: None,
-                slice_cb_qp_offset: 0,
-                slice_cr_qp_offset: 0,
-                deblocking: None,
-                slice_loop_filter_across_slices_enabled_flag: None,
-                entry_point_offsets: None,
-                slice_segment_header_extension_length: None,
-                byte_offset_to_slice_data: None,
-                opaque_tail: Some(OpaqueTail::capture_at(br.bit_pos(), rbsp)),
-            });
-        }
+        let pred_weight_table = if weighted_pred_table_present {
+            // Resolve the active L0 / L1 cardinalities the table parser
+            // needs. Both have been populated by the override block
+            // above (§7.4.7.1 inference fills L0 for P/B and L1 for B
+            // when override == 0).
+            let n0 = num_ref_idx_l0_active_minus1.expect("L0 active populated for inter");
+            let n1 = if matches!(st, SliceType::B) {
+                num_ref_idx_l1_active_minus1.expect("L1 active populated for B")
+            } else {
+                0
+            };
+            let inputs = PredWeightTableInputs::base_profile(
+                st,
+                n0,
+                n1,
+                chroma_array_type(sps),
+                sps.bit_depth_luma(),
+                sps.bit_depth_chroma(),
+            );
+            Some(PredWeightTable::parse(&mut br, &inputs)?)
+        } else {
+            None
+        };
 
         // §7.3.6.1 `five_minus_max_num_merge_cand` (ue(v)), signalled
         // for every inter slice immediately after the (optional)
@@ -1957,6 +1967,7 @@ impl SliceSegmentHeader {
             collocated_from_l0_flag,
             collocated_ref_idx,
             five_minus_max_num_merge_cand,
+            pred_weight_table,
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,
             slice_cr_qp_offset,
@@ -2577,14 +2588,18 @@ mod tests {
     /// default, traverses the §7.3.6.1 mvd / cabac-init / collocated
     /// block (with `mvd` absent for P, `cabac_init_flag` inferred
     /// `false` per §7.4.7.1, and the collocated block absent because
-    /// `slice_temporal_mvp_enabled_flag == 0`), and then defers at
-    /// the §7.3.6.3 `pred_weight_table()` gate because the table is
-    /// statically present (`weighted_pred_flag && slice_type == P`).
-    /// Zero further bits are consumed past the override flag, so the
-    /// opaque tail begins at the weighted-prediction-table gate one
-    /// bit after the override flag (byte 1, bit 1).
+    /// `slice_temporal_mvp_enabled_flag == 0`), and then decodes
+    /// `pred_weight_table()` in place (the §7.3.6.3 gate is statically
+    /// present because `weighted_pred_flag && slice_type == P`).
+    /// `ctx_sps` keeps `chroma_format_idc == 1` (4:2:0) so the chroma
+    /// sub-block is present, and the PPS default
+    /// `num_ref_idx_l0_default_active_minus1 == 0` (single L0 entry)
+    /// keeps the per-i loop to one iteration. The minimal table payload
+    /// here sets every flag off so the L0 entry's weight / offset
+    /// remain at their §7.4.7.3 inferred defaults; the parser then
+    /// walks the full inter-slice tail through `byte_alignment()`.
     #[test]
-    fn defers_pb_ref_list_body() {
+    fn parses_pb_with_weighted_pred_table_in_place() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         pps.weighted_pred_flag = true;
@@ -2596,7 +2611,15 @@ mod tests {
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
             (0, 1),     // num_ref_idx_active_override_flag = 0
-            (0b1, 1),   // first deferred bit, captured opaquely
+            // §7.3.6.3 pred_weight_table() — minimal "all flags 0" body.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0] = 0
+            (0, 1),   // chroma_weight_l0_flag[0] = 0
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2618,23 +2641,32 @@ mod tests {
         assert_eq!(sh.cabac_init_flag, Some(false));
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
-        // Defer at the weighted-pred-table gate (statically present
-        // for this slice).
-        assert_eq!(sh.five_minus_max_num_merge_cand, None);
-        assert!(sh.opaque_tail.is_some());
-        assert_eq!(sh.slice_qp_delta, None);
-        // Opaque tail begins at the weighted-pred gate one bit after
-        // the override flag (byte 1, bit 1).
-        let tail = sh.opaque_tail.unwrap();
-        assert_eq!(tail.start_bit_in_first_byte, 1);
+        // pred_weight_table parsed in place — single L0 entry, all
+        // flags off.
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.luma_log2_weight_denom, 0);
+        assert_eq!(pwt.delta_chroma_log2_weight_denom, 0);
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert!(!pwt.entries_l0[0].luma_weight_flag);
+        assert!(!pwt.entries_l0[0].chroma_weight_flag);
+        // P slice → L1 block is empty.
+        assert!(pwt.entries_l1.is_empty());
+        // Parser walked the rest of the tail past byte_alignment.
+        assert_eq!(sh.five_minus_max_num_merge_cand, Some(0));
+        assert_eq!(sh.max_num_merge_cand(), Some(5));
+        assert_eq!(sh.slice_qp_delta, Some(0));
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
     }
 
     /// IDR P-slice with `num_ref_idx_active_override_flag == 1` and an
     /// explicitly signalled `num_ref_idx_l0_active_minus1 == 1`. P
     /// slices never signal L1; verify the parser materialises the
-    /// override flag and the explicit L0 value, leaves L1 absent, and
-    /// defers at the §7.3.6.3 `pred_weight_table()` gate (kept present
-    /// here via `pps.weighted_pred_flag = true`).
+    /// override flag and the explicit L0 value, leaves L1 absent,
+    /// decodes a two-entry `pred_weight_table()` in place (the §7.3.6.3
+    /// gate is statically present here via `pps.weighted_pred_flag =
+    /// true`), and walks the rest of the inter-slice tail through
+    /// `byte_alignment()`.
     #[test]
     fn parses_pb_override_with_explicit_l0() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
@@ -2649,23 +2681,37 @@ mod tests {
             (1, 1),     // sao_chroma
             (1, 1),     // num_ref_idx_active_override_flag = 1
             (0b010, 3), // num_ref_idx_l0_active_minus1 ue(v) -> 1
-            (0b1, 1),   // first deferred bit, captured opaquely
+            // pred_weight_table() — 2 L0 entries, all flags 0.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l0_flag[1]
+            (0, 1),   // chroma_weight_l0_flag[1]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
         assert_eq!(sh.num_ref_idx_active_override_flag, Some(true));
         assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(1));
         assert_eq!(sh.num_ref_idx_l1_active_minus1, None);
-        assert!(sh.opaque_tail.is_some());
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 2);
+        assert!(pwt.entries_l1.is_empty());
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR B-slice with `num_ref_idx_active_override_flag == 1`:
     /// verifies that both `num_ref_idx_l0_active_minus1` and
-    /// `num_ref_idx_l1_active_minus1` are read for a B slice. The
-    /// `mvd_l1_zero_flag` / collocated walk is exercised so the bit
-    /// stream reaches the §7.3.6.3 `pred_weight_table()` gate (kept
-    /// present here via `pps.weighted_bipred_flag = true`) where the
-    /// parser defers.
+    /// `num_ref_idx_l1_active_minus1` are read for a B slice, the
+    /// `mvd_l1_zero_flag` is consumed, and the in-place
+    /// `pred_weight_table()` body (gate statically present via
+    /// `pps.weighted_bipred_flag = true`) decodes both L0 and L1
+    /// per-entry flag passes; the parser then walks the rest of the
+    /// inter-slice tail through `byte_alignment()`.
     #[test]
     fn parses_b_slice_override_with_both_lists() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
@@ -2682,7 +2728,23 @@ mod tests {
             (0b011, 3), // num_ref_idx_l0_active_minus1 ue(v) -> 2
             (0b010, 3), // num_ref_idx_l1_active_minus1 ue(v) -> 1
             (1, 1),     // mvd_l1_zero_flag = 1
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — L0 has 3 entries, L1 has 2 entries.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l0_flag[1]
+            (0, 1),   // chroma_weight_l0_flag[1]
+            (0, 1),   // luma_weight_l0_flag[2]
+            (0, 1),   // chroma_weight_l0_flag[2]
+            (0, 1),   // luma_weight_l1_flag[0]
+            (0, 1),   // chroma_weight_l1_flag[0]
+            (0, 1),   // luma_weight_l1_flag[1]
+            (0, 1),   // chroma_weight_l1_flag[1]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2690,14 +2752,19 @@ mod tests {
         assert_eq!(sh.num_ref_idx_active_override_flag, Some(true));
         assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(2));
         assert_eq!(sh.num_ref_idx_l1_active_minus1, Some(1));
-        assert!(sh.opaque_tail.is_some());
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 3);
+        assert_eq!(pwt.entries_l1.len(), 2);
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR B-slice with `num_ref_idx_active_override_flag == 0`: §7.4.7.1
     /// must infer BOTH L0 and L1 defaults from the PPS. The parser
-    /// reads through the mvd / cabac / collocated block and defers at
-    /// the §7.3.6.3 `pred_weight_table()` gate (kept present here via
-    /// `pps.weighted_bipred_flag = true`).
+    /// reads through the mvd / cabac / collocated block, decodes the
+    /// in-place `pred_weight_table()` (gate present via
+    /// `pps.weighted_bipred_flag = true`) with a single L0 / L1 entry
+    /// each (the PPS defaults), then walks the rest of the tail to
+    /// `byte_alignment()`.
     #[test]
     fn b_slice_override_zero_infers_both_defaults() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
@@ -2712,7 +2779,18 @@ mod tests {
             (1, 1),   // sao_chroma
             (0, 1),   // num_ref_idx_active_override_flag = 0
             (1, 1),   // mvd_l1_zero_flag = 1
-            (0b1, 1), // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 1 L0 + 1 L1 entry (defaults), all
+            // flags 0.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l1_flag[0]
+            (0, 1),   // chroma_weight_l1_flag[0]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2726,6 +2804,10 @@ mod tests {
             sh.num_ref_idx_l1_active_minus1,
             Some(pps.num_ref_idx_l1_default_active_minus1)
         );
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert_eq!(pwt.entries_l1.len(), 1);
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR B-slice with `pps.lists_modification_present_flag == 0`
@@ -2752,7 +2834,21 @@ mod tests {
             (0b010, 3), // num_ref_idx_l0_active_minus1 ue -> 1
             (0b010, 3), // num_ref_idx_l1_active_minus1 ue -> 1
             (1, 1),     // mvd_l1_zero_flag = 1
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 2 L0 + 2 L1 entries, all flags 0.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l0_flag[1]
+            (0, 1),   // chroma_weight_l0_flag[1]
+            (0, 1),   // luma_weight_l1_flag[0]
+            (0, 1),   // chroma_weight_l1_flag[0]
+            (0, 1),   // luma_weight_l1_flag[1]
+            (0, 1),   // chroma_weight_l1_flag[1]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2762,7 +2858,10 @@ mod tests {
         // mvp off → entire collocated block absent.
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
-        assert!(sh.opaque_tail.is_some());
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 2);
+        assert_eq!(pwt.entries_l1.len(), 2);
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR P-slice with `pps.cabac_init_present_flag == 1`: the cabac-
@@ -2784,7 +2883,15 @@ mod tests {
             (1, 1),     // sao_chroma
             (0, 1),     // num_ref_idx_active_override_flag = 0
             (1, 1),     // cabac_init_flag = 1
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 1 L0 entry, all flags 0.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2794,6 +2901,8 @@ mod tests {
         // mvp off → entire collocated block absent.
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
+        assert!(sh.pred_weight_table.is_some());
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 0`
@@ -2817,7 +2926,15 @@ mod tests {
             (1, 1),     // sao_chroma
             (1, 1),     // num_ref_idx_active_override_flag = 1
             (0b1, 1),   // num_ref_idx_l0_active_minus1 ue -> 0
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 1 L0 entry.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2827,6 +2944,8 @@ mod tests {
         // L0 has a single entry (active_minus1 == 0) → ref_idx absent,
         // inferred to 0.
         assert_eq!(sh.collocated_ref_idx, Some(0));
+        assert!(sh.pred_weight_table.is_some());
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 2`
@@ -2848,7 +2967,19 @@ mod tests {
             (1, 1),     // num_ref_idx_active_override_flag = 1
             (0b011, 3), // num_ref_idx_l0_active_minus1 ue -> 2
             (0b010, 3), // collocated_ref_idx ue -> 1
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 3 L0 entries.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l0_flag[1]
+            (0, 1),   // chroma_weight_l0_flag[1]
+            (0, 1),   // luma_weight_l0_flag[2]
+            (0, 1),   // chroma_weight_l0_flag[2]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2856,6 +2987,9 @@ mod tests {
         // P slice + mvp on: §7.4.7.1 infers collocated_from_l0 = 1.
         assert_eq!(sh.collocated_from_l0_flag, Some(true));
         assert_eq!(sh.collocated_ref_idx, Some(1));
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 3);
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// IDR B-slice with `mvp == 1`, `collocated_from_l0_flag = 0` (L1
@@ -2880,7 +3014,19 @@ mod tests {
             (0, 1),     // mvd_l1_zero_flag = 0
             (0, 1),     // collocated_from_l0_flag = 0
             (0b010, 3), // collocated_ref_idx ue -> 1
-            (0b1, 1),   // first deferred bit (weighted-pred gate)
+            // pred_weight_table() — 1 L0 + 2 L1 entries, all flags 0.
+            (0b1, 1), // luma_log2_weight_denom ue -> 0
+            (0b1, 1), // delta_chroma_log2_weight_denom se -> 0
+            (0, 1),   // luma_weight_l0_flag[0]
+            (0, 1),   // chroma_weight_l0_flag[0]
+            (0, 1),   // luma_weight_l1_flag[0]
+            (0, 1),   // chroma_weight_l1_flag[0]
+            (0, 1),   // luma_weight_l1_flag[1]
+            (0, 1),   // chroma_weight_l1_flag[1]
+            (0b1, 1), // five_minus_max_num_merge_cand ue -> 0
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
@@ -2889,6 +3035,10 @@ mod tests {
         // L1 active_minus1 == 1 → 2 entries; ref_idx = 1 indexes the
         // second entry, in range.
         assert_eq!(sh.collocated_ref_idx, Some(1));
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert_eq!(pwt.entries_l1.len(), 2);
+        assert!(sh.opaque_tail.is_none());
     }
 
     /// `collocated_ref_idx` overflow check: a value > the active
@@ -3048,6 +3198,161 @@ mod tests {
         assert_eq!(sh.max_num_merge_cand(), Some(5));
         assert_eq!(sh.slice_qp_delta, Some(-1));
         assert!(sh.opaque_tail.is_none());
+    }
+
+    /// IDR P-slice with `pps.weighted_pred_flag == 1` and a non-trivial
+    /// `pred_weight_table()` body (single L0 entry, `luma_log2_weight_denom
+    /// == 2`, `luma_weight_l0_flag == 1`, `delta_luma_weight_l0[0] == 5`,
+    /// `luma_offset_l0[0] == 0`; chroma flag off). Verifies the in-place
+    /// PWT decode resolves the §7.4.7.3 derived `LumaWeightL0[0] = (1 <<
+    /// 2) + 5 = 9` correctly and the parser continues to walk the rest
+    /// of the inter-slice tail through `byte_alignment()`.
+    #[test]
+    fn parses_p_slice_in_place_pwt_resolves_luma_weight() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
+        let mut fields: Vec<(u32, u8)> = vec![
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0 → L0 = PPS default (0)
+        ];
+        // pred_weight_table()
+        fields.push(ue_codeword(2)); // luma_log2_weight_denom = 2
+        fields.push(se_codeword(0)); // delta_chroma_log2_weight_denom = 0
+        fields.push((1, 1)); // luma_weight_l0_flag[0]
+        fields.push((0, 1)); // chroma_weight_l0_flag[0]
+        fields.push(se_codeword(5)); // delta_luma_weight_l0[0]
+        fields.push(se_codeword(0)); // luma_offset_l0[0]
+                                     // Inter-slice tail
+        fields.push(ue_codeword(0)); // five_minus_max_num_merge_cand
+        fields.push(se_codeword(0)); // slice_qp_delta
+        fields.push((1, 1)); // slice_loop_filter_across_slices_enabled_flag
+        fields.push((1, 1)); // byte_alignment '1'
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::P));
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.luma_log2_weight_denom, 2);
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert!(pwt.entries_l0[0].luma_weight_flag);
+        assert!(!pwt.entries_l0[0].chroma_weight_flag);
+        assert_eq!(pwt.entries_l0[0].delta_luma_weight, 5);
+        // §7.4.7.3 derived LumaWeightL0[0] = (1 << 2) + 5 = 9.
+        assert_eq!(pwt.luma_weight_l0(0), Some(9));
+        // The chroma flag is off → derived ChromaWeightL0[0][j] = 1 <<
+        // ChromaLog2WeightDenom = 1 << 2 = 4 (inferred form).
+        assert_eq!(pwt.chroma_weight_l0(0, 0), Some(4));
+        // ChromaOffsetL0[0][j] inferred to 0 when the chroma flag is off.
+        assert_eq!(pwt.chroma_offset_l0(0, 0, 128), Some(0));
+        // Header walked to byte_alignment.
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// IDR B-slice with `pps.weighted_bipred_flag == 1` and a
+    /// `pred_weight_table()` body that carries an L1 chroma weight +
+    /// offset delta. Verifies the in-place call site populates both L0
+    /// and L1 entries, the chroma sub-block on L1 is parsed, and the
+    /// derived `ChromaWeightL1` / `ChromaOffsetL1` resolve correctly.
+    #[test]
+    fn parses_b_slice_in_place_pwt_resolves_l1_chroma() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_bipred_flag = true;
+        let mut fields: Vec<(u32, u8)> = vec![
+            (1, 1),   // first
+            (0, 1),   // no_output (IDR)
+            (0b1, 1), // pps_id ue -> 0
+            (0b1, 1), // slice_type ue -> B
+            (1, 1),   // sao_luma
+            (1, 1),   // sao_chroma
+            (0, 1),   // num_ref_idx_active_override_flag = 0
+            (1, 1),   // mvd_l1_zero_flag = 1
+        ];
+        // pred_weight_table() — 1 L0 + 1 L1 entry.
+        fields.push(ue_codeword(1)); // luma_log2_weight_denom = 1
+        fields.push(se_codeword(1)); // delta_chroma_log2_weight_denom = 1 → ChromaLog2WeightDenom = 2
+        fields.push((0, 1)); // luma_weight_l0_flag[0]
+        fields.push((0, 1)); // chroma_weight_l0_flag[0]
+        fields.push((0, 1)); // luma_weight_l1_flag[0]
+        fields.push((1, 1)); // chroma_weight_l1_flag[0] = 1
+        fields.push(se_codeword(2)); // delta_chroma_weight_l1[0][0] = 2
+        fields.push(se_codeword(-1)); // delta_chroma_offset_l1[0][0] = -1
+        fields.push(se_codeword(-3)); // delta_chroma_weight_l1[0][1] = -3
+        fields.push(se_codeword(0)); // delta_chroma_offset_l1[0][1] = 0
+                                     // Inter-slice tail
+        fields.push(ue_codeword(0)); // five_minus_max_num_merge_cand
+        fields.push(se_codeword(0)); // slice_qp_delta
+        fields.push((1, 1)); // slice_loop_filter_across_slices_enabled_flag
+        fields.push((1, 1)); // byte_alignment '1'
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::B));
+        let pwt = sh.pred_weight_table.as_ref().expect("PWT decoded in place");
+        assert_eq!(pwt.luma_log2_weight_denom, 1);
+        assert_eq!(pwt.chroma_log2_weight_denom(), 2);
+        assert_eq!(pwt.entries_l0.len(), 1);
+        assert_eq!(pwt.entries_l1.len(), 1);
+        assert!(!pwt.entries_l1[0].luma_weight_flag);
+        assert!(pwt.entries_l1[0].chroma_weight_flag);
+        assert_eq!(pwt.entries_l1[0].delta_chroma_weight, [2, -3]);
+        assert_eq!(pwt.entries_l1[0].delta_chroma_offset, [-1, 0]);
+        // §7.4.7.3 derived ChromaWeightL1[0][j] = (1 << 2) + delta:
+        //   j=0: 4 + 2 = 6;  j=1: 4 + (-3) = 1.
+        assert_eq!(pwt.chroma_weight_l1(0, 0), Some(6));
+        assert_eq!(pwt.chroma_weight_l1(0, 1), Some(1));
+        // Equation 7-58 with WpOffsetHalfRangeC = 128 (base-profile bit
+        // depths, high_precision_offsets_enabled_flag = 0):
+        //   j=0: 128 + (-1) - ((128 * 6) >> 2) = 127 - 192 = -65.
+        //   j=1: 128 + 0    - ((128 * 1) >> 2) = 128 - 32  =  96.
+        assert_eq!(pwt.chroma_offset_l1(0, 0, 128), Some(-65));
+        assert_eq!(pwt.chroma_offset_l1(0, 1, 128), Some(96));
+        // L0 chroma flag was off → inferred ChromaWeightL0[0][j] = 4.
+        assert_eq!(pwt.chroma_weight_l0(0, 0), Some(4));
+        assert!(sh.opaque_tail.is_none());
+    }
+
+    /// A `pred_weight_table()` body that violates the §7.4.7.3 range
+    /// bound on `delta_luma_weight_l0` (out-of-range value 128) surfaces
+    /// from the in-place call site as the same
+    /// [`SliceError::ValueOutOfRange`] the standalone parser raises —
+    /// the failure must propagate from `SliceSegmentHeader::parse`.
+    #[test]
+    fn in_place_pwt_propagates_range_error() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.weighted_pred_flag = true;
+        let mut fields: Vec<(u32, u8)> = vec![
+            (1, 1),     // first
+            (0, 1),     // no_output (IDR)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0 → L0 default = 0
+        ];
+        fields.push(ue_codeword(0)); // luma_log2_weight_denom = 0
+        fields.push(se_codeword(0)); // delta_chroma_log2_weight_denom = 0
+        fields.push((1, 1)); // luma_weight_l0_flag[0]
+        fields.push((0, 1)); // chroma_weight_l0_flag[0]
+        fields.push(se_codeword(128)); // delta_luma_weight_l0[0] = 128 (out of range)
+        let bits = concat_bits(&fields);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).unwrap_err();
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "delta_luma_weight_l0",
+                got: 128,
+            }
+        );
     }
 
     /// `five_minus_max_num_merge_cand > 4` is a §7.4.7.1 conformance

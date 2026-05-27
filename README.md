@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 20 (2026-05-27).** The prior implementation was
+**Clean-room rebuild — round 21 (2026-05-27).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,54 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 20 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 21 wires the
+standalone §7.3.6.3 [`PredWeightTable::parse`] (round 17) into the
+§7.3.6.1 slice-header in-place call site, closing the last r20
+deferral point for the universal base-profile single-layer case.
+When the §7.3.6.1 gate is statically present
+(`(pps.weighted_pred_flag && slice_type == P)` or
+`(pps.weighted_bipred_flag && slice_type == B)`) the parser now
+constructs a [`PredWeightTableInputs::base_profile`] from the
+post-override `num_ref_idx_lX_active_minus1`, `ChromaArrayType` (per
+§7.4.2.2: `chroma_format_idc` unless `separate_colour_plane_flag == 1`),
+and the SPS bit-depths, then decodes `pred_weight_table()` in place
+and continues past the merge-candidate leaf and the shared I-slice
+tail through `byte_alignment()` — so `opaque_tail` is `None` and
+[`SliceSegmentHeader::byte_offset_to_slice_data`] reports where
+`slice_segment_data()` begins for *every* P / B slice in the
+crate's currently surfaced configuration (no SPS range / multilayer
+/ SCC extensions). The base-profile constructor sets every per-i
+§7.3.6.3 outer-gate decision to `true`, which is the universal
+correct value for any single-layer slice: in a single-layer stream
+every active reference is a different picture (an earlier-POC
+temporal reference), so the
+`pic_layer_id != nuh_layer_id || PicOrderCnt(RefPicListX[i]) !=
+PicOrderCnt(CurrPic)` outer gate of §7.3.6.3 is always satisfied
+and every `luma_weight_lX_flag[i]` / `chroma_weight_lX_flag[i]` is
+signalled. The per-i gate slots stay open in
+[`PredWeightTableInputs`] for the eventual SCC self-reference / IL
+ref-layer cases, which will be threaded through here once the SPS
+multilayer / SCC extensions surface (currently surfaced as opaque
+tails — see "Not yet implemented"). The decoded table is exposed as
+[`SliceSegmentHeader::pred_weight_table`] (an `Option<PredWeightTable>`
+that is `None` for I slices, for dependent slice segments, when the
+gate is statically absent, and for any prior-deferral path).
+§7.4.7.3 range failures (e.g. `delta_luma_weight_lX > 127`) raised
+inside the in-place parse propagate directly out of
+`SliceSegmentHeader::parse` as `SliceError::ValueOutOfRange`. With
+this round, every weighted-pred-gated independent slice segment
+parses through `byte_alignment()`; only the
+`pps.lists_modification_present_flag == 1` path still defers at the
+§7.3.6.2 gate (it needs the §7.4.7.2 `NumPicTotalCurr` derivation
+threaded through the slice parser — this is the next round's
+target). The eight pre-round tests that exercised the post-override
+walk are rewritten to consume their PWT bodies in place and assert
+`opaque_tail.is_none()`; three new tests cover the universal
+base-profile P-slice walk with a non-trivial luma weight (derived
+`LumaWeightL0[0] = 9`), the B-slice L1 chroma sub-block + equation
+7-58 `ChromaOffsetL1[0][j]` derivation, and the
+`delta_luma_weight_l0` range-failure propagation. Total tests now
+201 (was 198). Round 20 had landed the
 §7.3.6.1 in-place inter-slice `five_minus_max_num_merge_cand` `ue(v)`
 leaf (one syntax element after r19's collocated block), with the
 §7.4.7.1 equation 7-53 derivation `MaxNumMergeCand = 5 -
@@ -23,24 +70,11 @@ five_minus_max_num_merge_cand` exposed as
 range-checked at 0..=4. The merge-candidate field is signalled only
 when the §7.3.6.3 `pred_weight_table()` gate is statically absent —
 i.e. when neither `(pps.weighted_pred_flag && slice_type == P)` nor
-`(pps.weighted_bipred_flag && slice_type == B)` holds; when the gate
-is present the parser keeps deferring there, and the four r19 mvd /
-cabac-init / collocated fields stay populated as before. With the
-merge-candidate leaf in, the SCC `use_integer_mv_flag` block
-statically absent (the PPS SCC extension is not surfaced yet, so
-`motion_vector_resolution_control_idc` is inferred to 0), and the
-already-implemented I-slice tail (slice_qp_delta + chroma QP +
-deblocking override + loop-filter-across-slices + entry-points +
-slice-header extension + `byte_alignment()`) now shared, the entire
-inter-slice header parses end to end through `byte_alignment()` when
-the weighted-pred gate is off — `opaque_tail` is `None` and
-[`SliceSegmentHeader::byte_offset_to_slice_data`] reports where
-`slice_segment_data()` begins. The remaining §7.3.6.1 work is the
-§7.3.6.3 `pred_weight_table()` in-place wiring (the standalone parser
-already exists; the in-place call site needs the per-i outer-gate
-decisions threaded through from caller-supplied DPB context) and the
-§7.3.6.2 `ref_pic_lists_modification()` in-place wiring under the
-§7.4.7.2 `NumPicTotalCurr` derivation. Round 19 had landed the
+`(pps.weighted_bipred_flag && slice_type == B)` holds; with r21 in
+place the gate-is-present branch now decodes the table inline
+rather than deferring, so the full inter-slice header parses end to
+end through `byte_alignment()` in every configuration this crate
+surfaces today. Round 19 had landed the
 §7.3.6.1 in-place inter-slice
 `mvd_l1_zero_flag` / `cabac_init_flag` /
 `collocated_from_l0_flag` / `collocated_ref_idx` block (the four
@@ -431,13 +465,21 @@ data and CABAC remain unimplemented.
   `collocated_from_l0_flag` (signalled iff `mvp && slice_type == B`,
   else inferred `true`), and `collocated_ref_idx` (signalled iff
   `mvp` and the active list has > 1 entry, else inferred `0`,
-  range-checked against `num_ref_idx_lX_active_minus1`). When the
-  §7.3.6.3 `pred_weight_table()` gate is statically absent (neither
-  `pps.weighted_pred_flag && slice_type == P` nor
-  `pps.weighted_bipred_flag && slice_type == B`), the parser walks
-  past the absent table into `five_minus_max_num_merge_cand` `ue(v)`
-  (range 0..=4, with §7.4.7.1 equation 7-53 yielding `MaxNumMergeCand
-  = 5 - five_minus_max_num_merge_cand` accessible via
+  range-checked against `num_ref_idx_lX_active_minus1`). The
+  §7.3.6.3 `pred_weight_table()` is then decoded **in place** when
+  its outer gate is statically present
+  (`pps.weighted_pred_flag && slice_type == P` or
+  `pps.weighted_bipred_flag && slice_type == B`), via
+  [`PredWeightTable::parse`] with
+  [`PredWeightTableInputs::base_profile`] driven by the
+  post-override `num_ref_idx_lX_active_minus1`, the SPS-derived
+  `ChromaArrayType`, and the SPS bit-depths; the result is exposed
+  on [`SliceSegmentHeader::pred_weight_table`]. When the gate is
+  statically absent the table is skipped (the field stays `None`).
+  Either way the parser walks past the (possibly-decoded) table
+  into `five_minus_max_num_merge_cand` `ue(v)` (range 0..=4, with
+  §7.4.7.1 equation 7-53 yielding `MaxNumMergeCand =
+  5 - five_minus_max_num_merge_cand` accessible via
   [`SliceSegmentHeader::max_num_merge_cand`]), past the SCC
   `use_integer_mv_flag` (statically absent because the PPS SCC
   extension is not surfaced yet — §7.4.7.1 infers
@@ -446,14 +488,12 @@ data and CABAC remain unimplemented.
   deblocking override + loop-filter-across-slices + entry-points +
   slice-header extension + `byte_alignment()`); `opaque_tail` is
   `None` and [`SliceSegmentHeader::byte_offset_to_slice_data`]
-  reports where `slice_segment_data()` begins. When the
-  `pred_weight_table()` gate IS statically present, the parser keeps
-  deferring at the gate; the merge-candidate field stays `None` and
-  `opaque_tail` captures the bit position of the
-  `pred_weight_table()` block. The remaining inter-slice work
-  (`ref_pic_lists_modification()` in-place wiring under
-  `NumPicTotalCurr`, `pred_weight_table()` in-place wiring under
-  caller-supplied DPB context) stays the next rounds' target.
+  reports where `slice_segment_data()` begins. The remaining
+  inter-slice work (`ref_pic_lists_modification()` in-place wiring
+  under `NumPicTotalCurr`) stays the next round's target — the gate
+  is statically present only when `pps.lists_modification_present_flag
+  == 1`, at which point the parser still defers at the §7.3.6.2
+  block.
   Independent I-slice segments — IDR and non-IDR alike — parse end to
   end through `byte_alignment()`: `slice_qp_delta` (`se(v)`), the
   chroma QP offsets, the deblocking override block
@@ -463,11 +503,7 @@ data and CABAC remain unimplemented.
   [`SliceSegmentHeader::byte_offset_to_slice_data`] reports where
   `slice_segment_data()` begins, and
   [`SliceSegmentHeader::slice_qp_y`] applies equation 7-54. The
-  §7.4.7.1 inference rules are applied to absent fields. The P/B
-  reference-list / weighted-prediction sub-structures (which need DPB
-  state) are surfaced as an [`OpaqueTail`] rather than decoded; the
-  §7.3.6.2 syntax structure itself is implemented as a standalone
-  parser ([`RefPicListsModification`], see below).
+  §7.4.7.1 inference rules are applied to absent fields.
 
 * §7.3.6.2 [`RefPicListsModification`] — the
   `ref_pic_lists_modification()` syntax structure as a standalone
@@ -511,8 +547,17 @@ data and CABAC remain unimplemented.
   and the `NumActiveRefLayerPics` summand is added at the end.
 
 * §7.3.6.3 [`PredWeightTable`] — the `pred_weight_table()` syntax
-  structure as a standalone parser, callable by a future round once
-  the §7.3.6.1 in-place call site is wired up.
+  structure, wired in-place at the §7.3.6.1 call site (round 21).
+  When the §7.3.6.1 outer gate is statically present
+  (`weighted_pred_flag && slice_type == P` or
+  `weighted_bipred_flag && slice_type == B`), the slice parser
+  constructs a [`PredWeightTableInputs::base_profile`] from the
+  post-override `num_ref_idx_lX_active_minus1`, the SPS-derived
+  `ChromaArrayType`, and the SPS bit-depths, then decodes the table
+  in place and continues through the inter-slice tail.
+  [`SliceSegmentHeader::pred_weight_table`] surfaces the parsed
+  table (`None` when the gate is statically absent, for I slices,
+  for dependent slice segments, and for prior-deferral paths).
   [`PredWeightTable::parse`] reads `luma_log2_weight_denom`
   (range 0..=7) and, when `ChromaArrayType != 0`,
   `delta_chroma_log2_weight_denom` with the derived
@@ -568,7 +613,7 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
 [`SeqParameterSet::parse`], [`PicParameterSet::parse`],
 [`SliceSegmentHeader::parse`], [`RefPicListsModification::parse`],
-[`scan_order`], [`CabacEngine::new`].
+[`PredWeightTable::parse`], [`scan_order`], [`CabacEngine::new`].
 
 ## Not yet implemented
 
@@ -583,27 +628,30 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   [`HevcVps::opaque_tail`] when `vps_extension_flag == 1`. The §E.2.2
   `hrd_parameters()` bodies are now fully decoded (round 13).
 * Slice header (§7.3.6.1) deferred body: the P/B
-  `ref_pic_lists_modification()` (§7.3.6.2) /
-  `pred_weight_table()` (§7.3.6.3) sub-structures —
-  `SliceSegmentHeader::parse` surfaces these as an opaque tail only
-  when their gates are statically present (`lists_modification_present_flag
-  == 1 && NumPicTotalCurr > 1` for §7.3.6.2; `weighted_pred_flag &&
-  slice_type == P` or `weighted_bipred_flag && slice_type == B` for
-  §7.3.6.3); otherwise the parser walks through the entire
-  inter-slice tail to `byte_alignment()`. The §7.3.6.2 syntax
-  structure itself is decoded by the standalone
-  [`RefPicListsModification::parse`] (round 15), the §7.4.7.2
+  `ref_pic_lists_modification()` (§7.3.6.2) sub-structure —
+  `SliceSegmentHeader::parse` surfaces it as an opaque tail only
+  when its gate is statically present
+  (`lists_modification_present_flag == 1`); otherwise the parser
+  walks through the entire inter-slice tail to `byte_alignment()`.
+  The §7.3.6.2 syntax structure itself is decoded by the standalone
+  [`RefPicListsModification::parse`] (round 15) and the §7.4.7.2
   `NumPicTotalCurr` derivation is available as
-  [`NumPicTotalCurrInputs::compute`] (round 16), and the §7.3.6.3
-  `pred_weight_table()` syntax structure is decoded by the standalone
-  [`PredWeightTable::parse`] (round 17); a future round threads all
-  three together at the §7.3.6.1 call site. The
+  [`NumPicTotalCurrInputs::compute`] (round 16); a future round
+  threads them together at the §7.3.6.1 call site under
+  `NumPicTotalCurr > 1`. The §7.3.6.3 `pred_weight_table()` is now
+  decoded **in place** at the §7.3.6.1 call site (round 21, this
+  round) using [`PredWeightTableInputs::base_profile`] — the
+  universal base-profile single-layer case where every per-i
+  §7.3.6.3 outer gate (`pic_layer_id != nuh_layer_id ||
+  PicOrderCnt(...) != PicOrderCnt(CurrPic)`) is `true` because every
+  active reference in a single-layer slice is a different temporal
+  picture. The
   `num_ref_idx_active_override_flag` / `num_ref_idx_lX_active_minus1`
   override block (round 18), the
   `mvd_l1_zero_flag` / `cabac_init_flag` / `collocated_from_l0_flag`
   / `collocated_ref_idx` block (round 19), and the
-  `five_minus_max_num_merge_cand` leaf (round 20, this round) are
-  now decoded in place; the SCC `use_integer_mv_flag` closing flag is
+  `five_minus_max_num_merge_cand` leaf (round 20) are decoded in
+  place; the SCC `use_integer_mv_flag` closing flag is
   statically absent until the PPS SCC extension is surfaced (§7.4.7.1
   infers `motion_vector_resolution_control_idc` to 0). The non-IDR
   POC / reference-picture-set block (which previously sat under this
