@@ -263,17 +263,57 @@ impl SliceLongTermRefPic {
     }
 }
 
-/// One entry-point offset entry (`tiles_enabled_flag ||
-/// entropy_coding_sync_enabled_flag`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Entry-point-offset block (§7.3.6.1, gated by
+/// `tiles_enabled_flag || entropy_coding_sync_enabled_flag`).
+///
+/// `num_entry_point_offsets` is the number of subsets of
+/// `slice_segment_data()` minus one; each
+/// `entry_point_offset_minus1[i] + 1` is the byte length of subset
+/// `i` (§7.4.7.1). The trailing subset (`num_entry_point_offsets`)
+/// runs to the end of `slice_segment_data()` and is therefore not
+/// encoded.
+///
+/// Per §7.4.7.1, the on-wire `num_entry_point_offsets` is bounded by
+/// the active partitioning:
+///
+/// * `tiles_enabled_flag == 1` and `entropy_coding_sync_enabled_flag
+///   == 0` → `0..=(NumTileColumns * NumTileRows − 1)`.
+/// * `tiles_enabled_flag == 0` and `entropy_coding_sync_enabled_flag
+///   == 1` → `0..=(PicHeightInCtbsY − 1)`.
+/// * Both flags set (the "tiles + WPP" combination) is constrained by
+///   §7.4.3.3.1 to never appear in a conforming stream; this parser
+///   accepts the wider of the two bounds in that pathological case
+///   rather than gate the parse on a flag combination the PPS parser
+///   already rejects.
+///
+/// Each `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1` bits
+/// wide. `offset_len_minus1` itself is bounded to `0..=31` by
+/// §7.4.7.1, so the per-entry width is in `1..=32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryPointOffsets {
     /// `num_entry_point_offsets` (`ue(v)`). The number of subsets of
     /// slice-segment data is this value plus one.
     pub num_entry_point_offsets: u32,
     /// `offset_len_minus1` (`ue(v)`, range 0..=31). Each
     /// `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1` bits.
-    /// Only meaningful when `num_entry_point_offsets > 0`.
+    /// Only meaningful when `num_entry_point_offsets > 0`; left at 0
+    /// when no offsets are signalled.
     pub offset_len_minus1: u8,
+    /// `entry_point_offset_minus1[i]` (`u(offset_len_minus1 + 1)`) for
+    /// `i = 0 .. num_entry_point_offsets`. Empty when
+    /// `num_entry_point_offsets == 0`.
+    pub entry_point_offset_minus1: Vec<u32>,
+}
+
+impl EntryPointOffsets {
+    /// Byte length of subset `i` per §7.4.7.1, i.e.
+    /// `entry_point_offset_minus1[i] + 1`. Returns `None` when `i` is
+    /// out of range.
+    pub fn subset_length(&self, i: usize) -> Option<u64> {
+        self.entry_point_offset_minus1
+            .get(i)
+            .map(|v| u64::from(*v) + 1)
+    }
 }
 
 /// Parsed `ref_pic_lists_modification()` syntax structure
@@ -1897,11 +1937,32 @@ impl SliceSegmentHeader {
             pps.pps_loop_filter_across_slices_enabled_flag
         };
 
-        // Entry-point-offset block (§7.3.6.1).
+        // Entry-point-offset block (§7.3.6.1). §7.4.7.1 bounds
+        // `num_entry_point_offsets` by the active partitioning: the
+        // tile count when `tiles_enabled_flag == 1`, else
+        // `PicHeightInCtbsY` when `entropy_coding_sync_enabled_flag ==
+        // 1`. The two flags being simultaneously 1 is forbidden by
+        // §7.4.3.3.1 (rejected upstream by the PPS parser); the
+        // defensive cap here takes the wider of the two bounds in
+        // that pathological case rather than gate on a flag
+        // combination that already cannot occur. Each
+        // `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1`
+        // bits wide and is read into [`EntryPointOffsets::
+        // entry_point_offset_minus1`] (a per-index `Vec<u32>`); the
+        // byte length of subset `i` follows as
+        // `entry_point_offset_minus1[i] + 1` (§7.4.7.1) and is exposed
+        // via [`EntryPointOffsets::subset_length`].
         let entry_point_offsets = if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag
         {
             let num_entry_point_offsets = br.ue()?;
-            let offset_len_minus1 = if num_entry_point_offsets > 0 {
+            let max_num_entry_point_offsets = num_entry_point_offsets_upper_bound(sps, pps);
+            if num_entry_point_offsets > max_num_entry_point_offsets {
+                return Err(SliceError::ValueOutOfRange {
+                    field: "num_entry_point_offsets",
+                    got: num_entry_point_offsets as i64,
+                });
+            }
+            let (offset_len_minus1, entry_point_offset_minus1) = if num_entry_point_offsets > 0 {
                 let v = br.ue()?;
                 if v > 31 {
                     return Err(SliceError::ValueOutOfRange {
@@ -1910,16 +1971,19 @@ impl SliceSegmentHeader {
                     });
                 }
                 let len = v as u8;
+                let bits = len + 1;
+                let mut offsets = Vec::with_capacity(num_entry_point_offsets as usize);
                 for _ in 0..num_entry_point_offsets {
-                    br.skip((len as usize) + 1)?;
+                    offsets.push(br.u(bits)?);
                 }
-                len
+                (len, offsets)
             } else {
-                0
+                (0, Vec::new())
             };
             Some(EntryPointOffsets {
                 num_entry_point_offsets,
                 offset_len_minus1,
+                entry_point_offset_minus1,
             })
         } else {
             None
@@ -2019,6 +2083,43 @@ fn pic_size_in_ctbs_y(sps: &SeqParameterSet) -> u32 {
     let width_in_ctbs = sps.pic_width_in_luma_samples.div_ceil(ctb_size);
     let height_in_ctbs = sps.pic_height_in_luma_samples.div_ceil(ctb_size);
     width_in_ctbs * height_in_ctbs
+}
+
+/// `PicHeightInCtbsY` per equation 7-19: the picture height in CTBs,
+/// i.e. `Ceil(pic_height_in_luma_samples / CtbSizeY)`.
+fn pic_height_in_ctbs_y(sps: &SeqParameterSet) -> u32 {
+    let ctb_size = 1u32 << sps.log2_ctb_size();
+    sps.pic_height_in_luma_samples.div_ceil(ctb_size)
+}
+
+/// §7.4.7.1 upper bound on the slice header's
+/// `num_entry_point_offsets` for the active PPS partitioning. The
+/// caller has already gated on `tiles_enabled_flag ||
+/// entropy_coding_sync_enabled_flag`.
+fn num_entry_point_offsets_upper_bound(sps: &SeqParameterSet, pps: &PicParameterSet) -> u32 {
+    let tiles_bound = if pps.tiles_enabled_flag {
+        let cols = u64::from(pps.tiles.num_tile_columns_minus1) + 1;
+        let rows = u64::from(pps.tiles.num_tile_rows_minus1) + 1;
+        // (cols * rows) - 1 cannot overflow u32 for any conforming
+        // HEVC level (max tile count is 22 * 20 per Annex A), but
+        // arithmetic in u64 keeps the parser defensive against a
+        // pathological PPS.
+        let prod = cols.saturating_mul(rows).saturating_sub(1);
+        u32::try_from(prod).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let wpp_bound = if pps.entropy_coding_sync_enabled_flag {
+        pic_height_in_ctbs_y(sps).saturating_sub(1)
+    } else {
+        0
+    };
+    // Take the wider of the two: when only one flag is set the other
+    // bound is 0 and the active one wins; when both are set (a
+    // §7.4.3.3.1 forbidden combination already rejected by the PPS
+    // parser) this picks the wider so a stray header here is not
+    // rejected on top of a PPS error.
+    tiles_bound.max(wpp_bound)
 }
 
 /// `Ceil( Log2( n ) )` — the §7.4.7.1 width formula for
@@ -4536,6 +4637,161 @@ mod tests {
             SliceError::ValueOutOfRange {
                 field: "sumWeightL0Flags",
                 got: 27,
+            }
+        );
+    }
+
+    /// I-slice with WPP enabled (`entropy_coding_sync_enabled_flag ==
+    /// 1`): the §7.3.6.1 entry-point block is signalled with
+    /// `num_entry_point_offsets = 2`, `offset_len_minus1 = 3` (each
+    /// entry is `u(4)`), and per-row byte offsets `{6, 9}`. Verify
+    /// the parser captures the offsets verbatim and exposes the
+    /// per-subset byte length via [`EntryPointOffsets::subset_length`]
+    /// (`entry_point_offset_minus1[i] + 1`, §7.4.7.1).
+    #[test]
+    fn parses_wpp_entry_point_offsets_in_place() {
+        // Tall enough picture for two WPP entry points: 3 CTU rows.
+        // With CTB size = 16 (`log2_min_cb_minus3 = 0`,
+        // `log2_diff_max_min_cb = 1`) and `pic_height = 48`,
+        // `PicHeightInCtbsY = 3`, so the upper bound on
+        // `num_entry_point_offsets` is 2.
+        let sps = ctx_sps(1, false, true, true, 16, 48, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.entropy_coding_sync_enabled_flag = true;
+
+        let bits = concat_bits(&[
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output (IRAP)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (0, 1),     // slice_temporal_mvp_enabled_flag
+            (1, 1),     // sao_luma
+            (0, 1),     // sao_chroma
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            // Entry-point block.
+            (0b011, 3),   // num_entry_point_offsets ue -> 2
+            (0b00100, 5), // offset_len_minus1 ue -> 3 (entries are u(4))
+            (6, 4),       // entry_point_offset_minus1[0]
+            (9, 4),       // entry_point_offset_minus1[1]
+            (1, 1),       // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect("slice header");
+        let eps = sh.entry_point_offsets.expect("entry-point block present");
+        assert_eq!(eps.num_entry_point_offsets, 2);
+        assert_eq!(eps.offset_len_minus1, 3);
+        assert_eq!(eps.entry_point_offset_minus1, vec![6, 9]);
+        // §7.4.7.1 subset length is `entry_point_offset_minus1[i] + 1`.
+        assert_eq!(eps.subset_length(0), Some(7));
+        assert_eq!(eps.subset_length(1), Some(10));
+        assert_eq!(eps.subset_length(2), None);
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// Tiles enabled with a single tile (`num_tile_columns_minus1 ==
+    /// 0`, `num_tile_rows_minus1 == 0`): the §7.4.7.1 upper bound on
+    /// `num_entry_point_offsets` is `1 * 1 − 1 == 0`, so the block is
+    /// present (the gate fires on `tiles_enabled_flag`) but
+    /// `num_entry_point_offsets` must be 0 and the `offset_len_minus1`
+    /// / per-entry loop are skipped. Verify the parser materialises an
+    /// empty vec and reports a bare gate.
+    #[test]
+    fn parses_tiles_block_with_single_tile_no_offsets() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.tiles_enabled_flag = true;
+        // tiles inferred default (cols=0, rows=0 minus1 → 1×1).
+
+        let bits = concat_bits(&[
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (0, 1),     // slice_temporal_mvp_enabled_flag
+            (1, 1),     // sao_luma
+            (0, 1),     // sao_chroma
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            (0b1, 1),   // num_entry_point_offsets ue -> 0
+            (1, 1),     // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect("slice header");
+        let eps = sh.entry_point_offsets.expect("entry-point block present");
+        assert_eq!(eps.num_entry_point_offsets, 0);
+        assert_eq!(eps.offset_len_minus1, 0);
+        assert!(eps.entry_point_offset_minus1.is_empty());
+        assert!(eps.subset_length(0).is_none());
+    }
+
+    /// §7.4.7.1: when `entropy_coding_sync_enabled_flag == 1`, the
+    /// upper bound on `num_entry_point_offsets` is `PicHeightInCtbsY −
+    /// 1`. Build an SPS with `PicHeightInCtbsY == 1` (16×16 with CTB
+    /// size 16): the bound is 0, so a wire value of 1 must fail the
+    /// range check.
+    #[test]
+    fn rejects_wpp_entry_point_offsets_above_pic_height_bound() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.entropy_coding_sync_enabled_flag = true;
+
+        let bits = concat_bits(&[
+            (1, 1),
+            (0, 1),
+            (0b1, 1),
+            (0b011, 3),
+            (0, 1),
+            (1, 1),
+            (0, 1),
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // lf_across
+            (0b010, 3), // num_entry_point_offsets ue -> 1, breaches bound 0
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "num_entry_point_offsets",
+                got: 1,
+            }
+        );
+    }
+
+    /// §7.4.7.1: `offset_len_minus1` is bounded to `0..=31`. Build a
+    /// WPP-enabled fixture with a wire value of 32 and verify the
+    /// parser rejects.
+    #[test]
+    fn rejects_offset_len_minus1_above_31() {
+        let sps = ctx_sps(1, false, true, true, 16, 48, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.entropy_coding_sync_enabled_flag = true;
+
+        let bits = concat_bits(&[
+            (1, 1),
+            (0, 1),
+            (0b1, 1),
+            (0b011, 3),
+            (0, 1),
+            (1, 1),
+            (0, 1),
+            (0b1, 1),
+            (1, 1),
+            (0b010, 3), // num_entry_point_offsets ue -> 1
+            // offset_len_minus1 = 32, encoded ue: codeNum 32 has
+            // M = floor(log2(33)) = 5 leading zeros, then '1', then
+            // 5-bit suffix (33 - 32 = 1 → 00001). 11 bits total:
+            // 00000 1 00001 → 0b000_0010_0001.
+            (0b000_0010_0001, 11),
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect_err("must error");
+        assert_eq!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "offset_len_minus1",
+                got: 32,
             }
         );
     }

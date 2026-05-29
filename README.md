@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 21 (2026-05-27).** The prior implementation was
+**Clean-room rebuild — round 22 (2026-05-29).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,10 +14,32 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 21 wires the
-standalone §7.3.6.3 [`PredWeightTable::parse`] (round 17) into the
-§7.3.6.1 slice-header in-place call site, closing the last r20
-deferral point for the universal base-profile single-layer case.
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 22 finishes the
+§7.3.6.1 entry-point-offset block: the slice-header parser now
+captures every per-i `entry_point_offset_minus1[i]`
+(`u(offset_len_minus1 + 1)`) into
+[`EntryPointOffsets::entry_point_offset_minus1`] instead of skipping
+the bits, and the per-subset byte length of §7.4.7.1
+(`entry_point_offset_minus1[i] + 1`) is exposed via
+[`EntryPointOffsets::subset_length`]. The on-wire
+`num_entry_point_offsets` value is now range-checked against the
+§7.4.7.1 upper bound for the active PPS partitioning
+(`NumTileColumns * NumTileRows − 1` when `tiles_enabled_flag == 1`,
+`PicHeightInCtbsY − 1` when `entropy_coding_sync_enabled_flag == 1`,
+with the §7.4.3.3.1-forbidden `tiles + WPP` combination treated as
+the wider of the two as a defensive cap); a breaching wire value
+raises `SliceError::ValueOutOfRange { field:
+"num_entry_point_offsets", got }`. Together this closes the last
+parser-side "skip the bits, surface only the count" deferral inside
+the §7.3.6.1 slice-segment-header walk; entry-point byte positions
+are now first-class output and the downstream CABAC entry-point
+seeker can index directly into the slice-data subset cells without
+recovering the offsets from the wire a second time.
+
+Round 21 wires the standalone §7.3.6.3 [`PredWeightTable::parse`]
+(round 17) into the §7.3.6.1 slice-header in-place call site,
+closing the last r20 deferral point for the universal base-profile
+single-layer case.
 When the §7.3.6.1 gate is statically present
 (`(pps.weighted_pred_flag && slice_type == P)` or
 `(pps.weighted_bipred_flag && slice_type == B)`) the parser now
@@ -498,7 +520,12 @@ data and CABAC remain unimplemented.
   end through `byte_alignment()`: `slice_qp_delta` (`se(v)`), the
   chroma QP offsets, the deblocking override block
   ([`SliceDeblocking`]), `slice_loop_filter_across_slices_enabled_flag`,
-  the entry-point-offset block ([`EntryPointOffsets`]), and the
+  the entry-point-offset block ([`EntryPointOffsets`]) — including the
+  per-i `entry_point_offset_minus1[i]` `u(offset_len_minus1 + 1)`
+  values captured into `Vec<u32>` and the per-subset byte length
+  exposed via [`EntryPointOffsets::subset_length`], with
+  `num_entry_point_offsets` range-checked against the §7.4.7.1
+  partitioning bound — and the
   header-extension block;
   [`SliceSegmentHeader::byte_offset_to_slice_data`] reports where
   `slice_segment_data()` begins, and

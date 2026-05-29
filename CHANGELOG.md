@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 22 (2026-05-29)
+
+- §7.3.6.1 entry-point-offset block: the slice-header parser now
+  captures the per-i `entry_point_offset_minus1[i]` (`u(offset_len_minus1
+  + 1)`) values into [`EntryPointOffsets::entry_point_offset_minus1`]
+  (a `Vec<u32>`) instead of skipping them. The per-subset byte length
+  of §7.4.7.1 (`entry_point_offset_minus1[i] + 1`) is exposed via
+  [`EntryPointOffsets::subset_length`]. The struct loses its `Copy`
+  bound (it now owns a `Vec`).
+- §7.4.7.1 range check on `num_entry_point_offsets`: the on-wire value
+  is now bounded by the active PPS partitioning
+  (`NumTileColumns * NumTileRows − 1` for tiles, `PicHeightInCtbsY −
+  1` for WPP, with the `tiles + WPP` combination — already barred by
+  §7.4.3.3.1 — taking the wider of the two as a defensive cap). A
+  breaching wire value raises a `ValueOutOfRange { field:
+  "num_entry_point_offsets", got }` (`SliceError`).
+- New unit tests: `parses_wpp_entry_point_offsets_in_place` (two
+  per-row offsets `{6, 9}` captured verbatim, subset lengths
+  `{7, 10}`), `parses_tiles_block_with_single_tile_no_offsets`
+  (`num_entry_point_offsets == 0` honored when the §7.4.7.1 bound is
+  0), `rejects_wpp_entry_point_offsets_above_pic_height_bound` (16×16
+  WPP → bound 0, wire `1` rejected), `rejects_offset_len_minus1_above_31`
+  (a wire codeNum 32 rejected).
+
 ### Added — clean-room rebuild round 21 (2026-05-27)
 
 - §7.3.6.3 `pred_weight_table()` decoded **in place** at the §7.3.6.1
