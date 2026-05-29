@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 22 (2026-05-29).** The prior implementation was
+**Clean-room rebuild — round 23 (2026-05-29).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,47 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 22 finishes the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 23 wires the
+standalone §7.3.6.2 [`RefPicListsModification::parse`] (round 15)
+into the §7.3.6.1 slice-header in-place call site, closing the
+`pps.lists_modification_present_flag == 1` deferral point for every
+configuration whose §7.4.7.2 `NumPicTotalCurr` derivation does **not**
+require the §7.4.8 inter-RPS-prediction step. The slice parser now
+resolves the active short-term RPS (inline form via the slice-header
+`st_ref_pic_set(...)` body; SPS form via the SPS-resident
+`short_term_ref_pic_sets[idx]`), feeds the per-position
+`used_by_curr_pic_s{0,1}_flag` arrays (only meaningful when
+`inter_ref_pic_set_prediction_flag == 0` — the explicit form) plus
+the §7.4.7.1-resolved `UsedByCurrPicLt[i]` slice
+(`SliceLongTermRefPic::used_by_curr_pic_lt`, round 14) into
+[`NumPicTotalCurrInputs::from_used_flags`] / [`NumPicTotalCurrInputs::compute`]
+(round 16) to obtain `NumPicTotalCurr`. When `NumPicTotalCurr > 1`
+the parser invokes [`RefPicListsModification::parse`] in place and
+exposes the result via the new
+[`SliceSegmentHeader::ref_pic_lists_modification`] field (an
+`Option<RefPicListsModification>`), then continues into the mvd /
+cabac-init / collocated / pred-weight-table / merge-candidate / shared
+I-slice tail through `byte_alignment()`. When `NumPicTotalCurr <= 1`
+the §7.3.6.1 outer gate is statically false: the structure is not
+signalled and the parser advances directly into the mvd block (zero
+bits consumed for RPLM). When the picked short-term RPS uses
+inter-RPS-prediction (`inter_ref_pic_set_prediction_flag == 1`), the
+§7.4.8 derivation chain is the remaining blocker and the parser
+continues to surface the opaque tail starting at the
+`ref_pic_lists_modification()` bit position. With this round, every
+non-IDR P / B slice whose active short-term RPS is in explicit form
+parses end to end through `byte_alignment()` in the surfaced
+configuration; the §7.4.8 inter-RPS-prediction derivation is the
+last parser-side deferral inside the §7.3.6.1 walk. Total tests now
+208 (was 205): three new tests cover the inline-explicit RPS
+`NumPicTotalCurr == 2` in-place parse, the inline-explicit RPS
+`NumPicTotalCurr == 1` static skip, and the SPS-form inter-predicted
+RPS opaque-tail defer; the pre-round defer-on-flag test is rewritten
+into `skips_rplm_when_num_pic_total_curr_is_zero_idr` (IDR has no
+RPS block → `NumPicTotalCurr == 0`, gate statically false, full tail
+walked).
+
+Round 22 finishes the
 §7.3.6.1 entry-point-offset block: the slice-header parser now
 captures every per-i `entry_point_offset_minus1[i]`
 (`u(offset_len_minus1 + 1)`) into

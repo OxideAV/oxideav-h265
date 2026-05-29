@@ -1432,6 +1432,21 @@ pub struct SliceSegmentHeader {
     /// `byte_alignment()`. `None` when the header was not parsed all
     /// the way to `byte_alignment()` (a deferred body).
     pub byte_offset_to_slice_data: Option<usize>,
+    /// Decoded `ref_pic_lists_modification()` (§7.3.6.2) when the
+    /// §7.3.6.1 outer gate
+    /// (`pps.lists_modification_present_flag == 1 && NumPicTotalCurr > 1`)
+    /// is statically present. `None` when the gate is statically
+    /// absent (`pps.lists_modification_present_flag == 0`,
+    /// `NumPicTotalCurr <= 1`, an I slice, a dependent slice segment,
+    /// or a header whose parse stopped before this point — including
+    /// the inter-RPS-predicted SPS-form short-term RPS case, where
+    /// the per-position `UsedByCurrPicS0` / `UsedByCurrPicS1` flags
+    /// needed for the §7.4.7.2 `NumPicTotalCurr` derivation can only
+    /// be resolved by running the §7.4.8 inter-RPS-prediction step;
+    /// the parser defers in that case and surfaces an
+    /// [`Self::opaque_tail`] starting at the `ref_pic_lists_modification()`
+    /// bit position).
+    pub ref_pic_lists_modification: Option<RefPicListsModification>,
     /// Opaque suffix of the slice-header RBSP. Populated when the
     /// parser reaches a deferred body (the non-IDR POC/RPS block or a
     /// P/B reference-list / weighted-prediction sub-structure); carries
@@ -1637,6 +1652,7 @@ impl SliceSegmentHeader {
                 entry_point_offsets: None,
                 slice_segment_header_extension_length: None,
                 byte_offset_to_slice_data: Some(byte_offset),
+                ref_pic_lists_modification: None,
                 opaque_tail: None,
             });
         }
@@ -1707,61 +1723,134 @@ impl SliceSegmentHeader {
         // followed by the weighted-pred-table gate.
         //
         // The `ref_pic_lists_modification()` gate consumes the
-        // §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57), which
-        // requires running the full §7.4.8 inter-RPS-prediction step
-        // for an inter-predicted RPS. This round materialises the
-        // mvd / cabac-init / collocated block only when the
-        // modification block is statically absent, i.e. when
-        // `pps.lists_modification_present_flag == 0`. With the gate
-        // off the `if(... && NumPicTotalCurr > 1)` short-circuit
-        // applies without needing the derivation, so the bit stream
-        // advances straight to `mvd_l1_zero_flag` (or, when neither B
-        // nor cabac-init nor temporal MVP is in play, to the
-        // weighted-pred gate with zero bits consumed). When
-        // `lists_modification_present_flag == 1` the parser still
-        // defers — the opaque tail in that case begins at the
-        // `ref_pic_lists_modification()` block.
-        if st.is_inter() && pps.lists_modification_present_flag {
-            return Ok(Self {
-                first_slice_segment_in_pic_flag,
-                no_output_of_prior_pics_flag,
-                slice_pic_parameter_set_id,
-                dependent_slice_segment_flag,
-                slice_segment_address,
-                slice_reserved_flags,
-                slice_type,
-                pic_output_flag,
-                colour_plane_id,
-                slice_pic_order_cnt_lsb,
+        // §7.4.7.2 `NumPicTotalCurr` derivation (equation 7-57). When
+        // `pps.lists_modification_present_flag == 0` the
+        // `if(... && NumPicTotalCurr > 1)` short-circuit applies
+        // without needing the derivation, so the bit stream advances
+        // straight to `mvd_l1_zero_flag`. When the flag is 1 we attempt
+        // to derive `NumPicTotalCurr` from the resolved slice-header
+        // state (active short-term RPS + long-term entries):
+        //
+        // * For the inline-form short-term RPS
+        //   (`short_term_ref_pic_set_sps_flag == 0`) the on-wire form
+        //   per §7.4.8 has `inter_ref_pic_set_prediction_flag == 0`
+        //   when `stRpsIdx == num_short_term_ref_pic_sets` (the
+        //   slice-inline index): the `used_by_curr_pic_s{0,1}_flag`
+        //   arrays come directly from the inline RPS. The §7.4.8 form
+        //   *is* allowed at the slice-inline index when the SPS has
+        //   `num_short_term_ref_pic_sets > 0`; in that case the parser
+        //   defers (the derivation requires walking the source RPS
+        //   chain and is out of scope here).
+        // * For the SPS-form (`short_term_ref_pic_set_sps_flag == 1`)
+        //   the active RPS is `sps.short_term_ref_pic_sets[idx]`. When
+        //   that RPS uses the explicit form the per-position
+        //   `used_by_curr_pic_sX_flag` arrays are usable directly; when
+        //   it uses inter-prediction the §7.4.8 derivation must be run
+        //   first and the parser defers.
+        //
+        // The §F.7.4.7.2 multilayer-extension variant and the
+        // SCC `pps_curr_pic_ref_enabled_flag` closing-clause are wired
+        // through [`NumPicTotalCurrInputs`] but the base-profile call
+        // site here leaves both at their `false` defaults (the PPS
+        // SCC extension is not yet surfaced; multilayer extension is
+        // forwarded via the long-term-ref builder).
+        //
+        // For IDR slices the entire non-IDR POC/RPS block is absent
+        // and `inline_short_term_ref_pic_set` / `long_term_ref_pics`
+        // are empty: `NumPicTotalCurr` is `0` and the gate is
+        // statically false.
+        let (ref_pic_lists_modification, num_pic_total_curr_resolved) = if st.is_inter()
+            && pps.lists_modification_present_flag
+        {
+            match resolve_active_short_term_rps(
+                sps,
                 short_term_ref_pic_set_sps_flag,
-                inline_short_term_ref_pic_set,
+                inline_short_term_ref_pic_set.as_ref(),
                 short_term_ref_pic_set_idx,
-                num_long_term_sps,
-                num_long_term_pics,
-                long_term_ref_pics,
-                slice_temporal_mvp_enabled_flag,
-                slice_sao_luma_flag,
-                slice_sao_chroma_flag,
-                num_ref_idx_active_override_flag,
-                num_ref_idx_l0_active_minus1,
-                num_ref_idx_l1_active_minus1,
-                mvd_l1_zero_flag: None,
-                cabac_init_flag: None,
-                collocated_from_l0_flag: None,
-                collocated_ref_idx: None,
-                five_minus_max_num_merge_cand: None,
-                pred_weight_table: None,
-                slice_qp_delta: None,
-                slice_cb_qp_offset: 0,
-                slice_cr_qp_offset: 0,
-                deblocking: None,
-                slice_loop_filter_across_slices_enabled_flag: None,
-                entry_point_offsets: None,
-                slice_segment_header_extension_length: None,
-                byte_offset_to_slice_data: None,
-                opaque_tail: Some(OpaqueTail::capture_at(br.bit_pos(), rbsp)),
-            });
-        }
+            ) {
+                ActiveShortTermRps::Explicit(rps) => {
+                    let lt_used = collect_used_by_curr_pic_lt(&long_term_ref_pics, sps);
+                    let inputs = NumPicTotalCurrInputs::from_used_flags(
+                        &rps.used_by_curr_pic_s0_flag,
+                        &rps.used_by_curr_pic_s1_flag,
+                        &lt_used,
+                    );
+                    let npc = inputs.compute();
+                    if npc > 1 {
+                        let l0_active =
+                            num_ref_idx_l0_active_minus1.ok_or(SliceError::ValueOutOfRange {
+                                field: "num_ref_idx_l0_active_minus1",
+                                got: -1,
+                            })?;
+                        let l1_active = num_ref_idx_l1_active_minus1.unwrap_or(0);
+                        let rplm =
+                            RefPicListsModification::parse(&mut br, st, l0_active, l1_active, npc)?;
+                        (Some(rplm), Some(npc))
+                    } else {
+                        // `NumPicTotalCurr <= 1` — the §7.3.6.1
+                        // gate is statically false; the structure
+                        // is not signalled and we continue at
+                        // `mvd_l1_zero_flag`.
+                        (None, Some(npc))
+                    }
+                }
+                ActiveShortTermRps::Empty => {
+                    // IDR or no RPS picked: `NumPicTotalCurr == 0`,
+                    // gate is statically false.
+                    (None, Some(0))
+                }
+                ActiveShortTermRps::InterPredicted => {
+                    // §7.4.8 derivation is required; defer.
+                    return Ok(Self {
+                        first_slice_segment_in_pic_flag,
+                        no_output_of_prior_pics_flag,
+                        slice_pic_parameter_set_id,
+                        dependent_slice_segment_flag,
+                        slice_segment_address,
+                        slice_reserved_flags,
+                        slice_type,
+                        pic_output_flag,
+                        colour_plane_id,
+                        slice_pic_order_cnt_lsb,
+                        short_term_ref_pic_set_sps_flag,
+                        inline_short_term_ref_pic_set,
+                        short_term_ref_pic_set_idx,
+                        num_long_term_sps,
+                        num_long_term_pics,
+                        long_term_ref_pics,
+                        slice_temporal_mvp_enabled_flag,
+                        slice_sao_luma_flag,
+                        slice_sao_chroma_flag,
+                        num_ref_idx_active_override_flag,
+                        num_ref_idx_l0_active_minus1,
+                        num_ref_idx_l1_active_minus1,
+                        mvd_l1_zero_flag: None,
+                        cabac_init_flag: None,
+                        collocated_from_l0_flag: None,
+                        collocated_ref_idx: None,
+                        five_minus_max_num_merge_cand: None,
+                        pred_weight_table: None,
+                        slice_qp_delta: None,
+                        slice_cb_qp_offset: 0,
+                        slice_cr_qp_offset: 0,
+                        deblocking: None,
+                        slice_loop_filter_across_slices_enabled_flag: None,
+                        entry_point_offsets: None,
+                        slice_segment_header_extension_length: None,
+                        byte_offset_to_slice_data: None,
+                        ref_pic_lists_modification: None,
+                        opaque_tail: Some(OpaqueTail::capture_at(br.bit_pos(), rbsp)),
+                    });
+                }
+            }
+        } else {
+            (None, None)
+        };
+        // `num_pic_total_curr_resolved` is currently only used to gate
+        // the in-place RPLM parse above; future rounds may surface it
+        // on the slice header (the §8.3.4 implicit reference-list
+        // derivation needs the same value).
+        let _ = num_pic_total_curr_resolved;
 
         // §7.3.6.1 inter-slice mvd / cabac-init / collocated block —
         // reached only when `slice_type` is P or B and the
@@ -2042,6 +2131,7 @@ impl SliceSegmentHeader {
             entry_point_offsets,
             slice_segment_header_extension_length,
             byte_offset_to_slice_data: Some(byte_offset),
+            ref_pic_lists_modification,
             opaque_tail: None,
         })
     }
@@ -2295,6 +2385,84 @@ fn parse_long_term_ref_pic_block(
         });
     }
     Ok((num_long_term_sps, num_long_term_pics, entries))
+}
+
+/// Result of resolving the active short-term RPS for the in-place
+/// `NumPicTotalCurr` derivation at the §7.3.6.1
+/// `ref_pic_lists_modification()` gate.
+enum ActiveShortTermRps<'a> {
+    /// The active short-term RPS is in explicit form (i.e.
+    /// `inter_ref_pic_set_prediction_flag == 0` for the picked index),
+    /// so its `used_by_curr_pic_s{0,1}_flag` arrays are directly the
+    /// per-position `UsedByCurrPicS{0,1}` flags consumed by equation
+    /// 7-57.
+    Explicit(&'a ShortTermRefPicSet),
+    /// The slice has no active short-term RPS (an IDR slice, where the
+    /// non-IDR POC/RPS block is absent). `NumPicTotalCurr` is `0`.
+    Empty,
+    /// The active short-term RPS uses §7.4.8 inter-RPS-prediction
+    /// (`inter_ref_pic_set_prediction_flag == 1`). The §7.4.8
+    /// derivation must be run to materialise the per-position
+    /// `UsedByCurrPicS{0,1}` arrays; this parser does not run it.
+    InterPredicted,
+}
+
+/// Resolve the active short-term RPS for the current slice given the
+/// already-parsed §7.3.6.1 RPS gate state. See §7.4.8 for the
+/// `stRpsIdx` selection.
+fn resolve_active_short_term_rps<'a>(
+    sps: &'a SeqParameterSet,
+    short_term_ref_pic_set_sps_flag: Option<bool>,
+    inline_rps: Option<&'a ShortTermRefPicSet>,
+    short_term_ref_pic_set_idx: Option<u32>,
+) -> ActiveShortTermRps<'a> {
+    match short_term_ref_pic_set_sps_flag {
+        None => ActiveShortTermRps::Empty,
+        Some(false) => match inline_rps {
+            None => ActiveShortTermRps::Empty,
+            Some(rps) => {
+                if rps.inter_ref_pic_set_prediction_flag {
+                    ActiveShortTermRps::InterPredicted
+                } else {
+                    ActiveShortTermRps::Explicit(rps)
+                }
+            }
+        },
+        Some(true) => {
+            // §7.4.7.1: when not signalled (because
+            // `num_short_term_ref_pic_sets <= 1`), the index is
+            // inferred to 0.
+            let idx = short_term_ref_pic_set_idx.unwrap_or(0) as usize;
+            match sps.short_term_ref_pic_sets.get(idx) {
+                None => ActiveShortTermRps::Empty,
+                Some(rps) => {
+                    if rps.inter_ref_pic_set_prediction_flag {
+                        ActiveShortTermRps::InterPredicted
+                    } else {
+                        ActiveShortTermRps::Explicit(rps)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the per-entry `UsedByCurrPicLt[i]` flags for the active
+/// long-term-ref-pic block, per §7.4.7.1. SPS-resident entries pick
+/// `used_by_curr_pic_lt_sps_flag[lt_idx_sps[i]]`; in-slice entries
+/// carry the flag directly on the wire.
+///
+/// Returns `false` for any out-of-range SPS lookup (the slice parser
+/// rejects `lt_idx_sps >= num_long_term_ref_pics_sps` already; the
+/// fallback is defensive).
+fn collect_used_by_curr_pic_lt(
+    entries: &[SliceLongTermRefPic],
+    sps: &SeqParameterSet,
+) -> Vec<bool> {
+    entries
+        .iter()
+        .map(|e| e.used_by_curr_pic_lt(sps).unwrap_or(false))
+        .collect()
 }
 
 /// Defensive upper bound on `num_long_term_pics` (§7.4.7.1 bounds the
@@ -3171,12 +3339,18 @@ mod tests {
         );
     }
 
-    /// When `pps.lists_modification_present_flag == 1` the parser still
-    /// defers at the `ref_pic_lists_modification()` gate — the
-    /// `NumPicTotalCurr` derivation is not yet wired in. The mvd /
-    /// cabac-init / collocated fields stay `None`.
+    /// An IDR P-slice with `pps.lists_modification_present_flag == 1`:
+    /// because the §7.3.6.1 non-IDR POC/RPS block is absent for IDR
+    /// slices, the active short-term RPS is empty and the §7.4.7.2
+    /// `NumPicTotalCurr` is `0`. The §7.3.6.1 outer gate
+    /// (`... && NumPicTotalCurr > 1`) is therefore statically false
+    /// and `ref_pic_lists_modification()` is not signalled; the parser
+    /// continues straight into the mvd / cabac-init / collocated block
+    /// (all absent for this P slice + no-MVP / no-cabac-init /
+    /// no-temporal-MVP configuration) and walks the rest of the tail
+    /// through `byte_alignment()`.
     #[test]
-    fn defers_when_lists_modification_present_flag_set() {
+    fn skips_rplm_when_num_pic_total_curr_is_zero_idr() {
         let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         pps.lists_modification_present_flag = true;
@@ -3188,16 +3362,191 @@ mod tests {
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
             (0, 1),     // num_ref_idx_active_override_flag = 0
-            (0b1, 1),   // first deferred bit (ref_pic_lists_modification gate)
+            // RPLM gate statically false (NumPicTotalCurr == 0) — no
+            // bits consumed; parser walks into the mvd / cabac-init /
+            // collocated block. With the current configuration that
+            // block is fully absent (P slice, no cabac_init, no MVP).
+            (0b010, 3), // five_minus_max_num_merge_cand ue -> 1
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),     // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
         assert_eq!(sh.num_ref_idx_active_override_flag, Some(false));
+        assert_eq!(sh.ref_pic_lists_modification, None);
         assert_eq!(sh.mvd_l1_zero_flag, None);
-        assert_eq!(sh.cabac_init_flag, None);
+        assert_eq!(sh.cabac_init_flag, Some(false));
         assert_eq!(sh.collocated_from_l0_flag, None);
         assert_eq!(sh.collocated_ref_idx, None);
+        assert_eq!(sh.five_minus_max_num_merge_cand, Some(1));
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// Non-IDR P-slice with `pps.lists_modification_present_flag == 1`
+    /// and an inline short-term RPS in explicit form carrying two
+    /// `used_by_curr_pic_s0_flag` entries set to 1: §7.4.7.2 equation
+    /// 7-57 gives `NumPicTotalCurr == 2`, the §7.3.6.1 outer gate is
+    /// statically present, and `ref_pic_lists_modification()` parses
+    /// in place. The per-entry width of `list_entry_l0` is
+    /// `Ceil(Log2(2)) = 1` bit (§7.4.7.2). After RPLM the parser walks
+    /// the rest of the inter tail through `byte_alignment()`.
+    #[test]
+    fn parses_rplm_in_place_with_explicit_inline_rps_npc_two() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.lists_modification_present_flag = true;
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            // Inline st_ref_pic_set: stRpsIdx == num_short_term_ref_pic_sets
+            // == 0, so inter_ref_pic_set_prediction_flag is absent.
+            (0b011, 3), // num_negative_pics ue '011' -> 2
+            (0b1, 1),   // num_positive_pics ue '1' -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
+            (0b1, 1),   // delta_poc_s0_minus1[1] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[1] = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            //   → infers L0 active_minus1 = pps.num_ref_idx_l0_default
+            // RPLM gate statically present (NumPicTotalCurr == 2 > 1):
+            (1, 1), // ref_pic_list_modification_flag_l0 = 1
+            // list_entry_l0[0 .. l0_active_minus1] — each
+            // `Ceil(Log2(2)) = 1` bit, range 0..=1. The PPS default
+            // active_minus1 from TINY_PPS_RBSP picks the loop count.
+            // We feed enough bits for the largest plausible default
+            // and check that the slice parser caps the count from the
+            // resolved override-or-default value.
+            (0, 1),     // list_entry_l0[0] = 0
+            (0b010, 3), // five_minus_max_num_merge_cand ue -> 1
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),     // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        // TRAIL_N (Table 7-1 value 0) is non-IDR / non-IRAP.
+        let sh = SliceSegmentHeader::parse(&rbsp, 0, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::P));
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(false));
+        let inline = sh
+            .inline_short_term_ref_pic_set
+            .as_ref()
+            .expect("inline ST RPS");
+        assert_eq!(inline.num_negative_pics, 2);
+        assert_eq!(inline.used_by_curr_pic_s0_flag, vec![true, true]);
+        let rplm = sh
+            .ref_pic_lists_modification
+            .as_ref()
+            .expect("RPLM parsed in place");
+        assert!(rplm.ref_pic_list_modification_flag_l0);
+        // L0 active_minus1 == 0 (PPS TINY default) → 1 entry.
+        assert_eq!(rplm.list_entry_l0, vec![0]);
+        // P slice → L1 fields are not signalled.
+        assert_eq!(rplm.ref_pic_list_modification_flag_l1, None);
+        assert!(rplm.list_entry_l1.is_empty());
+        // Full inter tail walked, no opaque suffix.
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// Non-IDR P-slice with `pps.lists_modification_present_flag == 1`
+    /// and an inline short-term RPS in explicit form carrying *one*
+    /// `used_by_curr_pic_s0_flag` entry: equation 7-57 gives
+    /// `NumPicTotalCurr == 1`, the §7.3.6.1 outer gate is statically
+    /// false, `ref_pic_lists_modification()` is not signalled, and the
+    /// parser continues straight into the rest of the inter tail.
+    #[test]
+    fn skips_rplm_when_num_pic_total_curr_is_one() {
+        let sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.lists_modification_present_flag = true;
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue '010' -> 1
+            (0b1, 1),   // num_positive_pics ue '1' -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
+            (1, 1),     // sao_luma
+            (1, 1),     // sao_chroma
+            (0, 1),     // num_ref_idx_active_override_flag = 0
+            // No RPLM (gate statically false at NPC == 1).
+            (0b010, 3), // five_minus_max_num_merge_cand ue -> 1
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),     // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, 0, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::P));
+        assert_eq!(sh.ref_pic_lists_modification, None);
+        assert_eq!(sh.five_minus_max_num_merge_cand, Some(1));
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// Non-IDR P-slice with `pps.lists_modification_present_flag == 1`
+    /// using an SPS-resident short-term RPS whose
+    /// `inter_ref_pic_set_prediction_flag == 1`: the §7.4.7.2
+    /// `NumPicTotalCurr` derivation requires walking the source RPS
+    /// chain (§7.4.8) which this parser does not run. The parser
+    /// defers — `ref_pic_lists_modification` stays `None` and the
+    /// opaque tail begins at the `ref_pic_lists_modification()` bit.
+    #[test]
+    fn defers_rplm_when_active_st_rps_uses_inter_prediction() {
+        let mut sps = ctx_sps(1, false, true, false, 16, 16, 1, 0, 4);
+        sps.num_short_term_ref_pic_sets = 2;
+        sps.short_term_ref_pic_sets = vec![
+            ShortTermRefPicSet {
+                inter_ref_pic_set_prediction_flag: false,
+                num_negative_pics: 1,
+                num_positive_pics: 0,
+                delta_poc_s0_minus1: vec![0],
+                used_by_curr_pic_s0_flag: vec![true],
+                ..Default::default()
+            },
+            ShortTermRefPicSet {
+                // The picked RPS is in inter-prediction form — derivation
+                // out of scope here.
+                inter_ref_pic_set_prediction_flag: true,
+                ..Default::default()
+            },
+        ];
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.lists_modification_present_flag = true;
+        let bits = concat_bits(&[
+            (1, 1),     // first
+            (0b1, 1),   // pps_id ue -> 0
+            (0b010, 3), // slice_type ue -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (1, 1),     // short_term_ref_pic_set_sps_flag = 1
+            // num_short_term_ref_pic_sets == 2 → idx field width = 1 bit.
+            (1, 1), // short_term_ref_pic_set_idx u(1) = 1 (the inter-predicted RPS)
+            (1, 1), // sao_luma
+            (1, 1), // sao_chroma
+            (0, 1), // num_ref_idx_active_override_flag = 0
+            // (Deferral begins here; remaining bits are opaque.)
+            (1, 1),
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, 0, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::P));
+        assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(true));
+        assert_eq!(sh.short_term_ref_pic_set_idx, Some(1));
+        assert!(sh.ref_pic_lists_modification.is_none());
+        assert_eq!(sh.mvd_l1_zero_flag, None);
+        assert_eq!(sh.cabac_init_flag, None);
         assert!(sh.opaque_tail.is_some());
+        assert!(sh.byte_offset_to_slice_data.is_none());
     }
 
     /// IDR P-slice that walks the full inter-slice tail through

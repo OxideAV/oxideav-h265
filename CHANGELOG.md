@@ -6,6 +6,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 23 (2026-05-29)
+
+- §7.3.6.2 `ref_pic_lists_modification()` decoded **in place** at the
+  §7.3.6.1 slice-header call site when the §7.4.7.2 `NumPicTotalCurr`
+  derivation can be resolved without running the §7.4.8
+  inter-RPS-prediction step. The wiring covers two configurations:
+  * inline-form short-term RPS (`short_term_ref_pic_set_sps_flag ==
+    0`) — per §7.4.8, at `stRpsIdx == num_short_term_ref_pic_sets` the
+    `inter_ref_pic_set_prediction_flag` is signalled only when
+    `num_short_term_ref_pic_sets > 0`; when it is `0` (or signalled
+    `0`) the per-position `used_by_curr_pic_s{0,1}_flag` arrays are
+    consumed directly by equation 7-57;
+  * SPS-form short-term RPS (`short_term_ref_pic_set_sps_flag == 1`)
+    whose picked entry has `inter_ref_pic_set_prediction_flag == 0`
+    — the SPS-resident explicit arrays are likewise consumed
+    directly.
+  The §7.4.7.1 long-term-block resolver
+  (`SliceLongTermRefPic::used_by_curr_pic_lt`, round 14) supplies the
+  `UsedByCurrPicLt[i]` slice. When `NumPicTotalCurr > 1` the parser
+  calls the standalone `RefPicListsModification::parse` (round 15)
+  and exposes the result as
+  `SliceSegmentHeader::ref_pic_lists_modification` (an
+  `Option<RefPicListsModification>`); when `NumPicTotalCurr <= 1` the
+  §7.3.6.1 gate is statically false and the parser skips the structure
+  and continues into the mvd / cabac-init / collocated block. The
+  active short-term RPS in inter-RPS-predicted form still defers — the
+  §7.4.8 derivation chain is the next blocker — and the opaque tail
+  in that case begins at the `ref_pic_lists_modification()` bit
+  position.
+- New unit tests covering the new wiring:
+  `parses_rplm_in_place_with_explicit_inline_rps_npc_two` (inline
+  explicit RPS with `NumPicTotalCurr == 2`, RPLM decoded in place
+  with one `list_entry_l0` entry one bit wide),
+  `skips_rplm_when_num_pic_total_curr_is_one` (inline explicit RPS
+  with `NumPicTotalCurr == 1`, gate statically false, RPLM skipped),
+  `defers_rplm_when_active_st_rps_uses_inter_prediction` (SPS-form
+  RPS with `inter_ref_pic_set_prediction_flag == 1`, opaque tail
+  retained), and an updated
+  `skips_rplm_when_num_pic_total_curr_is_zero_idr` that replaces the
+  pre-round defer-on-flag test (an IDR slice with
+  `lists_modification_present_flag == 1` now walks the full inter
+  tail because the non-IDR POC/RPS block is absent and
+  `NumPicTotalCurr == 0`).
+- New field `SliceSegmentHeader::ref_pic_lists_modification:
+  Option<RefPicListsModification>`. `None` for I slices, dependent
+  slice segments, headers whose parse stopped before this point, the
+  inter-RPS-predicted defer case, and the statically-false-gate case
+  (`NumPicTotalCurr <= 1` or `pps.lists_modification_present_flag ==
+  0`).
+
 ### Added — clean-room rebuild round 22 (2026-05-29)
 
 - §7.3.6.1 entry-point-offset block: the slice-header parser now
