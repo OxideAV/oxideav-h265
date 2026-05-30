@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 25 (2026-05-30)
+
+- §7.3.2.3.1 PPS extension-flag block: new typed
+  [`pps::PpsExtensionFlags`] sub-struct exposing
+  `pps_range_extension_flag`, `pps_multilayer_extension_flag`,
+  `pps_3d_extension_flag`, `pps_scc_extension_flag`, and
+  `pps_extension_4bits` decoded from the eight bits that follow
+  `pps_extension_present_flag == 1`. The new
+  [`PicParameterSet::extension_flags`] field carries it (an
+  `Option<PpsExtensionFlags>`; `None` when the gate is absent, every
+  flag inferred to 0 per §7.4.3.3.1).
+- [`PpsExtensionFlags::has_body`] predicate — true when at least one
+  of the four extension flags is set or `pps_extension_4bits != 0`
+  (i.e. when an extension body follows in the bit stream and the PPS
+  therefore carries an opaque tail starting at the first body's bit
+  position).
+- Opaque-tail capture for the PPS now starts at the first signalled
+  extension body's bit position rather than at the
+  `pps_extension_present_flag` boundary; when every flag is zero the
+  tail is `None` because only `rbsp_trailing_bits()` remain (consumed
+  implicitly). The individual extension-body syntax structures
+  (`pps_range_extension()` §7.3.2.3.2, `pps_multilayer_extension()`
+  Annex F, `pps_3d_extension()` Annex I, `pps_scc_extension()`, and
+  the `pps_extension_data_flag` while-loop) remain inside the opaque
+  tail and are not yet decoded.
+- Tests: four new pps tests
+  (`decodes_extension_flag_block_without_bodies`,
+  `captures_range_extension_opaque_tail`,
+  `captures_extension_data_flag_tail_when_4bits_nonzero`,
+  `extension_flags_absent_when_gate_zero`). The prior
+  `captures_extension_opaque_tail` is replaced by the
+  no-body-flag-block test since the all-zero flag block no longer
+  surfaces an opaque tail. Total test count 218 (was 215).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-h265/releases/tag/v0.0.8) - 2026-05-30
 
 ### Other

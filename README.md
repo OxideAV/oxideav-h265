@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 24 (2026-05-30).** The prior implementation was
+**Clean-room rebuild — round 25 (2026-05-30).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,10 +14,36 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 24 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 25 decodes the
+§7.3.2.3.1 PPS extension-flag block as a new typed
+[`pps::PpsExtensionFlags`] sub-struct: when
+`pps_extension_present_flag == 1` the eight bits that follow
+(`pps_range_extension_flag`, `pps_multilayer_extension_flag`,
+`pps_3d_extension_flag`, `pps_scc_extension_flag`,
+`pps_extension_4bits`) are read into typed fields rather than swept
+into the opaque tail. The remaining `opaque_tail` capture now starts
+at the first bit of the first signalled extension body (the
+`pps_range_extension()` body if `pps_range_extension_flag == 1`,
+otherwise the next set flag's body, otherwise the
+`while( more_rbsp_data() ) pps_extension_data_flag` block gated by
+`pps_extension_4bits != 0`); and when all five sub-fields are zero —
+the dominant Main / Main 10 case — the tail is `None` because only
+`rbsp_trailing_bits()` remain, consumed implicitly. The §7.4.3.3.1
+inference rules apply for the absent gate: `extension_flags` is
+`None` and every flag is inferred to 0. A small predicate
+[`PpsExtensionFlags::has_body`] exposes "any of the four extension
+flags is set, or `pps_extension_4bits` is non-zero" so downstream
+callers can route to the right decoder once the body parsers land.
+Total tests now 218 (was 215): four new pps tests cover the
+no-body-flag-block decode (no opaque tail), the range-extension
+opaque tail capture, the `pps_extension_4bits != 0` opaque tail
+capture, and the gate-zero inference path; the prior
+`captures_extension_opaque_tail` test (which assumed every set of
+extension bits surfaced an opaque tail) is replaced by the
+no-body-flag-block test. Round 24 had landed the
 §7.4.8 inter-RPS-prediction derivation as the new
 [`ShortTermRefPicSet::materialize`] / [`MaterializedShortTermRefPicSet`]
-typed builder and wires it into the §7.3.6.1 slice parser to close
+typed builder and wired it into the §7.3.6.1 slice parser to close
 the last remaining round-23 deferral point. The explicit-form branch
 implements equations 7-63..7-70 (the per-position `UsedByCurrPicS{0,1}`
 arrays direct, the cumulative `DeltaPocS0[i] = DeltaPocS0[i-1] -
@@ -769,8 +795,12 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   3D Annex I, SCC) — likewise surfaced as opaque bytes.
 * PPS extension bodies (`pps_range_extension()`,
   `pps_multilayer_extension()`, `pps_3d_extension()`,
-  `pps_scc_extension()`) — surfaced as opaque bytes when
-  `pps_extension_present_flag == 1`.
+  `pps_scc_extension()`, and the `pps_extension_data_flag` while-loop
+  gated by `pps_extension_4bits != 0`) — surfaced as opaque bytes
+  starting at the first signalled body when
+  `pps_extension_present_flag == 1`. The eight bits of typed
+  extension flags themselves are decoded as of round 25
+  ([`pps::PpsExtensionFlags`]); only the bodies still defer.
 * VPS `vps_extension_data_flag` extension payload — the §F / §G / §H
   / §I multi-layer / 3D / SCC VPS-extension syntax; surfaced as
   [`HevcVps::opaque_tail`] when `vps_extension_flag == 1`. The §E.2.2

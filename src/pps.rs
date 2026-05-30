@@ -16,10 +16,20 @@
 //! * `pps_scaling_list_data_present_flag == 1` triggers a §7.3.4
 //!   `scaling_list_data()` parse into [`ScalingListData`] (shared with
 //!   the SPS path).
-//! * When `pps_extension_present_flag == 1` the four extension flags,
-//!   their bodies (`pps_range_extension()` etc.), and the trailing
-//!   `rbsp_trailing_bits()` are surfaced as a single [`OpaqueTail`]
-//!   exactly as the SPS path does for its VUI / extension tail.
+//! * When `pps_extension_present_flag == 1` the eight bits of typed
+//!   extension flags (`pps_range_extension_flag`,
+//!   `pps_multilayer_extension_flag`, `pps_3d_extension_flag`,
+//!   `pps_scc_extension_flag`, `pps_extension_4bits`) are decoded into
+//!   [`PpsExtensionFlags`]. When all five sub-fields are zero only the
+//!   `rbsp_trailing_bits()` remain and they are consumed implicitly;
+//!   otherwise the extension bodies (`pps_range_extension()`,
+//!   `pps_multilayer_extension()`, `pps_3d_extension()`,
+//!   `pps_scc_extension()`, and the
+//!   `pps_extension_data_flag` while-loop gated by
+//!   `pps_extension_4bits`) are surfaced as a single [`OpaqueTail`]
+//!   starting at the bit position of the first body. The §7.4.3.3.1
+//!   inference rules apply for the absent case (every flag inferred
+//!   to 0).
 //!
 //! ## Layout summary
 //!
@@ -76,7 +86,15 @@
 //! log2_parallel_merge_level_minus2                  ue(v)
 //! slice_segment_header_extension_present_flag        u(1)
 //! pps_extension_present_flag                         u(1)
-//!   /* opaque tail begins here when 1 */
+//! if( pps_extension_present_flag ) {
+//!   pps_range_extension_flag                          u(1)
+//!   pps_multilayer_extension_flag                     u(1)
+//!   pps_3d_extension_flag                             u(1)
+//!   pps_scc_extension_flag                            u(1)
+//!   pps_extension_4bits                               u(4)
+//! }
+//!   /* opaque tail begins here when any of the four extension
+//!      flags is 1, or when pps_extension_4bits != 0 */
 //! ```
 //!
 //! Validity checks performed here, sourced from §7.4.3.3.1:
@@ -199,6 +217,62 @@ pub struct DeblockingFilterControl {
     pub tc_offset_div2: i8,
 }
 
+/// PPS extension-flag block per §7.3.2.3.1
+/// (`pps_extension_present_flag == 1`), holding the four typed
+/// extension-present flags and the reserved-for-future-use
+/// `pps_extension_4bits` group as a single `u8` (low 4 bits carry the
+/// value; high 4 bits are zero).
+///
+/// Per §7.4.3.3.1, when `pps_extension_present_flag == 0` every flag
+/// in this block is inferred to 0 and `pps_extension_4bits` is
+/// inferred to 0; the parser surfaces that case as
+/// [`PicParameterSet::extension_flags`] = `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PpsExtensionFlags {
+    /// `pps_range_extension_flag` (§7.3.2.3.1). When true, a
+    /// `pps_range_extension()` body (§7.3.2.3.2) follows in the bit
+    /// stream and is currently surfaced inside the PPS
+    /// [`PicParameterSet::opaque_tail`].
+    pub pps_range_extension_flag: bool,
+    /// `pps_multilayer_extension_flag` (§7.3.2.3.1, Annex F). When
+    /// true, a `pps_multilayer_extension()` body follows and is
+    /// surfaced inside the opaque tail.
+    pub pps_multilayer_extension_flag: bool,
+    /// `pps_3d_extension_flag` (§7.3.2.3.1, Annex I). When true, a
+    /// `pps_3d_extension()` body follows and is surfaced inside the
+    /// opaque tail.
+    pub pps_3d_extension_flag: bool,
+    /// `pps_scc_extension_flag` (§7.3.2.3.1). When true, a
+    /// `pps_scc_extension()` body follows and is surfaced inside the
+    /// opaque tail.
+    pub pps_scc_extension_flag: bool,
+    /// `pps_extension_4bits` (`u(4)`). For bitstreams conforming to
+    /// the current version of the specification this value shall be
+    /// 0; non-zero values are reserved for future use. The §7.4.3.3.1
+    /// decoder-side rule is to allow any value and ignore the
+    /// `pps_extension_data_flag` while-loop it gates, so the parser
+    /// surfaces the value verbatim. The trailing
+    /// `while( more_rbsp_data() ) pps_extension_data_flag` block (only
+    /// signalled when this field is non-zero) is surfaced inside the
+    /// opaque tail.
+    pub pps_extension_4bits: u8,
+}
+
+impl PpsExtensionFlags {
+    /// True when at least one of the four extension flags is set or
+    /// `pps_extension_4bits` is non-zero — i.e. when at least one
+    /// downstream extension body follows in the bit stream and the
+    /// PPS therefore carries an opaque tail starting at the first
+    /// body's bit position.
+    pub fn has_body(&self) -> bool {
+        self.pps_range_extension_flag
+            || self.pps_multilayer_extension_flag
+            || self.pps_3d_extension_flag
+            || self.pps_scc_extension_flag
+            || self.pps_extension_4bits != 0
+    }
+}
+
 /// Parsed Picture Parameter Set per §7.3.2.3.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PicParameterSet {
@@ -281,16 +355,30 @@ pub struct PicParameterSet {
     pub log2_parallel_merge_level_minus2: u32,
     /// `slice_segment_header_extension_present_flag`.
     pub slice_segment_header_extension_present_flag: bool,
-    /// `pps_extension_present_flag`. When set, the four extension
-    /// flags plus their bodies and the RBSP trailing bits are surfaced
-    /// as [`Self::opaque_tail`].
+    /// `pps_extension_present_flag`. When set, the
+    /// [`Self::extension_flags`] block is decoded into typed fields;
+    /// any extension body whose flag is set (and the
+    /// `pps_extension_data_flag` while-loop gated by
+    /// `pps_extension_4bits != 0`) is surfaced inside
+    /// [`Self::opaque_tail`].
     pub pps_extension_present_flag: bool,
+    /// Typed extension-flag block per §7.3.2.3.1
+    /// (`pps_extension_present_flag == 1`). `None` when the gate is
+    /// absent; in that case every flag is inferred to 0 per the
+    /// §7.4.3.3.1 inference rules.
+    pub extension_flags: Option<PpsExtensionFlags>,
     /// Opaque suffix of the PPS RBSP. Populated when
-    /// `pps_extension_present_flag == 1` (the extension flag block and
-    /// any extension bodies are not parsed this round). `None` when
-    /// the PPS ended cleanly after `pps_extension_present_flag == 0`
-    /// (only `rbsp_trailing_bits()` remains and it is consumed
-    /// implicitly).
+    /// `pps_extension_present_flag == 1` **and**
+    /// [`PpsExtensionFlags::has_body`] is true on the decoded flags
+    /// — the bit position recorded inside the tail is the start of
+    /// the first signalled extension body (`pps_range_extension()`
+    /// if `pps_range_extension_flag`, otherwise the next set flag's
+    /// body, otherwise the `pps_extension_data_flag` while-loop). The
+    /// individual extension-body syntax structures are not yet
+    /// decoded. `None` when the PPS ended cleanly after the flag
+    /// block (no extension body is signalled and only
+    /// `rbsp_trailing_bits()` remains; consumed implicitly) or when
+    /// `pps_extension_present_flag == 0`.
     pub opaque_tail: Option<OpaqueTail>,
 }
 
@@ -480,14 +568,37 @@ impl PicParameterSet {
         let slice_segment_header_extension_present_flag = br.u1()? != 0;
 
         let pps_extension_present_flag = br.u1()? != 0;
-        let opaque_tail = if pps_extension_present_flag {
-            // The four extension flags, their bodies, and the
-            // rbsp_trailing_bits are surfaced as an opaque tail; their
-            // syntax structures are not materialised this round.
-            Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+        let (extension_flags, opaque_tail) = if pps_extension_present_flag {
+            // §7.3.2.3.1: when the gate is open, decode the eight bits
+            // of typed extension flags first.
+            let pps_range_extension_flag = br.u1()? != 0;
+            let pps_multilayer_extension_flag = br.u1()? != 0;
+            let pps_3d_extension_flag = br.u1()? != 0;
+            let pps_scc_extension_flag = br.u1()? != 0;
+            let pps_extension_4bits = br.u(4)? as u8;
+            let flags = PpsExtensionFlags {
+                pps_range_extension_flag,
+                pps_multilayer_extension_flag,
+                pps_3d_extension_flag,
+                pps_scc_extension_flag,
+                pps_extension_4bits,
+            };
+            // If any extension body or the pps_extension_data_flag
+            // while-loop follows, capture the remainder of the RBSP
+            // (those bodies + rbsp_trailing_bits) as an opaque tail
+            // starting at the first body's bit position. Otherwise
+            // only rbsp_trailing_bits remains and we consume it
+            // implicitly.
+            let tail = if flags.has_body() {
+                Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+            } else {
+                None
+            };
+            (Some(flags), tail)
         } else {
-            // Only rbsp_trailing_bits remains; consumed implicitly.
-            None
+            // §7.4.3.3.1: every extension flag inferred to 0; only
+            // rbsp_trailing_bits remains, consumed implicitly.
+            (None, None)
         };
 
         Ok(Self {
@@ -524,6 +635,7 @@ impl PicParameterSet {
             log2_parallel_merge_level_minus2,
             slice_segment_header_extension_present_flag,
             pps_extension_present_flag,
+            extension_flags,
             opaque_tail,
         })
     }
@@ -781,16 +893,17 @@ mod tests {
         assert_eq!(pps.deblocking.tc_offset_div2, 3);
     }
 
-    /// `pps_extension_present_flag == 1` surfaces an opaque tail.
+    /// `pps_extension_present_flag == 1` with every typed extension
+    /// flag (and `pps_extension_4bits`) equal to 0 decodes the
+    /// flag block but consumes only `rbsp_trailing_bits()` afterwards
+    /// — no opaque tail is surfaced because no extension body
+    /// follows.
     #[test]
-    fn captures_extension_opaque_tail() {
+    fn decodes_extension_flag_block_without_bodies() {
         let mut bits = minimal_pps_prefix_bits();
         // pps_extension_present_flag = 1
         bits += "1";
-        // Opaque extension body: 4 extension flags (all zero here) plus
-        // rbsp_trailing_bits. We just append some bytes that the parser
-        // must not interpret.
-        bits += "0000"; // pps_range/multilayer/3d/scc flags
+        bits += "0000"; // pps_range/multilayer/3d/scc flags = 0
         bits += "0000"; // pps_extension_4bits = 0
         bits += "1"; // rbsp stop bit
         while bits.len() % 8 != 0 {
@@ -799,8 +912,93 @@ mod tests {
         let rbsp = pack_bits(&bits);
         let pps = PicParameterSet::parse(&rbsp).expect("ext PPS parse");
         assert!(pps.pps_extension_present_flag);
-        let tail = pps.opaque_tail.as_ref().expect("opaque extension tail");
+        let flags = pps.extension_flags.expect("extension flag block");
+        assert!(!flags.pps_range_extension_flag);
+        assert!(!flags.pps_multilayer_extension_flag);
+        assert!(!flags.pps_3d_extension_flag);
+        assert!(!flags.pps_scc_extension_flag);
+        assert_eq!(flags.pps_extension_4bits, 0);
+        assert!(!flags.has_body());
+        // No extension body follows → no opaque tail.
+        assert!(pps.opaque_tail.is_none());
+    }
+
+    /// `pps_extension_present_flag == 1` with
+    /// `pps_range_extension_flag == 1` decodes the flag block and
+    /// surfaces an opaque tail starting at the first byte of the
+    /// `pps_range_extension()` body.
+    #[test]
+    fn captures_range_extension_opaque_tail() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "1"; // pps_range_extension_flag = 1
+        bits += "000"; // pps_multilayer/3d/scc = 0
+        bits += "0000"; // pps_extension_4bits = 0
+                        // Sentinel for the opaque pps_range_extension() body — the
+                        // parser must not interpret it. Use a recognisable pattern
+                        // (0xAA = 10101010) and ensure the rbsp_trailing_bits stop
+                        // bit follows so the buffer is well-formed RBSP.
+        bits += "10101010";
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("range-ext PPS parse");
+        assert!(pps.pps_extension_present_flag);
+        let flags = pps.extension_flags.expect("extension flag block");
+        assert!(flags.pps_range_extension_flag);
+        assert!(!flags.pps_multilayer_extension_flag);
+        assert!(!flags.pps_3d_extension_flag);
+        assert!(!flags.pps_scc_extension_flag);
+        assert_eq!(flags.pps_extension_4bits, 0);
+        assert!(flags.has_body());
+        let tail = pps.opaque_tail.as_ref().expect("range-ext opaque tail");
         assert!(!tail.bytes.is_empty());
+    }
+
+    /// `pps_extension_present_flag == 1` with the four typed
+    /// extension flags all 0 but `pps_extension_4bits != 0` still
+    /// surfaces an opaque tail — the §7.3.2.3.1
+    /// `while( more_rbsp_data() ) pps_extension_data_flag` block is
+    /// gated by `pps_extension_4bits` (the §7.4.3.3.1 decoder rule is
+    /// to ignore the data flags but they must be skipped past
+    /// rbsp_trailing_bits, so the bytes are surfaced as opaque).
+    #[test]
+    fn captures_extension_data_flag_tail_when_4bits_nonzero() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0000"; // pps_range/multilayer/3d/scc = 0
+        bits += "0001"; // pps_extension_4bits = 1 (reserved, non-zero)
+        bits += "0"; // a single pps_extension_data_flag value
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("ext-4bits PPS parse");
+        let flags = pps.extension_flags.expect("extension flag block");
+        assert_eq!(flags.pps_extension_4bits, 1);
+        assert!(flags.has_body());
+        assert!(pps.opaque_tail.is_some());
+    }
+
+    /// When `pps_extension_present_flag == 0` the typed
+    /// extension-flag block is absent and every flag is inferred to
+    /// 0 per §7.4.3.3.1.
+    #[test]
+    fn extension_flags_absent_when_gate_zero() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "0"; // pps_extension_present_flag = 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("no-ext PPS parse");
+        assert!(!pps.pps_extension_present_flag);
+        assert!(pps.extension_flags.is_none());
+        assert!(pps.opaque_tail.is_none());
     }
 
     /// `pps_scaling_list_data_present_flag == 1` parses an explicit

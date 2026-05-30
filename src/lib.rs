@@ -125,8 +125,14 @@
 //!   deblocking-filter-control block ([`pps::DeblockingFilterControl`]),
 //!   `lists_modification_present_flag`,
 //!   `log2_parallel_merge_level_minus2`, and the
-//!   `pps_extension_present_flag` gate (extension bodies surfaced as a
-//!   shared [`sps::OpaqueTail`]). When
+//!   `pps_extension_present_flag` gate. When
+//!   `pps_extension_present_flag == 1` the eight bits of typed
+//!   extension flags are decoded into [`pps::PpsExtensionFlags`]
+//!   (`pps_range_extension_flag`, `pps_multilayer_extension_flag`,
+//!   `pps_3d_extension_flag`, `pps_scc_extension_flag`, and the
+//!   reserved `pps_extension_4bits`); any extension body whose flag
+//!   is set is surfaced as a shared [`sps::OpaqueTail`] starting at
+//!   the first body's bit position. When
 //!   `pps_scaling_list_data_present_flag == 1` the §7.3.4
 //!   `scaling_list_data()` block is parsed into
 //!   [`scaling_list::ScalingListData`]. The §7.4.3.3.1 inference rules
