@@ -6,6 +6,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-h265/releases/tag/v0.0.8) - 2026-05-30
+
+### Other
+
+- §7.4.8 inter-RPS-prediction derivation + in-place wiring
+- §7.3.6.2 ref_pic_lists_modification() in-place wiring at the §7.3.6.1 call site
+- §7.3.6.1 entry-point-offset per-i values + §7.4.7.1 range check
+- §7.3.6.3 pred_weight_table() in-place wiring at the §7.3.6.1 call site
+- §7.3.6.1 inter five_minus_max_num_merge_cand + full inter tail walk
+- §7.3.6.1 inter mvd / cabac-init / collocated block (no-RPLM path)
+- §7.3.6.1 inter-slice num_ref_idx_active_override prelude
+- §7.3.6.3 pred_weight_table() standalone parser
+- §7.4.7.2 NumPicTotalCurr derivation (round 16)
+- §7.3.6.2 ref_pic_lists_modification() standalone parser
+- §E.2.1 vui_parameters() typed decode into the SPS
+- §E.2.2 / §E.2.3 hrd_parameters() + sub_layer_hrd_parameters() bodies
+- §7.3.2.1 VPS tail — layer-set inclusion matrix + timing-info block
+- §9.3 CABAC arithmetic decoding engine (DecodeDecision/Bypass/Terminate + context model)
+- §6.5.4/6.5.5/6.5.6 horizontal/vertical/traverse scans + §7.4.2 ScanOrder accessor
+- §6.5.3 up-right diagonal scan + §7.4.5 ScalingFactor derivation
+- §7.3.4 scaling_list_data() parse + §7.4.5 ScalingList derivation
+- round 7: §7.3.6.1 non-IDR POC + reference-picture-set block
+- round 6: §7.3.6.1 slice-segment-header structural parse
+- round 5: §7.3.2.3.1 PPS parse + BitReader::se()
+- round 4: §7.3.2.2 SPS tail — PCM / RPS / long-term ref / MVP / smoothing / opaque VUI+ext
+- round 3: §7.3.2.2 SPS structural parse up to SAO-enabled flag
+- round 2: §7.3.2.1 VPS structural parse + §7.3.3 profile-tier-level walk
+- round 1: Annex B NAL walker + §7.3.1.2 header parse
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added — clean-room rebuild round 24 (2026-05-30)
 
 - §7.4.8 inter-RPS-prediction derivation as the new typed builder
