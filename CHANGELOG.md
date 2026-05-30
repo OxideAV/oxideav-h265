@@ -6,6 +6,76 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 24 (2026-05-30)
+
+- §7.4.8 inter-RPS-prediction derivation as the new typed builder
+  [`ShortTermRefPicSet::materialize`] and the post-derivation form
+  [`MaterializedShortTermRefPicSet`]. The explicit-form branch
+  implements equations 7-63..7-70: `NumNegativePics =
+  num_negative_pics`, `NumPositivePics = num_positive_pics`,
+  `UsedByCurrPicS{0,1}[i] = used_by_curr_pic_s{0,1}_flag[i]`, and the
+  cumulative `DeltaPocS0[i] = DeltaPocS0[i-1] - (delta_poc_s0_minus1[i]
+  + 1)` / `DeltaPocS1[i] = DeltaPocS1[i-1] +
+  (delta_poc_s1_minus1[i] + 1)` recurrences with the equation-7-67 /
+  7-68 first-element seeds. The inter-RPS-prediction branch implements
+  equations 7-60 (`deltaRps = (1 - 2*delta_rps_sign) *
+  (abs_delta_rps_minus1 + 1)`), 7-61 (negative-side reconstruction —
+  source-positives in reverse, optional `deltaRps` self-term when
+  negative, then source-negatives in forward order), and 7-62
+  (positive-side, mirrored), running each surviving entry through its
+  `use_delta_flag[j]` gate. The per-position
+  `used_by_curr_pic_flag` / `use_delta_flag` array lengths are checked
+  against the source RPS's `NumDeltaPocs[RefRpsIdx] + 1` and a
+  mismatch raises
+  [`ShortTermRefPicSetMaterializeError::SourceLengthMismatch`]; an
+  absent source for an inter-form RPS raises
+  [`ShortTermRefPicSetMaterializeError::MissingSource`].
+- [`SeqParameterSet::materialize_short_term_ref_pic_sets`] runs the
+  full SPS-level chain, materialising each entry in order and feeding
+  inter-form entries their source from prior materialised entries via
+  the equation-7-59 `RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1)`
+  lookup. The output is exposed as
+  `Vec<MaterializedShortTermRefPicSet>` aligned 1:1 with the
+  SPS-resident `short_term_ref_pic_sets[]`.
+- §7.3.6.1 slice parser: the previously-deferred SPS / inline
+  inter-RPS-prediction branch at the `ref_pic_lists_modification()`
+  gate now resolves through the new derivation. The slice parser
+  materialises the SPS list once, picks the active RPS (inline source
+  via `RefRpsIdx = num_short_term_ref_pic_sets - (delta_idx_minus1 +
+  1)` for the inline-inter case), feeds the derived
+  `UsedByCurrPicS{0,1}` slices into
+  [`NumPicTotalCurrInputs::from_used_flags`] / `compute`, and then
+  walks the in-place RPLM gate exactly as the explicit-form path did
+  in round 23. Configurations whose materialisation succeeds reach
+  `byte_alignment()` end to end; only malformed inter-form chains
+  (e.g. on-wire `used_by_curr_pic_flag` length not matching the
+  source's `NumDeltaPocs + 1`) defer to an opaque tail at the RPLM
+  bit. With this round the only remaining parser-side §7.3.6.1
+  deferral is the malformed-inter-RPS-prediction fallback; every
+  conformant non-IDR P / B slice — explicit or inter-form short-term
+  RPS — parses end to end through `byte_alignment()`.
+- New unit tests (5 in `sps`, 1 in `slice`; total 215, was 208):
+  `materialize_explicit_form_recurrence` (equations 7-67..7-70 with a
+  three-negative / two-positive RPS),
+  `materialize_inter_rps_prediction_matches_fixture` (re-uses the
+  existing `parses_inter_rps_prediction` wire fixture with a hand-
+  traced expected output),
+  `materialize_inter_rps_prediction_negative_delta_rps` (deltaRps =
+  -2 with a single source positive — exercises the negative-side
+  source-positives-reverse + deltaRps-self-term branches of equation
+  7-61), `materialize_inter_rps_rejects_missing_source` and
+  `materialize_inter_rps_rejects_length_mismatch`,
+  `sps_materialize_chains_inter_rps_prediction` (SPS-level chain on
+  the same fixture verifying both entries materialise correctly), and
+  `parses_p_slice_with_sps_inter_predicted_rps_npc_le_1` (slice-level
+  test exercising the new wiring: a P-slice with an SPS-form
+  inter-predicted RPS materialises, `NumPicTotalCurr == 0` makes the
+  RPLM gate statically false, and the parser walks the inter-slice
+  tail to `byte_alignment()` without surfacing an opaque tail). The
+  pre-round `defers_rplm_when_active_st_rps_uses_inter_prediction`
+  test is preserved with an updated header that describes the
+  malformed-array defer path more precisely.
+
 ### Added — clean-room rebuild round 23 (2026-05-29)
 
 - §7.3.6.2 `ref_pic_lists_modification()` decoded **in place** at the

@@ -311,24 +311,255 @@ pub struct ShortTermRefPicSet {
 impl ShortTermRefPicSet {
     /// `NumDeltaPocs[stRpsIdx]` per §7.4.8: in the explicit form this
     /// is `num_negative_pics + num_positive_pics`; in the inter-RPS
-    /// form the same identity holds after the source-RPS derivation
-    /// finishes, but this method returns the post-explicit count so
-    /// the caller can chain derivations without re-running the §7.4.8
-    /// equations.
+    /// form the exact count requires the §7.4.8 derivation
+    /// (equations 7-61 / 7-62 / 7-71) against a materialised source
+    /// RPS. See [`Self::materialize`] / [`MaterializedShortTermRefPicSet`]
+    /// for the full derivation.
+    ///
+    /// For the inter-RPS form this helper returns the count of
+    /// `use_delta_flag[j] == 1` entries, which is an upper bound that
+    /// happens to be exact when none of the source POCs flip sign
+    /// across `deltaRps`. Callers that need the exact wire-conformant
+    /// count must materialise the RPS chain.
     pub fn num_delta_pocs(&self) -> u32 {
         if self.inter_ref_pic_set_prediction_flag {
-            // The §7.4.8 derivation populates `NumNegativePics[stRpsIdx]`
-            // and `NumPositivePics[stRpsIdx]` from the
-            // `used_by_curr_pic_flag` / `use_delta_flag` arrays plus the
-            // source RPS. Counting the `use_delta_flag == 1` entries
-            // gives an upper bound; an exact count requires walking the
-            // source RPS chain. The simple count is correct for the
-            // typical case where `inter_ref_pic_set_prediction_flag` is
-            // used but `use_delta_flag` defaults to 1 for every entry.
             self.use_delta_flag.iter().filter(|&&v| v).count() as u32
         } else {
             self.num_negative_pics + self.num_positive_pics
         }
+    }
+
+    /// Materialise this `st_ref_pic_set(stRpsIdx)` into the post-§7.4.8
+    /// per-position arrays `(NumNegativePics, DeltaPocS0[],
+    /// UsedByCurrPicS0[], NumPositivePics, DeltaPocS1[],
+    /// UsedByCurrPicS1[])` consumed by §7.4.7.2 and downstream paths.
+    ///
+    /// * For the explicit form (`inter_ref_pic_set_prediction_flag ==
+    ///   0`) this is equations 7-63..7-70: `NumNegativePics =
+    ///   num_negative_pics`, `NumPositivePics = num_positive_pics`,
+    ///   `UsedByCurrPicSk[i] = used_by_curr_pic_sk_flag[i]`, and the
+    ///   cumulative `DeltaPocS0[i] = DeltaPocS0[i-1] -
+    ///   (delta_poc_s0_minus1[i] + 1)` recurrence with the
+    ///   first-element seeds (`DeltaPocS0` at i=0 is
+    ///   `-(delta_poc_s0_minus1 at 0 + 1)` and `DeltaPocS1` at i=0 is
+    ///   `delta_poc_s1_minus1 at 0 + 1`). `source` is ignored in this
+    ///   branch.
+    /// * For the inter-RPS-prediction form
+    ///   (`inter_ref_pic_set_prediction_flag == 1`) this runs
+    ///   equations 7-61 (negative side, source-S1-reverse +
+    ///   `deltaRps`-self + source-S0-forward) and 7-62 (positive side,
+    ///   source-S0-reverse + `deltaRps`-self + source-S1-forward) over
+    ///   the already-materialised source RPS supplied via `source`,
+    ///   with `deltaRps = (1 - 2*delta_rps_sign) *
+    ///   (abs_delta_rps_minus1 + 1)`. The output's
+    ///   `NumNegativePics` / `NumPositivePics` reflect the surviving
+    ///   `dPoc < 0` / `dPoc > 0` entries with their `use_delta_flag[j]
+    ///   == 1` gates, per equation 7-71's `NumDeltaPocs`
+    ///   summation. The `source` argument must be `Some(_)` for the
+    ///   inter form; the function returns
+    ///   [`ShortTermRefPicSetMaterializeError::MissingSource`] if
+    ///   absent. Bounds on `used_by_curr_pic_flag` /
+    ///   `use_delta_flag` length are checked against the source's
+    ///   `NumDeltaPocs + 1`; a mismatch returns
+    ///   [`ShortTermRefPicSetMaterializeError::SourceLengthMismatch`].
+    pub fn materialize(
+        &self,
+        source: Option<&MaterializedShortTermRefPicSet>,
+    ) -> Result<MaterializedShortTermRefPicSet, ShortTermRefPicSetMaterializeError> {
+        if self.inter_ref_pic_set_prediction_flag {
+            let source = source.ok_or(ShortTermRefPicSetMaterializeError::MissingSource)?;
+            // `deltaRps` per equation 7-60. The bit-width of
+            // `abs_delta_rps_minus1` is bounded by `ue(v)` plus the
+            // §7.4.8 range check (<= 2^15-1 -> deltaRps fits in i32).
+            let abs = self.abs_delta_rps_minus1 as i64 + 1;
+            let delta_rps = if self.delta_rps_sign { -abs } else { abs } as i32;
+            let num_neg_src = source.num_negative_pics();
+            let num_pos_src = source.num_positive_pics();
+            let num_delta_src = source.num_delta_pocs(); // == num_neg_src + num_pos_src
+                                                         // Per §7.4.8 the `used_by_curr_pic_flag` / `use_delta_flag`
+                                                         // arrays have length `NumDeltaPocs[RefRpsIdx] + 1`.
+            let expected = (num_delta_src + 1) as usize;
+            if self.used_by_curr_pic_flag.len() != expected || self.use_delta_flag.len() != expected
+            {
+                return Err(ShortTermRefPicSetMaterializeError::SourceLengthMismatch {
+                    expected: expected as u32,
+                    got_used: self.used_by_curr_pic_flag.len(),
+                    got_delta: self.use_delta_flag.len(),
+                });
+            }
+            // Negative side (equation 7-61): walk source's positive
+            // POCs in reverse (their `dPoc = DeltaPocS1[RefRpsIdx][j]
+            // + deltaRps` may have crossed zero), then optionally
+            // `deltaRps` itself (only if negative), then source's
+            // negative POCs in forward order.
+            let mut delta_poc_s0 = Vec::new();
+            let mut used_by_curr_pic_s0 = Vec::new();
+            for j in (0..num_pos_src).rev() {
+                let d_poc = source.delta_poc_s1[j as usize] + delta_rps;
+                if d_poc < 0 && self.use_delta_flag[(num_neg_src + j) as usize] {
+                    delta_poc_s0.push(d_poc);
+                    used_by_curr_pic_s0
+                        .push(self.used_by_curr_pic_flag[(num_neg_src + j) as usize]);
+                }
+            }
+            if delta_rps < 0 && self.use_delta_flag[num_delta_src as usize] {
+                delta_poc_s0.push(delta_rps);
+                used_by_curr_pic_s0.push(self.used_by_curr_pic_flag[num_delta_src as usize]);
+            }
+            for j in 0..num_neg_src {
+                let d_poc = source.delta_poc_s0[j as usize] + delta_rps;
+                if d_poc < 0 && self.use_delta_flag[j as usize] {
+                    delta_poc_s0.push(d_poc);
+                    used_by_curr_pic_s0.push(self.used_by_curr_pic_flag[j as usize]);
+                }
+            }
+            // Positive side (equation 7-62): walk source's negative
+            // POCs in reverse (their `dPoc = DeltaPocS0[RefRpsIdx][j]
+            // + deltaRps` may have crossed zero), then optionally
+            // `deltaRps` itself (only if positive), then source's
+            // positive POCs in forward order.
+            let mut delta_poc_s1 = Vec::new();
+            let mut used_by_curr_pic_s1 = Vec::new();
+            for j in (0..num_neg_src).rev() {
+                let d_poc = source.delta_poc_s0[j as usize] + delta_rps;
+                if d_poc > 0 && self.use_delta_flag[j as usize] {
+                    delta_poc_s1.push(d_poc);
+                    used_by_curr_pic_s1.push(self.used_by_curr_pic_flag[j as usize]);
+                }
+            }
+            if delta_rps > 0 && self.use_delta_flag[num_delta_src as usize] {
+                delta_poc_s1.push(delta_rps);
+                used_by_curr_pic_s1.push(self.used_by_curr_pic_flag[num_delta_src as usize]);
+            }
+            for j in 0..num_pos_src {
+                let d_poc = source.delta_poc_s1[j as usize] + delta_rps;
+                if d_poc > 0 && self.use_delta_flag[(num_neg_src + j) as usize] {
+                    delta_poc_s1.push(d_poc);
+                    used_by_curr_pic_s1
+                        .push(self.used_by_curr_pic_flag[(num_neg_src + j) as usize]);
+                }
+            }
+            Ok(MaterializedShortTermRefPicSet {
+                delta_poc_s0,
+                used_by_curr_pic_s0,
+                delta_poc_s1,
+                used_by_curr_pic_s1,
+            })
+        } else {
+            // Explicit form, equations 7-63..7-70.
+            let mut delta_poc_s0 = Vec::with_capacity(self.num_negative_pics as usize);
+            let mut prev: i32 = 0;
+            for (i, &delta_minus1) in self.delta_poc_s0_minus1.iter().enumerate() {
+                // delta_minus1 has been range-checked to 0..=2^15-1 on
+                // parse; the cumulative sum cannot exceed i32 capacity
+                // given num_negative_pics <= 16.
+                let step = delta_minus1 as i32 + 1;
+                let d = if i == 0 { -step } else { prev - step };
+                delta_poc_s0.push(d);
+                prev = d;
+            }
+            let mut delta_poc_s1 = Vec::with_capacity(self.num_positive_pics as usize);
+            let mut prev: i32 = 0;
+            for (i, &delta_minus1) in self.delta_poc_s1_minus1.iter().enumerate() {
+                let step = delta_minus1 as i32 + 1;
+                let d = if i == 0 { step } else { prev + step };
+                delta_poc_s1.push(d);
+                prev = d;
+            }
+            Ok(MaterializedShortTermRefPicSet {
+                delta_poc_s0,
+                used_by_curr_pic_s0: self.used_by_curr_pic_s0_flag.clone(),
+                delta_poc_s1,
+                used_by_curr_pic_s1: self.used_by_curr_pic_s1_flag.clone(),
+            })
+        }
+    }
+}
+
+/// Errors that can arise while running the §7.4.8 inter-RPS-prediction
+/// derivation via [`ShortTermRefPicSet::materialize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortTermRefPicSetMaterializeError {
+    /// The RPS uses inter-RPS prediction
+    /// (`inter_ref_pic_set_prediction_flag == 1`) but the caller did
+    /// not supply a materialised source RPS.
+    MissingSource,
+    /// The on-wire `used_by_curr_pic_flag` / `use_delta_flag` arrays
+    /// did not match the source RPS's `NumDeltaPocs[RefRpsIdx] + 1`
+    /// length. This indicates the parser and the materialiser saw
+    /// different source RPSes (most likely a `RefRpsIdx` mismatch).
+    SourceLengthMismatch {
+        /// Expected length: `NumDeltaPocs[RefRpsIdx] + 1`.
+        expected: u32,
+        /// Actual length of `used_by_curr_pic_flag`.
+        got_used: usize,
+        /// Actual length of `use_delta_flag`.
+        got_delta: usize,
+    },
+}
+
+impl core::fmt::Display for ShortTermRefPicSetMaterializeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingSource => f.write_str(
+                "short-term RPS materialise: inter_ref_pic_set_prediction_flag is set but no source RPS supplied",
+            ),
+            Self::SourceLengthMismatch {
+                expected,
+                got_used,
+                got_delta,
+            } => write!(
+                f,
+                "short-term RPS materialise: per-position array length mismatch: expected {expected}, got used={got_used} delta={got_delta}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShortTermRefPicSetMaterializeError {}
+
+/// Materialised short-term reference-picture-set per §7.4.8 — the
+/// post-derivation form that exposes the per-position `DeltaPocS0[]`,
+/// `UsedByCurrPicS0[]`, `DeltaPocS1[]`, `UsedByCurrPicS1[]` arrays as
+/// signed POC deltas. `NumNegativePics[stRpsIdx]` and
+/// `NumPositivePics[stRpsIdx]` are exposed as the array lengths.
+///
+/// The DeltaPocS0 array is in source order — i.e. the negative POCs
+/// in the order §7.4.8 produces them — which for the explicit form
+/// (equations 7-67 / 7-69) is descending (each element is the next
+/// further-in-the-past POC) and for the inter-RPS-prediction form
+/// (equation 7-61) walks source positives in reverse, then optionally
+/// `deltaRps`, then source negatives in forward order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaterializedShortTermRefPicSet {
+    /// `DeltaPocS0[stRpsIdx][i]` for `i` in
+    /// `0..NumNegativePics[stRpsIdx]`. All entries are strictly
+    /// negative.
+    pub delta_poc_s0: Vec<i32>,
+    /// `UsedByCurrPicS0[stRpsIdx][i]` for `i` in
+    /// `0..NumNegativePics[stRpsIdx]`.
+    pub used_by_curr_pic_s0: Vec<bool>,
+    /// `DeltaPocS1[stRpsIdx][i]` for `i` in
+    /// `0..NumPositivePics[stRpsIdx]`. All entries are strictly
+    /// positive.
+    pub delta_poc_s1: Vec<i32>,
+    /// `UsedByCurrPicS1[stRpsIdx][i]` for `i` in
+    /// `0..NumPositivePics[stRpsIdx]`.
+    pub used_by_curr_pic_s1: Vec<bool>,
+}
+
+impl MaterializedShortTermRefPicSet {
+    /// `NumNegativePics[stRpsIdx]` per §7.4.8.
+    pub fn num_negative_pics(&self) -> u32 {
+        self.delta_poc_s0.len() as u32
+    }
+    /// `NumPositivePics[stRpsIdx]` per §7.4.8.
+    pub fn num_positive_pics(&self) -> u32 {
+        self.delta_poc_s1.len() as u32
+    }
+    /// `NumDeltaPocs[stRpsIdx]` per equation 7-71.
+    pub fn num_delta_pocs(&self) -> u32 {
+        self.num_negative_pics() + self.num_positive_pics()
     }
 }
 
@@ -486,6 +717,44 @@ impl SeqParameterSet {
     pub fn parse(rbsp: &[u8]) -> Result<Self, SpsError> {
         let mut br = BitReader::new(rbsp);
         Self::parse_inner(&mut br, rbsp)
+    }
+
+    /// Materialise the full SPS-level `short_term_ref_pic_sets[]`
+    /// list into the post-§7.4.8 form, chaining inter-RPS-prediction
+    /// entries through their `RefRpsIdx = stRpsIdx -
+    /// (delta_idx_minus1 + 1)` source.
+    ///
+    /// The returned vector is the same length as
+    /// [`Self::short_term_ref_pic_sets`], and the `idx`-th element is
+    /// the materialisation of
+    /// `self.short_term_ref_pic_sets[idx]`. Returns an error if any
+    /// in-chain materialisation fails (e.g. `RefRpsIdx` underflow,
+    /// `used_by_curr_pic_flag` / `use_delta_flag` length mismatch).
+    pub fn materialize_short_term_ref_pic_sets(
+        &self,
+    ) -> Result<Vec<MaterializedShortTermRefPicSet>, ShortTermRefPicSetMaterializeError> {
+        let mut out: Vec<MaterializedShortTermRefPicSet> =
+            Vec::with_capacity(self.short_term_ref_pic_sets.len());
+        for (st_rps_idx, rps) in self.short_term_ref_pic_sets.iter().enumerate() {
+            // `RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1)` per
+            // equation 7-59. For the explicit form `source` is unused
+            // and `RefRpsIdx` is not derived. For the inter form
+            // `delta_idx_minus1` was parsed as 0 for any SPS-resident
+            // entry that did not signal it explicitly (the wire signal
+            // is only present at the slice-inline call site), which
+            // maps to the immediately-preceding entry.
+            let source = if rps.inter_ref_pic_set_prediction_flag {
+                let ref_rps_idx = (st_rps_idx as i64) - (rps.delta_idx_minus1 as i64 + 1);
+                if ref_rps_idx < 0 {
+                    return Err(ShortTermRefPicSetMaterializeError::MissingSource);
+                }
+                out.get(ref_rps_idx as usize)
+            } else {
+                None
+            };
+            out.push(rps.materialize(source)?);
+        }
+        Ok(out)
     }
 
     fn parse_inner(br: &mut BitReader<'_>, rbsp: &[u8]) -> Result<Self, SpsError> {
@@ -1956,6 +2225,252 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// §7.4.8 explicit-form materialisation: the cumulative recurrence
+    /// for `DeltaPocS0[i]` (equation 7-69) and `DeltaPocS1[i]`
+    /// (equation 7-70) starting from the equation-7-67 / 7-68 seeds.
+    #[test]
+    fn materialize_explicit_form_recurrence() {
+        // Hand-assembled RPS: num_negative_pics = 3,
+        // delta_poc_s0_minus1 = [0, 1, 0], used_by_curr_pic_s0_flag =
+        // [true, false, true]; num_positive_pics = 2,
+        // delta_poc_s1_minus1 = [1, 0], used_by_curr_pic_s1_flag =
+        // [true, true]. Per §7.4.8:
+        //   DeltaPocS0 = [-1, -3, -4]
+        //   DeltaPocS1 = [ 2,  3]
+        let rps = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: false,
+            delta_idx_minus1: 0,
+            delta_rps_sign: false,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: Vec::new(),
+            use_delta_flag: Vec::new(),
+            num_negative_pics: 3,
+            num_positive_pics: 2,
+            delta_poc_s0_minus1: vec![0, 1, 0],
+            used_by_curr_pic_s0_flag: vec![true, false, true],
+            delta_poc_s1_minus1: vec![1, 0],
+            used_by_curr_pic_s1_flag: vec![true, true],
+        };
+        let m = rps.materialize(None).expect("explicit materialise");
+        assert_eq!(m.delta_poc_s0, vec![-1, -3, -4]);
+        assert_eq!(m.used_by_curr_pic_s0, vec![true, false, true]);
+        assert_eq!(m.delta_poc_s1, vec![2, 3]);
+        assert_eq!(m.used_by_curr_pic_s1, vec![true, true]);
+        assert_eq!(m.num_negative_pics(), 3);
+        assert_eq!(m.num_positive_pics(), 2);
+        assert_eq!(m.num_delta_pocs(), 5);
+    }
+
+    /// §7.4.8 inter-RPS-prediction (equations 7-61 / 7-62): a tiny
+    /// chain where the source has one negative POC at -1 and the
+    /// derived RPS uses `deltaRps = +1` to shift it past zero, so the
+    /// source's negative drops out and `deltaRps` itself lands as a
+    /// positive entry gated by the wire flags. Matches the
+    /// `parses_inter_rps_prediction` fixture above.
+    #[test]
+    fn materialize_inter_rps_prediction_matches_fixture() {
+        let src = MaterializedShortTermRefPicSet {
+            delta_poc_s0: vec![-1],
+            used_by_curr_pic_s0: vec![true],
+            delta_poc_s1: vec![],
+            used_by_curr_pic_s1: vec![],
+        };
+        // The inter-form RPS from the existing
+        // `parses_inter_rps_prediction` test: deltaRps = +1,
+        // used_by_curr_pic_flag = [true, false], use_delta_flag = [true,
+        // true].
+        let inter = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: true,
+            delta_idx_minus1: 0,
+            delta_rps_sign: false,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: vec![true, false],
+            use_delta_flag: vec![true, true],
+            num_negative_pics: 0,
+            num_positive_pics: 0,
+            delta_poc_s0_minus1: Vec::new(),
+            used_by_curr_pic_s0_flag: Vec::new(),
+            delta_poc_s1_minus1: Vec::new(),
+            used_by_curr_pic_s1_flag: Vec::new(),
+        };
+        let m = inter
+            .materialize(Some(&src))
+            .expect("inter-RPS materialise");
+        // Negative side (equation 7-61):
+        //   * No source positives.
+        //   * deltaRps = +1 ≥ 0, skip the self-term.
+        //   * Source negative j=0: dPoc = -1 + 1 = 0, not < 0, skip.
+        //   ⇒ NumNegativePics = 0.
+        assert!(m.delta_poc_s0.is_empty());
+        assert!(m.used_by_curr_pic_s0.is_empty());
+        // Positive side (equation 7-62):
+        //   * Source negative j=0 reverse: dPoc = -1 + 1 = 0, not > 0,
+        //     skip.
+        //   * deltaRps = +1 > 0 and use_delta_flag[NumDeltaPocs=1] =
+        //     true ⇒ DeltaPocS1[0] = +1, UsedByCurrPicS1[0] =
+        //     used_by_curr_pic_flag[1] = false.
+        //   * No source positives.
+        //   ⇒ NumPositivePics = 1.
+        assert_eq!(m.delta_poc_s1, vec![1]);
+        assert_eq!(m.used_by_curr_pic_s1, vec![false]);
+    }
+
+    /// §7.4.8 inter-RPS-prediction with `deltaRps < 0`: a source
+    /// positive POC at +1 with `deltaRps = -2` falls onto the negative
+    /// side via the source-positives-reverse step of equation 7-61.
+    #[test]
+    fn materialize_inter_rps_prediction_negative_delta_rps() {
+        // Source: one positive POC at +1 (no negatives).
+        let src = MaterializedShortTermRefPicSet {
+            delta_poc_s0: vec![],
+            used_by_curr_pic_s0: vec![],
+            delta_poc_s1: vec![1],
+            used_by_curr_pic_s1: vec![true],
+        };
+        // Inter-form: deltaRps = -(1+1) = -2; arrays sized
+        // NumDeltaPocs[src]+1 = 2.
+        // used_by_curr_pic_flag indexed:
+        //   * [0..NumNegativePics[src]) = none
+        //   * [NumNegativePics, NumNegativePics + NumPositivePics) = [0..1) = j_src=0
+        //   * [NumDeltaPocs] = trailing slot for `deltaRps` self-term
+        // So used_by_curr_pic_flag = [true_for_src_pos0, true_for_self_term].
+        let inter = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: true,
+            delta_idx_minus1: 0,
+            delta_rps_sign: true, // negative
+            abs_delta_rps_minus1: 1,
+            used_by_curr_pic_flag: vec![true, true],
+            use_delta_flag: vec![true, true],
+            num_negative_pics: 0,
+            num_positive_pics: 0,
+            delta_poc_s0_minus1: Vec::new(),
+            used_by_curr_pic_s0_flag: Vec::new(),
+            delta_poc_s1_minus1: Vec::new(),
+            used_by_curr_pic_s1_flag: Vec::new(),
+        };
+        let m = inter
+            .materialize(Some(&src))
+            .expect("inter-RPS negative deltaRps");
+        // Negative side (equation 7-61):
+        //   * Source positive j=0 reverse: dPoc = 1 + (-2) = -1 < 0 and
+        //     use_delta_flag[NumNeg=0 + 0] = use_delta_flag[0] = true
+        //     ⇒ DeltaPocS0[0] = -1, UsedByCurrPicS0[0] =
+        //       used_by_curr_pic_flag[0] = true.
+        //   * deltaRps = -2 < 0 and use_delta_flag[NumDeltaPocs=1] =
+        //     true ⇒ DeltaPocS0[1] = -2, UsedByCurrPicS0[1] =
+        //       used_by_curr_pic_flag[1] = true.
+        //   * No source negatives.
+        assert_eq!(m.delta_poc_s0, vec![-1, -2]);
+        assert_eq!(m.used_by_curr_pic_s0, vec![true, true]);
+        // Positive side: source negatives reverse: none. deltaRps < 0,
+        // skip self-term. Source positive j=0: dPoc = +1 + (-2) = -1,
+        // not > 0, skip. ⇒ empty.
+        assert!(m.delta_poc_s1.is_empty());
+        assert!(m.used_by_curr_pic_s1.is_empty());
+    }
+
+    /// [`ShortTermRefPicSet::materialize`] rejects the inter form
+    /// without a source RPS.
+    #[test]
+    fn materialize_inter_rps_rejects_missing_source() {
+        let inter = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: true,
+            delta_idx_minus1: 0,
+            delta_rps_sign: false,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: vec![true],
+            use_delta_flag: vec![true],
+            ..Default::default()
+        };
+        assert_eq!(
+            inter.materialize(None),
+            Err(ShortTermRefPicSetMaterializeError::MissingSource),
+        );
+    }
+
+    /// [`ShortTermRefPicSet::materialize`] surfaces a per-position
+    /// array-length mismatch against the source RPS's `NumDeltaPocs +
+    /// 1`.
+    #[test]
+    fn materialize_inter_rps_rejects_length_mismatch() {
+        let src = MaterializedShortTermRefPicSet {
+            delta_poc_s0: vec![-1, -2],
+            used_by_curr_pic_s0: vec![true, true],
+            delta_poc_s1: vec![],
+            used_by_curr_pic_s1: vec![],
+        };
+        // NumDeltaPocs[src] = 2, so the inter form expects arrays of
+        // length 3. Pass 2-element arrays to provoke the mismatch.
+        let inter = ShortTermRefPicSet {
+            inter_ref_pic_set_prediction_flag: true,
+            delta_idx_minus1: 0,
+            delta_rps_sign: false,
+            abs_delta_rps_minus1: 0,
+            used_by_curr_pic_flag: vec![true, true],
+            use_delta_flag: vec![true, true],
+            ..Default::default()
+        };
+        assert!(matches!(
+            inter.materialize(Some(&src)),
+            Err(ShortTermRefPicSetMaterializeError::SourceLengthMismatch {
+                expected: 3,
+                got_used: 2,
+                got_delta: 2,
+            }),
+        ));
+    }
+
+    /// [`SeqParameterSet::materialize_short_term_ref_pic_sets`]
+    /// chains explicit and inter-RPS-predicted entries through their
+    /// `RefRpsIdx` lookups using the same fixture as
+    /// `parses_inter_rps_prediction`.
+    #[test]
+    fn sps_materialize_chains_inter_rps_prediction() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm_enabled_flag
+        s += "011"; // num_short_term_ref_pic_sets = 2
+                    // st_ref_pic_set(0): explicit num_neg=1, num_pos=0,
+                    // delta_poc_s0_minus1[0]=0, used_by_curr_pic_s0_flag=1
+        s += "010";
+        s += "1";
+        s += "1";
+        s += "1";
+        // st_ref_pic_set(1): inter_ref_pic_set_prediction_flag = 1,
+        // delta_rps_sign=0, abs_delta_rps_minus1=0 (deltaRps=+1),
+        // used_by_curr_pic_flag = [1, 0], use_delta_flag[1] = 1.
+        s += "1";
+        s += "0";
+        s += "1";
+        s += "1"; // used_by_curr_pic_flag[0] = 1 (use_delta inferred)
+        s += "0"; // used_by_curr_pic_flag[1] = 0
+        s += "1"; // use_delta_flag[1] = 1
+                  // long_term=0, temporal_mvp=1, strong_intra_smoothing=1,
+                  // vui=0, ext=0, stop bit
+        s += "0";
+        s += "1";
+        s += "1";
+        s += "0";
+        s += "0";
+        s += "1";
+
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let m = sps
+            .materialize_short_term_ref_pic_sets()
+            .expect("materialize");
+        assert_eq!(m.len(), 2);
+        // Explicit source (idx 0): DeltaPocS0=[-1], UsedByCurrPicS0=[true].
+        assert_eq!(m[0].delta_poc_s0, vec![-1]);
+        assert_eq!(m[0].used_by_curr_pic_s0, vec![true]);
+        assert_eq!(m[0].num_delta_pocs(), 1);
+        // Inter-predicted (idx 1): NumNegativePics=0,
+        // NumPositivePics=1 with DeltaPocS1=[+1] from the deltaRps
+        // self-term (see `materialize_inter_rps_prediction_matches_fixture`).
+        assert!(m[1].delta_poc_s0.is_empty());
+        assert_eq!(m[1].delta_poc_s1, vec![1]);
+        assert_eq!(m[1].used_by_curr_pic_s1, vec![false]);
     }
 
     /// `num_long_term_ref_pics_sps > 32` is illegal per §7.4.3.2.

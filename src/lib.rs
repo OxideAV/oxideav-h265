@@ -238,9 +238,9 @@ pub use slice::{
     IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
 };
 pub use sps::{
-    ConformanceWindow, LongTermRefPicEntry, OpaqueTail, PcmInfo, SeqParameterSet,
-    ShortTermRefPicSet, SpsError, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
-    HEVC_MAX_RPS_PICS,
+    ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
+    SeqParameterSet, ShortTermRefPicSet, ShortTermRefPicSetMaterializeError, SpsError,
+    HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
 };
 pub use vps::{
     HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsError, VpsTimingInfo,

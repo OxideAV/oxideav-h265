@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 23 (2026-05-29).** The prior implementation was
+**Clean-room rebuild — round 24 (2026-05-30).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,51 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 23 wires the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 24 lands the
+§7.4.8 inter-RPS-prediction derivation as the new
+[`ShortTermRefPicSet::materialize`] / [`MaterializedShortTermRefPicSet`]
+typed builder and wires it into the §7.3.6.1 slice parser to close
+the last remaining round-23 deferral point. The explicit-form branch
+implements equations 7-63..7-70 (the per-position `UsedByCurrPicS{0,1}`
+arrays direct, the cumulative `DeltaPocS0[i] = DeltaPocS0[i-1] -
+(delta_poc_s0_minus1[i] + 1)` / `DeltaPocS1[i] = DeltaPocS1[i-1] +
+(delta_poc_s1_minus1[i] + 1)` recurrences with their
+equation-7-67 / 7-68 seeds). The inter-RPS-prediction branch
+implements equation 7-60 (`deltaRps = (1 - 2*delta_rps_sign) *
+(abs_delta_rps_minus1 + 1)`) and equations 7-61 (negative side —
+source-positives reverse + optional `deltaRps` self-term + source-
+negatives forward) and 7-62 (positive side, mirrored), filtering each
+candidate entry by its `dPoc < 0` / `dPoc > 0` sign and the per-entry
+`use_delta_flag[j]` gate. The
+[`SeqParameterSet::materialize_short_term_ref_pic_sets`] SPS-level
+helper runs the full chain, threading inter-form entries through the
+equation-7-59 `RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1)` source
+lookup so the materialisation is closed under inter-RPS prediction
+across the entire SPS list (and for slice-inline construction at
+`stRpsIdx == num_short_term_ref_pic_sets`). The §7.3.6.1 slice parser
+now consumes the materialised RPS at the in-place
+`ref_pic_lists_modification()` call site, picking the active RPS
+(inline source via `RefRpsIdx = num_short_term_ref_pic_sets -
+(delta_idx_minus1 + 1)` for the inline-inter case), feeding the
+derived `UsedByCurrPicS{0,1}` slices into
+[`NumPicTotalCurrInputs::from_used_flags`] / `compute`, and walking
+the in-place RPLM gate exactly as the explicit-form path did in
+round 23. Configurations whose materialisation succeeds reach
+`byte_alignment()` end to end; only malformed inter-form chains
+(on-wire `used_by_curr_pic_flag` / `use_delta_flag` length not
+matching the source's `NumDeltaPocs + 1`) defer to an opaque tail.
+Total tests now 215 (was 208): five new sps tests cover the §7.4.8
+derivation directly (explicit-form recurrence, inter-RPS positive and
+negative `deltaRps` cases, missing-source rejection, length-mismatch
+rejection, and an SPS-level chain test); one new slice test covers a
+P-slice with an SPS-form inter-predicted RPS that materialises to
+`NumPicTotalCurr == 0` and walks the full inter-slice tail without
+deferral; the pre-round
+`defers_rplm_when_active_st_rps_uses_inter_prediction` test is
+preserved with its prose updated to reflect that the deferral is now
+the malformed-array path. With this round, every conformant non-IDR
+P / B slice — explicit or inter-form short-term RPS — parses end to
+end through `byte_alignment()`. Round 23 had wired the
 standalone §7.3.6.2 [`RefPicListsModification::parse`] (round 15)
 into the §7.3.6.1 slice-header in-place call site, closing the
 `pps.lists_modification_present_flag == 1` deferral point for every
@@ -613,6 +657,40 @@ data and CABAC remain unimplemented.
   IDR-`nal_unit_type` slices skip the short-term / long-term loops
   and the `NumActiveRefLayerPics` summand is added at the end.
 
+* §7.4.8 [`MaterializedShortTermRefPicSet`] /
+  [`ShortTermRefPicSet::materialize`] — the post-derivation form of a
+  short-term RPS, exposing the per-position `DeltaPocS0[]`,
+  `UsedByCurrPicS0[]`, `DeltaPocS1[]`, `UsedByCurrPicS1[]` arrays as
+  signed POC deltas; `NumNegativePics` / `NumPositivePics` /
+  `NumDeltaPocs` are exposed as the array lengths
+  (equation 7-71). The explicit-form branch implements equations
+  7-63..7-70 directly (the per-position `UsedByCurrPicS{0,1}` arrays
+  pass through, the cumulative `DeltaPocS0[i] = DeltaPocS0[i-1] -
+  (delta_poc_s0_minus1[i] + 1)` / `DeltaPocS1[i] = DeltaPocS1[i-1] +
+  (delta_poc_s1_minus1[i] + 1)` recurrences with their
+  equation-7-67 / 7-68 first-element seeds). The
+  inter-RPS-prediction branch implements equation 7-60 (`deltaRps =
+  (1 - 2*delta_rps_sign) * (abs_delta_rps_minus1 + 1)`) and equations
+  7-61 / 7-62 — the negative side iterates source positives in
+  reverse, then optionally the `deltaRps` self-term, then source
+  negatives in forward order; the positive side mirrors the same
+  pattern with sources swapped. Each candidate entry is gated by its
+  sign test (`dPoc < 0` for the negative side, `dPoc > 0` for the
+  positive side) and the per-entry `use_delta_flag[j]` flag. Per-array
+  length is checked against the source's
+  `NumDeltaPocs[RefRpsIdx] + 1`; mismatches raise
+  [`ShortTermRefPicSetMaterializeError::SourceLengthMismatch`].
+  [`SeqParameterSet::materialize_short_term_ref_pic_sets`] runs the
+  full SPS-level chain, threading inter-form entries through the
+  equation-7-59 `RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1)` source
+  lookup. The slice parser uses both: the SPS list is materialised
+  once at the §7.3.6.1 `ref_pic_lists_modification()` gate, the
+  active RPS is picked (or constructed from the slice-inline form),
+  and the derived `UsedByCurrPicS{0,1}` slices feed
+  [`NumPicTotalCurrInputs::from_used_flags`] / `compute` so the
+  in-place RPLM gate is reached for every conformant slice — explicit
+  or inter-form.
+
 * §7.3.6.3 [`PredWeightTable`] — the `pred_weight_table()` syntax
   structure, wired in-place at the §7.3.6.1 call site (round 21).
   When the §7.3.6.1 outer gate is statically present
@@ -678,9 +756,12 @@ data and CABAC remain unimplemented.
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
-[`SeqParameterSet::parse`], [`PicParameterSet::parse`],
-[`SliceSegmentHeader::parse`], [`RefPicListsModification::parse`],
-[`PredWeightTable::parse`], [`scan_order`], [`CabacEngine::new`].
+[`SeqParameterSet::parse`],
+[`SeqParameterSet::materialize_short_term_ref_pic_sets`],
+[`PicParameterSet::parse`], [`SliceSegmentHeader::parse`],
+[`RefPicListsModification::parse`], [`PredWeightTable::parse`],
+[`ShortTermRefPicSet::materialize`], [`scan_order`],
+[`CabacEngine::new`].
 
 ## Not yet implemented
 
@@ -694,18 +775,21 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   / §I multi-layer / 3D / SCC VPS-extension syntax; surfaced as
   [`HevcVps::opaque_tail`] when `vps_extension_flag == 1`. The §E.2.2
   `hrd_parameters()` bodies are now fully decoded (round 13).
-* Slice header (§7.3.6.1) deferred body: the P/B
-  `ref_pic_lists_modification()` (§7.3.6.2) sub-structure —
-  `SliceSegmentHeader::parse` surfaces it as an opaque tail only
-  when its gate is statically present
-  (`lists_modification_present_flag == 1`); otherwise the parser
-  walks through the entire inter-slice tail to `byte_alignment()`.
-  The §7.3.6.2 syntax structure itself is decoded by the standalone
-  [`RefPicListsModification::parse`] (round 15) and the §7.4.7.2
-  `NumPicTotalCurr` derivation is available as
-  [`NumPicTotalCurrInputs::compute`] (round 16); a future round
-  threads them together at the §7.3.6.1 call site under
-  `NumPicTotalCurr > 1`. The §7.3.6.3 `pred_weight_table()` is now
+* Slice header (§7.3.6.1) deferred body: the active short-term RPS
+  is in inter-RPS-prediction form (`inter_ref_pic_set_prediction_flag
+  == 1`) **and** the on-wire `used_by_curr_pic_flag` /
+  `use_delta_flag` array lengths do not match the source's
+  `NumDeltaPocs[RefRpsIdx] + 1`. This is the only remaining
+  parser-side §7.3.6.1 deferral path: every conformant slice
+  configuration parses through `byte_alignment()` as of round 24
+  (round 23 wired the explicit-form RPLM; round 24 wires the §7.4.8
+  inter-RPS-prediction derivation via
+  [`ShortTermRefPicSet::materialize`] /
+  [`SeqParameterSet::materialize_short_term_ref_pic_sets`] so the
+  derived `UsedByCurrPicS{0,1}` arrays feed
+  [`NumPicTotalCurrInputs::from_used_flags`] and the inter-form RPS
+  path matches the explicit-form behaviour). The §7.3.6.3
+  `pred_weight_table()` is now
   decoded **in place** at the §7.3.6.1 call site (round 21, this
   round) using [`PredWeightTableInputs::base_profile`] — the
   universal base-profile single-layer case where every per-i
