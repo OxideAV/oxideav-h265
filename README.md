@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 25 (2026-05-30).** The prior implementation was
+**Clean-room rebuild — round 26 (2026-05-31).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,47 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 25 decodes the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 26 ships the
+§9.3.4.2 per-syntax-element binarization + context-index derivation
+layer for the two CABAC elements unblocked by the clean-room trace at
+`docs/video/h265/fixtures/main-422-10bit/cabac-cu-qp-delta-last-sig-trace.md`:
+`cu_qp_delta_abs` / `cu_qp_delta_sign_flag` (§7.3.8.14, §7.4.9.14) and
+`last_sig_coeff_{x,y}_{prefix,suffix}` (§7.3.8.11, §7.4.9.11). The new
+[`binarization`] module exposes [`binarization::decode_cu_qp_delta`]
+(§9.3.3.10 TR prefix `cMax = 5` + §9.3.3.11 EGk(k=0) escape suffix +
+bypass sign flag; per-bin ctxInc via Table 9-32 — bin 0 → ctx 0, bins
+1..=4 → ctx 1) plus [`binarization::decode_last_sig_coeff`] (§9.3.3.10
+TR prefix with `cMax = (log2TrafoSize << 1) − 1` and the §9.3.4.2.3
+per-bin `ctxInc = (binIdx >> ctxShift) + ctxOffset` via
+[`binarization::last_sig_coeff_prefix_ctx_offset_shift`] — luma
+`ctxOffset = 3*(log2TrafoSize − 2) + ((log2TrafoSize − 1) >> 2)`,
+`ctxShift = (log2TrafoSize + 1) >> 2`; chroma `ctxOffset = 15`,
+`ctxShift = log2TrafoSize − 2`). The §7.4.9.11 equations 7-74..7-77
+position derivation lives in [`binarization::last_sig_coeff_position`]
+(returns the pre-scanIdx-2-swap `LastSignificantCoeff{X,Y}`); the
+§7.4.9.14 `CuQpDeltaVal = cu_qp_delta_abs * (1 − 2 *
+cu_qp_delta_sign_flag)` derivation lives on the returned
+[`binarization::CuQpDelta`]. A [`binarization::LastSigCoeffBank`] tag
+(X / Y) is exposed for caller-side context-bank routing. The module
+sits one layer above the §9.3 arithmetic engine
+([`cabac::CabacEngine`], round 11) and consumes context variables
+([`cabac::ContextModel`]) supplied by the eventual slice-data parser.
+The §9.3.4.2 surface still has many remaining syntax elements
+(`sig_coeff_flag`, `coeff_abs_level_greater{1,2}_flag`,
+`coeff_abs_level_remaining`, motion-related elements, split / merge /
+prediction-mode flags, …) but the binarization scaffold plus the
+first two elements unblock the previously-blocked
+trace-dependent path and establish the module shape every future
+element plugs into. Total tests now 234 (was 218): 16 new tests cover
+the cu_qp_delta_abs ctxInc table (Table 9-32), last_sig_coeff
+offset/shift for luma + chroma at log2 = 2..=5, the `(binIdx >>
+ctxShift) + ctxOffset` ctxInc identity over the 32×32-luma and
+4×4-luma rows, the per-size `cMax`, the §7.4.9.11 position derivation
+on the trace-observed luma 32×32 `(prefix=6, LastX=8)` + 16×16 chroma
+rows, the suffix-nBits table, the TR-prefix terminator and all-ones
+escape paths, the cu_qp_delta_abs = 0 path (no sign flag, value = 0),
+the §7.4.9.14 signed derivation across the 10 multi-slice-per-frame
+trace rows, and a crafted-engine EGk(k=0) decode. Round 25 had decoded the
 §7.3.2.3.1 PPS extension-flag block as a new typed
 [`pps::PpsExtensionFlags`] sub-struct: when
 `pps_extension_present_flag == 1` the eight bits that follow
@@ -779,6 +819,36 @@ data and CABAC remain unimplemented.
   Table 9-52 / Table 9-53 values are transcribed directly from the
   H.265 specification.
 
+* §9.3.4.2 [`binarization`] — per-syntax-element binarization +
+  context-index derivation, the layer that drives
+  [`cabac::CabacEngine`] with concrete `(ctxTable, ctxIdx)` selections
+  for each entropy-coded syntax element. As of round 26 the module
+  ships two elements:
+  - [`binarization::decode_cu_qp_delta`] handles
+    `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` (§7.3.8.14, §7.4.9.14):
+    §9.3.3.10 TR prefix (`cMax = 5`, `cRiceParam = 0`), §9.3.3.11
+    EGk(k=0) suffix when the prefix is the all-ones escape, bypass-coded
+    sign flag (§7.4.9.14 implies the flag is absent when `abs == 0`),
+    and the §7.4.9.14 `CuQpDeltaVal = abs * (1 − 2 * sign_flag)`
+    derivation. Per-bin ctxInc (Table 9-32) lives in
+    [`binarization::cu_qp_delta_abs_ctx_inc`]: bin 0 → ctx 0, bins 1..=4
+    → ctx 1.
+  - [`binarization::decode_last_sig_coeff`] handles
+    `last_sig_coeff_{x,y}_{prefix,suffix}` (§7.3.8.11, §7.4.9.11):
+    §9.3.3.10 TR prefix with `cMax = (log2TrafoSize << 1) − 1`, a
+    `nBits = (prefix >> 1) − 1` bypass-coded suffix when `prefix > 3`,
+    and the §7.4.9.11 equations 7-74..7-77 position derivation
+    ([`binarization::last_sig_coeff_position`] returns the
+    pre-scanIdx-2-swap `LastSignificantCoeff{X,Y}`). The §9.3.4.2.3
+    `(ctxOffset, ctxShift)` derivation is in
+    [`binarization::last_sig_coeff_prefix_ctx_offset_shift`] (luma /
+    chroma per Tables 9-26 / 9-27), and the per-bin
+    `ctxInc = (binIdx >> ctxShift) + ctxOffset` in
+    [`binarization::last_sig_coeff_prefix_ctx_inc`]. The X and Y
+    prefix bins live in separate context banks; the
+    [`binarization::LastSigCoeffBank`] tag exposes the routing
+    decision.
+
 Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`NalHeader::parse`], [`strip_emulation_prevention`],
 [`BitReader`], [`HevcVps::parse`], [`ProfileTierLevel::parse`],
@@ -787,7 +857,9 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`PicParameterSet::parse`], [`SliceSegmentHeader::parse`],
 [`RefPicListsModification::parse`], [`PredWeightTable::parse`],
 [`ShortTermRefPicSet::materialize`], [`scan_order`],
-[`CabacEngine::new`].
+[`CabacEngine::new`],
+[`binarization::decode_cu_qp_delta`],
+[`binarization::decode_last_sig_coeff`].
 
 ## Not yet implemented
 
@@ -845,12 +917,21 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `ctxTable` / `ctxIdx` for each bin) and the §7.3.8.1..§7.3.8.12
   parse loops.
 * §9.3.4.2 per-syntax-element binarization / context-index
-  derivation — blocked on the docs `cu_qp_delta` + `last_sig_coeff`
-  multi-QG / multi-CTU 4:2:2 trace gap. (The §9.3 arithmetic decode
-  engine itself — DecodeDecision / DecodeBypass / DecodeTerminate
-  / RenormD / alignment — is implemented as of round 11; it sits
-  one layer below the binarization tables and is not affected by
-  the trace gap.)
+  derivation — the scaffold module ([`binarization`]) lands in
+  round 26 with the first two elements (`cu_qp_delta_abs` /
+  `cu_qp_delta_sign_flag` and `last_sig_coeff_{x,y}_{prefix,suffix}`)
+  unblocked by the docs CABAC trace
+  (`docs/video/h265/fixtures/main-422-10bit/cabac-cu-qp-delta-last-sig-trace.md`).
+  Still to land — every other §9.3.4.2 syntax element:
+  `sig_coeff_flag` (§9.3.4.2.5), `coded_sub_block_flag` (§9.3.4.2.4),
+  `coeff_abs_level_greater1_flag` / `_greater2_flag` /
+  `coeff_abs_level_remaining` / `coeff_sign_flag` (§9.3.4.2.6 +
+  bypass), split / merge / prediction-mode flags, motion-vector
+  binarization (`mvd_lX[]` EGk + sign), `sao_*` elements, etc. (The
+  §9.3 arithmetic decode engine itself — DecodeDecision /
+  DecodeBypass / DecodeTerminate / RenormD / alignment — is
+  implemented as of round 11; it sits one layer below the
+  binarization tables.)
 * Intra / inter prediction, transform, in-loop filters (deblock /
   SAO), DPB management.
 * Encoder.

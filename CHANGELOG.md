@@ -6,6 +6,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 26 (2026-05-31)
+
+- New [`binarization`] module implementing the §9.3.4.2
+  per-syntax-element binarization + context-index derivation layer for
+  the two CABAC elements unblocked by the clean-room trace
+  `docs/video/h265/fixtures/main-422-10bit/cabac-cu-qp-delta-last-sig-trace.md`:
+  - `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` (§7.3.8.14 / §7.4.9.14)
+    via [`binarization::decode_cu_qp_delta`] and the per-bin ctxInc
+    table [`binarization::cu_qp_delta_abs_ctx_inc`] (Table 9-32: bin 0
+    → ctx 0, bins 1..=4 → ctx 1). Binarization is §9.3.3.10 TR with
+    `cMax = 5`, `cRiceParam = 0`, followed by an EGk(k=0) suffix when
+    the prefix is the all-ones escape, plus the bypass-coded sign
+    flag. The decoded [`binarization::CuQpDelta`] surfaces the
+    §7.4.9.14 `CuQpDeltaVal = cu_qp_delta_abs * (1 − 2 *
+    cu_qp_delta_sign_flag)` derivation.
+  - `last_sig_coeff_{x,y}_{prefix,suffix}` (§7.3.8.11 / §7.4.9.11) via
+    [`binarization::decode_last_sig_coeff`] plus the
+    [`binarization::last_sig_coeff_prefix_ctx_offset_shift`] derivation
+    (§9.3.4.2.3 luma `ctxOffset = 3*(log2TrafoSize − 2) + ((log2TrafoSize
+    − 1) >> 2)`, `ctxShift = (log2TrafoSize + 1) >> 2`; chroma
+    `ctxOffset = 15`, `ctxShift = log2TrafoSize − 2`) and
+    [`binarization::last_sig_coeff_prefix_ctx_inc`] (`ctxInc =
+    (binIdx >> ctxShift) + ctxOffset`). The prefix `cMax =
+    (log2TrafoSize << 1) − 1` ([`binarization::last_sig_coeff_prefix_cmax`])
+    bounds the TR length; the suffix is a `nBits = (prefix >> 1) − 1`
+    bypass-coded fixed-length field present only when `prefix > 3`
+    ([`binarization::last_sig_coeff_suffix_n_bits`]). The §7.4.9.11
+    equations 7-74..7-77 position derivation lives in
+    [`binarization::last_sig_coeff_position`], returning
+    `LastSignificantCoeff{X,Y}` from `(prefix, optional suffix)`
+    pre-scanIdx-2 swap. A [`binarization::LastSigCoeffBank`] tag (X / Y)
+    is exposed for caller-side context-bank routing.
+- §9.3.3.10 TR-prefix and §9.3.3.11 EGk(k=0) helpers ship as internal
+  building blocks; the module sits one layer above the §9.3 arithmetic
+  engine ([`cabac::CabacEngine`], round 11) and consumes context
+  variables ([`cabac::ContextModel`]) supplied by the caller (the
+  slice-data parser, when it lands).
+- 16 new binarization unit tests (218 → 234 total): cu_qp_delta ctxInc
+  table (Table 9-32 spot-check); last_sig_coeff offset/shift for luma
+  log2 = 2..=5; same for chroma; ctxInc-from-binIdx parametrised over
+  the 32×32-luma and 4×4-luma rows; `cMax` per log2 size; equation
+  7-74 position derivation across the trace-observed luma 32×32 (px=6,
+  LastX=8) + 16×16 chroma rows; suffix-nBits table; TR-prefix
+  terminator and all-ones escape; cu_qp_delta_abs = 0 path (no sign
+  flag, value = 0); §7.4.9.14 signed-value derivation over the 10
+  multi-slice-per-frame trace rows; EGk(k=0) decoding driven through
+  a crafted engine offset.
+
 ### Added — clean-room rebuild round 25 (2026-05-30)
 
 - §7.3.2.3.1 PPS extension-flag block: new typed

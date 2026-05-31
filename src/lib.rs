@@ -210,6 +210,7 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod binarization;
 pub mod bitreader;
 pub mod cabac;
 pub mod hrd;
