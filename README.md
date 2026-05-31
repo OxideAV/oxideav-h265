@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 26 (2026-05-31).** The prior implementation was
+**Clean-room rebuild — round 27 (2026-06-01).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,9 +14,42 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 26 ships the
-§9.3.4.2 per-syntax-element binarization + context-index derivation
-layer for the two CABAC elements unblocked by the clean-room trace at
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 27 extends the
+[`binarization`] module with three more §9.3.4.2 ctxInc derivations
+that are pure-functional given the neighbour / sub-block context
+(no CABAC engine drive at this layer; callers compose the engine call
+themselves): `coded_sub_block_flag` (§9.3.4.2.4 equations 9-35..9-39)
+via [`binarization::coded_sub_block_flag_ctx_inc`] +
+[`binarization::coded_sub_block_flag_ctx_inc_with_edge`] (the latter
+applies the equation 9-36 / 9-37 edge gates `xS < (1 <<
+(log2TrafoSize − 2)) − 1` / `yS < (1 << (log2TrafoSize − 2)) − 1`
+before delegating); and the §9.3.4.2.2 Table 9-49 left/above ctxInc
+shape `ctxInc = (condL && availableL) + (condA && availableA)` as the
+shared [`binarization::left_above_ctx_inc`] helper, with the two row
+specialisations [`binarization::split_cu_flag_ctx_inc`] (condL/A =
+`CtDepth[xNb][yNb] > cqtDepth`) and
+[`binarization::cu_skip_flag_ctx_inc`] (condL/A =
+`cu_skip_flag[xNb][yNb]`) on top. The §9.3.4.2.4 luma bank is `{0, 1}`
+(equation 9-38 `ctxInc = Min(csbfCtx, 1)`), the chroma bank is `{2, 3}`
+(equation 9-39 `ctxInc = 2 + Min(csbfCtx, 1)`). The §9.3.4.2.2 ctxInc
+is in `{0, 1, 2}` for both row specialisations. Total tests now 251
+(was 234): 17 new tests cover the §9.3.4.2.4 luma + chroma banks (both
+neighbours zero / one set / both set with the `Min(csbfCtx, 1)`
+clamp), the LSB-masking defensive input, the edge-gating at the
+right-edge (4×4 TB single-sub-block / 8×8 TB right-edge / 16×16 TB
+bottom-edge / 32×32 TB interior, luma + chroma), the §9.3.4.2.2 Table
+9-49 `(condL && availableL) + (condA && availableA)` truth table
+(unavailable neighbour zeroes its branch even when its cond is true),
+the `split_cu_flag` condX strict inequality `CtDepth > cqtDepth`, the
+`cu_skip_flag` condX LSB-mask, the four-way split_cu_flag ctxInc table
+(both deeper / left deeper / left unavailable / both unavailable), the
+cu_skip_flag eight-way truth table (every combination of left/above
+flag-and-availability), and a bounded `ctxInc ∈ {0, 1, 2}` invariant
+over a small Cartesian product of inputs.
+
+Round 26 had shipped the §9.3.4.2 per-syntax-element binarization +
+context-index derivation layer for the two CABAC elements unblocked
+by the clean-room trace at
 `docs/video/h265/fixtures/main-422-10bit/cabac-cu-qp-delta-last-sig-trace.md`:
 `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` (§7.3.8.14, §7.4.9.14) and
 `last_sig_coeff_{x,y}_{prefix,suffix}` (§7.3.8.11, §7.4.9.11). The new
@@ -822,8 +855,28 @@ data and CABAC remain unimplemented.
 * §9.3.4.2 [`binarization`] — per-syntax-element binarization +
   context-index derivation, the layer that drives
   [`cabac::CabacEngine`] with concrete `(ctxTable, ctxIdx)` selections
-  for each entropy-coded syntax element. As of round 26 the module
-  ships two elements:
+  for each entropy-coded syntax element. As of round 27 the module
+  ships two CABAC-engine-coupled elements (rounds 26) plus three
+  pure-functional ctxInc derivations (round 27):
+  - **(round 27)** [`binarization::coded_sub_block_flag_ctx_inc`] +
+    [`binarization::coded_sub_block_flag_ctx_inc_with_edge`] handle
+    `coded_sub_block_flag` ctxInc derivation per §9.3.4.2.4 equations
+    9-35..9-39: `csbfCtx` is the sum of the two previously decoded
+    neighbour bins (gated by equations 9-36 / 9-37 against the TB's
+    sub-block edges `xS < (1 << (log2TrafoSize − 2)) − 1` /
+    `yS < (1 << (log2TrafoSize − 2)) − 1`), then `ctxInc =
+    Min(csbfCtx, 1)` for luma (bank `{0, 1}`) or `2 + Min(csbfCtx, 1)`
+    for chroma (bank `{2, 3}`).
+  - **(round 27)** [`binarization::left_above_ctx_inc`] +
+    [`binarization::split_cu_flag_ctx_inc`] +
+    [`binarization::cu_skip_flag_ctx_inc`] handle the
+    §9.3.4.2.2 Table 9-49 row shape `ctxInc = (condL && availableL) +
+    (condA && availableA)`: `split_cu_flag` reads each neighbour's
+    `CtDepth[xNb][yNb] > cqtDepth` via
+    [`binarization::split_cu_flag_cond`]; `cu_skip_flag` reads each
+    neighbour's `cu_skip_flag[xNb][yNb]` via
+    [`binarization::cu_skip_flag_cond`]. Both rows produce `ctxInc ∈
+    {0, 1, 2}`.
   - [`binarization::decode_cu_qp_delta`] handles
     `cu_qp_delta_abs` / `cu_qp_delta_sign_flag` (§7.3.8.14, §7.4.9.14):
     §9.3.3.10 TR prefix (`cMax = 5`, `cRiceParam = 0`), §9.3.3.11
@@ -859,7 +912,12 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 [`ShortTermRefPicSet::materialize`], [`scan_order`],
 [`CabacEngine::new`],
 [`binarization::decode_cu_qp_delta`],
-[`binarization::decode_last_sig_coeff`].
+[`binarization::decode_last_sig_coeff`],
+[`binarization::coded_sub_block_flag_ctx_inc`],
+[`binarization::coded_sub_block_flag_ctx_inc_with_edge`],
+[`binarization::split_cu_flag_ctx_inc`],
+[`binarization::cu_skip_flag_ctx_inc`],
+[`binarization::left_above_ctx_inc`].
 
 ## Not yet implemented
 
@@ -917,21 +975,25 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `ctxTable` / `ctxIdx` for each bin) and the §7.3.8.1..§7.3.8.12
   parse loops.
 * §9.3.4.2 per-syntax-element binarization / context-index
-  derivation — the scaffold module ([`binarization`]) lands in
-  round 26 with the first two elements (`cu_qp_delta_abs` /
-  `cu_qp_delta_sign_flag` and `last_sig_coeff_{x,y}_{prefix,suffix}`)
-  unblocked by the docs CABAC trace
+  derivation — the scaffold module ([`binarization`]) landed in
+  round 26 with the first two CABAC-engine-coupled elements
+  (`cu_qp_delta_abs` / `cu_qp_delta_sign_flag` and
+  `last_sig_coeff_{x,y}_{prefix,suffix}`) unblocked by the docs CABAC
+  trace
   (`docs/video/h265/fixtures/main-422-10bit/cabac-cu-qp-delta-last-sig-trace.md`).
-  Still to land — every other §9.3.4.2 syntax element:
-  `sig_coeff_flag` (§9.3.4.2.5), `coded_sub_block_flag` (§9.3.4.2.4),
-  `coeff_abs_level_greater1_flag` / `_greater2_flag` /
-  `coeff_abs_level_remaining` / `coeff_sign_flag` (§9.3.4.2.6 +
-  bypass), split / merge / prediction-mode flags, motion-vector
-  binarization (`mvd_lX[]` EGk + sign), `sao_*` elements, etc. (The
-  §9.3 arithmetic decode engine itself — DecodeDecision /
-  DecodeBypass / DecodeTerminate / RenormD / alignment — is
-  implemented as of round 11; it sits one layer below the
-  binarization tables.)
+  Round 27 adds three more pure-functional ctxInc derivations:
+  `coded_sub_block_flag` (§9.3.4.2.4 equations 9-35..9-39), and the
+  §9.3.4.2.2 Table 9-49 row shape for `split_cu_flag` and
+  `cu_skip_flag` (`ctxInc = (condL && availableL) + (condA &&
+  availableA)`). Still to land — every other §9.3.4.2 syntax element:
+  `sig_coeff_flag` (§9.3.4.2.5), `coeff_abs_level_greater1_flag` /
+  `_greater2_flag` / `coeff_abs_level_remaining` / `coeff_sign_flag`
+  (§9.3.4.2.6 + bypass), prediction-mode / part-mode / merge / merge-idx
+  / inter-pred-idc flags, motion-vector binarization (`mvd_lX[]` EGk +
+  sign), `sao_*` elements, etc. (The §9.3 arithmetic decode engine
+  itself — DecodeDecision / DecodeBypass / DecodeTerminate / RenormD /
+  alignment — is implemented as of round 11; it sits one layer below
+  the binarization tables.)
 * Intra / inter prediction, transform, in-loop filters (deblock /
   SAO), DPB management.
 * Encoder.

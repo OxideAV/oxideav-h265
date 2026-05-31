@@ -39,6 +39,33 @@
 //! Both elements live downstream of the §9.3.4.2 binarization layer
 //! that the slice-data parser (§7.3.8) drives; this module is the
 //! reusable per-element building block.
+//!
+//! Round 27 extends the ctxInc-derivation surface with three more
+//! syntax elements that are pure-functional given their neighbour /
+//! sub-block context (no CABAC engine drive needed at this layer —
+//! callers compose the engine call themselves):
+//!
+//! * **`coded_sub_block_flag`** (H.265 §7.3.8.11, §7.4.9.11) — the
+//!   §9.3.4.2.4 derivation of `ctxInc` from the colour-component
+//!   index, the current sub-block scan location `(xS, yS)`, the
+//!   transform-block size, and the previously decoded
+//!   `coded_sub_block_flag[xS+1][yS]` / `coded_sub_block_flag[xS][yS+1]`
+//!   neighbours. Implemented in
+//!   [`coded_sub_block_flag_ctx_inc`] following equations 9-35..9-39.
+//!
+//! * **`split_cu_flag` / `cu_skip_flag`** (H.265 §7.3.8.4, §7.4.9.4,
+//!   §7.3.8.5, §7.4.9.5) — the §9.3.4.2.2 Table 9-49 derivation of
+//!   `ctxInc` from the left and above neighbours' `condL` / `condA`
+//!   booleans plus their availability:
+//!   `ctxInc = (condL && availableL) + (condA && availableA)`.
+//!   Implemented as the shared
+//!   [`left_above_ctx_inc`] helper (the body of Table 9-49) plus
+//!   the [`split_cu_flag_cond`] and [`cu_skip_flag_cond`] callbacks
+//!   the caller wires into it. The Table 9-49 row for
+//!   `split_cu_flag` compares each neighbour's `CtDepth[xNb][yNb]`
+//!   to the current `cqtDepth`; the row for `cu_skip_flag` reads
+//!   each neighbour's `cu_skip_flag[xNb][yNb]` directly. Both rows
+//!   produce a `ctxInc` in `{0, 1, 2}`.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -359,6 +386,192 @@ pub fn decode_last_sig_coeff(
     })
 }
 
+// ---------------------------------------------------------------------
+// coded_sub_block_flag ctxInc — §9.3.4.2.4
+// ---------------------------------------------------------------------
+
+/// §9.3.4.2.4 — derive the `ctxInc` for one bin of
+/// `coded_sub_block_flag` from the colour-component index, the
+/// current sub-block scan location `(xS, yS)`, the transform-block
+/// size `log2TrafoSize`, and the two previously decoded neighbour
+/// bins in sub-block scan order.
+///
+/// Spec equations:
+///
+/// ```text
+/// // §9.3.4.2.4, equations 9-35..9-39
+/// csbfCtx = 0
+/// if xS < (1 << (log2TrafoSize - 2)) - 1:
+///     csbfCtx += coded_sub_block_flag[xS + 1][yS]
+/// if yS < (1 << (log2TrafoSize - 2)) - 1:
+///     csbfCtx += coded_sub_block_flag[xS][yS + 1]
+/// if cIdx == 0:
+///     ctxInc = min(csbfCtx, 1)
+/// else:
+///     ctxInc = 2 + min(csbfCtx, 1)
+/// ```
+///
+/// `right_neighbour` is the previously decoded
+/// `coded_sub_block_flag[xS + 1][yS]` (0/1); pass `0` whenever the
+/// current sub-block sits on the right edge of the TB
+/// (`xS == (1 << (log2TrafoSize - 2)) - 1`), where equation 9-36 does
+/// not apply. `below_neighbour` is the previously decoded
+/// `coded_sub_block_flag[xS][yS + 1]` (0/1); pass `0` whenever the
+/// current sub-block sits on the bottom edge of the TB
+/// (`yS == (1 << (log2TrafoSize - 2)) - 1`).
+///
+/// Returns `ctxInc` in `{0, 1}` for luma (`cIdx == 0`) or
+/// `{2, 3}` for chroma (`cIdx > 0`).
+///
+/// # Panics
+/// Does not panic; both neighbour inputs are clamped via the boolean
+/// `>= 1` comparison.
+#[must_use]
+pub fn coded_sub_block_flag_ctx_inc(
+    is_chroma: bool,
+    right_neighbour: u8,
+    below_neighbour: u8,
+) -> u32 {
+    // §9.3.4.2.4: csbfCtx is the unsigned sum of the two neighbour
+    // bins (each either 0 or 1), so it lies in {0, 1, 2}. The final
+    // ctxInc clamps to {0, 1} via min(csbfCtx, 1).
+    let csbf_ctx = (right_neighbour & 1) as u32 + (below_neighbour & 1) as u32;
+    let clipped = csbf_ctx.min(1);
+    if is_chroma {
+        // §9.3.4.2.4 equation 9-39: chroma uses the {2, 3} bank.
+        2 + clipped
+    } else {
+        // §9.3.4.2.4 equation 9-38: luma uses the {0, 1} bank.
+        clipped
+    }
+}
+
+/// §9.3.4.2.4 — helper that takes the full sub-block location and
+/// transform-block size and applies the edge-gating from equations
+/// 9-36 / 9-37 before delegating to [`coded_sub_block_flag_ctx_inc`].
+/// The caller passes the previously decoded
+/// `coded_sub_block_flag[xS + 1][yS]` and
+/// `coded_sub_block_flag[xS][yS + 1]` values regardless of the edge
+/// condition; this function zeroes them when the corresponding
+/// equation 9-36 / 9-37 does not apply (sub-block on the right /
+/// bottom TB edge).
+///
+/// `xs` / `ys` are the sub-block scan location in 4-sample units (so
+/// a 32×32 TB at `log2TrafoSize == 5` has `xs, ys ∈ 0..8`).
+#[must_use]
+pub fn coded_sub_block_flag_ctx_inc_with_edge(
+    is_chroma: bool,
+    xs: u32,
+    ys: u32,
+    log2_trafo_size: u32,
+    right_neighbour: u8,
+    below_neighbour: u8,
+) -> u32 {
+    // §9.3.4.2.4 edge gates: ( 1 << ( log2TrafoSize − 2 ) ) − 1 is
+    // the maximum sub-block index along each axis for the TB.
+    let max_sub_block_idx = (1u32 << (log2_trafo_size - 2)) - 1;
+    let right = if xs < max_sub_block_idx {
+        right_neighbour & 1
+    } else {
+        0
+    };
+    let below = if ys < max_sub_block_idx {
+        below_neighbour & 1
+    } else {
+        0
+    };
+    coded_sub_block_flag_ctx_inc(is_chroma, right, below)
+}
+
+// ---------------------------------------------------------------------
+// split_cu_flag / cu_skip_flag ctxInc — §9.3.4.2.2 Table 9-49
+// ---------------------------------------------------------------------
+
+/// §9.3.4.2.2 Table 9-49 — the shared `ctxInc` derivation for
+/// syntax elements that take their `ctxInc` from a `condL` / `condA`
+/// neighbour pair plus the §6.4.1 availability of the neighbour
+/// blocks:
+///
+/// ```text
+/// ctxInc = (condL && availableL) + (condA && availableA)
+/// ```
+///
+/// Used by `split_cu_flag` (with `condL = CtDepth[xNbL][yNbL] >
+/// cqtDepth`, `condA = CtDepth[xNbA][yNbA] > cqtDepth`) and
+/// `cu_skip_flag` (with `condL = cu_skip_flag[xNbL][yNbL]`,
+/// `condA = cu_skip_flag[xNbA][yNbA]`).
+///
+/// Returns a `ctxInc` in `{0, 1, 2}`.
+#[must_use]
+pub fn left_above_ctx_inc(cond_l: bool, available_l: bool, cond_a: bool, available_a: bool) -> u32 {
+    let l = (cond_l && available_l) as u32;
+    let a = (cond_a && available_a) as u32;
+    l + a
+}
+
+/// §9.3.4.2.2 Table 9-49 — `condL` / `condA` predicate for
+/// `split_cu_flag`: each neighbour contributes `CtDepth[xNb][yNb] >
+/// cqtDepth`. Returns the predicate as a `bool` ready to feed into
+/// [`left_above_ctx_inc`].
+///
+/// `neighbour_ct_depth` is the `CtDepth[xNb][yNb]` value already
+/// derived by the caller for the neighbouring (left or above) block;
+/// `cqt_depth` is the current block's coding-quadtree depth.
+#[must_use]
+pub fn split_cu_flag_cond(neighbour_ct_depth: u32, cqt_depth: u32) -> bool {
+    neighbour_ct_depth > cqt_depth
+}
+
+/// §9.3.4.2.2 Table 9-49 — `condL` / `condA` predicate for
+/// `cu_skip_flag`: each neighbour contributes
+/// `cu_skip_flag[xNb][yNb]` as-is.
+#[must_use]
+pub fn cu_skip_flag_cond(neighbour_cu_skip_flag: u8) -> bool {
+    (neighbour_cu_skip_flag & 1) != 0
+}
+
+/// §9.3.4.2.2 Table 9-49 row for `split_cu_flag`. Convenience: takes
+/// the neighbour `CtDepth` values and availability and returns
+/// `ctxInc` directly.
+///
+/// The neighbour `CtDepth` arguments are ignored when the matching
+/// `available` flag is false (the `(condX && availableX)` AND in the
+/// Table 9-49 formula short-circuits in that case), but the caller
+/// may pass any placeholder for them.
+#[must_use]
+pub fn split_cu_flag_ctx_inc(
+    left_ct_depth: u32,
+    available_l: bool,
+    above_ct_depth: u32,
+    available_a: bool,
+    cqt_depth: u32,
+) -> u32 {
+    left_above_ctx_inc(
+        split_cu_flag_cond(left_ct_depth, cqt_depth),
+        available_l,
+        split_cu_flag_cond(above_ct_depth, cqt_depth),
+        available_a,
+    )
+}
+
+/// §9.3.4.2.2 Table 9-49 row for `cu_skip_flag`. Convenience: takes
+/// the neighbour `cu_skip_flag` values and availability and returns
+/// `ctxInc` directly.
+#[must_use]
+pub fn cu_skip_flag_ctx_inc(
+    left_cu_skip_flag: u8,
+    available_l: bool,
+    above_cu_skip_flag: u8,
+    available_a: bool,
+) -> u32 {
+    left_above_ctx_inc(
+        cu_skip_flag_cond(left_cu_skip_flag),
+        available_l,
+        cu_skip_flag_cond(above_cu_skip_flag),
+        available_a,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +862,202 @@ mod tests {
         assert_eq!(eng.ivl_offset(), 256);
         let v = decode_eg_k0(&mut eng).unwrap();
         assert_eq!(v, 0);
+    }
+
+    // -------------------------------------------------------------
+    // §9.3.4.2.4 coded_sub_block_flag ctxInc
+    // -------------------------------------------------------------
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_luma_no_neighbours_active() {
+        // §9.3.4.2.4: both neighbours = 0 → csbfCtx = 0 →
+        // ctxInc = min(0, 1) = 0 for luma.
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 0, 0), 0);
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_luma_one_neighbour_active() {
+        // One neighbour set → csbfCtx = 1 → ctxInc = min(1, 1) = 1.
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 1, 0), 1);
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 0, 1), 1);
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_luma_both_neighbours_active_clamps() {
+        // Both neighbours set → csbfCtx = 2 → min(2, 1) = 1
+        // (equation 9-38 clamps the sum). The luma bank is {0, 1}
+        // so the maximum value is 1.
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 1, 1), 1);
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_chroma_offset_two() {
+        // §9.3.4.2.4 equation 9-39: chroma adds 2 to the luma
+        // ctxInc, putting chroma in {2, 3}.
+        assert_eq!(coded_sub_block_flag_ctx_inc(true, 0, 0), 2);
+        assert_eq!(coded_sub_block_flag_ctx_inc(true, 1, 0), 3);
+        assert_eq!(coded_sub_block_flag_ctx_inc(true, 0, 1), 3);
+        assert_eq!(coded_sub_block_flag_ctx_inc(true, 1, 1), 3);
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_ignores_high_bits() {
+        // Only the LSB of each neighbour input is consulted (the
+        // function masks with & 1). Confirms a defensive input
+        // does not leak into csbfCtx.
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 0xFE, 0), 0);
+        assert_eq!(coded_sub_block_flag_ctx_inc(false, 0xFF, 0xFE), 1);
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_with_edge_drops_right() {
+        // 4×4 TB: log2 = 2, max sub-block index = (1 << 0) − 1 = 0.
+        // So xs = 0 == max → equation 9-36 does NOT apply; the
+        // right_neighbour input is ignored.
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 0, 0, 2, 1, 0),
+            0
+        );
+        // 8×8 TB: log2 = 3, max sub-block index = (1 << 1) − 1 = 1.
+        // xs = 0 < 1 → right neighbour counts; xs = 1 == max → it
+        // does not.
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 0, 0, 3, 1, 0),
+            1
+        );
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 1, 0, 3, 1, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_with_edge_drops_below() {
+        // 16×16 TB: log2 = 4, max sub-block index = (1 << 2) − 1 =
+        // 3. ys = 2 < 3 → below counts; ys = 3 == max → it does not.
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 0, 2, 4, 0, 1),
+            1
+        );
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 0, 3, 4, 0, 1),
+            0
+        );
+    }
+
+    #[test]
+    fn coded_sub_block_flag_ctx_inc_with_edge_32x32_interior() {
+        // 32×32 TB: log2 = 5, max sub-block index = (1 << 3) − 1 =
+        // 7. An interior sub-block at (3, 3) with both neighbours
+        // active → csbfCtx = 2 → ctxInc = min(2, 1) = 1.
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(false, 3, 3, 5, 1, 1),
+            1
+        );
+        // Same location, chroma: ctxInc = 2 + 1 = 3.
+        assert_eq!(
+            coded_sub_block_flag_ctx_inc_with_edge(true, 3, 3, 5, 1, 1),
+            3
+        );
+    }
+
+    // -------------------------------------------------------------
+    // §9.3.4.2.2 Table 9-49 — split_cu_flag / cu_skip_flag ctxInc
+    // -------------------------------------------------------------
+
+    #[test]
+    fn left_above_ctx_inc_truth_table() {
+        // ctxInc = (condL && availableL) + (condA && availableA);
+        // for the four combinations of the two AND'ed booleans the
+        // sum is 0, 1, 1, or 2.
+        assert_eq!(left_above_ctx_inc(false, true, false, true), 0);
+        assert_eq!(left_above_ctx_inc(true, true, false, true), 1);
+        assert_eq!(left_above_ctx_inc(false, true, true, true), 1);
+        assert_eq!(left_above_ctx_inc(true, true, true, true), 2);
+    }
+
+    #[test]
+    fn left_above_ctx_inc_unavailable_zeroes_branch() {
+        // If a neighbour is unavailable per §6.4.1, its branch
+        // contributes 0 regardless of the cond value.
+        assert_eq!(left_above_ctx_inc(true, false, true, false), 0);
+        assert_eq!(left_above_ctx_inc(true, false, true, true), 1);
+        assert_eq!(left_above_ctx_inc(true, true, true, false), 1);
+    }
+
+    #[test]
+    fn split_cu_flag_cond_table() {
+        // §9.3.4.2.2 Table 9-49: condX = CtDepth[xNb][yNb] >
+        // cqtDepth. Strict inequality, so equal depth → false.
+        assert!(!split_cu_flag_cond(0, 0));
+        assert!(!split_cu_flag_cond(1, 1));
+        assert!(split_cu_flag_cond(1, 0));
+        assert!(split_cu_flag_cond(3, 2));
+        assert!(!split_cu_flag_cond(2, 3));
+    }
+
+    #[test]
+    fn cu_skip_flag_cond_table() {
+        // §9.3.4.2.2 Table 9-49: condX = cu_skip_flag[xNb][yNb].
+        assert!(!cu_skip_flag_cond(0));
+        assert!(cu_skip_flag_cond(1));
+        // Only the LSB matters.
+        assert!(!cu_skip_flag_cond(0b1110));
+        assert!(cu_skip_flag_cond(0b1111));
+    }
+
+    #[test]
+    fn split_cu_flag_ctx_inc_both_neighbours_deeper() {
+        // Both neighbours at depth 2, current cqtDepth = 1 → both
+        // conds true. Both available → ctxInc = 2.
+        assert_eq!(split_cu_flag_ctx_inc(2, true, 2, true, 1), 2);
+    }
+
+    #[test]
+    fn split_cu_flag_ctx_inc_only_left_deeper() {
+        // Left at depth 2, above at depth 1, current cqtDepth = 1.
+        // condL true (2 > 1), condA false (1 > 1 == false) →
+        // ctxInc = 1.
+        assert_eq!(split_cu_flag_ctx_inc(2, true, 1, true, 1), 1);
+    }
+
+    #[test]
+    fn split_cu_flag_ctx_inc_unavailable_left_drops_contribution() {
+        // Same conds as the both-deeper test, but left is
+        // unavailable per §6.4.1 → its contribution is 0.
+        assert_eq!(split_cu_flag_ctx_inc(2, false, 2, true, 1), 1);
+        // Both unavailable → 0 regardless of CtDepth.
+        assert_eq!(split_cu_flag_ctx_inc(7, false, 7, false, 0), 0);
+    }
+
+    #[test]
+    fn cu_skip_flag_ctx_inc_table() {
+        // Walk the (L, availL, A, availA) truth table for cu_skip_flag.
+        assert_eq!(cu_skip_flag_ctx_inc(0, true, 0, true), 0);
+        assert_eq!(cu_skip_flag_ctx_inc(1, true, 0, true), 1);
+        assert_eq!(cu_skip_flag_ctx_inc(0, true, 1, true), 1);
+        assert_eq!(cu_skip_flag_ctx_inc(1, true, 1, true), 2);
+        // Unavailable neighbours zero their contribution even if
+        // the flag itself is set.
+        assert_eq!(cu_skip_flag_ctx_inc(1, false, 1, true), 1);
+        assert_eq!(cu_skip_flag_ctx_inc(1, true, 1, false), 1);
+        assert_eq!(cu_skip_flag_ctx_inc(1, false, 1, false), 0);
+    }
+
+    #[test]
+    fn split_cu_flag_ctx_inc_bounded_zero_three() {
+        // ctxInc must lie in {0, 1, 2} regardless of the inputs.
+        for left_d in 0u32..=4 {
+            for above_d in 0u32..=4 {
+                for &cqt in &[0u32, 1, 2, 3] {
+                    for &avl in &[false, true] {
+                        for &ava in &[false, true] {
+                            let c = split_cu_flag_ctx_inc(left_d, avl, above_d, ava, cqt);
+                            assert!(c <= 2, "ctxInc out of {{0,1,2}} for inputs");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

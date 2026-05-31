@@ -6,6 +6,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 27 (2026-06-01)
+
+- Three more §9.3.4.2 ctxInc derivations land in the
+  [`binarization`] module, all pure-functional given their neighbour /
+  sub-block context (no CABAC engine drive at this layer — callers
+  compose the engine call themselves):
+  - `coded_sub_block_flag` (§7.3.8.11 / §7.4.9.11) per §9.3.4.2.4
+    equations 9-35..9-39:
+    [`binarization::coded_sub_block_flag_ctx_inc`] takes
+    `(is_chroma, right_neighbour, below_neighbour)` and returns
+    `ctxInc = Min(csbfCtx, 1)` for luma (bank `{0, 1}`, equation 9-38)
+    or `2 + Min(csbfCtx, 1)` for chroma (bank `{2, 3}`, equation
+    9-39), where `csbfCtx` is the unsigned sum of the two previously
+    decoded sub-block-flag neighbours.
+    [`binarization::coded_sub_block_flag_ctx_inc_with_edge`] applies
+    the equation 9-36 / 9-37 edge gates `xS < (1 << (log2TrafoSize −
+    2)) − 1` / `yS < (1 << (log2TrafoSize − 2)) − 1` (the right /
+    bottom sub-block-edge zero-outs) before delegating.
+  - `split_cu_flag` (§7.3.8.4 / §7.4.9.4) and `cu_skip_flag` (§7.3.8.5 /
+    §7.4.9.5) ctxInc derivations per §9.3.4.2.2 Table 9-49:
+    [`binarization::left_above_ctx_inc`] implements the shared row
+    shape `ctxInc = (condL && availableL) + (condA && availableA)`;
+    [`binarization::split_cu_flag_cond`] returns the `split_cu_flag`
+    per-neighbour predicate `CtDepth[xNb][yNb] > cqtDepth`;
+    [`binarization::cu_skip_flag_cond`] returns the `cu_skip_flag`
+    per-neighbour predicate `cu_skip_flag[xNb][yNb]`; the two row
+    specialisations [`binarization::split_cu_flag_ctx_inc`] and
+    [`binarization::cu_skip_flag_ctx_inc`] compose the per-neighbour
+    cond with the availability AND and produce `ctxInc ∈ {0, 1, 2}`
+    directly. Both row specialisations honour the §6.4.1 availability
+    contract: an unavailable neighbour contributes 0 to `ctxInc` even
+    when its cond would otherwise be true.
+- 17 new binarization unit tests (234 → 251 total): §9.3.4.2.4 luma
+  no-neighbours / one-neighbour / both-neighbours `Min` clamp; chroma
+  `+2` offset across the same four input combinations; high-bit-mask
+  defensive input; with-edge gating at 4×4 / 8×8 / 16×16 / 32×32 TBs
+  (right and bottom edges drop their neighbours, luma + chroma); the
+  §9.3.4.2.2 `(condL && availableL) + (condA && availableA)` truth
+  table; the unavailability zero-out branch; `split_cu_flag_cond`
+  strict-inequality table; `cu_skip_flag_cond` LSB-mask; four-way
+  `split_cu_flag_ctx_inc` table (both deeper / left deeper / left
+  unavailable / both unavailable); eight-way `cu_skip_flag_ctx_inc`
+  truth table; and a bounded `ctxInc ∈ {0, 1, 2}` invariant sweep
+  over a small Cartesian product of inputs.
+
 ### Added — clean-room rebuild round 26 (2026-05-31)
 
 - New [`binarization`] module implementing the §9.3.4.2
