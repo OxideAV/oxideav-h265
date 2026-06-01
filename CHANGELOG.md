@@ -6,6 +6,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 28 (2026-06-02)
+
+- Six more §9.3.4.2 / Table 9-48 closed-form `ctxInc` derivations
+  land in the [`binarization`] module. Each is a pure function of
+  parameters the slice-data parser already has in hand (no
+  neighbour-table walk, no CABAC engine drive at this layer):
+  - `split_transform_flag[ ][ ][ ]` (§7.3.8.10 / §7.4.9.10) per
+    Table 9-48: [`binarization::split_transform_flag_ctx_inc`]
+    returns `ctxInc = 5 − log2TrafoSize` for the legal residual-
+    quadtree TB sizes `log2TrafoSize ∈ {2, 3, 4, 5}`, mapping into
+    the four-context bank `{0, 1, 2, 3}`.
+  - `cbf_luma[ ][ ][ ]` (§7.3.8.10 / §7.4.9.10) per Table 9-48:
+    [`binarization::cbf_luma_ctx_inc`] returns
+    `ctxInc = (trafoDepth == 0) ? 1 : 0`, mapping into the two-
+    context bank `{0, 1}` (root of the residual quadtree on ctx 1,
+    deeper depths on ctx 0).
+  - `cbf_cb[ ][ ][ ]` and `cbf_cr[ ][ ][ ]` (§7.3.8.10 / §7.4.9.10)
+    per Table 9-48: [`binarization::cbf_cb_ctx_inc`] and
+    [`binarization::cbf_cr_ctx_inc`] both return
+    `ctxInc = trafoDepth` (the shared
+    [`binarization::cbf_chroma_ctx_inc`] helper). Cb and Cr each
+    have their own `ctxIdxOffset` (Table 9-4); this layer hands
+    back the bank-relative `ctxInc` only.
+  - `inter_pred_idc[ x0 ][ y0 ]` (§7.3.8.6 / §7.4.9.6) per Table
+    9-48: [`binarization::inter_pred_idc_ctx_inc`] returns bin 0
+    `ctxInc = (nPbW + nPbH != 12) ? CtDepth[x0][y0] : 4` and bin 1
+    `ctxInc = 4`. The `nPbW + nPbH == 12` condition picks out the
+    8×4 and 4×8 PUs (luma area 16 samples), which are encoded with
+    the bin-0 escape onto the bin-1 context bank.
+  - `log2_res_scale_abs_plus1[ c ]` (§7.3.8.13 / §7.4.9.13) per
+    Table 9-48:
+    [`binarization::log2_res_scale_abs_plus1_ctx_inc`] returns
+    `ctxInc = 4*c + binIdx` for `binIdx ∈ {0, 1, 2, 3}` and
+    `c ∈ {0, 1}` (Cb / Cr), mapping into per-component banks
+    `{0, 1, 2, 3}` and `{4, 5, 6, 7}` of the TR(`cMax = 4`) prefix.
+  - `res_scale_sign_flag[ c ]` (§7.3.8.13 / §7.4.9.13) per Table
+    9-48: [`binarization::res_scale_sign_flag_ctx_inc`] returns
+    `ctxInc = c`, one bit per chroma component each on its own
+    context.
+- 14 new binarization unit tests (251 → 265 total): Table 9-48 row
+  for `split_transform_flag` across log2TrafoSize 2..=5 plus the
+  `ctxInc <= 3` bank-bound sweep; `cbf_luma` Table 9-48 row across
+  trafoDepth 0..=4 plus the `ctxInc <= 1` bank-bound sweep; shared
+  `cbf_chroma_ctx_inc` identity across trafoDepth 0..=4 and the
+  Cb/Cr agreement check; `inter_pred_idc` bin 0 with `CtDepth`
+  routing (64×64, 16×16 at depth 2, 8×8 at depth 3), bin 0 escape
+  on the 8×4 / 4×8 16-sample PUs, bin 1 constant `ctxInc = 4`, and
+  the `ctxInc ∈ {0..=4}` bank-bound sweep across eight PU shapes
+  and four CtDepths; `log2_res_scale_abs_plus1` Cb bank and Cr bank
+  identities (`4*c + binIdx`) plus the Cb/Cr disjoint-bank
+  invariant; `res_scale_sign_flag` two-row identity.
+
 ### Added — clean-room rebuild round 27 (2026-06-01)
 
 - Three more §9.3.4.2 ctxInc derivations land in the

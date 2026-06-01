@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 27 (2026-06-01).** The prior implementation was
+**Clean-room rebuild — round 28 (2026-06-02).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,45 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 27 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 28 extends the
+[`binarization`] module with six more §9.3.4.2 / Table 9-48 closed-form
+`ctxInc` derivations — each a pure function of parameters the
+slice-data parser already has in hand (no neighbour-table walk, no
+CABAC engine drive at this layer). The new entries:
+[`binarization::split_transform_flag_ctx_inc`] (Table 9-48 row
+`ctxInc = 5 − log2TrafoSize`, four-context bank `{0..=3}` over the
+residual-quadtree TB sizes log2 = 2..=5);
+[`binarization::cbf_luma_ctx_inc`] (Table 9-48 row
+`ctxInc = (trafoDepth == 0) ? 1 : 0`, two-context bank `{0, 1}`);
+[`binarization::cbf_cb_ctx_inc`] and
+[`binarization::cbf_cr_ctx_inc`] (Table 9-48 row
+`ctxInc = trafoDepth`, shared
+[`binarization::cbf_chroma_ctx_inc`] helper; the per-component
+`ctxIdxOffset` is the caller's responsibility);
+[`binarization::inter_pred_idc_ctx_inc`] (Table 9-48: bin 0
+`ctxInc = (nPbW + nPbH != 12) ? CtDepth[x0][y0] : 4` — the
+`nPbW + nPbH == 12` condition picks out the 8×4 and 4×8 PUs, luma
+area 16 samples, which route bin 0 onto the bin-1 context bank;
+bin 1 `ctxInc = 4`);
+[`binarization::log2_res_scale_abs_plus1_ctx_inc`] (Table 9-48 row
+`ctxInc = 4*c + binIdx` for the TR(`cMax = 4`) prefix bins, per-
+component banks `{0..=3}` Cb and `{4..=7}` Cr); and
+[`binarization::res_scale_sign_flag_ctx_inc`] (Table 9-48 row
+`ctxInc = c`, one bit per chroma component). Total tests now 265
+(was 251): 14 new tests cover the Table 9-48 row for
+`split_transform_flag` across log2TrafoSize 2..=5 plus the
+`ctxInc <= 3` bank-bound sweep; `cbf_luma` Table 9-48 row across
+trafoDepth 0..=4 plus the `ctxInc <= 1` bank-bound sweep; shared
+`cbf_chroma_ctx_inc` identity and the Cb/Cr agreement check;
+`inter_pred_idc` bin 0 with `CtDepth` routing (64×64, 16×16 at
+depth 2, 8×8 at depth 3), bin 0 escape on the 8×4 / 4×8
+16-sample PUs, bin 1 constant `ctxInc = 4`, and the
+`ctxInc ∈ {0..=4}` bank-bound sweep across eight PU shapes and
+four CtDepths; `log2_res_scale_abs_plus1` Cb and Cr bank
+identities plus the disjoint-bank invariant; `res_scale_sign_flag`
+two-row identity.
+
+Round 27 had extended the
 [`binarization`] module with three more §9.3.4.2 ctxInc derivations
 that are pure-functional given the neighbour / sub-block context
 (no CABAC engine drive at this layer; callers compose the engine call

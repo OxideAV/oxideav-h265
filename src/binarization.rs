@@ -66,6 +66,59 @@
 //!   to the current `cqtDepth`; the row for `cu_skip_flag` reads
 //!   each neighbour's `cu_skip_flag[xNb][yNb]` directly. Both rows
 //!   produce a `ctxInc` in `{0, 1, 2}`.
+//!
+//! Round 28 extends the ctxInc-derivation surface with six more
+//! syntax elements whose Table 9-48 entry is itself a closed-form
+//! expression on parameters the caller already has in hand (no
+//! neighbour table walk, no CABAC engine drive at this layer):
+//!
+//! * **`split_transform_flag[ ][ ][ ]`** (H.265 §7.3.8.10, §7.4.9.10)
+//!   — Table 9-48 row: `ctxInc = 5 − log2TrafoSize`. Valid
+//!   `log2TrafoSize ∈ {2, 3, 4, 5}` for the residual-quadtree
+//!   transform-block sizes, so `ctxInc ∈ {0, 1, 2, 3}`. Implemented
+//!   in [`split_transform_flag_ctx_inc`].
+//!
+//! * **`cbf_luma[ ][ ][ ]`** (H.265 §7.3.8.10, §7.4.9.10) — Table
+//!   9-48 row: `ctxInc = (trafoDepth == 0) ? 1 : 0`. Implemented in
+//!   [`cbf_luma_ctx_inc`].
+//!
+//! * **`cbf_cb[ ][ ][ ]` / `cbf_cr[ ][ ][ ]`** (H.265 §7.3.8.10,
+//!   §7.4.9.10) — Table 9-48 row: `ctxInc = trafoDepth`. The two
+//!   syntax elements live in separate context banks (Table 9-22
+//!   shares the bank shape but each chroma component has its own
+//!   `ctxIdxOffset`); this layer hands back the bank-relative
+//!   `ctxInc` only. Implemented in [`cbf_cb_ctx_inc`] and
+//!   [`cbf_cr_ctx_inc`] (each is a wafer over the shared
+//!   [`cbf_chroma_ctx_inc`] helper).
+//!
+//! * **`inter_pred_idc[ x0 ][ y0 ]`** (H.265 §7.3.8.6, §7.4.9.6) —
+//!   Table 9-48 row: bin 0 uses
+//!   `ctxInc = (nPbW + nPbH != 12) ? CtDepth[x0][y0] : 4`; bin 1
+//!   uses `ctxInc = 4`. The `nPbW + nPbH == 12` condition picks out
+//!   the prediction-block shapes whose luma area is 16 samples
+//!   (8×4 and 4×8 PUs), which are encoded with the bin-0 escape
+//!   onto the bin-1 context bank. Implemented in
+//!   [`inter_pred_idc_ctx_inc`].
+//!
+//! * **`log2_res_scale_abs_plus1[ c ]`** (H.265 §7.3.8.13,
+//!   §7.4.9.13) — Table 9-48 row: `ctxInc = 4*c + binIdx` for
+//!   `binIdx ∈ {0, 1, 2, 3}` and `c ∈ {0, 1}` (Cb / Cr). The four
+//!   bins of the TR(`cMax = 4`) prefix occupy four consecutive
+//!   contexts per chroma component, so the per-component banks are
+//!   `{0, 1, 2, 3}` (Cb) and `{4, 5, 6, 7}` (Cr). Implemented in
+//!   [`log2_res_scale_abs_plus1_ctx_inc`].
+//!
+//! * **`res_scale_sign_flag[ c ]`** (H.265 §7.3.8.13, §7.4.9.13) —
+//!   Table 9-48 row: `ctxInc = c` for `c ∈ {0, 1}`. One bit per
+//!   chroma component, each on its own context. Implemented in
+//!   [`res_scale_sign_flag_ctx_inc`].
+//!
+//! All round-28 entries are bin-0 (and bin-1 for `inter_pred_idc` /
+//! `log2_res_scale_abs_plus1`) ctxInc derivations only; the matching
+//! binarization shapes (FL for the flags, TR(`cMax = 4`) for
+//! `log2_res_scale_abs_plus1` followed by a bypass tail) are driven
+//! by the slice-data parser the same way as the round-26 / 27
+//! elements.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -572,6 +625,180 @@ pub fn cu_skip_flag_ctx_inc(
     )
 }
 
+// ---------------------------------------------------------------------
+// split_transform_flag ctxInc — Table 9-48 row
+// ---------------------------------------------------------------------
+
+/// Table 9-48 row for `split_transform_flag[ ][ ][ ]`:
+///
+/// ```text
+/// ctxInc = 5 − log2TrafoSize
+/// ```
+///
+/// The residual-quadtree transform-block sizes are
+/// `log2TrafoSize ∈ {2, 3, 4, 5}` (4×4, 8×8, 16×16, 32×32), so the
+/// returned `ctxInc` lies in `{0, 1, 2, 3}`.
+///
+/// The §7.4.9.10 `split_transform_flag` syntax element is itself
+/// only signalled when `log2TrafoSize > MaxTbLog2SizeY` is false and
+/// `log2TrafoSize > MinTbLog2SizeY` is true; the caller is responsible
+/// for that gate. This function is the per-bin ctxInc derivation
+/// only.
+///
+/// # Panics
+/// Does not panic. For `log2TrafoSize > 5` the result is `u32::MAX`
+/// (a wrap of the `5 − x` subtraction); the spec only defines the
+/// derivation for `log2TrafoSize ∈ {2, 3, 4, 5}` and the caller is
+/// expected to honour that range.
+#[must_use]
+pub fn split_transform_flag_ctx_inc(log2_trafo_size: u32) -> u32 {
+    // §7.4.9.10 restricts the syntax element to log2TrafoSize in
+    // {2, 3, 4, 5}; perform the subtraction wrap-safely so an
+    // out-of-range caller surfaces a u32::MAX rather than panics.
+    5u32.wrapping_sub(log2_trafo_size)
+}
+
+// ---------------------------------------------------------------------
+// cbf_luma / cbf_cb / cbf_cr ctxInc — Table 9-48 rows
+// ---------------------------------------------------------------------
+
+/// Table 9-48 row for `cbf_luma[ ][ ][ ]`:
+///
+/// ```text
+/// ctxInc = (trafoDepth == 0) ? 1 : 0
+/// ```
+///
+/// `trafoDepth` is the §7.4.9.10 transform-tree depth, where 0 is
+/// the root of the residual quadtree. The two-context bank is
+/// `{0, 1}` and the spec assigns the *deeper* depths to context 0
+/// (the "no further split, deeper TU" case) and the depth-0 root
+/// to context 1.
+#[must_use]
+pub fn cbf_luma_ctx_inc(trafo_depth: u32) -> u32 {
+    if trafo_depth == 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Shared `ctxInc` derivation for `cbf_cb` and `cbf_cr` (Table 9-48
+/// row): `ctxInc = trafoDepth`. The §7.4.9.10 residual quadtree
+/// allows `trafoDepth ∈ {0, 1, 2, 3, 4}`; the chroma cbf
+/// context banks supplied by Table 9-22 are five entries per
+/// component, matching the depth range.
+///
+/// The two callers ([`cbf_cb_ctx_inc`] and [`cbf_cr_ctx_inc`])
+/// delegate to this helper; the per-component `ctxIdxOffset` is the
+/// caller's responsibility (Cb and Cr each have a distinct bank in
+/// Table 9-4).
+#[must_use]
+pub fn cbf_chroma_ctx_inc(trafo_depth: u32) -> u32 {
+    trafo_depth
+}
+
+/// Table 9-48 row for `cbf_cb[ ][ ][ ]`: `ctxInc = trafoDepth`.
+/// Forwards to [`cbf_chroma_ctx_inc`] for the shared formula.
+#[must_use]
+pub fn cbf_cb_ctx_inc(trafo_depth: u32) -> u32 {
+    cbf_chroma_ctx_inc(trafo_depth)
+}
+
+/// Table 9-48 row for `cbf_cr[ ][ ][ ]`: `ctxInc = trafoDepth`.
+/// Forwards to [`cbf_chroma_ctx_inc`] for the shared formula.
+#[must_use]
+pub fn cbf_cr_ctx_inc(trafo_depth: u32) -> u32 {
+    cbf_chroma_ctx_inc(trafo_depth)
+}
+
+// ---------------------------------------------------------------------
+// inter_pred_idc ctxInc — Table 9-48 row
+// ---------------------------------------------------------------------
+
+/// Table 9-48 row for `inter_pred_idc[ x0 ][ y0 ]`:
+///
+/// ```text
+/// bin 0:  ctxInc = (nPbW + nPbH != 12) ? CtDepth[x0][y0] : 4
+/// bin 1:  ctxInc = 4
+/// ```
+///
+/// `n_pb_w` and `n_pb_h` are the prediction-block width and height in
+/// luma samples (the §7.3.8.6 `nPbW` / `nPbH` derivation). The
+/// `nPbW + nPbH == 12` condition picks the two prediction-block
+/// shapes whose luma area is 16 samples — namely 8×4 (sum = 12) and
+/// 4×8 (sum = 12) — which are encoded with the bin-0 escape onto
+/// the shared bin-1 context bank (`ctxInc = 4`). All other shapes
+/// route bin 0 through the per-`CtDepth` context bank `{0, 1, 2, 3}`.
+///
+/// `ct_depth` is the §7.4.9.4 `CtDepth[x0][y0]` value (the coding-
+/// quadtree depth of the current coding unit); valid range is
+/// `{0, 1, 2, 3}` matching the §7.4.7.1 MaxCuDepth limit.
+///
+/// Returns `ctxInc` for any `binIdx`; `binIdx ∈ {2, 3, 4}` is `na`
+/// per Table 9-48 (the binarization is a TR with `cMax = 2`), so the
+/// function returns `4` for `binIdx >= 1` (matching bin 1).
+#[must_use]
+pub fn inter_pred_idc_ctx_inc(bin_idx: u32, n_pb_w: u32, n_pb_h: u32, ct_depth: u32) -> u32 {
+    if bin_idx == 0 {
+        // Bin 0 routes through CtDepth unless the PU is 8×4 or 4×8
+        // (luma area 16 samples ⇒ nPbW + nPbH == 12), in which case
+        // it shares the bin-1 context bank.
+        if n_pb_w + n_pb_h != 12 {
+            ct_depth
+        } else {
+            4
+        }
+    } else {
+        // Bin 1 — and the `na` entries `binIdx >= 2` — use ctx 4.
+        // Table 9-47 caps the prefix at `cMax = 2` (one or two bins),
+        // so the slice-data parser never invokes this with binIdx >=
+        // 2; the return value is the spec's bin-1 ctxInc.
+        4
+    }
+}
+
+// ---------------------------------------------------------------------
+// log2_res_scale_abs_plus1 / res_scale_sign_flag ctxInc —
+// Table 9-48 rows for §7.3.8.13 cross-component prediction
+// ---------------------------------------------------------------------
+
+/// Table 9-48 row for `log2_res_scale_abs_plus1[ c ]`:
+///
+/// ```text
+/// ctxInc = 4*c + binIdx
+/// ```
+///
+/// `c` is the chroma-component index passed at the §7.3.8.13
+/// `cross_comp_pred()` call site: `c == 0` for Cb, `c == 1` for Cr.
+/// The TR(`cMax = 4`) prefix occupies four consecutive contexts per
+/// chroma component, so the per-component banks are `{0, 1, 2, 3}`
+/// (Cb) and `{4, 5, 6, 7}` (Cr).
+///
+/// `binIdx` is the position of the bin within the TR prefix, in
+/// `{0, 1, 2, 3}`. The `binIdx >= 4` slots (the EGk(k=0) bypass
+/// escape, when the prefix is the all-ones escape `0b1111`) are
+/// `na` for the context-coded path; the caller switches to bypass
+/// decoding at that point and never passes them here.
+#[must_use]
+pub fn log2_res_scale_abs_plus1_ctx_inc(bin_idx: u32, c: u32) -> u32 {
+    // Per-component bank offset (4) times c, plus the bin position
+    // within the TR prefix.
+    4 * c + bin_idx
+}
+
+/// Table 9-48 row for `res_scale_sign_flag[ c ]`:
+///
+/// ```text
+/// ctxInc = c
+/// ```
+///
+/// `c == 0` for Cb, `c == 1` for Cr; each component has its own
+/// single-bin sign-flag context.
+#[must_use]
+pub fn res_scale_sign_flag_ctx_inc(c: u32) -> u32 {
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,5 +1286,177 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------
+    // split_transform_flag ctxInc — Table 9-48 row
+    // -------------------------------------------------------------
+
+    #[test]
+    fn split_transform_flag_ctx_inc_table_row() {
+        // ctxInc = 5 − log2TrafoSize for log2TrafoSize in
+        // {2, 3, 4, 5} → ctxInc in {3, 2, 1, 0}.
+        assert_eq!(split_transform_flag_ctx_inc(2), 3);
+        assert_eq!(split_transform_flag_ctx_inc(3), 2);
+        assert_eq!(split_transform_flag_ctx_inc(4), 1);
+        assert_eq!(split_transform_flag_ctx_inc(5), 0);
+    }
+
+    #[test]
+    fn split_transform_flag_ctx_inc_bounded_zero_three() {
+        // The four legal residual-quadtree TB sizes map exactly
+        // onto the four-context bank {0, 1, 2, 3}.
+        for log2 in 2u32..=5 {
+            let inc = split_transform_flag_ctx_inc(log2);
+            assert!(inc <= 3, "ctxInc {} out of bank {{0..=3}}", inc);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // cbf_luma / cbf_cb / cbf_cr ctxInc — Table 9-48 rows
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cbf_luma_ctx_inc_table_row() {
+        // ctxInc = (trafoDepth == 0) ? 1 : 0.
+        assert_eq!(cbf_luma_ctx_inc(0), 1);
+        assert_eq!(cbf_luma_ctx_inc(1), 0);
+        assert_eq!(cbf_luma_ctx_inc(2), 0);
+        assert_eq!(cbf_luma_ctx_inc(3), 0);
+        assert_eq!(cbf_luma_ctx_inc(4), 0);
+    }
+
+    #[test]
+    fn cbf_luma_ctx_inc_bank_zero_one() {
+        // The two-ctx bank {0, 1}: every legal trafoDepth lands in
+        // one of those two slots.
+        for d in 0u32..=4 {
+            let inc = cbf_luma_ctx_inc(d);
+            assert!(inc <= 1, "cbf_luma ctxInc {} out of {{0, 1}}", inc);
+        }
+    }
+
+    #[test]
+    fn cbf_chroma_ctx_inc_identity() {
+        // ctxInc = trafoDepth for both cbf_cb and cbf_cr (shared).
+        for d in 0u32..=4 {
+            assert_eq!(cbf_chroma_ctx_inc(d), d);
+            assert_eq!(cbf_cb_ctx_inc(d), d);
+            assert_eq!(cbf_cr_ctx_inc(d), d);
+        }
+    }
+
+    #[test]
+    fn cbf_cb_cr_share_formula() {
+        // cbf_cb and cbf_cr always agree at the bank-relative
+        // ctxInc layer; the distinct context banks are encoded in
+        // the caller's ctxIdxOffset, not here.
+        for d in 0u32..=4 {
+            assert_eq!(cbf_cb_ctx_inc(d), cbf_cr_ctx_inc(d));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // inter_pred_idc ctxInc — Table 9-48 row
+    // -------------------------------------------------------------
+
+    #[test]
+    fn inter_pred_idc_bin_0_routes_ct_depth() {
+        // For a PU that is not 8×4 or 4×8 (nPbW+nPbH != 12), bin 0
+        // ctxInc = CtDepth.
+        // 64×64 PU (CTU root): 64+64=128 != 12; CtDepth=0 → 0.
+        assert_eq!(inter_pred_idc_ctx_inc(0, 64, 64, 0), 0);
+        // 16×16 PU at CtDepth 2: 16+16=32 != 12 → ctxInc = 2.
+        assert_eq!(inter_pred_idc_ctx_inc(0, 16, 16, 2), 2);
+        // 8×8 PU at CtDepth 3: 8+8=16 != 12 → ctxInc = 3.
+        assert_eq!(inter_pred_idc_ctx_inc(0, 8, 8, 3), 3);
+    }
+
+    #[test]
+    fn inter_pred_idc_bin_0_escape_on_16_sample_pus() {
+        // 8×4 PU: nPbW + nPbH = 12 → bin 0 ctxInc = 4, regardless
+        // of CtDepth.
+        assert_eq!(inter_pred_idc_ctx_inc(0, 8, 4, 0), 4);
+        assert_eq!(inter_pred_idc_ctx_inc(0, 8, 4, 3), 4);
+        // 4×8 PU: same.
+        assert_eq!(inter_pred_idc_ctx_inc(0, 4, 8, 0), 4);
+        assert_eq!(inter_pred_idc_ctx_inc(0, 4, 8, 3), 4);
+    }
+
+    #[test]
+    fn inter_pred_idc_bin_1_always_ctx_4() {
+        // Bin 1 ctxInc = 4 regardless of nPbW / nPbH / CtDepth.
+        assert_eq!(inter_pred_idc_ctx_inc(1, 64, 64, 0), 4);
+        assert_eq!(inter_pred_idc_ctx_inc(1, 8, 4, 3), 4);
+        assert_eq!(inter_pred_idc_ctx_inc(1, 4, 8, 2), 4);
+        assert_eq!(inter_pred_idc_ctx_inc(1, 16, 8, 1), 4);
+    }
+
+    #[test]
+    fn inter_pred_idc_ctx_inc_bank_zero_four() {
+        // ctxInc ∈ {0, 1, 2, 3, 4} across all legal inputs.
+        for &(w, h) in &[
+            (64, 64),
+            (32, 32),
+            (16, 16),
+            (8, 8),
+            (8, 4),
+            (4, 8),
+            (16, 8),
+            (8, 16),
+        ] {
+            for ct_depth in 0u32..=3 {
+                for bin_idx in 0u32..=1 {
+                    let inc = inter_pred_idc_ctx_inc(bin_idx, w, h, ct_depth);
+                    assert!(inc <= 4, "ctxInc {} out of {{0..=4}}", inc);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
+    // log2_res_scale_abs_plus1 / res_scale_sign_flag ctxInc —
+    // Table 9-48 rows for §7.3.8.13 cross_comp_pred()
+    // -------------------------------------------------------------
+
+    #[test]
+    fn log2_res_scale_abs_plus1_ctx_inc_cb_bank() {
+        // c = 0 (Cb): ctxInc = binIdx for binIdx ∈ {0, 1, 2, 3} →
+        // bank {0, 1, 2, 3}.
+        for bin_idx in 0u32..=3 {
+            assert_eq!(log2_res_scale_abs_plus1_ctx_inc(bin_idx, 0), bin_idx);
+        }
+    }
+
+    #[test]
+    fn log2_res_scale_abs_plus1_ctx_inc_cr_bank() {
+        // c = 1 (Cr): ctxInc = 4 + binIdx for binIdx ∈ {0, 1, 2, 3}
+        // → bank {4, 5, 6, 7}.
+        for bin_idx in 0u32..=3 {
+            assert_eq!(log2_res_scale_abs_plus1_ctx_inc(bin_idx, 1), 4 + bin_idx);
+        }
+    }
+
+    #[test]
+    fn log2_res_scale_abs_plus1_ctx_inc_banks_disjoint() {
+        // Cb and Cr banks must not overlap.
+        for bin_idx in 0u32..=3 {
+            let cb = log2_res_scale_abs_plus1_ctx_inc(bin_idx, 0);
+            let cr = log2_res_scale_abs_plus1_ctx_inc(bin_idx, 1);
+            assert!(
+                cb < 4 && (4..8).contains(&cr),
+                "Cb / Cr ctxInc not in disjoint banks: cb={}, cr={}",
+                cb,
+                cr
+            );
+        }
+    }
+
+    #[test]
+    fn res_scale_sign_flag_ctx_inc_identity() {
+        // ctxInc = c. One bit per chroma component, each on its own
+        // context.
+        assert_eq!(res_scale_sign_flag_ctx_inc(0), 0);
+        assert_eq!(res_scale_sign_flag_ctx_inc(1), 1);
     }
 }
