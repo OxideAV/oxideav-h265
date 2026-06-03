@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 29 (2026-06-03)
+
+- §7.3.2.2.1 SPS extension-flag block now decodes typed: when
+  `sps_extension_present_flag == 1` the eight bits of the typed
+  block are decoded into a new [`sps::SpsExtensionFlags`] struct
+  carrying `sps_range_extension_flag` (§A.3.5 RExt-profile entry
+  point), `sps_multilayer_extension_flag` (Annex F),
+  `sps_3d_extension_flag` (Annex I), `sps_scc_extension_flag`
+  (§A.3.7 Screen Content Coding profiles family), and the
+  reserved-for-future-use `sps_extension_4bits` group. The opaque
+  tail now starts at the first signalled extension body
+  (`sps_range_extension()` / `sps_multilayer_extension()` /
+  `sps_3d_extension()` / `sps_scc_extension()`) or at the
+  `sps_extension_data_flag` while-loop when only
+  `sps_extension_4bits` is non-zero. When every flag in the typed
+  block is 0 the SPS ends cleanly without an opaque tail (only
+  `rbsp_trailing_bits()` follows). [`sps::SpsExtensionFlags`] is
+  re-exported from the crate root alongside the existing
+  [`SeqParameterSet`] surface; it mirrors the same shape adopted
+  for [`pps::PpsExtensionFlags`] in round 25, so RExt / SCC profile
+  detection now reads the same way from both parameter sets.
+- Four new SPS unit tests cover the typed block end-to-end (265 →
+  269 total, plus two pre-existing opaque-tail tests rewritten to
+  match the typed contract):
+  - `captures_extension_opaque_tail` — single-flag set
+    (`sps_range_extension_flag = 1`) lands the
+    `sps_range_extension()` body in the opaque tail at the right
+    bit position; the four typed flags + `sps_extension_4bits` are
+    asserted.
+  - `decodes_extension_flag_block_without_bodies` — typed block with
+    every flag 0 decodes cleanly, [`SpsExtensionFlags::has_body`]
+    returns false, and no opaque tail is surfaced.
+  - `captures_scc_extension_opaque_tail` — single-flag set
+    (`sps_scc_extension_flag = 1`) selects the §A.3.7 SCC profile
+    family; the typed block decodes and `sps_scc_extension()`
+    lands in the opaque tail.
+  - `captures_extension_data_flag_tail_when_4bits_nonzero` —
+    typed flags all 0 with `sps_extension_4bits = 1` still
+    surfaces an opaque tail (the §7.3.2.2.1
+    `while( more_rbsp_data() ) sps_extension_data_flag` block).
+  - `extension_flags_absent_when_gate_zero` — gate 0 leaves
+    `extension_flags = None` and no opaque tail.
+  - `decodes_vui_then_captures_extension_tail` (rewritten) now
+    drives the typed block through the VUI-present path with
+    `sps_range_extension_flag = 1` instead of stuffing the eight
+    "typed-flag bits" into the opaque tail.
+
 ### Added — clean-room rebuild round 28 (2026-06-02)
 
 - Six more §9.3.4.2 / Table 9-48 closed-form `ctxInc` derivations

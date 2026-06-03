@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 28 (2026-06-02).** The prior implementation was
+**Clean-room rebuild — round 29 (2026-06-03).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,34 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 28 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 29 finishes
+typing the §7.3.2.2.1 SPS extension-flag block as a new
+[`sps::SpsExtensionFlags`] sub-struct, mirroring the round-25 PPS
+work: when `sps_extension_present_flag == 1` the eight bits that
+follow (`sps_range_extension_flag`, `sps_multilayer_extension_flag`,
+`sps_3d_extension_flag`, `sps_scc_extension_flag`,
+`sps_extension_4bits`) are read into typed fields rather than swept
+into the opaque tail. The remaining `opaque_tail` capture now starts
+at the first bit of the first signalled extension body (the
+`sps_range_extension()` body if `sps_range_extension_flag == 1`,
+otherwise the next set flag's body, otherwise the
+`while( more_rbsp_data() ) sps_extension_data_flag` block gated by
+`sps_extension_4bits != 0`); and when all five sub-fields are zero —
+the dominant Main / Main 10 case — the tail is `None` because only
+`rbsp_trailing_bits()` remain, consumed implicitly. The §7.4.3.2.1
+inference rules apply for the absent gate: `extension_flags` is
+`None` and every flag is inferred to 0. The shared predicate
+[`SpsExtensionFlags::has_body`] exposes "any of the four extension
+flags is set, or `sps_extension_4bits` is non-zero" so downstream
+profile-routing code can read RExt (§A.3.5) / multilayer (Annex F) /
+3D (Annex I) / SCC (§A.3.7) selection from the SPS in the same way
+the PPS already exposes it. Total tests now 269 (was 265): five new
+SPS tests cover the typed flag block (no-body decode, range-extension
+opaque tail, SCC opaque tail, non-zero `sps_extension_4bits` opaque
+tail, gate-zero inference), plus the pre-existing
+`captures_extension_opaque_tail` and
+`decodes_vui_then_captures_extension_tail` are rewritten to drive the
+typed contract. Round 28 extends the
 [`binarization`] module with six more §9.3.4.2 / Table 9-48 closed-form
 `ctxInc` derivations — each a pure function of parameters the
 slice-data parser already has in hand (no neighbour-table walk, no
@@ -959,8 +986,17 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
 
 ## Not yet implemented
 
-* SPS extension bodies (Range Extension, Multilayer Annex F,
-  3D Annex I, SCC) — likewise surfaced as opaque bytes.
+* SPS extension bodies (`sps_range_extension()`,
+  `sps_multilayer_extension()`, `sps_3d_extension()`,
+  `sps_scc_extension()`, and the `sps_extension_data_flag` while-loop
+  gated by `sps_extension_4bits != 0`) — surfaced as opaque bytes
+  starting at the first signalled body when
+  `sps_extension_present_flag == 1`. The eight bits of typed
+  extension flags themselves are decoded as of round 29
+  ([`sps::SpsExtensionFlags`]); only the bodies still defer. Profile
+  routing (§A.3.5 RExt / Annex F multilayer / Annex I 3D / §A.3.7
+  SCC) can now read the SPS surface the same way the PPS already
+  exposes it.
 * PPS extension bodies (`pps_range_extension()`,
   `pps_multilayer_extension()`, `pps_3d_extension()`,
   `pps_scc_extension()`, and the `pps_extension_data_flag` while-loop

@@ -247,7 +247,7 @@ pub use slice::{
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
     SeqParameterSet, ShortTermRefPicSet, ShortTermRefPicSetMaterializeError, SpsError,
-    HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
+    SpsExtensionFlags, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
 };
 pub use vps::{
     HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsError, VpsTimingInfo,
