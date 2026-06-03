@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 31 (2026-06-03).** The prior implementation was
+**Clean-room rebuild — round 32 (2026-06-04).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,52 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 31 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 32 extends the
+[`binarization`] module with the §9.3.4.2.5 `sig_coeff_flag` ctxInc
+derivation — the per-scan-position significance bin the §7.3.8.11
+residual-coding loop emits before any greater-1 / greater-2 step.
+The derivation is a four-branch dispatch:
+[`binarization::sig_coeff_flag_sig_ctx_transform_skip`] (eq. 9-40
+fast path used when `transform_skip_context_enabled_flag` is 1 and
+either `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` or
+`cu_transquant_bypass_flag` is 1 — `sigCtx = 42` luma /
+`sigCtx = 16` chroma); [`binarization::sig_coeff_flag_sig_ctx_log2_2`]
+(eq. 9-41 4×4-TB case via
+[`binarization::SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`] = Table
+9-50 `[0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8]` indexed by
+`(yC << 2) + xC`); [`binarization::sig_coeff_flag_sig_ctx_dc`] (eq.
+9-42 DC case on `log2 > 2`, `xC + yC == 0`); and
+[`binarization::sig_coeff_flag_sig_ctx_general`] (equations 9-43..9-53
+general case — `prevCsbf` parity from right / below sub-block
+neighbours, inner-sub-block position routed through one of eq.
+9-45..9-48, then the luma-vs-chroma tail eq. 9-49..9-53; the
+eq.-9-43 / 9-44 edge gates on `xS / yS < (1 << (log2TrafoSize − 2))
+− 1` are applied internally). Eq. 9-54 / 9-55 carry the per-
+component `ctxInc` offset via
+[`binarization::sig_coeff_flag_ctx_inc_from_sig_ctx`] (luma
+`ctxInc = sigCtx`; chroma `ctxInc = 27 + sigCtx`). The Table 9-43
+binarization shape (FL with one context-coded bin per scan position)
+is captured as [`binarization::SIG_COEFF_FLAG_FL_CMAX`] (= 1). Total
+tests now 317 (was 294): 23 new tests cover Table 9-50 verbatim + the
+0..=8 entry-range invariant; eq. 9-40 luma 42 / chroma 16; eq. 9-41
+DC; the row-major (yC, xC) indexing sweep across the 4×4 scan space;
+`& 3` defensive masking; eq. 9-45 `prevCsbf = 0` luma 8×8 (DC / mid /
+edge); eq. 9-50 scan-idx branch on `scan_idx ∈ {1, 2}`; eq. 9-51 luma
+16×16 / 32×32; eq.-9-49 sub-block-offset bump; eq. 9-46 `prevCsbf = 1`
+yP row sweep; eq. 9-47 `prevCsbf = 2` xP row sweep; eq. 9-48 `prevCsbf
+= 3` position-independent over the 4×4 (xP, yP) product; eq. 9-43 /
+9-44 edge-gating on right-edge (xS = max) and bottom-edge (yS = max);
+chroma eq. 9-52 / 9-53 tails plus the eq. 9-49-doesn't-fire chroma
+invariant; chroma 8×8 scan-idx irrelevance; DC eq. 9-42 luma 8×8 across
+`scan_idx ∈ {0, 1}`; DC luma 16×16 / 32×32; DC chroma 8×8 / 16×16;
+eq. 9-54 luma identity over `sigCtx ∈ 0..=44`; eq. 9-55 chroma `+ 27`
+over `sigCtx ∈ 0..=20` plus the transform-skip anchors (chroma 16 → 43,
+luma 42 → 42); the FL `cMax = 1` shape; and end-to-end compose paths
+(`sig_ctx_general → ctx_inc_from_sig_ctx` on luma `(log2 = 4, xC = 4,
+yC = 0)` → 26; `sig_ctx_dc → ctx_inc_from_sig_ctx` on chroma
+`(log2 = 4, DC)` → 39).
+
+Round 31 had extended the
 [`binarization`] module with the two §9.3.4.2.6 / §9.3.4.2.7
 derivations whose `ctxInc` carries persistent per-transform-block
 state across sub-block invocations: the greater-than-1 / greater-than-2

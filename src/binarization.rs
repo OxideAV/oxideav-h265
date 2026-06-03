@@ -184,6 +184,45 @@
 //!   [`coeff_abs_level_greater2_flag_ctx_inc`], reading the
 //!   `ctxSet` value the §9.3.4.2.6 walker has already produced for
 //!   that same sub-block.
+//!
+//! Round 32 extends the residual-coding surface with the
+//! §9.3.4.2.5 `sig_coeff_flag` ctxInc derivation: the per-scan-position
+//! significance bin that the §7.3.8.11 residual-coding loop emits
+//! before any greater-1 / greater-2 step. The derivation is a
+//! four-branch dispatch on `(log2TrafoSize, xC + yC,
+//! transform_skip_context_enabled_flag && (transform_skip_flag ||
+//! cu_transquant_bypass_flag))`:
+//!
+//! * **transform-skip / transquant-bypass fast path** (eq. 9-40):
+//!   `sigCtx = 42` (luma) / `sigCtx = 16` (chroma). One context
+//!   per colour component, position-independent. Implemented in
+//!   [`sig_coeff_flag_sig_ctx_transform_skip`].
+//!
+//! * **`log2TrafoSize == 2`** (eq. 9-41) — the 4×4 TB case reads
+//!   `sigCtx` from the 16-entry Table 9-50 lookup at
+//!   `(yC << 2) + xC`. Implemented in
+//!   [`sig_coeff_flag_sig_ctx_log2_2`] +
+//!   [`SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`].
+//!
+//! * **DC position** (eq. 9-42) — `xC + yC == 0` on `log2 > 2` skips
+//!   the eq.-9-43..9-48 neighbour walk; `sigCtx` starts at 0 and
+//!   only the colour / size tail (eq.-9-49..9-53) applies.
+//!   Implemented in [`sig_coeff_flag_sig_ctx_dc`].
+//!
+//! * **general case** (eq. 9-43..9-53) — for `log2 > 2`, `xC +
+//!   yC > 0` the `prevCsbf` parity of the right / below sub-block
+//!   neighbours plus the inner sub-block position `(xC & 3, yC & 3)`
+//!   route through one of four `sigCtx` rules (eq. 9-45..9-48), then
+//!   the colour / size / scan-order tail (eq. 9-49..9-53). Implemented
+//!   in [`sig_coeff_flag_sig_ctx_general`], with the eq.-9-43 / 9-44
+//!   edge gates on `xS / yS < (1 << (log2TrafoSize − 2)) − 1`
+//!   applied internally.
+//!
+//! Eq. 9-54 / 9-55 carry the per-component `ctxInc` offset
+//! (`ctxInc = sigCtx` for luma, `ctxInc = 27 + sigCtx` for chroma);
+//! see [`sig_coeff_flag_ctx_inc_from_sig_ctx`]. Table 9-43 captures
+//! the `sig_coeff_flag` binarization shape as FL with `cMax = 1` via
+//! [`SIG_COEFF_FLAG_FL_CMAX`].
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1240,6 +1279,229 @@ pub fn coeff_abs_level_greater2_flag_ctx_inc(ctx_set: u32, is_chroma: bool) -> u
 /// context-coded bin per element invocation).
 pub const COEFF_ABS_LEVEL_GREATER_X_FL_CMAX: u32 = 1;
 
+// ---------------------------------------------------------------------
+// sig_coeff_flag ctxInc — §9.3.4.2.5
+// ---------------------------------------------------------------------
+
+/// §9.3.4.2.5 Table 9-50 — the `ctxIdxMap[ ]` 4×4 lookup that maps
+/// the inner-block scan position `(yC << 2) + xC` to a `sigCtx` for
+/// `log2TrafoSize == 2` transform blocks. Index order is row-major
+/// over `(yC, xC) ∈ {0..=3}^2`; the table is a fixed 16-entry
+/// permutation listed verbatim in Table 9-50 of the spec.
+pub const SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2: [u8; 16] =
+    [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+
+/// §9.3.4.2.5 first-branch sigCtx (equation 9-40) — used when
+/// `transform_skip_context_enabled_flag` is 1 and either
+/// `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` is 1 or
+/// `cu_transquant_bypass_flag` is 1. Returns 42 for luma, 16 for
+/// chroma.
+#[must_use]
+pub fn sig_coeff_flag_sig_ctx_transform_skip(is_chroma: bool) -> u32 {
+    // Eq. 9-40: sigCtx = (cIdx == 0) ? 42 : 16.
+    if is_chroma {
+        16
+    } else {
+        42
+    }
+}
+
+/// §9.3.4.2.5 second-branch sigCtx (equation 9-41) — used for the
+/// `log2TrafoSize == 2` (4×4) transform-block case. Reads
+/// [`SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`] at index
+/// `(yC << 2) + xC`.
+///
+/// `xc` and `yc` are the 4×4 inner-block scan coordinates, each in
+/// `0..=3`. Inputs outside this range are clamped via `& 3` so the
+/// caller's debug build does not panic on a malformed scan order
+/// driver — well-formed callers always pass `xc, yc < 4`.
+#[must_use]
+pub fn sig_coeff_flag_sig_ctx_log2_2(xc: u32, yc: u32) -> u32 {
+    let xc = (xc & 3) as usize;
+    let yc = (yc & 3) as usize;
+    // Eq. 9-41: sigCtx = ctxIdxMap[ (yC << 2) + xC ].
+    SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2[(yc << 2) + xc] as u32
+}
+
+/// §9.3.4.2.5 fourth-branch sigCtx derivation (equations 9-43..9-53)
+/// for `log2TrafoSize > 2` and `xC + yC > 0`. Combines:
+///
+/// * `prevCsbf` from the right / below sub-block neighbours of the
+///   current sub-block (equations 9-43, 9-44; edge-gated by the
+///   `xS < (1 << (log2TrafoSize − 2)) − 1` /
+///   `yS < (1 << (log2TrafoSize − 2)) − 1` conditions),
+/// * the inner-sub-block position `(xP, yP) = (xC & 3, yC & 3)`
+///   routed through equations 9-45..9-48 based on `prevCsbf`,
+/// * the colour / size / scan-order tail offsets in equations
+///   9-49..9-53.
+///
+/// Inputs:
+///
+/// * `is_chroma` — true when `cIdx > 0` (selects the chroma branch
+///   of equations 9-49..9-53),
+/// * `log2_trafo_size` — `3..=5` for this code path (the caller
+///   must have dispatched the 4×4 case to
+///   [`sig_coeff_flag_sig_ctx_log2_2`]),
+/// * `xc`, `yc` — coefficient scan position inside the TB,
+/// * `xs`, `ys` — sub-block scan position
+///   (`xs = xC >> 2`, `ys = yC >> 2`),
+/// * `right_csbf` / `below_csbf` — the previously decoded
+///   `coded_sub_block_flag[ xS + 1 ][ yS ]` / `[ xS ][ yS + 1 ]`
+///   neighbour bits (each 0 or 1); ignored when on the right /
+///   bottom TB edge per the equation 9-43 / 9-44 gates,
+/// * `scan_idx` — the §6.5.2 scan order index in `{0, 1, 2}`
+///   (`0` = up-right diagonal, `1` = horizontal, `2` = vertical);
+///   only `scan_idx == 0` is special-cased by equation 9-50 for
+///   the 8×8 luma case.
+///
+/// The `xC + yC == 0` DC-coefficient case (equation 9-42 — `sigCtx
+/// = 0` before the tail offsets) is **not** handled by this
+/// function; callers must route the DC position separately through
+/// [`sig_coeff_flag_sig_ctx_dc`].
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn sig_coeff_flag_sig_ctx_general(
+    is_chroma: bool,
+    log2_trafo_size: u32,
+    xc: u32,
+    yc: u32,
+    xs: u32,
+    ys: u32,
+    right_csbf: u8,
+    below_csbf: u8,
+    scan_idx: u32,
+) -> u32 {
+    // Equations 9-43 / 9-44: prevCsbf gates on the edge of the TB
+    // sub-block grid.
+    let max_sub_block_idx = (1u32 << (log2_trafo_size - 2)) - 1;
+    let right_bit = if xs < max_sub_block_idx {
+        (right_csbf & 1) as u32
+    } else {
+        0
+    };
+    let below_bit = if ys < max_sub_block_idx {
+        (below_csbf & 1) as u32
+    } else {
+        0
+    };
+    let prev_csbf = right_bit + (below_bit << 1);
+
+    // §9.3.4.2.5 inner-sub-block position.
+    let xp = xc & 3;
+    let yp = yc & 3;
+
+    // Equations 9-45..9-48: route by prevCsbf.
+    let mut sig_ctx: u32 = match prev_csbf {
+        0 => {
+            // Eq. 9-45: (xP + yP == 0) ? 2 : (xP + yP < 3) ? 1 : 0.
+            if xp + yp == 0 {
+                2
+            } else if xp + yp < 3 {
+                1
+            } else {
+                0
+            }
+        }
+        1 => {
+            // Eq. 9-46: (yP == 0) ? 2 : (yP == 1) ? 1 : 0.
+            if yp == 0 {
+                2
+            } else if yp == 1 {
+                1
+            } else {
+                0
+            }
+        }
+        2 => {
+            // Eq. 9-47: (xP == 0) ? 2 : (xP == 1) ? 1 : 0.
+            if xp == 0 {
+                2
+            } else if xp == 1 {
+                1
+            } else {
+                0
+            }
+        }
+        // prevCsbf == 3: eq. 9-48 — sigCtx = 2.
+        _ => 2,
+    };
+
+    // Equations 9-49..9-53: colour / size / scan tail offsets.
+    if !is_chroma {
+        // Luma branch.
+        // Eq. 9-49: when (xS + yS) > 0, sigCtx += 3.
+        if xs + ys > 0 {
+            sig_ctx += 3;
+        }
+        // Eq. 9-50 / 9-51: size-dependent constant.
+        if log2_trafo_size == 3 {
+            sig_ctx += if scan_idx == 0 { 9 } else { 15 };
+        } else {
+            sig_ctx += 21;
+        }
+    } else {
+        // Chroma branch.
+        // Eq. 9-52 / 9-53.
+        if log2_trafo_size == 3 {
+            sig_ctx += 9;
+        } else {
+            sig_ctx += 12;
+        }
+    }
+
+    sig_ctx
+}
+
+/// §9.3.4.2.5 DC sigCtx for `log2TrafoSize > 2` and `xC + yC == 0`
+/// (equation 9-42 plus the equations-9-49..9-53 tail). The DC
+/// coefficient skips the equation-9-43..9-48 neighbour walk;
+/// equation 9-42 sets `sigCtx = 0` directly and the size / colour
+/// tail is applied unchanged.
+///
+/// Inputs: `is_chroma`, `log2_trafo_size` (`3..=5`), `scan_idx`
+/// (only matters for the luma `log2 == 3` branch via eq. 9-50).
+#[must_use]
+pub fn sig_coeff_flag_sig_ctx_dc(is_chroma: bool, log2_trafo_size: u32, scan_idx: u32) -> u32 {
+    // Eq. 9-42: sigCtx = 0. For (xS, yS) == (0, 0) the eq.-9-49
+    // luma bump never fires.
+    let mut sig_ctx: u32 = 0;
+    if !is_chroma {
+        // Eq. 9-50 / 9-51.
+        if log2_trafo_size == 3 {
+            sig_ctx += if scan_idx == 0 { 9 } else { 15 };
+        } else {
+            sig_ctx += 21;
+        }
+    } else {
+        // Eq. 9-52 / 9-53.
+        if log2_trafo_size == 3 {
+            sig_ctx += 9;
+        } else {
+            sig_ctx += 12;
+        }
+    }
+    sig_ctx
+}
+
+/// §9.3.4.2.5 ctxInc from sigCtx (equations 9-54, 9-55):
+///
+/// ```text
+/// ctxInc = sigCtx           // cIdx == 0   (9-54)
+/// ctxInc = 27 + sigCtx      // cIdx > 0    (9-55)
+/// ```
+#[must_use]
+pub fn sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx: u32, is_chroma: bool) -> u32 {
+    if is_chroma {
+        27 + sig_ctx
+    } else {
+        sig_ctx
+    }
+}
+
+/// Table 9-43 binarization shape for `sig_coeff_flag`: FL with
+/// `cMax = 1` (single context-coded bin per scan position).
+pub const SIG_COEFF_FLAG_FL_CMAX: u32 = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2211,5 +2473,319 @@ mod tests {
         // Table 9-43: both flags are FL with cMax = 1 (a single
         // context-coded bin per invocation).
         assert_eq!(COEFF_ABS_LEVEL_GREATER_X_FL_CMAX, 1);
+    }
+
+    // -------------------------------------------------------------
+    // §9.3.4.2.5 sig_coeff_flag ctxInc derivation
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sig_coeff_flag_ctx_idx_map_matches_table_9_50() {
+        // Table 9-50 verbatim — sixteen entries indexed by i ∈ 0..16.
+        let expected: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+        assert_eq!(SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2, expected);
+        // Range invariant: every entry is in {0..=8} (matches the
+        // 4×4 luma / chroma context-bank slot space).
+        for &v in SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2.iter() {
+            assert!(v <= 8);
+        }
+    }
+
+    #[test]
+    fn sig_coeff_flag_sig_ctx_transform_skip_eq_9_40() {
+        // Eq. 9-40: luma 42, chroma 16.
+        assert_eq!(sig_coeff_flag_sig_ctx_transform_skip(false), 42);
+        assert_eq!(sig_coeff_flag_sig_ctx_transform_skip(true), 16);
+    }
+
+    #[test]
+    fn sig_coeff_flag_log2_2_dc_position_eq_9_41() {
+        // Eq. 9-41 at (0, 0) ⇒ ctxIdxMap[0] = 0 (the table's first
+        // entry).
+        assert_eq!(sig_coeff_flag_sig_ctx_log2_2(0, 0), 0);
+    }
+
+    #[test]
+    fn sig_coeff_flag_log2_2_sweep_matches_table_9_50_indexing() {
+        // Verify the row-major (yC, xC) indexing pattern reads back
+        // Table 9-50 verbatim across the full 4×4 scan space.
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let expected =
+                    SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2[((y << 2) + x) as usize] as u32;
+                assert_eq!(sig_coeff_flag_sig_ctx_log2_2(x, y), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn sig_coeff_flag_log2_2_indexing_masks_oversized_input() {
+        // Defensive: oversized coordinates wrap to 0..=3 via & 3.
+        // (xC, yC) = (4, 0) wraps to (0, 0) ⇒ ctxIdxMap[0] = 0.
+        assert_eq!(sig_coeff_flag_sig_ctx_log2_2(4, 0), 0);
+        // (5, 1) wraps to (1, 1) ⇒ ctxIdxMap[5] = 3.
+        assert_eq!(sig_coeff_flag_sig_ctx_log2_2(5, 1), 3);
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_45_prev_csbf_zero_luma_8x8() {
+        // log2 = 3, luma, (xS, yS) = (0, 0), prevCsbf = 0.
+        // Eq. 9-45 at (xP, yP):
+        //   (0, 0): xP + yP == 0 → sigCtx = 2.
+        //   (1, 0): xP + yP < 3 → sigCtx = 1.
+        //   (2, 2): xP + yP == 4 ≥ 3 → sigCtx = 0.
+        // Then no eq.-9-49 luma bump (xS + yS == 0). Eq. 9-50 with
+        // scan_idx = 0 ⇒ += 9.
+        // (0, 0, 0, 0): 2 + 9 = 11.
+        // (1, 0, 0, 0): 1 + 9 = 10.
+        // (2, 2, 0, 0): 0 + 9 = 9.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 3, 0, 0, 0, 0, 0, 0, 0),
+            11
+        );
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 3, 1, 0, 0, 0, 0, 0, 0),
+            10
+        );
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 3, 2, 2, 0, 0, 0, 0, 0),
+            9
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_50_scan_idx_branch_8x8_luma() {
+        // log2 = 3, luma, scan_idx = 1 (horizontal) ⇒ += 15 instead
+        // of 9. (xP, yP) = (1, 0), prevCsbf = 0 ⇒ sigCtx = 1 + 15 = 16.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 3, 1, 0, 0, 0, 0, 0, 1),
+            16
+        );
+        // scan_idx = 2 (vertical) ⇒ += 15 (the else branch covers
+        // every non-zero scan_idx).
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 3, 1, 0, 0, 0, 0, 0, 2),
+            16
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_51_large_luma_size() {
+        // log2 = 4 (16×16), luma, (xP, yP) = (0, 0), prevCsbf = 0,
+        // (xS, yS) = (0, 0). sigCtx = 2 + 21 = 23 (eq. 9-51 applies
+        // for log2 ≠ 3, scan_idx irrelevant).
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 0, 0, 0),
+            23
+        );
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 5, 0, 0, 0, 0, 0, 0, 0),
+            23
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_49_luma_subblock_offset_bump() {
+        // log2 = 4, luma, (xS, yS) = (1, 0) ⇒ eq.-9-49 adds 3.
+        // (xP, yP) = (0, 0), prevCsbf = 0 ⇒ sigCtx = 2 + 3 + 21 = 26.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 4, 0, 1, 0, 0, 0, 0),
+            26
+        );
+        // (xS, yS) = (0, 0) leaves the +3 off ⇒ sigCtx = 2 + 21 = 23.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 0, 0, 0),
+            23
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_46_prev_csbf_one() {
+        // log2 = 4, luma, right_csbf = 1 (gives prevCsbf bit 0 = 1),
+        // below_csbf = 0 → prevCsbf = 1. Eq. 9-46:
+        //   yP == 0 → sigCtx = 2.
+        //   yP == 1 → sigCtx = 1.
+        //   yP >= 2 → sigCtx = 0.
+        // (xS, yS) = (0, 0) keeps eq.-9-49 off; eq. 9-51 adds 21.
+        // (xP, yP) = (0, 0): 2 + 21 = 23.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 1, 0, 0),
+            23
+        );
+        // (xP, yP) = (0, 1) ⇒ 1 + 21 = 22.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 1, 0, 0, 1, 0, 0),
+            22
+        );
+        // (xP, yP) = (0, 2) ⇒ 0 + 21 = 21.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 2, 0, 0, 1, 0, 0),
+            21
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_47_prev_csbf_two() {
+        // log2 = 4, luma, below_csbf = 1 → prevCsbf = 2.
+        // Eq. 9-47:
+        //   xP == 0 → sigCtx = 2.
+        //   xP == 1 → sigCtx = 1.
+        //   xP >= 2 → sigCtx = 0.
+        // Add eq.-9-51 luma tail: + 21.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 0, 1, 0),
+            23
+        );
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 1, 0, 0, 0, 0, 1, 0),
+            22
+        );
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(false, 4, 2, 0, 0, 0, 0, 1, 0),
+            21
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_eq_9_48_prev_csbf_three() {
+        // log2 = 4, luma, right_csbf = 1 + below_csbf = 1 → prevCsbf
+        // = 3. Eq. 9-48: sigCtx = 2 (position-independent). + 21
+        // luma tail. (xP, yP) sweep all stay at 23.
+        for xp in 0..4 {
+            for yp in 0..4 {
+                assert_eq!(
+                    sig_coeff_flag_sig_ctx_general(false, 4, xp, yp, 0, 0, 1, 1, 0),
+                    23
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_edge_gates_neighbour_inputs() {
+        // log2 = 3 (8×8) ⇒ max sub-block index 1. (xS, yS) = (1, 0):
+        // xS is at the right edge (1 == 1) ⇒ eq.-9-43 gate suppresses
+        // right_csbf. yS is not at the bottom edge ⇒ eq.-9-44 admits
+        // below_csbf. So passing right_csbf = 1 with (xS, yS) = (1, 0)
+        // has the same effect as passing right_csbf = 0.
+        let with_right = sig_coeff_flag_sig_ctx_general(false, 3, 4, 0, 1, 0, 1, 0, 0);
+        let without_right = sig_coeff_flag_sig_ctx_general(false, 3, 4, 0, 1, 0, 0, 0, 0);
+        assert_eq!(with_right, without_right);
+
+        // (xS, yS) = (0, 1) ⇒ yS at bottom edge, below_csbf gated.
+        let with_below = sig_coeff_flag_sig_ctx_general(false, 3, 0, 4, 0, 1, 0, 1, 0);
+        let without_below = sig_coeff_flag_sig_ctx_general(false, 3, 0, 4, 0, 1, 0, 0, 0);
+        assert_eq!(with_below, without_below);
+
+        // Sanity: (xS, yS) = (0, 0) on a 16×16 TB admits both
+        // neighbours (max sub-block index = 3, both 0 < 3).
+        let admits = sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 1, 1, 0);
+        // prevCsbf = 3 ⇒ eq.-9-48 sigCtx = 2; eq. 9-51 + 21 = 23.
+        assert_eq!(admits, 23);
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_chroma_eq_9_52_9_53_tail() {
+        // Chroma branch never bumps via eq. 9-49.
+        // log2 = 3, chroma, (xP, yP) = (0, 0), prevCsbf = 0,
+        // (xS, yS) = (1, 0) ⇒ eq. 9-49 NOT applied; eq. 9-52 += 9.
+        //   sigCtx = 2 + 9 = 11.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(true, 3, 4, 0, 1, 0, 0, 0, 0),
+            11
+        );
+        // log2 = 4 chroma ⇒ eq. 9-53 += 12 (scan_idx irrelevant).
+        // (0, 0) prevCsbf 0 ⇒ 2 + 12 = 14.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(true, 4, 0, 0, 0, 0, 0, 0, 0),
+            14
+        );
+        // log2 = 5 chroma ⇒ same eq. 9-53 += 12.
+        assert_eq!(
+            sig_coeff_flag_sig_ctx_general(true, 5, 0, 0, 0, 0, 0, 0, 0),
+            14
+        );
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_chroma_eq_9_52_scan_idx_irrelevant() {
+        // Eq. 9-52 (chroma, log2 == 3) does NOT branch on scan_idx;
+        // unlike eq. 9-50 the chroma 8×8 tail is a flat += 9.
+        let s0 = sig_coeff_flag_sig_ctx_general(true, 3, 0, 0, 0, 0, 0, 0, 0);
+        let s1 = sig_coeff_flag_sig_ctx_general(true, 3, 0, 0, 0, 0, 0, 0, 1);
+        let s2 = sig_coeff_flag_sig_ctx_general(true, 3, 0, 0, 0, 0, 0, 0, 2);
+        assert_eq!(s0, s1);
+        assert_eq!(s0, s2);
+        assert_eq!(s0, 11);
+    }
+
+    #[test]
+    fn sig_coeff_flag_dc_eq_9_42_luma_log2_3() {
+        // Eq. 9-42 sigCtx = 0. Eq. 9-50 with scan_idx = 0 ⇒ + 9.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 0), 9);
+        // scan_idx = 1 ⇒ + 15.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 1), 15);
+    }
+
+    #[test]
+    fn sig_coeff_flag_dc_eq_9_42_luma_large_size() {
+        // Eq. 9-51 + 21.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 0), 21);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 5, 0), 21);
+        // scan_idx irrelevant for the eq.-9-51 branch.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 2), 21);
+    }
+
+    #[test]
+    fn sig_coeff_flag_dc_eq_9_42_chroma() {
+        // Eq. 9-52 + 9.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 3, 0), 9);
+        // Eq. 9-53 + 12.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 4, 0), 12);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 5, 0), 12);
+    }
+
+    #[test]
+    fn sig_coeff_flag_ctx_inc_eq_9_54_luma_identity() {
+        // Eq. 9-54: ctxInc = sigCtx.
+        for sig in 0..=44 {
+            assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig, false), sig);
+        }
+    }
+
+    #[test]
+    fn sig_coeff_flag_ctx_inc_eq_9_55_chroma_offset() {
+        // Eq. 9-55: ctxInc = 27 + sigCtx.
+        for sig in 0..=20 {
+            assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig, true), 27 + sig);
+        }
+        // Anchor values: transform-skip chroma (sigCtx = 16) ⇒ 43.
+        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(16, true), 43);
+        // Transform-skip luma (sigCtx = 42, eq. 9-54) ⇒ 42.
+        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(42, false), 42);
+    }
+
+    #[test]
+    fn sig_coeff_flag_fl_shape_is_one_bin() {
+        // Table 9-43: sig_coeff_flag is FL with cMax = 1 (single
+        // context-coded bin per scan position).
+        assert_eq!(SIG_COEFF_FLAG_FL_CMAX, 1);
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_composes_with_ctx_inc_full_pipe_luma() {
+        // End-to-end: log2 = 4, luma, (xC, yC) = (4, 0) → (xS, yS)
+        // = (1, 0), (xP, yP) = (0, 0). prevCsbf 0 ⇒ sigCtx = 2;
+        // eq.-9-49 +3 ⇒ 5; eq.-9-51 +21 ⇒ 26. ctxInc = 26 (eq. 9-54).
+        let sig = sig_coeff_flag_sig_ctx_general(false, 4, 4, 0, 1, 0, 0, 0, 0);
+        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig, false), 26);
+    }
+
+    #[test]
+    fn sig_coeff_flag_general_composes_with_ctx_inc_full_pipe_chroma() {
+        // log2 = 4, chroma, (xC, yC) = (0, 0) DC → must route via
+        // sig_coeff_flag_sig_ctx_dc. ctxInc = 27 + 12 = 39.
+        let sig_dc = sig_coeff_flag_sig_ctx_dc(true, 4, 0);
+        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig_dc, true), 39);
     }
 }

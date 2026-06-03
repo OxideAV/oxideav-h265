@@ -6,6 +6,74 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 32 (2026-06-04)
+
+- §9.3.4.2.5 `sig_coeff_flag` ctxInc derivation lands in the
+  [`binarization`] module. The per-scan-position significance bin
+  the §7.3.8.11 residual-coding loop emits before any greater-1 /
+  greater-2 step routes through one of four spec branches:
+  - [`binarization::sig_coeff_flag_sig_ctx_transform_skip`] — eq.
+    9-40 fast path used when `transform_skip_context_enabled_flag`
+    is 1 and either `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` or
+    `cu_transquant_bypass_flag` is 1. Returns
+    `sigCtx = 42` (luma) / `sigCtx = 16` (chroma), position-
+    independent.
+  - [`binarization::sig_coeff_flag_sig_ctx_log2_2`] — eq. 9-41 for
+    the `log2TrafoSize == 2` (4×4) TB case. Reads `sigCtx` from
+    [`binarization::SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`],
+    the 16-entry Table 9-50 lookup
+    `[0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8]` indexed by
+    `(yC << 2) + xC`.
+  - [`binarization::sig_coeff_flag_sig_ctx_dc`] — eq. 9-42 for the
+    `xC + yC == 0` DC coefficient on `log2TrafoSize > 2`. Starts
+    `sigCtx` at 0 (the eq.-9-43..9-48 neighbour walk is skipped)
+    then applies the eq.-9-49..9-53 colour / size / scan-order
+    tail.
+  - [`binarization::sig_coeff_flag_sig_ctx_general`] — equations
+    9-43..9-53 for the general `log2 > 2`, `xC + yC > 0` case.
+    Computes `prevCsbf` from the right / below sub-block-flag
+    neighbours (edge-gated by `xS / yS < (1 << (log2TrafoSize − 2))
+    − 1`), routes through one of equations 9-45 (`prevCsbf == 0`,
+    `(xP + yP == 0) ? 2 : (xP + yP < 3) ? 1 : 0`), 9-46
+    (`prevCsbf == 1`, `(yP == 0) ? 2 : (yP == 1) ? 1 : 0`), 9-47
+    (`prevCsbf == 2`, `(xP == 0) ? 2 : (xP == 1) ? 1 : 0`), 9-48
+    (`prevCsbf == 3`, `sigCtx = 2`), then applies the luma-vs-
+    chroma tail (eq. 9-49 luma `(xS + yS > 0) → += 3`; eq. 9-50
+    luma `log2 == 3` `(scan_idx == 0 ? 9 : 15)`; eq. 9-51 luma
+    other-sizes `+= 21`; eq. 9-52 chroma `log2 == 3` `+= 9`; eq.
+    9-53 chroma other-sizes `+= 12`).
+  - [`binarization::sig_coeff_flag_ctx_inc_from_sig_ctx`] — eq.
+    9-54 luma `ctxInc = sigCtx` / eq. 9-55 chroma
+    `ctxInc = 27 + sigCtx`, the final per-component offset
+    applied to whichever `sigCtx` derivation the caller dispatched.
+  - [`binarization::SIG_COEFF_FLAG_FL_CMAX`] = 1 — the Table 9-43
+    binarization shape (FL with one context-coded bin per scan
+    position).
+- Total tests now 317 (was 294). 23 new tests cover: Table 9-50
+  verbatim entries + entry-range invariant; eq. 9-40 luma 42 /
+  chroma 16; eq. 9-41 at the (0, 0) DC position; the eq. 9-41
+  row-major (yC, xC) indexing sweep over the full 4×4 scan space;
+  the `(xc, yc) & 3` defensive masking; eq. 9-45 `prevCsbf = 0`
+  luma 8×8 across the three DC / mid / edge positions; eq. 9-50
+  scan-idx branch (`scan_idx ∈ {1, 2} → += 15`) vs. `scan_idx == 0
+  → += 9`; eq. 9-51 luma 16×16 and 32×32; eq.-9-49 sub-block
+  offset bump on `(xS, yS) = (1, 0)` luma vs `(0, 0)`; eq. 9-46
+  `prevCsbf = 1` row sweep (yP 0 / 1 / 2); eq. 9-47 `prevCsbf =
+  2` row sweep (xP 0 / 1 / 2); eq. 9-48 `prevCsbf = 3` position-
+  independent across the 4×4 (xP, yP) product; eq. 9-43 / 9-44
+  edge-gating on the right edge (xS = max) and bottom edge (yS =
+  max); chroma eq. 9-52 / 9-53 tails (with eq. 9-49 luma bump
+  inactive on chroma); eq. 9-52 chroma's scan-idx-irrelevance
+  (unlike eq. 9-50 luma); DC eq. 9-42 luma 8×8 `scan_idx ∈ {0,
+  1}`; DC luma large sizes; DC chroma 8×8 / 16×16; eq. 9-54 luma
+  identity over `sigCtx ∈ 0..=44`; eq. 9-55 chroma `+ 27` over
+  `sigCtx ∈ 0..=20` plus the transform-skip chroma anchor (16 → 43)
+  and transform-skip luma anchor (42 → 42); the FL `cMax = 1`
+  shape assertion; an end-to-end luma compose
+  `sig_ctx_general → ctx_inc_from_sig_ctx` on `(log2 = 4, xC =
+  4, yC = 0)` → 26; and an end-to-end chroma compose
+  `sig_ctx_dc → ctx_inc_from_sig_ctx` on `(log2 = 4, DC)` → 39.
+
 ### Added — clean-room rebuild round 31 (2026-06-03)
 
 - §9.3.4.2.6 + §9.3.4.2.7 ctxInc derivations for the absolute-level
