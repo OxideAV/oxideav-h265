@@ -119,6 +119,37 @@
 //! `log2_res_scale_abs_plus1` followed by a bypass tail) are driven
 //! by the slice-data parser the same way as the round-26 / 27
 //! elements.
+//!
+//! Round 30 extends the surface with the §7.3.4 `sao()` per-CTU
+//! syntax-element family. Every element has either a single
+//! context-coded bin-0 followed by zero or more bypass-coded bins
+//! (Table 9-48) or is fully bypass-coded; no neighbour walk is
+//! needed at this layer.
+//!
+//! * **`sao_merge_left_flag` / `sao_merge_up_flag`** (H.265 §7.3.4,
+//!   §7.4.9.3) — Table 9-48 row: bin 0 `ctxInc = 0`. The FL
+//!   binarization has `cMax = 1` (single bin). The two merge flags
+//!   share the Table 9-5 context bank (Table 9-4). Implemented in
+//!   [`sao_merge_flag_ctx_inc`] + [`SAO_MERGE_FLAG_FL_CMAX`].
+//!
+//! * **`sao_type_idx_luma` / `sao_type_idx_chroma`** (H.265 §7.3.4,
+//!   §7.4.9.3) — Table 9-48 row: bin 0 `ctxInc = 0`, bin 1 bypass.
+//!   The TR(`cMax = 2`, `cRiceParam = 0`) binarization caps the
+//!   prefix at two bins, encoding `SaoTypeIdx ∈ {0, 1, 2}`. The two
+//!   variants share the Table 9-6 context bank. Implemented in
+//!   [`sao_type_idx_ctx_inc`] + [`SAO_TYPE_IDX_TR_CMAX`].
+//!
+//! * **`sao_offset_abs`** (H.265 §7.3.4, §7.4.9.3) — Table 9-48 row:
+//!   all bins bypass. TR(`cMax = (1 << min(bitDepth, 10) − 5) − 1`,
+//!   `cRiceParam = 0`). Implemented in [`sao_offset_abs_tr_cmax`].
+//!
+//! * **`sao_offset_sign`**, **`sao_band_position`**,
+//!   **`sao_eo_class_luma` / `sao_eo_class_chroma`** (H.265 §7.3.4,
+//!   §7.4.9.3) — Table 9-48 row: all bins bypass; FL binarizations
+//!   with `cMax = 1`, `cMax = 31`, `cMax = 3` respectively.
+//!   Implemented as [`SAO_OFFSET_SIGN_FL_CMAX`],
+//!   [`SAO_BAND_POSITION_FL_CMAX`] + [`SAO_BAND_POSITION_FL_NBITS`],
+//!   and [`SAO_EO_CLASS_FL_CMAX`] + [`SAO_EO_CLASS_FL_NBITS`].
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -799,6 +830,141 @@ pub fn res_scale_sign_flag_ctx_inc(c: u32) -> u32 {
     c
 }
 
+// ---------------------------------------------------------------------
+// §7.3.4 sao() — per-CTU SAO syntax elements (Table 9-48 / Table 9-43)
+// ---------------------------------------------------------------------
+//
+// Round 30 extends the §9.3.4.2 surface with the SAO syntax-element
+// family, all decoded inside the §7.3.4 `sao()` per-CTU block. Every
+// element is either a single context-coded bin-0 followed by zero or
+// more bypass-coded bins (Table 9-48), or fully bypass-coded; no
+// neighbour-table walk is needed at this layer.
+//
+// Table 9-48 rows captured here:
+//
+// * `sao_merge_left_flag`            → bin 0: ctxInc = 0  (FL, cMax = 1)
+// * `sao_merge_up_flag`              → bin 0: ctxInc = 0  (FL, cMax = 1)
+// * `sao_type_idx_luma`              → bin 0: ctxInc = 0; bin 1: bypass
+//                                      (TR, cMax = 2, cRiceParam = 0)
+// * `sao_type_idx_chroma`            → bin 0: ctxInc = 0; bin 1: bypass
+//                                      (TR, cMax = 2, cRiceParam = 0)
+// * `sao_offset_abs[ ][ ][ ][ ]`     → bypass × all
+//                                      (TR, cMax = (1 << (min(bitDepth, 10) − 5)) − 1,
+//                                      cRiceParam = 0)
+// * `sao_offset_sign[ ][ ][ ][ ]`    → bypass × 1     (FL, cMax = 1)
+// * `sao_band_position[ ][ ][ ]`     → bypass × 5     (FL, cMax = 31)
+// * `sao_eo_class_luma`              → bypass × 2     (FL, cMax = 3)
+// * `sao_eo_class_chroma`            → bypass × 2     (FL, cMax = 3)
+//
+// Table 9-4 association (the ctx banks each element lives in):
+//
+// * `sao_merge_left_flag` + `sao_merge_up_flag` share Table 9-5 (one
+//   ctxIdx per initType).
+// * `sao_type_idx_luma` + `sao_type_idx_chroma` share Table 9-6 (one
+//   ctxIdx per initType).
+//
+// The two pairs are distinct context banks; this layer hands back the
+// bank-relative ctxInc only (0 for every context-coded SAO bin).
+
+/// Table 9-48 row for `sao_merge_left_flag` and `sao_merge_up_flag`:
+///
+/// ```text
+/// bin 0: ctxInc = 0
+/// ```
+///
+/// Only bin 0 is context-coded; the FL binarization has `cMax = 1`, so
+/// there is exactly one bin and the function returns 0 for any call.
+/// The two merge flags share the same Table 9-5 context bank (see
+/// Table 9-4); this layer returns the bank-relative ctxInc only.
+#[must_use]
+pub fn sao_merge_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// Table 9-48 row for `sao_type_idx_luma` and `sao_type_idx_chroma`:
+///
+/// ```text
+/// bin 0: ctxInc = 0
+/// bin 1: bypass
+/// ```
+///
+/// `binIdx == 0` is context-coded with `ctxInc = 0`; `binIdx == 1` is
+/// bypass per Table 9-48 and is **not** routed through a context. The
+/// TR(`cMax = 2`) binarization caps the prefix at two bins. Callers
+/// driving the §9.3 engine must invoke `decode_decision` for bin 0 and
+/// `decode_bypass` for bin 1 directly, switching paths between bins.
+///
+/// Returns the ctxInc when called with `bin_idx == 0`; any other value
+/// is `na` per Table 9-48 and the function returns 0 defensively
+/// (callers should not invoke this for the bypass bin).
+#[must_use]
+pub fn sao_type_idx_ctx_inc(bin_idx: u32) -> u32 {
+    debug_assert!(
+        bin_idx == 0,
+        "sao_type_idx Table 9-48 row: only bin 0 is context-coded; bin >= 1 is bypass"
+    );
+    0
+}
+
+/// Table 9-43 binarization shape for `sao_merge_left_flag` and
+/// `sao_merge_up_flag`: FL with `cMax = 1` (single bin).
+pub const SAO_MERGE_FLAG_FL_CMAX: u32 = 1;
+
+/// Table 9-43 binarization shape for `sao_type_idx_luma` and
+/// `sao_type_idx_chroma`: TR with `cMax = 2`, `cRiceParam = 0`. The
+/// prefix is at most two bins; bin 0 is context-coded (ctxInc = 0),
+/// bin 1 is bypass-coded per Table 9-48.
+pub const SAO_TYPE_IDX_TR_CMAX: u32 = 2;
+
+/// Table 9-43 binarization shape for `sao_offset_sign`: FL with
+/// `cMax = 1` (single bypass-coded bin).
+pub const SAO_OFFSET_SIGN_FL_CMAX: u32 = 1;
+
+/// Table 9-43 binarization shape for `sao_band_position`: FL with
+/// `cMax = 31` (five bypass-coded bins; the FL-of-cMax-31 form
+/// uses `ceil(log2(cMax + 1)) = 5` bits per §9.3.3.5).
+pub const SAO_BAND_POSITION_FL_CMAX: u32 = 31;
+
+/// FL-binarization bit count for `sao_band_position`: 5 bypass bins.
+/// Per §9.3.3.5, FL of `cMax = N` uses `ceil(log2(N + 1))` bits.
+pub const SAO_BAND_POSITION_FL_NBITS: u32 = 5;
+
+/// Table 9-43 binarization shape for `sao_eo_class_luma` and
+/// `sao_eo_class_chroma`: FL with `cMax = 3` (two bypass-coded bins,
+/// encoding the §7.4.9.3 `SaoEoClass` ∈ {0, 1, 2, 3}: horizontal,
+/// vertical, 135-degree, 45-degree).
+pub const SAO_EO_CLASS_FL_CMAX: u32 = 3;
+
+/// FL-binarization bit count for `sao_eo_class_luma` /
+/// `sao_eo_class_chroma`: 2 bypass bins.
+pub const SAO_EO_CLASS_FL_NBITS: u32 = 2;
+
+/// Table 9-43 binarization shape for `sao_offset_abs`: TR with
+///
+/// ```text
+/// cMax = (1 << min(bitDepth, 10) - 5) - 1
+/// cRiceParam = 0
+/// ```
+///
+/// where `bitDepth` is the component's bit-depth in samples. For the
+/// canonical 8-bit case `cMax = (1 << 3) - 1 = 7`; for 10-bit and
+/// beyond `cMax = (1 << 5) - 1 = 31` (Min-clamped to 10 by the spec
+/// to keep the maximum SAO offset range bounded). All bins of the TR
+/// prefix are bypass-coded per Table 9-48.
+///
+/// `bit_depth` is the §7.4.7.1 `BitDepthY` or `BitDepthC` value
+/// for the colour component being decoded.
+#[must_use]
+pub fn sao_offset_abs_tr_cmax(bit_depth: u32) -> u32 {
+    // §9.3.3.5: Min(bitDepth, 10). Clamp at the spec maximum so the
+    // SAO offset range never exceeds [−31, 31].
+    let clamped = if bit_depth < 10 { bit_depth } else { 10 };
+    // The subtraction is well-defined for bit_depth >= 5; HEVC mandates
+    // bitDepth >= 8 in every conformant profile, so the result is
+    // always positive in practice.
+    (1u32 << (clamped - 5)) - 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,5 +1624,108 @@ mod tests {
         // context.
         assert_eq!(res_scale_sign_flag_ctx_inc(0), 0);
         assert_eq!(res_scale_sign_flag_ctx_inc(1), 1);
+    }
+
+    // -------------------------------------------------------------
+    // SAO ctxInc / binarization-shape — Table 9-48 + Table 9-43
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sao_merge_flag_ctx_inc_is_zero() {
+        // Table 9-48 row for sao_merge_left_flag / sao_merge_up_flag:
+        // bin 0 ctxInc = 0; the FL cMax = 1 ⇒ exactly one bin total.
+        assert_eq!(sao_merge_flag_ctx_inc(), 0);
+        assert_eq!(SAO_MERGE_FLAG_FL_CMAX, 1);
+    }
+
+    #[test]
+    fn sao_type_idx_ctx_inc_bin_zero() {
+        // Table 9-48 row for sao_type_idx_{luma,chroma}: bin 0 ctxInc
+        // = 0 (the only context-coded bin); bin 1 is bypass per
+        // Table 9-48 and not routed through this helper.
+        assert_eq!(sao_type_idx_ctx_inc(0), 0);
+    }
+
+    #[test]
+    fn sao_type_idx_tr_cmax_is_two() {
+        // §9.3.3.10 Table 9-43: TR cMax = 2 caps the prefix at two
+        // bins (the §7.4.9.3 SaoTypeIdx range {0, 1, 2}: NOT_APPLIED
+        // / BAND / EDGE).
+        assert_eq!(SAO_TYPE_IDX_TR_CMAX, 2);
+    }
+
+    #[test]
+    fn sao_offset_sign_fl_cmax_is_one() {
+        // Table 9-43: FL cMax = 1 ⇒ single bypass bin.
+        assert_eq!(SAO_OFFSET_SIGN_FL_CMAX, 1);
+    }
+
+    #[test]
+    fn sao_band_position_fl_shape() {
+        // Table 9-43: FL cMax = 31 ⇒ 5 bypass bins (§9.3.3.5
+        // ceil(log2(32)) = 5).
+        assert_eq!(SAO_BAND_POSITION_FL_CMAX, 31);
+        assert_eq!(SAO_BAND_POSITION_FL_NBITS, 5);
+        // Sanity: the FL-of-cMax-31 nbits is the expected log2 ceil.
+        // 2^5 = 32 = cMax + 1.
+        assert_eq!(
+            1u32 << SAO_BAND_POSITION_FL_NBITS,
+            SAO_BAND_POSITION_FL_CMAX + 1
+        );
+    }
+
+    #[test]
+    fn sao_eo_class_fl_shape() {
+        // Table 9-43: FL cMax = 3 ⇒ 2 bypass bins (encoding §7.4.9.3
+        // SaoEoClass ∈ {0, 1, 2, 3}).
+        assert_eq!(SAO_EO_CLASS_FL_CMAX, 3);
+        assert_eq!(SAO_EO_CLASS_FL_NBITS, 2);
+        // Sanity: 2^2 = 4 = cMax + 1.
+        assert_eq!(1u32 << SAO_EO_CLASS_FL_NBITS, SAO_EO_CLASS_FL_CMAX + 1);
+    }
+
+    #[test]
+    fn sao_offset_abs_tr_cmax_8bit() {
+        // §9.3.3.5: cMax = (1 << min(bitDepth, 10) − 5) − 1.
+        // bitDepth = 8 ⇒ (1 << 3) − 1 = 7.
+        assert_eq!(sao_offset_abs_tr_cmax(8), 7);
+    }
+
+    #[test]
+    fn sao_offset_abs_tr_cmax_10bit() {
+        // bitDepth = 10 ⇒ (1 << 5) − 1 = 31.
+        assert_eq!(sao_offset_abs_tr_cmax(10), 31);
+    }
+
+    #[test]
+    fn sao_offset_abs_tr_cmax_9bit() {
+        // bitDepth = 9 ⇒ (1 << 4) − 1 = 15.
+        assert_eq!(sao_offset_abs_tr_cmax(9), 15);
+    }
+
+    #[test]
+    fn sao_offset_abs_tr_cmax_clamps_above_10() {
+        // §9.3.3.5 Min(bitDepth, 10): bitDepth >= 10 must clamp to
+        // the 10-bit cMax = 31. Covers 12-bit and 16-bit profiles.
+        assert_eq!(sao_offset_abs_tr_cmax(11), 31);
+        assert_eq!(sao_offset_abs_tr_cmax(12), 31);
+        assert_eq!(sao_offset_abs_tr_cmax(16), 31);
+    }
+
+    #[test]
+    fn sao_offset_abs_tr_cmax_monotone() {
+        // cMax is non-decreasing in bitDepth across the clamp at 10.
+        let mut prev = sao_offset_abs_tr_cmax(8);
+        for bd in 9u32..=16 {
+            let cur = sao_offset_abs_tr_cmax(bd);
+            assert!(
+                cur >= prev,
+                "cMax must be non-decreasing in bitDepth: bd={} cur={} prev={}",
+                bd,
+                cur,
+                prev
+            );
+            prev = cur;
+        }
     }
 }

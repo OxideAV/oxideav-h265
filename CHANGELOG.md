@@ -6,6 +6,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 30 (2026-06-03)
+
+- §9.3.4.2 / Table 9-48 + §9.3.3 / Table 9-43 derivations for the
+  §7.3.4 `sao()` per-CTU syntax-element family land in the
+  [`binarization`] module. Every element is either a single
+  context-coded bin-0 followed by zero or more bypass-coded bins or
+  is fully bypass-coded; no neighbour-table walk is needed at this
+  layer. The new public surface:
+  - [`binarization::sao_merge_flag_ctx_inc`] — Table 9-48 row for
+    `sao_merge_left_flag` and `sao_merge_up_flag`: bin 0
+    `ctxInc = 0`. Both merge flags share the Table 9-5 context
+    bank (single ctxIdx per initType) per Table 9-4.
+    [`binarization::SAO_MERGE_FLAG_FL_CMAX`] = 1 captures the FL
+    binarization (single bin) from Table 9-43.
+  - [`binarization::sao_type_idx_ctx_inc`] — Table 9-48 row for
+    `sao_type_idx_luma` and `sao_type_idx_chroma`: bin 0
+    `ctxInc = 0`; bin 1 is bypass per Table 9-48 (not routed
+    through a context). The TR(`cMax = 2`, `cRiceParam = 0`)
+    binarization caps the prefix at two bins, encoding the §7.4.9.3
+    `SaoTypeIdx ∈ {0, 1, 2}` (NOT_APPLIED / BAND / EDGE). The two
+    variants share the Table 9-6 context bank per Table 9-4.
+    [`binarization::SAO_TYPE_IDX_TR_CMAX`] = 2.
+  - [`binarization::sao_offset_abs_tr_cmax`] — Table 9-43 row for
+    `sao_offset_abs[ ][ ][ ][ ]`:
+    `cMax = (1 << min(bitDepth, 10) − 5) − 1` (Min-clamped to 10 by
+    the spec to keep the offset range bounded). All bins of the
+    TR(`cRiceParam = 0`) prefix are bypass-coded per Table 9-48.
+    bitDepth = 8 → 7; bitDepth = 9 → 15; bitDepth >= 10 → 31.
+  - [`binarization::SAO_OFFSET_SIGN_FL_CMAX`] = 1,
+    [`binarization::SAO_BAND_POSITION_FL_CMAX`] = 31 +
+    [`binarization::SAO_BAND_POSITION_FL_NBITS`] = 5, and
+    [`binarization::SAO_EO_CLASS_FL_CMAX`] = 3 +
+    [`binarization::SAO_EO_CLASS_FL_NBITS`] = 2 — the Table 9-43
+    FL-binarization shapes for the three fully-bypass elements
+    (`sao_offset_sign`, `sao_band_position`, `sao_eo_class_{luma,
+    chroma}`).
+- Eleven new binarization tests cover the SAO row (269 → 280
+  total): merge-flag ctxInc identity + FL cMax = 1; type-idx
+  bin-0 ctxInc + TR cMax = 2; offset-sign FL cMax = 1;
+  band-position FL cMax = 31 + 5-bit consistency; eo-class FL
+  cMax = 3 + 2-bit consistency; offset-abs cMax derivation at
+  8-bit (7), 9-bit (15), 10-bit (31), and the Min-clamp behaviour
+  at 11/12/16-bit (all 31); offset-abs monotonicity in bitDepth.
+
 ### Added — clean-room rebuild round 29 (2026-06-03)
 
 - §7.3.2.2.1 SPS extension-flag block now decodes typed: when
