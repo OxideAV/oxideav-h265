@@ -1460,7 +1460,7 @@ mod tests {
         assert!(sps.long_term_ref_pics.is_empty());
         assert!(sps.sps_temporal_mvp_enabled_flag);
         assert!(sps.strong_intra_smoothing_enabled_flag);
-        // The fixture's libx265 encode signals a §E.2.1 VUI body. It
+        // The fixture's x265 CLI encode signals a §E.2.1 VUI body. It
         // decodes to a square (1:1) sample aspect ratio, an
         // unspecified-but-present video_signal_type, and a timing-info
         // block of vui_num_units_in_tick = 1 / vui_time_scale = 25

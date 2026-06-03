@@ -689,7 +689,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   root; `Error::Vui` variant added.
 - Tests: 18 new `vui` per-field tests plus the SPS-level
   `decodes_vui_then_continues_to_extension_flag` /
-  `decodes_vui_then_captures_extension_tail`; the tiny libx265
+  `decodes_vui_then_captures_extension_tail`; the tiny x265-encoded
   fixture test now asserts the decoded VUI (1:1 SAR, video_format 5,
   1/25 timing) instead of an opaque tail. Test count 130 → 146.
 
@@ -1112,7 +1112,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   slice tests use hand-assembled bit vectors instead of asserting the
   fixture slice's exact fields. Recommend the docs collaborator
   regenerate the tiny fixture's trace (or confirm the SPS↔slice
-  mismatch is an x265-encoder/instrumentation artefact).
+  mismatch is a validator/instrumentation artefact in the source fixture).
 
 ### Added — clean-room rebuild round 5 (2026-05-24)
 

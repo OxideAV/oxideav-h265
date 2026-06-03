@@ -582,7 +582,7 @@ data and CABAC remain unimplemented.
   the §E.3.1 `min_spatial_segmentation_idc` 0..=4095,
   `max_bytes_per_pic_denom` / `max_bits_per_min_cu_denom` 0..=16, and
   `log2_max_mv_length_{horizontal,vertical}` 0..=15 range-checks).
-  Validated against the libx265 tiny-fixture VUI (1:1 SAR, 25 fps
+  Validated against the x265-produced tiny-fixture VUI (1:1 SAR, 25 fps
   timing).
 * §7.3.2.2 [`SeqParameterSet`] — `sps_video_parameter_set_id`,
   `sps_max_sub_layers_minus1` / `sps_temporal_id_nesting_flag`, the
