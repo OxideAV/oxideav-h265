@@ -150,6 +150,40 @@
 //!   Implemented as [`SAO_OFFSET_SIGN_FL_CMAX`],
 //!   [`SAO_BAND_POSITION_FL_CMAX`] + [`SAO_BAND_POSITION_FL_NBITS`],
 //!   and [`SAO_EO_CLASS_FL_CMAX`] + [`SAO_EO_CLASS_FL_NBITS`].
+//!
+//! Round 31 extends the surface with the two §9.3.4.2.6 /
+//! §9.3.4.2.7 derivations whose `ctxInc` carries *persistent*
+//! per-transform-block state across sub-block invocations: the
+//! greater-than-1 / greater-than-2 absolute-level flags. Both
+//! elements are FL binarized with `cMax = 1` (one context-coded
+//! bin) per Table 9-43, but the bin's ctxInc is driven by a small
+//! sub-block-scoped state machine (`ctxSet`, `greater1Ctx`,
+//! `lastGreater1Ctx`, `lastGreater1Flag`) that the residual-coding
+//! loop threads from sub-block to sub-block within the same
+//! transform block.
+//!
+//! * **`coeff_abs_level_greater1_flag[ n ]`** (H.265 §7.3.8.11,
+//!   §7.4.9.11) — §9.3.4.2.6, equations 9-56..9-60. The per-bin
+//!   `ctxInc = (ctxSet * 4) + min(3, greater1Ctx)` for luma; chroma
+//!   adds `+16`. `ctxSet` is initialised at the start of each
+//!   sub-block from the previous sub-block's terminal `greater1Ctx`
+//!   value, and rotates within `{0, 1, 2, 3}` per the spec's
+//!   `lastGreater1Ctx == 0` increment rule. Implemented as a
+//!   pure-functional state machine in [`Greater1State`] (the
+//!   walker the slice-data parser carries across the residual
+//!   sub-blocks of one transform block) plus the per-flag step
+//!   functions [`Greater1State::on_subblock_entry`] +
+//!   [`Greater1State::on_coeff_abs_level_greater1_flag`].
+//!
+//! * **`coeff_abs_level_greater2_flag[ lastGreater1ScanPos ]`**
+//!   (H.265 §7.3.8.11, §7.4.9.11) — §9.3.4.2.7, equations
+//!   9-61..9-62. `ctxInc = ctxSet` (luma) / `ctxInc = ctxSet + 4`
+//!   (chroma). The element is signalled at most once per sub-block
+//!   at the first scan position that took the greater-1 escape
+//!   (`lastGreater1ScanPos`). Implemented in
+//!   [`coeff_abs_level_greater2_flag_ctx_inc`], reading the
+//!   `ctxSet` value the §9.3.4.2.6 walker has already produced for
+//!   that same sub-block.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -965,6 +999,247 @@ pub fn sao_offset_abs_tr_cmax(bit_depth: u32) -> u32 {
     (1u32 << (clamped - 5)) - 1
 }
 
+// ---------------------------------------------------------------------
+// coeff_abs_level_greater1_flag / coeff_abs_level_greater2_flag
+// — §9.3.4.2.6 (equations 9-56..9-60) and §9.3.4.2.7 (equations
+// 9-61..9-62). Both elements are Table 9-43 FL with cMax = 1, so the
+// binarization shape is one context-coded bin. The bin's `ctxInc` is
+// driven by a small per-transform-block state machine that threads
+// `ctxSet` / `greater1Ctx` from sub-block to sub-block.
+// ---------------------------------------------------------------------
+
+/// Persistent §9.3.4.2.6 state machine carried across the residual
+/// sub-blocks of a single transform block. The slice-data parser
+/// constructs one [`Greater1State`] per transform block and threads it
+/// through the §7.3.8.11 sub-block loop, calling
+/// [`Greater1State::on_subblock_entry`] before the sub-block's first
+/// `coeff_abs_level_greater1_flag` bin and
+/// [`Greater1State::on_coeff_abs_level_greater1_flag`] after each
+/// decoded bin's value lands.
+///
+/// The machine is the §9.3.4.2.6 equations encoded as a tiny FSM:
+///
+/// * Equations 9-56 / 9-57 initialise `ctxSet` for each sub-block
+///   based on the sub-block scan index `i` and the colour-component
+///   index `cIdx`.
+/// * The §9.3.4.2.6 `lastGreater1Ctx == 0` step (the spec's
+///   "increment `ctxSet` by one") routes the sub-block into the
+///   *next* context set whenever the previous sub-block ran out of
+///   the `greater1Ctx ∈ {1, 2, 3}` band.
+/// * Equation 9-59 `ctxInc = (ctxSet * 4) + min(3, greater1Ctx)`
+///   plus the chroma `+16` offset (eq. 9-60) is reported by
+///   [`Greater1State::current_ctx_inc`].
+/// * The post-bin `greater1Ctx` update from §9.3.4.2.6 (the
+///   `lastGreater1Flag == 1` → 0, `lastGreater1Flag == 0` →
+///   increment-clamped-by-3 rule) lives in
+///   [`Greater1State::on_coeff_abs_level_greater1_flag`].
+///
+/// The §9.3.4.2.7 `coeff_abs_level_greater2_flag` derivation reads
+/// the *current* `ctxSet` from this same machine (the per-sub-block
+/// value, not the post-update one) via
+/// [`Greater1State::ctx_set`], so callers compose the
+/// greater-2 invocation after the greater-1 sub-block walk without
+/// any cross-state-machine plumbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Greater1State {
+    /// §9.3.4.2.6 `ctxSet` — the current sub-block's context set in
+    /// `{0, 1, 2, 3}`. Eq. 9-59 multiplies this by 4 to pick the
+    /// per-set base.
+    ctx_set: u32,
+    /// §9.3.4.2.6 `greater1Ctx` — the within-set ctx position in
+    /// `{0, 1, 2, 3}` (clamped at 3 for the `ctxInc` eq. 9-59).
+    /// `0` means the sub-block has run out of the active band and
+    /// the next sub-block's entry will bump `ctxSet`.
+    greater1_ctx: u32,
+    /// Has any sub-block been entered yet in this transform block?
+    /// Used to recognise the "first sub-block" case the spec calls
+    /// out (`lastGreater1Ctx = 1`).
+    seen_any_subblock: bool,
+    /// True iff at least one `coeff_abs_level_greater1_flag` bin has
+    /// been read in *this* sub-block; signals that the next entry's
+    /// `lastGreater1Ctx == 0` check has a well-defined
+    /// `lastGreater1Flag` value to consume.
+    has_last_greater1_flag: bool,
+}
+
+impl Greater1State {
+    /// Construct a fresh state machine at the start of a transform
+    /// block. No sub-block has yet been entered;
+    /// [`on_subblock_entry`](Self::on_subblock_entry) must be called
+    /// before [`current_ctx_inc`](Self::current_ctx_inc) is
+    /// meaningful.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ctx_set: 0,
+            greater1_ctx: 1,
+            seen_any_subblock: false,
+            has_last_greater1_flag: false,
+        }
+    }
+
+    /// §9.3.4.2.6 sub-block entry: invoked once per sub-block before
+    /// the first `coeff_abs_level_greater1_flag` bin is decoded.
+    ///
+    /// * `i` — the §7.3.8.11 sub-block scan index inside the
+    ///   transform block.
+    /// * `is_chroma` — `true` for `cIdx > 0`, used by eq. 9-56 to
+    ///   force `ctxSet = 0` on every chroma sub-block.
+    /// * `last_greater1_flag` — the most-recently decoded
+    ///   `coeff_abs_level_greater1_flag` value from the *previous*
+    ///   sub-block (0 or 1); ignored when this is the first
+    ///   sub-block being entered (the spec's "first invocation"
+    ///   branch sets `lastGreater1Ctx = 1` unconditionally).
+    ///
+    /// Implements equations 9-56, 9-57, and 9-58. After this call
+    /// returns, [`current_ctx_inc`](Self::current_ctx_inc) yields
+    /// the eq.-9-59 `ctxInc` for the sub-block's first bin.
+    pub fn on_subblock_entry(&mut self, i: u32, is_chroma: bool, last_greater1_flag: u8) {
+        // Eq. 9-56 / 9-57: initialise ctxSet from (i, cIdx).
+        self.ctx_set = if i == 0 || is_chroma { 0 } else { 2 };
+
+        // §9.3.4.2.6 lastGreater1Ctx derivation. The spec branches
+        // on "first invocation" vs not:
+        //   * First sub-block in this transform block:
+        //     lastGreater1Ctx = 1. The ctxSet increment in eq. 9-58
+        //     never triggers (lastGreater1Ctx > 0).
+        //   * Subsequent sub-block, prior sub-block decoded at
+        //     least one greater1 bin: lastGreater1Ctx is the prior
+        //     sub-block's terminal greater1Ctx, then mutated by the
+        //     prior sub-block's lastGreater1Flag per the spec
+        //     bullets.
+        // The walker tracks the prior sub-block's terminal
+        // greater1Ctx as self.greater1_ctx (updated by the per-bin
+        // step in on_coeff_abs_level_greater1_flag). We replay the
+        // spec's lastGreater1Ctx mutation here, then the eq. 9-58
+        // bump condition is `lastGreater1Ctx == 0`.
+        let last_greater1_ctx = if !self.seen_any_subblock {
+            // First sub-block: spec sets lastGreater1Ctx = 1.
+            1
+        } else if !self.has_last_greater1_flag {
+            // Prior sub-block existed but decoded zero greater1
+            // bins (rare: the sub-block had only sig coeffs equal
+            // to 1 — i.e. no bin reached this code path). In that
+            // case the spec's "When lastGreater1Ctx is greater than
+            // 0, the variable lastGreater1Flag is set equal to ..."
+            // branch is skipped and lastGreater1Ctx retains the
+            // prior sub-block's value directly.
+            self.greater1_ctx
+        } else {
+            // Apply the spec's lastGreater1Ctx mutation: if the
+            // prior sub-block's lastGreater1Flag was 1 the ctx
+            // resets to 0; otherwise it advances by 1.
+            if self.greater1_ctx == 0 {
+                // No mutation: the "When lastGreater1Ctx > 0"
+                // guard skips the body entirely.
+                0
+            } else if last_greater1_flag != 0 {
+                0
+            } else {
+                self.greater1_ctx + 1
+            }
+        };
+
+        // Eq. 9-58: bump ctxSet whenever the just-derived
+        // lastGreater1Ctx is 0.
+        if last_greater1_ctx == 0 {
+            self.ctx_set += 1;
+        }
+
+        // Start-of-sub-block reset of the within-set ctx: §9.3.4.2.6
+        // says "greater1Ctx is set equal to 1".
+        self.greater1_ctx = 1;
+        self.seen_any_subblock = true;
+        self.has_last_greater1_flag = false;
+    }
+
+    /// §9.3.4.2.6 per-bin step: invoked *after* every
+    /// `coeff_abs_level_greater1_flag` bin in the current sub-block
+    /// is decoded. Updates `greater1Ctx` per the spec's
+    /// "lastGreater1Flag = 1 → 0 / = 0 → increment" rule, clamped to
+    /// `0..=3` by eq. 9-59's `min(3, greater1Ctx)` (the underlying
+    /// counter is implicitly clamped at 3 because eq. 9-59 truncates
+    /// any further growth).
+    ///
+    /// Note: the §9.3.4.2.6 spec keeps `greater1Ctx` unclamped
+    /// internally (it grows past 3) but eq. 9-59 clamps it; this
+    /// implementation tracks the clamped value because the only
+    /// observable property used downstream is whether
+    /// `greater1Ctx == 0` (for the next sub-block's eq.-9-58 bump),
+    /// and the eq. 9-59 reading clamps regardless.
+    pub fn on_coeff_abs_level_greater1_flag(&mut self, decoded_bin: u8) {
+        if self.greater1_ctx > 0 {
+            self.greater1_ctx = if decoded_bin != 0 {
+                0
+            } else {
+                (self.greater1_ctx + 1).min(3)
+            };
+            self.has_last_greater1_flag = true;
+        }
+    }
+
+    /// Eq. 9-59 + eq. 9-60: returns the `coeff_abs_level_greater1_flag`
+    /// `ctxInc` for the *next* bin to be decoded, given this state
+    /// machine's `(ctxSet, greater1Ctx)`.
+    ///
+    /// `is_chroma == true` (cIdx > 0) adds the eq.-9-60 `+ 16`
+    /// offset.
+    #[must_use]
+    pub fn current_ctx_inc(&self, is_chroma: bool) -> u32 {
+        let base = self.ctx_set * 4 + self.greater1_ctx.min(3);
+        if is_chroma {
+            base + 16
+        } else {
+            base
+        }
+    }
+
+    /// Current `ctxSet` value, exported for §9.3.4.2.7
+    /// `coeff_abs_level_greater2_flag` ctxInc derivation (which
+    /// reads the same sub-block's `ctxSet` per eq. 9-61).
+    #[must_use]
+    pub fn ctx_set(&self) -> u32 {
+        self.ctx_set
+    }
+}
+
+impl Default for Greater1State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// §9.3.4.2.7 ctxInc derivation for
+/// `coeff_abs_level_greater2_flag[ lastGreater1ScanPos ]`. The spec
+/// equations are:
+///
+/// ```text
+/// ctxInc = ctxSet                  (9-61)  // luma
+/// ctxInc = ctxSet + 4              (9-62)  // chroma (cIdx > 0)
+/// ```
+///
+/// `ctxSet` is the value derived by §9.3.4.2.6 for the same
+/// sub-block, available from [`Greater1State::ctx_set`].
+///
+/// The element is signalled at most once per sub-block at the first
+/// scan position that took the greater-1 escape; the per-sub-block
+/// `Greater1State` already has the matching `ctxSet` at the time
+/// the residual loop reaches that scan position, so the caller
+/// simply reads it off without further state plumbing.
+#[must_use]
+pub fn coeff_abs_level_greater2_flag_ctx_inc(ctx_set: u32, is_chroma: bool) -> u32 {
+    if is_chroma {
+        ctx_set + 4
+    } else {
+        ctx_set
+    }
+}
+
+/// Table 9-43 binarization shape for `coeff_abs_level_greater1_flag`
+/// and `coeff_abs_level_greater2_flag`: FL with `cMax = 1` (single
+/// context-coded bin per element invocation).
+pub const COEFF_ABS_LEVEL_GREATER_X_FL_CMAX: u32 = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1727,5 +2002,214 @@ mod tests {
             );
             prev = cur;
         }
+    }
+
+    // -------------------------------------------------------------
+    // §9.3.4.2.6 coeff_abs_level_greater1_flag — Greater1State
+    // -------------------------------------------------------------
+
+    #[test]
+    fn greater1_initial_state_is_set_zero_ctx_one() {
+        // Per §9.3.4.2.6, the first sub-block enters with
+        // lastGreater1Ctx = 1 (no eq.-9-58 bump) and greater1Ctx = 1.
+        // Eq. 9-56 forces ctxSet = 0 when i == 0.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        assert_eq!(s.ctx_set, 0);
+        assert_eq!(s.greater1_ctx, 1);
+        // Eq. 9-59 first-bin ctxInc = 0 * 4 + 1 = 1 for luma.
+        assert_eq!(s.current_ctx_inc(false), 1);
+        // Chroma adds +16 per eq. 9-60.
+        assert_eq!(s.current_ctx_inc(true), 17);
+    }
+
+    #[test]
+    fn greater1_eq_9_57_luma_nonzero_subblock_uses_ctx_set_two() {
+        // Eq. 9-57: i > 0 and cIdx == 0 (luma) ⇒ ctxSet starts at 2.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(1, false, 0);
+        assert_eq!(s.ctx_set, 2);
+        // First-bin ctxInc = 2 * 4 + 1 = 9 for luma.
+        assert_eq!(s.current_ctx_inc(false), 9);
+    }
+
+    #[test]
+    fn greater1_eq_9_56_chroma_always_starts_at_zero() {
+        // Eq. 9-56: cIdx > 0 (chroma) ⇒ ctxSet = 0 regardless of i.
+        for i in [0u32, 1, 2, 5, 7] {
+            let mut s = Greater1State::new();
+            s.on_subblock_entry(i, true, 0);
+            assert_eq!(s.ctx_set, 0, "chroma sub-block i={} ctxSet", i);
+            // Chroma first-bin ctxInc = 0 * 4 + 1 + 16 = 17.
+            assert_eq!(s.current_ctx_inc(true), 17);
+        }
+    }
+
+    #[test]
+    fn greater1_per_bin_step_flag_one_resets_ctx_to_zero() {
+        // §9.3.4.2.6: lastGreater1Flag == 1 ⇒ greater1Ctx becomes 0.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(1);
+        assert_eq!(s.greater1_ctx, 0);
+        // Eq. 9-59 next-bin ctxInc = 0 * 4 + min(3, 0) = 0.
+        assert_eq!(s.current_ctx_inc(false), 0);
+    }
+
+    #[test]
+    fn greater1_per_bin_step_flag_zero_increments() {
+        // §9.3.4.2.6: lastGreater1Flag == 0 ⇒ greater1Ctx
+        // incremented (until eq.-9-59 clamps at 3).
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        // 1 → 2 → 3 → 3 (clamped).
+        s.on_coeff_abs_level_greater1_flag(0);
+        assert_eq!(s.greater1_ctx, 2);
+        s.on_coeff_abs_level_greater1_flag(0);
+        assert_eq!(s.greater1_ctx, 3);
+        s.on_coeff_abs_level_greater1_flag(0);
+        assert_eq!(s.greater1_ctx, 3);
+        // Eq. 9-59: 0 * 4 + 3 = 3.
+        assert_eq!(s.current_ctx_inc(false), 3);
+    }
+
+    #[test]
+    fn greater1_per_bin_step_after_reset_stops_advancing() {
+        // §9.3.4.2.6: once greater1Ctx reaches 0 the "When
+        // greater1Ctx > 0" guard skips the update on every later bin
+        // in the same sub-block. The terminal value stays 0.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(1); // → 0
+        s.on_coeff_abs_level_greater1_flag(0); // skipped
+        s.on_coeff_abs_level_greater1_flag(1); // skipped
+        assert_eq!(s.greater1_ctx, 0);
+    }
+
+    #[test]
+    fn greater1_eq_9_58_bumps_ctx_set_when_last_greater1_ctx_zero() {
+        // Sub-block 0: read one flag = 0 → greater1Ctx terminal = 2.
+        // Then enter sub-block 1 with last_greater1_flag = 0:
+        // lastGreater1Ctx = 2 (post-spec mutation) ≠ 0 ⇒ no bump.
+        // But sub-block 1 with i > 0 starts at ctxSet = 2 by eq. 9-57.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(0); // greater1Ctx 1→2
+        s.on_subblock_entry(1, false, 0);
+        // ctxSet starts at 2 per eq. 9-57; no eq.-9-58 bump since
+        // lastGreater1Ctx mutation 2+1=3 ≠ 0.
+        assert_eq!(s.ctx_set, 2);
+    }
+
+    #[test]
+    fn greater1_eq_9_58_bump_triggers_after_flag_one_ladder() {
+        // Sub-block 0: greater1Ctx 1→0 via flag = 1. Then sub-block 1
+        // enters with last_greater1_flag = 1: lastGreater1Ctx is 0
+        // (the spec's "When lastGreater1Ctx > 0" guard skips the
+        // mutation, retaining 0). Eq. 9-58 bumps ctxSet by 1.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(1); // → 0
+        s.on_subblock_entry(1, false, 1);
+        // Eq. 9-57 says ctxSet = 2 (i > 0, luma), then eq. 9-58
+        // bumps by one ⇒ 3.
+        assert_eq!(s.ctx_set, 3);
+        // greater1Ctx resets to 1 per §9.3.4.2.6.
+        assert_eq!(s.greater1_ctx, 1);
+        // Eq. 9-59 first-bin ctxInc = 3 * 4 + 1 = 13.
+        assert_eq!(s.current_ctx_inc(false), 13);
+    }
+
+    #[test]
+    fn greater1_chroma_subblock_with_eq_9_58_bump() {
+        // Chroma sub-block 0: flag = 1 → greater1Ctx 1→0.
+        // Sub-block 1 (chroma) enters with last_greater1_flag = 1
+        // ⇒ eq. 9-56 forces ctxSet = 0, then eq. 9-58 bumps to 1.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, true, 0);
+        s.on_coeff_abs_level_greater1_flag(1);
+        s.on_subblock_entry(1, true, 1);
+        assert_eq!(s.ctx_set, 1);
+        // Chroma ctxInc = 1 * 4 + 1 + 16 = 21.
+        assert_eq!(s.current_ctx_inc(true), 21);
+    }
+
+    #[test]
+    fn greater1_ctx_inc_clamps_at_min_three() {
+        // Eq. 9-59 explicitly takes Min(3, greater1Ctx). The state
+        // machine tracks the clamped value, so synthesising ctxSet=1,
+        // greater1Ctx=3 gives ctxInc = 4 + 3 = 7 for luma; greater1Ctx
+        // can never exceed 3 internally so this is enforced by the
+        // type, not the read path.
+        let mut s = Greater1State::new();
+        // Manually push to (ctxSet=1, greater1Ctx=3) by reading three
+        // greater1=0 bins from the first sub-block (the third hits
+        // the clamp).
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(0); // 1→2
+        s.on_coeff_abs_level_greater1_flag(0); // 2→3
+        s.on_coeff_abs_level_greater1_flag(0); // 3→3 (clamped)
+        assert_eq!(s.greater1_ctx, 3);
+        // Eq. 9-59 = 0*4 + 3 = 3.
+        assert_eq!(s.current_ctx_inc(false), 3);
+        // Chroma adds +16.
+        assert_eq!(s.current_ctx_inc(true), 19);
+    }
+
+    // -------------------------------------------------------------
+    // §9.3.4.2.7 coeff_abs_level_greater2_flag — ctxInc derivation
+    // -------------------------------------------------------------
+
+    #[test]
+    fn greater2_ctx_inc_is_ctx_set_for_luma() {
+        // Eq. 9-61: ctxInc = ctxSet for cIdx == 0.
+        for ctx_set in 0u32..=3 {
+            assert_eq!(
+                coeff_abs_level_greater2_flag_ctx_inc(ctx_set, false),
+                ctx_set,
+                "luma ctxSet={}",
+                ctx_set
+            );
+        }
+    }
+
+    #[test]
+    fn greater2_ctx_inc_chroma_adds_four() {
+        // Eq. 9-62: ctxInc = ctxSet + 4 for cIdx > 0.
+        for ctx_set in 0u32..=3 {
+            assert_eq!(
+                coeff_abs_level_greater2_flag_ctx_inc(ctx_set, true),
+                ctx_set + 4,
+                "chroma ctxSet={}",
+                ctx_set
+            );
+        }
+    }
+
+    #[test]
+    fn greater2_reads_same_ctx_set_as_greater1_machine() {
+        // §9.3.4.2.7 explicitly references the §9.3.4.2.6 ctxSet for
+        // the same sub-block. Walk a small example: luma, sub-block 0,
+        // first greater-1 flag = 1, then the greater-2 flag is read at
+        // the lastGreater1ScanPos in the same sub-block ⇒ ctxSet = 0.
+        let mut s = Greater1State::new();
+        s.on_subblock_entry(0, false, 0);
+        s.on_coeff_abs_level_greater1_flag(1);
+        assert_eq!(s.ctx_set(), 0);
+        assert_eq!(coeff_abs_level_greater2_flag_ctx_inc(s.ctx_set(), false), 0);
+
+        // After the eq.-9-58 bump on entry to sub-block 1 (last
+        // flag = 1), ctxSet = 3 and the greater-2 read picks up 3.
+        s.on_subblock_entry(1, false, 1);
+        assert_eq!(s.ctx_set(), 3);
+        assert_eq!(coeff_abs_level_greater2_flag_ctx_inc(s.ctx_set(), false), 3);
+        assert_eq!(coeff_abs_level_greater2_flag_ctx_inc(s.ctx_set(), true), 7);
+    }
+
+    #[test]
+    fn coeff_abs_level_greater_x_fl_shape_is_one_bin() {
+        // Table 9-43: both flags are FL with cMax = 1 (a single
+        // context-coded bin per invocation).
+        assert_eq!(COEFF_ABS_LEVEL_GREATER_X_FL_CMAX, 1);
     }
 }

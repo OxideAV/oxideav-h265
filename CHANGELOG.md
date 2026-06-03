@@ -6,6 +6,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 31 (2026-06-03)
+
+- §9.3.4.2.6 + §9.3.4.2.7 ctxInc derivations for the absolute-level
+  greater-than-1 / greater-than-2 flags land in the
+  [`binarization`] module. Both elements are Table 9-43 FL with
+  `cMax = 1` (one context-coded bin per invocation), but the bin's
+  `ctxInc` is driven by a small sub-block-scoped state machine
+  (`ctxSet`, `greater1Ctx`, `lastGreater1Ctx`, `lastGreater1Flag`)
+  that the §7.3.8.11 residual loop threads from sub-block to
+  sub-block within the same transform block.
+  - [`binarization::Greater1State`] — the §9.3.4.2.6 walker the
+    slice parser carries across the residual sub-blocks of one
+    transform block. Implements equations 9-56 (`i == 0 || cIdx > 0
+    ⇒ ctxSet = 0`), 9-57 (luma `i > 0 ⇒ ctxSet = 2`), 9-58 (the
+    `lastGreater1Ctx == 0 ⇒ ctxSet += 1` bump after the prior
+    sub-block's greater-1-ladder mutation), and 9-59 (`ctxInc =
+    (ctxSet * 4) + min(3, greater1Ctx)`) + 9-60 (chroma `+ 16`).
+    Public step methods: [`Greater1State::new`],
+    [`Greater1State::on_subblock_entry`] (start-of-sub-block init
+    of `ctxSet` from `(i, is_chroma)` + prior sub-block's
+    `last_greater1_flag`),
+    [`Greater1State::on_coeff_abs_level_greater1_flag`] (per-bin
+    step applying the `lastGreater1Flag = 1 → 0 / = 0 →
+    increment-clamped-by-3` rule),
+    [`Greater1State::current_ctx_inc`] (eq. 9-59 + 9-60 read for
+    the next bin), and [`Greater1State::ctx_set`] (the §9.3.4.2.7
+    read of the same sub-block's `ctxSet`).
+  - [`binarization::coeff_abs_level_greater2_flag_ctx_inc`] —
+    §9.3.4.2.7 eq. 9-61 / 9-62 `ctxInc = ctxSet` for luma /
+    `ctxInc = ctxSet + 4` for chroma. Reads the §9.3.4.2.6 walker's
+    current `ctxSet` (the per-sub-block value, not the post-update
+    one) via [`Greater1State::ctx_set`].
+  - [`binarization::COEFF_ABS_LEVEL_GREATER_X_FL_CMAX`] — Table 9-43
+    binarization shape constant `= 1` (one context-coded bin per
+    invocation of either flag).
+- Total tests now 294 (was 280). 14 new tests cover: the
+  first-sub-block init (eq.-9-56 `i == 0 ⇒ ctxSet = 0`,
+  `greater1Ctx = 1`, luma first-bin `ctxInc = 1` and chroma `+ 16`);
+  eq.-9-57 luma `i > 0 ⇒ ctxSet = 2`; eq.-9-56 chroma always-zero
+  across `i ∈ {0, 1, 2, 5, 7}`; the per-bin step
+  `lastGreater1Flag = 1 ⇒ greater1Ctx = 0` and `= 0 ⇒
+  increment-clamped-at-3`, plus the "once at 0, the guard skips
+  later updates" invariant; eq.-9-58 non-bump path (prior sub-block
+  decoded a `0`-flag, `lastGreater1Ctx` mutates to a positive
+  value, ctxSet stays at eq.-9-57's 2); eq.-9-58 bump path (prior
+  sub-block ended at `greater1Ctx = 0`, `lastGreater1Ctx` stays 0,
+  ctxSet bumps from 2 to 3); chroma `ctxInc + 16` with eq.-9-58
+  bump (chroma starts at 0, bumps to 1, chroma `ctxInc = 1 * 4 + 1
+  + 16 = 21`); the eq.-9-59 `Min(3, …)` clamp; eq.-9-61 luma
+  identity across `ctxSet ∈ {0..=3}`; eq.-9-62 chroma `+ 4` across
+  `ctxSet ∈ {0..=3}`; an end-to-end composition showing
+  `coeff_abs_level_greater2_flag_ctx_inc(s.ctx_set(), …)` reads the
+  same sub-block's ctxSet as the walker holds; and the FL `cMax = 1`
+  shape assertion.
+
 ### Added — clean-room rebuild round 30 (2026-06-03)
 
 - §9.3.4.2 / Table 9-48 + §9.3.3 / Table 9-43 derivations for the

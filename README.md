@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 30 (2026-06-03).** The prior implementation was
+**Clean-room rebuild — round 31 (2026-06-03).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,51 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 30 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 31 extends the
+[`binarization`] module with the two §9.3.4.2.6 / §9.3.4.2.7
+derivations whose `ctxInc` carries persistent per-transform-block
+state across sub-block invocations: the greater-than-1 / greater-than-2
+absolute-level flags. Both are Table 9-43 FL with `cMax = 1` (one
+context-coded bin per invocation), but the bin's `ctxInc` is driven
+by a small sub-block-scoped state machine (`ctxSet`, `greater1Ctx`,
+`lastGreater1Ctx`, `lastGreater1Flag`) that the §7.3.8.11 residual
+loop threads from sub-block to sub-block within the same transform
+block. The new public surface:
+[`binarization::Greater1State`] — the §9.3.4.2.6 walker the slice
+parser carries across the residual sub-blocks of one transform block,
+implementing equations 9-56 (`i == 0 || cIdx > 0 ⇒ ctxSet = 0`),
+9-57 (luma `i > 0 ⇒ ctxSet = 2`), 9-58 (the
+`lastGreater1Ctx == 0 ⇒ ctxSet += 1` bump after the prior sub-block's
+greater-1-ladder mutation), and 9-59 (`ctxInc = (ctxSet * 4) +
+min(3, greater1Ctx)`) + 9-60 (chroma `+ 16`) read via
+[`Greater1State::on_subblock_entry`] / 
+[`Greater1State::on_coeff_abs_level_greater1_flag`] /
+[`Greater1State::current_ctx_inc`]; and
+[`binarization::coeff_abs_level_greater2_flag_ctx_inc`] —
+§9.3.4.2.7 eq. 9-61 / 9-62 `ctxInc = ctxSet` (luma) /
+`ctxInc = ctxSet + 4` (chroma), reading the same sub-block's
+`ctxSet` via [`Greater1State::ctx_set`]. The Table 9-43 binarization
+shape is captured as [`binarization::COEFF_ABS_LEVEL_GREATER_X_FL_CMAX`]
+(= 1). Total tests now 294 (was 280): 14 new tests cover the
+first-sub-block init (eq.-9-56 `i == 0 ⇒ ctxSet = 0`,
+`greater1Ctx = 1`, luma first-bin `ctxInc = 1` and chroma `+ 16`);
+eq.-9-57 luma `i > 0 ⇒ ctxSet = 2`; eq.-9-56 chroma always-zero
+across `i ∈ {0, 1, 2, 5, 7}`; the per-bin step `lastGreater1Flag = 1
+⇒ greater1Ctx = 0` and `= 0 ⇒ increment-clamped-at-3`, plus the
+"once at 0, the guard skips later updates" invariant; eq.-9-58
+non-bump path (prior sub-block decoded a `0`-flag, `lastGreater1Ctx`
+mutates to a positive value, ctxSet stays at eq.-9-57's 2);
+eq.-9-58 bump path (prior sub-block ended at `greater1Ctx = 0`,
+`lastGreater1Ctx` stays 0, ctxSet bumps from 2 to 3); chroma
+`ctxInc + 16` with eq.-9-58 bump (chroma starts at 0, bumps to 1,
+chroma `ctxInc = 1 * 4 + 1 + 16 = 21`); the eq.-9-59 `Min(3, …)`
+clamp; eq.-9-61 luma identity across `ctxSet ∈ {0..=3}`; eq.-9-62
+chroma `+ 4` across `ctxSet ∈ {0..=3}`; an end-to-end composition
+showing `coeff_abs_level_greater2_flag_ctx_inc(s.ctx_set(), …)`
+reads the same sub-block's ctxSet as the walker holds; and the FL
+`cMax = 1` shape assertion.
+
+Round 30 had extended the
 [`binarization`] module with the §9.3.4.2 / Table 9-48 +
 §9.3.3 / Table 9-43 derivations for the §7.3.4 `sao()` per-CTU
 syntax-element family. Every element is either a single context-coded
@@ -1097,11 +1141,15 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   `sao_type_idx_{luma,chroma}`, `sao_offset_abs`, `sao_offset_sign`,
   `sao_band_position`, `sao_eo_class_{luma,chroma}`). Still to land —
   every other §9.3.4.2 syntax element:
-  `sig_coeff_flag` (§9.3.4.2.5), `coeff_abs_level_greater1_flag` /
-  `_greater2_flag` / `coeff_abs_level_remaining` / `coeff_sign_flag`
-  (§9.3.4.2.6 + bypass), prediction-mode / part-mode / merge / merge-idx
+  `sig_coeff_flag` (§9.3.4.2.5; Table 9-50 `ctxIdxMap` requires
+  spec-trace confirmation of the i=15 entry — see "Spec gap" in the
+  round-31 report), `coeff_abs_level_remaining` / `coeff_sign_flag`
+  (bypass; §9.3.3.11), prediction-mode / part-mode / merge / merge-idx
   flags, motion-vector binarization (`mvd_lX[]` EGk +
-  sign), etc. (The §9.3 arithmetic decode engine
+  sign), etc. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
+  (`coeff_abs_level_greater1_flag` + `_greater2_flag`) via
+  [`binarization::Greater1State`] +
+  [`binarization::coeff_abs_level_greater2_flag_ctx_inc`]. (The §9.3 arithmetic decode engine
   itself — DecodeDecision / DecodeBypass / DecodeTerminate / RenormD /
   alignment — is implemented as of round 11; it sits one layer below
   the binarization tables.)
