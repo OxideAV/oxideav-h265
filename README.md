@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 32 (2026-06-04).** The prior implementation was
+**Clean-room rebuild — round 33 (2026-06-04).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,44 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 32 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 33 extends the
+[`binarization`] module with the §9.3.4.2.8 `palette_run_prefix`
+ctxInc derivation — the §7.3.8.13 palette-coding (Annex SCC) syntax
+element that signals the unary part of a palette-run length. The
+derivation is a two-branch dispatch on
+`(copy_above_palette_indices_flag, binIdx)`:
+[`binarization::palette_run_prefix_ctx_inc_eq_9_63`] (eq. 9-63 used
+when `copy_above_palette_indices_flag == 0` and `binIdx == 0` —
+`ctxInc = (palette_idx_idc < 1) ? 0 : ((palette_idx_idc < 3) ? 1 :
+2)`); and [`binarization::PALETTE_RUN_PREFIX_CTX_IDX_MAP`] (Table
+9-51 verbatim — `[u8::MAX, 3, 3, 4, 4]` for `copy_above == 0` (the
+bin-0 cell is the eq.-9-63 dispatch sentinel
+[`binarization::PALETTE_RUN_PREFIX_EQ_9_63_DISPATCH`]) and
+`[5, 6, 6, 7, 7]` for `copy_above == 1`). The public entry point
+[`binarization::palette_run_prefix_ctx_inc`] dispatches both branches
+and returns `Option<u32>` — `None` when `binIdx >=
+PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX = 5`, matching Table 9-51's
+">4" column and Table 9-48's bypass marking. The matching Table 9-43
+binarization shape lands as
+[`binarization::palette_run_prefix_tr_cmax`]
+(`cMax = Floor(Log2(PaletteMaxRunMinus1)) + 1`, `cRiceParam = 0`).
+Total tests now 331 (was 317): 14 new tests cover the eq.-9-63 three
+bands (`palette_idx_idc ∈ {0}`, `∈ {1, 2}`, `>= 3` including the
+`u32::MAX` defensive sweep); the public dispatch agreement with the
+standalone eq.-9-63 helper; Table 9-51 `copy_above == 0`
+`binIdx ∈ {1, 2, 3, 4}` lookup plus the `palette_idx_idc`-irrelevance
+on that branch; Table 9-51 `copy_above == 1`
+`binIdx ∈ {0, 1, 2, 3, 4}` lookup plus `palette_idx_idc`-irrelevance;
+the `binIdx >= 5` bypass boundary anchor; the full `ctxInc ∈ 0..=7`
+range invariant matching the Table 9-40 8-entry init-value table; the
+eq.-9-63 + Table 9-51-row-0 set-disjointness invariant; the
+`PaletteMaxRunMinus1 == 0` degenerate-input handler; TR `cMax`
+anchors at the `Floor(Log2(x)) + 1` boundaries for
+`x ∈ {1, 2, 3, 4, 7, 8, 15, 16, 31, 32}` plus 4095 / 4096 /
+`u32::MAX`; and the `PaletteMaxRunMinus1 → cMax`
+non-decreasing-in-`x` monotonicity invariant.
+
+Round 32 had extended the
 [`binarization`] module with the §9.3.4.2.5 `sig_coeff_flag` ctxInc
 derivation — the per-scan-position significance bin the §7.3.8.11
 residual-coding loop emits before any greater-1 / greater-2 step.

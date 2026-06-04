@@ -223,6 +223,35 @@
 //! see [`sig_coeff_flag_ctx_inc_from_sig_ctx`]. Table 9-43 captures
 //! the `sig_coeff_flag` binarization shape as FL with `cMax = 1` via
 //! [`SIG_COEFF_FLAG_FL_CMAX`].
+//!
+//! Round 33 extends the ctxInc-derivation surface with the
+//! §9.3.4.2.8 `palette_run_prefix` derivation — the §7.3.8.13
+//! palette-coding (SCC) syntax element that signals the unary part
+//! of the run length following a palette index or copy-above
+//! decision. Inputs are the bin index `binIdx`, the per-pixel
+//! `copy_above_palette_indices_flag`, and the `palette_idx_idc`
+//! decoded at the start of the run. The `ctxInc` is:
+//!
+//! * **`copy_above_palette_indices_flag == 0` and `binIdx == 0`**
+//!   (eq. 9-63) — a piecewise function of `palette_idx_idc` in
+//!   `{0, 1, 2}`:
+//!   `ctxInc = (palette_idx_idc < 1) ? 0 : ((palette_idx_idc < 3)
+//!   ? 1 : 2)`. Implemented in
+//!   [`palette_run_prefix_ctx_inc_eq_9_63`].
+//!
+//! * **otherwise** — `ctxInc = ctxIdxMap[copy_above_palette_indices_flag][binIdx]`
+//!   per Table 9-51, captured verbatim in
+//!   [`PALETTE_RUN_PREFIX_CTX_IDX_MAP`]. The `binIdx >= 5` cells of
+//!   Table 9-51 are bypass-coded per Table 9-48, so the lookup
+//!   covers `binIdx ∈ {0, 1, 2, 3, 4}` and the public entry point
+//!   [`palette_run_prefix_ctx_inc`] dispatches both branches with
+//!   an `Option<u32>` return (`None` ⇒ bypass).
+//!
+//! Round 33 also captures the matching Table 9-43 binarization
+//! shape: `palette_run_prefix` is a TR with
+//! `cMax = Floor(Log2(PaletteMaxRunMinus1)) + 1` and `cRiceParam = 0`;
+//! the helper [`palette_run_prefix_tr_cmax`] returns the per-block
+//! `cMax` from the `PaletteMaxRunMinus1` input.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1501,6 +1530,134 @@ pub fn sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx: u32, is_chroma: bool) -> u32
 /// Table 9-43 binarization shape for `sig_coeff_flag`: FL with
 /// `cMax = 1` (single context-coded bin per scan position).
 pub const SIG_COEFF_FLAG_FL_CMAX: u32 = 1;
+
+// ---------------------------------------------------------------------
+// palette_run_prefix ctxInc — §9.3.4.2.8 (equation 9-63, Table 9-51)
+// ---------------------------------------------------------------------
+
+/// §9.3.4.2.8 Table 9-51 — the `ctxIdxMap[ ][ ]` lookup that maps
+/// `(copy_above_palette_indices_flag, binIdx)` to `ctxInc` for the
+/// non-eq.-9-63 branch of the §9.3.4.2.8 derivation. The table is a
+/// 2 × 5 fixed permutation listed verbatim in Table 9-51 of the spec;
+/// the `binIdx >= 5` columns are bypass-coded per Table 9-48 and
+/// therefore omitted here.
+///
+/// Layout: `PALETTE_RUN_PREFIX_CTX_IDX_MAP[copy_above_flag][binIdx]`,
+/// with `copy_above_flag ∈ {0, 1}` and `binIdx ∈ {0, 1, 2, 3, 4}`.
+///
+/// The `copy_above_flag == 0, binIdx == 0` cell is spec-listed as
+/// `"0, 1, 2"` (i.e. dispatched to eq. 9-63 on `palette_idx_idc`).
+/// This module surfaces that branch separately as
+/// [`palette_run_prefix_ctx_inc_eq_9_63`], so the table entry is held
+/// as `u8::MAX` to mark "must dispatch to eq. 9-63" defensively (the
+/// public [`palette_run_prefix_ctx_inc`] handles the branch).
+pub const PALETTE_RUN_PREFIX_CTX_IDX_MAP: [[u8; 5]; 2] = [
+    // copy_above_palette_indices_flag == 0: bin 0 dispatches to eq.
+    // 9-63 (sentinel); bins 1..=4 are 3, 3, 4, 4.
+    [u8::MAX, 3, 3, 4, 4],
+    // copy_above_palette_indices_flag == 1: 5, 6, 6, 7, 7.
+    [5, 6, 6, 7, 7],
+];
+
+/// Sentinel marking the eq.-9-63 dispatch cell in
+/// [`PALETTE_RUN_PREFIX_CTX_IDX_MAP`].
+pub const PALETTE_RUN_PREFIX_EQ_9_63_DISPATCH: u8 = u8::MAX;
+
+/// §9.3.4.2.8 first `binIdx >= 5` index at which Table 9-51 declares
+/// `palette_run_prefix` bypass-coded. Equivalent to the TR prefix
+/// `cMax = 5` boundary above which §9.3.4.2.8 stops emitting ctxInc
+/// values.
+pub const PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX: u32 = 5;
+
+/// §9.3.4.2.8 equation 9-63 — the eq.-9-63 dispatch when
+/// `copy_above_palette_indices_flag == 0` and `binIdx == 0`:
+///
+/// ```text
+/// ctxInc = ( palette_idx_idc < 1 ) ? 0
+///        : ( ( palette_idx_idc < 3 ) ? 1 : 2 )            (9-63)
+/// ```
+///
+/// Returns `ctxInc ∈ {0, 1, 2}`.
+#[must_use]
+pub fn palette_run_prefix_ctx_inc_eq_9_63(palette_idx_idc: u32) -> u32 {
+    if palette_idx_idc < 1 {
+        0
+    } else if palette_idx_idc < 3 {
+        1
+    } else {
+        2
+    }
+}
+
+/// §9.3.4.2.8 — full `palette_run_prefix` ctxInc derivation.
+///
+/// Inputs:
+///
+/// * `bin_idx` — the §9.3.3.10 TR-prefix bin index (0-based).
+/// * `copy_above_palette_indices_flag` — the §7.4.9.6 palette flag
+///   that selects "copy-above" vs explicit-index palette mode for
+///   this run.
+/// * `palette_idx_idc` — the palette index decoded at the start of
+///   the run; only consulted on the eq.-9-63 branch.
+///
+/// Returns:
+///
+/// * `Some(ctxInc)` — when the bin is context-coded. The eq.-9-63
+///   branch returns `{0, 1, 2}`; otherwise the value is read from
+///   [`PALETTE_RUN_PREFIX_CTX_IDX_MAP`].
+/// * `None` — when `bin_idx >= 5`, the Table 9-51 ">4" column,
+///   signalling that the bin is bypass-coded per Table 9-48 and the
+///   caller must invoke the engine's bypass path.
+#[must_use]
+pub fn palette_run_prefix_ctx_inc(
+    bin_idx: u32,
+    copy_above_palette_indices_flag: bool,
+    palette_idx_idc: u32,
+) -> Option<u32> {
+    if bin_idx >= PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX {
+        return None;
+    }
+    if !copy_above_palette_indices_flag && bin_idx == 0 {
+        // §9.3.4.2.8 first bullet — dispatch to eq. 9-63.
+        return Some(palette_run_prefix_ctx_inc_eq_9_63(palette_idx_idc));
+    }
+    // Otherwise: Table 9-51 lookup.
+    let row = usize::from(copy_above_palette_indices_flag);
+    let col = bin_idx as usize;
+    let v = PALETTE_RUN_PREFIX_CTX_IDX_MAP[row][col];
+    debug_assert!(
+        v != PALETTE_RUN_PREFIX_EQ_9_63_DISPATCH,
+        "palette_run_prefix Table 9-51: the eq.-9-63 dispatch cell is \
+         already handled above; reaching the lookup with the sentinel \
+         indicates a derivation bug"
+    );
+    Some(u32::from(v))
+}
+
+/// Table 9-43 binarization shape `cMax` for `palette_run_prefix`:
+///
+/// ```text
+/// cMax = Floor( Log2( PaletteMaxRunMinus1 ) ) + 1
+/// cRiceParam = 0
+/// ```
+///
+/// `PaletteMaxRunMinus1` is the §7.4.9.6 per-CU palette-run cap (one
+/// less than the maximum allowed run length). When
+/// `PaletteMaxRunMinus1 == 0` the TR prefix is degenerate (a single
+/// terminating bin); the helper returns `1` in that case so callers
+/// can still emit a one-bin TR prefix.
+#[must_use]
+pub fn palette_run_prefix_tr_cmax(palette_max_run_minus1: u32) -> u32 {
+    if palette_max_run_minus1 == 0 {
+        // Floor(Log2(0)) is undefined; the spec's TR-prefix shape
+        // collapses to a single-bin terminator in this degenerate
+        // case. Returning 1 keeps the TR reader well-defined.
+        return 1;
+    }
+    // Floor(Log2(x)) for x > 0 == 31 - leading_zeros(x).
+    let floor_log2 = 31 - palette_max_run_minus1.leading_zeros();
+    floor_log2 + 1
+}
 
 #[cfg(test)]
 mod tests {
@@ -2787,5 +2944,196 @@ mod tests {
         // sig_coeff_flag_sig_ctx_dc. ctxInc = 27 + 12 = 39.
         let sig_dc = sig_coeff_flag_sig_ctx_dc(true, 4, 0);
         assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig_dc, true), 39);
+    }
+
+    // -----------------------------------------------------------------
+    // §9.3.4.2.8 palette_run_prefix — eq. 9-63 + Table 9-51
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn palette_run_prefix_eq_9_63_low_idx() {
+        // Eq. 9-63: palette_idx_idc < 1 ⇒ ctxInc = 0.
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(0), 0);
+    }
+
+    #[test]
+    fn palette_run_prefix_eq_9_63_mid_idx() {
+        // Eq. 9-63: 1 <= palette_idx_idc < 3 ⇒ ctxInc = 1.
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(1), 1);
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(2), 1);
+    }
+
+    #[test]
+    fn palette_run_prefix_eq_9_63_high_idx() {
+        // Eq. 9-63: palette_idx_idc >= 3 ⇒ ctxInc = 2.
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(3), 2);
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(4), 2);
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(100), 2);
+        assert_eq!(palette_run_prefix_ctx_inc_eq_9_63(u32::MAX), 2);
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_copy_above_zero_bin_zero_dispatches_eq_9_63() {
+        // copy_above == 0 and bin_idx == 0 ⇒ eq. 9-63 dispatch on
+        // palette_idx_idc. Verify the public entry point agrees with the
+        // standalone eq.-9-63 helper across the three eq.-9-63 bands.
+        for idc in [0u32, 1, 2, 3, 7] {
+            let expected = Some(palette_run_prefix_ctx_inc_eq_9_63(idc));
+            assert_eq!(
+                palette_run_prefix_ctx_inc(0, false, idc),
+                expected,
+                "palette_idx_idc = {idc}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_copy_above_zero_bins_one_through_four_table_9_51() {
+        // Table 9-51, copy_above_palette_indices_flag == 0:
+        //   binIdx 1 → 3, binIdx 2 → 3, binIdx 3 → 4, binIdx 4 → 4.
+        // palette_idx_idc is irrelevant on this branch.
+        assert_eq!(palette_run_prefix_ctx_inc(1, false, 0), Some(3));
+        assert_eq!(palette_run_prefix_ctx_inc(2, false, 0), Some(3));
+        assert_eq!(palette_run_prefix_ctx_inc(3, false, 0), Some(4));
+        assert_eq!(palette_run_prefix_ctx_inc(4, false, 0), Some(4));
+        // palette_idx_idc swept high/low must produce identical results
+        // on this branch (Table 9-51 only consults binIdx when
+        // copy_above == 0 and binIdx > 0).
+        assert_eq!(palette_run_prefix_ctx_inc(1, false, 42), Some(3));
+        assert_eq!(palette_run_prefix_ctx_inc(4, false, u32::MAX), Some(4));
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_copy_above_one_table_9_51() {
+        // Table 9-51, copy_above_palette_indices_flag == 1:
+        //   binIdx 0 → 5, binIdx 1 → 6, binIdx 2 → 6,
+        //   binIdx 3 → 7, binIdx 4 → 7.
+        assert_eq!(palette_run_prefix_ctx_inc(0, true, 0), Some(5));
+        assert_eq!(palette_run_prefix_ctx_inc(1, true, 0), Some(6));
+        assert_eq!(palette_run_prefix_ctx_inc(2, true, 0), Some(6));
+        assert_eq!(palette_run_prefix_ctx_inc(3, true, 0), Some(7));
+        assert_eq!(palette_run_prefix_ctx_inc(4, true, 0), Some(7));
+        // palette_idx_idc has no influence on this branch.
+        assert_eq!(palette_run_prefix_ctx_inc(0, true, 99), Some(5));
+        assert_eq!(palette_run_prefix_ctx_inc(2, true, u32::MAX), Some(6));
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_bypass_above_four() {
+        // Table 9-51 ">4" column: bypass-coded per Table 9-48.
+        for bin_idx in 5..=20 {
+            assert_eq!(palette_run_prefix_ctx_inc(bin_idx, false, 0), None);
+            assert_eq!(palette_run_prefix_ctx_inc(bin_idx, true, 0), None);
+        }
+        // First-bypass boundary anchor.
+        assert_eq!(PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX, 5);
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_idx_map_layout_matches_table_9_51() {
+        // Verify the static table layout matches Table 9-51 verbatim
+        // (modulo the eq.-9-63 dispatch sentinel at row 0, col 0).
+        assert_eq!(
+            PALETTE_RUN_PREFIX_CTX_IDX_MAP[0],
+            [PALETTE_RUN_PREFIX_EQ_9_63_DISPATCH, 3, 3, 4, 4]
+        );
+        assert_eq!(PALETTE_RUN_PREFIX_CTX_IDX_MAP[1], [5, 6, 6, 7, 7]);
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_max_eight_distinct_contexts() {
+        // Table 9-40 declares 8 init values per init type (ctxIdx
+        // 0..7). Verify the eq.-9-63 dispatch + Table 9-51 lookup
+        // produce only values in 0..=7.
+        for copy_above in [false, true] {
+            for bin_idx in 0..PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX {
+                for idc in 0..=8 {
+                    let ctx = palette_run_prefix_ctx_inc(bin_idx, copy_above, idc)
+                        .expect("all bin_idx < first-bypass should be context-coded");
+                    assert!(
+                        ctx < 8,
+                        "ctxInc = {ctx} >= 8 for bin_idx = {bin_idx}, \
+                         copy_above = {copy_above}, palette_idx_idc = {idc}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn palette_run_prefix_tr_cmax_degenerate_zero() {
+        // PaletteMaxRunMinus1 == 0 ⇒ Floor(Log2(0)) is undefined; the
+        // helper returns 1 so the TR reader emits a single
+        // terminating bin.
+        assert_eq!(palette_run_prefix_tr_cmax(0), 1);
+    }
+
+    #[test]
+    fn palette_run_prefix_tr_cmax_power_of_two_anchors() {
+        // Floor(Log2(x)) + 1 for x = 1, 2, 3, 4, 7, 8, 15, 16, 31, 32.
+        // x = 1 → Floor(Log2(1)) + 1 = 0 + 1 = 1.
+        assert_eq!(palette_run_prefix_tr_cmax(1), 1);
+        // x = 2 → 1 + 1 = 2.
+        assert_eq!(palette_run_prefix_tr_cmax(2), 2);
+        // x = 3 → 1 + 1 = 2.
+        assert_eq!(palette_run_prefix_tr_cmax(3), 2);
+        // x = 4 → 2 + 1 = 3.
+        assert_eq!(palette_run_prefix_tr_cmax(4), 3);
+        // x = 7 → 2 + 1 = 3.
+        assert_eq!(palette_run_prefix_tr_cmax(7), 3);
+        // x = 8 → 3 + 1 = 4.
+        assert_eq!(palette_run_prefix_tr_cmax(8), 4);
+        // x = 15 → 3 + 1 = 4.
+        assert_eq!(palette_run_prefix_tr_cmax(15), 4);
+        // x = 16 → 4 + 1 = 5.
+        assert_eq!(palette_run_prefix_tr_cmax(16), 5);
+        // x = 31 → 4 + 1 = 5.
+        assert_eq!(palette_run_prefix_tr_cmax(31), 5);
+        // x = 32 → 5 + 1 = 6.
+        assert_eq!(palette_run_prefix_tr_cmax(32), 6);
+    }
+
+    #[test]
+    fn palette_run_prefix_tr_cmax_max_block_sizes() {
+        // Largest plausible PaletteMaxRunMinus1 values (a 64×64 CU
+        // with all pixels in a single run: 4095, plus the absolute
+        // u32::MAX defensive sweep).
+        // 4095 → Floor(Log2(4095)) + 1 = 11 + 1 = 12.
+        assert_eq!(palette_run_prefix_tr_cmax(4095), 12);
+        // 4096 → Floor(Log2(4096)) + 1 = 12 + 1 = 13.
+        assert_eq!(palette_run_prefix_tr_cmax(4096), 13);
+        // u32::MAX → 31 + 1 = 32.
+        assert_eq!(palette_run_prefix_tr_cmax(u32::MAX), 32);
+    }
+
+    #[test]
+    fn palette_run_prefix_tr_cmax_monotone_nondecreasing() {
+        // PaletteMaxRunMinus1 → cMax is non-decreasing for x >= 1.
+        let mut prev = palette_run_prefix_tr_cmax(1);
+        for x in 2..=64 {
+            let cur = palette_run_prefix_tr_cmax(x);
+            assert!(cur >= prev, "cMax({x}) = {cur} < cMax({}) = {prev}", x - 1);
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn palette_run_prefix_ctx_inc_eq_9_63_full_coverage_with_table_9_51_disjoint() {
+        // Sanity invariant: when copy_above == 0 and bin_idx == 0 the
+        // ctxInc is in {0, 1, 2} (eq. 9-63 range), and the
+        // Table 9-51 lookup row 0 entries (bin_idx 1..=4) are in
+        // {3, 4}. The two value sets are disjoint and together cover
+        // {0, 1, 2, 3, 4} — the spec's ctxIdx assignment for the
+        // copy_above == 0 case.
+        let bin0_ctxs: std::collections::BTreeSet<u32> =
+            (0..=4).map(palette_run_prefix_ctx_inc_eq_9_63).collect();
+        assert_eq!(bin0_ctxs, [0u32, 1, 2].into_iter().collect());
+        let tail_ctxs: std::collections::BTreeSet<u32> = (1
+            ..PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX)
+            .map(|bi| palette_run_prefix_ctx_inc(bi, false, 0).unwrap())
+            .collect();
+        assert_eq!(tail_ctxs, [3u32, 4].into_iter().collect());
+        // No overlap.
+        assert!(bin0_ctxs.is_disjoint(&tail_ctxs));
     }
 }

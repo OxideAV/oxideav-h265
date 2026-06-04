@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 33 (2026-06-04)
+
+- §9.3.4.2.8 `palette_run_prefix` ctxInc derivation lands in the
+  [`binarization`] module. The §7.3.8.13 palette-coding (SCC) syntax
+  element that signals the unary part of a palette-run length now
+  has its `ctxInc` mapped via two cases:
+  - [`binarization::palette_run_prefix_ctx_inc_eq_9_63`] — eq. 9-63
+    branch (`copy_above_palette_indices_flag == 0 && binIdx == 0`):
+    `ctxInc = (palette_idx_idc < 1) ? 0 : ((palette_idx_idc < 3) ?
+    1 : 2)`. Returns `{0, 1, 2}`.
+  - [`binarization::PALETTE_RUN_PREFIX_CTX_IDX_MAP`] — Table 9-51
+    `ctxIdxMap[copy_above_palette_indices_flag][binIdx]` verbatim
+    for `binIdx ∈ {1, 2, 3, 4}` when `copy_above == 0` (`3, 3, 4, 4`)
+    and for `binIdx ∈ {0..=4}` when `copy_above == 1` (`5, 6, 6, 7,
+    7`). The `copy_above == 0, binIdx == 0` cell is held as the
+    sentinel [`binarization::PALETTE_RUN_PREFIX_EQ_9_63_DISPATCH`]
+    because that cell dispatches to eq. 9-63 above.
+  - [`binarization::palette_run_prefix_ctx_inc`] — the public entry
+    point that dispatches both branches and returns
+    `Option<u32>` (`None` ⇒ bypass, signalled when `binIdx >=
+    PALETTE_RUN_PREFIX_FIRST_BYPASS_BIN_IDX = 5` per Table 9-51's
+    ">4" column and Table 9-48).
+- §9.3.3 / Table 9-43 `palette_run_prefix` binarization shape lands
+  as [`binarization::palette_run_prefix_tr_cmax`]
+  (`cMax = Floor(Log2(PaletteMaxRunMinus1)) + 1`, `cRiceParam = 0`;
+  the degenerate `PaletteMaxRunMinus1 == 0` input collapses to a
+  single-bin TR terminator).
+- Test count: 317 → 331 (+14 new `palette_run_prefix` tests covering
+  the eq.-9-63 three bands, both copy-above branches of Table 9-51,
+  the ">4" bypass boundary, the `ctxInc ∈ 0..=7` Table 9-40
+  context-bank invariant, the `palette_idx_idc`-irrelevance of the
+  non-eq.-9-63 branch, the eq.-9-63 / Table 9-51 disjointness
+  invariant, plus TR `cMax` anchors at the
+  `Floor(Log2(x)) + 1` power-of-two boundaries up to `u32::MAX` and
+  monotonicity in `PaletteMaxRunMinus1`).
+
 ### Added — clean-room rebuild round 32 (2026-06-04)
 
 - §9.3.4.2.5 `sig_coeff_flag` ctxInc derivation lands in the
