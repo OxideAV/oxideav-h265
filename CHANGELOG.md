@@ -6,6 +6,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 34 (2026-06-05)
+
+- §9.3.3.11 `coeff_abs_level_remaining[ n ]` Rice-adaptive
+  binarization + bypass decode primitive lands in the
+  [`binarization`] module (non-persistent path:
+  `persistent_rice_adaptation_enabled_flag == 0`,
+  `extended_precision_processing_flag == 0`):
+  - [`binarization::coeff_abs_level_remaining_c_rice_param_eq_9_24`]
+    — eq. 9-24, the per-coefficient `cRiceParam` adaptation:
+    `Min(cLastRiceParam + (cLastAbsLevel > (3 << cLastRiceParam)
+    ? 1 : 0), 4)`.
+  - [`binarization::coeff_abs_level_remaining_c_max_eq_9_26`] —
+    eq. 9-26, `cMax = 4 << cRiceParam`.
+  - [`binarization::coeff_abs_level_remaining_prefix_val_eq_9_27`]
+    — eq. 9-27, `prefixVal = Min(cMax, level)`.
+  - [`binarization::coeff_abs_level_remaining_suffix_val_eq_9_28`]
+    — eq. 9-28, `suffixVal = level − cMax`.
+  - [`binarization::COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN`]
+    — the §9.3.3.2 TR-prefix length, constant 4 once eq. 9-26 is
+    substituted.
+  - [`binarization::decode_coeff_abs_level_remaining`] — the
+    end-to-end driver that runs against the §9.3.4.3.4
+    `CabacEngine` bypass stream.
+  - [`binarization::decode_coeff_abs_level_remaining_with`] — the
+    bin-source-driven core (the algorithm logic factored from the
+    engine wrapper) so the §9.3.3.11 derivation can be exercised
+    with a flat bin queue.
+- §9.3.3.3 EGk decoder helper generalised to arbitrary `k`; the
+  former `decode_eg_k0` is preserved as a named alias for the
+  `cu_qp_delta_abs` / `palette_escape_val` `k = 0` callers.
+- Test count: 331 → 350 (+19 new `coeff_abs_level_remaining` tests
+  covering the eq.-9-24 initial state, no-bump-at-threshold across
+  `cRiceParam ∈ {0..=4}`, the +1-above-threshold bump, saturation
+  at 4, monotone-in-`cLastAbsLevel`; the eq.-9-26 anchor table; the
+  §9.3.3.2 TR-prefix-length-is-4 invariant; the eq.-9-27 clamp at
+  `cMax`; the eq.-9-28 subtract; the prefix + suffix round-trip
+  recomposition across `r ∈ {0..=4}` and 13 level anchors; the
+  bin-source decode on zero / short-prefix `r ∈ {0, 1, 2}` /
+  escape-path `r = 0` with and without payload; the TR-only
+  round-trip across the full 0..cMax range for `r ∈ {0..=4}`; the
+  escape-path round-trip across 5 suffix-value anchors × 5 Rice
+  parameters; and the engine-wrapper smoke test).
+
 ### Added — clean-room rebuild round 33 (2026-06-04)
 
 - §9.3.4.2.8 `palette_run_prefix` ctxInc derivation lands in the

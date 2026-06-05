@@ -252,6 +252,35 @@
 //! `cMax = Floor(Log2(PaletteMaxRunMinus1)) + 1` and `cRiceParam = 0`;
 //! the helper [`palette_run_prefix_tr_cmax`] returns the per-block
 //! `cMax` from the `PaletteMaxRunMinus1` input.
+//!
+//! Round 34 adds the §9.3.3.11 `coeff_abs_level_remaining[ n ]`
+//! Rice-adaptive binarization + decode primitive (non-persistent
+//! branch: `persistent_rice_adaptation_enabled_flag == 0`):
+//!
+//! * [`coeff_abs_level_remaining_c_rice_param_eq_9_24`] — eq. 9-24
+//!   adapts `cRiceParam` from the previous coefficient in the
+//!   sub-block: `cRiceParam = Min(cLastRiceParam + (cLastAbsLevel >
+//!   (3 << cLastRiceParam) ? 1 : 0), 4)`.
+//! * [`coeff_abs_level_remaining_c_max_eq_9_26`] — eq. 9-26:
+//!   `cMax = 4 << cRiceParam`.
+//! * [`coeff_abs_level_remaining_prefix_val_eq_9_27`] — eq. 9-27:
+//!   `prefixVal = Min(cMax, level)` (the value the §9.3.3.2 TR
+//!   prefix is built from).
+//! * [`coeff_abs_level_remaining_suffix_val_eq_9_28`] — eq. 9-28:
+//!   `suffixVal = level - cMax` (only meaningful when the prefix is
+//!   the all-ones escape).
+//! * [`decode_coeff_abs_level_remaining`] — full bypass-coded decode
+//!   driver: reads a unary prefix capped at
+//!   `COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN = 4`, and when
+//!   the prefix terminates short, returns
+//!   `prefix << cRiceParam`; otherwise reads an EGk suffix with
+//!   `k = cRiceParam + 1` and returns `cMax + suffixVal`.
+//!
+//! The persistent-Rice branch (eq. 9-25; the
+//! `persistent_rice_adaptation_enabled_flag == 1` path that walks
+//! the SCC `StatCoeff[sbType]` state via eq. 9-22/9-23) is left for
+//! a follow-up round; the non-persistent branch is the Main-profile
+//! path the slice-data parser drives by default.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -298,19 +327,24 @@ where
 // suffix.
 // ---------------------------------------------------------------------
 
-/// §9.3.3.11 — decode an EGk-coded value from the bypass stream. For
-/// `k = 0` (the form `cu_qp_delta_abs` uses after its TR prefix) the
-/// reader counts leading zero bypass bins until a 1 is seen
-/// (`leading_zeros`), then reads `leading_zeros` more bypass bins as
-/// the suffix; the decoded value is `(1 << leading_zeros) - 1 + suffix`.
-/// The generalisation for other `k` adds the EGk shift; we expose only
-/// the `k = 0` form to keep the surface aligned with what this round
-/// has a clean-room trace for.
-fn decode_eg_k0(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
-    // Count leading zero bypass bins, capped at 32 to prevent runaway.
-    // A conforming HEVC `cu_qp_delta_abs` value is bounded by
-    // (51 + QpBdOffsetY) / 2 + 2; 32 is comfortably above any legal
-    // encoding.
+/// §9.3.3.3 — decode an EGk-coded value from the bypass stream for
+/// arbitrary Exp-Golomb order `k`.
+///
+/// The reader counts leading-zero bypass bins until a `1` is seen
+/// (call this count `leading_zeros`); reads `leading_zeros + k` more
+/// bypass bins as the suffix; and returns
+/// `((1 << leading_zeros) - 1) << k + suffix`.
+///
+/// For `k = 0` the reader collapses to the `cu_qp_delta_abs`-style
+/// "(1 << lz) - 1 + suffix" form (suffix length == `leading_zeros`,
+/// `<< 0` factor disappears) — preserved as
+/// [`decode_eg_k0`] for callers that only need the `k = 0` case.
+///
+/// `leading_zeros` is capped at 32 to keep the decoder defensive
+/// against runaway encodings; the cap is comfortably above any legal
+/// HEVC bypass-coded suffix value (§7.4.9.11 puts the practical
+/// ceiling well below `2^31`).
+fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
     let mut leading_zeros: u32 = 0;
     while leading_zeros < 32 {
         let bin = engine.decode_bypass()?;
@@ -319,8 +353,26 @@ fn decode_eg_k0(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
         }
         leading_zeros += 1;
     }
-    let suffix = engine.decode_bypass_bits(leading_zeros as u8)?;
-    Ok((1u32 << leading_zeros) - 1 + suffix)
+    let suffix_bits = leading_zeros + k;
+    // Guard against accidental >32-bit reads (cap `leading_zeros` at
+    // 32 already bounds this; the saturate keeps `decode_bypass_bits`
+    // happy if `k` is unusually large).
+    let suffix_bits = suffix_bits.min(32);
+    let suffix = engine.decode_bypass_bits(suffix_bits as u8)?;
+    let base = ((1u64 << leading_zeros) - 1) << k;
+    let value = base + suffix as u64;
+    // The defensive cap above keeps `value` inside `u32`; the
+    // saturate keeps us inside the public return type if the
+    // pathological 32-bit edge is ever reached.
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// §9.3.3.11 — decode an EGk-coded value with `k = 0` from the bypass
+/// stream. Preserved as a named alias for the `cu_qp_delta_abs` /
+/// `palette_escape_val` callers that historically used the `k = 0`
+/// fast path; equivalent to `decode_eg_k(engine, 0)`.
+fn decode_eg_k0(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
+    decode_eg_k(engine, 0)
 }
 
 // ---------------------------------------------------------------------
@@ -1657,6 +1709,175 @@ pub fn palette_run_prefix_tr_cmax(palette_max_run_minus1: u32) -> u32 {
     // Floor(Log2(x)) for x > 0 == 31 - leading_zeros(x).
     let floor_log2 = 31 - palette_max_run_minus1.leading_zeros();
     floor_log2 + 1
+}
+
+// ---------------------------------------------------------------------
+// coeff_abs_level_remaining (§9.3.3.11)
+// ---------------------------------------------------------------------
+
+/// §9.3.3.11 — TR-prefix escape length for `coeff_abs_level_remaining`.
+/// The §9.3.3.2 TR(`cMax`, `cRiceParam`) prefix is `cMax / (1 <<
+/// cRiceParam)` bins long; substituting eq. 9-26 (`cMax = 4 <<
+/// cRiceParam`) collapses that to a constant **4** bins regardless of
+/// `cRiceParam`. The all-4-ones prefix is the escape that signals the
+/// EGk(`cRiceParam + 1`) suffix is present.
+pub const COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN: u32 = 4;
+
+/// §9.3.3.11 — `cRiceParam` adaptation, non-persistent path
+/// (`persistent_rice_adaptation_enabled_flag == 0`), eq. 9-24:
+///
+/// ```text
+/// cRiceParam = Min( cLastRiceParam +
+///                   ( cLastAbsLevel > ( 3 * ( 1 << cLastRiceParam ) ) ? 1 : 0 ),
+///                   4 )
+/// ```
+///
+/// The bump (+1) fires when the previous coefficient's absolute level
+/// exceeded `3 << cLastRiceParam`; `cRiceParam` saturates at 4 (the
+/// non-persistent ceiling).
+///
+/// Inputs:
+///
+/// * `c_last_abs_level` — the `cAbsLevel` from the previous invocation
+///   in the same sub-block (`baseLevel + coeff_abs_level_remaining[n]`
+///   of the previous scan position; `0` if this is the first
+///   invocation for the sub-block).
+/// * `c_last_rice_param` — the `cRiceParam` from the previous
+///   invocation in the same sub-block (`0` if this is the first
+///   invocation).
+///
+/// Returns the per-coefficient `cRiceParam ∈ {0, 1, 2, 3, 4}` that
+/// drives eq. 9-26 + the §9.3.3.2 TR-prefix shape.
+#[must_use]
+pub fn coeff_abs_level_remaining_c_rice_param_eq_9_24(
+    c_last_abs_level: u32,
+    c_last_rice_param: u32,
+) -> u32 {
+    // `3 * (1 << r)` == `3 << r`; using the left-shift form keeps the
+    // comparison overflow-free for `r` up to 29 (3 << 29 < 2^32).
+    let threshold = 3u32 << c_last_rice_param;
+    let bump = u32::from(c_last_abs_level > threshold);
+    (c_last_rice_param + bump).min(4)
+}
+
+/// §9.3.3.11 eq. 9-26 — `cMax = 4 << cRiceParam`.
+///
+/// Drives the §9.3.3.2 TR-prefix `cMax` input. For `cRiceParam ∈
+/// {0, 1, 2, 3, 4}` this is `{4, 8, 16, 32, 64}`.
+#[must_use]
+pub fn coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param: u32) -> u32 {
+    4u32 << c_rice_param
+}
+
+/// §9.3.3.11 eq. 9-27 — `prefixVal = Min(cMax, level)`.
+///
+/// The TR-prefix input value: clamped to `cMax` so the prefix
+/// terminates at the all-ones escape when the level overflows the
+/// TR-only range.
+#[must_use]
+pub fn coeff_abs_level_remaining_prefix_val_eq_9_27(level: u32, c_max: u32) -> u32 {
+    level.min(c_max)
+}
+
+/// §9.3.3.11 eq. 9-28 — `suffixVal = level - cMax`.
+///
+/// Only meaningful when the TR prefix is the all-ones escape (i.e.
+/// `level >= cMax`); otherwise the suffix bin string is absent.
+/// Returns `0` for `level < cMax` so callers can avoid a separate
+/// branch when probing the suffix shape.
+#[must_use]
+pub fn coeff_abs_level_remaining_suffix_val_eq_9_28(level: u32, c_max: u32) -> u32 {
+    level.saturating_sub(c_max)
+}
+
+/// §9.3.3.11 — bin-source-driven core of `coeff_abs_level_remaining[
+/// n ]` decode. Factored out of [`decode_coeff_abs_level_remaining`]
+/// so the algorithm can be exercised by tests that supply a flat bin
+/// sequence directly, independently of the §9.3.4.3.4 CABAC
+/// arithmetic engine's bin / stream-bit relationship.
+///
+/// `read_bin()` returns one bypass-coded bin (0 or 1); the closure
+/// owns the underlying source state.
+///
+/// See [`decode_coeff_abs_level_remaining`] for the full §9.3.3.11
+/// scope, branch coverage, and follow-up notes.
+pub fn decode_coeff_abs_level_remaining_with<F>(
+    c_rice_param: u32,
+    mut read_bin: F,
+) -> Result<u32, CabacError>
+where
+    F: FnMut() -> Result<u8, CabacError>,
+{
+    // §9.3.3.2 truncated-rice prefix: up to ESCAPE_LEN unary bins.
+    let mut prefix_len: u32 = 0;
+    while prefix_len < COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN {
+        let bin = read_bin()?;
+        if bin == 0 {
+            // §9.3.3.2 terminator — the value is contained inside
+            // the TR shape; finish with the `cRiceParam`-bit suffix.
+            let mut tr_suffix: u32 = 0;
+            for _ in 0..c_rice_param {
+                tr_suffix = (tr_suffix << 1) | u32::from(read_bin()?);
+            }
+            return Ok((prefix_len << c_rice_param) + tr_suffix);
+        }
+        prefix_len += 1;
+    }
+    // Escape: all-ones prefix. EGk(cRiceParam + 1) suffix follows.
+    let k = c_rice_param + 1;
+    let mut leading_zeros: u32 = 0;
+    while leading_zeros < 32 {
+        let bin = read_bin()?;
+        if bin == 1 {
+            break;
+        }
+        leading_zeros += 1;
+    }
+    let suffix_bits = (leading_zeros + k).min(32);
+    let mut suffix: u32 = 0;
+    for _ in 0..suffix_bits {
+        suffix = (suffix << 1) | u32::from(read_bin()?);
+    }
+    let base = (((1u64 << leading_zeros) - 1) << k) as u32;
+    let c_max = coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param);
+    Ok(c_max + base + suffix)
+}
+
+/// §9.3.3.11 — full bypass-coded decode of `coeff_abs_level_remaining[
+/// n ]` given the per-coefficient `cRiceParam` already adapted by
+/// [`coeff_abs_level_remaining_c_rice_param_eq_9_24`].
+///
+/// The decoder:
+///
+/// 1. Reads a unary TR prefix of up to
+///    [`COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN`] = `4` bypass
+///    bins. The prefix length is the number of leading `1` bins.
+/// 2. If the prefix terminated short (length `< 4`), reads
+///    `cRiceParam` more bypass bins as the TR-suffix portion of the
+///    §9.3.3.2 shape; the decoded value is
+///    `(prefix_length << cRiceParam) + tr_suffix`.
+/// 3. Otherwise (the all-4-ones escape), reads an EGk suffix with
+///    `k = cRiceParam + 1` per the §9.3.3.11 "non-extended-precision"
+///    bullet; the decoded value is `cMax + suffixVal` where
+///    `cMax = 4 << cRiceParam`.
+///
+/// The function returns the bit-exact `coeff_abs_level_remaining[ n ]`
+/// value (not `baseLevel + remaining`); the caller composes the final
+/// signed coefficient using the §7.4.9.11 coding loop (`baseLevel`,
+/// `coeff_sign_flag[n]`).
+///
+/// This implements the §9.3.3.11 **non-persistent** path
+/// (`persistent_rice_adaptation_enabled_flag == 0`) and the
+/// **non-extended-precision** suffix branch
+/// (`extended_precision_processing_flag == 0`). The persistent and
+/// extended-precision branches are left for follow-up rounds; their
+/// inputs (StatCoeff[sbType], the §9.3.3.4 limited EGk shape) require
+/// trace material beyond what this round covers.
+pub fn decode_coeff_abs_level_remaining(
+    engine: &mut CabacEngine<'_>,
+    c_rice_param: u32,
+) -> Result<u32, CabacError> {
+    decode_coeff_abs_level_remaining_with(c_rice_param, || engine.decode_bypass())
 }
 
 #[cfg(test)]
@@ -3135,5 +3356,353 @@ mod tests {
         assert_eq!(tail_ctxs, [3u32, 4].into_iter().collect());
         // No overlap.
         assert!(bin0_ctxs.is_disjoint(&tail_ctxs));
+    }
+
+    // -----------------------------------------------------------------
+    // §9.3.3.11 coeff_abs_level_remaining — pure-function derivations
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn coeff_abs_level_remaining_c_rice_param_eq_9_24_initial_state() {
+        // First invocation in a sub-block: cLastAbsLevel = 0,
+        // cLastRiceParam = 0 ⇒ threshold = 3 << 0 = 3; 0 > 3 is false
+        // ⇒ no bump ⇒ cRiceParam = 0.
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(0, 0), 0);
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_c_rice_param_eq_9_24_no_bump_at_threshold() {
+        // The bump condition is strictly greater (>), not >=.
+        //   r = 0, threshold = 3: level 3 ⇒ no bump.
+        //   r = 1, threshold = 6: level 6 ⇒ no bump.
+        //   r = 2, threshold = 12: level 12 ⇒ no bump.
+        //   r = 3, threshold = 24: level 24 ⇒ no bump.
+        //   r = 4, threshold = 48: level 48 ⇒ no bump (already at cap).
+        for r in 0..=4u32 {
+            let thresh = 3u32 << r;
+            assert_eq!(
+                coeff_abs_level_remaining_c_rice_param_eq_9_24(thresh, r),
+                r,
+                "boundary at threshold for r = {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_c_rice_param_eq_9_24_bumps_one_above_threshold() {
+        // r = 0, threshold = 3, level = 4 ⇒ bump ⇒ 1.
+        // r = 1, threshold = 6, level = 7 ⇒ bump ⇒ 2.
+        // r = 2, threshold = 12, level = 13 ⇒ bump ⇒ 3.
+        // r = 3, threshold = 24, level = 25 ⇒ bump ⇒ 4.
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(4, 0), 1);
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(7, 1), 2);
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(13, 2), 3);
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(25, 3), 4);
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_c_rice_param_eq_9_24_saturates_at_four() {
+        // r = 4 already at cap; even a level vastly above threshold
+        // must stay clamped at 4.
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(49, 4), 4);
+        assert_eq!(
+            coeff_abs_level_remaining_c_rice_param_eq_9_24(u32::MAX, 4),
+            4
+        );
+        // r = 3 bumped + clamped ⇒ 4.
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(1_000, 3), 4);
+        // r = 4 with no bump still 4.
+        assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(0, 4), 4);
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_c_rice_param_eq_9_24_monotone_in_level() {
+        // Holding r fixed, the bump probability is non-decreasing in
+        // cLastAbsLevel: once we pass the threshold, every larger
+        // level also triggers (until we hit r = 4 saturation).
+        for r in 0..=3u32 {
+            let thresh = 3u32 << r;
+            // Just below threshold: no bump.
+            if thresh > 0 {
+                assert_eq!(
+                    coeff_abs_level_remaining_c_rice_param_eq_9_24(thresh - 1, r),
+                    r
+                );
+            }
+            // At threshold: no bump.
+            assert_eq!(coeff_abs_level_remaining_c_rice_param_eq_9_24(thresh, r), r);
+            // Just above: bump.
+            assert_eq!(
+                coeff_abs_level_remaining_c_rice_param_eq_9_24(thresh + 1, r),
+                r + 1
+            );
+            // Far above: still r + 1 (no double-bump in eq. 9-24).
+            assert_eq!(
+                coeff_abs_level_remaining_c_rice_param_eq_9_24(u32::MAX / 2, r),
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_c_max_eq_9_26_table() {
+        // Eq. 9-26 anchors for cRiceParam ∈ {0..=4}.
+        assert_eq!(coeff_abs_level_remaining_c_max_eq_9_26(0), 4);
+        assert_eq!(coeff_abs_level_remaining_c_max_eq_9_26(1), 8);
+        assert_eq!(coeff_abs_level_remaining_c_max_eq_9_26(2), 16);
+        assert_eq!(coeff_abs_level_remaining_c_max_eq_9_26(3), 32);
+        assert_eq!(coeff_abs_level_remaining_c_max_eq_9_26(4), 64);
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_tr_prefix_escape_len_is_four() {
+        // §9.3.3.2: TR(cMax, cRiceParam) prefix length is
+        // cMax / (1 << cRiceParam) = (4 << r) / (1 << r) = 4 — invariant
+        // across cRiceParam.
+        assert_eq!(COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN, 4);
+        for r in 0..=4u32 {
+            let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
+            let len = c_max / (1u32 << r);
+            assert_eq!(
+                len, COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN,
+                "TR prefix length mismatch at r = {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_prefix_val_eq_9_27_clamps_at_c_max() {
+        // Below cMax: prefixVal = level.
+        // At or above cMax: prefixVal = cMax (escape).
+        let c_max = coeff_abs_level_remaining_c_max_eq_9_26(0); // 4
+        assert_eq!(coeff_abs_level_remaining_prefix_val_eq_9_27(0, c_max), 0);
+        assert_eq!(coeff_abs_level_remaining_prefix_val_eq_9_27(3, c_max), 3);
+        assert_eq!(coeff_abs_level_remaining_prefix_val_eq_9_27(4, c_max), 4);
+        assert_eq!(coeff_abs_level_remaining_prefix_val_eq_9_27(5, c_max), 4);
+        assert_eq!(
+            coeff_abs_level_remaining_prefix_val_eq_9_27(u32::MAX, c_max),
+            c_max
+        );
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_suffix_val_eq_9_28_subtracts_c_max() {
+        let c_max = coeff_abs_level_remaining_c_max_eq_9_26(1); // 8
+                                                                // Below cMax: clamp at 0 (suffix is absent; caller checks the
+                                                                // prefix-escape flag before consuming it).
+        assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(0, c_max), 0);
+        assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(7, c_max), 0);
+        // At cMax: suffix = 0 (escape boundary).
+        assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(8, c_max), 0);
+        // Above cMax: linear in level.
+        assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(9, c_max), 1);
+        assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(100, c_max), 92);
+    }
+
+    #[test]
+    fn coeff_abs_level_remaining_prefix_plus_suffix_recomposes_level() {
+        // For any level and any cRiceParam ∈ {0..=4}: level ==
+        //   prefixVal                                  when level < cMax
+        //   cMax + suffixVal                           when level >= cMax
+        // Anchors a round-trip invariant the binarization+decode pipe
+        // must preserve.
+        for r in 0..=4u32 {
+            let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
+            for &level in &[0u32, 1, 3, 4, 7, 8, 15, 16, 63, 64, 65, 100, 4096] {
+                let prefix = coeff_abs_level_remaining_prefix_val_eq_9_27(level, c_max);
+                let suffix = coeff_abs_level_remaining_suffix_val_eq_9_28(level, c_max);
+                let recomposed = if level < c_max {
+                    prefix
+                } else {
+                    c_max + suffix
+                };
+                assert_eq!(
+                    recomposed, level,
+                    "round-trip failed at r = {r}, level = {level}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §9.3.3.11 coeff_abs_level_remaining — bin-source round-trips
+    //
+    // The §9.3.4.3.4 bypass arithmetic decoder does not map stream
+    // bits to bins 1-for-1 (the offset accumulator gates `bin == 1`
+    // by a 510 threshold), so end-to-end engine tests can't trivially
+    // synthesise a target bin sequence. Instead we drive the
+    // [`decode_coeff_abs_level_remaining_with`] entry point with a
+    // flat bin queue — the algorithm logic is identical and the
+    // engine wrapper is a one-line trampoline.
+    // -----------------------------------------------------------------
+
+    /// Helper: a FIFO bin source for
+    /// [`decode_coeff_abs_level_remaining_with`].
+    fn bin_queue(bins: &[u8]) -> impl FnMut() -> Result<u8, CabacError> + '_ {
+        let mut idx = 0usize;
+        move || {
+            let b = bins.get(idx).copied().ok_or(CabacError::EndOfBuffer)?;
+            idx += 1;
+            Ok(b)
+        }
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_zero_level_r0() {
+        // Smallest case: cRiceParam = 0, level = 0. TR prefix
+        // terminates at the first bin (0). No TR-suffix (r = 0) and
+        // no escape. Output = 0.
+        let bins = [0u8];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_short_prefix_r0() {
+        // cRiceParam = 0, level = 3. TR prefix: 1, 1, 1, 0
+        // (three 1s then terminator). No TR-suffix bits. Output = 3.
+        let bins = [1u8, 1, 1, 0];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_short_prefix_r1() {
+        // cRiceParam = 1: TR prefix length capped at 4; each prefix
+        // step contributes (1 << r) = 2 to the value, plus a 1-bit
+        // TR-suffix carrying the low bit.
+        //
+        // level = 5 = (2 << 1) | 1 → prefix_len = 2, tr_suffix = 1.
+        // Bins: 1, 1, 0 (prefix) + 1 (TR-suffix).
+        let bins = [1u8, 1, 0, 1];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(1, bin_queue(&bins)).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_short_prefix_r2() {
+        // cRiceParam = 2: each prefix step contributes 4, TR-suffix
+        // is 2 bits. level = 9 = (2 << 2) | 1 → prefix_len = 2,
+        // tr_suffix = 1 (binary 01).
+        let bins = [1u8, 1, 0, /* TR-suffix high */ 0, /* low */ 1];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(2, bin_queue(&bins)).unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_escape_path_r0() {
+        // cRiceParam = 0, level = 4 (== cMax). TR prefix = all 4 ones
+        // (escape). EGk(k = 1) suffix for suffixVal = 0:
+        //   leading_zeros = 0 (read a '1' immediately), suffix bits
+        //   = 0 + 1 = 1, payload = 0.
+        // value = ((1 << 0) − 1) << 1 + 0 = 0. Decoded level = 4.
+        let bins = [
+            1u8, 1, 1, 1, /* EGk lz=0 terminator */ 1, /* suffix bit */ 0,
+        ];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_escape_path_with_suffix_payload_r0() {
+        // cRiceParam = 0, level = 7. cMax = 4. suffixVal = 3.
+        // EGk(k = 1) of 3: leading_zeros = 1 (bins 0, 1), suffix
+        // bits = 1 + 1 = 2, payload = 01 ⇒ value = ((1 << 1) − 1)
+        // << 1 + 1 = 3. Decoded level = 4 + 3 = 7.
+        let bins = [
+            1u8, 1, 1, 1, // TR escape prefix
+            0, 1, // EGk leading-zero count: one zero then a terminating one
+            0, 1, // suffix bits MSB-first
+        ];
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_round_trips_tr_path_r0_thru_r4() {
+        // For each (cRiceParam, level) in the TR-only range
+        // (0..cMax), synthesise the §9.3.3.11 bin sequence,
+        // run the decoder, and confirm the original level comes back.
+        for r in 0..=4u32 {
+            let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
+            for level in 0..c_max {
+                let prefix_len = level >> r;
+                let tr_suffix = level & ((1u32 << r) - 1);
+                let mut bins: Vec<u8> = (0..prefix_len).map(|_| 1u8).collect();
+                bins.push(0); // TR terminator
+                for i in (0..r).rev() {
+                    bins.push(((tr_suffix >> i) & 1) as u8);
+                }
+                let got = decode_coeff_abs_level_remaining_with(r, bin_queue(&bins)).unwrap();
+                assert_eq!(got, level, "round-trip r = {r}, level = {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_round_trips_escape_path_anchors() {
+        // Escape-path anchors for cRiceParam ∈ {0..=4}: pick a few
+        // (suffix-value) anchors per r, synthesise the all-ones TR
+        // prefix + EGk(r + 1) suffix, decode, and confirm.
+        for r in 0..=4u32 {
+            let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
+            let k = r + 1;
+            for &suffix_val in &[0u32, 1, 3, 5, 12] {
+                // Encode suffix_val as EGk(k). Find smallest `lz`
+                // such that base = ((1 << lz) − 1) << k <= suffix_val
+                // and base + ((1 << (lz + k)) − 1) >= suffix_val.
+                let mut lz = 0u32;
+                while {
+                    let base = (((1u64 << lz) - 1) << k) as u32;
+                    let suffix_bits_capacity: u64 = 1u64 << (lz + k);
+                    let max_val = base as u64 + suffix_bits_capacity - 1;
+                    !(suffix_val >= base && suffix_val as u64 <= max_val)
+                } {
+                    lz += 1;
+                }
+                let base = (((1u64 << lz) - 1) << k) as u32;
+                let suffix_payload = suffix_val - base;
+                // Bins: all-ones TR prefix (4 ones) + lz zeros + a
+                // terminating one + (lz + k) suffix bits MSB-first.
+                let mut bins: Vec<u8> = std::iter::repeat_n(1u8, 4).collect();
+                bins.extend(std::iter::repeat_n(0u8, lz as usize));
+                bins.push(1);
+                for i in (0..lz + k).rev() {
+                    bins.push(((suffix_payload >> i) & 1) as u8);
+                }
+                let got = decode_coeff_abs_level_remaining_with(r, bin_queue(&bins)).unwrap();
+                assert_eq!(
+                    got,
+                    c_max + suffix_val,
+                    "escape-path round-trip r = {r}, suffix_val = {suffix_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_engine_wrapper_smoke() {
+        // End-to-end engine wrapper smoke: drive
+        // `decode_coeff_abs_level_remaining` with an all-zero stream
+        // and a stuck-MPS context state is unnecessary because the
+        // bypass path doesn't consult ContextModel. We just confirm
+        // the wrapper compiles, runs, and returns 0 on an all-zero
+        // bypass bin stream (which is the natural decode of the
+        // smallest-level case from the bin-source test above).
+        let buf = [0u8; 16];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        assert_eq!(decode_coeff_abs_level_remaining(&mut eng, 0).unwrap(), 0);
     }
 }

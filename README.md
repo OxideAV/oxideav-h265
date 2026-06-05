@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 33 (2026-06-04).** The prior implementation was
+**Clean-room rebuild — round 34 (2026-06-05).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,55 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 33 extends the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 34 adds the
+§9.3.3.11 `coeff_abs_level_remaining[ n ]` Rice-adaptive binarization
+and bypass decode primitive — the residual-coding magnitude tail the
+§7.3.8.11 loop emits when the absolute level exceeds the greater-1 /
+greater-2 flags. The non-persistent path
+(`persistent_rice_adaptation_enabled_flag == 0`) lands as five
+pure-function derivations plus a bin-source-driven decode core:
+[`binarization::coeff_abs_level_remaining_c_rice_param_eq_9_24`]
+(eq. 9-24 — `cRiceParam = Min(cLastRiceParam + (cLastAbsLevel >
+(3 << cLastRiceParam) ? 1 : 0), 4)`);
+[`binarization::coeff_abs_level_remaining_c_max_eq_9_26`] (eq. 9-26 —
+`cMax = 4 << cRiceParam` ∈ `{4, 8, 16, 32, 64}`);
+[`binarization::coeff_abs_level_remaining_prefix_val_eq_9_27`]
+(eq. 9-27 — `prefixVal = Min(cMax, level)`);
+[`binarization::coeff_abs_level_remaining_suffix_val_eq_9_28`]
+(eq. 9-28 — `suffixVal = level − cMax`);
+[`binarization::COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN`]
+(= 4, the §9.3.3.2 `cMax / (1 << cRiceParam)` prefix length that
+collapses to a `cRiceParam`-invariant constant once eq. 9-26 is
+substituted). The end-to-end decode driver
+[`binarization::decode_coeff_abs_level_remaining`] reads the unary
+TR-prefix (up to 4 bypass bins) and, when the prefix terminates
+short, the `cRiceParam`-bit TR-suffix; on the all-ones escape it
+reads an EGk suffix with `k = cRiceParam + 1` and returns
+`cMax + suffixVal`. The bin-source-factored core
+[`binarization::decode_coeff_abs_level_remaining_with`] lets unit
+tests drive the §9.3.3.11 algorithm directly with a flat bin queue
+(the §9.3.4.3.4 bypass arithmetic decoder gates `bin == 1` on a 510
+threshold so engine-level round-trips require running the offset
+accumulator, not a 1-to-1 stream-bit-to-bin map). The §9.3.3.3 EGk
+decoder helper is generalised to arbitrary `k` (the prior
+`decode_eg_k0` becomes a named alias for the `k = 0` case used by
+`cu_qp_delta_abs` and `palette_escape_val`). Total tests now 350
+(was 331): 19 new tests cover the eq.-9-24 initial state, no-bump-
+at-threshold across `r ∈ {0..=4}`, +1-above-threshold bump,
+saturation at 4, monotone-in-`cLastAbsLevel`; the eq.-9-26 anchor
+table; the §9.3.3.2 TR-prefix-length invariant; eq.-9-27 clamp at
+`cMax`; eq.-9-28 subtract; prefix + suffix round-trip recomposition
+across `r ∈ {0..=4}` and 13 level anchors; the bin-source decode on
+zero / short-prefix `r = 0` / `r = 1` / `r = 2` / escape-path `r = 0`
+with and without payload; the TR-only round-trip across the full
+0..cMax range for `r ∈ {0..=4}` (the `r = 4` sweep covers 64 levels);
+the escape-path round-trip across 5 suffix-value anchors × 5 Rice
+parameters; and the engine-wrapper smoke test confirming the
+trampoline `decode_coeff_abs_level_remaining` compiles, runs against
+the §9.3.4.3.4 `CabacEngine`, and returns the minimum level on an
+all-zero bypass stream.
+
+Round 33 had extended the
 [`binarization`] module with the §9.3.4.2.8 `palette_run_prefix`
 ctxInc derivation — the §7.3.8.13 palette-coding (Annex SCC) syntax
 element that signals the unary part of a palette-run length. The
