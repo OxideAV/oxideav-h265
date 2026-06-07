@@ -297,6 +297,30 @@
 //! §7.4.9.11 `(1 − 2 * coeff_sign_flag[n])` factor; the FL shape
 //! is captured as [`COEFF_SIGN_FLAG_FL_CMAX`] +
 //! [`COEFF_SIGN_FLAG_FL_NBITS`].
+//!
+//! Round 36 adds the §9.3.4.2 / Table 9-48 entries for the
+//! `cu_chroma_qp_offset_flag` / `cu_chroma_qp_offset_idx` transform-unit
+//! syntax pair (H.265 §7.3.8.11, §7.4.9.10). Both elements have a
+//! Table 9-48 row whose context-coded bins are all `ctxInc = 0` — the
+//! flag occupies a single context (Table 9-34, three ctxIdx slots
+//! across initType), and the idx occupies a single context (Table
+//! 9-35, three ctxIdx slots across initType). The flag is FL
+//! `cMax = 1`; the idx is TR with `cMax =
+//! chroma_qp_offset_list_len_minus1`, `cRiceParam = 0`. The §7.4.9.10
+//! derivation pair the flag + idx feed is `CuQpOffsetCb = (flag == 1)
+//! ? cb_qp_offset_list[idx] : 0` (and symmetric for Cr). The new
+//! public surface: [`CU_CHROMA_QP_OFFSET_FLAG_FL_CMAX`] (= 1, Table
+//! 9-43 shape) and [`CU_CHROMA_QP_OFFSET_FLAG_FL_NBITS`] (= 1);
+//! [`cu_chroma_qp_offset_flag_ctx_inc`] returns the Table 9-48 bin-0
+//! `ctxInc = 0` for the FL flag; [`cu_chroma_qp_offset_idx_tr_cmax`]
+//! returns the per-TU `cMax` from the PPS-resolved
+//! `chroma_qp_offset_list_len_minus1`; [`cu_chroma_qp_offset_idx_ctx_inc`]
+//! returns the Table 9-48 `ctxInc = 0` (constant across the TR-prefix
+//! bins 0..=4, since Table 9-48 lists `0` for every context-coded
+//! binIdx column); and [`decode_cu_chroma_qp_offset`] drives the
+//! CABAC engine to produce the typed [`CuChromaQpOffset`] (the
+//! flag plus, when the flag is 1, the idx with the §7.4.9.10
+//! derivation gates surfaced via [`CuChromaQpOffset::offset_indices`]).
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -477,6 +501,150 @@ pub fn decode_cu_qp_delta(
         sign_flag,
         value: signed,
     })
+}
+
+// ---------------------------------------------------------------------
+// cu_chroma_qp_offset_flag / cu_chroma_qp_offset_idx
+// (§7.3.8.11 transform_unit() / §7.4.9.10 — PPS chroma-QP-offset list
+// gating). Table 9-43 binarizations + Table 9-48 ctxInc derivations.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `cu_chroma_qp_offset_flag`: FL
+/// with `cMax = 1` (a single context-coded bin).
+pub const CU_CHROMA_QP_OFFSET_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `cu_chroma_qp_offset_flag`: one
+/// context-coded bin per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const CU_CHROMA_QP_OFFSET_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `cu_chroma_qp_offset_flag`. Bin 0
+/// is context-coded with `ctxInc = 0`; later bin-index columns are
+/// `na` (the FL `cMax = 1` shape only emits a single bin).
+///
+/// The flag's Table 9-34 ctxIdx layout (`initValue = 154` at every
+/// initType slot) is consumed at slice-init scope; this layer hands
+/// back the bank-relative `ctxInc` only.
+#[must_use]
+pub fn cu_chroma_qp_offset_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §9.3.4.2.1 / Table 9-48 row for `cu_chroma_qp_offset_idx`. Every
+/// context-coded bin column (binIdx 0..=4 of the TR prefix) lists
+/// `ctxInc = 0`; binIdx 5 is `na` (the §7.4.9.10 idx range tops out
+/// at `chroma_qp_offset_list_len_minus1 <= 5`, so the spec-mandated
+/// `cMax <= 5` TR prefix can produce at most five bins).
+///
+/// The idx's Table 9-35 ctxIdx layout (`initValue = 154` at every
+/// initType slot) is consumed at slice-init scope; this layer hands
+/// back the bank-relative `ctxInc` only.
+///
+/// `bin_idx` is the §9.3.4.2 binIdx of the bin being coded; values
+/// outside `0..=4` are `na` per Table 9-48.
+#[must_use]
+pub fn cu_chroma_qp_offset_idx_ctx_inc(bin_idx: u32) -> u32 {
+    debug_assert!(
+        bin_idx <= 4,
+        "cu_chroma_qp_offset_idx Table 9-48 row: binIdx > 4 is na"
+    );
+    0
+}
+
+/// §9.3.3.10 / Table 9-43 row for `cu_chroma_qp_offset_idx`: TR with
+/// `cMax = chroma_qp_offset_list_len_minus1`, `cRiceParam = 0`.
+/// `chroma_qp_offset_list_len_minus1` is the PPS-signalled length of
+/// `cb_qp_offset_list[ ]` / `cr_qp_offset_list[ ]` minus one
+/// (§7.4.3.3.1: a `u(3)` field, bounded by `<= 5`).
+#[must_use]
+pub fn cu_chroma_qp_offset_idx_tr_cmax(chroma_qp_offset_list_len_minus1: u32) -> u32 {
+    chroma_qp_offset_list_len_minus1
+}
+
+/// Decoded `cu_chroma_qp_offset_flag` / `cu_chroma_qp_offset_idx` pair
+/// with the §7.4.9.10 chroma-QP-offset-list dereference surfaced as a
+/// typed accessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CuChromaQpOffset {
+    /// `cu_chroma_qp_offset_flag` from the wire.
+    pub flag: u8,
+    /// `cu_chroma_qp_offset_idx` from the wire; `None` when the flag
+    /// is 0 (the idx is not signalled in that case per §7.3.8.11).
+    /// When the flag is 1 and `chroma_qp_offset_list_len_minus1 == 0`
+    /// the idx is also not signalled (the TR prefix has `cMax = 0`,
+    /// emitting zero bins) and the value is inferred to be 0.
+    pub idx: Option<u32>,
+}
+
+impl CuChromaQpOffset {
+    /// §7.4.9.10 — return the `(cb_qp_offset_list, cr_qp_offset_list)`
+    /// indices to dereference for `CuQpOffsetCb` / `CuQpOffsetCr`.
+    /// `None` is returned when the flag is 0: per §7.4.9.10 the
+    /// offsets are then both 0 (no list dereference).
+    #[must_use]
+    pub fn offset_indices(&self) -> Option<u32> {
+        if self.flag == 0 {
+            None
+        } else {
+            // §7.4.9.10: when present, idx defaults to 0; absent ⇒
+            // also 0 (the cMax = 0 / not-signalled paths share the
+            // same inferred value).
+            Some(self.idx.unwrap_or(0))
+        }
+    }
+}
+
+/// Decode the `cu_chroma_qp_offset` syntax pair (§7.3.8.11 /
+/// §7.4.9.10) from the CABAC engine, consuming one context for the
+/// FL `cu_chroma_qp_offset_flag` bin and (when the flag is 1 and
+/// `chroma_qp_offset_list_len_minus1 > 0`) one context for the TR
+/// prefix of `cu_chroma_qp_offset_idx`. All bins of both elements
+/// share `ctxInc = 0` per Table 9-48; the contexts live in separate
+/// Table 9-4 banks (Table 9-34 for the flag, Table 9-35 for the
+/// idx).
+///
+/// `ctx_flag` and `ctx_idx` are the caller's
+/// `(pStateIdx, valMps)` state for the two contexts; they are
+/// mutated in place per §9.3.4.3.2.2 state transition.
+///
+/// `chroma_qp_offset_list_len_minus1` is the PPS field that bounds
+/// the TR prefix; the function panics in debug if it exceeds 5
+/// (the §7.4.3.3.1 `u(3)` field's upper bound).
+///
+/// Returns the decoded [`CuChromaQpOffset`].
+pub fn decode_cu_chroma_qp_offset(
+    engine: &mut CabacEngine<'_>,
+    ctx_flag: &mut ContextModel,
+    ctx_idx: &mut ContextModel,
+    chroma_qp_offset_list_len_minus1: u32,
+) -> Result<CuChromaQpOffset, CabacError> {
+    debug_assert!(
+        chroma_qp_offset_list_len_minus1 <= 5,
+        "chroma_qp_offset_list_len_minus1 is a u(3) field bounded by 5 per §7.4.3.3.1"
+    );
+
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: bin 0 of the FL flag
+    // uses ctxInc = 0 and the FL cMax = 1 shape emits exactly one
+    // bin.
+    let flag = engine.decode_decision(ctx_flag)?;
+
+    // §7.3.8.11: the idx is signalled only when the flag is 1 and
+    // the list has more than one entry (else the TR cMax = 0 shape
+    // emits no bins and the idx is inferred to be 0 per §7.4.9.10).
+    let idx = if flag == 1 && chroma_qp_offset_list_len_minus1 > 0 {
+        let c_max = cu_chroma_qp_offset_idx_tr_cmax(chroma_qp_offset_list_len_minus1);
+        // §9.3.3.10 TR prefix with cRiceParam = 0; every bin uses
+        // ctx_idx (Table 9-48 ctxInc = 0).
+        let (prefix, _is_escape) =
+            read_truncated_rice_prefix(c_max, |_bin_idx| engine.decode_decision(ctx_idx))?;
+        // The TR escape (all-ones prefix == cMax) terminates the
+        // idx — there is no suffix continuation for this element
+        // (Table 9-43 has no follow-on EGk row).
+        Some(prefix)
+    } else {
+        None
+    };
+
+    Ok(CuChromaQpOffset { flag, idx })
 }
 
 // ---------------------------------------------------------------------
@@ -3934,6 +4102,119 @@ mod tests {
             let via_wrapper = decode_coeff_sign_flag(&mut eng_a).unwrap();
             let via_direct = eng_b.decode_bypass().unwrap();
             assert_eq!(via_wrapper, via_direct);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // cu_chroma_qp_offset_flag / cu_chroma_qp_offset_idx
+    // (§9.3.4.2.1 / Table 9-48, §7.4.9.10)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cu_chroma_qp_offset_flag_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for cu_chroma_qp_offset_flag: bin 0 ctxInc = 0,
+        // all later columns na.
+        assert_eq!(cu_chroma_qp_offset_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_flag_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 → one bin, Ceil(Log2(2)) = 1
+        // per §9.3.3.5.
+        assert_eq!(CU_CHROMA_QP_OFFSET_FLAG_FL_CMAX, 1);
+        assert_eq!(CU_CHROMA_QP_OFFSET_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_idx_table_9_48_ctx_inc_is_zero_across_prefix() {
+        // Table 9-48 row for cu_chroma_qp_offset_idx: binIdx 0..=4 all
+        // ctxInc = 0 (the TR prefix never escapes its single context
+        // bank).
+        for bin in 0..=4u32 {
+            assert_eq!(cu_chroma_qp_offset_idx_ctx_inc(bin), 0, "binIdx = {bin}");
+        }
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_idx_tr_cmax_passthrough() {
+        // §9.3.3.10 cMax = chroma_qp_offset_list_len_minus1; the
+        // §7.4.3.3.1 u(3) field caps the input at 5.
+        for n in 0..=5u32 {
+            assert_eq!(cu_chroma_qp_offset_idx_tr_cmax(n), n);
+        }
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_offset_indices_gating() {
+        // §7.4.9.10: flag = 0 ⇒ no list dereference (offset = 0).
+        let off0 = CuChromaQpOffset { flag: 0, idx: None };
+        assert_eq!(off0.offset_indices(), None);
+
+        // flag = 1, idx present ⇒ dereference at idx.
+        let off1 = CuChromaQpOffset {
+            flag: 1,
+            idx: Some(3),
+        };
+        assert_eq!(off1.offset_indices(), Some(3));
+
+        // flag = 1, idx not signalled (cMax = 0 case) ⇒ inferred 0.
+        let off2 = CuChromaQpOffset { flag: 1, idx: None };
+        assert_eq!(off2.offset_indices(), Some(0));
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_flag_zero_does_not_signal_idx() {
+        // All-zero stream + fresh MPS-only context: the FL flag
+        // decodes to valMps = 0, so the idx is not read and no
+        // context-state walk is required on the idx side.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_flag = fresh_mps_ctx(0);
+        let ctx_idx_pre = fresh_mps_ctx(0);
+        let mut ctx_idx = ctx_idx_pre;
+        let off = decode_cu_chroma_qp_offset(&mut eng, &mut ctx_flag, &mut ctx_idx, 5).unwrap();
+        assert_eq!(off.flag, 0);
+        assert_eq!(off.idx, None);
+        assert_eq!(off.offset_indices(), None);
+        // §7.4.9.10 gate: the idx context was not touched (its state
+        // matches the pre-call snapshot exactly).
+        assert_eq!(ctx_idx, ctx_idx_pre);
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_flag_one_and_zero_len_skips_idx_read() {
+        // Even when flag = 1, the idx is not signalled when
+        // chroma_qp_offset_list_len_minus1 == 0 (TR cMax = 0 emits
+        // zero bins). §7.4.9.10 then infers idx = 0. Engineer the
+        // flag = 1 path with a (valMps = 1) MPS-only context.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_flag = fresh_mps_ctx(1);
+        let ctx_idx_pre = fresh_mps_ctx(0);
+        let mut ctx_idx = ctx_idx_pre;
+        let off = decode_cu_chroma_qp_offset(&mut eng, &mut ctx_flag, &mut ctx_idx, 0).unwrap();
+        assert_eq!(off.flag, 1);
+        assert_eq!(off.idx, None);
+        // §7.4.9.10: absent idx ⇒ inferred to 0 via offset_indices().
+        assert_eq!(off.offset_indices(), Some(0));
+        // The idx context is untouched: TR cMax = 0 reads zero bins.
+        assert_eq!(ctx_idx, ctx_idx_pre);
+    }
+
+    #[test]
+    fn cu_chroma_qp_offset_idx_ctx_inc_default_is_zero_for_each_legal_bin() {
+        // The §7.4.3.3.1 PPS field caps the TR prefix at five bins
+        // (cMax = chroma_qp_offset_list_len_minus1 ≤ 5). Every legal
+        // bin index lives in the single Table 9-48 ctxInc = 0 slot.
+        for n in 0..=5u32 {
+            let c_max = cu_chroma_qp_offset_idx_tr_cmax(n);
+            for bin in 0..c_max {
+                assert_eq!(
+                    cu_chroma_qp_offset_idx_ctx_inc(bin),
+                    0,
+                    "cMax = {c_max}, binIdx = {bin}"
+                );
+            }
         }
     }
 

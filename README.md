@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 35 (2026-06-07).** The prior implementation was
+**Clean-room rebuild — round 36 (2026-06-07).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,48 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 35 closes the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 36 lands the
+§9.3.4.2 / Table 9-48 entries for the `cu_chroma_qp_offset_flag` /
+`cu_chroma_qp_offset_idx` transform-unit syntax pair (§7.3.8.11,
+§7.4.9.10) — the per-TU gate that swaps the picture's chroma-QP
+offset (`pps_cb_qp_offset`, `pps_cr_qp_offset`) for an entry from the
+PPS-signalled `cb_qp_offset_list[ ]` / `cr_qp_offset_list[ ]`. Both
+elements have Table 9-48 rows whose context-coded bins are all
+`ctxInc = 0`: the flag is FL `cMax = 1` (one bin) and the idx is TR
+`cMax = chroma_qp_offset_list_len_minus1`, `cRiceParam = 0` (binIdx
+0..=4 of the prefix, since the PPS u(3) field caps the list length at
+5). The new public surface:
+[`binarization::CU_CHROMA_QP_OFFSET_FLAG_FL_CMAX`] (= 1, Table 9-43)
+and [`binarization::CU_CHROMA_QP_OFFSET_FLAG_FL_NBITS`] (= 1, the
+§9.3.3.5 `Ceil(Log2(cMax + 1))` derivation collapsed to a constant);
+[`binarization::cu_chroma_qp_offset_flag_ctx_inc`] (returns 0 — the
+Table 9-48 bin-0 row for the flag);
+[`binarization::cu_chroma_qp_offset_idx_ctx_inc`] (returns 0 across
+binIdx 0..=4 — the Table 9-48 column for every context-coded bin of
+the TR prefix); [`binarization::cu_chroma_qp_offset_idx_tr_cmax`] (=
+`chroma_qp_offset_list_len_minus1`, the per-TU `cMax` the §9.3.3.10
+TR prefix consumes); the [`binarization::CuChromaQpOffset`] typed
+pair (`flag`, `idx`) plus its `offset_indices()` accessor surfacing
+the §7.4.9.10 derivation gate (`flag == 0` ⇒ `None` — both chroma QP
+offsets stay at the PPS / slice baseline; `flag == 1` ⇒
+`Some(idx_or_0)` — dereference at idx, with the §7.4.9.10
+not-signalled / cMax == 0 fast path inferring 0); and
+[`binarization::decode_cu_chroma_qp_offset`] driving the §9.3 CABAC
+engine to produce the typed pair with one context for the flag
+(Table 9-34 ctxIdx bank) and one for the TR prefix of the idx (Table
+9-35 ctxIdx bank). Total tests now 367 (was 359): 8 new tests cover
+the Table 9-48 ctxInc = 0 anchors for the flag and every legal
+prefix bin of the idx; the Table 9-43 FL shape (`cMax = 1`,
+`Ceil(Log2(2)) = 1` `nBits` cross-check); the `cu_chroma_qp_offset_idx`
+TR `cMax` pass-through across the legal `chroma_qp_offset_list_len_minus1`
+range 0..=5; the §7.4.9.10 `offset_indices()` gating across the
+three (flag, idx) shapes ({0, None} ⇒ None, {1, Some} ⇒ Some, {1,
+None} ⇒ Some(0)); the §7.3.8.11 flag-zero skip-idx invariant (the
+idx context state is bit-identical pre / post call); and the §7.3.8.11
+flag-one zero-cMax skip-idx invariant (the idx context state survives
+unchanged when `chroma_qp_offset_list_len_minus1 == 0`).
+
+Round 35 had closed the
 sign half of the §7.4.9.11 residual-coding magnitude tail: the
 §9.3.4.2 / Table 9-48 `coeff_sign_flag[ n ]` derivation — the
 per-scan-position sign bit that pairs with the round-34

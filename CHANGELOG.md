@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 36 (2026-06-07)
+
+- §9.3.4.2 / Table 9-48 entries for the `cu_chroma_qp_offset_flag` /
+  `cu_chroma_qp_offset_idx` transform-unit syntax pair land in the
+  [`binarization`] module — the per-TU gate that swaps the picture's
+  chroma-QP offset (`pps_cb_qp_offset`, `pps_cr_qp_offset`) for an
+  entry from the PPS-signalled `cb_qp_offset_list[ ]` /
+  `cr_qp_offset_list[ ]` (§7.3.8.11, §7.4.9.10). Both elements have a
+  Table 9-48 row whose every context-coded bin column is
+  `ctxInc = 0`: the flag is FL `cMax = 1` (one bin); the idx is TR
+  `cMax = chroma_qp_offset_list_len_minus1`, `cRiceParam = 0`
+  (binIdx 0..=4 — the §7.4.3.3.1 PPS u(3) field bounds the list
+  length at 5).
+  - [`binarization::CU_CHROMA_QP_OFFSET_FLAG_FL_CMAX`] — Table 9-43
+    shape: `cMax = 1`.
+  - [`binarization::CU_CHROMA_QP_OFFSET_FLAG_FL_NBITS`] — §9.3.3.5
+    `Ceil(Log2(cMax + 1))` collapsed to the `cMax = 1` constant `1`.
+  - [`binarization::cu_chroma_qp_offset_flag_ctx_inc`] — Table 9-48
+    bin-0 row for the flag: `ctxInc = 0` (Table 9-34 ctxIdx bank).
+  - [`binarization::cu_chroma_qp_offset_idx_ctx_inc`] — Table 9-48
+    row for every context-coded bin (binIdx 0..=4) of the TR prefix
+    of the idx: `ctxInc = 0` (Table 9-35 ctxIdx bank).
+  - [`binarization::cu_chroma_qp_offset_idx_tr_cmax`] — Table 9-43
+    cMax pass-through: `cMax = chroma_qp_offset_list_len_minus1`.
+  - [`binarization::CuChromaQpOffset`] — typed `(flag, idx)` pair
+    with `offset_indices()` surfacing the §7.4.9.10 dereference gate
+    (`flag == 0` ⇒ no list dereference; `flag == 1` ⇒ index 0 when
+    the idx is not signalled per the cMax == 0 fast path).
+  - [`binarization::decode_cu_chroma_qp_offset`] — engine-driven
+    decode primitive that reads the FL flag bin, then (when the
+    flag is 1 and the list has more than one entry) the TR prefix
+    of the idx, returning the typed pair.
+
 ### Added — clean-room rebuild round 35 (2026-06-07)
 
 - §9.3.4.2 / Table 9-48 `coeff_sign_flag[ n ]` derivation lands in
