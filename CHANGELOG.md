@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 37 (2026-06-08)
+
+- §9.3.4.2 / Table 9-48 entry for `cu_transquant_bypass_flag` lands
+  in the [`binarization`] module — the per-CU bypass switch that,
+  when set, replaces the §8.6 / §8.7 scaling + transform +
+  in-loop-filter path with a verbatim residual passthrough (H.265
+  §7.3.8.5, §7.4.9.5). Per Table 9-43 the flag is FL with
+  `cMax = 1` (a single context-coded bin); Table 9-48's row lists
+  `ctxInc = 0` for bin 0 and `na` for every later binIdx column.
+  Table 9-8 supplies the single context's `initValue = 154` at all
+  three initType slots. The PPS gate is
+  `transquant_bypass_enabled_flag` (§7.4.3.3.1): the flag is read
+  only when the PPS field is 1, otherwise §7.4.9.5 infers the value
+  to 0 (the normal scaling-and-transform path).
+  - [`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX`] — Table 9-43
+    shape: `cMax = 1`.
+  - [`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS`] — §9.3.3.5
+    `Ceil(Log2(cMax + 1))` collapsed to the `cMax = 1` constant `1`.
+  - [`binarization::cu_transquant_bypass_flag_ctx_inc`] — Table 9-48
+    bin-0 row: `ctxInc = 0` (single Table 9-8 ctxIdx slot).
+  - [`binarization::cu_transquant_bypass_flag_inferred`] — §7.4.9.5
+    inferred-value helper (`0` — the spec-mandated default when the
+    PPS gate is 0 and the element is not present on the wire).
+  - [`binarization::decode_cu_transquant_bypass_flag`] — engine-driven
+    decode primitive that reads the single FL bin using the
+    caller-allocated single Table 9-8 context and returns the
+    decoded `u8`.
+
 ### Added — clean-room rebuild round 36 (2026-06-07)
 
 - §9.3.4.2 / Table 9-48 entries for the `cu_chroma_qp_offset_flag` /

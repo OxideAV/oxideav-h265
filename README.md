@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 36 (2026-06-07).** The prior implementation was
+**Clean-room rebuild — round 37 (2026-06-08).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,38 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 36 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 37 lands the
+§9.3.4.2 / Table 9-48 entry for `cu_transquant_bypass_flag` — the
+per-CU bypass switch that, when set, replaces the §8.6 / §8.7
+scaling + transform + in-loop-filter path with a verbatim residual
+passthrough (§7.3.8.5, §7.4.9.5). Per Table 9-43 the flag is FL with
+`cMax = 1` (a single context-coded bin); Table 9-48's row lists
+`ctxInc = 0` for bin 0 and `na` for every later binIdx column. The
+single Table 9-8 context entry initialises with `initValue = 154` at
+all three initType slots. The PPS gate is
+`transquant_bypass_enabled_flag` (§7.4.3.3.1): the flag is read from
+the bitstream only when that PPS field is 1, otherwise §7.4.9.5
+infers the value to 0 (the normal scaling-and-transform path). The
+new public surface:
+[`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX`] (= 1, Table 9-43
+shape); [`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS`] (= 1,
+the §9.3.3.5 `Ceil(Log2(cMax + 1))` derivation collapsed to a
+constant); [`binarization::cu_transquant_bypass_flag_ctx_inc`]
+(returns 0 — the Table 9-48 bin-0 row);
+[`binarization::cu_transquant_bypass_flag_inferred`] (returns 0 — the
+§7.4.9.5 inferred-value helper for callers that branch on the PPS
+gate without entering the engine); and
+[`binarization::decode_cu_transquant_bypass_flag`] driving the §9.3
+CABAC engine to consume one FL bin against the single Table 9-8
+context, returning the decoded `u8`. Total tests now 373 (was 367):
+6 new tests cover the Table 9-48 `ctxInc = 0` anchor; the Table 9-43
+FL shape (`cMax = 1`, `Ceil(Log2(2)) = 1` `nBits` cross-check); the
+§7.4.9.5 inferred-value invariant; the engine-driven decode for the
+valMps = 0 and valMps = 1 contexts; and the
+exactly-one-bin-per-invocation anchor across two back-to-back
+contexts on the same engine.
+
+Round 36 had landed the
 §9.3.4.2 / Table 9-48 entries for the `cu_chroma_qp_offset_flag` /
 `cu_chroma_qp_offset_idx` transform-unit syntax pair (§7.3.8.11,
 §7.4.9.10) — the per-TU gate that swaps the picture's chroma-QP

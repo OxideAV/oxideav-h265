@@ -321,6 +321,30 @@
 //! CABAC engine to produce the typed [`CuChromaQpOffset`] (the
 //! flag plus, when the flag is 1, the idx with the §7.4.9.10
 //! derivation gates surfaced via [`CuChromaQpOffset::offset_indices`]).
+//!
+//! Round 37 adds the §9.3.4.2 / Table 9-48 entry for
+//! `cu_transquant_bypass_flag` — the per-CU bypass switch that, when
+//! set, replaces the scaling + transform + in-loop-filter path with a
+//! verbatim residual passthrough (H.265 §7.3.8.5, §7.4.9.5). Per
+//! Table 9-43 the flag is FL with `cMax = 1` (a single context-coded
+//! bin); Table 9-48's row lists `ctxInc = 0` for bin 0 and `na` for
+//! every later binIdx column. The flag occupies a single context
+//! (Table 9-8: `initValue = 154` at all three initType slots) which
+//! sits at the slice-init-allocated bank entry the parser hands to
+//! the decode primitive. The PPS gate is
+//! `transquant_bypass_enabled_flag` (§7.4.3.3.1): the flag is read
+//! from the bitstream only when that PPS field is 1, otherwise
+//! §7.4.9.5 infers the value to 0 (the normal scaling-and-transform
+//! path). The new public surface:
+//! [`CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX`] (= 1, Table 9-43 shape) and
+//! [`CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS`] (= 1);
+//! [`cu_transquant_bypass_flag_ctx_inc`] returns the Table 9-48 bin-0
+//! `ctxInc = 0`; [`decode_cu_transquant_bypass_flag`] drives one
+//! [`CabacEngine::decode_decision`] against the caller's context and
+//! returns the decoded `u8`; [`cu_transquant_bypass_flag_inferred`]
+//! surfaces the §7.4.9.5 "PPS gate off ⇒ value is 0" inference as a
+//! pure helper for callers that branch on the PPS without entering
+//! the engine.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -645,6 +669,76 @@ pub fn decode_cu_chroma_qp_offset(
     };
 
     Ok(CuChromaQpOffset { flag, idx })
+}
+
+// ---------------------------------------------------------------------
+// cu_transquant_bypass_flag (§7.3.8.5 coding_unit() / §7.4.9.5)
+// PPS gate: transquant_bypass_enabled_flag (§7.4.3.3.1). Table 9-43
+// FL binarization + Table 9-48 ctxInc + Table 9-8 ctxIdx initValue.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `cu_transquant_bypass_flag`: FL
+/// with `cMax = 1` (a single context-coded bin per CU).
+pub const CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `cu_transquant_bypass_flag`: one
+/// context-coded bin per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `cu_transquant_bypass_flag`. Bin 0
+/// is context-coded with `ctxInc = 0`; every later binIdx column is
+/// `na` (the FL `cMax = 1` shape only emits a single bin).
+///
+/// The flag's Table 9-8 ctxIdx layout (`initValue = 154` at every
+/// initType slot — same `pStateIdx`/`valMps` start at all three
+/// slice-type initialisation rows) is consumed at slice-init scope;
+/// this layer hands back the bank-relative `ctxInc` only.
+#[must_use]
+pub fn cu_transquant_bypass_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.5 — inferred value of `cu_transquant_bypass_flag` when the
+/// PPS gate `transquant_bypass_enabled_flag` is 0 and the element is
+/// not present on the wire. The spec mandates an inferred value of
+/// `0` (normal scaling-and-transform path).
+///
+/// Exposed as a pure helper so the parser can branch on the PPS
+/// without entering the CABAC engine: when the PPS gate is off the
+/// caller skips [`decode_cu_transquant_bypass_flag`] entirely and
+/// records the inferred `0`.
+#[must_use]
+pub fn cu_transquant_bypass_flag_inferred() -> u8 {
+    0
+}
+
+/// Decode `cu_transquant_bypass_flag` (§7.3.8.5 / §7.4.9.5) from the
+/// CABAC engine, consuming one context for the FL bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-8 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place per
+/// §9.3.4.3.2.2 state transition.
+///
+/// The PPS gate `transquant_bypass_enabled_flag` (§7.4.3.3.1) is
+/// upstream of this primitive: when the gate is 0 the parser does
+/// **not** call this function — see [`cu_transquant_bypass_flag_inferred`]
+/// for the §7.4.9.5 inferred value.
+///
+/// Returns the decoded `u8` (0 or 1) — 1 selects the §8.6 / §8.7
+/// transquant-bypass passthrough for the current CU per §7.4.9.5.
+pub fn decode_cu_transquant_bypass_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin uses ctxInc = 0 (a single Table
+    // 9-8 entry) per the Table 9-48 row.
+    debug_assert_eq!(
+        cu_transquant_bypass_flag_ctx_inc(),
+        0,
+        "Table 9-48 row for cu_transquant_bypass_flag: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
 }
 
 // ---------------------------------------------------------------------
@@ -4245,5 +4339,71 @@ mod tests {
                 "remaining = {remaining}, baseLevel = {base_level}, sign = {sign_flag}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // cu_transquant_bypass_flag (§7.3.8.5 / §7.4.9.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cu_transquant_bypass_flag_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for cu_transquant_bypass_flag: bin 0 ctxInc
+        // = 0; all later binIdx columns are na.
+        assert_eq!(cu_transquant_bypass_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn cu_transquant_bypass_flag_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX, 1);
+        assert_eq!(CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn cu_transquant_bypass_flag_inferred_is_zero_per_7_4_9_5() {
+        // §7.4.9.5: when transquant_bypass_enabled_flag (PPS) is 0
+        // the flag is not present and inferred to 0 — the normal
+        // scaling-and-transform path.
+        assert_eq!(cu_transquant_bypass_flag_inferred(), 0);
+    }
+
+    #[test]
+    fn decode_cu_transquant_bypass_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the
+        // FL flag decodes to 0 (the §8.6 / §8.7 normal path stays).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_cu_transquant_bypass_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn decode_cu_transquant_bypass_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the
+        // FL flag decodes to 1 (the §7.4.9.5 / §8.6 / §8.7 bypass
+        // passthrough is selected for the current CU).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_cu_transquant_bypass_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    #[test]
+    fn decode_cu_transquant_bypass_flag_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on
+        // the same engine each consume exactly one bin (Table 9-43
+        // FL cMax = 1). The second call's outcome is independent of
+        // the first since the contexts are separate.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_cu_transquant_bypass_flag(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_cu_transquant_bypass_flag(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
     }
 }
