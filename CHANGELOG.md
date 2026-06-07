@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 35 (2026-06-07)
+
+- §9.3.4.2 / Table 9-48 `coeff_sign_flag[ n ]` derivation lands in
+  the [`binarization`] module — the per-scan-position sign bit that
+  pairs with the round-34 `coeff_abs_level_remaining[ n ]` magnitude
+  to form the signed transform-coefficient level per §7.4.9.11. The
+  element is fully bypass-coded (Table 9-48 marks bin 0 `bypass`, all
+  later bin-index columns `na`) and FL binarized with `cMax = 1`
+  (Table 9-43), so the on-wire string is exactly one bin per
+  invocation.
+  - [`binarization::COEFF_SIGN_FLAG_FL_CMAX`] — Table 9-43 shape:
+    `cMax = 1`.
+  - [`binarization::COEFF_SIGN_FLAG_FL_NBITS`] — §9.3.3.5
+    `fixedLength = Ceil(Log2(cMax + 1))` collapsed to the
+    `cMax = 1` constant `1`.
+  - [`binarization::decode_coeff_sign_flag`] — reads one
+    [`CabacEngine::decode_bypass`] bin from the
+    post-§9.3.4.3.6-alignment engine state and returns the
+    per-scan-position sign bit (`0` ⇒ positive, `1` ⇒ negative per
+    §7.4.9.11).
+  - [`binarization::signed_level_from_sign_flag`] — composes the
+    §7.4.9.11 signed level via the `(1 − 2 * coeff_sign_flag[n])`
+    factor: `sign_flag == 0 ⇒ +abs_level`, `sign_flag == 1 ⇒
+    −abs_level`. Returns `i32` so the high-bit-depth `|level|` range
+    up to `CoeffMax = (1 << 15) − 1` survives composition before the
+    §7.4.9.11 / Annex A `[CoeffMin, CoeffMax]` clip.
+- The §9.3.4.3.6 alignment process (`ivlCurrRange := 256`) remains
+  a slice-data-loop scope responsibility — the per-flag entry point
+  expects [`CabacEngine::align`] to have already been invoked at the
+  start of the bypass-coded tail of the current transform block.
+- Test count: 350 → 359 (+9 new `coeff_sign_flag` tests covering
+  the Table 9-43 FL shape + §9.3.3.5 fixedLength derivation
+  cross-check; positive-branch identity sweep (sign_flag = 0 across
+  5 anchors `{0, 1, 7, 127, 32_767}`); negative-branch identity
+  sweep (sign_flag = 1, same anchors); inverse-identity
+  (`signed(abs, 0) + signed(abs, 1) == 0` across 9 levels including
+  `0 / 1 / 2 / 5 / 17 / 42 / 255 / 1023 / 65535`); high-bit-depth
+  `[CoeffMin, CoeffMax]` round-trip (16-bit `|level| = 32_768`
+  recovers under sign_flag = 1); the bypass-bin zero-output anchor
+  (post-`align()` all-zero stream ⇒ bin 0); the well-typed-output
+  anchor (output always in `{0, 1}` regardless of stream contents);
+  the wrapper-vs-direct-`decode_bypass` agreement across 8 bins of
+  a `5a a5 3c c3` seed (the wrapper is exactly the underlying
+  bypass primitive); and the §7.4.9.11 residual-loop composition
+  table (`baseLevel ∈ {1, 2, 3}` × `remaining ∈ {0, 1, 5, 17}` ×
+  `sign ∈ {0, 1}`, 10 anchors).
+
 ### Added — clean-room rebuild round 34 (2026-06-05)
 
 - §9.3.3.11 `coeff_abs_level_remaining[ n ]` Rice-adaptive

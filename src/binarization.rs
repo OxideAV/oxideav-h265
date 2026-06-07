@@ -281,6 +281,22 @@
 //! the SCC `StatCoeff[sbType]` state via eq. 9-22/9-23) is left for
 //! a follow-up round; the non-persistent branch is the Main-profile
 //! path the slice-data parser drives by default.
+//!
+//! Round 35 adds the §9.3.4.2 / Table 9-48 entry for
+//! `coeff_sign_flag[ n ]` — the per-scan-position sign bit that
+//! pairs with `coeff_abs_level_remaining[ n ]` to form the signed
+//! transform-coefficient level per §7.4.9.11. The element is fully
+//! bypass-coded (Table 9-48 marks bin 0 `bypass`, all later columns
+//! `na`) and FL binarized with `cMax = 1` (Table 9-43), so the
+//! on-wire string is a single bin per invocation. The §9.3.4.3.6
+//! alignment process (`ivlCurrRange := 256`) runs prior to the
+//! bypass tail at slice-data-loop scope; the per-flag entry point
+//! [`decode_coeff_sign_flag`] consumes one [`CabacEngine::decode_bypass`]
+//! bin from the post-alignment engine state. The signed level is
+//! composed via [`signed_level_from_sign_flag`] applying the
+//! §7.4.9.11 `(1 − 2 * coeff_sign_flag[n])` factor; the FL shape
+//! is captured as [`COEFF_SIGN_FLAG_FL_CMAX`] +
+//! [`COEFF_SIGN_FLAG_FL_NBITS`].
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1878,6 +1894,84 @@ pub fn decode_coeff_abs_level_remaining(
     c_rice_param: u32,
 ) -> Result<u32, CabacError> {
     decode_coeff_abs_level_remaining_with(c_rice_param, || engine.decode_bypass())
+}
+
+// ---------------------------------------------------------------------
+// coeff_sign_flag[ n ] — §7.3.8.11 / §7.4.9.11 / Table 9-43 / Table 9-48
+// ---------------------------------------------------------------------
+
+/// §9.3.3.5 / Table 9-43 — `coeff_sign_flag[ n ]` binarization shape.
+///
+/// Fixed-length with `cMax = 1` — a single bin per scan position. The
+/// spec's §9.3.3.5 derivation gives `fixedLength = Ceil(Log2(cMax + 1))
+/// = Ceil(Log2(2)) = 1`, so the on-wire string is exactly one bit
+/// whose value is the flag itself.
+pub const COEFF_SIGN_FLAG_FL_CMAX: u32 = 1;
+/// §9.3.3.5 — bit width of the FL string for `coeff_sign_flag[ n ]`.
+///
+/// `Ceil(Log2(COEFF_SIGN_FLAG_FL_CMAX + 1)) = 1`. Exposed so callers
+/// composing the slice-data bypass tail can iterate the per-scan-position
+/// sign bits without re-deriving the FL width.
+pub const COEFF_SIGN_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2 / Table 9-48 — `coeff_sign_flag[ n ]` is fully bypass-coded.
+///
+/// Table 9-48 marks the bin-0 cell `bypass` and all subsequent bin-index
+/// columns `na`; there is one bin per invocation and it carries no
+/// context coupling.
+///
+/// Returns the per-scan-position sign bit: `0` ⇒ positive,
+/// `1` ⇒ negative (per §7.4.9.11). The signed transform-coefficient
+/// level the slice-data residual loop emits is then
+/// `(coeff_abs_level_remaining[n] + baseLevel) * (1 − 2 *
+/// coeff_sign_flag[n])`; see [`signed_level_from_sign_flag`] for the
+/// arithmetic helper.
+///
+/// §9.3.4.3.6 specifies an alignment process that runs prior to
+/// bypass decoding of `coeff_abs_level_remaining[ ]` and
+/// `coeff_sign_flag[ ]` (`ivlCurrRange := 256`); the slice-data parser
+/// invokes [`CabacEngine::align`] once at the start of the bypass
+/// run, so this entry point reads a single bypass bin via the
+/// post-alignment engine state.
+pub fn decode_coeff_sign_flag(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    engine.decode_bypass()
+}
+
+/// §7.4.9.11 — compose the signed transform-coefficient level from the
+/// unsigned `cAbsLevel` (`baseLevel + coeff_abs_level_remaining[n]`)
+/// and the per-scan-position `coeff_sign_flag[n]`.
+///
+/// Implements `level * (1 − 2 * sign_flag)`:
+///
+/// * `sign_flag == 0` ⇒ the level is positive, returns `+abs_level`.
+/// * `sign_flag == 1` ⇒ the level is negative, returns `-abs_level`.
+///
+/// Inputs:
+///
+/// * `abs_level` — the unsigned absolute level emitted by the
+///   §7.3.8.11 residual loop (`baseLevel` plus, when present,
+///   [`decode_coeff_abs_level_remaining`]'s output).
+/// * `sign_flag` — the per-scan-position bin read via
+///   [`decode_coeff_sign_flag`] (or inferred to `0` per §7.4.9.11
+///   when the syntax element is not present).
+///
+/// The §7.4.9.11 sign-data-hiding adjustment (when
+/// `sign_data_hiding_enabled_flag && signHidden` and the
+/// `firstSigScanPos` sum-of-absolute-levels parity is odd) is a
+/// post-step the slice-data loop applies at a different scope and is
+/// **not** folded into this helper.
+///
+/// The return type is `i32` because `coeff_abs_level_remaining[n] +
+/// baseLevel` can exceed `i16::MAX` for high-bit-depth profiles before
+/// the §7.4.9.11 / Annex A clipping to `[CoeffMin, CoeffMax]`.
+#[must_use]
+pub fn signed_level_from_sign_flag(abs_level: u32, sign_flag: u8) -> i32 {
+    let abs_signed = abs_level as i32;
+    if sign_flag == 0 {
+        abs_signed
+    } else {
+        -abs_signed
+    }
 }
 
 #[cfg(test)]
@@ -3704,5 +3798,171 @@ mod tests {
         let buf = [0u8; 16];
         let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
         assert_eq!(decode_coeff_abs_level_remaining(&mut eng, 0).unwrap(), 0);
+    }
+
+    // -------------------------------------------------------------
+    // coeff_sign_flag[ n ] — §7.3.8.11 / §7.4.9.11 / Table 9-43 /
+    // Table 9-48
+    // -------------------------------------------------------------
+
+    #[test]
+    fn coeff_sign_flag_fl_shape_table_9_43() {
+        // Table 9-43: coeff_sign_flag[ ] is FL with cMax = 1; the
+        // §9.3.3.5 fixedLength derivation gives Ceil(Log2(2)) = 1.
+        assert_eq!(COEFF_SIGN_FLAG_FL_CMAX, 1);
+        assert_eq!(COEFF_SIGN_FLAG_FL_NBITS, 1);
+        // §9.3.3.5: fixedLength = Ceil(Log2(cMax + 1)).
+        // For cMax = 1: cMax + 1 = 2, Log2(2) = 1, Ceil = 1.
+        let n_plus_1 = COEFF_SIGN_FLAG_FL_CMAX + 1;
+        // Ceil(Log2(x)) for x >= 1 is `bit_width(x − 1)`, i.e.
+        // `u32::BITS − (x − 1).leading_zeros()` for x >= 2 and
+        // `0` for x == 1.
+        let derived = if n_plus_1 <= 1 {
+            0
+        } else {
+            u32::BITS - (n_plus_1 - 1).leading_zeros()
+        };
+        assert_eq!(derived, COEFF_SIGN_FLAG_FL_NBITS);
+    }
+
+    #[test]
+    fn signed_level_from_sign_flag_positive_branch() {
+        // §7.4.9.11: sign_flag == 0 ⇒ (1 − 2 * 0) = +1, so
+        //   level * (+1) = +abs_level.
+        assert_eq!(signed_level_from_sign_flag(0, 0), 0);
+        assert_eq!(signed_level_from_sign_flag(1, 0), 1);
+        assert_eq!(signed_level_from_sign_flag(7, 0), 7);
+        assert_eq!(signed_level_from_sign_flag(127, 0), 127);
+        assert_eq!(signed_level_from_sign_flag(32_767, 0), 32_767);
+    }
+
+    #[test]
+    fn signed_level_from_sign_flag_negative_branch() {
+        // §7.4.9.11: sign_flag == 1 ⇒ (1 − 2 * 1) = −1, so
+        //   level * (−1) = −abs_level.
+        assert_eq!(signed_level_from_sign_flag(0, 1), 0);
+        assert_eq!(signed_level_from_sign_flag(1, 1), -1);
+        assert_eq!(signed_level_from_sign_flag(7, 1), -7);
+        assert_eq!(signed_level_from_sign_flag(127, 1), -127);
+        assert_eq!(signed_level_from_sign_flag(32_767, 1), -32_767);
+    }
+
+    #[test]
+    fn signed_level_from_sign_flag_inverse_identity() {
+        // For every abs_level in a representative sweep:
+        //   signed(abs, 1) == −signed(abs, 0).
+        // Confirms the (1 − 2 * sign_flag) factor is the only
+        // difference between the two branches.
+        for level in [0u32, 1, 2, 5, 17, 42, 255, 1_023, 65_535] {
+            let pos = signed_level_from_sign_flag(level, 0);
+            let neg = signed_level_from_sign_flag(level, 1);
+            assert_eq!(pos + neg, 0, "level = {level}");
+        }
+    }
+
+    #[test]
+    fn signed_level_from_sign_flag_high_bit_depth_range() {
+        // High-bit-depth profiles (Main 4:4:4 12 / 14, RExt 16-bit) can
+        // produce |level| up to CoeffMax = (1 << 15) − 1 = 32_767 for
+        // 16-bit coding under the §A.4.2 transform bit-depth bounds,
+        // and CoeffMin ≥ −(1 << 15) = −32_768. The helper must round-
+        // trip across that full range without saturation.
+        let max = (1i32 << 15) - 1;
+        let min = -(1i32 << 15);
+        assert_eq!(signed_level_from_sign_flag(max as u32, 0), max);
+        assert_eq!(signed_level_from_sign_flag(max as u32, 1), -max);
+        // Magnitude of CoeffMin = 32_768 → encode with sign_flag = 1.
+        assert_eq!(
+            signed_level_from_sign_flag((-min) as u32, 1),
+            min,
+            "CoeffMin recovers when |level| = 32_768"
+        );
+    }
+
+    #[test]
+    fn decode_coeff_sign_flag_reads_one_bypass_bin_zero() {
+        // §9.3.4.2 / Table 9-48: the element is fully bypass-coded
+        // (bin 0 = bypass; all subsequent bin indices are `na`). One
+        // §9.3.4.3.4 DecodeBypass invocation reproduces the wire bit.
+        //
+        // An all-zero NAL body, after §9.3.4.3.6 alignment, is
+        // decoded by the §9.3.4.3.4 bypass routine as a 0 bin per
+        // the `ivlOffset < ivlCurrRange` (= 256) test: doubling a
+        // zero offset and OR-ing in a zero stream bit yields 0,
+        // which is below the post-double range 512.
+        let buf = [0u8; 16];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        eng.align();
+        assert_eq!(decode_coeff_sign_flag(&mut eng).unwrap(), 0);
+    }
+
+    #[test]
+    fn decode_coeff_sign_flag_well_typed_output() {
+        // §9.3.4.3.4 bypass decode: `decode_bypass` always returns
+        // a value in `{0, 1}` regardless of stream contents, since
+        // the routine compares `ivl_offset` against `ivl_curr_range`
+        // and returns 0 or 1 only. Strict-bit recovery from the
+        // wire is exercised by the cabac-module bypass tests; this
+        // test confirms the wrapper threads through without altering
+        // the output range.
+        let mut buf = [0u8; 16];
+        buf[1] = 0x40;
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        eng.align();
+        let bin = decode_coeff_sign_flag(&mut eng).unwrap();
+        assert!(bin == 0 || bin == 1);
+    }
+
+    #[test]
+    fn decode_coeff_sign_flag_matches_underlying_decode_bypass() {
+        // The wrapper is `engine.decode_bypass()` — these two paths
+        // must produce identical sequences when fed the same engine
+        // state. Confirm via two engines initialised from the same
+        // buffer: the first runs the wrapper N times; the second
+        // runs `decode_bypass` N times; the bin sequences agree.
+        let mut buf = [0u8; 16];
+        buf[0] = 0x5a;
+        buf[1] = 0xa5;
+        buf[2] = 0x3c;
+        buf[3] = 0xc3;
+
+        let mut eng_a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut eng_b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        eng_a.align();
+        eng_b.align();
+        for _ in 0..8 {
+            let via_wrapper = decode_coeff_sign_flag(&mut eng_a).unwrap();
+            let via_direct = eng_b.decode_bypass().unwrap();
+            assert_eq!(via_wrapper, via_direct);
+        }
+    }
+
+    #[test]
+    fn signed_level_composition_residual_loop_anchors() {
+        // §7.4.9.11 final composition anchors. baseLevel ∈ {1, 2, 3}
+        // (1 = greater1==0 fast path; 2 = greater1==1 / greater2==0;
+        // 3 = greater1==1 && greater2==1 at lastGreater1ScanPos);
+        // coeff_abs_level_remaining[n] ∈ {0, 1, 5, 17}; sign ∈ {0, 1}.
+        // The full level is `(remaining + baseLevel) * (1 − 2 * sign)`.
+        let cases: &[(u32, u32, u8, i32)] = &[
+            (0, 1, 0, 1),
+            (0, 1, 1, -1),
+            (0, 3, 0, 3),
+            (0, 3, 1, -3),
+            (1, 2, 0, 3),
+            (1, 2, 1, -3),
+            (5, 1, 0, 6),
+            (5, 1, 1, -6),
+            (17, 3, 0, 20),
+            (17, 3, 1, -20),
+        ];
+        for &(remaining, base_level, sign_flag, expected) in cases {
+            let abs_level = remaining + base_level;
+            let got = signed_level_from_sign_flag(abs_level, sign_flag);
+            assert_eq!(
+                got, expected,
+                "remaining = {remaining}, baseLevel = {base_level}, sign = {sign_flag}"
+            );
+        }
     }
 }

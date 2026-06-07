@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 34 (2026-06-05).** The prior implementation was
+**Clean-room rebuild — round 35 (2026-06-07).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,48 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 34 adds the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 35 closes the
+sign half of the §7.4.9.11 residual-coding magnitude tail: the
+§9.3.4.2 / Table 9-48 `coeff_sign_flag[ n ]` derivation — the
+per-scan-position sign bit that pairs with the round-34
+`coeff_abs_level_remaining[ n ]` magnitude to compose the signed
+transform-coefficient level. The element is fully bypass-coded
+(Table 9-48 marks bin 0 `bypass`, all later bin-index columns `na`)
+and FL binarized with `cMax = 1` (Table 9-43), so the on-wire string
+is one bin per invocation. The new public surface:
+[`binarization::COEFF_SIGN_FLAG_FL_CMAX`] (= 1, the Table 9-43 shape)
+and [`binarization::COEFF_SIGN_FLAG_FL_NBITS`] (= 1, the §9.3.3.5
+`fixedLength = Ceil(Log2(cMax + 1))` derivation collapsed to a
+constant); [`binarization::decode_coeff_sign_flag`] reads one
+[`CabacEngine::decode_bypass`] bin from the post-§9.3.4.3.6-alignment
+engine state and returns the per-scan-position sign bit; and
+[`binarization::signed_level_from_sign_flag`] composes the signed
+level via the §7.4.9.11 `(1 − 2 * coeff_sign_flag[n])` factor —
+`sign_flag == 0 ⇒ +abs_level`, `sign_flag == 1 ⇒ −abs_level` — with
+an `i32` return type so the high-bit-depth `|level|` range up to
+`CoeffMax = (1 << 15) − 1` survives the composition before the
+§7.4.9.11 / Annex A clipping. Total tests now 359 (was 350): 9 new
+tests cover the Table 9-43 FL shape (`cMax = 1`, `Ceil(Log2(2)) = 1`
+fixedLength derivation cross-check); the positive-branch identity
+sweep (sign_flag = 0 ⇒ `+abs_level` across 5 anchors); the negative-
+branch identity sweep (sign_flag = 1 ⇒ `−abs_level` across 5 anchors);
+the inverse-identity (`signed(abs, 0) + signed(abs, 1) == 0` across 9
+levels including 0 / 1 / 2 / 5 / 17 / 42 / 255 / 1023 / 65535); the
+high-bit-depth `[CoeffMin, CoeffMax]` range round-trip (16-bit
+`|level| = 32_768` recovers under sign_flag = 1); the bypass-bin
+zero-output anchor (post-`align()` all-zero stream ⇒ bin 0); the
+well-typed-output anchor (output is always in `{0, 1}` regardless of
+stream contents); the wrapper-vs-direct-`decode_bypass` agreement
+across 8 bins of a `5a a5 3c c3` seed (the wrapper is exactly the
+underlying bypass primitive); and the §7.4.9.11 residual-loop
+composition table (`baseLevel ∈ {1, 2, 3}` × `remaining ∈ {0, 1, 5,
+17}` × `sign ∈ {0, 1}`, 10 anchors). The §9.3.4.3.6 alignment is a
+slice-data-loop scope responsibility (one `CabacEngine::align`
+invocation transitions the engine to bypass mode for the full
+bypass tail of one transform block); the per-flag entry point
+expects that alignment has already been performed.
+
+Round 34 had added the
 §9.3.3.11 `coeff_abs_level_remaining[ n ]` Rice-adaptive binarization
 and bypass decode primitive — the residual-coding magnitude tail the
 §7.3.8.11 loop emits when the absolute level exceeds the greater-1 /
@@ -1269,12 +1310,15 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   availableA)`). Round 30 lands the §7.3.4 `sao()` family's Table 9-48
   ctxInc + Table 9-43 binarization shapes (merge flags,
   `sao_type_idx_{luma,chroma}`, `sao_offset_abs`, `sao_offset_sign`,
-  `sao_band_position`, `sao_eo_class_{luma,chroma}`). Still to land —
-  every other §9.3.4.2 syntax element:
+  `sao_band_position`, `sao_eo_class_{luma,chroma}`). Round 34 lands
+  `coeff_abs_level_remaining` (§9.3.3.11 non-persistent Rice path);
+  round 35 lands `coeff_sign_flag` (§9.3.4.2 / Table 9-48 fully
+  bypass-coded FL with `cMax = 1`) so the §7.4.9.11 residual-coding
+  signed-level composition has both magnitude and sign primitives in
+  place. Still to land — every other §9.3.4.2 syntax element:
   `sig_coeff_flag` (§9.3.4.2.5; Table 9-50 `ctxIdxMap` requires
   spec-trace confirmation of the i=15 entry — see "Spec gap" in the
-  round-31 report), `coeff_abs_level_remaining` / `coeff_sign_flag`
-  (bypass; §9.3.3.11), prediction-mode / part-mode / merge / merge-idx
+  round-31 report), prediction-mode / part-mode / merge / merge-idx
   flags, motion-vector binarization (`mvd_lX[]` EGk +
   sign), etc. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
   (`coeff_abs_level_greater1_flag` + `_greater2_flag`) via
