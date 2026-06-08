@@ -345,6 +345,28 @@
 //! surfaces the §7.4.9.5 "PPS gate off ⇒ value is 0" inference as a
 //! pure helper for callers that branch on the PPS without entering
 //! the engine.
+//!
+//! Round 38 adds the §9.3.4.2 / Table 9-48 entry for `rqt_root_cbf` —
+//! the inter-CU gate that signals whether the `transform_tree( )`
+//! syntax structure follows the current coding unit (H.265 §7.3.8.5,
+//! §7.4.9.5). Per Table 9-43 the flag is FL with `cMax = 1` (a single
+//! context-coded bin); Table 9-48's row lists `ctxInc = 0` for bin 0
+//! and `na` for every later binIdx column. Table 9-14 supplies a
+//! single ctxIdx slot with `initValue = 79` at both initType 1 and
+//! initType 2 (initType 0 is `na` in Table 9-4 — `rqt_root_cbf` is
+//! only ever read in inter slices, where §7.3.8.5 wires it under
+//! `CuPredMode != MODE_INTRA && !cu_skip_flag`). When the §7.3.8.5
+//! guard fails (intra CU, or skip CU) the flag is not present on the
+//! wire and the §7.4.9.5 inferred value is 1 (the `transform_tree( )`
+//! syntax structure is taken to be present). The new public surface:
+//! [`RQT_ROOT_CBF_FL_CMAX`] (= 1, Table 9-43 shape) and
+//! [`RQT_ROOT_CBF_FL_NBITS`] (= 1); [`rqt_root_cbf_ctx_inc`] returns
+//! the Table 9-48 bin-0 `ctxInc = 0`; [`decode_rqt_root_cbf`] drives
+//! one [`CabacEngine::decode_decision`] against the caller's context
+//! and returns the decoded `u8`; [`rqt_root_cbf_inferred`] surfaces
+//! the §7.4.9.5 "not present ⇒ value is 1" inference as a pure helper
+//! for callers that branch on the §7.3.8.5 guard without entering the
+//! engine.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -737,6 +759,87 @@ pub fn decode_cu_transquant_bypass_flag(
         cu_transquant_bypass_flag_ctx_inc(),
         0,
         "Table 9-48 row for cu_transquant_bypass_flag: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
+// rqt_root_cbf (§7.3.8.5 coding_unit() / §7.4.9.5)
+// Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-14 ctxIdx
+// initValue. Present only when the current coding unit is not
+// IntraPredMode (i.e. CuPredMode == MODE_INTER) and the cu_skip_flag
+// is 0; absent ⇒ inferred to 1 (the §7.4.9.5 / 2021 spec wording).
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `rqt_root_cbf`: FL with `cMax = 1`
+/// (a single context-coded bin per inter CU). Marks whether the
+/// `transform_tree( )` syntax structure is present for the current
+/// coding unit (§7.4.9.5).
+pub const RQT_ROOT_CBF_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `rqt_root_cbf`: one context-coded bin
+/// per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const RQT_ROOT_CBF_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `rqt_root_cbf`. Bin 0 is
+/// context-coded with `ctxInc = 0`; every later binIdx column is `na`
+/// (the FL `cMax = 1` shape only emits a single bin).
+///
+/// The flag's Table 9-14 ctxIdx layout has only the initType 1 and
+/// initType 2 slots populated (`initValue = 79` at both); initType 0
+/// is `na` per Table 9-4, since `rqt_root_cbf` is only ever read in
+/// inter slices (§7.3.8.5 routes the read under
+/// `CuPredMode != MODE_INTRA && !cu_skip_flag`). This layer hands back
+/// the bank-relative `ctxInc` only; the Table 9-14 initValue plus
+/// Table 9-4 initType-to-ctxIdx mapping is consumed at slice-init
+/// scope.
+#[must_use]
+pub fn rqt_root_cbf_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.5 — inferred value of `rqt_root_cbf` when the element is not
+/// present on the wire. The 2021 spec wording (V8/v8.0) mandates an
+/// inferred value of `1` (the `transform_tree( )` syntax structure is
+/// taken to be present); the V11/2026 revision conditions the
+/// inference on `!DcOnlyFlag[ x0 ][ y0 ]`, but the V8 baseline this
+/// rebuild targets is the unconditional 1.
+///
+/// Exposed as a pure helper so the parser can branch without entering
+/// the CABAC engine when the §7.3.8.5 guard (`CuPredMode == MODE_INTRA
+/// || cu_skip_flag == 1`) selects the not-present path.
+#[must_use]
+pub fn rqt_root_cbf_inferred() -> u8 {
+    1
+}
+
+/// Decode `rqt_root_cbf` (§7.3.8.5 / §7.4.9.5) from the CABAC engine,
+/// consuming one context for the FL bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-14 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place per
+/// §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.5 guard (`CuPredMode != MODE_INTRA && !cu_skip_flag`) is
+/// upstream of this primitive: when the guard fails the parser does
+/// **not** call this function — see [`rqt_root_cbf_inferred`] for the
+/// §7.4.9.5 inferred value.
+///
+/// Returns the decoded `u8` (0 or 1) — 1 means the `transform_tree( )`
+/// syntax structure follows the current coding-unit body; 0 means the
+/// CU has no transform-tree (samples derive from prediction only per
+/// §7.4.9.5).
+pub fn decode_rqt_root_cbf(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin uses ctxInc = 0 (a single Table
+    // 9-14 entry) per the Table 9-48 row.
+    debug_assert_eq!(
+        rqt_root_cbf_ctx_inc(),
+        0,
+        "Table 9-48 row for rqt_root_cbf: bin 0 ctxInc = 0"
     );
     engine.decode_decision(ctx)
 }
@@ -4405,5 +4508,87 @@ mod tests {
         let b = decode_cu_transquant_bypass_flag(&mut eng, &mut ctx_b).unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // rqt_root_cbf (§7.3.8.5 / §7.4.9.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rqt_root_cbf_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for rqt_root_cbf: bin 0 ctxInc = 0; every
+        // later binIdx column is na (Table 9-43 FL cMax = 1 — only
+        // one bin is ever emitted).
+        assert_eq!(rqt_root_cbf_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn rqt_root_cbf_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(RQT_ROOT_CBF_FL_CMAX, 1);
+        assert_eq!(RQT_ROOT_CBF_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn rqt_root_cbf_inferred_is_one_per_7_4_9_5() {
+        // §7.4.9.5 (V8 / 2021 baseline): when rqt_root_cbf is not
+        // present (the §7.3.8.5 guard CuPredMode == MODE_INTRA ||
+        // cu_skip_flag == 1 selects the not-present path), the value
+        // is inferred to 1 — the transform_tree() syntax structure is
+        // taken to be present.
+        assert_eq!(rqt_root_cbf_inferred(), 1);
+    }
+
+    #[test]
+    fn decode_rqt_root_cbf_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the
+        // FL flag decodes to 0 (CU has no transform_tree per §7.4.9.5
+        // — samples derive from prediction only).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_rqt_root_cbf(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn decode_rqt_root_cbf_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the
+        // FL flag decodes to 1 (the transform_tree() syntax structure
+        // follows the current coding-unit body per §7.4.9.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_rqt_root_cbf(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    #[test]
+    fn decode_rqt_root_cbf_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on
+        // the same engine each consume exactly one bin (Table 9-43
+        // FL cMax = 1). The second call's outcome is independent of
+        // the first since the contexts are separate.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_rqt_root_cbf(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_rqt_root_cbf(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+    }
+
+    #[test]
+    fn rqt_root_cbf_inferred_distinguishes_from_transquant_bypass() {
+        // rqt_root_cbf (not present ⇒ inferred to 1, §7.4.9.5) vs.
+        // cu_transquant_bypass_flag (PPS gate off ⇒ inferred to 0,
+        // §7.4.9.5). The two flags share the same §7.4.9.5 reference
+        // but their not-present-inference branches in opposite
+        // directions; this anchor pins both values against any
+        // accidental cross-wiring.
+        assert_eq!(rqt_root_cbf_inferred(), 1);
+        assert_eq!(cu_transquant_bypass_flag_inferred(), 0);
     }
 }

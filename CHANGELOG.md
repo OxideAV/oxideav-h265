@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 38 (2026-06-08)
+
+- §9.3.4.2 / Table 9-48 entry for `rqt_root_cbf` lands in the
+  [`binarization`] module — the inter-CU gate that signals whether the
+  `transform_tree( )` syntax structure follows the current coding unit
+  (H.265 §7.3.8.5, §7.4.9.5). Per Table 9-43 the flag is FL with
+  `cMax = 1` (a single context-coded bin); Table 9-48's row lists
+  `ctxInc = 0` for bin 0 and `na` for every later binIdx column.
+  Table 9-14 supplies a single ctxIdx slot with `initValue = 79` at
+  both initType 1 and initType 2 (initType 0 is `na` per Table 9-4 —
+  `rqt_root_cbf` is only ever read in inter slices). The §7.3.8.5
+  guard is `CuPredMode != MODE_INTRA && !cu_skip_flag`: the flag is
+  read only when that guard holds, otherwise §7.4.9.5 (V8 / 2021
+  baseline) infers the value to 1 (the `transform_tree( )` syntax
+  structure is taken to be present).
+  - [`binarization::RQT_ROOT_CBF_FL_CMAX`] — Table 9-43 shape:
+    `cMax = 1`.
+  - [`binarization::RQT_ROOT_CBF_FL_NBITS`] — §9.3.3.5
+    `Ceil(Log2(cMax + 1))` collapsed to the `cMax = 1` constant `1`.
+  - [`binarization::rqt_root_cbf_ctx_inc`] — Table 9-48 bin-0 row:
+    `ctxInc = 0` (single Table 9-14 ctxIdx slot).
+  - [`binarization::rqt_root_cbf_inferred`] — §7.4.9.5 inferred-value
+    helper (`1` — the spec-mandated default when the §7.3.8.5 guard
+    fails and the element is not present on the wire).
+  - [`binarization::decode_rqt_root_cbf`] — engine-driven decode
+    primitive that reads the single FL bin using the caller-allocated
+    single Table 9-14 context and returns the decoded `u8`.
+
 ### Added — clean-room rebuild round 37 (2026-06-08)
 
 - §9.3.4.2 / Table 9-48 entry for `cu_transquant_bypass_flag` lands

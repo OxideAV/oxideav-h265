@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 37 (2026-06-08).** The prior implementation was
+**Clean-room rebuild — round 38 (2026-06-08).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,42 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 37 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 38 lands the
+§9.3.4.2 / Table 9-48 entry for `rqt_root_cbf` — the inter-CU gate
+that signals whether the `transform_tree( )` syntax structure follows
+the current coding unit (§7.3.8.5, §7.4.9.5). Per Table 9-43 the
+flag is FL with `cMax = 1` (a single context-coded bin); Table 9-48's
+row lists `ctxInc = 0` for bin 0 and `na` for every later binIdx
+column. The single Table 9-14 context entry initialises with
+`initValue = 79` at both initType 1 and initType 2 (initType 0 is
+`na` per Table 9-4 — `rqt_root_cbf` is only ever read in inter
+slices). The §7.3.8.5 guard is `CuPredMode != MODE_INTRA &&
+!cu_skip_flag`: the flag is read from the bitstream only when that
+guard holds, otherwise §7.4.9.5 (V8 / 2021 baseline) infers the value
+to 1 (the `transform_tree( )` syntax structure is taken to be
+present). The new public surface:
+[`binarization::RQT_ROOT_CBF_FL_CMAX`] (= 1, Table 9-43 shape);
+[`binarization::RQT_ROOT_CBF_FL_NBITS`] (= 1, the §9.3.3.5
+`Ceil(Log2(cMax + 1))` derivation collapsed to a constant);
+[`binarization::rqt_root_cbf_ctx_inc`] (returns 0 — the Table 9-48
+bin-0 row); [`binarization::rqt_root_cbf_inferred`] (returns 1 — the
+§7.4.9.5 inferred-value helper for callers that branch on the
+§7.3.8.5 guard without entering the engine); and
+[`binarization::decode_rqt_root_cbf`] driving the §9.3 CABAC engine
+to consume one FL bin against the single Table 9-14 context,
+returning the decoded `u8`. Total tests now 380 (was 373): 7 new
+tests cover the Table 9-48 `ctxInc = 0` anchor; the Table 9-43 FL
+shape (`cMax = 1`, `Ceil(Log2(2)) = 1` `nBits` cross-check); the
+§7.4.9.5 inferred-value invariant (= 1); the engine-driven decode
+for the valMps = 0 and valMps = 1 contexts; the
+exactly-one-bin-per-invocation anchor across two back-to-back
+contexts on the same engine; and a cross-check that
+`rqt_root_cbf_inferred()` and `cu_transquant_bypass_flag_inferred()`
+branch in opposite directions (1 vs. 0) despite both citing §7.4.9.5
+— a guard against accidental cross-wiring of the two adjacent
+not-present-inference helpers.
+
+Round 37 had landed the
 §9.3.4.2 / Table 9-48 entry for `cu_transquant_bypass_flag` — the
 per-CU bypass switch that, when set, replaces the §8.6 / §8.7
 scaling + transform + in-loop-filter path with a verbatim residual
@@ -26,7 +61,7 @@ all three initType slots. The PPS gate is
 `transquant_bypass_enabled_flag` (§7.4.3.3.1): the flag is read from
 the bitstream only when that PPS field is 1, otherwise §7.4.9.5
 infers the value to 0 (the normal scaling-and-transform path). The
-new public surface:
+public surface:
 [`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_CMAX`] (= 1, Table 9-43
 shape); [`binarization::CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS`] (= 1,
 the §9.3.3.5 `Ceil(Log2(cMax + 1))` derivation collapsed to a
@@ -37,13 +72,7 @@ constant); [`binarization::cu_transquant_bypass_flag_ctx_inc`]
 gate without entering the engine); and
 [`binarization::decode_cu_transquant_bypass_flag`] driving the §9.3
 CABAC engine to consume one FL bin against the single Table 9-8
-context, returning the decoded `u8`. Total tests now 373 (was 367):
-6 new tests cover the Table 9-48 `ctxInc = 0` anchor; the Table 9-43
-FL shape (`cMax = 1`, `Ceil(Log2(2)) = 1` `nBits` cross-check); the
-§7.4.9.5 inferred-value invariant; the engine-driven decode for the
-valMps = 0 and valMps = 1 contexts; and the
-exactly-one-bin-per-invocation anchor across two back-to-back
-contexts on the same engine.
+context, returning the decoded `u8`.
 
 Round 36 had landed the
 §9.3.4.2 / Table 9-48 entries for the `cu_chroma_qp_offset_flag` /
