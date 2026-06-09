@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 39 (2026-06-09)
+
+- §9.3.4.2 / Table 9-48 entry for `pred_mode_flag` lands in the
+  [`binarization`] module — the per-CU bit that selects between
+  MODE_INTER (value 0) and MODE_INTRA (value 1) inside a P or B
+  slice (H.265 §7.3.8.5, §7.4.9.5). Per Table 9-43 the flag is FL
+  with `cMax = 1` (a single context-coded bin); Table 9-48's row
+  lists `ctxInc = 0` for bin 0 and `na` for every later binIdx
+  column. Table 9-10 supplies two ctxIdx slots with
+  `initValue = 149` at initType 1 and `initValue = 134` at
+  initType 2 (initType 0 is `na` per Table 9-4 — the §7.3.8.5
+  `slice_type != I` guard skips the read for I slices entirely).
+  When the §7.3.8.5 guard fails the flag is not coded on the wire
+  and §7.4.9.5 derives `CuPredMode` directly: I slice ⇒ MODE_INTRA;
+  P or B slice with `cu_skip_flag == 1` ⇒ MODE_SKIP.
+  - [`binarization::PRED_MODE_FLAG_FL_CMAX`] — Table 9-43 shape:
+    `cMax = 1`.
+  - [`binarization::PRED_MODE_FLAG_FL_NBITS`] — §9.3.3.5
+    `Ceil(Log2(cMax + 1))` collapsed to the `cMax = 1` constant `1`.
+  - [`binarization::pred_mode_flag_ctx_inc`] — Table 9-48 bin-0 row:
+    `ctxInc = 0` (two Table 9-10 ctxIdx slots, selected at slice-init
+    scope by the Table 9-4 initType-to-ctxIdx mapping).
+  - [`binarization::CuPredMode`] — three-variant enum capturing the
+    §7.4.9.5 mapping: `Inter`, `Intra`, `Skip`. The `Skip` variant is
+    reachable only from the not-present inference path on P/B slices.
+  - [`binarization::cu_pred_mode_from_flag`] — present-on-wire
+    mapping: `0 ⇒ MODE_INTER`, `1 ⇒ MODE_INTRA`.
+  - [`binarization::pred_mode_flag_inferred_cu_pred_mode`] — §7.4.9.5
+    not-present derivation: `slice_type == I ⇒ MODE_INTRA`;
+    `slice_type ∈ {P, B} && cu_skip_flag == 1 ⇒ MODE_SKIP`.
+  - [`binarization::decode_pred_mode_flag`] — engine-driven decode
+    primitive that reads the single FL bin using the caller-allocated
+    Table 9-10 context and returns the decoded `u8`.
+
 ### Added — clean-room rebuild round 38 (2026-06-08)
 
 - §9.3.4.2 / Table 9-48 entry for `rqt_root_cbf` lands in the

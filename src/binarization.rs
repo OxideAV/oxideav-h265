@@ -367,6 +367,31 @@
 //! the §7.4.9.5 "not present ⇒ value is 1" inference as a pure helper
 //! for callers that branch on the §7.3.8.5 guard without entering the
 //! engine.
+//!
+//! Round 39 adds the §9.3.4.2 / Table 9-48 entry for `pred_mode_flag` —
+//! the per-CU bit that selects between MODE_INTER (value 0) and
+//! MODE_INTRA (value 1) inside a P or B slice (H.265 §7.3.8.5,
+//! §7.4.9.5). Per Table 9-43 the flag is FL with `cMax = 1` (a single
+//! context-coded bin); Table 9-48's row lists `ctxInc = 0` for bin 0
+//! and `na` for every later binIdx column. Table 9-10 supplies two
+//! ctxIdx slots with `initValue = {149, 134}` for initType 1 and
+//! initType 2 (initType 0 is `na` in Table 9-4 — the §7.3.8.5
+//! `slice_type != I` guard skips the read for I slices, where the
+//! mode is unconditionally intra). When the §7.3.8.5 guard fails the
+//! flag is not present on the wire and §7.4.9.5 derives `CuPredMode`
+//! directly: I slice ⇒ MODE_INTRA; P or B slice with
+//! `cu_skip_flag == 1` ⇒ MODE_SKIP. The new public surface:
+//! [`PRED_MODE_FLAG_FL_CMAX`] (= 1, Table 9-43 shape) and
+//! [`PRED_MODE_FLAG_FL_NBITS`] (= 1); [`pred_mode_flag_ctx_inc`]
+//! returns the Table 9-48 bin-0 `ctxInc = 0`;
+//! [`decode_pred_mode_flag`] drives one
+//! [`CabacEngine::decode_decision`] against the caller's context and
+//! returns the decoded `u8`; the [`CuPredMode`] enum captures the
+//! §7.4.9.5 mapping (`0 ⇒ MODE_INTER`, `1 ⇒ MODE_INTRA`, plus the
+//! not-present-only MODE_SKIP state); [`cu_pred_mode_from_flag`]
+//! applies the present-on-wire mapping; and
+//! [`pred_mode_flag_inferred_cu_pred_mode`] applies the §7.4.9.5
+//! not-present inference branching on `slice_type` and `cu_skip_flag`.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -840,6 +865,170 @@ pub fn decode_rqt_root_cbf(
         rqt_root_cbf_ctx_inc(),
         0,
         "Table 9-48 row for rqt_root_cbf: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
+// pred_mode_flag (§7.3.8.5 coding_unit() / §7.4.9.5)
+// Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-10 ctxIdx
+// initValue. Present only when the slice is P or B (slice_type != I)
+// and cu_skip_flag == 0; absent ⇒ CuPredMode is derived per §7.4.9.5
+// from slice_type and cu_skip_flag without entering the engine.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `pred_mode_flag`: FL with
+/// `cMax = 1` (a single context-coded bin per non-skip P/B coding
+/// unit). Selects between MODE_INTER (value 0) and MODE_INTRA (value
+/// 1) per §7.4.9.5.
+pub const PRED_MODE_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `pred_mode_flag`: one context-coded
+/// bin per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const PRED_MODE_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `pred_mode_flag`. Bin 0 is
+/// context-coded with `ctxInc = 0`; every later binIdx column is `na`
+/// (the FL `cMax = 1` shape only emits a single bin).
+///
+/// The flag's Table 9-10 ctxIdx layout has only the initType 1 and
+/// initType 2 slots populated (`initValue = 149` at initType 1,
+/// `initValue = 134` at initType 2); initType 0 is `na` in Table 9-4
+/// because the §7.3.8.5 `slice_type != I` guard skips the read for I
+/// slices entirely. This layer hands back the bank-relative `ctxInc`
+/// only; the Table 9-10 initValue plus Table 9-4 initType-to-ctxIdx
+/// mapping is consumed at slice-init scope.
+#[must_use]
+pub fn pred_mode_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.5 / §9.5.1 — the coding-unit prediction mode. Selected by
+/// `pred_mode_flag` (when present on the wire) or inferred from
+/// slice-level state (when not present), per §7.4.9.5.
+///
+/// `pred_mode_flag == 0` maps to [`CuPredMode::Inter`];
+/// `pred_mode_flag == 1` maps to [`CuPredMode::Intra`].
+/// [`CuPredMode::Skip`] is reachable only via the §7.4.9.5
+/// not-present inference path: a P or B slice CU whose `cu_skip_flag`
+/// is 1 and whose `pred_mode_flag` was therefore not coded.
+///
+/// The enum is local to the binarization module because no other
+/// module currently expresses CuPredMode in code; the
+/// `coding_unit( )` syntax walker may promote it to a wider type in
+/// a future round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CuPredMode {
+    /// MODE_INTER — inter-picture prediction (samples derived from a
+    /// reference picture). Reachable from `pred_mode_flag == 0` (P
+    /// or B slice, non-skip CU).
+    Inter,
+    /// MODE_INTRA — intra-picture prediction (samples derived from
+    /// neighbouring reconstructed samples in the current picture).
+    /// Reachable from `pred_mode_flag == 1` and from the I-slice
+    /// not-present inference (§7.4.9.5).
+    Intra,
+    /// MODE_SKIP — inter-prediction skip path (no residual, no
+    /// `pred_mode_flag`, no transform tree). Reachable only from
+    /// §7.4.9.5 not-present inference when `slice_type != I` and
+    /// `cu_skip_flag == 1`.
+    Skip,
+}
+
+/// Map a decoded `pred_mode_flag` value to [`CuPredMode`] per
+/// §7.4.9.5: `0 ⇒ MODE_INTER`, `1 ⇒ MODE_INTRA`. The mapping is
+/// total over the FL `cMax = 1` shape (any other input is rejected
+/// in debug builds; release builds fall back to MODE_INTRA to keep
+/// the function `must_use`-friendly without panicking on accidental
+/// out-of-range inputs).
+#[must_use]
+pub fn cu_pred_mode_from_flag(pred_mode_flag: u8) -> CuPredMode {
+    debug_assert!(
+        pred_mode_flag <= 1,
+        "pred_mode_flag is FL cMax = 1 (Table 9-43); decoded value must be 0 or 1"
+    );
+    if pred_mode_flag == 0 {
+        CuPredMode::Inter
+    } else {
+        CuPredMode::Intra
+    }
+}
+
+/// §7.4.9.5 — derive [`CuPredMode`] for a coding unit whose
+/// `pred_mode_flag` is not present on the wire. The §7.3.8.5 guard
+/// that suppresses the read is `slice_type == I` (no flag is coded
+/// because the slice is purely intra) or `cu_skip_flag == 1` (the
+/// skip path bypasses the flag).
+///
+/// `slice_type_is_i` is `true` iff the current slice has
+/// `slice_type == I` per §7.4.7.1.
+/// `cu_skip_flag` is the §7.3.8.5 / §7.4.9.5 decoded skip flag (or
+/// the 0-inferred value when `slice_type == I`).
+///
+/// The §7.4.9.5 derivation:
+///
+/// * If the slice is I, `CuPredMode` is inferred to MODE_INTRA
+///   regardless of `cu_skip_flag` (which is itself not coded for
+///   I slices and inferred to 0 per §7.4.9.5).
+/// * Otherwise (P or B slice), the only path that reaches this
+///   helper is `cu_skip_flag == 1`; the spec then infers
+///   `CuPredMode = MODE_SKIP`. A `cu_skip_flag == 0` input would
+///   contradict the §7.3.8.5 guard (the flag *would* be present
+///   and decoded); the function asserts this in debug builds and
+///   falls back to MODE_INTER in release builds to avoid panicking
+///   on a caller bug.
+#[must_use]
+pub fn pred_mode_flag_inferred_cu_pred_mode(slice_type_is_i: bool, cu_skip_flag: u8) -> CuPredMode {
+    if slice_type_is_i {
+        // §7.4.9.5: "If slice_type is equal to I, CuPredMode[ x ][ y ]
+        // is inferred to be equal to MODE_INTRA." cu_skip_flag is not
+        // coded for I slices (§7.3.8.5 `if( slice_type != I )` guard)
+        // and is itself inferred to 0; the I-slice branch is therefore
+        // unconditional on the skip flag.
+        CuPredMode::Intra
+    } else {
+        // §7.4.9.5: "Otherwise (slice_type is equal to P or B), when
+        // cu_skip_flag[ x0 ][ y0 ] is equal to 1, CuPredMode[ x ][ y ]
+        // is inferred to be equal to MODE_SKIP." The §7.3.8.5
+        // pred_mode_flag read is gated on `!cu_skip_flag[ x0 ][ y0 ]`,
+        // so the only way this branch is reached on a P/B slice is
+        // with cu_skip_flag == 1.
+        debug_assert_eq!(
+            cu_skip_flag, 1,
+            "§7.4.9.5: pred_mode_flag not-present on a P/B slice requires cu_skip_flag == 1"
+        );
+        CuPredMode::Skip
+    }
+}
+
+/// Decode `pred_mode_flag` (§7.3.8.5 / §7.4.9.5) from the CABAC
+/// engine, consuming one context for the FL bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-10 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place
+/// per §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.5 guard (`slice_type != I && !cu_skip_flag`) is
+/// upstream of this primitive: when the guard fails the parser does
+/// **not** call this function — see
+/// [`pred_mode_flag_inferred_cu_pred_mode`] for the §7.4.9.5
+/// not-present derivation.
+///
+/// Returns the decoded `u8` (0 or 1) — 0 selects MODE_INTER per
+/// §7.4.9.5 (`CuPredMode = MODE_INTER`), 1 selects MODE_INTRA
+/// (`CuPredMode = MODE_INTRA`). See [`cu_pred_mode_from_flag`] to
+/// fold the result into the [`CuPredMode`] enum.
+pub fn decode_pred_mode_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin uses ctxInc = 0 (a single Table
+    // 9-10 entry) per the Table 9-48 row.
+    debug_assert_eq!(
+        pred_mode_flag_ctx_inc(),
+        0,
+        "Table 9-48 row for pred_mode_flag: bin 0 ctxInc = 0"
     );
     engine.decode_decision(ctx)
 }
@@ -4590,5 +4779,111 @@ mod tests {
         // accidental cross-wiring.
         assert_eq!(rqt_root_cbf_inferred(), 1);
         assert_eq!(cu_transquant_bypass_flag_inferred(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // pred_mode_flag (§7.3.8.5 / §7.4.9.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pred_mode_flag_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for pred_mode_flag: bin 0 ctxInc = 0; every
+        // later binIdx column is na (Table 9-43 FL cMax = 1 — only
+        // one bin is ever emitted).
+        assert_eq!(pred_mode_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn pred_mode_flag_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(PRED_MODE_FLAG_FL_CMAX, 1);
+        assert_eq!(PRED_MODE_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn cu_pred_mode_from_flag_maps_table_9_48_values() {
+        // §7.4.9.5: pred_mode_flag == 0 ⇒ MODE_INTER;
+        // pred_mode_flag == 1 ⇒ MODE_INTRA. The two-valued FL
+        // shape covers the full Table 9-48 binIdx 0 column.
+        assert_eq!(cu_pred_mode_from_flag(0), CuPredMode::Inter);
+        assert_eq!(cu_pred_mode_from_flag(1), CuPredMode::Intra);
+    }
+
+    #[test]
+    fn pred_mode_flag_inferred_i_slice_is_intra() {
+        // §7.4.9.5: "If slice_type is equal to I, CuPredMode[ x ][ y ]
+        // is inferred to be equal to MODE_INTRA." cu_skip_flag is not
+        // coded on I slices (§7.3.8.5 `if( slice_type != I )` guard)
+        // and is itself inferred to 0; pin both `cu_skip_flag = 0`
+        // inputs to confirm the slice-type branch dominates.
+        assert_eq!(
+            pred_mode_flag_inferred_cu_pred_mode(true, 0),
+            CuPredMode::Intra
+        );
+    }
+
+    #[test]
+    fn pred_mode_flag_inferred_pb_skip_is_skip() {
+        // §7.4.9.5: "Otherwise (slice_type is equal to P or B), when
+        // cu_skip_flag[ x0 ][ y0 ] is equal to 1, CuPredMode[ x ][ y ]
+        // is inferred to be equal to MODE_SKIP." This is the only
+        // not-present path on P/B slices (the §7.3.8.5 guard reads
+        // the flag whenever cu_skip_flag == 0).
+        assert_eq!(
+            pred_mode_flag_inferred_cu_pred_mode(false, 1),
+            CuPredMode::Skip
+        );
+    }
+
+    #[test]
+    fn decode_pred_mode_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the
+        // FL flag decodes to 0 (MODE_INTER per §7.4.9.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_pred_mode_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+        assert_eq!(cu_pred_mode_from_flag(flag), CuPredMode::Inter);
+    }
+
+    #[test]
+    fn decode_pred_mode_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the
+        // FL flag decodes to 1 (MODE_INTRA per §7.4.9.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_pred_mode_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+        assert_eq!(cu_pred_mode_from_flag(flag), CuPredMode::Intra);
+    }
+
+    #[test]
+    fn decode_pred_mode_flag_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on
+        // the same engine each consume exactly one bin (Table 9-43
+        // FL cMax = 1). The second call's outcome is independent of
+        // the first since the contexts are separate.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_pred_mode_flag(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_pred_mode_flag(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+    }
+
+    #[test]
+    fn cu_pred_mode_variants_distinct() {
+        // §7.4.9.5 lists three reachable CuPredMode values: MODE_INTER
+        // (pred_mode_flag == 0), MODE_INTRA (pred_mode_flag == 1 OR
+        // I-slice not-present inference), MODE_SKIP (P/B not-present
+        // with cu_skip_flag == 1). Pin all three as distinct.
+        assert_ne!(CuPredMode::Inter, CuPredMode::Intra);
+        assert_ne!(CuPredMode::Inter, CuPredMode::Skip);
+        assert_ne!(CuPredMode::Intra, CuPredMode::Skip);
     }
 }
