@@ -6,6 +6,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 41 (2026-06-10)
+
+- §9.3.4.2 / Table 9-43 + Table 9-48 entries for the two §7.3.8.5
+  intra-PB luma-mode fields that follow `prev_intra_luma_pred_flag`:
+  `mpm_idx` and `rem_intra_luma_pred_mode` (H.265 §7.4.9.2). Both are
+  fully bypass-coded (Table 9-48 marks every bin `bypass`, so neither
+  consumes a context model). Presence is exactly the round-40
+  [`binarization::LumaIntraModeSource`] selection: `Mpm` (flag == 1) ⇒
+  `mpm_idx` present and `IntraPredModeY = candModeList[ mpm_idx ]` per
+  §8.4.2; `Remaining` (flag == 0) ⇒ `rem_intra_luma_pred_mode` present
+  and seeds the §8.4.2 step-2 `IntraPredModeY` before the sorted
+  candModeList increment pass. The two are mutually exclusive per the
+  §7.3.8.5 `if( prev_intra_luma_pred_flag ) … else …` syntax.
+  - [`binarization::MPM_IDX_TR_CMAX`] (= 2) and
+    [`binarization::MPM_IDX_TR_C_RICE_PARAM`] (= 0) — Table 9-43 TR
+    shape; with `cRiceParam = 0` the §9.3.3.10 TR collapses to
+    truncated-unary (`0` / `10` / `11` for values 0 / 1 / 2).
+  - [`binarization::decode_mpm_idx`] — drives the truncated-unary
+    prefix through the §9.3.4.3.4 bypass decoder; a `0` bin terminates
+    at value 0, otherwise a second bin distinguishes 1 from 2. Output
+    is always in `0..=2` (the three-entry §8.4.2 candModeList).
+  - [`binarization::REM_INTRA_LUMA_PRED_MODE_FL_CMAX`] (= 31) and
+    [`binarization::REM_INTRA_LUMA_PRED_MODE_FL_NBITS`] (= 5) — Table
+    9-43 FL shape; §9.3.3.5 `Ceil(Log2(cMax + 1)) = Ceil(Log2(32)) = 5`.
+  - [`binarization::decode_rem_intra_luma_pred_mode`] — reads the five
+    FL bypass bins MSB-first via
+    [`cabac::CabacEngine::decode_bypass_bits`]. Output is always in
+    `0..=31`.
+- §9.3.4.2.5 Table 9-50 `ctxIdxMap[ 15 ]`: the round-32 `sig_coeff_flag`
+  path reconstructed this entry `= 8` by pair-symmetry; the staged docs
+  errata #93 now formally confirms it (`= 8`; the PDF truncation at
+  `i = 15` is a layout artefact). The existing
+  [`binarization::SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`] already
+  carries the confirmed value — no code change required.
+- Test count: 396 → 403 (+7 new tests covering the Table 9-43 TR shape
+  for `mpm_idx` (`cMax = 2`, `cRiceParam = 0`); the Table 9-43 FL shape
+  for `rem_intra_luma_pred_mode` (`cMax = 31`, `Ceil(Log2(32)) = 5`
+  `nBits` cross-check); the `mpm_idx` value-0 first-zero-bin path; the
+  `mpm_idx` `0..=2` range invariant; the `mpm_idx` at-most-two-bins
+  consumption anchor (value 0 ⇒ one bin, value 1/2 ⇒ two bins, with a
+  post-read engine-offset cross-check); the `rem_intra_luma_pred_mode`
+  five-bypass-bin wrapper-vs-direct agreement (value + engine offset);
+  and the `rem_intra_luma_pred_mode` `0..=31` range invariant).
+
 ### Added — clean-room rebuild round 40 (2026-06-10)
 
 - §9.3.4.2 / Table 9-48 entry for `prev_intra_luma_pred_flag` lands in

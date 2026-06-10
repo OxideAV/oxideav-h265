@@ -419,6 +419,20 @@
 //! enum; and [`decode_prev_intra_luma_pred_flag`] drives one
 //! [`CabacEngine::decode_decision`] against the caller's context and
 //! returns the decoded `u8`.
+//!
+//! Round 41 adds the two §7.3.8.5 luma-mode fields the round-40 flag
+//! gates: `mpm_idx` (Table 9-43 TR with `cMax = 2`, `cRiceParam = 0`)
+//! and `rem_intra_luma_pred_mode` (Table 9-43 FL with `cMax = 31`),
+//! per H.265 §7.4.9.2 / §8.4.2. Both are fully bypass-coded (Table 9-48
+//! marks every bin `bypass`), so neither consumes a context model and
+//! presence is exactly the [`LumaIntraModeSource`] selection. The new
+//! public surface: [`MPM_IDX_TR_CMAX`] (= 2) +
+//! [`MPM_IDX_TR_C_RICE_PARAM`] (= 0) and [`decode_mpm_idx`] (the
+//! truncated-unary prefix through the bypass decoder, output `0..=2`);
+//! [`REM_INTRA_LUMA_PRED_MODE_FL_CMAX`] (= 31) +
+//! [`REM_INTRA_LUMA_PRED_MODE_FL_NBITS`] (= 5) and
+//! [`decode_rem_intra_luma_pred_mode`] (five FL bypass bins MSB-first,
+//! output `0..=31`).
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1167,6 +1181,98 @@ pub fn decode_prev_intra_luma_pred_flag(
         "Table 9-48 row for prev_intra_luma_pred_flag: bin 0 ctxInc = 0"
     );
     engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
+// mpm_idx / rem_intra_luma_pred_mode (§7.3.8.5 coding_unit() / §7.4.9.2)
+// Table 9-43 binarization + Table 9-48 (both fully bypass-coded). These
+// are the two §7.3.8.5 intra-PB luma-mode fields that follow
+// prev_intra_luma_pred_flag: when the flag is 1 the §8.4.2 candidate
+// list is selected and `mpm_idx` (TR cMax = 2, cRiceParam = 0) picks
+// among the three candidates; when 0 `rem_intra_luma_pred_mode`
+// (FL cMax = 31) carries the residual mode directly. Neither element is
+// context-coded — Table 9-48 marks every bin `bypass` — so the slice
+// parser reads them through the §9.3.4.3.4 bypass arithmetic decoder
+// without allocating a context model. Presence is exactly the
+// LumaIntraModeSource selection: Mpm ⇒ mpm_idx present, Remaining ⇒
+// rem_intra_luma_pred_mode present (the two are mutually exclusive per
+// the §7.3.8.5 `if( prev_intra_luma_pred_flag ) … else …` syntax).
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `mpm_idx`: TR with `cMax = 2` and
+/// `cRiceParam = 0`. The TR prefix with `cRiceParam = 0` collapses to
+/// truncated-unary, so the on-wire string is `0`, `10`, or `11` for the
+/// three values 0, 1, 2 — at most two bypass bins (Table 9-48 marks
+/// bin 0 and bin 1 `bypass`, binIdx ≥ 2 `na`).
+pub const MPM_IDX_TR_CMAX: u32 = 2;
+
+/// `cRiceParam` for the `mpm_idx` TR binarization (Table 9-43): 0. With
+/// `cRiceParam = 0` the §9.3.3.10 TR has no Rice suffix and the prefix
+/// is plain truncated-unary.
+pub const MPM_IDX_TR_C_RICE_PARAM: u32 = 0;
+
+/// Table 9-43 binarization shape for `rem_intra_luma_pred_mode`: FL with
+/// `cMax = 31`. The §9.3.3.5 derivation gives
+/// `fixedLength = Ceil(Log2(cMax + 1)) = Ceil(Log2(32)) = 5`, so the
+/// on-wire string is exactly five bypass bins (Table 9-48 marks
+/// binIdx 0..=4 `bypass`, binIdx 5 `na`) read MSB-first.
+pub const REM_INTRA_LUMA_PRED_MODE_FL_CMAX: u32 = 31;
+
+/// §9.3.3.5 — bit width of the FL string for `rem_intra_luma_pred_mode`.
+///
+/// `Ceil(Log2(REM_INTRA_LUMA_PRED_MODE_FL_CMAX + 1)) = Ceil(Log2(32))
+/// = 5`. The decoded 5-bit value is the §8.4.2 step-2 starting point
+/// (`IntraPredModeY` before the candModeList increment pass).
+pub const REM_INTRA_LUMA_PRED_MODE_FL_NBITS: u32 = 5;
+
+/// Decode `mpm_idx` (§7.3.8.5 / §7.4.9.2) from the CABAC engine.
+///
+/// Read when `prev_intra_luma_pred_flag == 1`
+/// ([`LumaIntraModeSource::Mpm`]): the §8.4.2 derivation sets
+/// `IntraPredModeY = candModeList[ mpm_idx ]`, so the returned value is
+/// the index into the three-entry most-probable-mode candidate list and
+/// is always in `0..=2`.
+///
+/// Binarization is TR with `cMax = 2`, `cRiceParam = 0` (Table 9-43) and
+/// every bin is bypass-coded (Table 9-48), so this reads the
+/// truncated-unary prefix straight from the §9.3.4.3.4 bypass decoder:
+/// a `0` bin terminates immediately (value 0), otherwise a second bin
+/// distinguishes value 1 (`10`) from value 2 (`11`). No context model is
+/// consumed.
+pub fn decode_mpm_idx(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    // §9.3.3.10 TR prefix with cRiceParam = 0 driven entirely by the
+    // bypass decoder. `is_escape` (all `cMax` bins were 1) is the
+    // value == cMax case; with cRiceParam = 0 there is no suffix to
+    // read, so the prefix value is the final value either way.
+    let (value, _is_escape) =
+        read_truncated_rice_prefix(MPM_IDX_TR_CMAX, |_bin_idx| engine.decode_bypass())?;
+    debug_assert!(
+        value <= MPM_IDX_TR_CMAX,
+        "mpm_idx is TR cMax = 2 (Table 9-43); decoded value must be in 0..=2"
+    );
+    Ok(value as u8)
+}
+
+/// Decode `rem_intra_luma_pred_mode` (§7.3.8.5 / §7.4.9.2) from the
+/// CABAC engine.
+///
+/// Read when `prev_intra_luma_pred_flag == 0`
+/// ([`LumaIntraModeSource::Remaining`]): the §8.4.2 step-2 derivation
+/// seeds `IntraPredModeY = rem_intra_luma_pred_mode`, then increments it
+/// once for each sorted candModeList entry it meets or exceeds. The
+/// returned value is the pre-increment seed and is always in `0..=31`.
+///
+/// Binarization is FL with `cMax = 31` (Table 9-43) and every bin is
+/// bypass-coded (Table 9-48), so this reads exactly five bypass bins
+/// MSB-first via [`CabacEngine::decode_bypass_bits`]. No context model
+/// is consumed.
+pub fn decode_rem_intra_luma_pred_mode(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    let value = engine.decode_bypass_bits(REM_INTRA_LUMA_PRED_MODE_FL_NBITS as u8)?;
+    debug_assert!(
+        value <= REM_INTRA_LUMA_PRED_MODE_FL_CMAX,
+        "rem_intra_luma_pred_mode is FL cMax = 31 (Table 9-43); decoded value must be in 0..=31"
+    );
+    Ok(value as u8)
 }
 
 // ---------------------------------------------------------------------
@@ -5118,5 +5224,127 @@ mod tests {
         let b = decode_prev_intra_luma_pred_flag(&mut eng, &mut ctx_b).unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
+    }
+
+    // -------------------------------------------------------------
+    // mpm_idx / rem_intra_luma_pred_mode (§7.3.8.5 / §7.4.9.2)
+    // Table 9-43 binarization + Table 9-48 (fully bypass-coded)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn mpm_idx_tr_shape_table_9_43() {
+        // Table 9-43 row: TR with cMax = 2, cRiceParam = 0 — the
+        // three-value truncated-unary string set {0, 10, 11}.
+        assert_eq!(MPM_IDX_TR_CMAX, 2);
+        assert_eq!(MPM_IDX_TR_C_RICE_PARAM, 0);
+    }
+
+    #[test]
+    fn rem_intra_luma_pred_mode_fl_shape_table_9_43() {
+        // Table 9-43 row: FL with cMax = 31 → §9.3.3.5
+        // Ceil(Log2(32)) = 5 bins.
+        assert_eq!(REM_INTRA_LUMA_PRED_MODE_FL_CMAX, 31);
+        assert_eq!(REM_INTRA_LUMA_PRED_MODE_FL_NBITS, 5);
+        // Cross-check the §9.3.3.5 derivation against the constant.
+        let derived = 32u32.next_power_of_two().trailing_zeros();
+        assert_eq!(derived, REM_INTRA_LUMA_PRED_MODE_FL_NBITS);
+    }
+
+    #[test]
+    fn mpm_idx_decodes_value_zero_on_first_zero_bin() {
+        // §9.3.3.10 TR prefix, cRiceParam = 0: the first bypass bin is
+        // 0 ⇒ value 0 (no second bin read). An all-zero stream decodes
+        // a 0 bypass bin per the §9.3.4.3.4 `ivlOffset < ivlCurrRange`
+        // test, so mpm_idx = 0.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        assert_eq!(decode_mpm_idx(&mut eng).unwrap(), 0);
+    }
+
+    #[test]
+    fn mpm_idx_output_always_in_range() {
+        // Whatever the stream, the TR cMax = 2 binarization caps the
+        // decoded value at 2 — the §8.4.2 candModeList has exactly three
+        // entries, so mpm_idx ∈ {0, 1, 2}.
+        // First 9 bits seed ivlOffset (must be < 510 per §9.3.2.5);
+        // the 0xfe lead keeps a near-all-ones stream while staying
+        // valid (509).
+        let seeds: [[u8; 8]; 4] = [
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66],
+            [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+        ];
+        for buf in seeds {
+            let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+            let v = decode_mpm_idx(&mut eng).unwrap();
+            assert!(v <= 2, "mpm_idx out of range: {v} for {buf:?}");
+        }
+    }
+
+    #[test]
+    fn mpm_idx_consumes_at_most_two_bins() {
+        // The TR cMax = 2 prefix reads one bin (terminating 0) or two
+        // (a leading 1 then either 0 or the cMax escape). Drive two
+        // engines from the same buffer: one runs the wrapper once, the
+        // other replays the equivalent raw bypass sequence and must
+        // land on the same post-read engine offset.
+        let buf = [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66];
+        let mut eng_a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut eng_b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let v = decode_mpm_idx(&mut eng_a).unwrap();
+        // Replay: first bin always read; second read iff first was 1.
+        let b0 = eng_b.decode_bypass().unwrap();
+        let bins_read = if b0 == 1 {
+            let _ = eng_b.decode_bypass().unwrap();
+            2
+        } else {
+            1
+        };
+        // value 0 ⇒ one bin (terminating 0); value 1 or 2 ⇒ two bins
+        // (a leading 1 then the second prefix bin).
+        let expected_bins = if v == 0 { 1 } else { 2 };
+        assert_eq!(bins_read, expected_bins);
+        assert_eq!(eng_a.ivl_offset(), eng_b.ivl_offset());
+    }
+
+    #[test]
+    fn rem_intra_luma_pred_mode_reads_five_bypass_bins() {
+        // FL cMax = 31: the wrapper is exactly decode_bypass_bits(5).
+        // Drive two engines from the same buffer — the wrapper and a
+        // direct five-bin MSB-first accumulation must agree on both the
+        // returned value and the post-read engine offset.
+        let buf = [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66];
+        let mut eng_a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut eng_b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let via_wrapper = decode_rem_intra_luma_pred_mode(&mut eng_a).unwrap();
+        let mut via_direct: u32 = 0;
+        for _ in 0..5 {
+            via_direct = (via_direct << 1) | (eng_b.decode_bypass().unwrap() as u32);
+        }
+        assert_eq!(via_wrapper as u32, via_direct);
+        assert_eq!(eng_a.ivl_offset(), eng_b.ivl_offset());
+    }
+
+    #[test]
+    fn rem_intra_luma_pred_mode_output_always_in_range() {
+        // The five-bit FL string caps the decoded value at 31 — the
+        // §8.4.2 step-2 seed for IntraPredModeY before the candModeList
+        // increment pass.
+        // First 9 bits seed ivlOffset (must be < 510 per §9.3.2.5).
+        let seeds: [[u8; 8]; 4] = [
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66],
+            [0x13, 0x57, 0x9b, 0xdf, 0x24, 0x68, 0xac, 0xe0],
+        ];
+        for buf in seeds {
+            let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+            let v = decode_rem_intra_luma_pred_mode(&mut eng).unwrap();
+            assert!(
+                v <= 31,
+                "rem_intra_luma_pred_mode out of range: {v} for {buf:?}"
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 40 (2026-06-10).** The prior implementation was
+**Clean-room rebuild — round 41 (2026-06-10).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,48 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 40 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 41 lands the
+§9.3.4.2 / Table 9-43 + Table 9-48 entries for the two §7.3.8.5
+intra-PB luma-mode fields that follow round 40's
+`prev_intra_luma_pred_flag`: `mpm_idx` and `rem_intra_luma_pred_mode`
+(§7.4.9.2). Both are fully bypass-coded — Table 9-48 marks every bin
+`bypass`, so neither consumes a context model — and their presence is
+exactly the round-40 [`binarization::LumaIntraModeSource`] selection:
+when the flag is 1 (`Mpm`) the §8.4.2 candidate list is selected and
+`mpm_idx` (Table 9-43 TR with `cMax = 2`, `cRiceParam = 0`) picks among
+the three most-probable-mode candidates (`IntraPredModeY =
+candModeList[ mpm_idx ]`, always `0..=2`); when the flag is 0
+(`Remaining`) `rem_intra_luma_pred_mode` (Table 9-43 FL with
+`cMax = 31`, `Ceil(Log2(32)) = 5` bypass bins read MSB-first) seeds the
+§8.4.2 step-2 `IntraPredModeY` before the sorted-candModeList increment
+pass (always `0..=31`). The two are mutually exclusive per the §7.3.8.5
+`if( prev_intra_luma_pred_flag ) … else …` syntax. New public surface:
+[`binarization::MPM_IDX_TR_CMAX`] (= 2) and
+[`binarization::MPM_IDX_TR_C_RICE_PARAM`] (= 0, the Table 9-43 TR
+shape); [`binarization::decode_mpm_idx`] (drives the truncated-unary
+prefix through the §9.3.4.3.4 bypass decoder — a `0` bin terminates at
+value 0, otherwise a second bin distinguishes 1 from 2);
+[`binarization::REM_INTRA_LUMA_PRED_MODE_FL_CMAX`] (= 31) and
+[`binarization::REM_INTRA_LUMA_PRED_MODE_FL_NBITS`] (= 5, the §9.3.3.5
+`Ceil(Log2(cMax + 1))` derivation collapsed to a constant); and
+[`binarization::decode_rem_intra_luma_pred_mode`] (reads the five FL
+bypass bins via [`cabac::CabacEngine::decode_bypass_bits`]). Total
+tests now 403 (was 396): 7 new tests cover the Table 9-43 TR shape for
+`mpm_idx` (`cMax = 2`, `cRiceParam = 0`); the Table 9-43 FL shape for
+`rem_intra_luma_pred_mode` (`cMax = 31`, `Ceil(Log2(32)) = 5` `nBits`
+cross-check); the `mpm_idx` value-0 first-zero-bin path; the `mpm_idx`
+`0..=2` range invariant and the at-most-two-bins consumption anchor
+(value 0 ⇒ one bin, value 1/2 ⇒ two bins, with a post-read engine-offset
+cross-check); the `rem_intra_luma_pred_mode` five-bypass-bin
+wrapper-vs-direct agreement (value + engine offset); and the
+`0..=31` range invariant. The Table 9-50 §9.3.4.2.5 `ctxIdxMap[ 15 ]`
+entry the round-32 `sig_coeff_flag` path reconstructed by pair-symmetry
+is now formally confirmed `= 8` by the staged docs errata #93 (the PDF
+truncation at `i = 15` was a layout artefact); the existing constant
+[`binarization::SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`] already
+carries the confirmed value — no code change was required.
+
+Round 40 lands the
 §9.3.4.2 / Table 9-48 entry for `prev_intra_luma_pred_flag` — the
 per-luma-prediction-block bit that selects, for an intra CU, whether
 the luma intra prediction mode is taken from the §8.4.2
@@ -1473,18 +1514,24 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   round 35 lands `coeff_sign_flag` (§9.3.4.2 / Table 9-48 fully
   bypass-coded FL with `cMax = 1`) so the §7.4.9.11 residual-coding
   signed-level composition has both magnitude and sign primitives in
-  place. Still to land — every other §9.3.4.2 syntax element:
-  `sig_coeff_flag` (§9.3.4.2.5; Table 9-50 `ctxIdxMap` requires
-  spec-trace confirmation of the i=15 entry — see "Spec gap" in the
-  round-31 report), part-mode / merge / merge-idx flags, intra-mode
-  fields (`mpm_idx`, `rem_intra_luma_pred_mode`,
-  `intra_chroma_pred_mode`), motion-vector binarization (`mvd_lX[]`
-  EGk + sign), etc. Round 39 lands `pred_mode_flag` (§9.3.4.2 /
-  Table 9-48, FL `cMax = 1`) and round 40 lands
-  `prev_intra_luma_pred_flag` (§9.3.4.2 / Table 9-48, FL `cMax = 1`,
-  Table 9-12 init `{184, 154, 183}`) via
+  place. The §9.3.4.2.5 `sig_coeff_flag` Table 9-50 `ctxIdxMap[ 15 ]`
+  entry — reconstructed `= 8` by pair-symmetry in round 32 — is now
+  formally confirmed by the staged docs errata #93 (the PDF truncation
+  at `i = 15` was a layout artefact; the in-tree constant already
+  carries the confirmed value). Still to land — every other §9.3.4.2
+  syntax element: part-mode / merge / merge-idx flags, the chroma
+  intra-mode field `intra_chroma_pred_mode` (§9.3.3.8), motion-vector
+  binarization (`mvd_lX[]` EGk + sign), etc. Round 39 lands
+  `pred_mode_flag` (§9.3.4.2 / Table 9-48, FL `cMax = 1`); round 40
+  lands `prev_intra_luma_pred_flag` (§9.3.4.2 / Table 9-48, FL
+  `cMax = 1`, Table 9-12 init `{184, 154, 183}`) via
   [`binarization::decode_prev_intra_luma_pred_flag`] +
-  [`binarization::LumaIntraModeSource`]. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
+  [`binarization::LumaIntraModeSource`]; and round 41 lands the two
+  luma-mode fields the flag gates — `mpm_idx` (Table 9-43 TR
+  `cMax = 2`, `cRiceParam = 0`) and `rem_intra_luma_pred_mode` (Table
+  9-43 FL `cMax = 31`), both fully bypass-coded per Table 9-48, via
+  [`binarization::decode_mpm_idx`] +
+  [`binarization::decode_rem_intra_luma_pred_mode`]. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
   (`coeff_abs_level_greater1_flag` + `_greater2_flag`) via
   [`binarization::Greater1State`] +
   [`binarization::coeff_abs_level_greater2_flag_ctx_inc`]. (The §9.3 arithmetic decode engine
