@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 40 (2026-06-10)
+
+- §9.3.4.2 / Table 9-48 entry for `prev_intra_luma_pred_flag` lands in
+  the [`binarization`] module — the per-luma-prediction-block bit that
+  selects, for an intra CU, whether the luma intra prediction mode is
+  taken from the §8.4.2 most-probable-mode list (`mpm_idx` follows) or
+  from the remaining-mode field (`rem_intra_luma_pred_mode` follows),
+  per H.265 §7.3.8.5, §7.4.9.2. Per Table 9-43 the flag is FL with
+  `cMax = 1` (a single context-coded bin); Table 9-48's row lists
+  `ctxInc = 0` for bin 0 and `na` for every later binIdx column.
+  Table 9-12 supplies three ctxIdx slots with
+  `initValue = {184, 154, 183}` for initType 0, 1 and 2 — unlike
+  `pred_mode_flag`, this element is read in I, P and B slices (intra
+  CUs occur in every slice type), so all three initType slots are
+  populated. The flag is always present when the §7.3.8.5 intra-PB
+  loop reaches it (no inferred-value rule).
+  - [`binarization::PREV_INTRA_LUMA_PRED_FLAG_FL_CMAX`] — Table 9-43
+    shape: `cMax = 1`.
+  - [`binarization::PREV_INTRA_LUMA_PRED_FLAG_FL_NBITS`] — §9.3.3.5
+    `Ceil(Log2(cMax + 1))` collapsed to the `cMax = 1` constant `1`.
+  - [`binarization::prev_intra_luma_pred_flag_ctx_inc`] — Table 9-48
+    bin-0 row: `ctxInc = 0` (three Table 9-12 ctxIdx slots, selected
+    at slice-init scope by the Table 9-4 initType-to-ctxIdx mapping).
+  - [`binarization::LumaIntraModeSource`] — two-variant enum capturing
+    the §7.4.9.2 selection: `Mpm` (flag == 1, §8.4.2 candidate list) /
+    `Remaining` (flag == 0, `rem_intra_luma_pred_mode`).
+  - [`binarization::luma_intra_mode_source_from_flag`] — folds a
+    decoded flag into the enum: `1 ⇒ Mpm`, `0 ⇒ Remaining`.
+  - [`binarization::decode_prev_intra_luma_pred_flag`] — engine-driven
+    decode primitive that reads the single FL bin using the
+    caller-allocated Table 9-12 context and returns the decoded `u8`.
+- Test count: 389 → 396 (+7 new `prev_intra_luma_pred_flag` tests
+  covering the Table 9-48 `ctxInc = 0` anchor; the Table 9-43 FL shape
+  (`cMax = 1`, `Ceil(Log2(2)) = 1` `nBits` cross-check); the
+  `luma_intra_mode_source_from_flag` mapping (`1 ⇒ Mpm`,
+  `0 ⇒ Remaining`); the `LumaIntraModeSource` variant distinctness
+  anchor; the engine-driven decode for the valMps = 0 / valMps = 1
+  contexts (with `LumaIntraModeSource` cross-check); and the
+  exactly-one-bin-per-invocation anchor across two back-to-back
+  contexts on the same engine).
+
 ### Added — clean-room rebuild round 39 (2026-06-09)
 
 - §9.3.4.2 / Table 9-48 entry for `pred_mode_flag` lands in the

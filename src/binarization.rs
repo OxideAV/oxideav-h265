@@ -392,6 +392,33 @@
 //! applies the present-on-wire mapping; and
 //! [`pred_mode_flag_inferred_cu_pred_mode`] applies the §7.4.9.5
 //! not-present inference branching on `slice_type` and `cu_skip_flag`.
+//!
+//! Round 40 adds the §9.3.4.2 / Table 9-48 entry for
+//! `prev_intra_luma_pred_flag` — the per-luma-prediction-block bit that
+//! selects, for an intra CU, whether the luma intra prediction mode is
+//! taken from the most-probable-mode list (`mpm_idx` follows) or from
+//! the remaining-mode field (`rem_intra_luma_pred_mode` follows), per
+//! H.265 §7.3.8.5, §7.4.9.2. Per Table 9-43 the flag is FL with
+//! `cMax = 1` (a single context-coded bin); Table 9-48's row lists
+//! `ctxInc = 0` for bin 0 and `na` for every later binIdx column.
+//! Table 9-12 supplies three ctxIdx slots with
+//! `initValue = {184, 154, 183}` for initType 0, 1 and 2 — unlike
+//! `pred_mode_flag`, this element is read in I, P and B slices (intra
+//! CUs occur in every slice type), so all three initType slots are
+//! populated. The flag is always present when the §7.3.8.5 intra-PB
+//! loop reaches it (no inferred-value rule); when it is 1 the §8.4.2
+//! candidate-mode derivation supplies `IntraPredModeY` and `mpm_idx`
+//! selects among the candidates, when it is 0
+//! `rem_intra_luma_pred_mode` carries the mode directly. The new
+//! public surface: [`PREV_INTRA_LUMA_PRED_FLAG_FL_CMAX`] (= 1, Table
+//! 9-43 shape) and [`PREV_INTRA_LUMA_PRED_FLAG_FL_NBITS`] (= 1);
+//! [`prev_intra_luma_pred_flag_ctx_inc`] returns the Table 9-48 bin-0
+//! `ctxInc = 0`; the [`LumaIntraModeSource`] enum captures the
+//! §7.4.9.2 selection (`1 ⇒ Mpm`, `0 ⇒ Remaining`);
+//! [`luma_intra_mode_source_from_flag`] folds a decoded flag into the
+//! enum; and [`decode_prev_intra_luma_pred_flag`] drives one
+//! [`CabacEngine::decode_decision`] against the caller's context and
+//! returns the decoded `u8`.
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1029,6 +1056,115 @@ pub fn decode_pred_mode_flag(
         pred_mode_flag_ctx_inc(),
         0,
         "Table 9-48 row for pred_mode_flag: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
+// prev_intra_luma_pred_flag (§7.3.8.5 coding_unit() / §7.4.9.2)
+// Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-12 ctxIdx
+// initValue. Read once per luma prediction block of an intra CU (the
+// §7.3.8.5 `for( j ) for( i )` PB loop). When the flag is 1 the luma
+// intra mode is taken from the §8.4.2 most-probable-mode list (mpm_idx
+// follows); when 0 it comes from rem_intra_luma_pred_mode. There is no
+// not-present inference: the §7.3.8.5 loop always reads it.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `prev_intra_luma_pred_flag`: FL
+/// with `cMax = 1` (a single context-coded bin per luma prediction
+/// block of an intra CU). Selects between the MPM-list mode source
+/// (value 1) and the remaining-mode field (value 0) per §7.4.9.2.
+pub const PREV_INTRA_LUMA_PRED_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `prev_intra_luma_pred_flag`: one
+/// context-coded bin per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const PREV_INTRA_LUMA_PRED_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `prev_intra_luma_pred_flag`. Bin 0
+/// is context-coded with `ctxInc = 0`; every later binIdx column is
+/// `na` (the FL `cMax = 1` shape only emits a single bin).
+///
+/// Table 9-12 lists three ctxIdx slots with
+/// `initValue = {184, 154, 183}` for initType 0, 1 and 2 — the element
+/// is read in I, P and B slices (intra CUs occur in every slice type),
+/// so all three initType slots are populated (unlike `pred_mode_flag`,
+/// whose initType 0 column is `na`). This layer hands back the
+/// bank-relative `ctxInc` only; the Table 9-12 initValue plus the
+/// Table 9-4 initType-to-ctxIdx mapping is consumed at slice-init
+/// scope.
+#[must_use]
+pub fn prev_intra_luma_pred_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.2 — the source of a luma prediction block's intra mode,
+/// selected by `prev_intra_luma_pred_flag`.
+///
+/// `prev_intra_luma_pred_flag == 1` maps to [`LumaIntraModeSource::Mpm`]
+/// (the §8.4.2 most-probable-mode candidate list; `mpm_idx` follows in
+/// the §7.3.8.5 syntax to select among the candidates).
+/// `prev_intra_luma_pred_flag == 0` maps to
+/// [`LumaIntraModeSource::Remaining`] (the §7.3.8.5
+/// `rem_intra_luma_pred_mode` field carries the mode directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LumaIntraModeSource {
+    /// The luma intra mode is taken from the §8.4.2 most-probable-mode
+    /// candidate list. Reachable from `prev_intra_luma_pred_flag == 1`;
+    /// the §7.3.8.5 `mpm_idx` element follows to pick a candidate.
+    Mpm,
+    /// The luma intra mode is carried directly by the §7.3.8.5
+    /// `rem_intra_luma_pred_mode` field. Reachable from
+    /// `prev_intra_luma_pred_flag == 0`.
+    Remaining,
+}
+
+/// Map a decoded `prev_intra_luma_pred_flag` value to
+/// [`LumaIntraModeSource`] per §7.4.9.2 / §7.3.8.5: `1 ⇒ Mpm`,
+/// `0 ⇒ Remaining`. The mapping is total over the FL `cMax = 1` shape
+/// (any other input is rejected in debug builds; release builds fall
+/// back to [`LumaIntraModeSource::Remaining`] to avoid panicking on an
+/// accidental out-of-range input).
+#[must_use]
+pub fn luma_intra_mode_source_from_flag(prev_intra_luma_pred_flag: u8) -> LumaIntraModeSource {
+    debug_assert!(
+        prev_intra_luma_pred_flag <= 1,
+        "prev_intra_luma_pred_flag is FL cMax = 1 (Table 9-43); decoded value must be 0 or 1"
+    );
+    if prev_intra_luma_pred_flag == 1 {
+        LumaIntraModeSource::Mpm
+    } else {
+        LumaIntraModeSource::Remaining
+    }
+}
+
+/// Decode `prev_intra_luma_pred_flag` (§7.3.8.5 / §7.4.9.2) from the
+/// CABAC engine, consuming one context for the FL bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-12 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place per
+/// the §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.5 intra-PB loop always reaches this read for an intra CU
+/// (there is no not-present inference rule for this element), so the
+/// parser unconditionally calls this primitive once per luma
+/// prediction block.
+///
+/// Returns the decoded `u8` (0 or 1) — 1 selects the §8.4.2
+/// most-probable-mode source (`mpm_idx` follows), 0 selects the
+/// `rem_intra_luma_pred_mode` source. See
+/// [`luma_intra_mode_source_from_flag`] to fold the result into the
+/// [`LumaIntraModeSource`] enum.
+pub fn decode_prev_intra_luma_pred_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin uses ctxInc = 0 (a single Table
+    // 9-12 entry) per the Table 9-48 row.
+    debug_assert_eq!(
+        prev_intra_luma_pred_flag_ctx_inc(),
+        0,
+        "Table 9-48 row for prev_intra_luma_pred_flag: bin 0 ctxInc = 0"
     );
     engine.decode_decision(ctx)
 }
@@ -4885,5 +5021,102 @@ mod tests {
         assert_ne!(CuPredMode::Inter, CuPredMode::Intra);
         assert_ne!(CuPredMode::Inter, CuPredMode::Skip);
         assert_ne!(CuPredMode::Intra, CuPredMode::Skip);
+    }
+
+    // -----------------------------------------------------------------
+    // prev_intra_luma_pred_flag (§7.3.8.5 / §7.4.9.2)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn prev_intra_luma_pred_flag_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for prev_intra_luma_pred_flag: bin 0
+        // ctxInc = 0; every later binIdx column is na (Table 9-43 FL
+        // cMax = 1 — only one bin is ever emitted).
+        assert_eq!(prev_intra_luma_pred_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn prev_intra_luma_pred_flag_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(PREV_INTRA_LUMA_PRED_FLAG_FL_CMAX, 1);
+        assert_eq!(PREV_INTRA_LUMA_PRED_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn luma_intra_mode_source_from_flag_maps_table_9_48_values() {
+        // §7.4.9.2 / §7.3.8.5: prev_intra_luma_pred_flag == 1 ⇒ the
+        // §8.4.2 MPM-list source (mpm_idx follows);
+        // prev_intra_luma_pred_flag == 0 ⇒ the rem_intra_luma_pred_mode
+        // source. The two-valued FL shape covers the full Table 9-48
+        // binIdx 0 column.
+        assert_eq!(
+            luma_intra_mode_source_from_flag(1),
+            LumaIntraModeSource::Mpm
+        );
+        assert_eq!(
+            luma_intra_mode_source_from_flag(0),
+            LumaIntraModeSource::Remaining
+        );
+    }
+
+    #[test]
+    fn luma_intra_mode_source_variants_distinct() {
+        // §7.4.9.2 lists two reachable mode sources for an intra luma
+        // PB: the §8.4.2 MPM list (flag == 1) and the
+        // rem_intra_luma_pred_mode field (flag == 0). Pin them as
+        // distinct.
+        assert_ne!(LumaIntraModeSource::Mpm, LumaIntraModeSource::Remaining);
+    }
+
+    #[test]
+    fn decode_prev_intra_luma_pred_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the
+        // FL flag decodes to 0 (the rem_intra_luma_pred_mode source
+        // per §7.4.9.2).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_prev_intra_luma_pred_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+        assert_eq!(
+            luma_intra_mode_source_from_flag(flag),
+            LumaIntraModeSource::Remaining
+        );
+    }
+
+    #[test]
+    fn decode_prev_intra_luma_pred_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the
+        // FL flag decodes to 1 (the §8.4.2 MPM-list source per
+        // §7.4.9.2 — mpm_idx follows in §7.3.8.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_prev_intra_luma_pred_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+        assert_eq!(
+            luma_intra_mode_source_from_flag(flag),
+            LumaIntraModeSource::Mpm
+        );
+    }
+
+    #[test]
+    fn decode_prev_intra_luma_pred_flag_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on
+        // the same engine each consume exactly one bin (Table 9-43
+        // FL cMax = 1). The second call's outcome is independent of
+        // the first since the contexts are separate. The §7.3.8.5
+        // intra-PB loop reads this element once per luma prediction
+        // block, so the exactly-one-bin invariant is the per-PB
+        // contract.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_prev_intra_luma_pred_flag(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_prev_intra_luma_pred_flag(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
     }
 }

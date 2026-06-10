@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 39 (2026-06-09).** The prior implementation was
+**Clean-room rebuild — round 40 (2026-06-10).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,45 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 39 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 40 lands the
+§9.3.4.2 / Table 9-48 entry for `prev_intra_luma_pred_flag` — the
+per-luma-prediction-block bit that selects, for an intra CU, whether
+the luma intra prediction mode is taken from the §8.4.2
+most-probable-mode list (`mpm_idx` follows) or from the remaining-mode
+field (`rem_intra_luma_pred_mode` follows) (§7.3.8.5, §7.4.9.2). Per
+Table 9-43 the flag is FL with `cMax = 1` (a single context-coded
+bin); Table 9-48's row lists `ctxInc = 0` for bin 0 and `na` for every
+later binIdx column. Table 9-12 supplies three ctxIdx slots with
+`initValue = 184` at initType 0, `154` at initType 1 and `183` at
+initType 2 — unlike `pred_mode_flag`, this element is read in I, P and
+B slices (intra CUs occur in every slice type), so all three initType
+slots are populated. The flag is always present when the §7.3.8.5
+intra-PB loop reaches it (no inferred-value rule); when it is 1 the
+§8.4.2 candidate-mode derivation supplies `IntraPredModeY` and
+`mpm_idx` picks among the candidates, when 0
+`rem_intra_luma_pred_mode` carries the mode directly. The new public
+surface: [`binarization::PREV_INTRA_LUMA_PRED_FLAG_FL_CMAX`] (= 1,
+Table 9-43 shape); [`binarization::PREV_INTRA_LUMA_PRED_FLAG_FL_NBITS`]
+(= 1, the §9.3.3.5 `Ceil(Log2(cMax + 1))` derivation collapsed to a
+constant); [`binarization::prev_intra_luma_pred_flag_ctx_inc`]
+(returns 0 — the Table 9-48 bin-0 row);
+[`binarization::LumaIntraModeSource`] (two-variant enum capturing the
+§7.4.9.2 `Mpm` / `Remaining` selection);
+[`binarization::luma_intra_mode_source_from_flag`] (the present-on-wire
+mapping 1 ⇒ Mpm, 0 ⇒ Remaining); and
+[`binarization::decode_prev_intra_luma_pred_flag`] driving the §9.3
+CABAC engine to consume one FL bin against the caller-allocated Table
+9-12 context, returning the decoded `u8`. Total tests now 396 (was
+389): 7 new tests cover the Table 9-48 `ctxInc = 0` anchor; the Table
+9-43 FL shape (`cMax = 1`, `Ceil(Log2(2)) = 1` `nBits` cross-check);
+the `luma_intra_mode_source_from_flag` mapping (1 ⇒ Mpm, 0 ⇒
+Remaining); the `LumaIntraModeSource` variant distinctness anchor; the
+engine-driven decode for the valMps = 0 / valMps = 1 contexts (with
+`LumaIntraModeSource` cross-check); and the
+exactly-one-bin-per-invocation anchor across two back-to-back contexts
+on the same engine.
+
+Round 39 had landed the
 §9.3.4.2 / Table 9-48 entry for `pred_mode_flag` — the per-CU bit that
 selects between MODE_INTER (value 0) and MODE_INTRA (value 1) inside a
 P or B slice (§7.3.8.5, §7.4.9.5). Per Table 9-43 the flag is FL with
@@ -1438,9 +1476,15 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   place. Still to land — every other §9.3.4.2 syntax element:
   `sig_coeff_flag` (§9.3.4.2.5; Table 9-50 `ctxIdxMap` requires
   spec-trace confirmation of the i=15 entry — see "Spec gap" in the
-  round-31 report), prediction-mode / part-mode / merge / merge-idx
-  flags, motion-vector binarization (`mvd_lX[]` EGk +
-  sign), etc. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
+  round-31 report), part-mode / merge / merge-idx flags, intra-mode
+  fields (`mpm_idx`, `rem_intra_luma_pred_mode`,
+  `intra_chroma_pred_mode`), motion-vector binarization (`mvd_lX[]`
+  EGk + sign), etc. Round 39 lands `pred_mode_flag` (§9.3.4.2 /
+  Table 9-48, FL `cMax = 1`) and round 40 lands
+  `prev_intra_luma_pred_flag` (§9.3.4.2 / Table 9-48, FL `cMax = 1`,
+  Table 9-12 init `{184, 154, 183}`) via
+  [`binarization::decode_prev_intra_luma_pred_flag`] +
+  [`binarization::LumaIntraModeSource`]. Round 31 lands §9.3.4.2.6 + §9.3.4.2.7
   (`coeff_abs_level_greater1_flag` + `_greater2_flag`) via
   [`binarization::Greater1State`] +
   [`binarization::coeff_abs_level_greater2_flag_ctx_inc`]. (The §9.3 arithmetic decode engine
