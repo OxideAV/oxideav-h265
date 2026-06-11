@@ -433,6 +433,30 @@
 //! [`REM_INTRA_LUMA_PRED_MODE_FL_NBITS`] (= 5) and
 //! [`decode_rem_intra_luma_pred_mode`] (five FL bypass bins MSB-first,
 //! output `0..=31`).
+//!
+//! Round 42 adds the §7.3.8.5 chroma-mode field that follows the
+//! round-40/41 luma-mode group: `intra_chroma_pred_mode`, per H.265
+//! §7.4.9.5 / §9.3.3.8 / §8.4.3. Unlike the Table 9-43 generic shapes,
+//! this element has its own binarization process (§9.3.3.8 / Table
+//! 9-46): the single-bin string `0` signals value 4, and a `1` prefix
+//! followed by a two-bit FL suffix signals values 0..=3. Table 9-48
+//! marks bin 0 context-coded with `ctxInc = 0` (Table 9-13 supplies
+//! `initValue = {63, 152, 152}` for initType 0, 1 and 2) and bins 1..2
+//! `bypass`. The §8.4.3 derivation maps the decoded value plus
+//! `IntraPredModeY` to `modeIdx` via Table 8-2 (value 4 tracks the luma
+//! mode; values 0..=3 select from {0, 26, 10, 1} with a collision
+//! substitute of 34), then — when `ChromaArrayType == 2` — remaps
+//! `modeIdx` through Table 8-3. The new public surface:
+//! [`INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA`] (= 4, the Table 9-46
+//! single-bin value), [`INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS`] (= 2),
+//! [`intra_chroma_pred_mode_ctx_inc`] (the Table 9-48 bin-0
+//! `ctxInc = 0`), [`decode_intra_chroma_pred_mode`] (one
+//! [`CabacEngine::decode_decision`] then, for the `1` prefix, two
+//! bypass bins; output `{0, 1, 2, 3, 4}`),
+//! [`intra_pred_mode_c_mode_idx`] (Table 8-2),
+//! [`INTRA_PRED_MODE_C_CHROMA_422_MAP`] /
+//! [`intra_pred_mode_c_chroma_422`] (Table 8-3), and
+//! [`derive_intra_pred_mode_c`] (the full §8.4.3 output).
 
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
 
@@ -1273,6 +1297,180 @@ pub fn decode_rem_intra_luma_pred_mode(engine: &mut CabacEngine<'_>) -> Result<u
         "rem_intra_luma_pred_mode is FL cMax = 31 (Table 9-43); decoded value must be in 0..=31"
     );
     Ok(value as u8)
+}
+
+// ---------------------------------------------------------------------
+// intra_chroma_pred_mode (§7.3.8.5 coding_unit() / §7.4.9.5)
+// §9.3.3.8 / Table 9-46 binarization + Table 9-48 + §8.4.3 derivation.
+// The chroma-mode field that follows the luma-mode group in §7.3.8.5:
+// present once per CU when ChromaArrayType != 0 and != 3, and once per
+// luma prediction block (the same i/j loop as the luma fields) when
+// ChromaArrayType == 3; absent entirely when ChromaArrayType == 0
+// (monochrome — §8.4.3 is only invoked when ChromaArrayType != 0).
+// ---------------------------------------------------------------------
+
+/// Table 9-46 — the `intra_chroma_pred_mode` value signalled by the
+/// single-bin string `0`: 4. Per Table 8-2 row 4 the §8.4.3 `modeIdx`
+/// for this value is `IntraPredModeY` itself (the chroma prediction
+/// mode tracks the luma mode; for `ChromaArrayType == 2` the tracked
+/// mode is then remapped through Table 8-3).
+pub const INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA: u8 = 4;
+
+/// §9.3.3.8 / Table 9-46 — bit width of the FL suffix that follows the
+/// `1` prefix bin: 2. The suffix carries values 0..=3 MSB-first
+/// (`100`⇒0, `101`⇒1, `110`⇒2, `111`⇒3); both suffix bins are
+/// bypass-coded per Table 9-48.
+pub const INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS: u32 = 2;
+
+/// §9.3.4.2.1 / Table 9-48 row for `intra_chroma_pred_mode`. Bin 0 is
+/// context-coded with `ctxInc = 0`; bins 1 and 2 are `bypass` and bins
+/// beyond binIdx 2 are `na` (the Table 9-46 strings are at most three
+/// bins long).
+///
+/// Table 9-13 lists three ctxIdx slots with
+/// `initValue = {63, 152, 152}` for initType 0, 1 and 2 — the element
+/// is read in I, P and B slices (intra CUs occur in every slice type),
+/// so all three initType slots are populated. This layer hands back
+/// the bank-relative `ctxInc` only; the Table 9-13 initValue plus the
+/// Table 9-4 initType-to-ctxIdx mapping is consumed at slice-init
+/// scope.
+///
+/// Returns the ctxInc when called with `bin_idx == 0`; any other value
+/// is bypass (1, 2) or `na` per Table 9-48 and the function returns 0
+/// defensively (callers should not invoke this for the bypass bins).
+#[must_use]
+pub fn intra_chroma_pred_mode_ctx_inc(bin_idx: u32) -> u32 {
+    debug_assert!(
+        bin_idx == 0,
+        "intra_chroma_pred_mode Table 9-48 row: only bin 0 is context-coded; bins 1..2 are bypass"
+    );
+    0
+}
+
+/// Decode `intra_chroma_pred_mode` (§7.3.8.5 / §7.4.9.5) from the
+/// CABAC engine.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-13 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place per
+/// the §9.3.4.3.2.2 state transition.
+///
+/// Binarization is the §9.3.3.8 / Table 9-46 process: one
+/// context-coded prefix bin, then — only when that bin is 1 — a
+/// two-bit bypass FL suffix. A `0` prefix decodes to value 4
+/// ([`INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA`]; no suffix bins are read);
+/// a `1` prefix is followed by the MSB-first two-bit suffix carrying
+/// values 0..=3. The returned value is therefore always in
+/// `{0, 1, 2, 3, 4}` — feed it to [`intra_pred_mode_c_mode_idx`] /
+/// [`derive_intra_pred_mode_c`] for the §8.4.3 `IntraPredModeC`
+/// derivation.
+pub fn decode_intra_chroma_pred_mode(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48: bin 0 is context-coded with ctxInc = 0.
+    debug_assert_eq!(
+        intra_chroma_pred_mode_ctx_inc(0),
+        0,
+        "Table 9-48 row for intra_chroma_pred_mode: bin 0 ctxInc = 0"
+    );
+    let prefix = engine.decode_decision(ctx)?;
+    if prefix == 0 {
+        // Table 9-46: the single-bin string `0` is value 4.
+        return Ok(INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA);
+    }
+    // Table 9-46: `1` prefix + two-bit FL bypass suffix ⇒ values 0..=3.
+    let suffix = engine.decode_bypass_bits(INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS as u8)?;
+    debug_assert!(
+        suffix <= 3,
+        "intra_chroma_pred_mode suffix is two FL bins (Table 9-46); value must be in 0..=3"
+    );
+    Ok(suffix as u8)
+}
+
+/// §8.4.3 Table 8-2 — derive `modeIdx` from `intra_chroma_pred_mode`
+/// and `IntraPredModeY`.
+///
+/// Row 4 (`intra_chroma_pred_mode == 4`) yields `IntraPredModeY`
+/// itself. Rows 0..=3 select the base mode from `{0, 26, 10, 1}`
+/// (planar, vertical, horizontal, DC angular indices in
+/// `intra_chroma_pred_mode` order); when the selected base mode equals
+/// `IntraPredModeY` the table substitutes 34 instead (each Table 8-2
+/// column places 34 exactly where the row's base mode would collide
+/// with the luma mode).
+///
+/// `intra_pred_mode_y` must be a valid §8.4.2 mode (0..=34) and
+/// `intra_chroma_pred_mode` a decoded Table 9-46 value
+/// (`{0, 1, 2, 3, 4}`); out-of-range inputs are rejected in debug
+/// builds (release builds fall back to the luma-tracking row to avoid
+/// panicking on an accidental out-of-range input).
+#[must_use]
+pub fn intra_pred_mode_c_mode_idx(intra_chroma_pred_mode: u8, intra_pred_mode_y: u8) -> u8 {
+    debug_assert!(
+        intra_chroma_pred_mode <= 4,
+        "intra_chroma_pred_mode is a Table 9-46 value; must be in 0..=4"
+    );
+    debug_assert!(
+        intra_pred_mode_y <= 34,
+        "IntraPredModeY is a §8.4.2 mode index; must be in 0..=34"
+    );
+    // Table 8-2 rows 0..=3 base modes, in intra_chroma_pred_mode order.
+    const BASE_MODES: [u8; 4] = [0, 26, 10, 1];
+    match BASE_MODES.get(intra_chroma_pred_mode as usize) {
+        Some(&base) if base == intra_pred_mode_y => 34,
+        Some(&base) => base,
+        // Row 4 (and the release-build out-of-range fallback): modeIdx
+        // tracks the luma mode.
+        None => intra_pred_mode_y,
+    }
+}
+
+/// §8.4.3 Table 8-3 — `IntraPredModeC` as a function of `modeIdx` when
+/// `ChromaArrayType == 2`. Indexed by `modeIdx` 0..=34; entries 0..=2
+/// pass through unchanged (the Table 8-3 `X <= 2` column).
+pub const INTRA_PRED_MODE_C_CHROMA_422_MAP: [u8; 35] = [
+    0, 1, 2, // X <= 2 passes through
+    2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, // modeIdx 3..=14
+    18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, // modeIdx 15..=25
+    26, 27, 27, 28, 28, 29, 29, 30, 31, // modeIdx 26..=34
+];
+
+/// §8.4.3 Table 8-3 — remap `modeIdx` to `IntraPredModeC` for
+/// `ChromaArrayType == 2` streams. `mode_idx` must be in 0..=34;
+/// out-of-range inputs are rejected in debug builds (release builds
+/// pass the value through unchanged to avoid panicking).
+#[must_use]
+pub fn intra_pred_mode_c_chroma_422(mode_idx: u8) -> u8 {
+    debug_assert!(
+        mode_idx <= 34,
+        "modeIdx is a §8.4.3 Table 8-2 output; must be in 0..=34"
+    );
+    INTRA_PRED_MODE_C_CHROMA_422_MAP
+        .get(mode_idx as usize)
+        .copied()
+        .unwrap_or(mode_idx)
+}
+
+/// §8.4.3 — the full `IntraPredModeC` derivation: Table 8-2 `modeIdx`
+/// from the decoded `intra_chroma_pred_mode` and the §8.4.2
+/// `IntraPredModeY`, then — when `ChromaArrayType == 2` — the Table
+/// 8-3 remap; otherwise `IntraPredModeC` is `modeIdx` itself.
+///
+/// §8.4.3 is only invoked when `ChromaArrayType != 0`; the §7.3.8.5
+/// syntax never emits `intra_chroma_pred_mode` for a monochrome
+/// stream, so a caller holding a decoded value is already past that
+/// gate.
+#[must_use]
+pub fn derive_intra_pred_mode_c(
+    intra_chroma_pred_mode: u8,
+    intra_pred_mode_y: u8,
+    chroma_array_type_is_2: bool,
+) -> u8 {
+    let mode_idx = intra_pred_mode_c_mode_idx(intra_chroma_pred_mode, intra_pred_mode_y);
+    if chroma_array_type_is_2 {
+        intra_pred_mode_c_chroma_422(mode_idx)
+    } else {
+        mode_idx
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -5346,5 +5544,178 @@ mod tests {
                 "rem_intra_luma_pred_mode out of range: {v} for {buf:?}"
             );
         }
+    }
+
+    // -------------------------------------------------------------
+    // intra_chroma_pred_mode (§7.3.8.5 / §7.4.9.5)
+    // §9.3.3.8 / Table 9-46 + Table 9-48 + §8.4.3 (Tables 8-2, 8-3)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn intra_chroma_pred_mode_table_9_46_shape() {
+        // Table 9-46: the single-bin string `0` carries value 4; the
+        // `1`-prefixed strings carry a two-bit FL suffix for 0..=3.
+        assert_eq!(INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA, 4);
+        assert_eq!(INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS, 2);
+    }
+
+    #[test]
+    fn intra_chroma_pred_mode_ctx_inc_table_9_48_anchor() {
+        // Table 9-48 row: bin 0 ctxInc = 0 (bins 1..2 are bypass and
+        // never routed through this function).
+        assert_eq!(intra_chroma_pred_mode_ctx_inc(0), 0);
+    }
+
+    #[test]
+    fn decode_intra_chroma_pred_mode_zero_prefix_is_value_4() {
+        // A 0 prefix bin (fresh valMps = 0 context against the all-zero
+        // stream) terminates the Table 9-46 string immediately: value 4,
+        // no suffix bins read. Cross-check the bin count by replaying
+        // the raw decision on a second engine and comparing offsets.
+        let buf = [0u8; 8];
+        let mut eng_a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut eng_b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(0);
+        let v = decode_intra_chroma_pred_mode(&mut eng_a, &mut ctx_a).unwrap();
+        assert_eq!(v, INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA);
+        let _ = eng_b.decode_decision(&mut ctx_b).unwrap();
+        assert_eq!(eng_a.ivl_offset(), eng_b.ivl_offset());
+    }
+
+    #[test]
+    fn decode_intra_chroma_pred_mode_one_prefix_reads_two_suffix_bins() {
+        // A 1 prefix bin (fresh valMps = 1 context) is followed by the
+        // two-bit MSB-first bypass suffix. Replay the raw sequence on a
+        // second engine: same value, same post-read offset.
+        let buf = [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66];
+        let mut eng_a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut eng_b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(1);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let v = decode_intra_chroma_pred_mode(&mut eng_a, &mut ctx_a).unwrap();
+        let prefix = eng_b.decode_decision(&mut ctx_b).unwrap();
+        let expected = if prefix == 0 {
+            INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA
+        } else {
+            let hi = eng_b.decode_bypass().unwrap();
+            let lo = eng_b.decode_bypass().unwrap();
+            (hi << 1) | lo
+        };
+        assert_eq!(v, expected);
+        assert_eq!(eng_a.ivl_offset(), eng_b.ivl_offset());
+    }
+
+    #[test]
+    fn decode_intra_chroma_pred_mode_output_always_in_table_9_46_domain() {
+        // Whatever the stream and context polarity, the Table 9-46
+        // binarization only produces {0, 1, 2, 3, 4}.
+        // First 9 bits seed ivlOffset (must be < 510 per §9.3.2.5).
+        let seeds: [[u8; 8]; 4] = [
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            [0x5a, 0xa5, 0x3c, 0xc3, 0x0f, 0xf0, 0x99, 0x66],
+            [0x13, 0x57, 0x9b, 0xdf, 0x24, 0x68, 0xac, 0xe0],
+        ];
+        for buf in seeds {
+            for mps in [0u8, 1u8] {
+                let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+                let mut ctx = fresh_mps_ctx(mps);
+                let v = decode_intra_chroma_pred_mode(&mut eng, &mut ctx).unwrap();
+                assert!(
+                    v <= 4,
+                    "intra_chroma_pred_mode out of range: {v} for {buf:?} mps {mps}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_pred_mode_c_mode_idx_table_8_2_rows() {
+        // Table 8-2 rows 0..=3: base modes {0, 26, 10, 1}, substituting
+        // 34 exactly where the base mode collides with IntraPredModeY.
+        // Columns: Y ∈ {0, 26, 10, 1, X (other)}.
+        let columns = [0u8, 26, 10, 1, 7];
+        let rows: [(u8, [u8; 5]); 4] = [
+            (0, [34, 0, 0, 0, 0]),
+            (1, [26, 34, 26, 26, 26]),
+            (2, [10, 10, 34, 10, 10]),
+            (3, [1, 1, 1, 34, 1]),
+        ];
+        for (icpm, expected) in rows {
+            for (y, want) in columns.iter().zip(expected.iter()) {
+                assert_eq!(
+                    intra_pred_mode_c_mode_idx(icpm, *y),
+                    *want,
+                    "Table 8-2 row {icpm} column Y = {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intra_pred_mode_c_mode_idx_row_4_tracks_luma() {
+        // Table 8-2 row 4: modeIdx = IntraPredModeY for every column,
+        // including the four base-mode columns.
+        for y in [0u8, 1, 10, 26, 7, 34] {
+            assert_eq!(intra_pred_mode_c_mode_idx(4, y), y);
+        }
+    }
+
+    #[test]
+    fn intra_pred_mode_c_chroma_422_map_table_8_3_anchors() {
+        // Table 8-3 spot anchors across both printed rows, plus the
+        // X <= 2 pass-through column.
+        assert_eq!(INTRA_PRED_MODE_C_CHROMA_422_MAP.len(), 35);
+        for x in 0u8..=2 {
+            assert_eq!(intra_pred_mode_c_chroma_422(x), x);
+        }
+        let anchors: [(u8, u8); 10] = [
+            (3, 2),
+            (5, 2),
+            (6, 3),
+            (10, 10),
+            (17, 20),
+            (18, 21),
+            (26, 26),
+            (28, 27),
+            (31, 29),
+            (34, 31),
+        ];
+        for (mode_idx, want) in anchors {
+            assert_eq!(
+                intra_pred_mode_c_chroma_422(mode_idx),
+                want,
+                "Table 8-3 modeIdx {mode_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn intra_pred_mode_c_chroma_422_map_is_monotonic_and_in_range() {
+        // The Table 8-3 row is non-decreasing in modeIdx and every
+        // output is itself a valid mode index (0..=34) — a structural
+        // cross-check on the transcription.
+        let map = INTRA_PRED_MODE_C_CHROMA_422_MAP;
+        for w in map.windows(2) {
+            assert!(w[0] <= w[1], "Table 8-3 row must be non-decreasing: {w:?}");
+        }
+        assert!(map.iter().all(|&m| m <= 34));
+    }
+
+    #[test]
+    fn derive_intra_pred_mode_c_applies_table_8_3_only_for_422() {
+        // §8.4.3: ChromaArrayType == 2 routes modeIdx through Table 8-3;
+        // every other (non-zero) ChromaArrayType passes modeIdx through.
+        // icpm 4 with Y = 30: modeIdx = 30, Table 8-3 ⇒ 28.
+        assert_eq!(derive_intra_pred_mode_c(4, 30, true), 28);
+        assert_eq!(derive_intra_pred_mode_c(4, 30, false), 30);
+        // icpm 1 with Y = 26 collides ⇒ modeIdx = 34, Table 8-3 ⇒ 31.
+        assert_eq!(derive_intra_pred_mode_c(1, 26, true), 31);
+        assert_eq!(derive_intra_pred_mode_c(1, 26, false), 34);
+        // icpm 0 with Y = 7 ⇒ modeIdx = 0; X <= 2 passes through under
+        // Table 8-3, so both paths agree.
+        assert_eq!(derive_intra_pred_mode_c(0, 7, true), 0);
+        assert_eq!(derive_intra_pred_mode_c(0, 7, false), 0);
     }
 }

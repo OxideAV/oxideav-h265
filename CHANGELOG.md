@@ -6,6 +6,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 42 (2026-06-11)
+
+- §9.3.3.8 / Table 9-46 + Table 9-48 entries for `intra_chroma_pred_mode`
+  (H.265 §7.3.8.5, §7.4.9.5) — the chroma-mode field that follows the
+  round-40/41 luma-mode group, plus the §8.4.3 `IntraPredModeC`
+  derivation (Tables 8-2 and 8-3). Unlike the generic Table 9-43
+  shapes, this element has its own binarization process: the
+  single-bin string `0` carries value 4 and a `1` prefix is followed
+  by a two-bit FL bypass suffix carrying values 0..=3. Table 9-48
+  marks bin 0 context-coded with `ctxInc = 0` (Table 9-13 supplies
+  `initValue = {63, 152, 152}` for initType 0 / 1 / 2 — the element is
+  read in I, P and B slices) and bins 1..2 `bypass`. Presence follows
+  the §7.3.8.5 `ChromaArrayType` gates: once per CU when
+  `ChromaArrayType` is 1 or 2, once per luma prediction block when 3,
+  absent when 0 (§8.4.3 is only invoked when `ChromaArrayType != 0`).
+  - [`binarization::INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA`] (= 4) — the
+    Table 9-46 single-bin value; Table 8-2 row 4 sets `modeIdx` to
+    `IntraPredModeY` itself.
+  - [`binarization::INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS`] (= 2) —
+    the Table 9-46 FL suffix width behind the `1` prefix.
+  - [`binarization::intra_chroma_pred_mode_ctx_inc`] — Table 9-48
+    bin-0 row: `ctxInc = 0`.
+  - [`binarization::decode_intra_chroma_pred_mode`] — engine-driven
+    decode: one `decode_decision` for the prefix, then (only on a `1`
+    prefix) two MSB-first bypass bins. Output is always in
+    `{0, 1, 2, 3, 4}`.
+  - [`binarization::intra_pred_mode_c_mode_idx`] — Table 8-2: rows
+    0..=3 select the base mode from `{0, 26, 10, 1}` substituting 34
+    on a collision with `IntraPredModeY`; row 4 tracks the luma mode.
+  - [`binarization::INTRA_PRED_MODE_C_CHROMA_422_MAP`] /
+    [`binarization::intra_pred_mode_c_chroma_422`] — the Table 8-3
+    35-entry remap applied when `ChromaArrayType == 2`.
+  - [`binarization::derive_intra_pred_mode_c`] — the full §8.4.3
+    output: Table 8-2 `modeIdx`, then Table 8-3 iff
+    `ChromaArrayType == 2`, else pass-through.
+- Test count: 403 → 413 (+10 new tests covering the Table 9-46 shape
+  constants; the Table 9-48 `ctxInc = 0` anchor; the `0`-prefix ⇒
+  value-4 single-bin path (with engine-offset cross-check); the
+  `1`-prefix two-suffix-bin wrapper-vs-raw-replay agreement (value +
+  engine offset); the `{0..4}` output-domain sweep over both context
+  polarities; the full Table 8-2 row/column matrix incl. the row-4
+  luma-tracking column; Table 8-3 spot anchors + the X ≤ 2
+  pass-through; a Table 8-3 structural cross-check (non-decreasing,
+  all entries ≤ 34); and the §8.4.3 combined-derivation 4:2:2 vs
+  non-4:2:2 routing).
+
 ### Added — clean-room rebuild round 41 (2026-06-10)
 
 - §9.3.4.2 / Table 9-43 + Table 9-48 entries for the two §7.3.8.5

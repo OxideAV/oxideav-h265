@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 41 (2026-06-10).** The prior implementation was
+**Clean-room rebuild — round 42 (2026-06-11).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,48 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 41 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 42 lands
+`intra_chroma_pred_mode` — the §7.3.8.5 chroma-mode field that follows
+the round-40/41 luma-mode group — plus the §8.4.3 `IntraPredModeC`
+derivation (§7.4.9.5, §9.3.3.8). Unlike the generic Table 9-43 shapes,
+this element has its own binarization process (Table 9-46): the
+single-bin string `0` carries value 4 and a `1` prefix is followed by a
+two-bit FL bypass suffix carrying values 0..=3; Table 9-48 marks bin 0
+context-coded with `ctxInc = 0` (Table 9-13 `initValue = {63, 152,
+152}` for initType 0 / 1 / 2) and bins 1..2 `bypass`. Presence follows
+the §7.3.8.5 `ChromaArrayType` gates (once per CU for 4:2:0 / 4:2:2,
+once per luma PB for 4:4:4, absent for monochrome). The §8.4.3
+derivation: Table 8-2 maps the decoded value plus `IntraPredModeY` to
+`modeIdx` (rows 0..=3 select from the base modes `{0, 26, 10, 1}`
+substituting 34 on a collision with the luma mode; row 4 — the value
+behind the single-bin string — tracks the luma mode), then
+`ChromaArrayType == 2` remaps `modeIdx` through the 35-entry Table 8-3.
+New public surface:
+[`binarization::INTRA_CHROMA_PRED_MODE_SAME_AS_LUMA`] (= 4) and
+[`binarization::INTRA_CHROMA_PRED_MODE_SUFFIX_FL_NBITS`] (= 2, the
+Table 9-46 shape); [`binarization::intra_chroma_pred_mode_ctx_inc`]
+(Table 9-48 bin-0 `ctxInc = 0`);
+[`binarization::decode_intra_chroma_pred_mode`] (one
+`decode_decision` prefix, then two MSB-first bypass bins only on a `1`
+prefix; output `{0, 1, 2, 3, 4}`);
+[`binarization::intra_pred_mode_c_mode_idx`] (Table 8-2);
+[`binarization::INTRA_PRED_MODE_C_CHROMA_422_MAP`] /
+[`binarization::intra_pred_mode_c_chroma_422`] (Table 8-3); and
+[`binarization::derive_intra_pred_mode_c`] (the full §8.4.3 output).
+Total tests now 413 (was 403): 10 new tests cover the Table 9-46 shape
+constants; the Table 9-48 `ctxInc` anchor; the `0`-prefix ⇒ value-4
+path and the `1`-prefix two-suffix-bin replay agreement (both with
+engine-offset cross-checks); the output-domain sweep over both context
+polarities; the full Table 8-2 row/column matrix; Table 8-3 spot
+anchors, the X ≤ 2 pass-through, and a structural non-decreasing /
+range cross-check; and the §8.4.3 4:2:2-vs-other routing. With this
+the intra-mode signalling group (`prev_intra_luma_pred_flag`,
+`mpm_idx`, `rem_intra_luma_pred_mode`, `intra_chroma_pred_mode`) is
+complete through both binarization and the §8.4.3 chroma derivation;
+the §8.4.2 luma candModeList construction (neighbour-mode candidate
+derivation) remains a follow-up.
+
+Round 41 lands the
 §9.3.4.2 / Table 9-43 + Table 9-48 entries for the two §7.3.8.5
 intra-PB luma-mode fields that follow round 40's
 `prev_intra_luma_pred_flag`: `mpm_idx` and `rem_intra_luma_pred_mode`
