@@ -885,18 +885,25 @@ impl SeqParameterSet {
             false
         };
 
+        // §A.4.1 items b) / c): each dimension "shall be less than or
+        // equal to Sqrt( MaxLumaPs * 8 )". The largest Table A.8
+        // MaxLumaPs is 142 606 336 (levels 7 .. 7.2), giving
+        // Sqrt( 142 606 336 * 8 ) = 33 776 (integer part). Enforcing
+        // the ceiling here keeps every downstream PicWidthInCtbsY /
+        // PicSizeInCtbsY derivation (eqs. 7-15 .. 7-19) inside u32.
+        const MAX_LUMA_DIMENSION: u32 = 33_776;
         let pic_width_in_luma_samples = br.ue()?;
-        if pic_width_in_luma_samples == 0 {
+        if pic_width_in_luma_samples == 0 || pic_width_in_luma_samples > MAX_LUMA_DIMENSION {
             return Err(SpsError::ValueOutOfRange {
                 field: "pic_width_in_luma_samples",
-                got: 0,
+                got: pic_width_in_luma_samples,
             });
         }
         let pic_height_in_luma_samples = br.ue()?;
-        if pic_height_in_luma_samples == 0 {
+        if pic_height_in_luma_samples == 0 || pic_height_in_luma_samples > MAX_LUMA_DIMENSION {
             return Err(SpsError::ValueOutOfRange {
                 field: "pic_height_in_luma_samples",
-                got: 0,
+                got: pic_height_in_luma_samples,
             });
         }
 
@@ -966,12 +973,80 @@ impl SeqParameterSet {
             }
         }
 
-        let log2_min_luma_coding_block_size_minus3 = br.ue()? as u8;
-        let log2_diff_max_min_luma_coding_block_size = br.ue()? as u8;
-        let log2_min_luma_transform_block_size_minus2 = br.ue()? as u8;
-        let log2_diff_max_min_luma_transform_block_size = br.ue()? as u8;
-        let max_transform_hierarchy_depth_inter = br.ue()? as u8;
-        let max_transform_hierarchy_depth_intra = br.ue()? as u8;
+        let log2_min_luma_coding_block_size_minus3_raw = br.ue()?;
+        let log2_diff_max_min_luma_coding_block_size_raw = br.ue()?;
+        // §7.4.3.2.1 eqs. 7-10 / 7-11: MinCbLog2SizeY =
+        // log2_min_luma_coding_block_size_minus3 + 3 and CtbLog2SizeY =
+        // MinCbLog2SizeY + log2_diff_max_min_luma_coding_block_size.
+        // Every Annex A profile requires "CtbLog2SizeY derived
+        // according to active SPSs ... shall be in the range of 4 to 6,
+        // inclusive" (e.g. the §A.3.2 Main-profile item), and the
+        // eq.-7-13 `CtbSizeY = 1 << CtbLog2SizeY` shift (re-derived all
+        // over the slice/CTB layers) is only meaningful under that
+        // bound — reject out-of-range values here.
+        let ctb_log2_size_y = log2_min_luma_coding_block_size_minus3_raw
+            .saturating_add(3)
+            .saturating_add(log2_diff_max_min_luma_coding_block_size_raw);
+        if !(4..=6).contains(&ctb_log2_size_y) {
+            return Err(SpsError::ValueOutOfRange {
+                field: "CtbLog2SizeY",
+                got: ctb_log2_size_y,
+            });
+        }
+        let log2_min_luma_coding_block_size_minus3 =
+            log2_min_luma_coding_block_size_minus3_raw as u8;
+        let log2_diff_max_min_luma_coding_block_size =
+            log2_diff_max_min_luma_coding_block_size_raw as u8;
+        let min_cb_log2_size_y = u32::from(log2_min_luma_coding_block_size_minus3) + 3;
+
+        let log2_min_luma_transform_block_size_minus2_raw = br.ue()?;
+        // §7.4.3.2.1: "The CVS shall not contain data that result in
+        // MinTbLog2SizeY greater than or equal to MinCbLog2SizeY"
+        // (MinTbLog2SizeY = log2_min_luma_transform_block_size_minus2
+        // + 2).
+        let min_tb_log2_size_y = log2_min_luma_transform_block_size_minus2_raw.saturating_add(2);
+        if min_tb_log2_size_y >= min_cb_log2_size_y {
+            return Err(SpsError::ValueOutOfRange {
+                field: "log2_min_luma_transform_block_size_minus2",
+                got: log2_min_luma_transform_block_size_minus2_raw,
+            });
+        }
+        let log2_min_luma_transform_block_size_minus2 =
+            log2_min_luma_transform_block_size_minus2_raw as u8;
+
+        let log2_diff_max_min_luma_transform_block_size_raw = br.ue()?;
+        // §7.4.3.2.1: "The CVS shall not contain data that result in
+        // MaxTbLog2SizeY greater than Min( CtbLog2SizeY, 5 )".
+        let max_tb_log2_size_y =
+            min_tb_log2_size_y.saturating_add(log2_diff_max_min_luma_transform_block_size_raw);
+        if max_tb_log2_size_y > ctb_log2_size_y.min(5) {
+            return Err(SpsError::ValueOutOfRange {
+                field: "log2_diff_max_min_luma_transform_block_size",
+                got: log2_diff_max_min_luma_transform_block_size_raw,
+            });
+        }
+        let log2_diff_max_min_luma_transform_block_size =
+            log2_diff_max_min_luma_transform_block_size_raw as u8;
+
+        // §7.4.3.2.1: both hierarchy depths "shall be in the range of
+        // 0 to CtbLog2SizeY − MinTbLog2SizeY, inclusive".
+        let max_hierarchy_depth = ctb_log2_size_y - min_tb_log2_size_y;
+        let max_transform_hierarchy_depth_inter_raw = br.ue()?;
+        if max_transform_hierarchy_depth_inter_raw > max_hierarchy_depth {
+            return Err(SpsError::ValueOutOfRange {
+                field: "max_transform_hierarchy_depth_inter",
+                got: max_transform_hierarchy_depth_inter_raw,
+            });
+        }
+        let max_transform_hierarchy_depth_inter = max_transform_hierarchy_depth_inter_raw as u8;
+        let max_transform_hierarchy_depth_intra_raw = br.ue()?;
+        if max_transform_hierarchy_depth_intra_raw > max_hierarchy_depth {
+            return Err(SpsError::ValueOutOfRange {
+                field: "max_transform_hierarchy_depth_intra",
+                got: max_transform_hierarchy_depth_intra_raw,
+            });
+        }
+        let max_transform_hierarchy_depth_intra = max_transform_hierarchy_depth_intra_raw as u8;
 
         let scaling_list_enabled_flag = br.u1()? != 0;
         let mut sps_scaling_list_data_present_flag = false;
@@ -1431,17 +1506,15 @@ mod tests {
         out
     }
 
-    /// Prefix of bits that get every SPS hand-assembled fixture through
-    /// the structural header up to (but not including) the round-4 tail.
-    /// `chroma_format_idc=1, width=16, height=16, conf_win=0, bit_depths=0,
-    /// log2_max_poc_lsb_minus4=4, max_sub_layers_minus1=0, ordering_info
-    /// present with single triple {dpb=0, reorder=0, latency=0},
-    /// log2_min_cb=0, log2_diff=1, log2_min_tb=0, log2_diff_tb=2,
-    /// max_transform_depth_*=0, scaling_list=0, amp=0, sao=1`.
-    ///
-    /// This is the EXACT same prefix the round-3 tests used; the round-4
-    /// tail tests then concatenate the tail bits they want to exercise.
-    fn synthesised_prefix_bits() -> String {
+    /// Header bits through the per-sub-layer ordering triple, with the
+    /// `pic_width_in_luma_samples` / `pic_height_in_luma_samples`
+    /// `ue(v)` bit strings supplied by the caller (the fixture default
+    /// is 16 × 16 → `000010001` each). Everything else is fixed:
+    /// `vps_id=0, max_sub_layers_minus1=0, nesting=1, a §7.3.3 PTL
+    /// walk (profile_idc=1, level=30), sps_id=0, chroma_format_idc=1,
+    /// conf_win=0, bit_depths=0, log2_max_poc_lsb_minus4=4,
+    /// ordering_info present with single triple {0,0,0}`.
+    fn synthesised_header_through_ordering(width_ue: &str, height_ue: &str) -> String {
         let mut s = String::new();
         s += "0000"; // vps_id
         s += "000"; // max_sub_layers_minus1
@@ -1463,10 +1536,10 @@ mod tests {
         s += "1";
         // chroma_format_idc ue(v)=1 → '010'
         s += "010";
-        // width ue(v)=16 → '000010001'
-        s += "000010001";
-        // height ue(v)=16
-        s += "000010001";
+        // width ue(v)
+        s += width_ue;
+        // height ue(v)
+        s += height_ue;
         // conf_win = 0
         s += "0";
         // bd_luma=0, bd_chroma=0
@@ -1479,6 +1552,21 @@ mod tests {
         s += "1";
         s += "1";
         s += "1";
+        s
+    }
+
+    /// Prefix of bits that get every SPS hand-assembled fixture through
+    /// the structural header up to (but not including) the round-4 tail.
+    /// `chroma_format_idc=1, width=16, height=16, conf_win=0, bit_depths=0,
+    /// log2_max_poc_lsb_minus4=4, max_sub_layers_minus1=0, ordering_info
+    /// present with single triple {dpb=0, reorder=0, latency=0},
+    /// log2_min_cb=0, log2_diff=1, log2_min_tb=0, log2_diff_tb=2,
+    /// max_transform_depth_*=0, scaling_list=0, amp=0, sao=1`.
+    ///
+    /// This is the EXACT same prefix the round-3 tests used; the round-4
+    /// tail tests then concatenate the tail bits they want to exercise.
+    fn synthesised_prefix_bits() -> String {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
         // log2_min_cb_minus3 = 0
         s += "1";
         // log2_diff = 1 → '010'
@@ -1993,6 +2081,135 @@ mod tests {
             SpsError::ValueOutOfRange {
                 field: "chroma_format_idc",
                 got: 4
+            }
+        );
+    }
+
+    /// Fuzz regression (r282 `parse_annexb`): an SPS whose
+    /// coding-block-size pair drives `CtbLog2SizeY` (§7.4.3.2.1
+    /// eqs. 7-10 / 7-11) past the Annex A profile bound of 4..=6
+    /// previously survived the parse and panicked downstream in every
+    /// `CtbSizeY = 1 << CtbLog2SizeY` (eq. 7-13) re-derivation.
+    #[test]
+    fn rejects_ctb_log2_size_above_6() {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        // log2_min_luma_coding_block_size_minus3 = 0 → MinCbLog2SizeY = 3
+        s += "1";
+        // log2_diff_max_min_luma_coding_block_size ue = 4 → CtbLog2SizeY = 7
+        s += "00101";
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "CtbLog2SizeY",
+                got: 7
+            }
+        );
+    }
+
+    /// Annex A also bounds `CtbLog2SizeY` from below (4): a
+    /// 8×8-CTB SPS must be rejected.
+    #[test]
+    fn rejects_ctb_log2_size_below_4() {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        // log2_min_cb_minus3 = 0, log2_diff = 0 → CtbLog2SizeY = 3
+        s += "1";
+        s += "1";
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "CtbLog2SizeY",
+                got: 3
+            }
+        );
+    }
+
+    /// §7.4.3.2.1: "The CVS shall not contain data that result in
+    /// MinTbLog2SizeY greater than or equal to MinCbLog2SizeY".
+    #[test]
+    fn rejects_min_tb_log2_size_reaching_min_cb() {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        s += "1"; // MinCbLog2SizeY = 3
+        s += "010"; // CtbLog2SizeY = 4
+        s += "010"; // log2_min_tb_minus2 = 1 → MinTbLog2SizeY = 3 == MinCb
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "log2_min_luma_transform_block_size_minus2",
+                got: 1
+            }
+        );
+    }
+
+    /// §7.4.3.2.1: "The CVS shall not contain data that result in
+    /// MaxTbLog2SizeY greater than Min( CtbLog2SizeY, 5 )".
+    #[test]
+    fn rejects_max_tb_log2_size_above_cap() {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        s += "1"; // MinCbLog2SizeY = 3
+        s += "010"; // CtbLog2SizeY = 4 → cap = Min(4, 5) = 4
+        s += "1"; // MinTbLog2SizeY = 2
+        s += "00100"; // log2_diff_tb = 3 → MaxTbLog2SizeY = 5 > 4
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "log2_diff_max_min_luma_transform_block_size",
+                got: 3
+            }
+        );
+    }
+
+    /// §7.4.3.2.1: both hierarchy depths "shall be in the range of 0
+    /// to CtbLog2SizeY − MinTbLog2SizeY, inclusive" (= 2 here).
+    #[test]
+    fn rejects_transform_hierarchy_depth_above_cap() {
+        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        s += "1"; // MinCbLog2SizeY = 3
+        s += "010"; // CtbLog2SizeY = 4
+        s += "1"; // MinTbLog2SizeY = 2
+        s += "011"; // log2_diff_tb = 2 → MaxTbLog2SizeY = 4 (legal)
+        s += "00100"; // max_transform_hierarchy_depth_inter = 3 > 2
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "max_transform_hierarchy_depth_inter",
+                got: 3
+            }
+        );
+    }
+
+    /// §A.4.1 item b): `pic_width_in_luma_samples` ≤
+    /// `Sqrt( MaxLumaPs * 8 )` = 33 776 at the largest Table A.8
+    /// level. An unbounded width previously let the
+    /// PicWidthInCtbsY × PicHeightInCtbsY product (eq. 7-19 territory)
+    /// overflow u32 downstream.
+    #[test]
+    fn rejects_oversized_pic_width() {
+        // ue(33 777): codeNum + 1 = 33 778 needs 16 bits → 15-zero
+        // prefix followed by the 16-bit value.
+        let code: u32 = 33_778;
+        let len = 32 - code.leading_zeros();
+        let mut ue = "0".repeat(len as usize - 1);
+        for i in (0..len).rev() {
+            ue.push(if (code >> i) & 1 == 1 { '1' } else { '0' });
+        }
+        let s = synthesised_header_through_ordering(&ue, "000010001");
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).unwrap_err();
+        assert_eq!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "pic_width_in_luma_samples",
+                got: 33_777
             }
         );
     }

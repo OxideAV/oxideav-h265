@@ -718,10 +718,20 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
                 // §9.3.3.11: cAbsLevel = baseLevel +
                 // coeff_abs_level_remaining[ n ]; carried with the
                 // cRiceParam to the next invocation in this sub-block.
-                c_last_abs_level = base_level + remaining;
+                // A non-conformant bin stream can drive `remaining`
+                // to the binarization's u32 saturation point, so the
+                // composition saturates instead of overflowing.
+                c_last_abs_level = base_level.saturating_add(remaining);
                 c_last_rice_param = c_rice_param;
             }
-            let abs_level = base_level + remaining;
+            // §7.4.9.11 bitstream conformance bounds the resulting
+            // TransCoeffLevel to [CoeffMin, CoeffMax]; the widest
+            // profile bound (eqs. 7-27 .. 7-30 with
+            // extended_precision_processing_flag and BitDepth 16) is
+            // ±(1 << 22). Clamping the magnitude keeps the decode
+            // total — and the i32 level array sound — on
+            // non-conformant escapes; conforming values are unchanged.
+            let abs_level = base_level.saturating_add(remaining).min(1 << 22);
             let xc = (xs << 2) + u32::from(pos_scan[n].x);
             let yc = (ys << 2) + u32::from(pos_scan[n].y);
             let idx = yc as usize * size + xc as usize;

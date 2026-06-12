@@ -478,6 +478,26 @@ impl PicParameterSet {
         let (tiles, loop_filter_across_tiles_enabled_flag) = if tiles_enabled_flag {
             let num_tile_columns_minus1 = br.ue()?;
             let num_tile_rows_minus1 = br.ue()?;
+            // §A.4.1 item f): "num_tile_columns_minus1 shall be less
+            // than MaxTileCols and num_tile_rows_minus1 shall be less
+            // than MaxTileRows". The largest Table A.8 entries are
+            // MaxTileCols = 40 / MaxTileRows = 44 (levels 7 .. 7.2);
+            // the tighter §7.4.3.3.1 PicWidthInCtbsY-relative bound
+            // needs the active SPS, which the PPS parse does not see.
+            // Rejecting here also bounds the explicit width / height
+            // array allocations below.
+            if num_tile_columns_minus1 >= 40 {
+                return Err(PpsError::ValueOutOfRange {
+                    field: "num_tile_columns_minus1",
+                    got: num_tile_columns_minus1 as i64,
+                });
+            }
+            if num_tile_rows_minus1 >= 44 {
+                return Err(PpsError::ValueOutOfRange {
+                    field: "num_tile_rows_minus1",
+                    got: num_tile_rows_minus1 as i64,
+                });
+            }
             let uniform_spacing_flag = br.u1()? != 0;
             let (column_width_minus1, row_height_minus1) = if !uniform_spacing_flag {
                 let mut cols = Vec::with_capacity(num_tile_columns_minus1 as usize);
@@ -1121,6 +1141,38 @@ mod tests {
         assert!(!pps.init_qp_in_range(4));
         // 16-bit (minus8=8): QpBdOffsetY=48, lower bound -74 → in range.
         assert!(pps.init_qp_in_range(8));
+    }
+
+    /// Fuzz regression (r282 hardening): §A.4.1 item f) bounds the
+    /// tile grid (`num_tile_columns_minus1 < MaxTileCols`, at most 40
+    /// per Table A.8). An unbounded `ue(v)` count previously drove the
+    /// explicit column-width array pre-allocation directly off the
+    /// wire value.
+    #[test]
+    fn rejects_oversized_tile_column_count() {
+        let mut bits = minimal_pps_prefix_bits_until_scaling_list();
+        // The helper's last four bits are `tiles_enabled_flag = 0`,
+        // `entropy_coding_sync = 0`, `loop_filter_across_slices = 1`,
+        // `deblocking_filter_control_present = 0` — rewrite the tail
+        // with tiles enabled and an out-of-range column count (the
+        // parse rejects before reading anything further).
+        bits.truncate(bits.len() - 4);
+        bits += "1"; // tiles_enabled_flag = 1
+        bits += "0"; // entropy_coding_sync_enabled_flag = 0
+        bits += "00000101001"; // num_tile_columns_minus1 ue = 40
+        bits += "1"; // num_tile_rows_minus1 = 0
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let err = PicParameterSet::parse(&rbsp).unwrap_err();
+        assert_eq!(
+            err,
+            PpsError::ValueOutOfRange {
+                field: "num_tile_columns_minus1",
+                got: 40
+            }
+        );
     }
 
     // --- test helpers --------------------------------------------------

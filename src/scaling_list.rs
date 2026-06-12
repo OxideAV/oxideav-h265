@@ -77,6 +77,18 @@ pub enum ScalingListError {
         /// The (illegal) `scaling_list_dc_coef_minus8` value.
         got: i32,
     },
+    /// `scaling_list_delta_coef` was outside the §7.4.5 range of −128
+    /// to 127, inclusive.
+    DeltaCoefOutOfRange {
+        /// The `sizeId` of the offending slot.
+        size_id: u8,
+        /// The `matrixId` of the offending slot.
+        matrix_id: u8,
+        /// The coefficient index `i`.
+        index: u8,
+        /// The (illegal) `scaling_list_delta_coef` value.
+        got: i32,
+    },
     /// A derived coefficient `ScalingList[sizeId][matrixId][i]` was not
     /// greater than 0, violating the §7.4.5 conformance requirement.
     NonPositiveCoef {
@@ -111,6 +123,15 @@ impl core::fmt::Display for ScalingListError {
                 f,
                 "scaling_list_dc_coef_minus8[{}][{matrix_id}] out of range: {got}",
                 size_id - 2
+            ),
+            Self::DeltaCoefOutOfRange {
+                size_id,
+                matrix_id,
+                index,
+                got,
+            } => write!(
+                f,
+                "scaling_list_delta_coef[{size_id}][{matrix_id}][{index}] out of range: {got}"
             ),
             Self::NonPositiveCoef {
                 size_id,
@@ -271,6 +292,18 @@ impl ScalingListData {
                     let mut coef = Vec::with_capacity(n);
                     for i in 0..n {
                         let delta_coef = br.se()?;
+                        // §7.4.5: "The value of scaling_list_delta_coef
+                        // shall be in the range of −128 to 127,
+                        // inclusive." (Also keeps the eq. nextCoef sum
+                        // below inside i32.)
+                        if !(-128..=127).contains(&delta_coef) {
+                            return Err(ScalingListError::DeltaCoefOutOfRange {
+                                size_id: size_id as u8,
+                                matrix_id: matrix_id as u8,
+                                index: i as u8,
+                                got: delta_coef,
+                            });
+                        }
                         // nextCoef = (nextCoef + delta_coef + 256) % 256
                         next_coef = (next_coef + delta_coef + 256).rem_euclid(256);
                         if next_coef <= 0 {
@@ -711,6 +744,31 @@ mod tests {
                 size_id: 0,
                 matrix_id: 0,
                 index: 0,
+            }
+        );
+    }
+
+    /// Fuzz regression (r282 `parse_annexb`): §7.4.5 bounds
+    /// `scaling_list_delta_coef` to −128..=127, inclusive. An
+    /// unbounded `se(v)` value previously overflowed the i32
+    /// `nextCoef + scaling_list_delta_coef + 256` sum.
+    #[test]
+    fn rejects_delta_coef_out_of_range() {
+        let mut f = Vec::new();
+        // sizeId 0, matrixId 0: explicit list; first delta_coef
+        // = −129 (codeNum 258), one past the §7.4.5 lower bound.
+        f.push((1, 1));
+        f.extend(se(-129));
+        let buf = pack(&f);
+        let mut br = BitReader::new(&buf);
+        let err = ScalingListData::parse(&mut br).unwrap_err();
+        assert_eq!(
+            err,
+            ScalingListError::DeltaCoefOutOfRange {
+                size_id: 0,
+                matrix_id: 0,
+                index: 0,
+                got: -129,
             }
         );
     }

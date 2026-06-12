@@ -1,10 +1,11 @@
 name: Fuzz
 
-# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 3 targets (~10 min each). The
-# cross-decode harnesses dlopen libde265 / libx265 at runtime via
-# libloading; the CI runner needs `libde265-dev libx265-dev` so they
-# actually validate instead of silently skipping.
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The shared
+# workflow auto-discovers the targets from fuzz/fuzz_targets/*.rs and
+# splits the 30-minute total budget evenly across them. Current
+# targets: parse_annexb (Annex B walk + VPS/SPS/PPS + slice-header
+# parse) and decode_residual (§7.3.8.11 residual_coding() through the
+# §9.3 CABAC engine).
 
 on:
   schedule:
@@ -15,6 +16,5 @@ jobs:
   fuzz:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
-      extra_packages_apt: "libde265-dev libx265-dev"
       time_budget_seconds: 1800
     secrets: inherit

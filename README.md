@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 43 (2026-06-12).** The prior implementation was
+**Clean-room rebuild — round 44 (2026-06-12).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,44 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 43 lands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 44 stands the
+scheduled Fuzz workflow back up (the post-rebuild tree had no `fuzz/`
+directory, so the daily run failed at target discovery): a cargo-fuzz
+scaffold with two panic-free harnesses — `parse_annexb` (Annex B NAL
+walk → §7.3.1.2 header → VPS / SPS / PPS dispatch, plus the §7.3.6.1
+`slice_segment_header()` parse against the last activated SPS + PPS
+pair) and `decode_residual` (the §7.3.8.11 `residual_coding( )` driver
+through the §9.3 arithmetic engine, with the leading input bytes
+mapped onto the driver configuration including the §7.4.9.11 scanIdx
+derivation) — seeded from the `docs/video/h265/fixtures/` Annex B
+corpus plus synthetic residual configurations. The first runs
+surfaced three real findings, all fixed with regression pins: (1) the
+SPS parse accepted coding-block-size fields that drive `CtbLog2SizeY`
+(§7.4.3.2.1 eqs. 7-10 / 7-11) outside the Annex A 4..=6 profile
+bound, panicking every downstream `CtbSizeY = 1 << CtbLog2SizeY`
+(eq. 7-13) re-derivation — the §7.4.3.2.1 block-size derivations are
+now validated at parse time (`CtbLog2SizeY` ∈ 4..=6;
+`MinTbLog2SizeY < MinCbLog2SizeY`;
+`MaxTbLog2SizeY ≤ Min( CtbLog2SizeY, 5 )`; both transform-hierarchy
+depths ≤ `CtbLog2SizeY − MinTbLog2SizeY`), alongside the §A.4.1
+item-b/c picture-dimension ceiling (`Sqrt( MaxLumaPs * 8 )` = 33 776
+at the largest Table A.8 level) and the §A.4.1 item-f tile-grid
+bounds (`num_tile_columns_minus1 < 40`,
+`num_tile_rows_minus1 < 44`), which also stops the PPS explicit
+column/row arrays from pre-allocating off the raw wire count; (2) the
+§9.3.3.11 `coeff_abs_level_remaining` EGk escape could compose a
+value past u32 on a non-conformant bypass-bin stream — the
+composition now saturates in u64 and the §7.3.8.11 driver clamps the
+level magnitude at the widest §7.4.9.11 / eqs. 7-27..7-30 profile
+bound (±2²²), leaving every conforming stream bit-identical; (3) the
+§7.3.4 `scaling_list_data()` parse accepted an unbounded
+`scaling_list_delta_coef`, overflowing the §7.3.4 `nextCoef` sum —
+the §7.4.5 −128..=127 range is now enforced
+([`ScalingListError::DeltaCoefOutOfRange`]). After the fixes both
+targets ran locally ≥ 5 minutes crash-free under AddressSanitizer
+with debug assertions. Total tests now 436 (was 427).
+
+Round 43 lands the
 §7.3.8.11 `residual_coding( )` syntax driver — the new [`residual`]
 module composes every previously-landed residual primitive (rounds
 26..35) into the full coefficient-decode loop that reconstructs one

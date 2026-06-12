@@ -2860,9 +2860,17 @@ where
     for _ in 0..suffix_bits {
         suffix = (suffix << 1) | u32::from(read_bin()?);
     }
-    let base = (((1u64 << leading_zeros) - 1) << k) as u32;
-    let c_max = coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param);
-    Ok(c_max + base + suffix)
+    // Compose in u64: `leading_zeros` can reach 32 on a non-conformant
+    // bin stream, where `base` alone exceeds u32::MAX. The §7.4.9.11
+    // conformance requirement bounds the corresponding TransCoeffLevel
+    // to [CoeffMin, CoeffMax] (eqs. 7-27 .. 7-30), far below the
+    // saturation point, so the clamp only fires on bin streams the
+    // spec already rejects — the decode stays total instead of
+    // overflowing.
+    let base = ((1u64 << leading_zeros) - 1) << k;
+    let c_max = u64::from(coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param));
+    let value = c_max + base + u64::from(suffix);
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// §9.3.3.11 — full bypass-coded decode of `coeff_abs_level_remaining[
@@ -4727,6 +4735,24 @@ mod tests {
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
             7
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_escape_saturates_instead_of_overflowing() {
+        // Fuzz regression (r282 `decode_residual`): a non-conformant
+        // bypass-bin stream can drive the EGk escape to its maximal
+        // shape — 4 TR escape ones, then 32 leading zeros (the loop
+        // cap), then 32 all-ones suffix bits — whose composed value
+        // exceeds u32. The decode must saturate, not overflow.
+        // §7.4.9.11 conformance (eqs. 7-27 .. 7-30) keeps every legal
+        // stream far below the saturation point.
+        let mut bins = vec![1u8, 1, 1, 1]; // TR escape prefix
+        bins.extend([0u8; 32]); // EGk leading zeros (loop cap)
+        bins.extend([1u8; 32]); // suffix payload
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
+            u32::MAX
         );
     }
 

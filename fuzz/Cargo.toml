@@ -1,0 +1,34 @@
+[package]
+name = "oxideav-h265-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-h265]
+path = ".."
+
+[[bin]]
+name = "parse_annexb"
+path = "fuzz_targets/parse_annexb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_residual"
+path = "fuzz_targets/decode_residual.rs"
+test = false
+doc = false
+bench = false
+
+# Stand-alone workspace: keeps the fuzz harness out of any enclosing
+# workspace's member resolution (the harness builds with nightly-only
+# instrumentation flags the surrounding crates never want).
+[workspace]
+members = ["."]

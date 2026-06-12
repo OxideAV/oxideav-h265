@@ -6,6 +6,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 44 (2026-06-12)
+
+- cargo-fuzz scaffold under `fuzz/` restoring the scheduled Fuzz
+  workflow (the post-rebuild tree had no fuzz targets, so the daily
+  run failed at discovery). Two harnesses, each run ≥ 5 minutes
+  locally under AddressSanitizer + debug assertions after the fixes
+  below:
+  - `parse_annexb` — Annex B NAL walk (§B.1) → §7.3.1.2 header →
+    VPS (§7.3.2.1) / SPS (§7.3.2.2) / PPS (§7.3.2.3.1) dispatch, plus
+    the §7.3.6.1 `slice_segment_header()` parse against the last
+    activated SPS + PPS pair. Seeded from the
+    `docs/video/h265/fixtures/` Annex B corpus.
+  - `decode_residual` — the §7.3.8.11 `residual_coding( )` driver
+    through the §9.3 arithmetic engine; the leading input bytes map
+    onto the driver configuration (transform size, chroma, the
+    §7.4.9.11 scanIdx derivation inputs, sign-data-hiding gates, the
+    uniform context init). Seeded with synthetic configurations.
+- SPS parse-time validation of the §7.4.3.2.1 block-size derivations:
+  `CtbLog2SizeY` (eqs. 7-10 / 7-11) must lie in the Annex A profile
+  bound 4..=6, `MinTbLog2SizeY` must be `< MinCbLog2SizeY`,
+  `MaxTbLog2SizeY` must be `≤ Min( CtbLog2SizeY, 5 )`, and both
+  transform-hierarchy depths `≤ CtbLog2SizeY − MinTbLog2SizeY`; plus
+  the §A.4.1 item-b/c picture-dimension ceiling
+  (`Sqrt( MaxLumaPs * 8 )` = 33 776 at the largest Table A.8 level).
+- PPS parse-time validation of the §A.4.1 item-f tile-grid bounds
+  (`num_tile_columns_minus1 < 40`, `num_tile_rows_minus1 < 44`, the
+  largest Table A.8 entries), which also stops the explicit
+  column/row arrays from pre-allocating off the raw wire count.
+
+### Fixed — clean-room rebuild round 44 (2026-06-12)
+
+- Fuzz finding (`parse_annexb`): an SPS with out-of-range
+  coding-block-size fields survived the parse and panicked every
+  downstream `CtbSizeY = 1 << CtbLog2SizeY` (eq. 7-13) re-derivation
+  (first hit in the slice-header `PicSizeInCtbsY` path). Rejected at
+  SPS parse time; regression tests pin all the new bounds.
+- Fuzz finding (`decode_residual`): the §9.3.3.11
+  `coeff_abs_level_remaining` EGk escape could compose a value past
+  u32 on a non-conformant bypass-bin stream (32 leading zeros +
+  all-ones suffix) and overflow. The composition now saturates in
+  u64, and the §7.3.8.11 driver clamps the level magnitude at the
+  widest §7.4.9.11 / eqs. 7-27..7-30 profile bound (±2²²);
+  conforming streams are bit-identical. A regression test pins the
+  maximal-escape shape.
+- Fuzz finding (`parse_annexb`): the §7.3.4 `scaling_list_data()`
+  parse accepted an unbounded `scaling_list_delta_coef` and
+  overflowed the i32 `nextCoef + scaling_list_delta_coef + 256` sum.
+  The §7.4.5 −128..=127 range is now enforced (new
+  `ScalingListError::DeltaCoefOutOfRange` variant); a regression
+  test pins the one-past-the-bound value.
+
 ### Added — clean-room rebuild round 43 (2026-06-12)
 
 - §7.3.8.11 `residual_coding( )` syntax driver — the new [`residual`]
