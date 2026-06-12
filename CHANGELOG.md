@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 43 (2026-06-12)
+
+- §7.3.8.11 `residual_coding( )` syntax driver — the new [`residual`]
+  module composes the rounds-26..35 residual primitives into the full
+  coefficient-decode loop reconstructing one transform block's
+  `TransCoeffLevel[ ][ ]` array: the do-while locate of
+  `(lastSubBlock, lastScanPos)` from `LastSignificantCoeff{X,Y}`
+  (with the eq. 7-78 vertical-scan swap), the reverse sub-block scan
+  with `coded_sub_block_flag` decode and the §7.4.9.11 not-present
+  inferences, the per-sub-block `sig_coeff_flag` loop with the full
+  §9.3.4.2.5 sigCtx branch dispatch (eq. 9-40 / Table 9-50 / eq. 9-42
+  DC / eqs. 9-43..9-53) and both inference rules (last-significant;
+  `inferSbDcSigCoeffFlag` DC), the `coeff_abs_level_greater1_flag`
+  pass with the `numGreater1Flag < 8` cap and lazy §9.3.4.2.6
+  sub-block entry, the at-most-one `coeff_abs_level_greater2_flag`,
+  the `signHidden` derivation + `coeff_sign_flag` gates + odd-parity
+  `sumAbsLevel` negation, and the level loop with the §7.3.8.11
+  remaining-presence test and the §9.3.3.11 per-sub-block eq.-9-24
+  Rice adaptation.
+  - [`residual::decode_residual_coding_with`] — bin-source-generic
+    driver core; [`residual::ResidualBinSource`] +
+    [`residual::ResidualElement`] identify each context-coded request.
+  - [`residual::decode_residual_coding`] /
+    [`residual::EngineResidualBinSource`] — the §9.3.4.3
+    arithmetic-engine binding over [`residual::ResidualContexts`]
+    (banks sized 18 / 18 / 4 / 44 / 24 / 6 per the Table 9-26..9-31
+    ctxIdx spans, exposed as `*_CTX_COUNT` constants;
+    [`residual::ResidualContexts::init_uniform`] is bring-up
+    scaffolding until the initValue transcription lands).
+  - [`residual::residual_coding_scan_idx`] — the §7.4.9.11 scanIdx
+    derivation; [`residual::ResidualBlock`] — the reconstructed
+    coefficient array; [`residual::ResidualCodingError`].
+- The Table 9-50 `ctxIdxMap` doc-comment on
+  [`binarization::SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`] now
+  cites the staged docs errata entry
+  (`docs/video/h265/h265-errata-and-clarifications.md` #93) pinning
+  the PDF-truncated `i = 15` cell to 8 (the constant already carried
+  that value from the round-32 pair-symmetry reconstruction).
+- 14 new tests (427 total, was 413): DC-only luma/chroma context
+  routing, 4×4 full sweep with Table 9-50 ctxInc cross-checks, 8×8
+  two-sub-block walk (csbf ctxInc, DC inference, eq.-9-58 ctxSet
+  bump), sign-data-hiding parity flip + disabled counterpart,
+  greater-1 cap with the `numSigCoeff >= 8` threshold, eq.-9-24 Rice
+  adaptation, vertical-scan swap, transform-skip sigCtx routing,
+  scanIdx derivation matrix, input validation, and two engine-backed
+  runs.
+
 ### Added — clean-room rebuild round 42 (2026-06-11)
 
 - §9.3.3.8 / Table 9-46 + Table 9-48 entries for `intra_chroma_pred_mode`

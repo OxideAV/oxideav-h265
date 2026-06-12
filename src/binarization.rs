@@ -478,7 +478,10 @@ use crate::cabac::{CabacEngine, CabacError, ContextModel};
 /// Returns `(prefix_val, is_escape)`. `is_escape` is `true` exactly
 /// when `prefix_val == cMax`: i.e. all `cMax` bins were 1, signalling
 /// that a TR + EGk continuation suffix must be read by the caller.
-fn read_truncated_rice_prefix<F>(c_max: u32, mut read_bin: F) -> Result<(u32, bool), CabacError>
+pub(crate) fn read_truncated_rice_prefix<F>(
+    c_max: u32,
+    mut read_bin: F,
+) -> Result<(u32, bool), CabacError>
 where
     F: FnMut(u32) -> Result<u8, CabacError>,
 {
@@ -2377,8 +2380,17 @@ pub const COEFF_ABS_LEVEL_GREATER_X_FL_CMAX: u32 = 1;
 /// §9.3.4.2.5 Table 9-50 — the `ctxIdxMap[ ]` 4×4 lookup that maps
 /// the inner-block scan position `(yC << 2) + xC` to a `sigCtx` for
 /// `log2TrafoSize == 2` transform blocks. Index order is row-major
-/// over `(yC, xC) ∈ {0..=3}^2`; the table is a fixed 16-entry
-/// permutation listed verbatim in Table 9-50 of the spec.
+/// over `(yC, xC) ∈ {0..=3}^2`.
+///
+/// The published Table 9-50 renders only `i ∈ 0..=14`; the `i = 15`
+/// cell is cropped past the page margin (a publishing/layout
+/// artefact — eq. 9-41 indexes the map by `( yC << 2 ) + xC` over a
+/// full 4×4 sub-block, so the 16th entry is normative content). The
+/// staged H.265 errata file
+/// (`docs/video/h265/h265-errata-and-clarifications.md`, entry #93)
+/// pins `ctxIdxMap[ 15 ] = 8` from the table's anti-diagonal
+/// pair-symmetry and the eq. 9-49..9-53 offset structure, matching
+/// the value this constant has carried since round 32.
 pub const SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2: [u8; 16] =
     [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
 

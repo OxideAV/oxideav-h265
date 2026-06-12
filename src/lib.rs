@@ -216,6 +216,7 @@ pub mod cabac;
 pub mod hrd;
 pub mod nal;
 pub mod pps;
+pub mod residual;
 pub mod scaling_list;
 pub mod scan;
 pub mod slice;

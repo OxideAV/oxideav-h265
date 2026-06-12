@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 42 (2026-06-11).** The prior implementation was
+**Clean-room rebuild — round 43 (2026-06-12).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,64 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 42 lands
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 43 lands the
+§7.3.8.11 `residual_coding( )` syntax driver — the new [`residual`]
+module composes every previously-landed residual primitive (rounds
+26..35) into the full coefficient-decode loop that reconstructs one
+transform block's `TransCoeffLevel[ ][ ]` array: the §7.3.8.11
+do-while locate of `(lastSubBlock, lastScanPos)` from the decoded
+`LastSignificantCoeff{X,Y}` (with the eq. 7-78 vertical-scan swap);
+the reverse sub-block scan with `coded_sub_block_flag` decode
+(presence gate `i < lastSubBlock && i > 0`) and the §7.4.9.11
+not-present inferences; the per-sub-block `sig_coeff_flag` loop with
+the full §9.3.4.2.5 sigCtx branch dispatch (eq. 9-40 transform-skip /
+Table 9-50 4×4 / eq. 9-42 DC / eqs. 9-43..9-53 general) and both
+§7.4.9.11 inference rules (last-significant ⇒ 1;
+`inferSbDcSigCoeffFlag` DC ⇒ 1); the `coeff_abs_level_greater1_flag`
+pass with the per-sub-block `numGreater1Flag < 8` cap and a lazy
+§9.3.4.2.6 sub-block entry (sub-blocks that decode no greater-1 bins
+do not advance `ctxSet`, matching the clause's "first time for the
+current sub-block scan index i" trigger); the at-most-one
+`coeff_abs_level_greater2_flag` at `lastGreater1ScanPos`; the
+§7.3.8.11 `signHidden` derivation with the `coeff_sign_flag`
+presence gate and the odd-parity `sumAbsLevel` negation at
+`firstSigScanPos`; and the level loop with the
+`baseLevel == ( ( numSigCoeff < 8 ) ? ( ( n == lastGreater1ScanPos ) ? 3 : 2 ) : 1 )`
+remaining-presence test and the §9.3.3.11 per-sub-block eq.-9-24
+Rice adaptation (`cLastAbsLevel` / `cLastRiceParam` reset per
+sub-block). The driver is generic over
+[`residual::ResidualBinSource`] (scripted-bin tests assert the exact
+`(element, ctxInc)` request sequence);
+[`residual::EngineResidualBinSource`] +
+[`residual::ResidualContexts`] (banks sized 18 / 18 / 4 / 44 / 24 / 6
+per the Table 9-26..9-31 ctxIdx spans) +
+[`residual::decode_residual_coding`] bind it to the §9.3.4.3
+arithmetic engine, and [`residual::residual_coding_scan_idx`]
+implements the §7.4.9.11 scanIdx derivation. The §9.3.4.2.5
+Table 9-50 `ctxIdxMap[ 15 ]` doc-comment now cites the staged errata
+entry (`docs/video/h265/h265-errata-and-clarifications.md` #93) that
+formally pins the PDF-truncated cell to 8 — the in-tree constant
+already carried that value from the round-32 pair-symmetry
+reconstruction, so no table change was needed. Total tests now 427
+(was 413): 14 new tests cover DC-only luma and chroma context
+routing; the 4×4 full sweep with greater-1 / greater-2 / remaining
+composition and per-position Table 9-50 ctxInc cross-checks; the
+8×8 two-sub-block walk (csbf neighbour ctxInc, DC inference, the
+eq.-9-58 ctxSet bump); the sign-data-hiding parity flip and its
+disabled counterpart; the greater-1 8-bin cap with the
+`numSigCoeff >= 8` threshold switch; eq.-9-24 Rice adaptation within
+a sub-block (TR-escape + EG1 then a cRiceParam-1 decode); the
+eq.-7-78 vertical-scan swap; eq.-9-40 transform-skip sigCtx routing;
+the §7.4.9.11 scanIdx derivation matrix; driver input validation;
+and two engine-backed runs (smoke decode + context-bank adaptation).
+Remaining residual follow-ups: the Table 9-26..9-31 initValue
+transcription plus the Table 9-4 initType slice-init wiring, the
+leading `transform_skip_flag` / RDPCM elements of §7.3.8.11, the
+persistent-Rice (§9.3.3.11 eqs. 9-20..9-23 / 9-25) and
+extended-precision branches, and the §8.6 scaling / inverse-transform
+reconstruction.
+
+Round 42 lands
 `intra_chroma_pred_mode` — the §7.3.8.5 chroma-mode field that follows
 the round-40/41 luma-mode group — plus the §8.4.3 `IntraPredModeC`
 derivation (§7.4.9.5, §9.3.3.8). Unlike the generic Table 9-43 shapes,
@@ -1559,7 +1616,12 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   entry — reconstructed `= 8` by pair-symmetry in round 32 — is now
   formally confirmed by the staged docs errata #93 (the PDF truncation
   at `i = 15` was a layout artefact; the in-tree constant already
-  carries the confirmed value). Still to land — every other §9.3.4.2
+  carries the confirmed value, and its doc-comment cites the errata
+  file as of round 43). Round 43 composes all of the above into the
+  §7.3.8.11 `residual_coding( )` driver
+  ([`residual::decode_residual_coding`] /
+  [`residual::decode_residual_coding_with`]) — see the round-43 notes
+  at the top of this README. Still to land — every other §9.3.4.2
   syntax element: part-mode / merge / merge-idx flags, the chroma
   intra-mode field `intra_chroma_pred_mode` (§9.3.3.8), motion-vector
   binarization (`mvd_lX[]` EGk + sign), etc. Round 39 lands
