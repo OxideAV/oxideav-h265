@@ -5,7 +5,7 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 44 (2026-06-12).** The prior implementation was
+**Clean-room rebuild — round 45 (2026-06-12).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
@@ -14,7 +14,37 @@ for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild is in progress against the published H.265 specification
-(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 44 stands the
+(ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 45 lands the
+complete §9.3.2.2 context-variable initialization layer — the new
+[`ctx_init`] module transcribes all 38 `initValue` tables
+(Tables 9-5..9-42, one flat constant per table on the printed ctxIdx
+axis; both staged spec PDFs cross-checked cell-for-cell) and the
+Table 9-4 ctxIdx-span association, including the irregular layouts:
+`part_mode` (1 + 4 + 4), `cbf_cb`/`cbf_cr` (4 × 3 plus the ctxIdx
+12/13/14 fifth context), the Table 9-23
+`abs_mvd_greater0_flag`/`greater1_flag` interleave, the
+luma + shared-chroma pairs of `transform_skip_flag` /
+`explicit_rdpcm_flag` / `explicit_rdpcm_dir_flag`, and the
+Table 9-29 `sig_coeff_flag` body-plus-transform-skip-tail (42 × 3 +
+ctxIdx 126..131). [`ctx_init::SliceContexts`] materialises the whole
+per-slice context array (185 adapting context variables per
+`initType`; Table 9-4 shared-variable groups stored once):
+`SliceContexts::init( initType, SliceQpY )` runs
+equations 9-4..9-6 over every bank,
+`SliceContexts::for_slice( slice_type, cabac_init_flag, SliceQpY )`
+adds the equation 9-7 `initType` derivation, and
+[`residual::ResidualContexts::init`] gives the §7.3.8.11
+`residual_coding( )` driver its Table 9-26..9-31 banks — the CABAC
+engine is now slice-initialisable end-to-end for `initType` 0 / 1 / 2.
+Inter-only banks at `initType == 0` carry the §9.3.2.2 NOTE 2
+non-adapting placeholder (`pStateIdx = 63`), unreachable from any
+table entry. Total tests now 447 (was 436): table-shape pins for all
+38 tables, hand-evaluated `(pStateIdx, valMps)` pins across QPs
+0..51 for regular / inter-only / irregular layouts, whole-array
+smoke tests per `initType`, the equation 9-7 routing matrix, and the
+Table 9-29 tail slicing pins.
+
+Round 44 stands the
 scheduled Fuzz workflow back up (the post-rebuild tree had no `fuzz/`
 directory, so the daily run failed at target discovery): a cargo-fuzz
 scaffold with two panic-free harnesses — `parse_annexb` (Annex B NAL

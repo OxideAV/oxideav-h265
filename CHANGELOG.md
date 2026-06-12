@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 45 (2026-06-12)
+
+- `ctx_init` module — the complete §9.3.2.2 context-variable
+  initialization layer:
+  - All 38 `initValue` tables (Tables 9-5..9-42) transcribed from the
+    staged specification PDFs, one flat constant per table laid out on
+    the printed ctxIdx axis, covering every context-coded syntax
+    element of §7.3.8.1..§7.3.8.12 (the §9.3.2.2 exceptions
+    `end_of_slice_segment_flag` / `end_of_subset_one_bit` / `pcm_flag`
+    keep the NOTE 2 non-adapting `ctxTable == 0` state). Both staged
+    PDFs (v8 08/2021 and v11 01/2026) were cross-checked and agree on
+    every cell.
+  - The Table 9-4 ctxIdx-span selection: `uniform_init_values` for the
+    regular contiguous three-`initType` layouts, `inter_init_values`
+    for the inter-only two-column tables (returns `None` at
+    `initType == 0`), `sig_coeff_flag_init_values` for the Table 9-29
+    42-per-type body plus the ctxIdx 126..131 transform-skip tail, and
+    dedicated handling for the irregular `part_mode` (1 + 4 + 4),
+    `cbf_cb`/`cbf_cr` (4 × 3 + the ctxIdx 12/13/14 fifth context),
+    `abs_mvd_greater0_flag`/`greater1_flag` (Table 9-23 interleave),
+    `transform_skip_flag` and `explicit_rdpcm_*` (luma + shared-chroma
+    pairs) layouts.
+  - `SliceContexts` — the whole per-slice context array (185 adapting
+    context variables per `initType`; Table 9-4 shared-variable groups
+    such as `sao_merge_left/up`, `ref_idx_l0/l1`, `mvp_l0/l1_flag`,
+    `cbf_cb/cr` and the palette copy-above pair stored once).
+    `SliceContexts::init(initType, SliceQpY)` runs equations 9-4..9-6
+    over every bank; `SliceContexts::for_slice(slice_type,
+    cabac_init_flag, SliceQpY)` adds the equation 9-7 `initType`
+    derivation. Inter-only banks at `initType == 0` take the NOTE 2
+    non-adapting placeholder (`pStateIdx = 63`), unreachable from any
+    table entry, so an accidental I-slice read is recognisable.
+  - `ResidualContexts::init(initType, SliceQpY)` — the Table 9-26..9-31
+    per-`initType` bank initialization for the §7.3.8.11
+    `residual_coding( )` driver (`init_uniform` stays as the scripted
+    bring-up constructor). With this the CABAC engine is
+    slice-initialisable end-to-end for `initType` 0 / 1 / 2.
+- 11 new tests (447 total, was 436): table-shape pins for all 38
+  tables; the Table 9-26 == Table 9-27 printed-value identity;
+  hand-evaluated `(pStateIdx, valMps)` pins across QPs 0..51 for
+  regular, inter-only and irregular layouts; whole-array smoke tests
+  per `initType` (every table-derived state in 0..=62, placeholders
+  exactly on the inter-only banks, 185-context count); the
+  equation 9-7 routing matrix (P/B `cabac_init_flag` swap, I-slice
+  invariance); span-helper slicing pins including the Table 9-29
+  transform-skip tail; and the `initType > 2` rejection.
+
 ### Added — clean-room rebuild round 44 (2026-06-12)
 
 - cargo-fuzz scaffold under `fuzz/` restoring the scheduled Fuzz

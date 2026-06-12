@@ -100,9 +100,11 @@
 //! (`coded_sub_block_flag`, 12 ⇒ 4), Table 9-29 (`sig_coeff_flag`,
 //! 132 ⇒ 44), Table 9-30 (`coeff_abs_level_greater1_flag`, 72 ⇒ 24)
 //! and Table 9-31 (`coeff_abs_level_greater2_flag`, 18 ⇒ 6). The
-//! initValue transcription itself plus the Table 9-4 initType
-//! slice-init wiring is the next follow-up; until it lands,
-//! [`ResidualContexts::init_uniform`] offers a bring-up constructor.
+//! initValue tables themselves live in [`crate::ctx_init`];
+//! [`ResidualContexts::init`] performs the §9.3.2.2 per-`initType`
+//! bank initialization from them, and
+//! [`ResidualContexts::init_uniform`] remains as a single-initValue
+//! bring-up constructor for scripted tests.
 
 use crate::binarization::{
     coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
@@ -176,9 +178,10 @@ pub enum ResidualElement {
 
 /// The per-`initType` CABAC context banks for the residual-coding
 /// syntax elements, sized per Tables 9-26..9-31 (see the bank-size
-/// constants). The §9.3.2.2 initialization of these banks from the
-/// table initValues and the Table 9-4 `initType` → ctxIdx mapping is
-/// slice-init scope (follow-up); [`init_uniform`](Self::init_uniform)
+/// constants). [`init`](Self::init) performs the §9.3.2.2
+/// initialization from the Table 9-26..9-31 initValues with the
+/// Table 9-4 `initType` → ctxIdx mapping (tables in
+/// [`crate::ctx_init`]); [`init_uniform`](Self::init_uniform)
 /// constructs a bank set from a single initValue for bring-up and
 /// tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,15 +201,61 @@ pub struct ResidualContexts {
 }
 
 impl ResidualContexts {
+    /// §9.3.2.2 initialization of every bank from the Table 9-26..9-31
+    /// `initValue` entries for the given `initType` (the Table 9-4
+    /// ctxIdx spans; see [`crate::ctx_init`]) at `SliceQpY ==
+    /// slice_qp_y` (equation 7-54).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `init_type > 2`.
+    #[must_use]
+    pub fn init(init_type: u8, slice_qp_y: i32) -> Self {
+        use crate::ctx_init::{
+            sig_coeff_flag_init_values, uniform_init_values, TABLE_9_26_LAST_SIG_COEFF_X_PREFIX,
+            TABLE_9_27_LAST_SIG_COEFF_Y_PREFIX, TABLE_9_28_CODED_SUB_BLOCK_FLAG,
+            TABLE_9_30_COEFF_ABS_LEVEL_GREATER1_FLAG, TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG,
+        };
+        let init = |v: u8| ContextModel::init(v, slice_qp_y);
+        Self {
+            last_sig_coeff_x_prefix: uniform_init_values::<LAST_SIG_COEFF_PREFIX_CTX_COUNT>(
+                &TABLE_9_26_LAST_SIG_COEFF_X_PREFIX,
+                init_type,
+            )
+            .map(init),
+            last_sig_coeff_y_prefix: uniform_init_values::<LAST_SIG_COEFF_PREFIX_CTX_COUNT>(
+                &TABLE_9_27_LAST_SIG_COEFF_Y_PREFIX,
+                init_type,
+            )
+            .map(init),
+            coded_sub_block_flag: uniform_init_values::<CODED_SUB_BLOCK_FLAG_CTX_COUNT>(
+                &TABLE_9_28_CODED_SUB_BLOCK_FLAG,
+                init_type,
+            )
+            .map(init),
+            sig_coeff_flag: sig_coeff_flag_init_values(init_type).map(init),
+            coeff_abs_level_greater1_flag: uniform_init_values::<
+                COEFF_ABS_LEVEL_GREATER1_FLAG_CTX_COUNT,
+            >(
+                &TABLE_9_30_COEFF_ABS_LEVEL_GREATER1_FLAG, init_type
+            )
+            .map(init),
+            coeff_abs_level_greater2_flag: uniform_init_values::<
+                COEFF_ABS_LEVEL_GREATER2_FLAG_CTX_COUNT,
+            >(
+                &TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG, init_type
+            )
+            .map(init),
+        }
+    }
+
     /// Initialize every context in every bank from one `initValue`
     /// via the §9.3.2.2 process ([`ContextModel::init`]).
     ///
-    /// Bring-up scaffolding: a conformant decoder initializes each
-    /// ctxIdx from its own Table 9-26..9-31 entry selected by the
-    /// Table 9-4 `initType` mapping — that transcription is the
-    /// noted follow-up. Uniform initialization still exercises every
-    /// engine/state path (only the per-context starting
-    /// probabilities differ).
+    /// Bring-up scaffolding predating [`init`](Self::init): uniform
+    /// initialization still exercises every engine/state path (only
+    /// the per-context starting probabilities differ), and the
+    /// scripted-bin tests keep using it.
     #[must_use]
     pub fn init_uniform(init_value: u8, slice_qp_y: i32) -> Self {
         let c = ContextModel::init(init_value, slice_qp_y);
@@ -1234,5 +1283,122 @@ mod tests {
             contexts.last_sig_coeff_x_prefix, before.last_sig_coeff_x_prefix,
             "last_sig_coeff_x_prefix bank must adapt"
         );
+    }
+
+    // --- §9.3.2.2 Table 9-26..9-31 per-initType bank init ---
+
+    fn cm(p_state_idx: u8, val_mps: u8) -> ContextModel {
+        ContextModel {
+            p_state_idx,
+            val_mps,
+        }
+    }
+
+    /// Representative derived `(pStateIdx, valMps)` pins across QPs:
+    /// the §9.3.2.2 equations applied to cited Table 9-26..9-31
+    /// entries, hand-evaluated.
+    #[test]
+    fn residual_contexts_init_pins() {
+        // Table 9-26 ctxIdx 0 (initType 0, initValue 110).
+        assert_eq!(
+            ResidualContexts::init(0, 0).last_sig_coeff_x_prefix[0],
+            cm(32, 1)
+        );
+        assert_eq!(
+            ResidualContexts::init(0, 26).last_sig_coeff_x_prefix[0],
+            cm(7, 1)
+        );
+        assert_eq!(
+            ResidualContexts::init(0, 51).last_sig_coeff_x_prefix[0],
+            cm(15, 0)
+        );
+        // Table 9-26 ctxIdx 18 (initType 1, initValue 125) and ctxIdx
+        // 53 (initType 2, initValue 93).
+        assert_eq!(
+            ResidualContexts::init(1, 26).last_sig_coeff_x_prefix[0],
+            cm(7, 1)
+        );
+        assert_eq!(
+            ResidualContexts::init(2, 26).last_sig_coeff_x_prefix[17],
+            cm(8, 0)
+        );
+        // Table 9-27 prints the same values as Table 9-26, so the two
+        // banks start identical (they adapt independently afterwards).
+        let ctx = ResidualContexts::init(1, 30);
+        assert_eq!(ctx.last_sig_coeff_x_prefix, ctx.last_sig_coeff_y_prefix);
+        // Table 9-28 ctxIdx 0 (initType 0, initValue 91) and ctxIdx 4
+        // (initType 1, initValue 121).
+        assert_eq!(
+            ResidualContexts::init(0, 26).coded_sub_block_flag[0],
+            cm(24, 0)
+        );
+        assert_eq!(
+            ResidualContexts::init(1, 26).coded_sub_block_flag[0],
+            cm(24, 0)
+        );
+        // Table 9-29: ctxIdx 0 (initType 0, initValue 111), ctxIdx 42
+        // (initType 1, initValue 155), ctxIdx 84 (initType 2,
+        // initValue 170), and the transform-skip tail ctxIdx 126 / 127
+        // (initType 0, initValues 141 / 111) landing in bank slots
+        // 42 / 43.
+        assert_eq!(ResidualContexts::init(0, 26).sig_coeff_flag[0], cm(15, 1));
+        for qp in [0, 26, 51] {
+            // initValue 155 ⇒ m == 0: QP-independent state.
+            assert_eq!(ResidualContexts::init(1, qp).sig_coeff_flag[0], cm(8, 1));
+        }
+        assert_eq!(ResidualContexts::init(2, 51).sig_coeff_flag[0], cm(15, 1));
+        assert_eq!(ResidualContexts::init(0, 26).sig_coeff_flag[42], cm(15, 1));
+        assert_eq!(ResidualContexts::init(0, 51).sig_coeff_flag[43], cm(7, 0));
+        // Table 9-30 ctxIdx 0 (initType 0, initValue 140) and ctxIdx
+        // 48 (initType 2, initValue 154).
+        assert_eq!(
+            ResidualContexts::init(0, 26).coeff_abs_level_greater1_flag[0],
+            cm(7, 1)
+        );
+        assert_eq!(
+            ResidualContexts::init(2, 26).coeff_abs_level_greater1_flag[0],
+            cm(0, 1)
+        );
+        // Table 9-31 ctxIdx 0 (initType 0, initValue 138) and ctxIdx 6
+        // (initType 1, initValue 107).
+        assert_eq!(
+            ResidualContexts::init(0, 26).coeff_abs_level_greater2_flag[0],
+            cm(8, 0)
+        );
+        assert_eq!(
+            ResidualContexts::init(1, 26).coeff_abs_level_greater2_flag[0],
+            cm(16, 0)
+        );
+    }
+
+    /// Whole-bank smoke test: every initType / QP combination yields
+    /// in-range states everywhere, and the three initTypes give three
+    /// distinct bank sets.
+    #[test]
+    fn residual_contexts_init_smoke() {
+        for init_type in 0u8..=2 {
+            for qp in [0, 17, 26, 37, 51] {
+                let ctx = ResidualContexts::init(init_type, qp);
+                let banks: [&[ContextModel]; 6] = [
+                    &ctx.last_sig_coeff_x_prefix,
+                    &ctx.last_sig_coeff_y_prefix,
+                    &ctx.coded_sub_block_flag,
+                    &ctx.sig_coeff_flag,
+                    &ctx.coeff_abs_level_greater1_flag,
+                    &ctx.coeff_abs_level_greater2_flag,
+                ];
+                for bank in banks {
+                    for c in bank {
+                        // Equations 9-4..9-6 bound preCtxState to
+                        // 1..=126 ⇒ pStateIdx 0..=62.
+                        assert!(c.p_state_idx <= 62);
+                        assert!(c.val_mps <= 1);
+                    }
+                }
+            }
+        }
+        assert_ne!(ResidualContexts::init(0, 26), ResidualContexts::init(1, 26));
+        assert_ne!(ResidualContexts::init(1, 26), ResidualContexts::init(2, 26));
+        assert_ne!(ResidualContexts::init(0, 26), ResidualContexts::init(2, 26));
     }
 }

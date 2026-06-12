@@ -213,6 +213,7 @@ use oxideav_core::RuntimeContext;
 pub mod binarization;
 pub mod bitreader;
 pub mod cabac;
+pub mod ctx_init;
 pub mod hrd;
 pub mod nal;
 pub mod pps;
@@ -226,6 +227,7 @@ pub mod vui;
 
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
+pub use ctx_init::SliceContexts;
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
