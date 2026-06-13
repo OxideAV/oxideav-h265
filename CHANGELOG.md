@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 46 (2026-06-14)
+
+- `sei` module — the §7.3.2.4 / §7.3.5 / §D.2 Supplemental Enhancement
+  Information parse:
+  - The §7.3.5 `sei_message()` framing with the extensible
+    `payloadType` / `payloadSize` byte runs (every `0xFF` adds 255, the
+    first non-`0xFF` byte is the final term), and the §7.3.2.4
+    `sei_rbsp()` `do … while( more_rbsp_data() )` message loop
+    (`parse_sei_rbsp`), terminating positionally at the
+    `rbsp_trailing_bits()` `0x80` stop byte.
+  - The §D.2 `sei_payload()` dispatch split by `nal_unit_type`
+    (`PREFIX_SEI_NUT` 39 / `SUFFIX_SEI_NUT` 40 via `SeiNalType`). Eight
+    payload types are decoded into typed structs: `recovery_point` (6),
+    `user_data_registered_itu_t_t35` (4), `user_data_unregistered` (5),
+    `active_parameter_sets` (129), `decoded_picture_hash` (132,
+    suffix-only, MD5 / CRC / checksum variants),
+    `mastering_display_colour_volume` (137), `content_light_level_info`
+    (144), and `alternative_transfer_characteristics` (147). Every
+    other (or branch-illegal) `payloadType` is carried verbatim as
+    `SeiPayload::Reserved`, so the framing always advances by the
+    declared `payloadSize`.
+  - Overrun / truncation are surfaced as `SeiError::PayloadSizeOverrun`
+    / `TruncatedHeader` / `TruncatedPayload`. 31 new tests cover the
+    extensible byte runs, each typed payload (including negative
+    `recovery_poc_cnt` and the three `decoded_picture_hash` variants),
+    the prefix/suffix dispatch (prefix-only payload in a suffix NAL ⇒
+    Reserved and vice versa), multi-message RBSPs, and the error paths.
+    Total tests now 478 (was 447).
+
 ### Added — clean-room rebuild round 45 (2026-06-12)
 
 - `ctx_init` module — the complete §9.3.2.2 context-variable

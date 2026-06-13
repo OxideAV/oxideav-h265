@@ -5,13 +5,42 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 45 (2026-06-12).** The prior implementation was
+**Clean-room rebuild — round 46 (2026-06-14).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
 number in an external library's HEVC decoder — clean-room provenance
 for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
+
+Round 46 lands the §7.3.2.4 / §7.3.5 / §D.2 Supplemental Enhancement
+Information parse — the new [`sei`] module. The §7.3.5 `sei_message()`
+framing reads the extensible `payloadType` / `payloadSize` byte runs
+(each `0xFF` adds 255, the first non-`0xFF` byte is the final additive
+term), and [`sei::parse_sei_rbsp`] drives the §7.3.2.4 `sei_rbsp()`
+`do … while( more_rbsp_data() )` message loop, terminating positionally
+at the `rbsp_trailing_bits()` `0x80` stop byte. The §D.2
+`sei_payload()` dispatch is split by `nal_unit_type` (`PREFIX_SEI_NUT`
+39 / `SUFFIX_SEI_NUT` 40, via [`sei::SeiNalType`]). Eight payload types
+decode into typed structs — [`sei::RecoveryPoint`] (6),
+[`sei::UserDataRegisteredItuTT35`] (4), [`sei::UserDataUnregistered`]
+(5), [`sei::ActiveParameterSets`] (129), [`sei::DecodedPictureHash`]
+(132, suffix-only, MD5 / CRC / checksum variants),
+[`sei::MasteringDisplayColourVolume`] (137),
+[`sei::ContentLightLevelInfo`] (144), and
+[`sei::AlternativeTransferCharacteristics`] (147) — and every other or
+branch-illegal `payloadType` is carried verbatim as
+[`sei::SeiPayload::Reserved`], so the framing always advances by the
+declared `payloadSize` even for not-yet-typed payloads (the HDR-metadata
+and decoded-picture-hash bodies are the highest-value first set; the
+remaining §D.2 payload bodies — `pic_timing`, `buffering_period`,
+`frame_packing_arrangement`, etc. — are the follow-up). Truncation /
+overrun raise [`sei::SeiError`]. Total tests now 478 (was 447): 31 new
+tests cover the extensible byte runs (short form, `0xFF` accumulation,
+truncation), each typed payload (including a negative `recovery_poc_cnt`
+and the three `decoded_picture_hash` variants), the prefix/suffix
+dispatch (a prefix-only payload in a suffix NAL ⇒ Reserved and vice
+versa), multi-message RBSPs, and the error paths.
 
 The rebuild is in progress against the published H.265 specification
 (ITU-T Recommendation H.265 | ISO/IEC 23008-2). Round 45 lands the

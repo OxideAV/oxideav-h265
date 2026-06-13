@@ -220,6 +220,7 @@ pub mod pps;
 pub mod residual;
 pub mod scaling_list;
 pub mod scan;
+pub mod sei;
 pub mod slice;
 pub mod sps;
 pub mod vps;
