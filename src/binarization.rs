@@ -955,6 +955,105 @@ pub fn decode_rqt_root_cbf(
 }
 
 // ---------------------------------------------------------------------
+// merge_flag (§7.3.8.6 prediction_unit() / §7.4.9.6)
+// Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-15 ctxIdx
+// initValue. Read in the §7.3.8.6 `else /* MODE_INTER */` branch
+// (i.e. cu_skip_flag == 0); when present and 1 the inter-prediction
+// parameters are inferred from a neighbouring inter partition
+// (merge_idx follows), when 0 the explicit motion fields
+// (inter_pred_idc / ref_idx / mvp) are coded. Absent ⇒ inferred per
+// §7.4.9.6 from CuPredMode (MODE_SKIP ⇒ 1, otherwise 0).
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `merge_flag`: FL with `cMax = 1`
+/// (a single context-coded bin per non-skip inter prediction unit).
+/// Selects between the merge path (value 1 — inter-prediction
+/// parameters inferred from a neighbouring inter-predicted partition)
+/// and the explicit-motion path (value 0) per §7.4.9.6.
+pub const MERGE_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `merge_flag`: one context-coded bin
+/// per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const MERGE_FLAG_FL_NBITS: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `merge_flag`. Bin 0 is
+/// context-coded with `ctxInc = 0`; every later binIdx column is `na`
+/// (the FL `cMax = 1` shape only emits a single bin).
+///
+/// The flag's Table 9-15 ctxIdx layout has only the initType 1 and
+/// initType 2 slots populated (`initValue = 110` at initType 1,
+/// `initValue = 154` at initType 2); initType 0 is `na` in Table 9-4
+/// because `merge_flag` is only ever read in inter (P/B) slices — the
+/// §7.3.8.6 `prediction_unit( )` read sits under the coding-unit's
+/// inter path (`CuPredMode != MODE_INTRA && !cu_skip_flag`), which is
+/// unreachable in an I slice. This layer hands back the bank-relative
+/// `ctxInc` only; the Table 9-15 initValue plus Table 9-4
+/// initType-to-ctxIdx mapping is consumed at slice-init scope (see
+/// `ctx_init::TABLE_9_15_MERGE_FLAG`).
+#[must_use]
+pub fn merge_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.6 — inferred value of `merge_flag` when the element is not
+/// present on the wire. The §7.3.8.6 guard that suppresses the read is
+/// `cu_skip_flag == 1` (the skip path codes only `merge_idx`); the
+/// §7.4.9.6 inference is then:
+///
+/// * If `CuPredMode[ x0 ][ y0 ]` is equal to `MODE_SKIP`,
+///   `merge_flag` is inferred to be equal to 1.
+/// * Otherwise, `merge_flag` is inferred to be equal to 0.
+///
+/// `cu_pred_mode` is the §7.4.9.5 prediction mode of the current
+/// coding unit. The only not-present path the §7.3.8.6 syntax reaches
+/// is the `cu_skip_flag == 1` branch, whose CuPredMode is
+/// [`CuPredMode::Skip`] per §7.4.9.5 — so this returns 1 for
+/// [`CuPredMode::Skip`] and 0 for the inter/intra modes (which would
+/// only arise from a caller bug, since a present `merge_flag` is
+/// decoded rather than inferred on those paths).
+///
+/// Exposed as a pure helper so the parser can branch without entering
+/// the CABAC engine when the §7.3.8.6 skip path selects the
+/// not-present case.
+#[must_use]
+pub fn merge_flag_inferred(cu_pred_mode: CuPredMode) -> u8 {
+    // §7.4.9.6: CuPredMode == MODE_SKIP ⇒ 1, otherwise ⇒ 0.
+    u8::from(cu_pred_mode == CuPredMode::Skip)
+}
+
+/// Decode `merge_flag` (§7.3.8.6 / §7.4.9.6) from the CABAC engine,
+/// consuming one context for the FL bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the single
+/// Table 9-15 / §9.3.4.2 `ctxInc = 0` slot; it is mutated in place per
+/// §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.6 guard (the `else /* MODE_INTER */` branch — i.e.
+/// `cu_skip_flag == 0`) is upstream of this primitive: when the CU
+/// takes the skip path the parser does **not** call this function —
+/// see [`merge_flag_inferred`] for the §7.4.9.6 not-present value.
+///
+/// Returns the decoded `u8` (0 or 1) — 1 selects the merge path (the
+/// inter-prediction parameters are inferred from a neighbouring
+/// inter-predicted partition, `merge_idx` follows per §7.3.8.6); 0
+/// selects the explicit-motion path (`inter_pred_idc` / `ref_idx_lX` /
+/// `mvp_lX_flag` / `mvd_coding` are coded).
+pub fn decode_merge_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin uses ctxInc = 0 (a single Table
+    // 9-15 entry) per the Table 9-48 row.
+    debug_assert_eq!(
+        merge_flag_ctx_inc(),
+        0,
+        "Table 9-48 row for merge_flag: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
 // pred_mode_flag (§7.3.8.5 coding_unit() / §7.4.9.5)
 // Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-10 ctxIdx
 // initValue. Present only when the slice is P or B (slice_type != I)
@@ -5478,6 +5577,83 @@ mod tests {
         // accidental cross-wiring.
         assert_eq!(rqt_root_cbf_inferred(), 1);
         assert_eq!(cu_transquant_bypass_flag_inferred(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // merge_flag (§7.3.8.6 / §7.4.9.6)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn merge_flag_table_9_48_ctx_inc_is_zero() {
+        // Table 9-48 row for merge_flag: bin 0 ctxInc = 0; every later
+        // binIdx column is na (Table 9-43 FL cMax = 1 — only one bin is
+        // ever emitted).
+        assert_eq!(merge_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn merge_flag_fl_shape_table_9_43() {
+        // Table 9-43 FL row with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(MERGE_FLAG_FL_CMAX, 1);
+        assert_eq!(MERGE_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn merge_flag_inferred_skip_is_one_per_7_4_9_6() {
+        // §7.4.9.6: when merge_flag is not present (the §7.3.8.6
+        // cu_skip_flag == 1 path), and CuPredMode == MODE_SKIP, the
+        // value is inferred to 1.
+        assert_eq!(merge_flag_inferred(CuPredMode::Skip), 1);
+    }
+
+    #[test]
+    fn merge_flag_inferred_non_skip_is_zero_per_7_4_9_6() {
+        // §7.4.9.6: otherwise (CuPredMode != MODE_SKIP) the not-present
+        // inference is 0. These modes are not reached via the §7.3.8.6
+        // not-present path in practice, but the pure helper is total.
+        assert_eq!(merge_flag_inferred(CuPredMode::Inter), 0);
+        assert_eq!(merge_flag_inferred(CuPredMode::Intra), 0);
+    }
+
+    #[test]
+    fn decode_merge_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the FL
+        // flag decodes to 0 (explicit-motion path — inter_pred_idc /
+        // ref_idx / mvp follow per §7.3.8.6).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_merge_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn decode_merge_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the FL
+        // flag decodes to 1 (merge path — merge_idx follows per
+        // §7.3.8.6).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_merge_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    #[test]
+    fn decode_merge_flag_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on the
+        // same engine each consume exactly one bin (Table 9-43 FL
+        // cMax = 1). The second call's outcome is independent of the
+        // first since the contexts are separate.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_merge_flag(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_merge_flag(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
     }
 
     // -----------------------------------------------------------------

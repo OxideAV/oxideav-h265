@@ -1760,9 +1760,19 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   [`binarization::decode_mvd_component_with`] +
   [`binarization::MvdComponent`] +
   [`binarization::mvd_component_value`]; the §9.3.3.3 EGk closure path
-  is factored as [`binarization::read_eg_k_with`]. Still to land —
-  the remaining §9.3.4.2 syntax elements: part-mode / merge /
-  merge-idx flags, `inter_pred_idc`, `ref_idx_lX`, `mvp_lX_flag`, etc.
+  is factored as [`binarization::read_eg_k_with`]. Round 308 lands the
+  §7.3.8.6 `prediction_unit( )` `merge_flag` (§7.4.9.6 / Table 9-43 FL
+  `cMax = 1`, Table 9-48 bin-0 `ctxInc = 0`, Table 9-15 init
+  `{110, 154}`, initType 0 = `na` since the element is P/B-only) via
+  [`binarization::decode_merge_flag`] +
+  [`binarization::merge_flag_ctx_inc`] +
+  [`binarization::merge_flag_inferred`] (the §7.4.9.6 not-present
+  inference: `MODE_SKIP ⇒ 1`, otherwise `0`) +
+  [`binarization::MERGE_FLAG_FL_CMAX`] /
+  [`binarization::MERGE_FLAG_FL_NBITS`]; the Table 9-15 init bank was
+  already wired in [`ctx_init`]. Still to land —
+  the remaining §9.3.4.2 syntax elements: part-mode / merge-idx flags,
+  `inter_pred_idc`, `ref_idx_lX`, `mvp_lX_flag`, etc.
   Round 39 lands
   `pred_mode_flag` (§9.3.4.2 / Table 9-48, FL `cMax = 1`); round 40
   lands `prev_intra_luma_pred_flag` (§9.3.4.2 / Table 9-48, FL

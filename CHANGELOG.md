@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 308 (2026-06-15)
+
+- `binarization` module — the §7.3.8.6 `prediction_unit( )`
+  `merge_flag` syntax element:
+  - `decode_merge_flag` decodes the single context-coded FL `cMax = 1`
+    bin (Table 9-43 shape, Table 9-48 bin-0 `ctxInc = 0`) from the
+    CABAC engine. Value 1 selects the merge path (inter-prediction
+    parameters inferred from a neighbouring inter-predicted partition,
+    `merge_idx` follows); value 0 selects the explicit-motion path.
+  - `merge_flag_inferred` applies the §7.4.9.6 not-present inference
+    (`CuPredMode == MODE_SKIP ⇒ 1`, otherwise `0`) for the §7.3.8.6
+    `cu_skip_flag == 1` path, without entering the engine.
+  - `merge_flag_ctx_inc` (= 0) plus the `MERGE_FLAG_FL_CMAX` /
+    `MERGE_FLAG_FL_NBITS` shape constants. The Table 9-15 init bank
+    (`{110, 154}`, initType 0 = `na`) was already wired in `ctx_init`.
+
 ### Added — clean-room rebuild round 48 (2026-06-14)
 
 - `binarization` module — the §7.3.8.9 / §7.4.9.9 `mvd_coding( )`
