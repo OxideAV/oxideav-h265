@@ -1749,10 +1749,21 @@ Top-level entry points: [`NalIter`], [`collect_nal_units`],
   §7.3.8.11 `residual_coding( )` driver
   ([`residual::decode_residual_coding`] /
   [`residual::decode_residual_coding_with`]) — see the round-43 notes
-  at the top of this README. Still to land — every other §9.3.4.2
-  syntax element: part-mode / merge / merge-idx flags, the chroma
-  intra-mode field `intra_chroma_pred_mode` (§9.3.3.8), motion-vector
-  binarization (`mvd_lX[]` EGk + sign), etc. Round 39 lands
+  at the top of this README. Round 48 lands the §7.3.8.9 / §7.4.9.9
+  `mvd_coding( )` motion-vector-difference binarization — the two
+  context-coded magnitude flags (`abs_mvd_greater0_flag`,
+  `abs_mvd_greater1_flag`, Table 9-23 single-context banks),
+  the bypass EG1 escape (`abs_mvd_minus2`, Table 9-43 `EG1`) and the
+  bypass FL sign bit (`mvd_sign_flag`, `cMax = 1`), composed into the
+  signed component difference `lMvd` per equation 7-73 — via
+  [`binarization::decode_mvd_component`] /
+  [`binarization::decode_mvd_component_with`] +
+  [`binarization::MvdComponent`] +
+  [`binarization::mvd_component_value`]; the §9.3.3.3 EGk closure path
+  is factored as [`binarization::read_eg_k_with`]. Still to land —
+  the remaining §9.3.4.2 syntax elements: part-mode / merge /
+  merge-idx flags, `inter_pred_idc`, `ref_idx_lX`, `mvp_lX_flag`, etc.
+  Round 39 lands
   `pred_mode_flag` (§9.3.4.2 / Table 9-48, FL `cMax = 1`); round 40
   lands `prev_intra_luma_pred_flag` (§9.3.4.2 / Table 9-48, FL
   `cMax = 1`, Table 9-12 init `{184, 154, 183}`) via

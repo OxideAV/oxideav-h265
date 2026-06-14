@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 48 (2026-06-14)
+
+- `binarization` module — the §7.3.8.9 / §7.4.9.9 `mvd_coding( )`
+  motion-vector-difference syntax structure:
+  - `decode_mvd_component` / `decode_mvd_component_with` decode one
+    `mvd_coding( )` component (`compIdx`): the two context-coded
+    magnitude flags `abs_mvd_greater0_flag` / `abs_mvd_greater1_flag`
+    (Table 9-48 `ctxInc = 0`, Table 9-23 single-context banks via
+    `SliceContexts`), the bypass-coded EG1 escape `abs_mvd_minus2`
+    (Table 9-43 `EG1`) read only when `abs_mvd_greater1_flag == 1`,
+    and the bypass FL sign bit `mvd_sign_flag` (`cMax = 1`) read only
+    when `abs_mvd_greater0_flag == 1`.
+  - `MvdComponent` carries all four wire fields plus the equation-7-73
+    composed signed difference `lMvd`; `mvd_component_value` applies
+    the not-present inferences (`abs_mvd_greater1_flag` ⇒ 0,
+    `abs_mvd_minus2` ⇒ −1, `mvd_sign_flag` ⇒ 0).
+  - `abs_mvd_greater0_flag_ctx_inc` / `abs_mvd_greater1_flag_ctx_inc`
+    expose the Table 9-48 `ctxInc`; `ABS_MVD_GREATER_FLAG_FL_CMAX`,
+    `MVD_SIGN_FLAG_FL_CMAX`, `ABS_MVD_MINUS2_EG_K` expose the
+    Table 9-43 binarization parameters.
+  - `read_eg_k_with` factors the §9.3.3.3 k-th-order Exp-Golomb decode
+    over a generic bin reader, shared with the engine-driven
+    `decode_eg_k`.
+
 ### Added — clean-room rebuild round 47 (2026-06-14)
 
 - `transform` module — the §8.6.2 / §8.6.3 / §8.6.4 scaling,

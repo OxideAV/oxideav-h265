@@ -524,22 +524,39 @@ where
 /// HEVC bypass-coded suffix value (§7.4.9.11 puts the practical
 /// ceiling well below `2^31`).
 fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
+    read_eg_k_with(k, || engine.decode_bypass())
+}
+
+/// §9.3.3.3 — decode an EGk-coded value of order `k` from a generic
+/// bin reader (each call yields the next bypass bin). Factored out of
+/// [`decode_eg_k`] so the §7.3.8.9 `abs_mvd_minus2` EG1 escape can be
+/// composed and unit-tested without driving the arithmetic engine's
+/// range/offset state. The decode follows the equation-9-13 do-while:
+/// count leading `0` bins until a `1` (`leading_zeros`), then read
+/// `leading_zeros + k` suffix bins, yielding
+/// `((1 << leading_zeros) − 1) << k + suffix`.
+pub(crate) fn read_eg_k_with<F>(k: u32, mut read_bin: F) -> Result<u32, CabacError>
+where
+    F: FnMut() -> Result<u8, CabacError>,
+{
     let mut leading_zeros: u32 = 0;
     while leading_zeros < 32 {
-        let bin = engine.decode_bypass()?;
+        let bin = read_bin()?;
         if bin == 1 {
             break;
         }
         leading_zeros += 1;
     }
-    let suffix_bits = leading_zeros + k;
     // Guard against accidental >32-bit reads (cap `leading_zeros` at
-    // 32 already bounds this; the saturate keeps `decode_bypass_bits`
-    // happy if `k` is unusually large).
-    let suffix_bits = suffix_bits.min(32);
-    let suffix = engine.decode_bypass_bits(suffix_bits as u8)?;
+    // 32 already bounds this; the saturate keeps the read width inside
+    // a single `u32` if `k` is unusually large).
+    let suffix_bits = (leading_zeros + k).min(32);
+    let mut suffix: u32 = 0;
+    for _ in 0..suffix_bits {
+        suffix = (suffix << 1) | u32::from(read_bin()?);
+    }
     let base = ((1u64 << leading_zeros) - 1) << k;
-    let value = base + suffix as u64;
+    let value = base + u64::from(suffix);
     // The defensive cap above keeps `value` inside `u32`; the
     // saturate keeps us inside the public return type if the
     // pathological 32-bit edge is ever reached.
@@ -2986,6 +3003,210 @@ pub fn signed_level_from_sign_flag(abs_level: u32, sign_flag: u8) -> i32 {
     } else {
         -abs_signed
     }
+}
+
+// ---------------------------------------------------------------------
+// mvd_coding( x0, y0, refList ) — §7.3.8.9 / §7.4.9.9 / Table 9-43 /
+// Table 9-48. Motion-vector-difference binarization: two context-coded
+// magnitude flags (`abs_mvd_greater0_flag`, `abs_mvd_greater1_flag`),
+// a bypass EG1 escape magnitude (`abs_mvd_minus2`), and a bypass FL
+// sign bit (`mvd_sign_flag`), composed per equation 7-73 into the
+// signed component difference `lMvd`.
+// ---------------------------------------------------------------------
+
+/// §9.3.4.2 / Table 9-48 — `abs_mvd_greater0_flag[ ]` is context-coded
+/// with a single context (`ctxInc = 0` at bin 0; all later bin-index
+/// columns are `na` since the FL `cMax = 1` binarization is one bin).
+///
+/// Table 9-4 maps the element to its `Table 9-23` context bank; per
+/// [`SliceContexts`] this is the single-entry `abs_mvd_greater0_flag`
+/// array (inter slices only). The caller passes the corresponding
+/// [`ContextModel`]; this function returns the fixed `ctxInc`.
+#[must_use]
+pub fn abs_mvd_greater0_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §9.3.4.2 / Table 9-48 — `abs_mvd_greater1_flag[ ]` is context-coded
+/// with a single context (`ctxInc = 0` at bin 0; later columns `na`).
+///
+/// The element binds to its own `Table 9-23` context bank (distinct
+/// from `abs_mvd_greater0_flag`); the returned `ctxInc` selects within
+/// that single-entry bank.
+#[must_use]
+pub fn abs_mvd_greater1_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// Table 9-43 — `abs_mvd_greater0_flag[ ]` / `abs_mvd_greater1_flag[ ]`
+/// / `mvd_sign_flag[ ]` are FL with `cMax = 1` (a single bin each).
+pub const ABS_MVD_GREATER_FLAG_FL_CMAX: u32 = 1;
+
+/// Table 9-43 — `abs_mvd_minus2[ ]` uses EG1 (k-th order Exp-Golomb
+/// with `k = 1`), fully bypass-coded per Table 9-48.
+pub const ABS_MVD_MINUS2_EG_K: u32 = 1;
+
+/// Table 9-43 — `mvd_sign_flag[ ]` is FL with `cMax = 1`; the single
+/// bin (bypass-coded per Table 9-48) is the sign bit itself.
+pub const MVD_SIGN_FLAG_FL_CMAX: u32 = 1;
+
+/// One decoded `mvd_coding( )` motion-vector-difference component
+/// (§7.3.8.9 / §7.4.9.9). All four wire fields are retained alongside
+/// the equation-7-73 composed signed value so callers can both record
+/// the parsed syntax and consume `lMvd` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvdComponent {
+    /// `abs_mvd_greater0_flag[ compIdx ]` — magnitude `> 0`.
+    pub greater0_flag: u8,
+    /// `abs_mvd_greater1_flag[ compIdx ]` — magnitude `> 1`.
+    /// `None` when not present (inferred `0` per §7.4.9.9), i.e. when
+    /// `greater0_flag == 0`.
+    pub greater1_flag: Option<u8>,
+    /// `abs_mvd_minus2[ compIdx ]` from the EG1 bypass escape.
+    /// `None` when not present (inferred `−1` per §7.4.9.9), i.e. when
+    /// `greater1_flag` is `0`/absent.
+    pub minus2: Option<u32>,
+    /// `mvd_sign_flag[ compIdx ]`. `None` when not present (inferred
+    /// `0` per §7.4.9.9), i.e. when `greater0_flag == 0`.
+    pub sign_flag: Option<u8>,
+    /// `lMvd[ compIdx ]` per equation 7-73:
+    /// `greater0_flag * (abs_mvd_minus2 + 2) * (1 − 2 * sign_flag)`.
+    /// Zero when `greater0_flag == 0`.
+    pub value: i32,
+}
+
+/// §7.4.9.9 equation 7-73 — compose the signed component difference
+/// `lMvd` from the four `mvd_coding( )` wire fields, applying the
+/// not-present inferences:
+///
+/// * `abs_mvd_greater1_flag` inferred `0` ⇒ when `greater0_flag == 1`
+///   but `greater1_flag` is absent/`0`, the magnitude is exactly `1`.
+/// * `abs_mvd_minus2` inferred `−1` ⇒ when absent, `minus2 + 2 == 1`
+///   (the magnitude-equals-1 case); when present, magnitude is
+///   `minus2 + 2` (`>= 2`).
+/// * `mvd_sign_flag` inferred `0` ⇒ a positive value.
+///
+/// `greater0_flag == 0` short-circuits to `0` (the whole product
+/// vanishes), matching the §7.3.8.9 parse where no further fields are
+/// signalled.
+#[must_use]
+pub fn mvd_component_value(greater0_flag: u8, minus2: Option<u32>, sign_flag: Option<u8>) -> i32 {
+    if greater0_flag == 0 {
+        return 0;
+    }
+    // abs_mvd_minus2 inferred −1 when absent ⇒ magnitude (minus2 + 2):
+    //   absent  → −1 + 2 = 1
+    //   present → minus2 + 2  (>= 2)
+    let magnitude = match minus2 {
+        Some(m) => m as i32 + 2,
+        None => 1,
+    };
+    // mvd_sign_flag inferred 0 when absent ⇒ positive.
+    let sign = sign_flag.unwrap_or(0);
+    magnitude * (1 - 2 * i32::from(sign))
+}
+
+/// Decode one `mvd_coding( )` component (§7.3.8.9) from split bin
+/// readers, factored out of [`decode_mvd_component`] so the
+/// composition can be unit-tested without driving the arithmetic
+/// engine's range/offset state.
+///
+/// `read_ctx_bin` is invoked for each context-coded bin in parse
+/// order — first `abs_mvd_greater0_flag`, then (only when that bin is
+/// `1`) `abs_mvd_greater1_flag`. `read_bypass_bin` is invoked for each
+/// bypass bin of the EG1 `abs_mvd_minus2` escape and the
+/// `mvd_sign_flag` bit; the EG1 read consumes the §9.3.3.3 leading-zero
+/// prefix plus `leading_zeros + 1` suffix bins.
+///
+/// The reader split mirrors Table 9-48: the two `greater` flags are
+/// `DecodeDecision` bins, `abs_mvd_minus2` and `mvd_sign_flag` are
+/// `DecodeBypass` bins. Per §7.3.8.9, `abs_mvd_minus2` is only read
+/// when `abs_mvd_greater1_flag == 1`, and `mvd_sign_flag` only when
+/// `abs_mvd_greater0_flag == 1`.
+pub fn decode_mvd_component_with<C, B>(
+    mut read_ctx_bin: C,
+    mut read_bypass_bin: B,
+) -> Result<MvdComponent, CabacError>
+where
+    C: FnMut() -> Result<u8, CabacError>,
+    B: FnMut() -> Result<u8, CabacError>,
+{
+    let greater0_flag = read_ctx_bin()?;
+    if greater0_flag == 0 {
+        // §7.3.8.9: no further fields signalled; all inferred absent.
+        return Ok(MvdComponent {
+            greater0_flag: 0,
+            greater1_flag: None,
+            minus2: None,
+            sign_flag: None,
+            value: 0,
+        });
+    }
+    let greater1_flag = read_ctx_bin()?;
+    // abs_mvd_minus2 is present only when greater1_flag == 1.
+    let minus2 = if greater1_flag == 1 {
+        Some(read_eg_k_with(ABS_MVD_MINUS2_EG_K, &mut read_bypass_bin)?)
+    } else {
+        None
+    };
+    // mvd_sign_flag is present whenever greater0_flag == 1.
+    let sign_flag = read_bypass_bin()?;
+    let value = mvd_component_value(greater0_flag, minus2, Some(sign_flag));
+    Ok(MvdComponent {
+        greater0_flag,
+        greater1_flag: Some(greater1_flag),
+        minus2,
+        sign_flag: Some(sign_flag),
+        value,
+    })
+}
+
+/// Decode one `mvd_coding( )` component (§7.3.8.9 / §7.4.9.9) from the
+/// CABAC engine.
+///
+/// `ctx_greater0` and `ctx_greater1` are the caller's
+/// [`SliceContexts::abs_mvd_greater0_flag`] / `abs_mvd_greater1_flag`
+/// single-entry context models (Table 9-23 banks); they are mutated in
+/// place per the §9.3.4.3.2.2 state transition. The `abs_mvd_minus2`
+/// EG1 escape and the `mvd_sign_flag` bit are read via
+/// [`CabacEngine::decode_bypass`].
+///
+/// The caller decodes both components (`compIdx = 0` then `1`) of a
+/// `mvd_coding( )` invocation by calling this twice with the same two
+/// context models; the §7.3.8.9 interleaving of the two
+/// `abs_mvd_greater0_flag` bins ahead of the rest is a slice-data
+/// concern handled one layer up. This entry point decodes a single
+/// component end-to-end.
+pub fn decode_mvd_component(
+    engine: &mut CabacEngine<'_>,
+    ctx_greater0: &mut ContextModel,
+    ctx_greater1: &mut ContextModel,
+) -> Result<MvdComponent, CabacError> {
+    let greater0_flag = engine.decode_decision(ctx_greater0)?;
+    if greater0_flag == 0 {
+        return Ok(MvdComponent {
+            greater0_flag: 0,
+            greater1_flag: None,
+            minus2: None,
+            sign_flag: None,
+            value: 0,
+        });
+    }
+    let greater1_flag = engine.decode_decision(ctx_greater1)?;
+    let minus2 = if greater1_flag == 1 {
+        Some(decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?)
+    } else {
+        None
+    };
+    let sign_flag = engine.decode_bypass()?;
+    let value = mvd_component_value(greater0_flag, minus2, Some(sign_flag));
+    Ok(MvdComponent {
+        greater0_flag,
+        greater1_flag: Some(greater1_flag),
+        minus2,
+        sign_flag: Some(sign_flag),
+        value,
+    })
 }
 
 #[cfg(test)]
@@ -5755,5 +5976,164 @@ mod tests {
         // Table 8-3, so both paths agree.
         assert_eq!(derive_intra_pred_mode_c(0, 7, true), 0);
         assert_eq!(derive_intra_pred_mode_c(0, 7, false), 0);
+    }
+
+    // -------------------------------------------------------------
+    // §7.3.8.9 / §7.4.9.9 mvd_coding( ) — Table 9-43 / Table 9-48
+    // -------------------------------------------------------------
+
+    #[test]
+    fn mvd_ctx_inc_single_context_each() {
+        // Table 9-48: both `greater` flags are context-coded with a
+        // single dedicated context (ctxInc = 0 at bin 0).
+        assert_eq!(abs_mvd_greater0_flag_ctx_inc(), 0);
+        assert_eq!(abs_mvd_greater1_flag_ctx_inc(), 0);
+    }
+
+    #[test]
+    fn mvd_binarization_constants_match_table_9_43() {
+        // FL cMax = 1 for the two greater flags + the sign flag; EG1
+        // for abs_mvd_minus2.
+        assert_eq!(ABS_MVD_GREATER_FLAG_FL_CMAX, 1);
+        assert_eq!(MVD_SIGN_FLAG_FL_CMAX, 1);
+        assert_eq!(ABS_MVD_MINUS2_EG_K, 1);
+    }
+
+    #[test]
+    fn mvd_value_equation_7_73_inference_branches() {
+        // greater0 == 0 ⇒ lMvd == 0 (all other fields absent).
+        assert_eq!(mvd_component_value(0, None, None), 0);
+        // greater0 == 1, greater1 absent/0 (minus2 absent, inferred −1)
+        //   ⇒ magnitude = (−1 + 2) = 1; sign absent ⇒ +1.
+        assert_eq!(mvd_component_value(1, None, Some(0)), 1);
+        // ... with sign_flag == 1 ⇒ −1.
+        assert_eq!(mvd_component_value(1, None, Some(1)), -1);
+        // greater0 == 1, greater1 == 1 ⇒ minus2 present.
+        //   minus2 = 0 ⇒ magnitude 2; minus2 = 3 ⇒ magnitude 5.
+        assert_eq!(mvd_component_value(1, Some(0), Some(0)), 2);
+        assert_eq!(mvd_component_value(1, Some(0), Some(1)), -2);
+        assert_eq!(mvd_component_value(1, Some(3), Some(0)), 5);
+        assert_eq!(mvd_component_value(1, Some(3), Some(1)), -5);
+        // Sign defaults to positive when absent.
+        assert_eq!(mvd_component_value(1, Some(7), None), 9);
+    }
+
+    #[test]
+    fn mvd_component_with_greater0_zero_short_circuits() {
+        // First context bin = 0 ⇒ no bypass bins consumed at all; every
+        // downstream field stays inferred-absent.
+        let mut bypass_called = false;
+        let c = decode_mvd_component_with(
+            || Ok(0u8),
+            || {
+                bypass_called = true;
+                Ok(0u8)
+            },
+        )
+        .unwrap();
+        assert!(!bypass_called, "no bypass bin should be read");
+        assert_eq!(
+            c,
+            MvdComponent {
+                greater0_flag: 0,
+                greater1_flag: None,
+                minus2: None,
+                sign_flag: None,
+                value: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn mvd_component_with_magnitude_one() {
+        // greater0 = 1, greater1 = 0 ⇒ abs_mvd_minus2 absent, only the
+        // sign bit is bypass-read. Sign = 1 ⇒ lMvd = −1.
+        let ctx_bins = [1u8, 0]; // greater0, greater1
+        let bypass_bins = [1u8]; // mvd_sign_flag
+        let c = decode_mvd_component_with(bin_queue(&ctx_bins), bin_queue(&bypass_bins)).unwrap();
+        assert_eq!(
+            c,
+            MvdComponent {
+                greater0_flag: 1,
+                greater1_flag: Some(0),
+                minus2: None,
+                sign_flag: Some(1),
+                value: -1,
+            }
+        );
+    }
+
+    #[test]
+    fn mvd_component_with_eg1_escape() {
+        // greater0 = 1, greater1 = 1 ⇒ abs_mvd_minus2 is EG1-coded then
+        // the sign bit follows. EG1 of value 0 is the bin string "1 0":
+        //   leading_zeros = 0 (first bypass bin is 1), then
+        //   leading_zeros + k = 0 + 1 = 1 suffix bin = 0 ⇒ value 0.
+        // So minus2 = 0 ⇒ magnitude = 2; sign = 0 ⇒ lMvd = +2.
+        let ctx_bins = [1u8, 1];
+        let bypass_bins = [1u8, 0, 0]; // EG1 prefix '1', suffix '0', sign '0'
+        let c = decode_mvd_component_with(bin_queue(&ctx_bins), bin_queue(&bypass_bins)).unwrap();
+        assert_eq!(
+            c,
+            MvdComponent {
+                greater0_flag: 1,
+                greater1_flag: Some(1),
+                minus2: Some(0),
+                sign_flag: Some(0),
+                value: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn mvd_component_with_eg1_value_one_full() {
+        // greater0 = 1, greater1 = 1, abs_mvd_minus2 = 1 (EG1 "1 1":
+        //   leading_zeros = 0, suffix bits = lz + k = 1 = "1" ⇒
+        //   base 0 + suffix 1 = 1), then sign = 0. magnitude =
+        //   minus2 + 2 = 3 ⇒ lMvd = +3.
+        let ctx_bins = [1u8, 1];
+        let bypass_bins = [1u8, 1, 0]; // EG1(1)='1','1' ; sign '0'
+        let c = decode_mvd_component_with(bin_queue(&ctx_bins), bin_queue(&bypass_bins)).unwrap();
+        assert_eq!(c.minus2, Some(1));
+        assert_eq!(c.value, 3);
+    }
+
+    #[test]
+    fn read_eg_k_with_eg1_battery() {
+        // §9.3.3.3 EG1 (k = 1) decode across a battery of bin strings,
+        // confirming the closure reader implements the do-while inverse
+        // shared with the engine-driven `decode_eg_k`.
+        // EG1 bin strings (prefix of leading 0s + 1, then lz+1 suffix):
+        //   "1 s"          lz=0 → suffix 1 bit
+        //   "0 1 s1 s0"    lz=1 → suffix 2 bits
+        let cases: &[(&[u8], u32)] = &[
+            (&[1, 0], 0),             // lz0, suffix 0 ⇒ 0
+            (&[1, 1], 1),             // lz0, suffix 1 ⇒ 1
+            (&[0, 1, 0, 0], 2),       // lz1, base=2, suffix 0 ⇒ 2
+            (&[0, 1, 0, 1], 3),       // lz1, base=2, suffix 1 ⇒ 3
+            (&[0, 1, 1, 0], 4),       // lz1, base=2, suffix 2 ⇒ 4
+            (&[0, 0, 1, 0, 0, 0], 6), // lz2, base=6, suffix 0 ⇒ 6
+        ];
+        for (bins, expected) in cases {
+            assert_eq!(
+                read_eg_k_with(1, bin_queue(bins)).unwrap(),
+                *expected,
+                "bins {bins:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvd_component_engine_greater0_zero() {
+        // All-zero stream: 9 init bits then the first DecodeDecision
+        // returns 0 for an MPS-state context ⇒ greater0 = 0, value 0.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut g0 = fresh_mps_ctx(0);
+        let mut g1 = fresh_mps_ctx(0);
+        let c = decode_mvd_component(&mut eng, &mut g0, &mut g1).unwrap();
+        assert_eq!(c.greater0_flag, 0);
+        assert_eq!(c.value, 0);
+        assert_eq!(c.greater1_flag, None);
     }
 }
