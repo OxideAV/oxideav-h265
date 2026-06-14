@@ -5,6 +5,23 @@
 //! framework.
 //!
 //! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
+//! The latest round adds the §8.6.2 / §8.6.3 / §8.6.4 scaling,
+//! transformation and residual-array construction step — the new
+//! [`transform`] module. [`transform::scale_coefficients`] implements
+//! the §8.6.3 dequantization (the `levelScale` / `m[x][y]` /
+//! `1 << (qP/6)` product, `bdShift` offset-round and
+//! `[coeffMin, coeffMax]` clip of equations 8-300..8-309);
+//! [`transform::inverse_transform`] implements the §8.6.4 separable
+//! inverse transform (the equation-8-316 4x4 DST-VII for `MODE_INTRA`
+//! 4x4 luma and the equations-8-318..8-321 32x32 DCT-II with the
+//! equation-8-317 column subsampling for every other block, plus the
+//! equation-8-314 intermediate offset-round); and
+//! [`transform::residual_block`] orchestrates the §8.6.2 dispatch over
+//! `cu_transquant_bypass_flag` (the equation-8-297 `rotateCoeffs`
+//! pass-through), `transform_skip_flag` (the equation-8-298 `tsShift`
+//! left-shift), and the full scale-then-transform path, applying the
+//! equation-8-299 final `bdShift` offset-round.
+//!
 //! Round 12 finishes the §7.3.2.1 VPS tail through the optional VPS
 //! timing-info block ([`vps::HevcVps`] now carries `max_layer_id`,
 //! `num_layer_sets_minus1`, the `layer_id_included_flag[][]`
@@ -223,6 +240,7 @@ pub mod scan;
 pub mod sei;
 pub mod slice;
 pub mod sps;
+pub mod transform;
 pub mod vps;
 pub mod vui;
 

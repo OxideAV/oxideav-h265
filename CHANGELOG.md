@@ -6,6 +6,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 47 (2026-06-14)
+
+- `transform` module — the §8.6.2 / §8.6.3 / §8.6.4 scaling,
+  transformation and residual-array construction process that turns the
+  decoded `TransCoeffLevel[ xC ][ yC ]` array of one transform block
+  into the `(nTbS)x(nTbS)` array `r` of residual samples:
+  - `scale_coefficients` — the §8.6.3 scaling (dequantization) process.
+    Each `TransCoeffLevel[ x ][ y ]` is multiplied by `m[ x ][ y ]`
+    (a flat 16, or `ScalingFactor[ sizeId ][ matrixId ][ x ][ y ]`), the
+    `levelScale[ qP % 6 ]` rational-step list (`{40,45,51,57,64,72}`)
+    and `1 << ( qP / 6 )`, then offset-rounded by `bdShift`
+    (equation 8-301/8-305) and clipped to `[ coeffMin, coeffMax ]`
+    (equations 8-300..8-309), with `i64` product intermediates for the
+    extended-precision ranges.
+  - `inverse_transform` — the §8.6.4 separable inverse transform: the
+    column then row §8.6.4.2 one-dimensional transform, selecting the
+    equation-8-316 4x4 DST-VII matrix for `MODE_INTRA` 4x4 luma
+    (`trType == 1`) and the equations-8-318..8-321 32x32 DCT-II matrix
+    (subsampled at stride `1 << (5 − log2(nTbS))` per equation 8-317)
+    for every other block, with the equation-8-314 intermediate
+    `(e + 64) >> 7` offset-round and clip.
+  - `residual_block` — the §8.6.2 orchestration over
+    `cu_transquant_bypass_flag` (the equation-8-297 `rotateCoeffs`
+    pass-through), `transform_skip_flag` (the equation-8-298 `tsShift`
+    left-shift), and the full scale-then-transform path, applying the
+    equation-8-299 final `bdShift` offset-round (equations 8-294..8-296).
+  - The §7.4.5 `CoeffMin` / `CoeffMax` derivation (`coeff_range`,
+    equations 7-27..7-30) and the `LEVEL_SCALE` / `Component` /
+    `PredMode` / `BlockParams` / `TransformError` public surface.
+  - 17 tests: hand-computed §8.6.3 single-DC / negative-level /
+    saturation scaling, the transquant-bypass verbatim + `rotateCoeffs`
+    mirror copies, an exact 4x4 inverse-DCT case, the DST-vs-DCT
+    `trType` selection (luma-intra-4x4 only) and the chroma / inter
+    exclusions, the `transform_skip` `tsShift` path, the DCT subsample
+    stride, matrix-cell pins, and the size / length / bit-depth error
+    paths. Total tests 495 (was 478).
+
 ### Added — clean-room rebuild round 46 (2026-06-14)
 
 - `sei` module — the §7.3.2.4 / §7.3.5 / §D.2 Supplemental Enhancement

@@ -5,13 +5,45 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 46 (2026-06-14).** The prior implementation was
+**Clean-room rebuild — round 47 (2026-06-14).** The prior implementation was
 retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
 number in an external library's HEVC decoder — clean-room provenance
 for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
+
+Round 47 lands the §8.6.2 / §8.6.3 / §8.6.4 scaling, transformation and
+residual-array construction process — the new [`transform`] module —
+turning the decoded `TransCoeffLevel[ xC ][ yC ]` array of one transform
+block into the `(nTbS)x(nTbS)` array `r` of residual samples.
+[`transform::scale_coefficients`] is the §8.6.3 dequantization (the
+`m[x][y]` scaling factor × the `levelScale[ qP % 6 ]` rational-step list
+`{40,45,51,57,64,72}` × `1 << (qP/6)`, `bdShift` offset-rounded and
+`[coeffMin, coeffMax]`-clipped per equations 8-300..8-309, with `i64`
+product intermediates for the extended-precision ranges).
+[`transform::inverse_transform`] is the §8.6.4 separable inverse
+transform: the column-then-row §8.6.4.2 1-D transform selects the
+equation-8-316 4x4 DST-VII matrix for `MODE_INTRA` 4x4 luma
+(`trType == 1`) and the equations-8-318..8-321 32x32 DCT-II matrix
+(subsampled at stride `1 << (5 − log2(nTbS))` per equation 8-317) for
+every other block, with the equation-8-314 `(e + 64) >> 7` intermediate
+offset-round and clip. [`transform::residual_block`] orchestrates the
+§8.6.2 dispatch over `cu_transquant_bypass_flag` (the equation-8-297
+`rotateCoeffs` pass-through), `transform_skip_flag` (the equation-8-298
+`tsShift` left-shift) and the full scale-then-transform path, applying
+the equation-8-299 final `bdShift` offset-round. The §7.4.5
+`CoeffMin`/`CoeffMax` derivation (equations 7-27..7-30) ships as
+[`transform::coeff_range`]. Total tests now 495 (was 478): 17 new tests
+cover the hand-computed scaling cases (single DC, negative-level
+arithmetic shift, `CoeffMax` saturation), the transquant-bypass copies
+(verbatim + `rotateCoeffs` mirror), an exact 4x4 inverse-DCT, the
+DST-vs-DCT `trType` selection and its chroma / inter exclusions, the
+`transform_skip` `tsShift` path, the DCT subsample stride, matrix-cell
+pins and the size / length / bit-depth error paths. The §8.6.1 `qP`
+derivation, the §8.6.5 transform-bypass RDPCM modification, the §8.6.6
+cross-component-prediction modification and the §8.6.7 picture
+construction are the follow-ups.
 
 Round 46 lands the §7.3.2.4 / §7.3.5 / §D.2 Supplemental Enhancement
 Information parse — the new [`sei`] module. The §7.3.5 `sei_message()`
