@@ -431,9 +431,9 @@ pub fn reference_filter_flag(pred_mode_intra: u8, n_tbs: usize) -> bool {
 /// `filterFlag` (Table 8-4) and `biIntFlag` (strong-smoothing) tests
 /// internally and returns the input unchanged when `filterFlag == 0`.
 ///
-/// `bit_depth_luma` is `BitDepthY` (the `biIntFlag` threshold of
-/// equations 8-16/8-17 reads it even for the chroma path, but
-/// `biIntFlag` itself is gated on `cIdx == 0`).
+/// `bit_depth_luma` is `BitDepthY` (the §8.4.4.2.3 `biIntFlag`
+/// `1 << ( BitDepthY − 5 )` threshold reads it, but `biIntFlag` itself is
+/// gated on `cIdx == 0`).
 #[must_use]
 pub fn filter_reference_samples(
     p: &ReferenceSamples,
