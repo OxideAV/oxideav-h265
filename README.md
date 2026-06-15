@@ -80,15 +80,24 @@ layers are usable directly through the public parser / engine API.
   dequantization), `inverse_transform` (the §8.6.4 separable inverse
   DST-VII / DCT-II), and the `residual_block` orchestrator turning a
   decoded `TransCoeffLevel` array into an `(nTbS)x(nTbS)` residual array.
+* **Intra sample prediction (§8.4.4.2)** — the `intra_pred` module: the
+  §8.4.4.2.2 reference-sample substitution sweep, the §8.4.4.2.3
+  neighbour-sample filtering (Table 8-4 `filterFlag` + the `nTbS == 32`
+  luma `biIntFlag` bi-linear path), and the §8.4.4.2.4 / §8.4.4.2.5 /
+  §8.4.4.2.6 `INTRA_PLANAR` / `INTRA_DC` / `INTRA_ANGULAR2..34` predictors
+  (Tables 8-5 / 8-6 angle + inverse-angle projection, with the vertical /
+  horizontal / DC boundary filters). `intra_predict` chains the
+  §8.4.4.2.1 filtering-gate + predictor dispatch from a substituted
+  reference array; the §6.4.1 availability derivation that marks the
+  neighbours remains the caller's responsibility.
 
 ## Not yet implemented
 
 * The §7.3.8 slice-data syntax-element walk that drives the CABAC engine
   through the CTU / CU / TU parse loops.
-* Intra / inter sample prediction (§8.4.4.2 reference-sample
-  substitution + filtering + the DC / planar / angular predictors,
-  §8.5 inter prediction), in-loop filters (deblock / SAO), and DPB
-  management.
+* Inter sample prediction (§8.5), in-loop filters (deblock / SAO), and
+  DPB management. (Intra sample prediction §8.4.4.2 is implemented; the
+  §6.4.1 z-scan neighbour-availability derivation that feeds it is not.)
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
   the typed flags are decoded but the bodies surface as opaque bytes.
 * Encoder.

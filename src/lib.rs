@@ -232,6 +232,7 @@ pub mod bitreader;
 pub mod cabac;
 pub mod ctx_init;
 pub mod hrd;
+pub mod intra_pred;
 pub mod nal;
 pub mod pps;
 pub mod residual;

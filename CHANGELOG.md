@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 315 (2026-06-15)
+
+- `intra_pred` module — §8.4.4.2 intra sample prediction, the predictor
+  core that turns marked neighbour samples into the `(nTbS)x(nTbS)`
+  `predSamples` array, consuming the §8.4.2 / §8.4.3 mode derivation
+  landed in prior rounds:
+  - `substitute_reference_samples` — §8.4.4.2.2 reference-sample
+    substitution. The bottom-left→corner→top-right sweep fills every
+    sample marked "not available for intra prediction" (step-1 seed of
+    `p[ −1 ][ 2*nTbS−1 ]`, then the single forward propagation that
+    covers steps 2 and 3); when no neighbour is available, all samples
+    take the mid-level `1 << ( bitDepth − 1 )`.
+  - `filter_reference_samples` / `reference_filter_flag` — §8.4.4.2.3.
+    The Table 8-4 `filterFlag` gate (suppressed for `INTRA_DC` and
+    `nTbS == 4`), the `[1 2 1] >> 2` smoothing (eqs. 8-41..8-45), and the
+    `nTbS == 32` luma `biIntFlag` bi-linear interpolation (eqs.
+    8-36..8-40).
+  - `predict_planar` — §8.4.4.2.4 `INTRA_PLANAR` (eq. 8-46).
+  - `predict_dc` — §8.4.4.2.5 `INTRA_DC` (`dcVal` eq. 8-47 + the luma
+    `nTbS < 32` boundary smoothing eqs. 8-48..8-51).
+  - `predict_angular` — §8.4.4.2.6 `INTRA_ANGULAR2..34`. Tables 8-5 /
+    8-6 `intraPredAngle` / `invAngle`, the main reference-array
+    projection with the negative-angle inverse-angle extension (eqs.
+    8-53..8-67), and the mode-26 / mode-10 luma boundary filter (eqs.
+    8-60 / 8-68).
+  - `intra_predict` / `intra_predict_with_substitution` — §8.4.4.2.1
+    steps 1 and 2: the filtering gate
+    (`intra_smoothing_disabled_flag == 0 && (cIdx == 0 ||
+    ChromaArrayType == 3)`) plus the planar / DC / angular dispatch,
+    with the substitution-first variant running the full pipeline from a
+    `MarkedReferenceSamples` input.
+  - 18 unit tests: substitution (mid-level fallback, sweep propagation,
+    step-1 seed, available-value preservation), Table 8-4 boundaries,
+    hand-worked planar eq-8-46 / DC eq-8-47..8-50 / angular pure-index
+    cells, boundary-filter on/off, and the end-to-end pipeline.
+
 ### Added — clean-room rebuild round 311 (2026-06-15)
 
 - `binarization` module — the §8.4.2 derivation process for luma intra
