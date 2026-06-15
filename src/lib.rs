@@ -227,6 +227,7 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod availability;
 pub mod binarization;
 pub mod bitreader;
 pub mod cabac;
@@ -245,6 +246,7 @@ pub mod transform;
 pub mod vps;
 pub mod vui;
 
+pub use availability::{AvailabilityError, PictureTiling, TilingParams};
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
 pub use ctx_init::SliceContexts;

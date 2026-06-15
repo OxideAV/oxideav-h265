@@ -60,6 +60,16 @@ layers are usable directly through the public parser / engine API.
   expansion.
 * **Scan orders (§6.5 / §7.4.2)** — up-right-diagonal, horizontal,
   vertical, and traverse scans with the `ScanOrder` accessor.
+* **Picture-level scanning + availability (§6.4 / §6.5.1 / §6.5.2)** —
+  the `availability` module: `PictureTiling` derives the §6.5.1
+  `colWidth` / `rowHeight` / `colBd` / `rowBd` / `CtbAddrRsToTs` /
+  `CtbAddrTsToRs` / `TileId` tile-scan conversion (eqs. 6-3..6-9) and
+  the §6.5.2 `MinTbAddrZs` z-scan address (eq. 6-10), then answers the
+  §6.4.1 z-scan block-availability query (in-picture + decode-order +
+  slice + tile tests) and the §6.4.2 prediction-block availability
+  (the `sameCb` short-cut and the `MODE_INTRA` masking). This is the
+  derivation that feeds the per-sample "available for intra prediction"
+  markings consumed by `intra_pred`.
 * **CABAC engine (§9.3)** — `CabacEngine` (init, DecodeDecision with
   the Table 9-52 / 9-53 range split + state transition, DecodeBypass,
   DecodeTerminate, RenormD, and the aligned-bypass hook) plus
@@ -96,8 +106,10 @@ layers are usable directly through the public parser / engine API.
 * The §7.3.8 slice-data syntax-element walk that drives the CABAC engine
   through the CTU / CU / TU parse loops.
 * Inter sample prediction (§8.5), in-loop filters (deblock / SAO), and
-  DPB management. (Intra sample prediction §8.4.4.2 is implemented; the
-  §6.4.1 z-scan neighbour-availability derivation that feeds it is not.)
+  DPB management. (Intra sample prediction §8.4.4.2 and the §6.4
+  neighbour-availability derivation that feeds it are implemented; what
+  remains is the slice-data walk that wires the per-location
+  `SliceAddrRs` / `CuPredMode` lookups into the availability query.)
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
   the typed flags are decoded but the bodies surface as opaque bytes.
 * Encoder.

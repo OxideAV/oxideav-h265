@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 318 (2026-06-16)
+
+- `availability` module — §6.4 availability processes plus the §6.5.1 /
+  §6.5.2 picture-level scanning conversions they depend on. This is the
+  neighbour-availability derivation that produces the per-sample
+  "available for intra prediction" markings consumed by `intra_pred`:
+  - `PictureTiling::new` / `TilingParams` — §6.5.1 CTB raster-scan ↔
+    tile-scan conversion. Derives `colWidth` / `rowHeight` (eqs. 6-3 /
+    6-4, both the `uniform_spacing_flag` even-split and the explicit
+    `column_width_minus1` / `row_height_minus1` forms), `colBd` /
+    `rowBd` (eqs. 6-5 / 6-6), `CtbAddrRsToTs` / `CtbAddrTsToRs` (eqs.
+    6-7 / 6-8, the tile-scan permutation and its inverse), and `TileId`
+    (eq. 6-9). Rejects zero geometry, `CtbLog2SizeY < MinTbLog2SizeY`,
+    mis-sized explicit tile arrays, and tile sizes that overflow the
+    picture.
+  - `PictureTiling::min_tb_addr_zs` — §6.5.2 eq. 6-10. The
+    `MinTbAddrZs[ x ][ y ]` z-scan address of a minimum block,
+    interleaving the within-CTB Morton (z) order of the block's low
+    `( x, y )` bits with the tile-scan CTB address in the high bits.
+  - `PictureTiling::z_scan_availability` — §6.4.1. `availableN` from
+    the in-picture boundary test (eq. 6-2), the decode-order test
+    (`minBlockAddrN > minBlockAddrCurr`), the `SliceAddrRs`
+    slice-segment-boundary test, and the `TileId` tile-boundary test.
+    Takes a caller-supplied `slice_addr_rs` CTB→`SliceAddrRs` lookup.
+  - `PictureTiling::prediction_block_availability` — §6.4.2. Wraps the
+    z-scan query with the `sameCb` short-cut (the NxN partIdx-1
+    forced-FALSE branch for the not-yet-decoded co-CU region) and the
+    final `MODE_INTRA` masking, via a caller-supplied `CuPredMode`
+    lookup.
+  - 18 unit tests, all expected values hand-derived from the §6.4 /
+    §6.5 equations (single-tile identity, 2×2-tile tile-scan reorder,
+    explicit-width tiles + overflow rejection, Morton interleave,
+    and the availability boundary/slice/tile/sameCb/intra-mask cases).
+
 ### Added — clean-room rebuild round 315 (2026-06-15)
 
 - `intra_pred` module — §8.4.4.2 intra sample prediction, the predictor
