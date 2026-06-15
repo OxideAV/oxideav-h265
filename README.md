@@ -5,13 +5,52 @@ A pure-Rust H.265 / HEVC video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 47 (2026-06-14).** The prior implementation was
-retired under the workspace
+**Clean-room rebuild — round 311 (2026-06-15).** The prior implementation
+was retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
 a CTU-level source comment cited a specific named variable and line
 number in an external library's HEVC decoder — clean-room provenance
 for the surrounding code path could not be defended. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
+
+Round 311 lands the §8.4.2 derivation process for luma intra prediction
+mode in the [`binarization`] module — the process the round-40/41
+signalling group (`prev_intra_luma_pred_flag`, `mpm_idx`,
+`rem_intra_luma_pred_mode`) feeds, completing the luma intra-mode
+resolution chain alongside the round-42 §8.4.3 chroma derivation.
+[`binarization::intra_luma_cand_mode_list`] is §8.4.2 step 3: it builds
+the three-entry `candModeList[ 0..=2 ]` from the two step-2 candidate
+neighbour modes `candIntraPredModeA` / `candIntraPredModeB`, splitting
+the equal-candidate case on `candA < 2` (equations 8-21..8-23 ⇒
+`{INTRA_PLANAR, INTRA_DC, INTRA_ANGULAR26}`) versus the angular case
+(equations 8-24..8-26 — the candidate plus its two mod-32-wrapped
+neighbouring angular modes), and on distinct candidates filling slots
+0/1 (equations 8-27/8-28) with `candModeList[ 2 ]` the first of
+`{PLANAR, DC, ANGULAR26}` not already present.
+[`binarization::derive_intra_pred_mode_y`] is §8.4.2 step 4: the
+[`binarization::LumaIntraModeSource::Mpm`] path reads
+`IntraPredModeY = candModeList[ mpm_idx ]`; the
+[`binarization::LumaIntraModeSource::Remaining`] path sorts the
+candidate list ascending (the equations 8-29..8-31 three-compare-and-swap
+sort) and runs `rem_intra_luma_pred_mode` through the increment pass
+(`+1` for every sorted candidate at or below the running value), mapping
+the 31-value remaining field onto the 35-mode space exclusive of the
+three most-probable modes. The Table 8-1 mode-name constants ship as
+[`binarization::INTRA_PLANAR`] / [`binarization::INTRA_DC`] /
+[`binarization::INTRA_ANGULAR26`] / [`binarization::INTRA_PRED_MODE_MAX`].
+The §8.4.2-step-2 candidate reduction (the §6.4.1 availability walk,
+the `CuPredMode` / `pcm_flag` tests and the CTB-row-boundary B clamp)
+stays the slice-data parser's responsibility, matching the
+availability-as-input convention of the §9.3.4.2.2 neighbour ctxInc
+derivations. Total tests now 521 (was 511): 10 new tests cover the
+Table 8-1 constants, the three step-3 branches (with the mod-32 edge
+wraps at modes 2 and 34), the all-candidate-pair in-range invariant,
+the step-4 Mpm direct index, the Remaining low-mode anchors, the
+pre-increment ascending sort, the bijection-onto-`(0..=34) \ candModeList`
+invariant over the full rem range, and an end-to-end composition on both
+paths. The §8.4.4.2 intra sample prediction process (reference-sample
+substitution, filtering, the DC / planar / angular predictors) is the
+follow-up.
 
 Round 47 lands the §8.6.2 / §8.6.3 / §8.6.4 scaling, transformation and
 residual-array construction process — the new [`transform`] module —

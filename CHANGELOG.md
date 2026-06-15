@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 311 (2026-06-15)
+
+- `binarization` module — the §8.4.2 derivation process for luma intra
+  prediction mode, the process the round-40/41 signalling group
+  (`prev_intra_luma_pred_flag`, `mpm_idx`, `rem_intra_luma_pred_mode`)
+  feeds, completing the luma intra-mode resolution chain alongside the
+  round-42 §8.4.3 chroma derivation:
+  - `intra_luma_cand_mode_list` — §8.4.2 step 3: builds the three-entry
+    `candModeList[ 0..=2 ]` from the two step-2 candidate neighbour modes
+    `candIntraPredModeA` / `candIntraPredModeB`. The equal-candidate
+    branch splits on `candA < 2` (eqs. 8-21..8-23 ⇒ `{PLANAR, DC,
+    ANGULAR26}`) versus the angular case (eqs. 8-24..8-26 — the candidate
+    plus its two mod-32-wrapped neighbouring angular modes); the
+    distinct-candidate branch fills slots 0/1 (eqs. 8-27/8-28) and picks
+    `candModeList[ 2 ]` as the first of `{PLANAR, DC, ANGULAR26}` not
+    already present.
+  - `derive_intra_pred_mode_y` — §8.4.2 step 4: on the
+    [`LumaIntraModeSource::Mpm`] path `IntraPredModeY =
+    candModeList[ mpm_idx ]`; on the [`LumaIntraModeSource::Remaining`]
+    path the candidate list is sorted ascending (the eqs. 8-29..8-31
+    three-compare-and-swap sort) and `rem_intra_luma_pred_mode` is passed
+    through the increment pass (`+1` for every sorted candidate at or
+    below the running value), mapping the 31-value remaining field onto
+    the 35-mode space exclusive of the three most-probable modes.
+  - `INTRA_PLANAR` (0), `INTRA_DC` (1), `INTRA_ANGULAR26` (26) and
+    `INTRA_PRED_MODE_MAX` (34) — the Table 8-1 mode-name constants.
+  - The §8.4.2-step-2 candidate reduction (§6.4.1 availability,
+    `CuPredMode` / `pcm_flag` tests, the CTB-row-boundary B clamp) stays
+    the slice-data parser's responsibility, consistent with the
+    availability-as-input convention of the §9.3.4.2.2 neighbour ctxInc
+    derivations.
+- 10 new tests (521 total, was 511): the Table 8-1 mode constants; the
+  step-3 equal-low (eqs. 8-21..8-23), equal-angular with mod-32 edge
+  wraps at modes 2 and 34 (eqs. 8-24..8-26), and distinct-candidate
+  first-missing-default (eqs. 8-27/8-28) branches; the all-candidate-pair
+  in-range invariant; the step-4 Mpm direct index; the Remaining
+  low-mode anchors, the pre-increment ascending sort, and the
+  bijection-onto-`(0..=34) \ candModeList` invariant over the full rem
+  range; and an end-to-end candModeList → IntraPredModeY composition on
+  both paths.
+
 ### Added — clean-room rebuild round 308 (2026-06-15)
 
 - `binarization` module — the §7.3.8.6 `prediction_unit( )`

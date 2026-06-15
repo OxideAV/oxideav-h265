@@ -1419,6 +1419,179 @@ pub fn decode_rem_intra_luma_pred_mode(engine: &mut CabacEngine<'_>) -> Result<u
 }
 
 // ---------------------------------------------------------------------
+// IntraPredModeY derivation (§8.4.2 — derivation process for luma intra
+// prediction mode). This is the process the §7.3.8.5 luma-mode signalling
+// group (prev_intra_luma_pred_flag, mpm_idx, rem_intra_luma_pred_mode)
+// feeds: given the two §8.4.2-step-2 candidate neighbour modes
+// candIntraPredModeA / candIntraPredModeB it builds the three-entry
+// candModeList (step 3) and then resolves IntraPredModeY from the
+// signalled fields (step 4 — either candModeList[ mpm_idx ] on the Mpm
+// path, or rem_intra_luma_pred_mode passed through the sorted-list
+// increment pass on the Remaining path).
+//
+// Table 8-1 names the modes: 0 = INTRA_PLANAR, 1 = INTRA_DC,
+// 2..34 = INTRA_ANGULAR2..INTRA_ANGULAR34 (35 modes total). The
+// §8.4.2-step-2 candidate reduction (availability via §6.4.1,
+// CuPredMode / pcm_flag tests, the CTB-row-boundary B clamp) is the
+// slice-data parser's responsibility — it holds the neighbour state and
+// the §6.4.1 z-scan availability — and yields the two candidate mode
+// values this process consumes, matching the availability-as-input
+// convention the §9.3.4.2.2 neighbour ctxInc derivations use.
+// ---------------------------------------------------------------------
+
+/// Table 8-1 — `INTRA_PLANAR`, the mode-0 planar predictor.
+pub const INTRA_PLANAR: u8 = 0;
+
+/// Table 8-1 — `INTRA_DC`, the mode-1 DC predictor. This is also the
+/// §8.4.2-step-2 substitute value `candIntraPredModeX` takes when the
+/// neighbour is unavailable, inter-coded, PCM, or (for B) lies in the
+/// CTB row above the current one.
+pub const INTRA_DC: u8 = 1;
+
+/// Table 8-1 — `INTRA_ANGULAR26`, the mode-26 vertical angular
+/// predictor. §8.4.2 step 3 uses it as `candModeList[ 2 ]` in the
+/// equal-and-low-candidate (eq. 8-23) and the both-PLANAR-and-DC-present
+/// (final step-3 else) fall-throughs.
+pub const INTRA_ANGULAR26: u8 = 26;
+
+/// Table 8-1 — the highest luma intra prediction mode index
+/// (`INTRA_ANGULAR34`); modes run `0..=34` inclusive.
+pub const INTRA_PRED_MODE_MAX: u8 = 34;
+
+/// §8.4.2 step 3 — build the three-entry most-probable-mode candidate
+/// list `candModeList[ 0..=2 ]` from the two §8.4.2-step-2 candidate
+/// neighbour modes `candIntraPredModeA` (left, location `(xPb − 1, yPb)`)
+/// and `candIntraPredModeB` (above, location `(xPb, yPb − 1)`).
+///
+/// Both candidate inputs are already the reduced step-2 values (an
+/// available intra neighbour's `IntraPredModeY`, else `INTRA_DC`); this
+/// function implements only the step-3 list construction:
+///
+/// * `candIntraPredModeB == candIntraPredModeA`:
+///   * candidate `< 2` (PLANAR or DC) ⇒ `{PLANAR, DC, ANGULAR26}`
+///     (eqs. 8-21..8-23).
+///   * otherwise (an angular candidate) ⇒ the candidate plus its two
+///     neighbouring angular modes (eqs. 8-24..8-26):
+///     `{candA, 2 + ((candA + 29) % 32), 2 + ((candA − 2 + 1) % 32)}`.
+/// * `candIntraPredModeB != candIntraPredModeA`:
+///   * `candModeList[ 0 ] = candA`, `candModeList[ 1 ] = candB`
+///     (eqs. 8-27/8-28); `candModeList[ 2 ]` is the first of
+///     `{PLANAR, DC, ANGULAR26}` not already present in the first two
+///     entries.
+///
+/// Both candidate inputs must be valid Table 8-1 modes (`0..=34`).
+#[must_use]
+pub fn intra_luma_cand_mode_list(
+    cand_intra_pred_mode_a: u8,
+    cand_intra_pred_mode_b: u8,
+) -> [u8; 3] {
+    debug_assert!(
+        cand_intra_pred_mode_a <= INTRA_PRED_MODE_MAX,
+        "candIntraPredModeA is a Table 8-1 mode; must be in 0..=34"
+    );
+    debug_assert!(
+        cand_intra_pred_mode_b <= INTRA_PRED_MODE_MAX,
+        "candIntraPredModeB is a Table 8-1 mode; must be in 0..=34"
+    );
+
+    if cand_intra_pred_mode_b == cand_intra_pred_mode_a {
+        if cand_intra_pred_mode_a < 2 {
+            // eqs. 8-21..8-23 — equal low candidate.
+            [INTRA_PLANAR, INTRA_DC, INTRA_ANGULAR26]
+        } else {
+            // eqs. 8-24..8-26 — equal angular candidate; the `% 32`
+            // arithmetic wraps the two neighbouring angular modes back
+            // into the 2..=33 angular band (the `2 +` re-bases the
+            // 0..=31 residue onto INTRA_ANGULAR2).
+            let a = u32::from(cand_intra_pred_mode_a);
+            let one = 2 + ((a + 29) % 32);
+            let two = 2 + ((a - 2 + 1) % 32);
+            [cand_intra_pred_mode_a, one as u8, two as u8]
+        }
+    } else {
+        // eqs. 8-27/8-28 — distinct candidates fill slots 0 and 1; slot
+        // 2 is the first default mode (PLANAR, then DC, then ANGULAR26)
+        // not already present.
+        let zero = cand_intra_pred_mode_a;
+        let one = cand_intra_pred_mode_b;
+        let two = if zero != INTRA_PLANAR && one != INTRA_PLANAR {
+            INTRA_PLANAR
+        } else if zero != INTRA_DC && one != INTRA_DC {
+            INTRA_DC
+        } else {
+            INTRA_ANGULAR26
+        };
+        [zero, one, two]
+    }
+}
+
+/// §8.4.2 step 4 — derive `IntraPredModeY[ xPb ][ yPb ]` from the step-3
+/// `candModeList` and the §7.3.8.5 signalled luma-mode fields.
+///
+/// `cand_mode_list` is the [`intra_luma_cand_mode_list`] output; `source`
+/// is the [`LumaIntraModeSource`] the round-40 `prev_intra_luma_pred_flag`
+/// selects.
+///
+/// * [`LumaIntraModeSource::Mpm`] — `IntraPredModeY = candModeList[
+///   mpm_idx ]` (the `mpm_idx` field, `0..=2`, indexes the candidate
+///   list directly). `field` carries the decoded `mpm_idx`.
+/// * [`LumaIntraModeSource::Remaining`] — the step-4 ordered procedure:
+///   the candidate list is sorted ascending (the eqs. 8-29..8-31
+///   three-compare-and-swap sort), `IntraPredModeY` is seeded with
+///   `rem_intra_luma_pred_mode` (`field`, `0..=31`), then incremented by
+///   one for every sorted candidate it meets or exceeds (low-to-high, so
+///   the running value is re-compared against each successive candidate).
+///   This re-injects the three excluded most-probable modes, mapping the
+///   31-value remaining field onto the 35-mode space.
+///
+/// The returned value is always a valid Table 8-1 mode (`0..=34`).
+#[must_use]
+pub fn derive_intra_pred_mode_y(
+    cand_mode_list: [u8; 3],
+    source: LumaIntraModeSource,
+    field: u8,
+) -> u8 {
+    match source {
+        LumaIntraModeSource::Mpm => {
+            debug_assert!(
+                field <= MPM_IDX_TR_CMAX as u8,
+                "mpm_idx is TR cMax = 2 (Table 9-43); must index the three-entry candModeList"
+            );
+            cand_mode_list[field as usize]
+        }
+        LumaIntraModeSource::Remaining => {
+            debug_assert!(
+                field <= REM_INTRA_LUMA_PRED_MODE_FL_CMAX as u8,
+                "rem_intra_luma_pred_mode is FL cMax = 31 (Table 9-43); must be in 0..=31"
+            );
+            // eqs. 8-29..8-31 — sort the three candidates ascending.
+            let mut sorted = cand_mode_list;
+            if sorted[0] > sorted[1] {
+                sorted.swap(0, 1);
+            }
+            if sorted[0] > sorted[2] {
+                sorted.swap(0, 2);
+            }
+            if sorted[1] > sorted[2] {
+                sorted.swap(1, 2);
+            }
+            // step-4 increment pass: seed with rem_intra_luma_pred_mode,
+            // then bump once per sorted candidate at-or-below the running
+            // value. The candidates are distinct and ascending, so the
+            // bump count is monotone and the result is the unsigned
+            // remaining field shifted up past the three excluded modes.
+            let mut mode = field;
+            for &cand in &sorted {
+                if mode >= cand {
+                    mode += 1;
+                }
+            }
+            mode
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // intra_chroma_pred_mode (§7.3.8.5 coding_unit() / §7.4.9.5)
 // §9.3.3.8 / Table 9-46 binarization + Table 9-48 + §8.4.3 derivation.
 // The chroma-mode field that follows the luma-mode group in §7.3.8.5:
@@ -6152,6 +6325,173 @@ mod tests {
         // Table 8-3, so both paths agree.
         assert_eq!(derive_intra_pred_mode_c(0, 7, true), 0);
         assert_eq!(derive_intra_pred_mode_c(0, 7, false), 0);
+    }
+
+    // -------------------------------------------------------------
+    // §8.4.2 — derivation process for luma intra prediction mode
+    // (candModeList construction + IntraPredModeY resolution)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn intra_mode_table_8_1_name_constants() {
+        // Table 8-1: 0 = INTRA_PLANAR, 1 = INTRA_DC, 26 = INTRA_ANGULAR26,
+        // 34 = INTRA_ANGULAR34 (the max mode).
+        assert_eq!(INTRA_PLANAR, 0);
+        assert_eq!(INTRA_DC, 1);
+        assert_eq!(INTRA_ANGULAR26, 26);
+        assert_eq!(INTRA_PRED_MODE_MAX, 34);
+    }
+
+    #[test]
+    fn cand_mode_list_equal_low_candidate_eqs_8_21_8_23() {
+        // candB == candA and candA < 2 ⇒ {PLANAR, DC, ANGULAR26}, for
+        // both the PLANAR (0) and DC (1) equal-candidate cases.
+        assert_eq!(intra_luma_cand_mode_list(0, 0), [0, 1, 26]);
+        assert_eq!(intra_luma_cand_mode_list(1, 1), [0, 1, 26]);
+    }
+
+    #[test]
+    fn cand_mode_list_equal_angular_candidate_eqs_8_24_8_26() {
+        // candB == candA and candA >= 2 ⇒ the candidate plus its two
+        // neighbouring angular modes (mod-32 wrap into 2..=33).
+        // candA = 26: {26, 2 + (55 % 32) = 25, 2 + (25 % 32) = 27}.
+        assert_eq!(intra_luma_cand_mode_list(26, 26), [26, 25, 27]);
+        // candA = 2 (low angular edge): {2, 2 + (31 % 32) = 33,
+        // 2 + (1 % 32) = 3} — the −1 neighbour wraps to the top mode 33.
+        assert_eq!(intra_luma_cand_mode_list(2, 2), [2, 33, 3]);
+        // candA = 34 (top angular edge): {34, 2 + (63 % 32) = 2 + 31 = 33,
+        // 2 + (33 % 32) = 2 + 1 = 3} — the +1 neighbour wraps to mode 3.
+        assert_eq!(intra_luma_cand_mode_list(34, 34), [34, 33, 3]);
+    }
+
+    #[test]
+    fn cand_mode_list_distinct_third_is_first_missing_default() {
+        // candA != candB ⇒ slots 0/1 = candA/candB (eqs. 8-27/8-28);
+        // slot 2 is the first of PLANAR, DC, ANGULAR26 not already present.
+        // Neither is PLANAR ⇒ slot 2 = PLANAR.
+        assert_eq!(intra_luma_cand_mode_list(1, 26), [1, 26, 0]);
+        // PLANAR present, DC absent ⇒ slot 2 = DC.
+        assert_eq!(intra_luma_cand_mode_list(0, 26), [0, 26, 1]);
+        // PLANAR and DC both present ⇒ slot 2 = ANGULAR26.
+        assert_eq!(intra_luma_cand_mode_list(0, 1), [0, 1, 26]);
+        assert_eq!(intra_luma_cand_mode_list(1, 0), [1, 0, 26]);
+    }
+
+    #[test]
+    fn cand_mode_list_entries_are_valid_modes() {
+        // Structural invariant: every candModeList entry is a Table 8-1
+        // mode (0..=34) across the full candidate-pair product.
+        for a in 0u8..=34 {
+            for b in 0u8..=34 {
+                let list = intra_luma_cand_mode_list(a, b);
+                for &m in &list {
+                    assert!(
+                        m <= INTRA_PRED_MODE_MAX,
+                        "candModeList entry {m} out of range"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derive_intra_pred_mode_y_mpm_indexes_cand_list() {
+        // step-4 Mpm path: IntraPredModeY = candModeList[ mpm_idx ].
+        let list = [26u8, 25, 27];
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Mpm, 0),
+            26
+        );
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Mpm, 1),
+            25
+        );
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Mpm, 2),
+            27
+        );
+    }
+
+    #[test]
+    fn derive_intra_pred_mode_y_remaining_low_modes() {
+        // step-4 Remaining path with candModeList = {0, 1, 26} (sorted).
+        // rem = 0 ⇒ 0>=0→1, 1>=1→2, 2>=26? no ⇒ 2.
+        let list = [0u8, 1, 26];
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 0),
+            2
+        );
+        // rem = 23 ⇒ 23>=0→24, 24>=1→25, 25>=26? no ⇒ 25.
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 23),
+            25
+        );
+        // rem = 24 ⇒ 24>=0→25, 25>=1→26, 26>=26→27 ⇒ 27 (jumps over the
+        // ANGULAR26 candidate too).
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 24),
+            27
+        );
+    }
+
+    #[test]
+    fn derive_intra_pred_mode_y_remaining_sorts_cand_list() {
+        // step-4 sorts candModeList ascending before the increment pass:
+        // an unsorted {26, 25, 27} input sorts to {25, 26, 27}.
+        // rem = 24 ⇒ 24>=25? no ⇒ 24 (below all three candidates).
+        let list = [26u8, 25, 27];
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 24),
+            24
+        );
+        // rem = 25 ⇒ 25>=25→26, 26>=26→27, 27>=27→28 ⇒ 28.
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 25),
+            28
+        );
+    }
+
+    #[test]
+    fn derive_intra_pred_mode_y_remaining_bijective_over_full_range() {
+        // The Remaining path maps the 31 rem values 0..=30 onto a set of
+        // 31 distinct modes that excludes exactly the three candModeList
+        // modes — a bijection onto (0..=34) \ candModeList.
+        let list = [0u8, 1, 26]; // sorted, the equal-low-candidate list
+        let mut produced = std::collections::BTreeSet::new();
+        for rem in 0u8..=31 {
+            let mode = derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, rem);
+            assert!(mode <= INTRA_PRED_MODE_MAX, "mode {mode} out of range");
+            assert!(
+                produced.insert(mode),
+                "rem path produced duplicate mode {mode}"
+            );
+        }
+        // 32 distinct outputs (rem 0..=31) — none equal to a candidate.
+        for &cand in &list {
+            assert!(
+                !produced.contains(&cand),
+                "rem path produced candidate mode {cand}"
+            );
+        }
+    }
+
+    #[test]
+    fn intra_pred_mode_y_end_to_end_remaining() {
+        // End-to-end §8.4.2: distinct neighbour candidates A = 10, B = 2
+        // ⇒ candModeList {10, 2, 0} (slot 2 = PLANAR, neither slot is
+        // PLANAR), Remaining with rem = 0:
+        //   sorted {0, 2, 10}; 0>=0→1, 1>=2? no, 1>=10? no ⇒ 1.
+        let list = intra_luma_cand_mode_list(10, 2);
+        assert_eq!(list, [10, 2, 0]);
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Remaining, 0),
+            1
+        );
+        // Same list, Mpm path with mpm_idx = 0 ⇒ candModeList[0] = 10.
+        assert_eq!(
+            derive_intra_pred_mode_y(list, LumaIntraModeSource::Mpm, 0),
+            10
+        );
     }
 
     // -------------------------------------------------------------
