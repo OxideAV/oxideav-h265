@@ -100,16 +100,31 @@ layers are usable directly through the public parser / engine API.
   §8.4.4.2.1 filtering-gate + predictor dispatch from a substituted
   reference array; the §6.4.1 availability derivation that marks the
   neighbours remains the caller's responsibility.
+* **Inter fractional-sample interpolation + default combine (§8.5.3.3.3 /
+  §8.5.3.3.4.2)** — the `inter_pred` module: `RefPlane` (the §8.5.3.3.3
+  `Clip3` edge-extended reference plane), `interp_luma_block`
+  (the separable 8-tap quarter-pel luma filter of equations 8-224..8-238
+  with Table 8-8 phase selection), `interp_chroma_block` (the separable
+  4-tap eighth-pel chroma filter of equations 8-241..8-261 with Table 8-9
+  phase selection), and `default_weighted_pred` (the §8.5.3.3.4.2
+  uni- / bi-predictive combine of equations 8-262..8-264, the
+  `weighted_pred_flag == 0` path). The interpolation carries the
+  `14 − BitDepth`-bit intermediate precision; the combine clips to the
+  sample range. The §8.5.3.1 / §8.5.3.2 motion-vector / merge derivation
+  that produces `mvLX` and the §8.5.3.3.1 block-walk driver remain the
+  caller's / follow-ups' responsibility.
 
 ## Not yet implemented
 
 * The §7.3.8 slice-data syntax-element walk that drives the CABAC engine
   through the CTU / CU / TU parse loops.
-* Inter sample prediction (§8.5), in-loop filters (deblock / SAO), and
-  DPB management. (Intra sample prediction §8.4.4.2 and the §6.4
-  neighbour-availability derivation that feeds it are implemented; what
-  remains is the slice-data walk that wires the per-location
-  `SliceAddrRs` / `CuPredMode` lookups into the availability query.)
+* The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
+  / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
+  splits `mvLX` into its integer / fractional parts and drives
+  `inter_pred`, and the §8.5.3.3.4.3 explicit weighted-prediction path.
+  In-loop filters (deblock / SAO) and DPB management likewise remain.
+  (The §8.5.3.3.3 fractional-sample interpolation and §8.5.3.3.4.2 default
+  combine are implemented; see above.)
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
   the typed flags are decoded but the bodies surface as opaque bytes.
 * Encoder.

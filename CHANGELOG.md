@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 321 (2026-06-16)
+
+- `inter_pred` module — §8.5.3.3.3 fractional sample interpolation plus
+  the §8.5.3.3.4.2 default weighted sample prediction combine, the first
+  inter-prediction sample-generation increment:
+  - `RefPlane` — a row-major reference-picture sample plane with the
+    §8.5.3.3.3 `Clip3( 0, dim − 1, … )` edge extension (equations 8-222 /
+    8-223 for luma, 8-239 / 8-240 for chroma) so the filters can index
+    with the raw `xInt + i` / `yInt + j` offsets.
+  - `interp_luma_block` — §8.5.3.3.3.2 separable 8-tap quarter-pel luma
+    interpolation (equations 8-224..8-238), with Table 8-8 phase
+    selection. `shift1 = Min(4, BitDepthY − 8)`, `shift2 = 6`,
+    `shift3 = Max(2, 14 − BitDepthY)`; full-pel is `A << shift3`.
+  - `interp_chroma_block` — §8.5.3.3.3.3 separable 4-tap eighth-pel chroma
+    interpolation (equations 8-241..8-261), with Table 8-9 phase
+    selection.
+  - `default_weighted_pred` — §8.5.3.3.4.2 uni- / bi-predictive combine
+    (equations 8-262..8-264, the `weighted_pred_flag == 0` path), with
+    `shift1 = Max(2, 14 − bitDepth)`, `shift2 = Max(3, 15 − bitDepth)`,
+    clipping to `[0, (1 << bitDepth) − 1]`.
+  - `InterPredError` — empty / mismatched plane, empty block, out-of-range
+    fraction, out-of-range bit depth, and array-length-mismatch surfaces.
+
+  The interpolation carries the `14 − BitDepth`-bit intermediate precision
+  the spec keeps between §8.5.3.3.3 and §8.5.3.3.4; the combine clips to
+  the sample range. The §8.5.3.1 / §8.5.3.2 MV / merge derivation, the
+  §8.5.3.3.1 block-walk driver, and the §8.5.3.3.4.3 explicit weighted
+  path remain follow-ups. 12 unit tests (flat-plane invariants for all
+  4×4 luma and 8×8 chroma phases, hand-computed kernel values, edge
+  extension, uni- / bi-predictive combine, clipping, 10-bit shift3, and an
+  end-to-end interpolate-then-combine pipeline).
+
 ### Added — clean-room rebuild round 318 (2026-06-16)
 
 - `availability` module — §6.4 availability processes plus the §6.5.1 /
