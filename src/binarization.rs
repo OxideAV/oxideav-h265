@@ -2286,6 +2286,128 @@ pub fn res_scale_sign_flag_ctx_inc(c: u32) -> u32 {
     c
 }
 
+/// Table 9-43 binarization shape for `log2_res_scale_abs_plus1[ c ]`:
+/// TR with `cMax = 4`, `cRiceParam = 0` (the prefix is the entire
+/// element — there is no EGk continuation; the all-ones `0b1111`
+/// prefix simply encodes the value `4`).
+pub const LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX: u32 = 4;
+
+/// Decoded §7.3.8.12 `cross_comp_pred( x0, y0, c )` pair plus the
+/// §7.4.9.12 derived `ResScaleVal` for the chroma component `c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossCompPred {
+    /// `log2_res_scale_abs_plus1[ c ]` from the wire (TR, `cMax = 4`).
+    /// When this is 0, `res_scale_sign_flag` is not signalled and
+    /// `ResScaleVal` is 0.
+    pub log2_res_scale_abs_plus1: u32,
+    /// `res_scale_sign_flag[ c ]` from the wire; `None` when
+    /// `log2_res_scale_abs_plus1 == 0` (the flag is not present).
+    pub res_scale_sign_flag: Option<u8>,
+    /// §7.4.9.12 derived scaling factor `ResScaleVal[ c+1 ][ x0 ][ y0 ]`
+    /// (equations 7-79 / 7-80): `0` when `log2_res_scale_abs_plus1 == 0`,
+    /// else `(1 << (log2_res_scale_abs_plus1 − 1)) * (1 − 2 *
+    /// res_scale_sign_flag)`.
+    pub res_scale_val: i32,
+}
+
+/// Decode the §7.3.8.12 `cross_comp_pred( x0, y0, c )` syntax structure
+/// from the CABAC engine, returning the decoded pair and the §7.4.9.12
+/// derived [`CrossCompPred::res_scale_val`].
+///
+/// The TR(`cMax = 4`) prefix of `log2_res_scale_abs_plus1[ c ]` is
+/// context-coded; bin `binIdx` uses `ctx[binIdx]` (the per-component
+/// `{0, 1, 2, 3}` bank already sliced out of the Table 9-36 bank by the
+/// caller via [`log2_res_scale_abs_plus1_ctx_inc`]). When the prefix is
+/// non-zero, the single-bin `res_scale_sign_flag[ c ]` follows,
+/// context-coded against `ctx_sign` (Table 9-37, ctxInc = c — also
+/// pre-sliced by the caller).
+///
+/// `ctx` must provide at least [`LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX`]
+/// context slots for the prefix bins; only as many as are actually
+/// decoded are mutated in place per §9.3.4.3.2.2.
+pub fn decode_cross_comp_pred(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut [ContextModel],
+    ctx_sign: &mut ContextModel,
+) -> Result<CrossCompPred, CabacError> {
+    debug_assert!(
+        ctx.len() >= LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX as usize,
+        "cross_comp_pred needs cMax = 4 prefix contexts for the component bank"
+    );
+    // §9.3.3.10 TR prefix (cRiceParam = 0); each bin uses its own
+    // context within the per-component bank (Table 9-48 ctxInc =
+    // 4*c + binIdx, with the *c offset already applied by the caller's
+    // slice). The all-ones escape simply yields the value cMax = 4 —
+    // there is no EGk continuation for this element (Table 9-43).
+    let (log2_res_scale_abs_plus1, _is_escape) =
+        read_truncated_rice_prefix(LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX, |bin_idx| {
+            engine.decode_decision(&mut ctx[bin_idx as usize])
+        })?;
+
+    // §7.3.8.12: res_scale_sign_flag is present only when the prefix is
+    // non-zero. §7.4.9.12 eqs 7-79 / 7-80 derive ResScaleVal.
+    let (res_scale_sign_flag, res_scale_val) = if log2_res_scale_abs_plus1 == 0 {
+        (None, 0i32)
+    } else {
+        let sign = engine.decode_decision(ctx_sign)?;
+        let magnitude = 1i32 << (log2_res_scale_abs_plus1 - 1);
+        let val = magnitude * (1 - 2 * i32::from(sign));
+        (Some(sign), val)
+    };
+
+    Ok(CrossCompPred {
+        log2_res_scale_abs_plus1,
+        res_scale_sign_flag,
+        res_scale_val,
+    })
+}
+
+// ---------------------------------------------------------------------
+// tu_residual_act_flag (§7.3.8.10 transform_unit() / §7.4.9.10)
+// Table 9-39 ctxIdx initValue; FL (cMax = 1) binarization; Table 9-48
+// ctxInc = 0. Present only when the SCC residual adaptive colour
+// transform gate is satisfied (§7.3.8.10).
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `tu_residual_act_flag`: FL with
+/// `cMax = 1` (a single context-coded bin per transform unit).
+pub const TU_RESIDUAL_ACT_FLAG_FL_CMAX: u32 = 1;
+
+/// §9.3.4.2.1 / Table 9-48 row for `tu_residual_act_flag`: bin 0 is
+/// context-coded with `ctxInc = 0`; the FL `cMax = 1` shape emits only
+/// that one bin.
+#[must_use]
+pub fn tu_residual_act_flag_ctx_inc() -> u32 {
+    0
+}
+
+/// §7.4.9.10 — inferred value of `tu_residual_act_flag` when it is not
+/// present (the adaptive-colour-transform gate is not satisfied): the
+/// spec mandates an inferred value of `0` (no adaptive colour
+/// transform).
+#[must_use]
+pub fn tu_residual_act_flag_inferred() -> u8 {
+    0
+}
+
+/// Decode `tu_residual_act_flag` (§7.3.8.10 / §7.4.9.10) from the CABAC
+/// engine, consuming one Table 9-39 context for the single FL bin
+/// (Table 9-48 ctxInc = 0). The gate that decides whether the element
+/// is present (the §7.3.8.10 `residual_adaptive_colour_transform_enabled_flag`
+/// predicate) is the caller's responsibility; see
+/// [`tu_residual_act_flag_inferred`] for the absent case.
+pub fn decode_tu_residual_act_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    debug_assert_eq!(
+        tu_residual_act_flag_ctx_inc(),
+        0,
+        "Table 9-48 row for tu_residual_act_flag: bin 0 ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
 // ---------------------------------------------------------------------
 // §7.3.4 sao() — per-CTU SAO syntax elements (Table 9-48 / Table 9-43)
 // ---------------------------------------------------------------------
@@ -4140,6 +4262,44 @@ mod tests {
         // context.
         assert_eq!(res_scale_sign_flag_ctx_inc(0), 0);
         assert_eq!(res_scale_sign_flag_ctx_inc(1), 1);
+    }
+
+    #[test]
+    fn cross_comp_pred_smoke_and_res_scale_val() {
+        // §7.3.8.12 decode end-to-end: the TR(cMax=4) prefix plus the
+        // conditional sign flag, with the §7.4.9.12 ResScaleVal
+        // derivation (eqs 7-79 / 7-80) consistent with the decoded
+        // pair.
+        let buf = [0x5A; 32];
+        let mut engine = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut prefix = [ContextModel::init(154, 26); 4];
+        let mut sign = ContextModel::init(154, 26);
+        let ccp = decode_cross_comp_pred(&mut engine, &mut prefix, &mut sign).unwrap();
+        assert!(ccp.log2_res_scale_abs_plus1 <= LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX);
+        if ccp.log2_res_scale_abs_plus1 == 0 {
+            assert_eq!(ccp.res_scale_val, 0);
+            assert!(ccp.res_scale_sign_flag.is_none());
+        } else {
+            let s = ccp
+                .res_scale_sign_flag
+                .expect("sign present when prefix != 0");
+            let mag = 1i32 << (ccp.log2_res_scale_abs_plus1 - 1);
+            assert_eq!(ccp.res_scale_val, mag * (1 - 2 * i32::from(s)));
+        }
+    }
+
+    #[test]
+    fn tu_residual_act_flag_inferred_and_ctx_inc() {
+        // §7.4.9.10 inferred 0; Table 9-48 ctxInc 0; FL cMax = 1.
+        assert_eq!(tu_residual_act_flag_inferred(), 0);
+        assert_eq!(tu_residual_act_flag_ctx_inc(), 0);
+        assert_eq!(TU_RESIDUAL_ACT_FLAG_FL_CMAX, 1);
+        // A single context-coded bin decodes to 0 or 1.
+        let buf = [0x5A; 8];
+        let mut engine = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = ContextModel::init(154, 26);
+        let bit = decode_tu_residual_act_flag(&mut engine, &mut ctx).unwrap();
+        assert!(bit <= 1);
     }
 
     // -------------------------------------------------------------

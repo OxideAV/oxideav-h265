@@ -6,6 +6,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 325 (2026-06-16)
+
+- `transform_unit` module — the §7.3.8.10 `transform_unit( x0, y0,
+  xBase, yBase, log2TrafoSize, trafoDepth, blkIdx )` syntax driver, the
+  leaf the §7.3.8.8 `transform_tree()` recursion bottoms out in:
+  - `decode_transform_unit` — walks the §7.3.8.10 table exactly: the
+    `cbfChroma` derivation (including the `ChromaArrayType == 2`
+    lower-half companions), the adaptive-colour-transform predicate
+    gating `tu_residual_act_flag`, the `delta_qp()` / `chroma_qp_offset()`
+    blocks (each gated by the per-quantization-group `IsCuQpDeltaCoded` /
+    `IsCuChromaQpOffsetCoded` state in `QuantGroupState`), the luma
+    `residual_coding()`, and the chroma path — both the in-place branch
+    (with the §7.3.8.12 `cross_comp_pred()` prelude and the
+    `log2TrafoSizeC = Max(2, log2TrafoSize − (ChromaArrayType == 3 ? 0 :
+    1))` chroma size, plus the `ChromaArrayType == 2` stacked-sub-block
+    pair) and the `blkIdx == 3` deferred-chroma branch where the chroma
+    residuals are coded against the parent node at the last luma leaf.
+  - `TransformUnitParams` / `TransformUnit` / `QuantGroupState` /
+    `CuPredMode` — typed inputs, decoded result, and the
+    across-transform-unit quant-group decode state.
+- `binarization` — two new §7.3.8.10 / §7.3.8.12 primitive decoders the
+  driver composes:
+  - `decode_cross_comp_pred` — §7.3.8.12 `cross_comp_pred( x0, y0, c )`:
+    the TR(`cMax = 4`) `log2_res_scale_abs_plus1[ c ]` prefix plus the
+    conditional `res_scale_sign_flag[ c ]`, with the §7.4.9.12
+    `ResScaleVal` derivation (equations 7-79 / 7-80) surfaced on
+    `CrossCompPred`.
+  - `decode_tu_residual_act_flag` — §7.3.8.10 `tu_residual_act_flag`
+    (FL `cMax = 1`, Table 9-39 / Table 9-48 ctxInc 0), plus the §7.4.9.10
+    `tu_residual_act_flag_inferred` helper.
+
 ### Added — clean-room rebuild round 321 (2026-06-16)
 
 - `inter_pred` module — §8.5.3.3.3 fractional sample interpolation plus

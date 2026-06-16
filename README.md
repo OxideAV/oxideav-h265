@@ -86,6 +86,24 @@ layers are usable directly through the public parser / engine API.
   and the §8.4.2 / §8.4.3 luma + chroma intra-prediction-mode
   derivation. These compose into the §7.3.8.11 `residual_coding()`
   driver.
+* **Transform-unit driver (§7.3.8.10)** — the `transform_unit` module:
+  `decode_transform_unit` walks the §7.3.8.10 `transform_unit( )` syntax
+  exactly, composing the existing per-element primitives into the leaf
+  the §7.3.8.8 `transform_tree()` recursion bottoms out in. It derives
+  `cbfChroma` (with the `ChromaArrayType == 2` lower-half companions),
+  evaluates the adaptive-colour-transform predicate gating
+  `tu_residual_act_flag`, reads the `delta_qp()` / `chroma_qp_offset()`
+  blocks (each gated by the per-quantization-group `IsCuQpDeltaCoded` /
+  `IsCuChromaQpOffsetCoded` state carried in `QuantGroupState`), the luma
+  `residual_coding()`, and the chroma path — both the in-place branch
+  (with the §7.3.8.12 `cross_comp_pred()` prelude, the
+  `log2TrafoSizeC = Max(2, log2TrafoSize − (ChromaArrayType == 3 ? 0 : 1))`
+  chroma size, and the `ChromaArrayType == 2` stacked-sub-block pair) and
+  the `blkIdx == 3` deferred-chroma branch. Two new
+  binarization decoders back it: `decode_cross_comp_pred` (§7.3.8.12, the
+  TR(`cMax = 4`) `log2_res_scale_abs_plus1` prefix + conditional
+  `res_scale_sign_flag`, with the §7.4.9.12 `ResScaleVal` derivation) and
+  `decode_tu_residual_act_flag` (§7.3.8.10, FL `cMax = 1`).
 * **Scaling + transform (§8.6)** — `scale_coefficients` (§8.6.3
   dequantization), `inverse_transform` (the §8.6.4 separable inverse
   DST-VII / DCT-II), and the `residual_block` orchestrator turning a
@@ -116,8 +134,12 @@ layers are usable directly through the public parser / engine API.
 
 ## Not yet implemented
 
-* The §7.3.8 slice-data syntax-element walk that drives the CABAC engine
-  through the CTU / CU / TU parse loops.
+* The upper §7.3.8 slice-data syntax-element walk that drives the CABAC
+  engine through the CTU / CU / transform-tree parse loops: the §7.3.4
+  `sao()` per-CTU block, §7.3.8.4 `coding_tree_unit()`, §7.3.8.4
+  `coding_quadtree()`, §7.3.8.5 `coding_unit()`, and §7.3.8.8
+  `transform_tree()` recursion. (The §7.3.8.10 `transform_unit()` leaf
+  these bottom out in is implemented; see above.)
 * The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
   / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
   splits `mvLX` into its integer / fractional parts and drives
