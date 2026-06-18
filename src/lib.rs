@@ -242,6 +242,7 @@ pub mod scaling_list;
 pub mod scan;
 pub mod sei;
 pub mod slice;
+pub mod slice_data;
 pub mod sps;
 pub mod transform;
 pub mod transform_tree;
@@ -271,6 +272,11 @@ pub use slice::{
     PredWeightTableInputs, RefPicListsModification, SliceDeblocking, SliceError,
     SliceLongTermRefPic, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP,
     IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
+};
+pub use slice_data::{
+    decode_coding_quadtree, decode_coding_tree_unit, decode_sao, CodingQuadtree, CodingTreeUnit,
+    CodingUnit, CtuGrid, IntraLumaMode, PredictionUnit, SaoComponent, SaoCtbParams,
+    SliceDataParams,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,

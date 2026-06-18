@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — clean-room rebuild round 338 (2026-06-19)
 
+- `slice_data` module — the §7.3.8.1 .. §7.3.8.6 slice-data CABAC
+  syntax-element walk, the upper rung of the §7.3.8 parse loop that was
+  the crate's largest missing subsystem. It drives the CABAC engine
+  through the per-CTU syntax structures, composing the leaf decode
+  primitives with the existing §7.3.8.8 `transform_tree()` recursion:
+  - `decode_coding_tree_unit` (§7.3.8.2) — optional §7.3.8.3 `sao()` +
+    the §7.3.8.4 coding-quadtree root, producing `CodingTreeUnit`.
+  - `decode_sao` (§7.3.8.3) — the full per-CTB SAO param walk: the two
+    merge flags, the per-component `sao_type_idx` / offset / band /
+    eo-class reads, the §7.4.9.3 `SaoTypeIdx[2]`/eo-class inheritance,
+    into `SaoCtbParams` / `SaoComponent`.
+  - `decode_coding_quadtree` (§7.3.8.4) — the recursive `split_cu_flag`
+    walk with the §7.4.9.4 boundary inference, the §6.5.1
+    quantization-group resets at the `Log2MinCuQpDeltaSize` /
+    `Log2MinCuChromaQpOffsetSize` thresholds, and the in-picture
+    boundary `if( x1 < … )` child guards, into `CodingQuadtree`.
+  - `coding_unit` (§7.3.8.5) — the full CU body: `cu_transquant_bypass`,
+    `cu_skip_flag`, `pred_mode_flag`, `part_mode`, the PCM gate, the
+    intra luma/chroma mode signalling group, the inter `prediction_unit`
+    emission per `PartMode`, `rqt_root_cbf`, and entry into the
+    transform tree, into `CodingUnit` / `IntraLumaMode`.
+  - `prediction_unit` (§7.3.8.6) — the merge / non-merge inter PU walk
+    (`merge_flag` / `merge_idx` / `inter_pred_idc` / `ref_idx` /
+    `mvd_coding` / `mvp_lX_flag`, with the `mvd_l1_zero_flag` + PRED_BI
+    zero-inference), into `PredictionUnit`.
+  - `CtuGrid` — a per-CTU `CtDepth` / `cu_skip_flag` neighbour grid at
+    `MinCbSizeY` granularity feeding the §9.3.4.2.2 `split_cu_flag` /
+    `cu_skip_flag` left/above ctxInc derivations.
+  - 6 driver tests covering the grid neighbour lookups, SAO decode,
+    the min-CB leaf case, and the full I-slice CTU walk.
+
 - `binarization` — the remaining §7.3.8.3 / §7.3.8.5 / §7.3.8.6 leaf
   decode primitives the slice-data CTU/CU walk composes:
   - SAO (§7.3.8.3): `decode_sao_merge_flag` (FL `cMax = 1`, ctxInc 0),
