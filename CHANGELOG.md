@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 330 (2026-06-18)
+
+- `transform_tree` module — the §7.3.8.8 `transform_tree( x0, y0,
+  xBase, yBase, log2TrafoSize, trafoDepth, blkIdx )` recursion, the
+  missing rung between the §7.3.8.5 `coding_unit( )` walk and the
+  §7.3.8.10 `transform_unit( )` leaf:
+  - `decode_transform_tree` — mirrors the §7.3.8.8 syntax table exactly:
+    the `split_transform_flag` presence gate (`log2TrafoSize <=
+    MaxTbLog2SizeY && log2TrafoSize > MinTbLog2SizeY && trafoDepth <
+    MaxTrafoDepth && !(IntraSplitFlag && trafoDepth == 0)`) with the
+    §7.4.9.8 forced-split inference (`log2TrafoSize > MaxTbLog2SizeY`,
+    `IntraSplitFlag` at depth 0, `interSplitFlag`); the per-node
+    `cbf_cb` / `cbf_cr` reads gated by the inheritance condition
+    (`trafoDepth == 0 || cbf_cX[xBase][yBase][trafoDepth − 1]`) with the
+    `ChromaArrayType == 2` lower-half companions (`!split_transform_flag
+    || log2TrafoSize == 3`); the four-way quarter-size recursion; and at
+    each leaf the §7.3.8.8 `cbf_luma` presence condition
+    (`CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr ||
+    (ChromaArrayType == 2 && (cbf_cb_lower || cbf_cr_lower))`) before
+    invoking `decode_transform_unit`. One `QuantGroupState` is threaded
+    through the whole subtree so the `delta_qp()` / `chroma_qp_offset()`
+    gates fire once per quantization group.
+  - `TransformTreeParams` (the per-CU geometry + context: `MaxTbLog2SizeY`
+    / `MinTbLog2SizeY` / `MaxTrafoDepth`, `IntraSplitFlag`,
+    `interSplitFlag`, `CuPredMode`, `ChromaArrayType`, and the
+    `TransformUnitParams` template) and the `TransformTree`
+    `Split { … children } / Leaf { cbf_luma, unit }` decoded result.
+- `binarization` — four new §7.3.8.8 single-bin decode primitives the
+  recursion composes: `decode_split_transform_flag` /
+  `split_transform_flag_inferred`, `decode_cbf_luma` /
+  `cbf_luma_inferred`, `decode_cbf_cb` / `decode_cbf_cr` /
+  `cbf_chroma_inferred` (each an FL `cMax = 1` context-coded bin per
+  §9.3.4.2.1 / Table 9-48, with the §7.4.9.8 not-present inference).
+
 ### Added — clean-room rebuild round 325 (2026-06-16)
 
 - `transform_unit` module — the §7.3.8.10 `transform_unit( x0, y0,

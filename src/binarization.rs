@@ -2199,6 +2199,115 @@ pub fn cbf_cr_ctx_inc(trafo_depth: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------
+// split_transform_flag / cbf_luma / cbf_cb / cbf_cr decode primitives
+// (§7.3.8.8 transform_tree). Each is an FL `cMax = 1` single
+// context-coded bin (§9.3.4.2.1 / Table 9-48). The caller selects the
+// `ctxInc` via the matching `*_ctx_inc` helper and supplies the
+// resolved [`ContextModel`] slot; these primitives only drive the
+// CABAC engine for that one bin per §9.3.4.3.2.
+// ---------------------------------------------------------------------
+
+/// Decode `split_transform_flag[ x0 ][ y0 ][ trafoDepth ]` (§7.3.8.8 /
+/// §7.4.9.8) from the CABAC engine, consuming one context-coded bin.
+///
+/// `ctx` is the caller's `split_transform_flag` bank slot for the
+/// `ctxInc = 5 − log2TrafoSize` index ([`split_transform_flag_ctx_inc`]);
+/// it is mutated in place per §9.3.4.3.2.2 state transition. The
+/// §7.3.8.8 presence gate (`log2TrafoSize <= MaxTbLog2SizeY &&
+/// log2TrafoSize > MinTbLog2SizeY && trafoDepth < MaxTrafoDepth &&
+/// !( IntraSplitFlag && trafoDepth == 0 )`) is upstream of this
+/// primitive; when the gate fails the caller infers the value via
+/// [`split_transform_flag_inferred`] instead.
+pub fn decode_split_transform_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    engine.decode_decision(ctx)
+}
+
+/// §7.4.9.8 — inferred value of `split_transform_flag` when the element
+/// is not present on the wire.
+///
+/// The flag is inferred to be `1` when any of:
+/// * `log2TrafoSize > MaxTbLog2SizeY`,
+/// * `IntraSplitFlag == 1 && trafoDepth == 0`,
+/// * `interSplitFlag == 1`
+///
+/// and to `0` otherwise. `interSplitFlag` is `1` exactly when
+/// `max_transform_hierarchy_depth_inter == 0 && CuPredMode == MODE_INTER
+/// && PartMode != PART_2Nx2N && trafoDepth == 0` (§7.4.9.8); the caller
+/// passes its derived value in `inter_split_flag`.
+#[must_use]
+pub fn split_transform_flag_inferred(
+    log2_trafo_size: u32,
+    max_tb_log2_size_y: u32,
+    intra_split_flag: bool,
+    trafo_depth: u32,
+    inter_split_flag: bool,
+) -> u8 {
+    if log2_trafo_size > max_tb_log2_size_y
+        || (intra_split_flag && trafo_depth == 0)
+        || inter_split_flag
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// Decode `cbf_luma[ x0 ][ y0 ][ trafoDepth ]` (§7.3.8.8 / §7.4.9.8)
+/// from the CABAC engine, consuming one context-coded bin.
+///
+/// `ctx` is the caller's `cbf_luma` bank slot for the
+/// `ctxInc = (trafoDepth == 0) ? 1 : 0` index ([`cbf_luma_ctx_inc`]).
+/// When the §7.3.8.8 presence condition fails the value is inferred to
+/// `1` ([`cbf_luma_inferred`]).
+pub fn decode_cbf_luma(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    engine.decode_decision(ctx)
+}
+
+/// §7.4.9.8 — inferred value of `cbf_luma` when not present: `1`.
+#[must_use]
+pub fn cbf_luma_inferred() -> u8 {
+    1
+}
+
+/// Decode `cbf_cb[ x0 ][ y0 ][ trafoDepth ]` (§7.3.8.8 / §7.4.9.8) from
+/// the CABAC engine, consuming one context-coded bin.
+///
+/// `ctx` is the caller's shared `cbf_chroma` bank slot for the
+/// `ctxInc = trafoDepth` index ([`cbf_cb_ctx_inc`]). When not present
+/// the value is inferred to `0` ([`cbf_chroma_inferred`]).
+pub fn decode_cbf_cb(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    engine.decode_decision(ctx)
+}
+
+/// Decode `cbf_cr[ x0 ][ y0 ][ trafoDepth ]` (§7.3.8.8 / §7.4.9.8) from
+/// the CABAC engine, consuming one context-coded bin.
+///
+/// `ctx` is the caller's shared `cbf_chroma` bank slot for the
+/// `ctxInc = trafoDepth` index ([`cbf_cr_ctx_inc`]). When not present
+/// the value is inferred to `0` ([`cbf_chroma_inferred`]).
+pub fn decode_cbf_cr(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    engine.decode_decision(ctx)
+}
+
+/// §7.4.9.8 — inferred value of `cbf_cb` / `cbf_cr` when not present: `0`.
+#[must_use]
+pub fn cbf_chroma_inferred() -> u8 {
+    0
+}
+
+// ---------------------------------------------------------------------
 // inter_pred_idc ctxInc — Table 9-48 row
 // ---------------------------------------------------------------------
 

@@ -86,6 +86,24 @@ layers are usable directly through the public parser / engine API.
   and the §8.4.2 / §8.4.3 luma + chroma intra-prediction-mode
   derivation. These compose into the §7.3.8.11 `residual_coding()`
   driver.
+* **Transform-tree recursion (§7.3.8.8)** — the `transform_tree` module:
+  `decode_transform_tree` walks the §7.3.8.8 `transform_tree( )` syntax
+  exactly — the `split_transform_flag` presence gate plus the §7.4.9.8
+  forced-split inference (`log2TrafoSize > MaxTbLog2SizeY`, `IntraSplitFlag`
+  at depth 0, `interSplitFlag`); the per-node `cbf_cb` / `cbf_cr` reads
+  gated by the inheritance condition (`trafoDepth == 0 ||
+  cbf_cX[xBase][yBase][trafoDepth − 1]`) with the `ChromaArrayType == 2`
+  lower-half companions; the four-way quarter-size recursion; and at each
+  leaf the §7.3.8.8 `cbf_luma` presence condition before invoking the
+  §7.3.8.10 `decode_transform_unit`. One `QuantGroupState` threads through
+  the whole subtree so the `delta_qp()` / `chroma_qp_offset()` gates fire
+  once per quantization group. `TransformTreeParams` carries the per-CU
+  geometry (`MaxTbLog2SizeY` / `MinTbLog2SizeY` / `MaxTrafoDepth`,
+  `IntraSplitFlag`, `interSplitFlag`) and the result is a
+  `Split { … } / Leaf { cbf_luma, unit }` tree. Four new §7.3.8.8 single-bin
+  decode primitives back it (`decode_split_transform_flag`,
+  `decode_cbf_luma`, `decode_cbf_cb` / `decode_cbf_cr`, each with its
+  §7.4.9.8 not-present inference helper).
 * **Transform-unit driver (§7.3.8.10)** — the `transform_unit` module:
   `decode_transform_unit` walks the §7.3.8.10 `transform_unit( )` syntax
   exactly, composing the existing per-element primitives into the leaf
@@ -135,11 +153,12 @@ layers are usable directly through the public parser / engine API.
 ## Not yet implemented
 
 * The upper §7.3.8 slice-data syntax-element walk that drives the CABAC
-  engine through the CTU / CU / transform-tree parse loops: the §7.3.4
-  `sao()` per-CTU block, §7.3.8.4 `coding_tree_unit()`, §7.3.8.4
-  `coding_quadtree()`, §7.3.8.5 `coding_unit()`, and §7.3.8.8
-  `transform_tree()` recursion. (The §7.3.8.10 `transform_unit()` leaf
-  these bottom out in is implemented; see above.)
+  engine through the CTU / CU parse loops: the §7.3.4 `sao()` per-CTU
+  block, §7.3.8.4 `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, and
+  §7.3.8.5 `coding_unit()`. (The §7.3.8.8 `transform_tree()` recursion and
+  its §7.3.8.10 `transform_unit()` leaf are implemented; see above. The
+  CU-level walk that derives `IntraSplitFlag` / `MaxTrafoDepth` /
+  `interSplitFlag` and enters the tree under `rqt_root_cbf` remains.)
 * The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
   / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
   splits `mvLX` into its integer / fractional parts and drives

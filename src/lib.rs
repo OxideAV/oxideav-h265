@@ -244,6 +244,7 @@ pub mod sei;
 pub mod slice;
 pub mod sps;
 pub mod transform;
+pub mod transform_tree;
 pub mod transform_unit;
 pub mod vps;
 pub mod vui;
@@ -276,6 +277,7 @@ pub use sps::{
     SeqParameterSet, ShortTermRefPicSet, ShortTermRefPicSetMaterializeError, SpsError,
     SpsExtensionFlags, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
 };
+pub use transform_tree::{decode_transform_tree, TransformTree, TransformTreeParams};
 pub use transform_unit::{
     decode_transform_unit, CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams,
 };
