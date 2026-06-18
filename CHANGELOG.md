@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 334 (2026-06-18)
+
+- `binarization` — the §7.3.8.4 `split_cu_flag` and §7.3.8.5
+  `cu_skip_flag` single-bin decode primitives, the gateway flags of the
+  `coding_quadtree( )` / `coding_unit( )` walk:
+  - `decode_split_cu_flag` / `decode_cu_skip_flag` — Table 9-43 FL
+    `cMax = 1` (one context-coded bin); the bank slot is selected by the
+    existing §9.3.4.2.2 / Table 9-49 `split_cu_flag_ctx_inc` /
+    `cu_skip_flag_ctx_inc` left/above neighbour ctxInc helpers, and the
+    decode itself is a single §9.3.4.3.2 context decision. The §7.3.8.4
+    split-presence gate / §7.4.9.4 boundary inference and the §7.3.8.5
+    `slice_type != I` read gate remain the caller's responsibility.
+  - `cu_pred_mode_from_skip` — the §7.4.9.5 not-present `CuPredMode`
+    derivation from `cu_skip_flag` + slice type: `Some(Intra)` for I
+    slices, `Some(Skip)` for a P / B skip CU, and `None` for a P / B
+    non-skip CU (signalling a `pred_mode_flag` read is still required).
+  - `SPLIT_CU_FLAG_FL_{CMAX,NBITS}` / `CU_SKIP_FLAG_FL_{CMAX,NBITS}`
+    binarization-shape constants.
+  - 9 new unit tests (zero / one / one-bin-consumed paths for both
+    decoders, the FL shapes, and the four `cu_pred_mode_from_skip`
+    branches).
+
 ### Added — clean-room rebuild round 330 (2026-06-18)
 
 - `transform_tree` module — the §7.3.8.8 `transform_tree( x0, y0,

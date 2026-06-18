@@ -2113,6 +2113,143 @@ pub fn cu_skip_flag_ctx_inc(
 }
 
 // ---------------------------------------------------------------------
+// split_cu_flag (§7.3.8.4 coding_quadtree() / §7.4.9.4) decode primitive
+// Table 9-43 FL binarization (cMax = 1) + Table 9-48 / §9.3.4.2.2 ctxInc
+// + Table 9-7 ctxIdx initValue. Read once per §7.3.8.4
+// `coding_quadtree( )` node inside the split-presence gate
+//   ( x0 + ( 1 << log2CbSize ) <= pic_width_in_luma_samples ) &&
+//   ( y0 + ( 1 << log2CbSize ) <= pic_height_in_luma_samples ) &&
+//   log2CbSize > MinCbLog2SizeY
+// otherwise it is inferred (§7.4.9.4): 1 when the block extends past the
+// picture boundary or log2CbSize > MinCbLog2SizeY, else 0. The caller
+// owns that gate / inference and the §9.3.4.2.2 neighbour `CtDepth`
+// lookup that feeds [`split_cu_flag_ctx_inc`]; this primitive reads the
+// single context-coded bin once the bank slot is selected.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `split_cu_flag[ ][ ]`: FL with
+/// `cMax = 1` (a single context-coded bin per §7.3.8.4 coding-quadtree
+/// node). Value 1 splits the coding block into four quarter-size child
+/// nodes; value 0 makes it a leaf coding unit (§7.4.9.4).
+pub const SPLIT_CU_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `split_cu_flag`: one context-coded bin
+/// per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const SPLIT_CU_FLAG_FL_NBITS: u32 = 1;
+
+/// Decode `split_cu_flag[ x0 ][ y0 ]` (§7.3.8.4 / §7.4.9.4) from the
+/// CABAC engine, consuming one context for the FL `cMax = 1` bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the
+/// §9.3.4.2.2 ctxInc slot in the §7.3.8.4 `split_cu_flag[3]` bank
+/// (derive the slot with [`split_cu_flag_ctx_inc`] from the left /
+/// above neighbours' `CtDepth` and §6.4.1 availability); it is mutated
+/// in place per the §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.4 split-presence gate and the §7.4.9.4 not-present
+/// inference (1 at a picture boundary or when `log2CbSize >
+/// MinCbLog2SizeY`, else 0) are the `coding_quadtree( )` caller's
+/// responsibility; this primitive is reached only when the flag is
+/// present on the wire.
+///
+/// Returns the decoded `u8` (0 or 1): 1 recurses into four quarter-size
+/// `coding_quadtree( )` children, 0 enters `coding_unit( )` for the
+/// current block.
+pub fn decode_split_cu_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; that bin's ctxInc comes from §9.3.4.2.2
+    // (Table 9-49) and selects the bank slot the caller already bound
+    // into `ctx`, so the decode itself is a single context decision.
+    engine.decode_decision(ctx)
+}
+
+// ---------------------------------------------------------------------
+// cu_skip_flag (§7.3.8.5 coding_unit() / §7.4.9.5) decode primitive
+// Table 9-43 FL binarization (cMax = 1) + Table 9-48 / §9.3.4.2.2 ctxInc
+// + Table 9-9 ctxIdx initValue. Read once at the start of a §7.3.8.4
+// `coding_quadtree( )` leaf when `slice_type != I` (inter-only); absent
+// for I slices, where §7.4.9.5 infers it to 0. When 1 the CU takes the
+// MODE_SKIP path: no `pred_mode_flag`, no `part_mode`, no transform
+// tree — only the §7.3.8.6 merge-mode `prediction_unit( )` is parsed.
+// ---------------------------------------------------------------------
+
+/// Table 9-43 binarization shape for `cu_skip_flag`: FL with
+/// `cMax = 1` (a single context-coded bin per non-I coding unit).
+/// Value 1 selects the MODE_SKIP path (§7.4.9.5).
+pub const CU_SKIP_FLAG_FL_CMAX: u32 = 1;
+
+/// FL-binarization bit count for `cu_skip_flag`: one context-coded bin
+/// per §9.3.3.5 `Ceil(Log2(cMax + 1)) = 1`.
+pub const CU_SKIP_FLAG_FL_NBITS: u32 = 1;
+
+/// Decode `cu_skip_flag[ x0 ][ y0 ]` (§7.3.8.5 / §7.4.9.5) from the
+/// CABAC engine, consuming one context for the FL `cMax = 1` bin.
+///
+/// `ctx` is the caller's `(pStateIdx, valMps)` state for the
+/// §9.3.4.2.2 ctxInc slot in the §7.3.8.5 `cu_skip_flag[3]` bank
+/// (derive the slot with [`cu_skip_flag_ctx_inc`] from the left /
+/// above neighbours' decoded `cu_skip_flag` and §6.4.1 availability);
+/// it is mutated in place per the §9.3.4.3.2.2 state transition.
+///
+/// The §7.3.8.5 read is gated on `slice_type != I`; for I slices the
+/// flag is not present and §7.4.9.5 infers it to 0 (the caller owns
+/// that gate). When the decoded value is 1 the coding unit takes the
+/// MODE_SKIP path: see [`cu_pred_mode_from_skip`] for the §7.4.9.5
+/// not-present `CuPredMode` inference that follows.
+///
+/// Returns the decoded `u8` (0 or 1).
+pub fn decode_cu_skip_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // §9.3.4.2.1 + Table 9-48 + Table 9-43: the FL `cMax = 1` shape
+    // emits exactly one bin; the ctxInc comes from §9.3.4.2.2 (Table
+    // 9-49) and selects the bank slot the caller already bound into
+    // `ctx`, so the decode is a single context decision.
+    engine.decode_decision(ctx)
+}
+
+/// §7.4.9.5 — derive [`CuPredMode`] for a coding unit from its decoded
+/// `cu_skip_flag` and the slice type, for the path where
+/// `pred_mode_flag` is therefore not present.
+///
+/// `cu_skip_flag == 1` (only reachable for `slice_type != I`) maps to
+/// [`CuPredMode::Skip`]; `cu_skip_flag == 0` in a P / B slice leaves the
+/// mode to be decided by the subsequent `pred_mode_flag` (returns
+/// `None`, signalling the caller must read that flag). For an I slice
+/// `cu_skip_flag` is inferred to 0 and the mode is MODE_INTRA without a
+/// `pred_mode_flag` read.
+///
+/// * `slice_type_is_i` — `true` iff `slice_type == I` (§7.4.7.1).
+/// * `cu_skip_flag` — the §7.3.8.5 decoded flag (or 0-inferred for I).
+///
+/// Returns `Some(mode)` when the mode is fully determined without a
+/// `pred_mode_flag` read, or `None` when a P / B non-skip CU still needs
+/// `pred_mode_flag` to disambiguate MODE_INTER vs MODE_INTRA.
+#[must_use]
+pub fn cu_pred_mode_from_skip(slice_type_is_i: bool, cu_skip_flag: u8) -> Option<CuPredMode> {
+    debug_assert!(
+        cu_skip_flag <= 1,
+        "cu_skip_flag is FL cMax = 1 (Table 9-43); decoded value must be 0 or 1"
+    );
+    if slice_type_is_i {
+        // §7.4.9.5: I slices infer cu_skip_flag = 0 and CuPredMode =
+        // MODE_INTRA without coding pred_mode_flag.
+        Some(CuPredMode::Intra)
+    } else if cu_skip_flag != 0 {
+        // P / B skip CU: §7.4.9.5 infers MODE_SKIP, pred_mode_flag absent.
+        Some(CuPredMode::Skip)
+    } else {
+        // P / B non-skip CU: pred_mode_flag is present and decides the
+        // mode; the caller must read it.
+        None
+    }
+}
+
+// ---------------------------------------------------------------------
 // split_transform_flag ctxInc — Table 9-48 row
 // ---------------------------------------------------------------------
 
@@ -6920,5 +7057,114 @@ mod tests {
         assert_eq!(c.greater0_flag, 0);
         assert_eq!(c.value, 0);
         assert_eq!(c.greater1_flag, None);
+    }
+
+    // -----------------------------------------------------------------
+    // split_cu_flag (§7.3.8.4 / §7.4.9.4)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn split_cu_flag_fl_shape_table_9_43() {
+        // Table 9-43 row: FL with cMax = 1 ⇒ one bin, §9.3.3.5 nBits
+        // = Ceil(Log2(cMax + 1)) = 1.
+        assert_eq!(SPLIT_CU_FLAG_FL_CMAX, 1);
+        assert_eq!(SPLIT_CU_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn decode_split_cu_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the FL
+        // flag decodes to 0 (leaf coding unit — coding_unit() follows
+        // per §7.3.8.4).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_split_cu_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn decode_split_cu_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the FL
+        // flag decodes to 1 (split into four quarter-size children per
+        // §7.3.8.4).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_split_cu_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    #[test]
+    fn decode_split_cu_flag_consumes_exactly_one_bin() {
+        // Two back-to-back calls against fresh MPS-only contexts on the
+        // same engine each consume exactly one bin (Table 9-43 FL
+        // cMax = 1); separate contexts make the outcomes independent.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx_a = fresh_mps_ctx(0);
+        let mut ctx_b = fresh_mps_ctx(1);
+        let a = decode_split_cu_flag(&mut eng, &mut ctx_a).unwrap();
+        let b = decode_split_cu_flag(&mut eng, &mut ctx_b).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // cu_skip_flag (§7.3.8.5 / §7.4.9.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cu_skip_flag_fl_shape_table_9_43() {
+        // Table 9-43 row: FL with cMax = 1 ⇒ one bin, §9.3.3.5 nBits = 1.
+        assert_eq!(CU_SKIP_FLAG_FL_CMAX, 1);
+        assert_eq!(CU_SKIP_FLAG_FL_NBITS, 1);
+    }
+
+    #[test]
+    fn decode_cu_skip_flag_zero_path() {
+        // Empty bin stream + fresh MPS-only valMps = 0 context: the FL
+        // flag decodes to 0 (non-skip CU — pred_mode_flag / part_mode
+        // follow per §7.3.8.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let flag = decode_cu_skip_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn decode_cu_skip_flag_one_path() {
+        // Empty bin stream + fresh MPS-only valMps = 1 context: the FL
+        // flag decodes to 1 (MODE_SKIP path per §7.4.9.5).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(1);
+        let flag = decode_cu_skip_flag(&mut eng, &mut ctx).unwrap();
+        assert_eq!(flag, 1);
+        assert_eq!(cu_pred_mode_from_skip(false, flag), Some(CuPredMode::Skip));
+    }
+
+    #[test]
+    fn cu_pred_mode_from_skip_i_slice_is_intra() {
+        // §7.4.9.5: I slices infer cu_skip_flag = 0 and CuPredMode =
+        // MODE_INTRA without a pred_mode_flag read. The cu_skip_flag
+        // input is pinned 0 (its inferred value).
+        assert_eq!(cu_pred_mode_from_skip(true, 0), Some(CuPredMode::Intra));
+    }
+
+    #[test]
+    fn cu_pred_mode_from_skip_pb_skip_is_skip() {
+        // §7.4.9.5: a P / B CU with cu_skip_flag == 1 infers MODE_SKIP;
+        // pred_mode_flag is not present.
+        assert_eq!(cu_pred_mode_from_skip(false, 1), Some(CuPredMode::Skip));
+    }
+
+    #[test]
+    fn cu_pred_mode_from_skip_pb_non_skip_needs_pred_mode_flag() {
+        // §7.3.8.5 / §7.4.9.5: a P / B CU with cu_skip_flag == 0 still
+        // codes pred_mode_flag, so the mode is not yet determined —
+        // the helper returns None to signal that read is required.
+        assert_eq!(cu_pred_mode_from_skip(false, 0), None);
     }
 }

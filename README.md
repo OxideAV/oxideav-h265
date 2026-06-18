@@ -78,7 +78,10 @@ layers are usable directly through the public parser / engine API.
 * **§9.3.4.2 binarization** — a growing set of per-syntax-element
   binarization + context-index primitives, including `cu_qp_delta`,
   `last_sig_coeff_{x,y}_{prefix,suffix}`, `coded_sub_block_flag`,
-  `split_cu_flag` / `cu_skip_flag` / `pred_mode_flag` ctxInc shapes,
+  the `split_cu_flag` / `cu_skip_flag` single-bin decode primitives
+  (§7.3.8.4 / §7.3.8.5, FL `cMax = 1` with the §9.3.4.2.2 left/above
+  ctxInc and the §7.4.9.5 `cu_skip_flag` → `CuPredMode::Skip`
+  not-present mapping) alongside `pred_mode_flag`,
   the SAO family, `coeff_abs_level_greater{1,2}_flag`,
   `coeff_abs_level_remaining`, `coeff_sign_flag`, `mvd_coding()`,
   `merge_flag`, the luma-intra-mode signalling group
@@ -157,8 +160,10 @@ layers are usable directly through the public parser / engine API.
   block, §7.3.8.4 `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, and
   §7.3.8.5 `coding_unit()`. (The §7.3.8.8 `transform_tree()` recursion and
   its §7.3.8.10 `transform_unit()` leaf are implemented; see above. The
-  CU-level walk that derives `IntraSplitFlag` / `MaxTrafoDepth` /
-  `interSplitFlag` and enters the tree under `rqt_root_cbf` remains.)
+  §7.3.8.4 `split_cu_flag` and §7.3.8.5 `cu_skip_flag` gateway single-bin
+  decode primitives are now implemented — the recursion / leaf that
+  threads them, deriving `IntraSplitFlag` / `MaxTrafoDepth` /
+  `interSplitFlag` and entering the tree under `rqt_root_cbf`, remains.)
 * The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
   / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
   splits `mvLX` into its integer / fractional parts and drives
