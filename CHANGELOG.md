@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 338 (2026-06-19)
+
+- `binarization` — the remaining §7.3.8.3 / §7.3.8.5 / §7.3.8.6 leaf
+  decode primitives the slice-data CTU/CU walk composes:
+  - SAO (§7.3.8.3): `decode_sao_merge_flag` (FL `cMax = 1`, ctxInc 0),
+    `decode_sao_type_idx` (TR `cMax = 2`, bin 0 context + bin 1 bypass),
+    `decode_sao_offset_abs` (TR, bypass, `cMax` per
+    `sao_offset_abs_tr_cmax(bitDepth)`), `decode_sao_offset_sign`
+    (FL `cMax = 1` bypass), `decode_sao_band_position` (FL `cMax = 31`,
+    5 bypass bins), `decode_sao_eo_class` (FL `cMax = 3`, 2 bypass bins).
+  - `part_mode` (§7.3.8.5 / §9.3.3.7 / Table 9-45): `decode_part_mode`
+    walks the `CuPredMode` + `log2CbSize` + `amp_enabled_flag`-dependent
+    bin string (bins 0..=2 context-coded via the `part_mode[ctxInc]`
+    bank, bin 3 bypass) into the `PartMode` enum + `IntraSplitFlag`
+    (`PartModeResult`); `part_mode_inferred` for the §7.4.9.5
+    not-present `PART_2Nx2N` case; `PartMode::is_amp`.
+  - `pcm_flag` / `end_of_slice_segment_flag` (§7.3.8.5 / §7.3.8.1):
+    `decode_pcm_flag` / `decode_end_of_slice_segment_flag`, both the
+    §9.3.4.3.5 *terminate* path (Table 9-48 `terminate` row).
+  - prediction_unit (§7.3.8.6): `decode_merge_idx` (TR
+    `cMax = MaxNumMergeCand − 1`, bin 0 context + bypass tail),
+    `decode_inter_pred_idc` (§9.3.3.9 / Table 9-47 → `InterPredIdc`),
+    `decode_ref_idx` (TR `cMax = num_ref_idx_lX_active_minus1`, bins
+    0/1 context + bypass tail), `decode_mvp_flag` (FL `cMax = 1`).
+  - 20 new unit tests covering the inference paths, AMP classification,
+    terminate-path decoders, and the bypass/context bin splits.
+
 ### Added — clean-room rebuild round 334 (2026-06-18)
 
 - `binarization` — the §7.3.8.4 `split_cu_flag` and §7.3.8.5

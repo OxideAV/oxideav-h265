@@ -2789,6 +2789,448 @@ pub fn sao_offset_abs_tr_cmax(bit_depth: u32) -> u32 {
     (1u32 << (clamped - 5)) - 1
 }
 
+/// Decode `sao_merge_left_flag` / `sao_merge_up_flag` (§7.3.8.3) — the
+/// two §7.4.9.3 SAO-merge flags. Both are Table 9-43 FL `cMax = 1` with
+/// a single `ctxInc = 0` context-coded bin (Table 9-48) sharing the
+/// Table 9-5 `sao_merge_flag` bank. The §7.3.8.3 presence gates
+/// (`rx > 0 && leftCtbInSliceSeg && leftCtbInTile` for the left flag;
+/// `ry > 0 && !sao_merge_left_flag && upCtbInSliceSeg && upCtbInTile`
+/// for the up flag) are the caller's responsibility; when the gate
+/// fails the flag is inferred to 0 (§7.4.9.3) and this function is not
+/// called.
+pub fn decode_sao_merge_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    debug_assert_eq!(
+        sao_merge_flag_ctx_inc(),
+        0,
+        "Table 9-48: sao_merge ctxInc = 0"
+    );
+    engine.decode_decision(ctx)
+}
+
+/// Decode `sao_type_idx_luma` / `sao_type_idx_chroma` (§7.3.8.3) — the
+/// §7.4.9.3 `SaoTypeIdx[cIdx][rx][ry]` selector. Table 9-43 TR
+/// `cMax = 2, cRiceParam = 0`: bin 0 is context-coded (`ctxInc = 0`,
+/// `ctx`), bin 1 is bypass (Table 9-48). The decoded value is
+/// 0 (not applied), 1 (band offset) or 2 (edge offset) per §7.4.9.3.
+pub fn decode_sao_type_idx(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    // TR(cMax = 2): bin 0 context-coded, bin 1 bypass.
+    let bin0 = engine.decode_decision(ctx)?;
+    if bin0 == 0 {
+        return Ok(0);
+    }
+    let bin1 = engine.decode_bypass()?;
+    Ok(if bin1 == 0 { 1 } else { 2 })
+}
+
+/// Decode `sao_offset_abs[cIdx][rx][ry][i]` (§7.3.8.3) — one of the
+/// four §7.4.9.3 SAO offset magnitudes. Table 9-43 TR
+/// `cMax = (1 << (Min(bitDepth, 10) − 5)) − 1, cRiceParam = 0`; every
+/// bin is bypass (Table 9-48). `bit_depth` is `BitDepthY` (luma) or
+/// `BitDepthC` (chroma); see [`sao_offset_abs_tr_cmax`].
+pub fn decode_sao_offset_abs(
+    engine: &mut CabacEngine<'_>,
+    bit_depth: u32,
+) -> Result<u32, CabacError> {
+    let c_max = sao_offset_abs_tr_cmax(bit_depth);
+    let (value, _is_escape) = read_truncated_rice_prefix(c_max, |_| engine.decode_bypass())?;
+    Ok(value)
+}
+
+/// Decode `sao_offset_sign[cIdx][rx][ry][i]` (§7.3.8.3) — the sign of a
+/// band-offset SAO offset. Table 9-43 FL `cMax = 1`, a single bypass
+/// bin (Table 9-48). Read only for band-offset (`SaoTypeIdx == 1`)
+/// when the corresponding `sao_offset_abs != 0`; otherwise inferred to
+/// 0 (§7.4.9.3). Returns 0 (positive) or 1 (negative).
+pub fn decode_sao_offset_sign(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    engine.decode_bypass()
+}
+
+/// Decode `sao_band_position[cIdx][rx][ry]` (§7.3.8.3) — the §7.4.9.3
+/// starting band of a band-offset SAO. Table 9-43 FL `cMax = 31`, five
+/// bypass bins MSB-first (Table 9-48). Read only for band offset
+/// (`SaoTypeIdx == 1`).
+pub fn decode_sao_band_position(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    Ok(engine.decode_bypass_bits(SAO_BAND_POSITION_FL_NBITS as u8)? as u8)
+}
+
+/// Decode `sao_eo_class_luma` / `sao_eo_class_chroma` (§7.3.8.3) — the
+/// §7.4.9.3 `SaoEoClass[cIdx][rx][ry]` edge-offset direction. Table
+/// 9-43 FL `cMax = 3`, two bypass bins MSB-first (Table 9-48). Read
+/// only for edge offset (`SaoTypeIdx == 2`). Returns 0 (horizontal),
+/// 1 (vertical), 2 (135°) or 3 (45°).
+pub fn decode_sao_eo_class(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    Ok(engine.decode_bypass_bits(SAO_EO_CLASS_FL_NBITS as u8)? as u8)
+}
+
+// ---------------------------------------------------------------------
+// part_mode (§7.3.8.5 coding_unit() / §7.4.9.5 / §9.3.3.7).
+// Table 9-45 binarization (CuPredMode + log2CbSize dependent) + Table
+// 9-48 ctxInc (bin 0/1/2 context-coded, bin 3 bypass) + Table 7-10
+// PartMode / IntraSplitFlag derivation. The bin string is variable so
+// the decoder walks it bin-by-bin against the active-CU geometry.
+// ---------------------------------------------------------------------
+
+/// §7.4.9.5 / Table 7-10 — the coding-unit partitioning mode `PartMode`
+/// derived from `part_mode`. The eight values cover the square split
+/// (`PART_2Nx2N`, `PART_NxN`), the symmetric halves (`PART_2NxN`,
+/// `PART_Nx2N`), and the four asymmetric-motion-partition (AMP) forms
+/// (`PART_2NxnU/nD/nLx2N/nRx2N`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PartMode {
+    /// `PART_2Nx2N` (part_mode 0) — a single prediction block covering
+    /// the whole CU.
+    Part2Nx2N,
+    /// `PART_2NxN` (part_mode 1) — two horizontal halves.
+    Part2NxN,
+    /// `PART_Nx2N` (part_mode 2) — two vertical halves.
+    PartNx2N,
+    /// `PART_NxN` (part_mode 3 inter / part_mode 1 intra) — four
+    /// quarter-size blocks. For intra it sets `IntraSplitFlag = 1`.
+    PartNxN,
+    /// `PART_2NxnU` (part_mode 4) — AMP, top quarter + bottom
+    /// three-quarters (inter only).
+    Part2NxnU,
+    /// `PART_2NxnD` (part_mode 5) — AMP, top three-quarters + bottom
+    /// quarter (inter only).
+    Part2NxnD,
+    /// `PART_nLx2N` (part_mode 6) — AMP, left quarter + right
+    /// three-quarters (inter only).
+    PartNLx2N,
+    /// `PART_nRx2N` (part_mode 7) — AMP, left three-quarters + right
+    /// quarter (inter only).
+    PartNRx2N,
+}
+
+impl PartMode {
+    /// `true` for the four asymmetric-motion-partition modes
+    /// (`PART_2NxnU/nD/nLx2N/nRx2N`), which are only valid for inter
+    /// CUs with `amp_enabled_flag == 1`.
+    #[must_use]
+    pub fn is_amp(self) -> bool {
+        matches!(
+            self,
+            Self::Part2NxnU | Self::Part2NxnD | Self::PartNLx2N | Self::PartNRx2N
+        )
+    }
+}
+
+/// Decoded `part_mode` result: the §7.4.9.5 `PartMode` plus the
+/// `IntraSplitFlag` it implies (set only by intra `PART_NxN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartModeResult {
+    /// The §7.4.9.5 `PartMode`.
+    pub part_mode: PartMode,
+    /// §7.4.9.5 `IntraSplitFlag` — 1 only for an intra CU split into
+    /// `PART_NxN`, 0 otherwise.
+    pub intra_split_flag: bool,
+}
+
+/// §7.4.9.5 — the `part_mode`-not-present inference: `PartMode =
+/// PART_2Nx2N`, `IntraSplitFlag = 0`. The §7.3.8.5 read is suppressed
+/// when `CuPredMode == MODE_INTRA && log2CbSize > MinCbLog2SizeY`.
+#[must_use]
+pub fn part_mode_inferred() -> PartModeResult {
+    PartModeResult {
+        part_mode: PartMode::Part2Nx2N,
+        intra_split_flag: false,
+    }
+}
+
+/// Decode `part_mode` (§7.3.8.5 / §9.3.3.7) from the CABAC engine,
+/// returning the §7.4.9.5 `PartMode` + `IntraSplitFlag`.
+///
+/// The Table 9-45 binarization is selected by `cu_pred_mode`,
+/// `log2_cb_size`, `min_cb_log2_size` (`MinCbLog2SizeY`) and
+/// `amp_enabled` (`amp_enabled_flag`). Table 9-48 routes bin 0..=2
+/// through the per-bin `part_mode[ctxInc]` bank (`ctx0` / `ctx1`;
+/// bin 2's ctxInc is 2 for `log2CbSize == MinCbLog2SizeY`, 3 for
+/// `log2CbSize > MinCbLog2SizeY`, so the caller passes both context
+/// slots); bin 3 is bypass.
+///
+/// * `ctx0` — `part_mode` bank slot 0 (bin 0).
+/// * `ctx1` — `part_mode` bank slot 1 (bin 1).
+/// * `ctx_bin2` — `part_mode` bank slot 2 or 3 (bin 2), already
+///   selected by the caller from `log2_cb_size == min_cb_log2_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_part_mode(
+    engine: &mut CabacEngine<'_>,
+    ctx0: &mut ContextModel,
+    ctx1: &mut ContextModel,
+    ctx_bin2: &mut ContextModel,
+    cu_pred_mode: CuPredMode,
+    log2_cb_size: u32,
+    min_cb_log2_size: u32,
+    amp_enabled: bool,
+) -> Result<PartModeResult, CabacError> {
+    // Table 9-45 bin 0 is always context-coded.
+    let b0 = engine.decode_decision(ctx0)?;
+
+    if cu_pred_mode == CuPredMode::Intra {
+        // Intra: only PART_2Nx2N (bin "1") or PART_NxN (bin "0").
+        // Table 9-45 intra column: part_mode 0 → "1", part_mode 1 → "0".
+        return Ok(if b0 == 1 {
+            PartModeResult {
+                part_mode: PartMode::Part2Nx2N,
+                intra_split_flag: false,
+            }
+        } else {
+            PartModeResult {
+                part_mode: PartMode::PartNxN,
+                intra_split_flag: true,
+            }
+        });
+    }
+
+    // Inter (MODE_INTER). part_mode 0 (PART_2Nx2N) = "1".
+    if b0 == 1 {
+        return Ok(PartModeResult {
+            part_mode: PartMode::Part2Nx2N,
+            intra_split_flag: false,
+        });
+    }
+
+    // bin 0 == 0: read bin 1 (context-coded).
+    let b1 = engine.decode_decision(ctx1)?;
+
+    // The asymmetric/quarter tail is only present when
+    // log2CbSize > MinCbLog2SizeY (the "amp_enabled_flag" /
+    // "!amp_enabled_flag" Table 9-45 columns) or
+    // log2CbSize == MinCbLog2SizeY && log2CbSize > 3 (the trailing
+    // "001"/"000" forms). When log2CbSize == MinCbLog2SizeY &&
+    // log2CbSize == 3 only the two-bin forms "01"/"00" exist.
+    let big = log2_cb_size > min_cb_log2_size;
+
+    if big {
+        if !amp_enabled {
+            // Columns "!amp_enabled_flag": "01" → PART_2NxN,
+            // "00" → PART_Nx2N. Two bins total.
+            return Ok(PartModeResult {
+                part_mode: if b1 == 1 {
+                    PartMode::Part2NxN
+                } else {
+                    PartMode::PartNx2N
+                },
+                intra_split_flag: false,
+            });
+        }
+        // amp_enabled_flag column. After "0x" a third context bin
+        // distinguishes the symmetric ("011"/"001") from the AMP
+        // ("0100"/"0101"/"0000"/"0001") forms.
+        let b2 = engine.decode_decision(ctx_bin2)?;
+        if b2 == 1 {
+            // "011" → PART_2NxN, "001" → PART_Nx2N.
+            return Ok(PartModeResult {
+                part_mode: if b1 == 1 {
+                    PartMode::Part2NxN
+                } else {
+                    PartMode::PartNx2N
+                },
+                intra_split_flag: false,
+            });
+        }
+        // b2 == 0: AMP. Bin 3 is bypass. b1 selects horizontal
+        // (PART_2NxnU/nD, "010x") vs vertical (PART_nLx2N/nRx2N,
+        // "000x"); b3 selects the U/L vs D/R half.
+        let b3 = engine.decode_bypass()?;
+        let part_mode = match (b1, b3) {
+            (1, 0) => PartMode::Part2NxnU, // 0100
+            (1, 1) => PartMode::Part2NxnD, // 0101
+            (0, 0) => PartMode::PartNLx2N, // 0000
+            _ => PartMode::PartNRx2N,      // 0001
+        };
+        return Ok(PartModeResult {
+            part_mode,
+            intra_split_flag: false,
+        });
+    }
+
+    // log2CbSize == MinCbLog2SizeY. "01" → PART_2NxN. The "00" prefix
+    // continues to PART_Nx2N ("00") when log2CbSize == 3, or splits
+    // into "001" (PART_Nx2N) / "000" (PART_NxN) when log2CbSize > 3.
+    if b1 == 1 {
+        return Ok(PartModeResult {
+            part_mode: PartMode::Part2NxN,
+            intra_split_flag: false,
+        });
+    }
+    if log2_cb_size == 3 {
+        // "00" → PART_Nx2N (no third bin at the 8×8 minimum).
+        return Ok(PartModeResult {
+            part_mode: PartMode::PartNx2N,
+            intra_split_flag: false,
+        });
+    }
+    // log2CbSize > 3 && == MinCbLog2SizeY: third bin (context-coded,
+    // ctxInc = bin2 slot). "001" → PART_Nx2N, "000" → PART_NxN.
+    let b2 = engine.decode_decision(ctx_bin2)?;
+    Ok(PartModeResult {
+        part_mode: if b2 == 1 {
+            PartMode::PartNx2N
+        } else {
+            PartMode::PartNxN
+        },
+        intra_split_flag: false,
+    })
+}
+
+/// Decode `pcm_flag[x0][y0]` (§7.3.8.5) — the §7.4.9.5 PCM gate. Table
+/// 9-43 FL `cMax = 1` whose single bin is the §9.3.4.3.5 *terminate*
+/// path (Table 9-48 `terminate` row), so it is decoded via
+/// [`CabacEngine::decode_terminate`], **not** `decode_decision`. The
+/// §7.3.8.5 presence gate (`PartMode == PART_2Nx2N && pcm_enabled_flag
+/// && Log2MinIpcmCbSizeY <= log2CbSize <= Log2MaxIpcmCbSizeY`) is the
+/// caller's; not-present infers 0 (§7.4.9.5).
+pub fn decode_pcm_flag(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    engine.decode_terminate()
+}
+
+/// Decode `end_of_slice_segment_flag` (§7.3.8.1) — the per-CTU loop
+/// terminator. Table 9-43 FL `cMax = 1` decoded via the §9.3.4.3.5
+/// *terminate* path (Table 9-48 `terminate` row),
+/// [`CabacEngine::decode_terminate`]. 1 ends the slice-segment data
+/// loop.
+pub fn decode_end_of_slice_segment_flag(engine: &mut CabacEngine<'_>) -> Result<u8, CabacError> {
+    engine.decode_terminate()
+}
+
+/// Decode `merge_idx[x0][y0]` (§7.3.8.6) — the §7.4.9.6 merge-candidate
+/// index. Table 9-43 TR `cMax = MaxNumMergeCand − 1, cRiceParam = 0`:
+/// bin 0 is context-coded (`ctxInc = 0`, `ctx`), bins >= 1 are bypass
+/// (Table 9-48). Read only when `MaxNumMergeCand > 1`; otherwise
+/// inferred to 0 (§7.4.9.6).
+pub fn decode_merge_idx(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+    max_num_merge_cand: u32,
+) -> Result<u8, CabacError> {
+    let c_max = max_num_merge_cand.saturating_sub(1);
+    if c_max == 0 {
+        return Ok(0);
+    }
+    // bin 0 context-coded; remaining bins bypass.
+    let b0 = engine.decode_decision(ctx)?;
+    if b0 == 0 {
+        return Ok(0);
+    }
+    let mut value: u32 = 1;
+    while value < c_max {
+        if engine.decode_bypass()? == 0 {
+            return Ok(value as u8);
+        }
+        value += 1;
+    }
+    Ok(value as u8)
+}
+
+/// §9.3.3.9 / Table 9-47 / §7.4.9.6 — the §7.4.9.6 `inter_pred_idc`
+/// values: which reference lists a P/B prediction block uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InterPredIdc {
+    /// `PRED_L0` — uni-prediction from RefPicList0.
+    PredL0,
+    /// `PRED_L1` — uni-prediction from RefPicList1.
+    PredL1,
+    /// `PRED_BI` — bi-prediction from both lists.
+    PredBi,
+}
+
+/// Decode `inter_pred_idc[x0][y0]` (§7.3.8.6 / §9.3.3.9) — the §7.4.9.6
+/// reference-list selector. Table 9-47 binarization depends on
+/// `nPbW + nPbH`: when `!= 12` bin 0 (`PRED_BI` = "1", else two bins)
+/// uses `ctxInc = CtDepth`, bin 1 uses `ctxInc = 4` (Table 9-48); when
+/// `== 12` the single bin uses `ctxInc = 4`. Read only on B slices;
+/// a non-B inter PB is `PRED_L0` (§7.4.9.6, not signalled here).
+///
+/// * `ctx_b0` — the `inter_pred_idc` bank slot `CtDepth` (bin 0,
+///   `nPbW + nPbH != 12` case) or slot 4 (`== 12` case), selected by
+///   the caller.
+/// * `ctx_b1` — the `inter_pred_idc` bank slot 4 (bin 1).
+/// * `n_pb_w` / `n_pb_h` — the prediction-block width / height.
+pub fn decode_inter_pred_idc(
+    engine: &mut CabacEngine<'_>,
+    ctx_b0: &mut ContextModel,
+    ctx_b1: &mut ContextModel,
+    n_pb_w: u32,
+    n_pb_h: u32,
+) -> Result<InterPredIdc, CabacError> {
+    if n_pb_w + n_pb_h == 12 {
+        // Single bin, ctxInc = 4: "0" → PRED_L0, "1" → PRED_L1.
+        let b = engine.decode_decision(ctx_b0)?;
+        return Ok(if b == 0 {
+            InterPredIdc::PredL0
+        } else {
+            InterPredIdc::PredL1
+        });
+    }
+    // bin 0 (ctxInc = CtDepth): "1" → PRED_BI.
+    let b0 = engine.decode_decision(ctx_b0)?;
+    if b0 == 1 {
+        return Ok(InterPredIdc::PredBi);
+    }
+    // "00" → PRED_L0, "01" → PRED_L1 (bin 1, ctxInc = 4).
+    let b1 = engine.decode_decision(ctx_b1)?;
+    Ok(if b1 == 0 {
+        InterPredIdc::PredL0
+    } else {
+        InterPredIdc::PredL1
+    })
+}
+
+/// Decode `ref_idx_l0[x0][y0]` / `ref_idx_l1[x0][y0]` (§7.3.8.6) — the
+/// §7.4.9.6 reference-picture index. Table 9-43 TR
+/// `cMax = num_ref_idx_lX_active_minus1, cRiceParam = 0`: bin 0 uses
+/// `ctxInc = 0` (`ctx0`), bin 1 uses `ctxInc = 1` (`ctx1`), bins >= 2
+/// are bypass (Table 9-48). Read only when
+/// `num_ref_idx_lX_active_minus1 > 0`; else inferred to 0 (§7.4.9.6).
+pub fn decode_ref_idx(
+    engine: &mut CabacEngine<'_>,
+    ctx0: &mut ContextModel,
+    ctx1: &mut ContextModel,
+    num_ref_idx_active_minus1: u32,
+) -> Result<u8, CabacError> {
+    let c_max = num_ref_idx_active_minus1;
+    if c_max == 0 {
+        return Ok(0);
+    }
+    // bin 0 (ctxInc = 0).
+    if engine.decode_decision(ctx0)? == 0 {
+        return Ok(0);
+    }
+    if c_max == 1 {
+        return Ok(1);
+    }
+    // bin 1 (ctxInc = 1).
+    if engine.decode_decision(ctx1)? == 0 {
+        return Ok(1);
+    }
+    // bins >= 2 bypass.
+    let mut value: u32 = 2;
+    while value < c_max {
+        if engine.decode_bypass()? == 0 {
+            return Ok(value as u8);
+        }
+        value += 1;
+    }
+    Ok(value as u8)
+}
+
+/// Decode `mvp_l0_flag[x0][y0]` / `mvp_l1_flag[x0][y0]` (§7.3.8.6) — the
+/// §7.4.9.6 motion-vector-predictor candidate flag. Table 9-43 FL
+/// `cMax = 1`, a single `ctxInc = 0` context-coded bin (Table 9-48)
+/// sharing the `mvp_flag` bank. Returns 0 or 1.
+pub fn decode_mvp_flag(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut ContextModel,
+) -> Result<u8, CabacError> {
+    engine.decode_decision(ctx)
+}
+
 // ---------------------------------------------------------------------
 // coeff_abs_level_greater1_flag / coeff_abs_level_greater2_flag
 // — §9.3.4.2.6 (equations 9-56..9-60) and §9.3.4.2.7 (equations
@@ -7166,5 +7608,217 @@ mod tests {
         // codes pred_mode_flag, so the mode is not yet determined —
         // the helper returns None to signal that read is required.
         assert_eq!(cu_pred_mode_from_skip(false, 0), None);
+    }
+
+    // -------------------------------------------------------------
+    // §7.3.8.3 SAO element decoders
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sao_offset_abs_cmax_by_bit_depth() {
+        // §9.3.3.5: cMax = (1 << (Min(bitDepth, 10) − 5)) − 1.
+        assert_eq!(sao_offset_abs_tr_cmax(8), 7); // (1<<3)-1
+        assert_eq!(sao_offset_abs_tr_cmax(10), 31); // (1<<5)-1
+        assert_eq!(sao_offset_abs_tr_cmax(12), 31); // clamped at 10
+    }
+
+    #[test]
+    fn sao_type_idx_zero_when_first_bin_zero() {
+        // All-zero stream → bin 0 (context, MPS=0) decodes to 0 →
+        // SaoTypeIdx = 0 (not applied), no second bin consumed.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        assert_eq!(decode_sao_type_idx(&mut eng, &mut ctx).unwrap(), 0);
+    }
+
+    #[test]
+    fn sao_band_position_reads_five_bypass_bits() {
+        // All-zero buffer → five bypass bins → 0.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        assert_eq!(decode_sao_band_position(&mut eng).unwrap(), 0);
+    }
+
+    #[test]
+    fn sao_eo_class_reads_two_bypass_bits() {
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let c = decode_sao_eo_class(&mut eng).unwrap();
+        assert!(c <= 3);
+    }
+
+    // -------------------------------------------------------------
+    // §7.4.9.5 part_mode
+    // -------------------------------------------------------------
+
+    #[test]
+    fn part_mode_is_amp_classification() {
+        assert!(!PartMode::Part2Nx2N.is_amp());
+        assert!(!PartMode::PartNxN.is_amp());
+        assert!(PartMode::Part2NxnU.is_amp());
+        assert!(PartMode::Part2NxnD.is_amp());
+        assert!(PartMode::PartNLx2N.is_amp());
+        assert!(PartMode::PartNRx2N.is_amp());
+    }
+
+    #[test]
+    fn part_mode_inferred_is_2nx2n() {
+        let r = part_mode_inferred();
+        assert_eq!(r.part_mode, PartMode::Part2Nx2N);
+        assert!(!r.intra_split_flag);
+    }
+
+    #[test]
+    fn part_mode_intra_nxn_sets_intra_split_flag() {
+        // Intra column: bin 0 == 0 → PART_NxN, IntraSplitFlag = 1.
+        // All-zero stream gives bin 0 == 0 with an MPS=0 context.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(0);
+        let mut c1 = fresh_mps_ctx(0);
+        let mut c2 = fresh_mps_ctx(0);
+        let r = decode_part_mode(
+            &mut eng,
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            CuPredMode::Intra,
+            4,
+            3,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.part_mode, PartMode::PartNxN);
+        assert!(r.intra_split_flag);
+    }
+
+    #[test]
+    fn part_mode_intra_2nx2n_when_bin0_one() {
+        // Intra column: bin 0 == 1 → PART_2Nx2N. MPS=1 all-zero stream
+        // decodes bin 0 == 1.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(1);
+        let mut c1 = fresh_mps_ctx(1);
+        let mut c2 = fresh_mps_ctx(1);
+        let r = decode_part_mode(
+            &mut eng,
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            CuPredMode::Intra,
+            4,
+            3,
+            false,
+        )
+        .unwrap();
+        assert_eq!(r.part_mode, PartMode::Part2Nx2N);
+        assert!(!r.intra_split_flag);
+    }
+
+    #[test]
+    fn part_mode_inter_2nx2n_when_bin0_one() {
+        // Inter, bin 0 == 1 → PART_2Nx2N (single bin).
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(1);
+        let mut c1 = fresh_mps_ctx(1);
+        let mut c2 = fresh_mps_ctx(1);
+        let r = decode_part_mode(
+            &mut eng,
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            CuPredMode::Inter,
+            5,
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.part_mode, PartMode::Part2Nx2N);
+    }
+
+    // -------------------------------------------------------------
+    // merge_idx / ref_idx / mvp_flag / inter_pred_idc / pcm /
+    // end_of_slice_segment_flag
+    // -------------------------------------------------------------
+
+    #[test]
+    fn merge_idx_zero_when_max_cand_one() {
+        // MaxNumMergeCand == 1 → cMax == 0 → inferred 0, no bins read.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        assert_eq!(decode_merge_idx(&mut eng, &mut ctx, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_idx_zero_when_first_bin_zero() {
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        assert_eq!(decode_merge_idx(&mut eng, &mut ctx, 5).unwrap(), 0);
+    }
+
+    #[test]
+    fn ref_idx_zero_when_active_minus1_zero() {
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(0);
+        let mut c1 = fresh_mps_ctx(0);
+        assert_eq!(decode_ref_idx(&mut eng, &mut c0, &mut c1, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn ref_idx_zero_when_first_bin_zero() {
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(0);
+        let mut c1 = fresh_mps_ctx(0);
+        assert_eq!(decode_ref_idx(&mut eng, &mut c0, &mut c1, 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn inter_pred_idc_npb12_is_single_bin() {
+        // nPbW + nPbH == 12: single bin, "0" → PRED_L0.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(0);
+        let mut c1 = fresh_mps_ctx(0);
+        let r = decode_inter_pred_idc(&mut eng, &mut c0, &mut c1, 8, 4).unwrap();
+        assert_eq!(r, InterPredIdc::PredL0);
+    }
+
+    #[test]
+    fn inter_pred_idc_bi_when_bin0_one() {
+        // nPbW + nPbH != 12, bin 0 == 1 → PRED_BI.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut c0 = fresh_mps_ctx(1);
+        let mut c1 = fresh_mps_ctx(1);
+        let r = decode_inter_pred_idc(&mut eng, &mut c0, &mut c1, 16, 16).unwrap();
+        assert_eq!(r, InterPredIdc::PredBi);
+    }
+
+    #[test]
+    fn pcm_and_end_of_slice_use_terminate() {
+        // The terminate path on an all-zero buffer returns 0 (not the
+        // termination value); both share decode_terminate.
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let pcm = decode_pcm_flag(&mut eng).unwrap();
+        assert!(pcm <= 1);
+        let eos = decode_end_of_slice_segment_flag(&mut eng).unwrap();
+        assert!(eos <= 1);
+    }
+
+    #[test]
+    fn mvp_flag_single_bin() {
+        let buf = [0u8; 8];
+        let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
+        let mut ctx = fresh_mps_ctx(0);
+        let v = decode_mvp_flag(&mut eng, &mut ctx).unwrap();
+        assert!(v <= 1);
     }
 }
