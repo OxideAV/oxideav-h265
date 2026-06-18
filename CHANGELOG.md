@@ -38,6 +38,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     `cu_skip_flag` left/above ctxInc derivations.
   - 6 driver tests covering the grid neighbour lookups, SAO decode,
     the min-CB leaf case, and the full I-slice CTU walk.
+- `tests/tiny_i_ctu_walk.rs` — end-to-end fixture test driving the
+  slice-data walk on the real `tiny-i-only-16x16-main` HEVC bitstream
+  (embedded slice NAL, emulation-prevention-stripped, slice-header
+  walked to `byte_alignment()`, CABAC engine on the remaining bytes).
+  The single 16×16 intra CTU decodes bit-exactly through SAO (type 0
+  on Y/Cb/Cr, both merge flags absent at rx==ry==0) and the §7.3.8.4 /
+  §7.3.8.5 coding-quadtree / coding-unit structure (one un-split 16×16
+  intra PART_2Nx2N CU, one luma PB + one chroma mode).
 
 - `binarization` — the remaining §7.3.8.3 / §7.3.8.5 / §7.3.8.6 leaf
   decode primitives the slice-data CTU/CU walk composes:

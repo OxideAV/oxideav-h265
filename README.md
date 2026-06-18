@@ -125,6 +125,31 @@ layers are usable directly through the public parser / engine API.
   TR(`cMax = 4`) `log2_res_scale_abs_plus1` prefix + conditional
   `res_scale_sign_flag`, with the §7.4.9.12 `ResScaleVal` derivation) and
   `decode_tu_residual_act_flag` (§7.3.8.10, FL `cMax = 1`).
+* **Slice-data CTU/CU CABAC walk (§7.3.8.1 .. §7.3.8.6)** — the
+  `slice_data` module: the upper rung of the §7.3.8 slice-data parse
+  loop that drives the CABAC engine through the per-CTU syntax
+  structures, composing the leaf decode primitives with the §7.3.8.8
+  `transform_tree()` recursion. `decode_coding_tree_unit` (§7.3.8.2)
+  pairs an optional §7.3.8.3 `sao()` (the full per-CTB SAO walk —
+  merge flags, `sao_type_idx`, the four offsets, signs, band position
+  / eo-class, with the §7.4.9.3 `SaoTypeIdx[2]` inheritance) with the
+  §7.3.8.4 `decode_coding_quadtree` (`split_cu_flag` recursion + the
+  §7.4.9.4 boundary inference, the §6.5.1 quantization-group resets,
+  the in-picture child guards). The §7.3.8.5 `coding_unit` body walks
+  `cu_transquant_bypass` / `cu_skip_flag` / `pred_mode_flag` /
+  `part_mode` (Table 9-45 → `PartMode` + `IntraSplitFlag`), the PCM
+  gate, the intra luma/chroma mode signalling group, the §7.3.8.6
+  `prediction_unit` emission per `PartMode` (merge / non-merge inter:
+  `merge_idx` / `inter_pred_idc` / `ref_idx` / `mvd_coding` /
+  `mvp_lX_flag`), `rqt_root_cbf`, and entry into the transform tree —
+  into a `CodingTreeUnit` → `CodingQuadtree` → `CodingUnit` parse tree.
+  A per-CTU `CtuGrid` threads the `CtDepth` / `cu_skip_flag` neighbour
+  state for the §9.3.4.2.2 `split_cu_flag` / `cu_skip_flag` ctxInc.
+  The walk runs end to end on real HEVC bitstream: the
+  `tiny-i-only-16x16-main` fixture's single intra CTU decodes
+  bit-exactly through SAO (type 0 on all components) and the §7.3.8.4 /
+  §7.3.8.5 coding-quadtree / coding-unit structure (one un-split 16×16
+  intra PART_2Nx2N CU).
 * **Scaling + transform (§8.6)** — `scale_coefficients` (§8.6.3
   dequantization), `inverse_transform` (the §8.6.4 separable inverse
   DST-VII / DCT-II), and the `residual_block` orchestrator turning a
@@ -155,15 +180,18 @@ layers are usable directly through the public parser / engine API.
 
 ## Not yet implemented
 
-* The upper §7.3.8 slice-data syntax-element walk that drives the CABAC
-  engine through the CTU / CU parse loops: the §7.3.4 `sao()` per-CTU
-  block, §7.3.8.4 `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, and
-  §7.3.8.5 `coding_unit()`. (The §7.3.8.8 `transform_tree()` recursion and
-  its §7.3.8.10 `transform_unit()` leaf are implemented; see above. The
-  §7.3.8.4 `split_cu_flag` and §7.3.8.5 `cu_skip_flag` gateway single-bin
-  decode primitives are now implemented — the recursion / leaf that
-  threads them, deriving `IntraSplitFlag` / `MaxTrafoDepth` /
-  `interSplitFlag` and entering the tree under `rqt_root_cbf`, remains.)
+* Picture reconstruction from the decoded slice-data parse tree: the
+  §8.4 intra-block / §8.5 inter-block sample-write passes that turn the
+  `slice_data` module's `CodingTreeUnit` → `CodingQuadtree` →
+  `CodingUnit` tree (now decoded end to end; see "What's implemented")
+  into reconstructed luma / chroma planes, the in-loop deblock / SAO
+  application, and DPB management. The §7.3.8 slice-data CABAC
+  syntax-element walk itself — the §7.3.8.3 `sao()`, §7.3.8.2
+  `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, §7.3.8.5
+  `coding_unit()` and §7.3.8.6 `prediction_unit()` structures — is
+  implemented and runs end to end on real HEVC bitstream (the
+  `tiny-i-only-16x16-main` fixture's single intra CTU + SAO decode
+  bit-exactly through it).
 * The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
   / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
   splits `mvLX` into its integer / fractional parts and drives
