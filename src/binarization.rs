@@ -500,19 +500,19 @@ where
 }
 
 // ---------------------------------------------------------------------
-// §9.3.3.11 — Exp-Golomb of order k (bypass-coded, MSB-first prefix
-// then k-bit suffix). For k = 0 (the only k this round needs) the read
-// is a unary "0…0 1" leading zeros count followed by `count` bits of
-// suffix.
+// §9.3.3.3 — Exp-Golomb of order k (bypass-coded, MSB-first prefix then
+// suffix). Per the §9.3.3.3 NOTE the EGk prefix uses 1's and 0's in the
+// reverse meaning of the §9.2 EG0 prefix: it is a unary run of `1` bins
+// terminated by a single `0`, followed by `prefix_ones + k` suffix bits.
 // ---------------------------------------------------------------------
 
 /// §9.3.3.3 — decode an EGk-coded value from the bypass stream for
 /// arbitrary Exp-Golomb order `k`.
 ///
-/// The reader counts leading-zero bypass bins until a `1` is seen
-/// (call this count `leading_zeros`); reads `leading_zeros + k` more
+/// The reader counts leading `1` bypass bins until a terminating `0`
+/// (call this count `prefix_ones`); reads `prefix_ones + k` more
 /// bypass bins as the suffix; and returns
-/// `((1 << leading_zeros) - 1) << k + suffix`.
+/// `((1 << prefix_ones) - 1) << k + suffix`.
 ///
 /// For `k = 0` the reader collapses to the `cu_qp_delta_abs`-style
 /// "(1 << lz) - 1 + suffix" form (suffix length == `leading_zeros`,
@@ -532,30 +532,32 @@ fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> 
 /// [`decode_eg_k`] so the §7.3.8.9 `abs_mvd_minus2` EG1 escape can be
 /// composed and unit-tested without driving the arithmetic engine's
 /// range/offset state. The decode follows the equation-9-13 do-while:
-/// count leading `0` bins until a `1` (`leading_zeros`), then read
-/// `leading_zeros + k` suffix bins, yielding
-/// `((1 << leading_zeros) − 1) << k + suffix`.
+/// per the §9.3.3.3 NOTE the EGk unary prefix uses 1's and 0's in the
+/// reverse meaning of the §9.2 EG0 prefix, so the prefix is a run of
+/// `1` bins terminated by a single `0`. Count those leading `1` bins
+/// (`prefix_ones`), then read `prefix_ones + k` suffix bins, yielding
+/// `((1 << prefix_ones) − 1) << k + suffix`.
 pub(crate) fn read_eg_k_with<F>(k: u32, mut read_bin: F) -> Result<u32, CabacError>
 where
     F: FnMut() -> Result<u8, CabacError>,
 {
-    let mut leading_zeros: u32 = 0;
-    while leading_zeros < 32 {
+    let mut prefix_ones: u32 = 0;
+    while prefix_ones < 32 {
         let bin = read_bin()?;
-        if bin == 1 {
+        if bin == 0 {
             break;
         }
-        leading_zeros += 1;
+        prefix_ones += 1;
     }
-    // Guard against accidental >32-bit reads (cap `leading_zeros` at
+    // Guard against accidental >32-bit reads (cap `prefix_ones` at
     // 32 already bounds this; the saturate keeps the read width inside
     // a single `u32` if `k` is unusually large).
-    let suffix_bits = (leading_zeros + k).min(32);
+    let suffix_bits = (prefix_ones + k).min(32);
     let mut suffix: u32 = 0;
     for _ in 0..suffix_bits {
         suffix = (suffix << 1) | u32::from(read_bin()?);
     }
-    let base = ((1u64 << leading_zeros) - 1) << k;
+    let base = ((1u64 << prefix_ones) - 1) << k;
     let value = base + u64::from(suffix);
     // The defensive cap above keeps `value` inside `u32`; the
     // saturate keeps us inside the public return type if the
@@ -4209,7 +4211,9 @@ pub fn mvd_component_value(greater0_flag: u8, minus2: Option<u32>, sign_flag: Op
 /// `DecodeDecision` bins, `abs_mvd_minus2` and `mvd_sign_flag` are
 /// `DecodeBypass` bins. Per §7.3.8.9, `abs_mvd_minus2` is only read
 /// when `abs_mvd_greater1_flag == 1`, and `mvd_sign_flag` only when
-/// `abs_mvd_greater0_flag == 1`.
+/// `abs_mvd_greater0_flag == 1`. The EG1 read consumes the §9.3.3.3
+/// prefix (a run of `1` bins terminated by `0`) plus `prefix_ones + 1`
+/// suffix bins.
 pub fn decode_mvd_component_with<C, B>(
     mut read_ctx_bin: C,
     mut read_bypass_bin: B,
@@ -4575,15 +4579,17 @@ mod tests {
     // construct an offset that crosses the threshold on the first
     // bypass read: init `ivlOffset` to 256, then a fed 1-bit pushes
     // it to 513 ≥ 510, the engine returns bin = 1, and EGk's
-    // leading-zeros count terminates at 0 → value = 0.
+    // §9.3.3.3 EGk(0): the prefix is a run of `1` bins terminated by a
+    // `0`; a value of 0 is the bare terminating `0` (no prefix ones, no
+    // suffix bits).
     #[test]
-    fn eg_k0_decodes_zero_when_first_bypass_returns_one() {
-        // Pack 9-bit init offset = 256 (0b1_0000_0000): byte0 =
-        // 0b1000_0000, byte1 MSB = 0. Next bypass bin reads byte1
-        // bit1; set it to 1 → byte1 = 0b0100_0000 = 0x40.
-        let buf = [0b1000_0000, 0b0100_0000, 0x00];
+    fn eg_k0_decodes_zero_when_first_bypass_returns_zero() {
+        // 9-bit init offset = 0 (all-zero buffer). The first bypass bin
+        // is `(0 << 1) | 0 = 0 < ivlCurrRange`, so DecodeBypass returns
+        // 0 — the bare EGk prefix terminator ⇒ value 0.
+        let buf = [0u8, 0, 0];
         let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
-        assert_eq!(eng.ivl_offset(), 256);
+        assert_eq!(eng.ivl_offset(), 0);
         let v = decode_eg_k0(&mut eng).unwrap();
         assert_eq!(v, 0);
     }
@@ -7438,12 +7444,12 @@ mod tests {
     #[test]
     fn mvd_component_with_eg1_escape() {
         // greater0 = 1, greater1 = 1 ⇒ abs_mvd_minus2 is EG1-coded then
-        // the sign bit follows. EG1 of value 0 is the bin string "1 0":
-        //   leading_zeros = 0 (first bypass bin is 1), then
-        //   leading_zeros + k = 0 + 1 = 1 suffix bin = 0 ⇒ value 0.
+        // the sign bit follows. §9.3.3.3 EG1 of value 0 is the bin string
+        // "0 0": the prefix is the bare terminating `0` (prefix_ones = 0),
+        // then prefix_ones + k = 0 + 1 = 1 suffix bin = `0` ⇒ value 0.
         // So minus2 = 0 ⇒ magnitude = 2; sign = 0 ⇒ lMvd = +2.
         let ctx_bins = [1u8, 1];
-        let bypass_bins = [1u8, 0, 0]; // EG1 prefix '1', suffix '0', sign '0'
+        let bypass_bins = [0u8, 0, 0]; // EG1 prefix '0', suffix '0', sign '0'
         let c = decode_mvd_component_with(bin_queue(&ctx_bins), bin_queue(&bypass_bins)).unwrap();
         assert_eq!(
             c,
@@ -7459,12 +7465,12 @@ mod tests {
 
     #[test]
     fn mvd_component_with_eg1_value_one_full() {
-        // greater0 = 1, greater1 = 1, abs_mvd_minus2 = 1 (EG1 "1 1":
-        //   leading_zeros = 0, suffix bits = lz + k = 1 = "1" ⇒
-        //   base 0 + suffix 1 = 1), then sign = 0. magnitude =
+        // greater0 = 1, greater1 = 1, abs_mvd_minus2 = 1 (§9.3.3.3 EG1
+        //   "0 1": prefix_ones = 0, suffix bits = prefix_ones + k = 1 =
+        //   "1" ⇒ base 0 + suffix 1 = 1), then sign = 0. magnitude =
         //   minus2 + 2 = 3 ⇒ lMvd = +3.
         let ctx_bins = [1u8, 1];
-        let bypass_bins = [1u8, 1, 0]; // EG1(1)='1','1' ; sign '0'
+        let bypass_bins = [0u8, 1, 0]; // EG1(1)='0','1' ; sign '0'
         let c = decode_mvd_component_with(bin_queue(&ctx_bins), bin_queue(&bypass_bins)).unwrap();
         assert_eq!(c.minus2, Some(1));
         assert_eq!(c.value, 3);
@@ -7473,18 +7479,19 @@ mod tests {
     #[test]
     fn read_eg_k_with_eg1_battery() {
         // §9.3.3.3 EG1 (k = 1) decode across a battery of bin strings,
-        // confirming the closure reader implements the do-while inverse
-        // shared with the engine-driven `decode_eg_k`.
-        // EG1 bin strings (prefix of leading 0s + 1, then lz+1 suffix):
-        //   "1 s"          lz=0 → suffix 1 bit
-        //   "0 1 s1 s0"    lz=1 → suffix 2 bits
+        // confirming the closure reader implements the do-while shared
+        // with the engine-driven `decode_eg_k`. The EGk unary prefix is a
+        // run of `1` bins terminated by a `0` (the §9.3.3.3 NOTE), then
+        // prefix_ones + k suffix bits:
+        //   "0 s"          prefix_ones=0 → suffix 1 bit
+        //   "1 0 s1 s0"    prefix_ones=1 → base 2, suffix 2 bits
         let cases: &[(&[u8], u32)] = &[
-            (&[1, 0], 0),             // lz0, suffix 0 ⇒ 0
-            (&[1, 1], 1),             // lz0, suffix 1 ⇒ 1
-            (&[0, 1, 0, 0], 2),       // lz1, base=2, suffix 0 ⇒ 2
-            (&[0, 1, 0, 1], 3),       // lz1, base=2, suffix 1 ⇒ 3
-            (&[0, 1, 1, 0], 4),       // lz1, base=2, suffix 2 ⇒ 4
-            (&[0, 0, 1, 0, 0, 0], 6), // lz2, base=6, suffix 0 ⇒ 6
+            (&[0, 0], 0),             // p0, suffix 0 ⇒ 0
+            (&[0, 1], 1),             // p0, suffix 1 ⇒ 1
+            (&[1, 0, 0, 0], 2),       // p1, base=2, suffix 0 ⇒ 2
+            (&[1, 0, 0, 1], 3),       // p1, base=2, suffix 1 ⇒ 3
+            (&[1, 0, 1, 0], 4),       // p1, base=2, suffix 2 ⇒ 4
+            (&[1, 1, 0, 0, 0, 0], 6), // p2, base=6, suffix 0 ⇒ 6
         ];
         for (bins, expected) in cases {
             assert_eq!(

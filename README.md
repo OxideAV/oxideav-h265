@@ -6,38 +6,30 @@ clean-room against ITU-T Recommendation H.265 | ISO/IEC 23008-2.
 
 ## Status
 
-In-progress clean-room rebuild. The crate implements the non-VCL and
-entropy-layer foundations of an HEVC decoder — the full parameter-set /
-slice-header parser stack, the CABAC arithmetic decoding engine, the
-§9.3.4.2 per-syntax-element binarization + context-index primitives, the
-§7.3.8 slice-data CABAC syntax walk, the §8.6 scaling / transform path —
-and now the **§8.4 intra sample-reconstruction driver**: the `recon`
-module walks a decoded `CodingTreeUnit` and writes reconstructed samples
-into a `Picture` (§8.4.2 / §8.4.3 mode derivation, §8.4.4.2 reference-
-sample prediction, §8.6.2 dequant + inverse transform, §8.6.1 QP
-derivation, §8.4.4.1 add-and-clip). A flat 16×16 intra CU reconstructs
-to the `tiny-i-only-16x16-main` fixture's documented luma / Cb plane
-values from a §8.6 DC residual.
+In-progress clean-room rebuild. The crate decodes a real HEVC intra
+frame to pixels end to end: the `tiny-i-only-16x16-main` fixture's IDR
+slice decodes through the §7.3.8 slice-data CABAC walk and the §8.4
+intra sample-reconstruction driver to the byte-exact `expected.yuv`
+planes (luma 0x51, Cb 0x5a, Cr 0xf0), with the single-CTU slice
+terminating exactly at `end_of_slice_segment_flag`.
+
+The decode stack: the full parameter-set / slice-header parser stack,
+the §9.3 CABAC arithmetic decoding engine, the §9.3.4.2
+per-syntax-element binarization + context-index primitives, the §7.3.8
+slice-data CABAC syntax walk, the §8.6 scaling / transform path, and the
+**§8.4 intra sample-reconstruction driver** — the `recon` module walks a
+decoded `CodingTreeUnit` and writes reconstructed samples into a
+`Picture`: §8.4.2 / §8.4.3 mode derivation, §8.4.4.2 reference-sample
+prediction, §8.6.2 dequant + inverse transform, §8.6.1 QP derivation,
+§8.4.4.1 add-and-clip.
 
 Inter sample prediction (§8.5), the in-loop filters (§8.7 deblocking /
-SAO apply), a full DPB, and an encoder are not yet wired. The end-to-end
-decode of a real bitstream is blocked on a residual-coefficient CABAC
-alignment defect (see below) — the reconstruction driver is validated
-against synthesized spec-correct coefficients in the interim.
-
-The runtime registration hook (`register`) is a no-op and every decode
-path returns `Error::NotImplemented` until the full pipeline lands. Lower
-layers are usable directly through the public parser / engine API.
-
-### Known defect — residual-coding CABAC alignment
-
-The §7.3.8.11 residual-coding walk on the `tiny-i-only-16x16-main`
-fixture does not terminate at the byte-aligned `end_of_slice_segment_
-flag` (it decodes `false` where `true` is required for the single-CTU
-slice), so the decoded `TransCoeffLevel` magnitudes are wrong. The
-reconstruction driver, intra prediction, and §8.6 transform are
-independently validated; the next round must trace the residual-coding
-bin sequence against the spec to locate the divergence.
+SAO apply), a full DPB, multi-CTU / multi-slice / tile / WPP picture
+assembly, and an encoder are not yet wired. The runtime registration
+hook (`register`) is a no-op and the top-level decode entry point still
+returns `Error::NotImplemented` until the picture-level driver and DPB
+land; the per-CTU reconstruction is usable directly through the public
+`recon` / `picture` API.
 
 ## What's implemented
 

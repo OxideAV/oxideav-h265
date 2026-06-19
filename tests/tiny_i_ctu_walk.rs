@@ -176,3 +176,74 @@ fn tiny_i_single_ctu_decodes_end_to_end() {
     // test here).
     let _eos = oxideav_h265::slice_data::end_of_slice_segment_flag(&mut engine).unwrap();
 }
+
+/// End-to-end §8 reconstruction: decode the real `tiny-i-only-16x16-main`
+/// IDR slice CABAC bytes through the §7.3.8 syntax walk, run the §8.4
+/// intra sample-reconstruction driver, and validate the resulting
+/// luma/chroma planes byte-for-byte against the fixture's documented
+/// `expected.yuv` (luma 0x51, Cb 0x5a, Cr 0xf0 — the decoded red frame).
+///
+/// This exercises the full decode-to-pixels pipeline on real bitstream:
+/// SAO + coding-quadtree + coding-unit + transform-tree + residual-coding
+/// CABAC walk, §8.4.2 / §8.4.3 mode derivation, §8.4.4.2 intra
+/// prediction, §8.6 dequantization + inverse transform, §8.6.1 QP
+/// derivation, and §8.4.4.1 add-and-clip. The `end_of_slice_segment_flag`
+/// terminating the single-CTU slice confirms the CABAC walk is bit-exact.
+#[test]
+fn tiny_i_reconstructs_expected_yuv_end_to_end() {
+    use oxideav_h265::picture::{Picture, Plane};
+    use oxideav_h265::recon::{reconstruct_intra_ctu, ReconParams};
+
+    let rbsp = strip_emulation_prevention(&SLICE_NAL[2..]);
+    let cabac_offset = slice_header_cabac_offset(&rbsp);
+    let params = tiny_i_params();
+    let mut engine = CabacEngine::new(BitReader::new(&rbsp[cabac_offset..])).unwrap();
+    // §9.3.1: SliceQpY = 26 + init_qp(0) + slice_qp_delta(-1) = 25.
+    let mut ctx = SliceContexts::init(0, 25);
+    let ctu = decode_coding_tree_unit(&mut engine, &mut ctx, &params, 0, 0, false, false).unwrap();
+
+    // The single-CTU slice must terminate exactly at the byte-aligned
+    // end_of_slice_segment_flag — proof the residual-coding CABAC walk
+    // consumed the correct number of bins.
+    let eos = oxideav_h265::slice_data::end_of_slice_segment_flag(&mut engine).unwrap();
+    assert!(
+        eos,
+        "single-CTU slice must terminate at end_of_slice_segment_flag"
+    );
+
+    let recon_params = ReconParams {
+        chroma_array_type: 1,
+        bit_depth_luma: 8,
+        bit_depth_chroma: 8,
+        intra_smoothing_disabled: false,
+        strong_intra_smoothing_enabled: true,
+        slice_qp_y: 25,
+        cb_qp_offset: 0,
+        cr_qp_offset: 0,
+        transform_skip_rotation_enabled: false,
+        extended_precision: false,
+    };
+    let mut pic = Picture::new(16, 16, 1, 8, 8);
+    reconstruct_intra_ctu(&mut pic, &recon_params, &ctu).unwrap();
+
+    // expected.yuv: luma plane all 0x51 (81), Cb all 0x5a (90),
+    // Cr all 0xf0 (240).
+    for y in 0..16 {
+        for x in 0..16 {
+            assert_eq!(pic.sample(Plane::Luma, x, y), 0x51, "luma ({x},{y})");
+        }
+    }
+    for y in 0..8 {
+        for x in 0..8 {
+            assert_eq!(pic.sample(Plane::Cb, x, y), 0x5a, "cb ({x},{y})");
+            assert_eq!(pic.sample(Plane::Cr, x, y), 0xf0, "cr ({x},{y})");
+        }
+    }
+
+    // The packed planar output matches expected.yuv byte for byte.
+    let packed = pic.to_planar_u8().unwrap();
+    let mut expected = vec![0x51u8; 256];
+    expected.extend(std::iter::repeat_n(0x5au8, 64));
+    expected.extend(std::iter::repeat_n(0xf0u8, 64));
+    assert_eq!(packed, expected, "reconstructed planes match expected.yuv");
+}

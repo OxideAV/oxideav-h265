@@ -30,23 +30,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     chroma-QP mapping, eq. 8-260) derivation.
   - The transform-tree recursion reconstructs each leaf transform block
     luma + (4:2:0 / 4:2:2 / 4:4:4) chroma in §8.4.4.1 decode order.
-  - 6 driver tests: a flat 16×16 intra CU reconstructs luma to a constant
-    81 and Cb to a constant 90 (the `tiny-i-only-16x16-main` fixture's
-    `expected.yuv` plane values) from a §8.6 DC residual on a midlevel-128
-    prediction; chroma-plane uniformity; out-of-range `Clip1` saturation;
-    inter-CU rejection; and 8-bit planar packing.
+  - 6 driver unit tests plus an end-to-end fixture test
+    (`tiny_i_reconstructs_expected_yuv_end_to_end`) that decodes the real
+    `tiny-i-only-16x16-main` IDR slice CABAC bytes through the §7.3.8
+    syntax walk and reconstructs the byte-exact `expected.yuv` planes
+    (luma 0x51, Cb 0x5a, Cr 0xf0), with the single-CTU slice terminating
+    at `end_of_slice_segment_flag`. This is the crate's first
+    decode-to-pixels validation on a real bitstream.
 
 ### Fixed — round 341
 
-- §9.3.3.3 EGk suffix polarity in `coeff_abs_level_remaining`. The
-  escape-path k-th-order Exp-Golomb suffix decode counted leading `0`
-  bins terminated by a `1`, but per eq. 9-13 the EGk unary prefix is a
-  run of `1` bins terminated by a single `0` (the §9.3.3.3 NOTE: EGk uses
-  1's and 0's reversed from the §9.2 EG0 prefix). The inverted polarity
-  produced wrong escape-path coefficient magnitudes; with the fix a
-  DC-heavy residual decodes to a uniform field. Four binarization unit
-  tests and one residual round-trip test that had encoded the inverted
-  prefix are rewritten to the spec-correct ones-then-zero shape.
+- §9.3.3.3 EGk prefix polarity (two call sites). The k-th-order
+  Exp-Golomb prefix decode — both the `coeff_abs_level_remaining`
+  escape-path suffix and the shared `read_eg_k_with` helper used by
+  `cu_qp_delta_abs`, `palette_escape_val`, and the `abs_mvd_minus2` EG1
+  escape — counted leading `0` bins terminated by a `1`, but per
+  eq. 9-13 the EGk unary prefix is a run of `1` bins terminated by a
+  single `0` (the §9.3.3.3 NOTE: EGk uses 1's and 0's reversed from the
+  §9.2 EG0 prefix). The inverted polarity produced wrong escape-path
+  magnitudes for every EGk-coded syntax element, mis-decoding
+  `cu_qp_delta_abs` and the high-magnitude coefficient levels and
+  derailing the residual-coding CABAC alignment. With the fix the
+  `tiny-i-only-16x16-main` slice decodes bit-exactly to its
+  `end_of_slice_segment_flag` terminator and reconstructs the documented
+  `expected.yuv`. Seven unit tests that had encoded the inverted
+  zeros-then-one prefix are rewritten to the spec-correct ones-then-zero
+  shape.
 - §8.6.4 inverse-transform matrix orientation. The §8.6.4.2 1-D transform
   read the in-code DCT base table as `transMatrix[i][j*stride]`, but per
   eqs. 8-318/8-319 the named `transMatrixCol0to15` base table is indexed
