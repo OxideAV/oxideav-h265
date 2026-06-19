@@ -6,6 +6,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 341 (2026-06-19)
+
+- `picture` module — the §8 reconstruction target: a `Picture` holding
+  the three reconstructed sample planes (`SL` / `SCb` / `SCr`) sized from
+  the active geometry + `ChromaArrayType` (Table 6-1 `SubWidthC` /
+  `SubHeightC`), per-sample read/write, the §8 `Clip1Y` / `Clip1C`
+  sample clip (`clip1`), and an 8-bit planar `Y`→`Cb`→`Cr` packer for
+  fixture comparison.
+- `recon` module — the §8.4 intra sample-reconstruction driver, the rung
+  between the §7.3.8 slice-data syntax walk and the per-block §8.4.4
+  intra-prediction + §8.6 dequantization / inverse-transform primitives.
+  `reconstruct_intra_ctu` walks a decoded `CodingTreeUnit` and writes
+  reconstructed samples into a `Picture`:
+  - §8.4.2 `IntraPredModeY` + §8.4.3 `IntraPredModeC` derivation from the
+    signalled luma/chroma mode fields.
+  - §8.4.4.2.1 reference-sample gathering from the already-reconstructed
+    picture (the §6.4.1 raster within-picture availability), then
+    §8.4.4.2 prediction.
+  - §8.6.2 dequantize + inverse-transform of each coded residual block,
+    §8.4.4.1 add-and-clip into the plane.
+  - §8.6.1 `Qp′Y` (eq. 8-258) and `Qp′Cb` / `Qp′Cr` (Table 8-10 4:2:0
+    chroma-QP mapping, eq. 8-260) derivation.
+  - The transform-tree recursion reconstructs each leaf transform block
+    luma + (4:2:0 / 4:2:2 / 4:4:4) chroma in §8.4.4.1 decode order.
+  - 6 driver tests: a flat 16×16 intra CU reconstructs luma to a constant
+    81 and Cb to a constant 90 (the `tiny-i-only-16x16-main` fixture's
+    `expected.yuv` plane values) from a §8.6 DC residual on a midlevel-128
+    prediction; chroma-plane uniformity; out-of-range `Clip1` saturation;
+    inter-CU rejection; and 8-bit planar packing.
+
+### Fixed — round 341
+
+- §8.6.4 inverse-transform matrix orientation. The §8.6.4.2 1-D transform
+  read the in-code DCT base table as `transMatrix[i][j*stride]`, but per
+  eqs. 8-318/8-319 the named `transMatrixCol0to15` base table is indexed
+  `[column][row]`, so the in-code row-major listing is the transpose of
+  `transMatrix` and eq. 8-317 must read it as `DCT32[j*stride][i]`. The
+  previous indexing computed the forward (analysis) transform — a DC-only
+  coefficient excited a non-constant column instead of the flat row-0 DC
+  basis, so a DC-only block reconstructed to a spread of values rather
+  than the uniform field the inverse transform must produce. Two unit
+  tests that had baked in the transposed behaviour are rewritten to the
+  correct constant-field reconstruction.
+
 ### Added — clean-room rebuild round 338 (2026-06-19)
 
 - `slice_data` module — the §7.3.8.1 .. §7.3.8.6 slice-data CABAC

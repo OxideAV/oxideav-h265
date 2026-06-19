@@ -236,7 +236,9 @@ pub mod hrd;
 pub mod inter_pred;
 pub mod intra_pred;
 pub mod nal;
+pub mod picture;
 pub mod pps;
+pub mod recon;
 pub mod residual;
 pub mod scaling_list;
 pub mod scan;
@@ -259,7 +261,9 @@ pub use hrd::{
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
 };
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
+pub use picture::{clip1, sub_wh_c, Picture, Plane};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
+pub use recon::{reconstruct_intra_ctu, ReconError, ReconParams};
 pub use scaling_list::{
     ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,
     MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS,
