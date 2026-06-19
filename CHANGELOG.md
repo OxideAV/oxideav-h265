@@ -38,6 +38,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed — round 341
 
+- §9.3.3.3 EGk suffix polarity in `coeff_abs_level_remaining`. The
+  escape-path k-th-order Exp-Golomb suffix decode counted leading `0`
+  bins terminated by a `1`, but per eq. 9-13 the EGk unary prefix is a
+  run of `1` bins terminated by a single `0` (the §9.3.3.3 NOTE: EGk uses
+  1's and 0's reversed from the §9.2 EG0 prefix). The inverted polarity
+  produced wrong escape-path coefficient magnitudes; with the fix a
+  DC-heavy residual decodes to a uniform field. Four binarization unit
+  tests and one residual round-trip test that had encoded the inverted
+  prefix are rewritten to the spec-correct ones-then-zero shape.
 - §8.6.4 inverse-transform matrix orientation. The §8.6.4.2 1-D transform
   read the in-code DCT base table as `transMatrix[i][j*stride]`, but per
   eqs. 8-318/8-319 the named `transMatrixCol0to15` base table is indexed

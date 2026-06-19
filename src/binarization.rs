@@ -3946,27 +3946,32 @@ where
     }
     // Escape: all-ones prefix. EGk(cRiceParam + 1) suffix follows.
     let k = c_rice_param + 1;
-    let mut leading_zeros: u32 = 0;
-    while leading_zeros < 32 {
+    // §9.3.3.3 eq. 9-13: the EGk unary prefix is a run of `1` bins
+    // terminated by a single `0` bin (the loop emits `put( 1 )` while
+    // `absV >= ( 1 << k )`, then `put( 0 )` to stop). The decoded prefix
+    // length is the count of leading `1` bins before that terminating
+    // `0`.
+    let mut prefix_ones: u32 = 0;
+    while prefix_ones < 32 {
         let bin = read_bin()?;
-        if bin == 1 {
+        if bin == 0 {
             break;
         }
-        leading_zeros += 1;
+        prefix_ones += 1;
     }
-    let suffix_bits = (leading_zeros + k).min(32);
+    let suffix_bits = (prefix_ones + k).min(32);
     let mut suffix: u32 = 0;
     for _ in 0..suffix_bits {
         suffix = (suffix << 1) | u32::from(read_bin()?);
     }
-    // Compose in u64: `leading_zeros` can reach 32 on a non-conformant
+    // Compose in u64: `prefix_ones` can reach 32 on a non-conformant
     // bin stream, where `base` alone exceeds u32::MAX. The §7.4.9.11
     // conformance requirement bounds the corresponding TransCoeffLevel
     // to [CoeffMin, CoeffMax] (eqs. 7-27 .. 7-30), far below the
     // saturation point, so the clamp only fires on bin streams the
     // spec already rejects — the decode stays total instead of
     // overflowing.
-    let base = ((1u64 << leading_zeros) - 1) << k;
+    let base = ((1u64 << prefix_ones) - 1) << k;
     let c_max = u64::from(coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param));
     let value = c_max + base + u64::from(suffix);
     Ok(u32::try_from(value).unwrap_or(u32::MAX))
@@ -6050,11 +6055,13 @@ mod tests {
     fn decode_coeff_abs_level_remaining_escape_path_r0() {
         // cRiceParam = 0, level = 4 (== cMax). TR prefix = all 4 ones
         // (escape). EGk(k = 1) suffix for suffixVal = 0:
-        //   leading_zeros = 0 (read a '1' immediately), suffix bits
-        //   = 0 + 1 = 1, payload = 0.
-        // value = ((1 << 0) − 1) << 1 + 0 = 0. Decoded level = 4.
+        //   §9.3.3.3 eq. 9-13 — the EGk unary prefix is a run of `1`
+        //   bins terminated by a `0`. suffixVal = 0 ⇒ prefix is the bare
+        //   terminating `0` (prefix_ones = 0), suffix bits = 0 + 1 = 1,
+        //   payload = 0. value = ((1 << 0) − 1) << 1 + 0 = 0.
+        // Decoded level = cMax + 0 = 4.
         let bins = [
-            1u8, 1, 1, 1, /* EGk lz=0 terminator */ 1, /* suffix bit */ 0,
+            1u8, 1, 1, 1, /* EGk prefix terminator */ 0, /* suffix bit */ 0,
         ];
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
@@ -6065,12 +6072,12 @@ mod tests {
     #[test]
     fn decode_coeff_abs_level_remaining_escape_path_with_suffix_payload_r0() {
         // cRiceParam = 0, level = 7. cMax = 4. suffixVal = 3.
-        // EGk(k = 1) of 3: leading_zeros = 1 (bins 0, 1), suffix
-        // bits = 1 + 1 = 2, payload = 01 ⇒ value = ((1 << 1) − 1)
-        // << 1 + 1 = 3. Decoded level = 4 + 3 = 7.
+        // EGk(k = 1) of 3: prefix_ones = 1 (a `1` then the terminating
+        // `0`), suffix bits = 1 + 1 = 2, payload = 01 ⇒ value =
+        // ((1 << 1) − 1) << 1 + 1 = 3. Decoded level = 4 + 3 = 7.
         let bins = [
             1u8, 1, 1, 1, // TR escape prefix
-            0, 1, // EGk leading-zero count: one zero then a terminating one
+            1, 0, // EGk prefix: one `1` bin then the terminating `0`
             0, 1, // suffix bits MSB-first
         ];
         assert_eq!(
@@ -6083,13 +6090,13 @@ mod tests {
     fn decode_coeff_abs_level_remaining_escape_saturates_instead_of_overflowing() {
         // Fuzz regression (r282 `decode_residual`): a non-conformant
         // bypass-bin stream can drive the EGk escape to its maximal
-        // shape — 4 TR escape ones, then 32 leading zeros (the loop
-        // cap), then 32 all-ones suffix bits — whose composed value
+        // shape — 4 TR escape ones, then 32 leading prefix ones (the
+        // loop cap), then 32 all-ones suffix bits — whose composed value
         // exceeds u32. The decode must saturate, not overflow.
         // §7.4.9.11 conformance (eqs. 7-27 .. 7-30) keeps every legal
         // stream far below the saturation point.
         let mut bins = vec![1u8, 1, 1, 1]; // TR escape prefix
-        bins.extend([0u8; 32]); // EGk leading zeros (loop cap)
+        bins.extend([1u8; 32]); // EGk prefix ones (loop cap)
         bins.extend([1u8; 32]); // suffix payload
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
@@ -6141,11 +6148,12 @@ mod tests {
                 }
                 let base = (((1u64 << lz) - 1) << k) as u32;
                 let suffix_payload = suffix_val - base;
-                // Bins: all-ones TR prefix (4 ones) + lz zeros + a
-                // terminating one + (lz + k) suffix bits MSB-first.
+                // Bins: all-ones TR prefix (4 ones) + the §9.3.3.3 EGk
+                // prefix `lz` ones + a terminating zero + (lz + k) suffix
+                // bits MSB-first.
                 let mut bins: Vec<u8> = std::iter::repeat_n(1u8, 4).collect();
-                bins.extend(std::iter::repeat_n(0u8, lz as usize));
-                bins.push(1);
+                bins.extend(std::iter::repeat_n(1u8, lz as usize));
+                bins.push(0);
                 for i in (0..lz + k).rev() {
                     bins.push(((suffix_payload >> i) & 1) as u8);
                 }

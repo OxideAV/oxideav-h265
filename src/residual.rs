@@ -1120,9 +1120,14 @@ mod tests {
         decisions.extend([0; 14]); // sig n=13..0 = 0
         decisions.extend([1, 1]); // greater1 at n=15, n=14
         decisions.push(1); // greater2 at n=15 (lastGreater1ScanPos)
+                           // remaining #1 = 10 at cRiceParam 0: TR escape prefix `1111`,
+                           // then EGk(k=1) of suffixVal = 6 = prefix `110` (§9.3.3.3 ones-
+                           // then-zero) + 3-bit suffix `000`.
+                           // remaining #2 = 1 at cRiceParam 1: TR prefix `0` (terminator)
+                           // + 1-bit suffix `1`.
         let bypasses = [
             0, 0, // signs at n=15, n=14
-            1, 1, 1, 1, 0, 0, 1, 0, 0, 0, // remaining #1 = 10 (escape + EG1)
+            1, 1, 1, 1, 1, 1, 0, 0, 0, 0, // remaining #1 = 10 (escape + EG1)
             0, 1, // remaining #2 = 1 at cRiceParam 1
         ];
         let mut bins = Scripted::new(&decisions, &bypasses);
