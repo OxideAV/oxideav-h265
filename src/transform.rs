@@ -335,12 +335,23 @@ fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
     } else {
         // §8.6.4.2 eq. 8-317: y[i] = Σ_j transMatrix[i][j * stride] *
         // x[j], stride = 1 << (5 - log2(nTbS)).
+        //
+        // The §8.6.4.2 transMatrix is laid out (eq. 8-318/8-319) so that
+        // `transMatrix[ m ][ n ]` = `transMatrixCol0to15[ m ][ n ]` with
+        // `m` the column index 0..15 and `n` the row index 0..31; i.e.
+        // the named base table is indexed [column][row]. The in-code
+        // [`DCT32`] is the natural row-major listing of that base table,
+        // so `DCT32[ a ][ b ] == transMatrix[ b ][ a ]`. Equation 8-317's
+        // `transMatrix[ i ][ j*stride ]` therefore reads `DCT32[ j*stride
+        // ][ i ]` — the column index `j*stride` becomes the DCT32 row.
+        // (For DC-only input this yields the constant row-0 basis, the
+        // uniform synthesis the inverse transform must produce.)
         let log2 = log2_tbs(n_tbs).expect("transform_1d called with non-2^k nTbS");
         let stride = 1usize << (5 - log2);
         for (i, oi) in out.iter_mut().enumerate() {
             let mut acc = 0i64;
             for (j, &xj) in input.iter().enumerate() {
-                acc += DCT32[i][j * stride] as i64 * xj;
+                acc += DCT32[j * stride][i] as i64 * xj;
             }
             *oi = acc;
         }
@@ -689,33 +700,33 @@ mod tests {
         assert_eq!(r[0], 0);
     }
 
-    /// A column of equal scaled coefficients (constant along y in
-    /// column 0, zero elsewhere) excites only DCT basis row 0 of the
-    /// column transform — which is the all-64 row — so the column
-    /// result e is non-trivial only at y=0, and the subsequent row
-    /// transform spreads a single value across each row at x=0. Rather
-    /// than asserting "flat" (which a single DC coefficient does NOT
-    /// produce — the inverse DCT of one coefficient is a full cosine
-    /// basis pattern), pin the exact §8.6.4 output of a hand-computed
-    /// 4x4 DCT case so a regression in the matrix or the shifts is
-    /// caught.
+    /// The inverse DCT of a single DC coefficient is a constant field:
+    /// the DC basis function (transMatrix row 0, all-64 per eq. 8-319) is
+    /// flat, so a `d[0][0]`-only input must reconstruct to a uniform `r`.
+    /// This pins the §8.6.4 matrix-orientation: eq. 8-317's
+    /// `transMatrix[ i ][ j*stride ]` reads the in-code [`DCT32`] as
+    /// `DCT32[ j*stride ][ i ]` (the base table is laid out
+    /// [column][row], eq. 8-318/8-319), so the DC input excites the
+    /// constant row-0 basis.
     #[test]
     fn dc_only_dct_4x4_exact() {
         // d has only d[0][0] = 64 (n=4, trType=0/inter).
         let n = 4;
         let d = flat_levels(n, &[(0, 0, 64)]);
         let r = inverse_transform(&d, n, PredMode::Inter, Component::Luma, 8, false).unwrap();
-        // Column transform of column 0 (input [64,0,0,0]) with stride 8:
-        //   e[i][0] = DCT32[i][0] * 64 = [64,90,90,90] * 64
-        //           = [4096, 5760, 5760, 5760]; other columns 0.
-        // g[x][y] = clip((e+64)>>7): g[0][.] = [(4096+64)>>7, (5760+64)>>7 ...]
-        //   = [32, 45, 45, 45]; other x -> (0+64)>>7 = 0.
-        // Row transform of row y (only x=0 nonzero):
-        //   r[i][y] = DCT32[i][0] * g[0][y] = [64,90,90,90] * g[0][y].
-        // Row 0: g[0][0]=32 -> [2048, 2880, 2880, 2880].
-        assert_eq!(&r[0..4], &[2048, 2880, 2880, 2880]);
-        // Row 1: g[0][1]=45 -> [2880, 4050, 4050, 4050].
-        assert_eq!(&r[4..8], &[2880, 4050, 4050, 4050]);
+        // Column transform of column 0 (input [64,0,0,0]):
+        //   e[0][i] = transMatrix[i][0] * 64 = DCT32[0][i] * 64
+        //           = 64 * 64 = 4096 (row 0 of DCT32 is all 64);
+        //   every other column is 0.
+        // g[x][y] = clip((e+64)>>7): g[0][.] = (4096+64)>>7 = 32;
+        //   g[x>0][.] = (0+64)>>7 = 0.
+        // Row transform of row y (only x=0 nonzero, value 32):
+        //   r[i][y] = transMatrix[i][0] * 32 = 64 * 32 = 2048 for all i.
+        // So the whole 4x4 block reconstructs to the constant 2048.
+        assert!(
+            r.iter().all(|&v| v == 2048),
+            "DC-only must be uniform: {r:?}"
+        );
     }
 
     /// trType selection: only MODE_INTRA / nTbS==4 / luma uses the DST.
@@ -841,23 +852,24 @@ mod tests {
     /// exactly one basis row.
     #[test]
     fn dct_subsample_stride_picks_right_columns() {
-        // 8x8: a unit column impulse at row index 1 of the column
-        // transform reads transMatrix[i][1*stride] with stride 4. For
-        // i = 0, transMatrix[0][4] = 64 (row 0 all 64). Run a DC-only
-        // block and confirm flatness already covers row 0; here check
-        // nTbS=8 stride via direct transform_1d.
+        // 8x8: eq. 8-317 reads transMatrix[i][j*stride] with stride 4,
+        // which in the in-code [`DCT32`] ([column][row] layout) is
+        // DCT32[j*stride][i].
         let mut x = vec![0i64; 8];
-        x[0] = 1; // DC basis input.
+        x[0] = 1; // DC basis input (j = 0).
         let y = transform_1d(&x, 8, false);
-        // y[i] = transMatrix[i][0] * 1 = DCT32[i][0]. With stride the
-        // column index is 0 regardless, so this is the first column.
-        assert_eq!(y[0], 64);
-        assert_eq!(y[1], 90);
-        // x[1] excites column 1*stride = 4.
+        // y[i] = transMatrix[i][0] = DCT32[0][i] = 64 for all i (the
+        // all-64 DC basis row).
+        assert!(
+            y.iter().all(|&v| v == 64),
+            "DC basis must be flat 64: {y:?}"
+        );
+        // x[1] excites transform-matrix column 1*stride = 4, i.e.
+        // DCT32 row 4 = [89, 75, 50, 18, ...].
         let mut x2 = vec![0i64; 8];
         x2[1] = 1;
         let y2 = transform_1d(&x2, 8, false);
-        assert_eq!(y2[0], DCT32[0][4] as i64); // 64
-        assert_eq!(y2[1], DCT32[1][4] as i64); // 82
+        assert_eq!(y2[0], DCT32[4][0] as i64); // 89
+        assert_eq!(y2[1], DCT32[4][1] as i64); // 75
     }
 }
