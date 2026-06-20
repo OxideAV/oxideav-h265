@@ -23,13 +23,21 @@ decoded `CodingTreeUnit` and writes reconstructed samples into a
 prediction, §8.6.2 dequant + inverse transform, §8.6.1 QP derivation,
 §8.4.4.1 add-and-clip.
 
-Inter sample prediction (§8.5), the in-loop filters (§8.7 deblocking /
-SAO apply), a full DPB, multi-CTU / multi-slice / tile / WPP picture
-assembly, and an encoder are not yet wired. The runtime registration
-hook (`register`) is a no-op and the top-level decode entry point still
+Inter sample prediction (§8.5) now reconstructs a P / B prediction unit
+to pixels: the §8.5.3.3.1 block-walk driver, §8.5.3.2 motion-vector
+reconstruction / chroma-MV derivation, and the §8.5/§8.6.5 inter PU
+reconstruction-into-`Picture` path are wired (a uni-/bi-predictive PU
+with a resolved motion vector + reference picture reconstructs to bit
+pixels), and the §8.7.2.4 deblocking boundary-strength derivation lands.
+What remains for an end-to-end inter fixture is the §8.5.3.2.2/.3/.6/.7
+merge/MVP **candidate** derivation (needs neighbour + collocated state),
+the §8.7.2.5 edge filtering, SAO apply, a full DPB, and multi-CTU /
+multi-slice / tile / WPP picture assembly. The runtime registration hook
+(`register`) is a no-op and the top-level decode entry point still
 returns `Error::NotImplemented` until the picture-level driver and DPB
-land; the per-CTU reconstruction is usable directly through the public
-`recon` / `picture` API.
+land; the per-CTU intra reconstruction and the per-PU inter
+reconstruction are usable directly through the public `recon` /
+`inter_pred` / `motion` / `picture` API.
 
 ## What's implemented
 
@@ -186,9 +194,36 @@ land; the per-CTU reconstruction is usable directly through the public
   uni- / bi-predictive combine of equations 8-262..8-264, the
   `weighted_pred_flag == 0` path). The interpolation carries the
   `14 − BitDepth`-bit intermediate precision; the combine clips to the
-  sample range. The §8.5.3.1 / §8.5.3.2 motion-vector / merge derivation
-  that produces `mvLX` and the §8.5.3.3.1 block-walk driver remain the
-  caller's / follow-ups' responsibility.
+  sample range.
+* **Inter block-walk driver (§8.5.3.3.1)** — `inter_pred::predict_inter_pu`
+  wires the fractional-sample interpolation + default combine into the
+  §8.5.3.3.1 driver: split each used list's `mvLX` / `mvCLX` into its
+  integer / fractional parts (equations 8-214..8-221), interpolate luma +
+  Cb / Cr over the whole PU, and default-weighted-combine the L0 / L1
+  intermediate arrays into the final clipped prediction planes
+  (`ListPrediction` / `InterPredGeometry` / `InterPrediction`).
+* **Motion-vector reconstruction + merge fallback + motion field
+  (§8.5.3.2)** — the `motion` module: `reconstruct_mv` (§8.5.3.2.1 step
+  4/5, the `uLX = (mvpLX + mvdLX + 2^16) % 2^16` wrap of equations
+  8-94..8-101, fractional + integer-MV paths), `derive_chroma_mv`
+  (§8.5.3.2.10, `mvCLX = mvLX * 2 / SubWidthC`),
+  `append_zero_merge_candidates` (§8.5.3.2.5 zero-MV merge padding,
+  P uni-L0 / B bi forms), and `MotionField` — a per-4×4-block store of
+  mode + `predFlagLX` / reference-picture identity / `mvLX` that the
+  §8.7.2.4 boundary-strength derivation and the inter reconstruction read.
+* **Inter PU reconstruction (§8.5 / §8.6.5)** — `recon::reconstruct_inter_pu`
+  builds the §8.5.3.3.2 reference planes from a `ResolvedList`
+  (`predFlagLX` + `mvLX` / `mvCLX` + reference `Picture`), runs the
+  driver, then adds the §8.6.2 residual and applies the §8.6.5 / §8.4.4.1
+  clip into the target `Picture`. A uni-L0 full-pel P-block and a
+  bi-predictive average reconstruct to real pixels.
+* **Deblocking boundary strength (§8.7.2.4)** — `deblock::derive_boundary_strength`
+  implements the bS cascade on the 8×8 luma grid (EDGE_VER 8-stride x /
+  4-stride y, EDGE_HOR transposed): intra neighbour ⇒ 2; a transform-block
+  edge with a non-zero coefficient ⇒ 1; the motion criteria
+  (different reference-picture set / number of MVs, single-MV |Δ| ≥ 4, the
+  bi-predictive cross-list and same-reference straight + crossed tests)
+  ⇒ 1; otherwise 0, reading the per-4×4 motion state from a `MotionField`.
 
 ## Not yet implemented
 
@@ -204,13 +239,15 @@ land; the per-CTU reconstruction is usable directly through the public
   implemented and runs end to end on real HEVC bitstream (the
   `tiny-i-only-16x16-main` fixture's single intra CTU + SAO decode
   bit-exactly through it).
-* The rest of inter prediction (§8.5): the §8.5.3.1 / §8.5.3.2 motion-vector
-  / merge-candidate derivation, the §8.5.3.3.1 prediction-block walk that
-  splits `mvLX` into its integer / fractional parts and drives
-  `inter_pred`, and the §8.5.3.3.4.3 explicit weighted-prediction path.
-  In-loop filters (deblock / SAO) and DPB management likewise remain.
-  (The §8.5.3.3.3 fractional-sample interpolation and §8.5.3.3.4.2 default
-  combine are implemented; see above.)
+* The rest of inter prediction (§8.5): the §8.5.3.2.2 / §8.5.3.2.3 /
+  §8.5.3.2.6 / §8.5.3.2.7 / §8.5.3.2.8 merge / spatial / temporal / MVP
+  **candidate** derivation (which needs the neighbour-PU and collocated
+  picture state), and the §8.5.3.3.4.3 explicit weighted-prediction path.
+  The §8.5.3.3.3 interpolation, §8.5.3.3.4.2 default combine, §8.5.3.3.1
+  block-walk driver, §8.5.3.2.1 MV reconstruction, §8.5.3.2.10 chroma MV,
+  §8.5.3.2.5 zero-merge, and the §8.5/§8.6.5 inter PU reconstruction are
+  implemented (see above). The in-loop filters past §8.7.2.4 bS
+  (§8.7.2.5 edge filtering, SAO apply) and DPB management remain.
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
   the typed flags are decoded but the bodies surface as opaque bytes.
 * Encoder.
