@@ -14,8 +14,10 @@
 //! the coding / transform tree geometry) is the input `edgeFlags` array;
 //! producing it from the decoded partition tree is the picture driver's
 //! follow-up. The §8.7.2.5 edge filtering process (the actual sample
-//! modification using `bS`, `β` and `tC`) is a separate follow-up; this
-//! module stops at the `bS` grid.
+//! modification using `bS`, `β` and `tC`) is implemented by the
+//! per-sample primitives [`luma_beta_tc`] (§8.7.2.5.3 β/tC, Table 8-12
+//! via [`beta_prime`] / [`tc_prime`]), [`luma_sample_decision`]
+//! (§8.7.2.5.6) and [`filter_luma_sample`] (§8.7.2.5.7 strong/weak).
 
 use crate::motion::MotionField;
 
@@ -216,6 +218,184 @@ pub fn derive_boundary_strength(
     BoundaryStrength { n_cbs, bs }
 }
 
+/// Table 8-12 — `β′` as a function of the input variable `Q` (0..=51).
+///
+/// The deblocking threshold `β′` is 0 for `Q < 16`, then rises in the
+/// pattern documented in Table 8-12. `Q` outside `0..=51` returns the
+/// boundary value (the callers clip `Q` to `0..=51` for `β′`, eq. 8-348).
+#[must_use]
+pub fn beta_prime(q: i32) -> i32 {
+    const BETA: [i32; 52] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Q 0..15
+        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, // Q 16..31
+        26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, // Q 32..47
+        58, 60, 62, 64, // Q 48..51
+    ];
+    BETA[q.clamp(0, 51) as usize]
+}
+
+/// Table 8-12 — `tC′` as a function of the input variable `Q` (0..=53).
+///
+/// The clipping threshold `tC′` is 0 for `Q <= 17`, `1` at `Q = 18`,
+/// then rises per Table 8-12 up to `24` at `Q = 53`. `Q` outside
+/// `0..=53` returns the boundary value (callers clip `Q` to `0..=53`,
+/// eqs. 8-350 / 8-383).
+#[must_use]
+pub fn tc_prime(q: i32) -> i32 {
+    const TC: [i32; 54] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // Q 0..18
+        1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, // Q 19..37
+        5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24, // Q 38..53
+    ];
+    TC[q.clamp(0, 53) as usize]
+}
+
+/// §8.7.2.5.3 — derive `β` and `tC` for a luma block edge.
+///
+/// `qp_q` / `qp_p` are the `QpY` values of the coding units containing
+/// the `q0,0` and `p0,0` samples; `bs` is the §8.7.2.4 boundary strength
+/// (must be 1 or 2 for a filtered edge); `beta_offset_div2` /
+/// `tc_offset_div2` are the per-slice `slice_beta_offset_div2` /
+/// `slice_tc_offset_div2` syntax-element values; `bit_depth` is
+/// `BitDepthY`.
+///
+/// Returns `(β, tC)` per eqs. 8-347..8-351.
+#[must_use]
+pub fn luma_beta_tc(
+    qp_q: i32,
+    qp_p: i32,
+    bs: u8,
+    beta_offset_div2: i32,
+    tc_offset_div2: i32,
+    bit_depth: u8,
+) -> (i32, i32) {
+    let qp_l = (qp_q + qp_p + 1) >> 1; // eq. 8-347
+    let q_beta = (qp_l + (beta_offset_div2 << 1)).clamp(0, 51); // eq. 8-348
+    let beta = beta_prime(q_beta) * (1 << (i32::from(bit_depth) - 8)); // eq. 8-349
+    let q_tc = (qp_l + 2 * (i32::from(bs) - 1) + (tc_offset_div2 << 1)).clamp(0, 53); // eq. 8-350
+    let tc = tc_prime(q_tc) * (1 << (i32::from(bit_depth) - 8)); // eq. 8-351
+    (beta, tc)
+}
+
+/// §8.7.2.5.6 — decision process for a luma sample.
+///
+/// Returns `dSam`: `true` (1) when the long (strong) filter conditions
+/// across `p0`/`p3`/`q0`/`q3` hold, given `dpq`, `β` and `tC`.
+#[inline]
+#[must_use]
+pub fn luma_sample_decision(
+    p0: i32,
+    p3: i32,
+    q0: i32,
+    q3: i32,
+    dpq: i32,
+    beta: i32,
+    tc: i32,
+) -> bool {
+    dpq < (beta >> 2)
+        && (p3 - p0).abs() + (q0 - q3).abs() < (beta >> 3)
+        && (p0 - q0).abs() < (5 * tc + 1) >> 1
+}
+
+/// Decisions emitted by the §8.7.2.5.3 luma edge decision process for a
+/// 4-row edge segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LumaEdgeDecision {
+    /// `dE`: 0 = no filtering, 1 = weak (normal), 2 = strong (long).
+    pub de: u8,
+    /// `dEp`: when 1, the `p1` sample is also filtered (weak filter).
+    pub dep: u8,
+    /// `dEq`: when 1, the `q1` sample is also filtered (weak filter).
+    pub deq: u8,
+    /// `β` (eq. 8-349).
+    pub beta: i32,
+    /// `tC` (eq. 8-351).
+    pub tc: i32,
+}
+
+/// The result of §8.7.2.5.7 luma-sample filtering for one boundary row.
+///
+/// `p[i]` / `q[i]` are the filtered sample values (`pi'` / `qj'`); only
+/// the first `ndp` `p[]` and `ndq` `q[]` entries are valid replacements
+/// for the input samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LumaFilterOut {
+    /// `nDp` — number of filtered samples on the p side (0..=3).
+    pub ndp: usize,
+    /// `nDq` — number of filtered samples on the q side (0..=3).
+    pub ndq: usize,
+    /// `p0'`, `p1'`, `p2'` (only `0..ndp` valid).
+    pub p: [i32; 3],
+    /// `q0'`, `q1'`, `q2'` (only `0..ndq` valid).
+    pub q: [i32; 3],
+}
+
+/// §8.7.2.5.7 — filtering process for a luma sample row.
+///
+/// `p` / `q` are the four samples each side of the boundary (`p[0]` is
+/// `p0`, closest to the edge); `dec` carries `dE` / `dEp` / `dEq` and
+/// `tC`; `bit_depth` is `BitDepthY` for the final `Clip1Y`.
+///
+/// Strong filtering (`dE == 2`) writes `p0'..p2'` / `q0'..q2'`; weak
+/// filtering (`dE == 1`) writes `p0'` (+`p1'` when `dEp`) and `q0'`
+/// (+`q1'` when `dEq`). The PCM / transquant-bypass / palette
+/// suppressions are applied by the caller (they need per-CU state).
+#[must_use]
+pub fn filter_luma_sample(
+    p: [i32; 4],
+    q: [i32; 4],
+    de: u8,
+    dep: u8,
+    deq: u8,
+    tc: i32,
+    bit_depth: u8,
+) -> LumaFilterOut {
+    let [p0, p1, p2, p3] = p;
+    let [q0, q1, q2, q3] = q;
+    let clip = |v: i32| crate::picture::clip1(v, bit_depth);
+    if de == 2 {
+        // Strong filter (eqs. 8-389..8-394).
+        let p0p =
+            (p0 - 2 * tc).max((p0 + 2 * tc).min((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3));
+        let p1p = (p1 - 2 * tc).max((p1 + 2 * tc).min((p2 + p1 + p0 + q0 + 2) >> 2));
+        let p2p = (p2 - 2 * tc).max((p2 + 2 * tc).min((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3));
+        let q0p =
+            (q0 - 2 * tc).max((q0 + 2 * tc).min((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3));
+        let q1p = (q1 - 2 * tc).max((q1 + 2 * tc).min((p0 + q0 + q1 + q2 + 2) >> 2));
+        let q2p = (q2 - 2 * tc).max((q2 + 2 * tc).min((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3));
+        return LumaFilterOut {
+            ndp: 3,
+            ndq: 3,
+            p: [p0p, p1p, p2p],
+            q: [q0p, q1p, q2p],
+        };
+    }
+    // Weak filter (eqs. 8-395..8-402).
+    let mut out = LumaFilterOut {
+        ndp: 0,
+        ndq: 0,
+        p: [p0, p1, p2],
+        q: [q0, q1, q2],
+    };
+    let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4; // eq. 8-395
+    if delta.abs() < tc * 10 {
+        let delta = delta.clamp(-tc, tc); // eq. 8-396
+        out.p[0] = clip(p0 + delta); // eq. 8-397
+        out.q[0] = clip(q0 - delta); // eq. 8-398
+        if dep == 1 {
+            let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1); // eq. 8-399
+            out.p[1] = clip(p1 + dp); // eq. 8-400
+        }
+        if deq == 1 {
+            let dq = ((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1); // eq. 8-401
+            out.q[1] = clip(q1 + dq); // eq. 8-402
+        }
+        out.ndp = (dep + 1) as usize; // eq. 8-403 (nDp = dEp + 1)
+        out.ndq = (deq + 1) as usize; // (nDq = dEq + 1)
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +580,97 @@ mod tests {
         let bs =
             derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
         assert_eq!(bs.at(8, 0), 1);
+    }
+
+    // ----- §8.7.2.5.3 / .6 / .7 luma filtering primitives -----
+
+    /// Table 8-12 spot checks: β′ is 0 below Q=16 and tracks the listed
+    /// breakpoints; tC′ is 0 up to Q=17 and 1 at Q=18.
+    #[test]
+    fn table_8_12_breakpoints() {
+        assert_eq!(beta_prime(15), 0);
+        assert_eq!(beta_prime(16), 6);
+        assert_eq!(beta_prime(29), 20);
+        assert_eq!(beta_prime(51), 64);
+        assert_eq!(tc_prime(17), 0);
+        assert_eq!(tc_prime(18), 1);
+        assert_eq!(tc_prime(53), 24);
+        // Clip behaviour at the table edges.
+        assert_eq!(beta_prime(-3), 0);
+        assert_eq!(tc_prime(99), 24);
+    }
+
+    /// §8.7.2.5.3 β/tC at 8-bit: qPL = (QpQ+QpP+1)>>1, no offsets, bS=2.
+    /// QpQ=QpP=37 ⇒ qPL=37 ⇒ Q_beta=37 ⇒ β′=36, β=36; Q_tc=37+2=39 ⇒
+    /// tC′=5, tC=5.
+    #[test]
+    fn luma_beta_tc_no_offset_8bit() {
+        let (beta, tc) = luma_beta_tc(37, 37, 2, 0, 0, 8);
+        assert_eq!(beta, 36);
+        assert_eq!(tc, 5);
+        // bS=1 lowers the tC index by 2 (Q_tc=37): tC′=4.
+        let (_, tc1) = luma_beta_tc(37, 37, 1, 0, 0, 8);
+        assert_eq!(tc1, 4);
+    }
+
+    /// 10-bit scaling: β and tC are multiplied by 1<<(BitDepthY−8)=4.
+    #[test]
+    fn luma_beta_tc_10bit_scaled() {
+        let (beta, tc) = luma_beta_tc(37, 37, 2, 0, 0, 10);
+        assert_eq!(beta, 36 * 4);
+        assert_eq!(tc, 5 * 4);
+    }
+
+    /// §8.7.2.5.6: a flat region (all-equal samples) passes the decision.
+    #[test]
+    fn luma_sample_decision_flat_passes() {
+        // dpq=0 < β>>2; |p3−p0|+|q0−q3|=0 < β>>3; |p0−q0|=0 < (5tC+1)>>1.
+        assert!(luma_sample_decision(128, 128, 128, 128, 0, 32, 4));
+        // A large step at the boundary fails the |p0−q0| test.
+        assert!(!luma_sample_decision(64, 64, 200, 200, 0, 32, 4));
+    }
+
+    /// §8.7.2.5.7 strong filter: a flat block stays flat (idempotent).
+    #[test]
+    fn strong_filter_flat_is_idempotent() {
+        let s = [100; 4];
+        let out = filter_luma_sample(s, s, 2, 0, 0, 6, 8);
+        assert_eq!(out.ndp, 3);
+        assert_eq!(out.ndq, 3);
+        assert_eq!(out.p, [100, 100, 100]);
+        assert_eq!(out.q, [100, 100, 100]);
+    }
+
+    /// §8.7.2.5.7 strong filter clips each output to ±2·tC of the input.
+    #[test]
+    fn strong_filter_clips_to_two_tc() {
+        // A hard step: p side 0, q side 255. tC=2 ⇒ p0' clipped to
+        // p0+2·tC = 0+4 = 4; q0' clipped to q0−2·tC = 255−4 = 251.
+        let out = filter_luma_sample([0, 0, 0, 0], [255, 255, 255, 255], 2, 0, 0, 2, 8);
+        assert_eq!(out.p[0], 4);
+        assert_eq!(out.q[0], 251);
+    }
+
+    /// §8.7.2.5.7 weak filter: small ramp, dEp=dEq=0 filters only p0/q0.
+    /// p0=98,q0=102,p1=q1=100 ⇒ δ=(9·4−3·0+8)>>4=2; |δ|<10·tC; clamp to
+    /// [−tC,tC]=2 ⇒ p0'=100, q0'=100; nDp=nDq=1.
+    #[test]
+    fn weak_filter_centres_small_step() {
+        let out = filter_luma_sample([98, 100, 100, 100], [102, 100, 100, 100], 1, 0, 0, 5, 8);
+        assert_eq!(out.ndp, 1);
+        assert_eq!(out.ndq, 1);
+        assert_eq!(out.p[0], 100);
+        assert_eq!(out.q[0], 100);
+    }
+
+    /// §8.7.2.5.7 weak filter no-op when |δ| ≥ 10·tC.
+    #[test]
+    fn weak_filter_skips_large_delta() {
+        // Big step with tiny tC ⇒ |δ| ≥ 10·tC ⇒ nDp=nDq=0, no change.
+        let out = filter_luma_sample([0, 0, 0, 0], [255, 255, 255, 255], 1, 1, 1, 1, 8);
+        assert_eq!(out.ndp, 0);
+        assert_eq!(out.ndq, 0);
+        assert_eq!(out.p[0], 0);
+        assert_eq!(out.q[0], 255);
     }
 }
