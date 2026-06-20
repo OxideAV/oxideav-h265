@@ -17,7 +17,10 @@
 //! modification using `bS`, `β` and `tC`) is implemented by the
 //! per-sample primitives [`luma_beta_tc`] (§8.7.2.5.3 β/tC, Table 8-12
 //! via [`beta_prime`] / [`tc_prime`]), [`luma_sample_decision`]
-//! (§8.7.2.5.6) and [`filter_luma_sample`] (§8.7.2.5.7 strong/weak).
+//! (§8.7.2.5.6), [`luma_edge_decision`] (§8.7.2.5.3 `dE`/`dEp`/`dEq`)
+//! and [`filter_luma_sample`] (§8.7.2.5.7 strong/weak), plus the chroma
+//! path [`chroma_tc`] (§8.7.2.5.5, Table 8-10 via [`chroma_qpc_420`])
+//! and [`filter_chroma_sample`] (§8.7.2.5.8).
 
 use crate::motion::MotionField;
 
@@ -396,6 +399,132 @@ pub fn filter_luma_sample(
     out
 }
 
+/// §8.7.2.5.3 — decision process for a luma block edge.
+///
+/// `p` / `q` are the `(i=0..3) × (k=0,3)` sample grids on each side of
+/// the edge, laid out as `p[i][k_idx]` where `k_idx` selects row 0 or
+/// row 3 of the edge segment (`p[i][0]` = `pi,0`, `p[i][1]` = `pi,3`).
+/// `beta` / `tc` come from [`luma_beta_tc`]. Returns the
+/// [`LumaEdgeDecision`] (`dE`, `dEp`, `dEq`) that drives §8.7.2.5.4.
+///
+/// The result's `beta` / `tc` fields echo the inputs so a caller can
+/// pass the whole decision straight into [`filter_luma_sample`].
+#[must_use]
+pub fn luma_edge_decision(
+    p: [[i32; 2]; 4],
+    q: [[i32; 2]; 4],
+    beta: i32,
+    tc: i32,
+) -> LumaEdgeDecision {
+    // Row 0 (k_idx 0) and row 3 (k_idx 1) second differences (eqs.
+    // 8-352..8-360 for EDGE_VER, identical form 8-361..8-369 for HOR).
+    let dp0 = (p[2][0] - 2 * p[1][0] + p[0][0]).abs(); // eq. 8-352
+    let dp3 = (p[2][1] - 2 * p[1][1] + p[0][1]).abs(); // eq. 8-353
+    let dq0 = (q[2][0] - 2 * q[1][0] + q[0][0]).abs(); // eq. 8-354
+    let dq3 = (q[2][1] - 2 * q[1][1] + q[0][1]).abs(); // eq. 8-355
+    let dpq0 = dp0 + dq0; // eq. 8-356
+    let dpq3 = dp3 + dq3; // eq. 8-357
+    let dp = dp0 + dp3; // eq. 8-358
+    let dq = dq0 + dq3; // eq. 8-359
+    let d = dpq0 + dpq3; // eq. 8-360
+
+    let mut dec = LumaEdgeDecision {
+        de: 0,
+        dep: 0,
+        deq: 0,
+        beta,
+        tc,
+    };
+    if d < beta {
+        // Strong/weak split (eqs. 8-360 step 3).
+        let dsam0 = luma_sample_decision(p[0][0], p[3][0], q[0][0], q[3][0], 2 * dpq0, beta, tc);
+        let dsam3 = luma_sample_decision(p[0][1], p[3][1], q[0][1], q[3][1], 2 * dpq3, beta, tc);
+        dec.de = if dsam0 && dsam3 { 2 } else { 1 };
+        let thr = (beta + (beta >> 1)) >> 3;
+        if dp < thr {
+            dec.dep = 1; // eq. step g
+        }
+        if dq < thr {
+            dec.deq = 1; // eq. step h
+        }
+    }
+    dec
+}
+
+/// Table 8-10 — `ChromaArrayType == 1` chroma-QP mapping `QpC = f(qPi)`.
+///
+/// The piecewise mapping is identity below `qPi == 30`, a flat-ish run
+/// `29..37` across `qPi 30..43`, then `qPi − 6` for `qPi >= 44`.
+#[must_use]
+pub fn chroma_qpc_420(qpi: i32) -> i32 {
+    match qpi {
+        x if x < 30 => x,
+        30 => 29,
+        31 => 30,
+        32 => 31,
+        33 => 32,
+        34 => 33,
+        35 => 33,
+        36 => 34,
+        37 => 34,
+        38 => 35,
+        39 => 35,
+        40 => 36,
+        41 => 36,
+        42 => 37,
+        43 => 37,
+        x => x - 6,
+    }
+}
+
+/// §8.7.2.5.5 — derive `tC` for a chroma block edge.
+///
+/// `qp_q` / `qp_p` are the luma `QpY` values of the CUs containing the
+/// `q0,0` / `p0,0` chroma samples; `c_qp_pic_offset` is the picture-level
+/// `pps_cb_qp_offset` / `pps_cr_qp_offset` for the filtered component;
+/// `chroma_array_type` selects Table 8-10 (`== 1`) vs `Min(qPi, 51)`;
+/// `tc_offset_div2` is `slice_tc_offset_div2`; `bit_depth` is
+/// `BitDepthC`.
+///
+/// Returns `tC` per eqs. 8-382..8-384.
+#[must_use]
+pub fn chroma_tc(
+    qp_q: i32,
+    qp_p: i32,
+    c_qp_pic_offset: i32,
+    chroma_array_type: u8,
+    tc_offset_div2: i32,
+    bit_depth: u8,
+) -> i32 {
+    let qpi = ((qp_q + qp_p + 1) >> 1) + c_qp_pic_offset; // eq. 8-382
+    let qp_c = if chroma_array_type == 1 {
+        chroma_qpc_420(qpi)
+    } else {
+        qpi.min(51)
+    };
+    let q = (qp_c + 2 + (tc_offset_div2 << 1)).clamp(0, 53); // eq. 8-383
+    tc_prime(q) * (1 << (i32::from(bit_depth) - 8)) // eq. 8-384
+}
+
+/// §8.7.2.5.8 — filtering process for a chroma sample.
+///
+/// `p` / `q` are the two samples each side of the boundary (`p[0]` is
+/// `p0`, closest to the edge); `tc` is from [`chroma_tc`]; `bit_depth`
+/// is `BitDepthC` for the final `Clip1C`. Returns `(p0', q0')`. The
+/// PCM / transquant-bypass / palette suppressions (which restore the
+/// input sample) are applied by the caller.
+#[inline]
+#[must_use]
+pub fn filter_chroma_sample(p: [i32; 2], q: [i32; 2], tc: i32, bit_depth: u8) -> (i32, i32) {
+    let [p0, p1] = p;
+    let [q0, q1] = q;
+    let delta = (((q0 - p0) << 2) + p1 - q1 + 4) >> 3; // eq. 8-403
+    let delta = delta.clamp(-tc, tc);
+    let p0p = crate::picture::clip1(p0 + delta, bit_depth); // eq. 8-404
+    let q0p = crate::picture::clip1(q0 - delta, bit_depth); // eq. 8-405
+    (p0p, q0p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +801,87 @@ mod tests {
         assert_eq!(out.ndq, 0);
         assert_eq!(out.p[0], 0);
         assert_eq!(out.q[0], 255);
+    }
+
+    // ----- §8.7.2.5.3 edge decision + §8.7.2.5.5 / .8 chroma -----
+
+    /// §8.7.2.5.3: a perfectly flat edge (d=0 < β) with no step picks the
+    /// strong filter (dE=2) and sets dEp=dEq=1 (dp=dq=0 < threshold).
+    #[test]
+    fn edge_decision_flat_is_strong() {
+        let flat = [[128, 128], [128, 128], [128, 128], [128, 128]];
+        let dec = luma_edge_decision(flat, flat, 32, 6);
+        assert_eq!(dec.de, 2);
+        assert_eq!(dec.dep, 1);
+        assert_eq!(dec.deq, 1);
+    }
+
+    /// §8.7.2.5.3: a large hard step (d ≥ β) leaves dE=0 (no filtering).
+    #[test]
+    fn edge_decision_hard_step_no_filter() {
+        // p side ramps strongly so the second differences make d ≥ β.
+        let p = [[0, 0], [60, 60], [0, 0], [0, 0]];
+        let q = [[255, 255], [255, 255], [255, 255], [255, 255]];
+        let dec = luma_edge_decision(p, q, 8, 2);
+        assert_eq!(dec.de, 0);
+        assert_eq!(dec.dep, 0);
+        assert_eq!(dec.deq, 0);
+    }
+
+    /// §8.7.2.5.3: a smooth region that passes d<β but fails the strong
+    /// per-sample decision (a moderate boundary step) selects the weak
+    /// filter (dE=1).
+    #[test]
+    fn edge_decision_moderate_step_is_weak() {
+        // Flat halves with a step at the boundary: second differences are
+        // 0 (d=0<β) but |p0−q0| is large ⇒ luma_sample_decision fails.
+        let p = [[100, 100], [100, 100], [100, 100], [100, 100]];
+        let q = [[140, 140], [140, 140], [140, 140], [140, 140]];
+        let dec = luma_edge_decision(p, q, 64, 4);
+        assert_eq!(dec.de, 1);
+    }
+
+    /// Table 8-10 (4:2:0) chroma-QP mapping breakpoints.
+    #[test]
+    fn table_8_10_chroma_qpc() {
+        assert_eq!(chroma_qpc_420(29), 29);
+        assert_eq!(chroma_qpc_420(30), 29);
+        assert_eq!(chroma_qpc_420(35), 33);
+        assert_eq!(chroma_qpc_420(43), 37);
+        assert_eq!(chroma_qpc_420(44), 38);
+        assert_eq!(chroma_qpc_420(51), 45);
+    }
+
+    /// §8.7.2.5.5 chroma tC: 4:2:0, QpY=37 both sides, no offsets.
+    /// qPi=37 ⇒ QpC=34 (Table 8-10) ⇒ Q=34+2=36 ⇒ tC′=4, tC=4 at 8-bit.
+    #[test]
+    fn chroma_tc_420_8bit() {
+        assert_eq!(chroma_tc(37, 37, 0, 1, 0, 8), 4);
+        // 4:4:4 (chroma_array_type=3): QpC=Min(qPi,51)=37 ⇒ Q=39 ⇒ tC′=5.
+        assert_eq!(chroma_tc(37, 37, 0, 3, 0, 8), 5);
+        // 10-bit scales by 1<<(BitDepthC−8)=4.
+        assert_eq!(chroma_tc(37, 37, 0, 1, 0, 10), 4 * 4);
+    }
+
+    /// §8.7.2.5.8 chroma sample filter: a flat edge is unchanged.
+    #[test]
+    fn chroma_filter_flat_unchanged() {
+        let (p0, q0) = filter_chroma_sample([100, 100], [100, 100], 6, 8);
+        assert_eq!(p0, 100);
+        assert_eq!(q0, 100);
+    }
+
+    /// §8.7.2.5.8 chroma sample filter centres a small step and clips δ.
+    /// p0=98,q0=102,p1=q1=100 ⇒ δ=((4·4)+0+4)>>3 = 20>>3 = 2 ⇒ clamp 2 ⇒
+    /// p0'=100, q0'=100.
+    #[test]
+    fn chroma_filter_small_step() {
+        let (p0, q0) = filter_chroma_sample([98, 100], [102, 100], 6, 8);
+        assert_eq!(p0, 100);
+        assert_eq!(q0, 100);
+        // tC clamp: hard step 0/255, tC=3 ⇒ δ clamped to 3.
+        let (p0, q0) = filter_chroma_sample([0, 0], [255, 255], 3, 8);
+        assert_eq!(p0, 3);
+        assert_eq!(q0, 252);
     }
 }
