@@ -261,6 +261,10 @@ pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
 };
+pub use inter_pred::{
+    default_weighted_pred, interp_chroma_block, interp_luma_block, predict_inter_pu,
+    InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, RefPlane,
+};
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
