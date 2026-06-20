@@ -20,7 +20,10 @@
 //! (§8.7.2.5.6), [`luma_edge_decision`] (§8.7.2.5.3 `dE`/`dEp`/`dEq`)
 //! and [`filter_luma_sample`] (§8.7.2.5.7 strong/weak), plus the chroma
 //! path [`chroma_tc`] (§8.7.2.5.5, Table 8-10 via [`chroma_qpc_420`])
-//! and [`filter_chroma_sample`] (§8.7.2.5.8).
+//! and [`filter_chroma_sample`] (§8.7.2.5.8). The plane-level block-edge
+//! drivers [`filter_luma_block_edge`] (§8.7.2.5.4) and
+//! [`filter_chroma_block_edge`] (§8.7.2.5.5) gather/apply those
+//! primitives across a 4-row edge segment of a [`SamplePlane`] in place.
 
 use crate::motion::MotionField;
 
@@ -525,6 +528,219 @@ pub fn filter_chroma_sample(p: [i32; 2], q: [i32; 2], tc: i32, bit_depth: u8) ->
     (p0p, q0p)
 }
 
+/// A mutable sample plane: row-major `samples[y * stride + x]`.
+///
+/// The §8.7.2.5.4 / .5 block-edge filtering processes read and write
+/// this plane in place. Callers wrap their reconstructed luma / chroma
+/// component buffer (as `i32` samples) in a [`SamplePlane`].
+pub struct SamplePlane<'a> {
+    /// Row-major sample storage, `width * height` long.
+    pub samples: &'a mut [i32],
+    /// Plane width in samples.
+    pub width: usize,
+    /// Row stride in samples (usually equal to `width`).
+    pub stride: usize,
+}
+
+impl core::fmt::Debug for SamplePlane<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SamplePlane")
+            .field("len", &self.samples.len())
+            .field("width", &self.width)
+            .field("stride", &self.stride)
+            .finish()
+    }
+}
+
+impl SamplePlane<'_> {
+    #[inline]
+    fn get(&self, x: usize, y: usize) -> i32 {
+        self.samples[y * self.stride + x]
+    }
+    #[inline]
+    fn set(&mut self, x: usize, y: usize, v: i32) {
+        self.samples[y * self.stride + x] = v;
+    }
+    /// `(x, y)` plane coordinates for the `i`-th sample on the p (`pi`,
+    /// negative side) or q (`qi`, positive side) of an edge at `(ex, ey)`
+    /// for row offset `k` along the edge.
+    #[inline]
+    fn edge_xy(
+        &self,
+        ex: usize,
+        ey: usize,
+        edge: EdgeType,
+        side_p: bool,
+        i: usize,
+        k: usize,
+    ) -> (usize, usize) {
+        match (edge, side_p) {
+            // EDGE_VER: q at x = ex+i, p at x = ex-i-1; both at y = ey+k.
+            (EdgeType::Vertical, false) => (ex + i, ey + k),
+            (EdgeType::Vertical, true) => (ex - i - 1, ey + k),
+            // EDGE_HOR: q at y = ey+i, p at y = ey-i-1; both at x = ex+k.
+            (EdgeType::Horizontal, false) => (ex + k, ey + i),
+            (EdgeType::Horizontal, true) => (ex + k, ey - i - 1),
+        }
+    }
+}
+
+/// The position + orientation of one 4-row deblocking edge segment.
+///
+/// `(ex, ey)` is the plane location of `q0,0`: for `EDGE_VER` the column
+/// `ex` is the first q-side column; for `EDGE_HOR` the row `ey` is the
+/// first q-side row.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgePos {
+    /// `q0,0` x location in the plane.
+    pub ex: usize,
+    /// `q0,0` y location in the plane.
+    pub ey: usize,
+    /// Edge orientation (`EDGE_VER` / `EDGE_HOR`).
+    pub edge: EdgeType,
+}
+
+/// The §8.7.2.5.3 / .5 QP + offset context for one block edge.
+///
+/// `qp_q` / `qp_p` are the `QpY` values of the CUs containing `q0,0` /
+/// `p0,0`; the `*_div2` fields are the per-slice
+/// `slice_beta_offset_div2` / `slice_tc_offset_div2`; `bit_depth` is
+/// `BitDepthY` (luma) or `BitDepthC` (chroma).
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeQp {
+    /// `QpY` of the q-side CU.
+    pub qp_q: i32,
+    /// `QpY` of the p-side CU.
+    pub qp_p: i32,
+    /// `slice_beta_offset_div2` (luma only; ignored for chroma).
+    pub beta_offset_div2: i32,
+    /// `slice_tc_offset_div2`.
+    pub tc_offset_div2: i32,
+    /// `BitDepthY` (luma) or `BitDepthC` (chroma).
+    pub bit_depth: u8,
+}
+
+/// §8.7.2.5.4 — filtering process for a luma block edge.
+///
+/// Filters the 4-row edge segment positioned by `pos` (the `q0,0`
+/// boundary location). `bs` (1 or 2) and the [`EdgeQp`] context drive
+/// [`luma_beta_tc`] / [`luma_edge_decision`] / [`filter_luma_sample`].
+///
+/// Returns the [`LumaEdgeDecision`] that was applied (for inspection /
+/// trace); the plane is modified in place. A `bs == 0` edge is a no-op.
+///
+/// # Panics
+/// Panics if the edge segment reads/writes outside the plane.
+pub fn filter_luma_block_edge(
+    plane: &mut SamplePlane<'_>,
+    pos: EdgePos,
+    bs: u8,
+    qp: EdgeQp,
+) -> LumaEdgeDecision {
+    let EdgePos { ex, ey, edge } = pos;
+    let zero = LumaEdgeDecision {
+        de: 0,
+        dep: 0,
+        deq: 0,
+        beta: 0,
+        tc: 0,
+    };
+    if bs == 0 {
+        return zero;
+    }
+    let (beta, tc) = luma_beta_tc(
+        qp.qp_q,
+        qp.qp_p,
+        bs,
+        qp.beta_offset_div2,
+        qp.tc_offset_div2,
+        qp.bit_depth,
+    );
+    let bit_depth = qp.bit_depth;
+    // Gather the decision grid: rows k=0 and k=3, samples i=0..3 each side.
+    let mut pg = [[0i32; 2]; 4];
+    let mut qg = [[0i32; 2]; 4];
+    for (k_idx, &k) in [0usize, 3].iter().enumerate() {
+        for i in 0..4 {
+            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
+            pg[i][k_idx] = plane.get(px, py);
+            qg[i][k_idx] = plane.get(qx, qy);
+        }
+    }
+    let dec = luma_edge_decision(pg, qg, beta, tc);
+    if dec.de == 0 {
+        return dec;
+    }
+    // Apply the filter to each of the 4 rows (eq. 8-372/8-373 layout).
+    for k in 0..4 {
+        let mut p = [0i32; 4];
+        let mut q = [0i32; 4];
+        for i in 0..4 {
+            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
+            p[i] = plane.get(px, py);
+            q[i] = plane.get(qx, qy);
+        }
+        let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
+        for i in 0..out.ndp {
+            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+            plane.set(px, py, out.p[i]);
+        }
+        for j in 0..out.ndq {
+            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
+            plane.set(qx, qy, out.q[j]);
+        }
+    }
+    dec
+}
+
+/// §8.7.2.5.5 — filtering process for a chroma block edge.
+///
+/// Filters the 4-row chroma edge segment positioned by `pos` (the `q0,0`
+/// chroma location). The [`EdgeQp`] context carries the luma `QpY`
+/// values + `slice_tc_offset_div2` + `BitDepthC`; `c_qp_pic_offset` is
+/// the picture chroma offset; `chroma_array_type` selects Table 8-10
+/// (`== 1`) vs `Min(qPi, 51)`. Only `p0`/`q0` are modified (eqs.
+/// 8-385..8-388). Returns the `tC` that was applied.
+///
+/// # Panics
+/// Panics if the edge segment reads/writes outside the plane.
+pub fn filter_chroma_block_edge(
+    plane: &mut SamplePlane<'_>,
+    pos: EdgePos,
+    qp: EdgeQp,
+    c_qp_pic_offset: i32,
+    chroma_array_type: u8,
+) -> i32 {
+    let EdgePos { ex, ey, edge } = pos;
+    let bit_depth = qp.bit_depth;
+    let tc = chroma_tc(
+        qp.qp_q,
+        qp.qp_p,
+        c_qp_pic_offset,
+        chroma_array_type,
+        qp.tc_offset_div2,
+        bit_depth,
+    );
+    for k in 0..4 {
+        let mut p = [0i32; 2];
+        let mut q = [0i32; 2];
+        for i in 0..2 {
+            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
+            p[i] = plane.get(px, py);
+            q[i] = plane.get(qx, qy);
+        }
+        let (p0p, q0p) = filter_chroma_sample(p, q, tc, bit_depth);
+        let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
+        let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
+        plane.set(px, py, p0p);
+        plane.set(qx, qy, q0p);
+    }
+    tc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,5 +1099,164 @@ mod tests {
         let (p0, q0) = filter_chroma_sample([0, 0], [255, 255], 3, 8);
         assert_eq!(p0, 3);
         assert_eq!(q0, 252);
+    }
+
+    // ----- §8.7.2.5.4 / .5 plane-level block-edge filtering -----
+
+    /// A vertical edge at plane `(x, y)`.
+    fn vpos(x: usize, y: usize) -> EdgePos {
+        EdgePos {
+            ex: x,
+            ey: y,
+            edge: EdgeType::Vertical,
+        }
+    }
+
+    /// 8-bit QP context with no slice offsets.
+    fn qp8(qp_q: i32, qp_p: i32) -> EdgeQp {
+        EdgeQp {
+            qp_q,
+            qp_p,
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            bit_depth: 8,
+        }
+    }
+
+    /// Build a `w×h` plane filled with a constant value plus a single
+    /// vertical step at column `step_x` (left = `lo`, right = `hi`).
+    fn vstep_plane(w: usize, h: usize, step_x: usize, lo: i32, hi: i32) -> Vec<i32> {
+        let mut v = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                v[y * w + x] = if x < step_x { lo } else { hi };
+            }
+        }
+        v
+    }
+
+    /// §8.7.2.5.4 EDGE_VER: a small uniform step across a vertical edge
+    /// is smoothed (the boundary columns move toward each other), and the
+    /// strong filter touches 3 samples each side.
+    #[test]
+    fn luma_block_edge_ver_smooths_small_step() {
+        let (w, h) = (16usize, 8usize);
+        // Step of 8 at column 8: left=120, right=128. With low QP the
+        // strong/weak decision fires (flat halves ⇒ d=0 < β).
+        let mut buf = vstep_plane(w, h, 8, 120, 128);
+        let before_p0 = buf[7]; // column 7, row 0 (p0)
+        let before_q0 = buf[8]; // column 8, row 0 (q0)
+        let mut plane = SamplePlane {
+            samples: &mut buf,
+            width: w,
+            stride: w,
+        };
+        // QP 37 both sides ⇒ β=36, tC=5 (bS=2) at 8-bit; step 8 < β.
+        let dec = filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(37, 37));
+        assert_ne!(dec.de, 0, "edge should be filtered");
+        // p0 rose toward the boundary, q0 fell toward it.
+        assert!(plane.get(7, 0) > before_p0);
+        assert!(plane.get(8, 0) < before_q0);
+        // Samples far from the edge (col 0, col 15) are untouched.
+        assert_eq!(plane.get(0, 0), 120);
+        assert_eq!(plane.get(15, 0), 128);
+    }
+
+    /// §8.7.2.5.4: a large step at low QP leaves the plane byte-identical.
+    /// The flat halves pass `d < β` so `dE` may be 1 (weak filter armed),
+    /// but the weak filter's `|δ| < 10·tC` guard fails for the huge step,
+    /// so `nDp = nDq = 0` and no sample is modified.
+    #[test]
+    fn luma_block_edge_ver_skips_large_step() {
+        let (w, h) = (16usize, 8usize);
+        let mut buf = vstep_plane(w, h, 8, 0, 255);
+        let snapshot = buf.clone();
+        let mut plane = SamplePlane {
+            samples: &mut buf,
+            width: w,
+            stride: w,
+        };
+        // Low QP (β=10, tC=1): the weak filter is rejected by the δ guard.
+        filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(20, 20));
+        assert_eq!(*plane.samples, snapshot[..]);
+    }
+
+    /// §8.7.2.5.4 EDGE_HOR mirrors EDGE_VER: a horizontal step at row 4
+    /// is smoothed across the boundary rows.
+    #[test]
+    fn luma_block_edge_hor_smooths_small_step() {
+        let (w, h) = (8usize, 16usize);
+        let mut buf = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                buf[y * w + x] = if y < 8 { 120 } else { 128 };
+            }
+        }
+        let mut plane = SamplePlane {
+            samples: &mut buf,
+            width: w,
+            stride: w,
+        };
+        // Boundary at row 8 (q0,0 row): filter the EDGE_HOR segment at x=0.
+        let pos = EdgePos {
+            ex: 0,
+            ey: 8,
+            edge: EdgeType::Horizontal,
+        };
+        let dec = filter_luma_block_edge(&mut plane, pos, 2, qp8(37, 37));
+        assert_ne!(dec.de, 0);
+        assert!(plane.get(0, 7) > 120); // p0 row rose
+        assert!(plane.get(0, 8) < 128); // q0 row fell
+    }
+
+    /// §8.7.2.5.5 chroma EDGE_VER: only p0/q0 columns are modified; p1/q1
+    /// and farther samples stay put.
+    #[test]
+    fn chroma_block_edge_ver_only_p0_q0() {
+        let (w, h) = (16usize, 8usize);
+        let mut buf = vstep_plane(w, h, 8, 124, 128);
+        let mut plane = SamplePlane {
+            samples: &mut buf,
+            width: w,
+            stride: w,
+        };
+        // 4:2:0, QpY 37 both sides ⇒ tC=4 (8-bit). Step 4 ⇒ δ clamped.
+        filter_chroma_block_edge(&mut plane, vpos(8, 0), qp8(37, 37), 0, 1);
+        // p0 (col 7) and q0 (col 8) move; p1 (col 6) and q1 (col 9) don't.
+        assert!(plane.get(7, 0) > 124);
+        assert!(plane.get(8, 0) < 128);
+        assert_eq!(plane.get(6, 0), 124);
+        assert_eq!(plane.get(9, 0), 128);
+    }
+
+    /// Integration: a 16×16 luma plane with two flat 120/128 halves,
+    /// filter the internal vertical edge with strong-filter QP, and
+    /// confirm the result is monotonic across the (now smoothed) seam and
+    /// stays within the clip bounds of the original samples.
+    #[test]
+    fn integration_internal_vertical_seam() {
+        let (w, h) = (16usize, 16usize);
+        let mut buf = vstep_plane(w, h, 8, 120, 128);
+        let mut plane = SamplePlane {
+            samples: &mut buf,
+            width: w,
+            stride: w,
+        };
+        let dec = filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(40, 40));
+        assert_ne!(dec.de, 0);
+        for y in 0..4 {
+            // Across the seam columns 5..11 the row is non-decreasing
+            // (the filter cannot create overshoot beyond the 120..128
+            // span for this monotone input).
+            for x in 5..11 {
+                let a = plane.get(x, y);
+                let b = plane.get(x + 1, y);
+                assert!(a <= b, "row {y}: col {x}={a} > col {}={b}", x + 1);
+                assert!(
+                    (120..=128).contains(&a),
+                    "col {x} row {y} = {a} out of span"
+                );
+            }
+        }
     }
 }

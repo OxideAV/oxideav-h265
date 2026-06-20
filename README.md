@@ -28,10 +28,15 @@ to pixels: the §8.5.3.3.1 block-walk driver, §8.5.3.2 motion-vector
 reconstruction / chroma-MV derivation, and the §8.5/§8.6.5 inter PU
 reconstruction-into-`Picture` path are wired (a uni-/bi-predictive PU
 with a resolved motion vector + reference picture reconstructs to bit
-pixels), and the §8.7.2.4 deblocking boundary-strength derivation lands.
+pixels), the §8.7.2.4 deblocking boundary-strength derivation lands, and
+the §8.7.2.5 deblocking edge-filtering process (luma strong/weak +
+chroma sample filters, Table 8-12 β′/tC′, Table 8-10 chroma QpC, applied
+in place across a `SamplePlane` by `filter_luma_block_edge` /
+`filter_chroma_block_edge`) is implemented.
 What remains for an end-to-end inter fixture is the §8.5.3.2.2/.3/.6/.7
 merge/MVP **candidate** derivation (needs neighbour + collocated state),
-the §8.7.2.5 edge filtering, SAO apply, a full DPB, and multi-CTU /
+the §8.7.2.2/.3 edge-flag + picture-level deblock driver, SAO apply, a
+full DPB, and multi-CTU /
 multi-slice / tile / WPP picture assembly. The runtime registration hook
 (`register`) is a no-op and the top-level decode entry point still
 returns `Error::NotImplemented` until the picture-level driver and DPB
@@ -224,6 +229,20 @@ reconstruction are usable directly through the public `recon` /
   (different reference-picture set / number of MVs, single-MV |Δ| ≥ 4, the
   bi-predictive cross-list and same-reference straight + crossed tests)
   ⇒ 1; otherwise 0, reading the per-4×4 motion state from a `MotionField`.
+* **Deblocking edge filtering (§8.7.2.5)** — the per-sample core of the
+  filter: `beta_prime` / `tc_prime` (Table 8-12 β′/tC′), `luma_beta_tc`
+  (§8.7.2.5.3 β/tC, eqs. 8-347..8-351), `luma_edge_decision` (§8.7.2.5.3
+  `dE`/`dEp`/`dEq` over the 4-row segment) feeding `luma_sample_decision`
+  (§8.7.2.5.6), `filter_luma_sample` (§8.7.2.5.7 strong eqs. 8-389..8-394
+  / weak eqs. 8-395..8-402 with ±2·tC clipping), plus the chroma path
+  `chroma_qpc_420` (Table 8-10), `chroma_tc` (§8.7.2.5.5) and
+  `filter_chroma_sample` (§8.7.2.5.8). The plane-level drivers
+  `filter_luma_block_edge` (§8.7.2.5.4) and `filter_chroma_block_edge`
+  (§8.7.2.5.5) gather and apply those primitives in place across a 4-row
+  edge segment of a `SamplePlane`, for both EDGE_VER and EDGE_HOR. What
+  is still missing for a full in-loop deblock is the §8.7.2.2/.3
+  edge-flag derivation and the picture-level edge-walk driver (which
+  needs the decoded partition tree + per-CU QP map).
 
 ## Not yet implemented
 
@@ -231,8 +250,10 @@ reconstruction are usable directly through the public `recon` /
   §8.4 intra-block / §8.5 inter-block sample-write passes that turn the
   `slice_data` module's `CodingTreeUnit` → `CodingQuadtree` →
   `CodingUnit` tree (now decoded end to end; see "What's implemented")
-  into reconstructed luma / chroma planes, the in-loop deblock / SAO
-  application, and DPB management. The §7.3.8 slice-data CABAC
+  into reconstructed luma / chroma planes, the picture-level in-loop
+  deblock edge-walk (the §8.7.2.5 sample filters now exist; the
+  §8.7.2.2/.3 edge-flag + driver do not) / SAO application, and DPB
+  management. The §7.3.8 slice-data CABAC
   syntax-element walk itself — the §7.3.8.3 `sao()`, §7.3.8.2
   `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, §7.3.8.5
   `coding_unit()` and §7.3.8.6 `prediction_unit()` structures — is

@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 350 (2026-06-20)
+
+- `deblock` module — the §8.7.2.5 deblocking edge-filtering process, the
+  sample-modification stage that the §8.7.2.4 bS derivation fed into:
+  - `beta_prime` / `tc_prime`: Table 8-12 β′/tC′ from input Q.
+  - `luma_beta_tc`: §8.7.2.5.3 β/tC derivation (eqs. 8-347..8-351).
+  - `luma_sample_decision` (§8.7.2.5.6) + `luma_edge_decision`
+    (§8.7.2.5.3 dE/dEp/dEq over the 4-row segment).
+  - `filter_luma_sample`: §8.7.2.5.7 strong (eqs. 8-389..8-394) and weak
+    (eqs. 8-395..8-402) luma sample filters with ±2·tC clipping.
+  - `chroma_qpc_420` (Table 8-10), `chroma_tc` (§8.7.2.5.5) and
+    `filter_chroma_sample` (§8.7.2.5.8) for the chroma path.
+  - `SamplePlane` + `filter_luma_block_edge` (§8.7.2.5.4) /
+    `filter_chroma_block_edge` (§8.7.2.5.5): plane-level drivers that
+    gather and apply the primitives in place across a 4-row EDGE_VER /
+    EDGE_HOR segment.
+  16 new deblock unit/integration tests (Table 8-12 / 8-10 breakpoints,
+  β/tC at 8/10-bit, flat/step decision paths, strong/weak/chroma filter
+  math, plane-level seam smoothing).
+
 ### Added — clean-room rebuild round 341 (2026-06-19)
 
 - `picture` module — the §8 reconstruction target: a `Picture` holding
