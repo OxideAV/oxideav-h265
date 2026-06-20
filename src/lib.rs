@@ -235,6 +235,7 @@ pub mod ctx_init;
 pub mod hrd;
 pub mod inter_pred;
 pub mod intra_pred;
+pub mod motion;
 pub mod nal;
 pub mod picture;
 pub mod pps;
@@ -264,6 +265,10 @@ pub use hrd::{
 pub use inter_pred::{
     default_weighted_pred, interp_chroma_block, interp_luma_block, predict_inter_pu,
     InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, RefPlane,
+};
+pub use motion::{
+    append_zero_merge_candidates, derive_chroma_mv, reconstruct_mv, MergeCandidate, MotionCell,
+    MotionField, Mv,
 };
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
