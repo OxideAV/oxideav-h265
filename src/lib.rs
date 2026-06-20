@@ -275,7 +275,9 @@ pub use motion::{
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
-pub use recon::{reconstruct_intra_ctu, ReconError, ReconParams};
+pub use recon::{
+    reconstruct_inter_pu, reconstruct_intra_ctu, ReconError, ReconParams, ResolvedList,
+};
 pub use sao::{apply_sao_ctb, apply_sao_picture, ResolvedSao, ResolvedSaoComponent};
 pub use scaling_list::{
     ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,

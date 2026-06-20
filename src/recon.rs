@@ -47,6 +47,8 @@ pub enum ReconError {
     IntraPred(IntraPredError),
     /// A §8.6.2 dequantization / inverse-transform primitive failed.
     Transform(TransformError),
+    /// A §8.5.3.3 inter-prediction primitive failed.
+    InterPred(crate::inter_pred::InterPredError),
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
@@ -57,6 +59,7 @@ impl core::fmt::Display for ReconError {
         match self {
             Self::IntraPred(e) => write!(f, "intra prediction failed: {e}"),
             Self::Transform(e) => write!(f, "inverse transform failed: {e}"),
+            Self::InterPred(e) => write!(f, "inter prediction failed: {e}"),
             Self::InterNotSupported => {
                 f.write_str("inter prediction is not reconstructed by the intra path")
             }
@@ -296,6 +299,155 @@ fn reconstruct_intra_block(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §8.5 inter sample reconstruction
+// ---------------------------------------------------------------------------
+
+use crate::inter_pred::{
+    predict_inter_pu, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
+};
+
+/// One reference list's fully-resolved per-PU motion: the
+/// §8.5.3.2-derived luma motion vector, the §8.5.3.2.10 chroma motion
+/// vector, and the §8.5.3.3.2-selected reference picture.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedList<'a> {
+    /// `predFlagLX` — whether this list contributes.
+    pub pred_flag: bool,
+    /// `mvLX` in quarter-luma-sample units.
+    pub mv_l: [i32; 2],
+    /// `mvCLX` in eighth-chroma-sample units (§8.5.3.2.10).
+    pub mv_c: [i32; 2],
+    /// `RefPicListX[refIdxLX]` — the reference picture's samples.
+    pub ref_pic: &'a Picture,
+}
+
+/// Build the §8.5.3.3.2 [`ListPrediction`] for one reference list,
+/// borrowing the reference picture's luma + (when chroma is present)
+/// Cb / Cr planes for the lifetime `'a`.
+fn build_list_prediction<'a>(
+    list: &ResolvedList<'a>,
+    chroma_array_type: u8,
+) -> Result<ListPrediction<'a>, ReconError> {
+    let (lw, lh) = list.ref_pic.plane_dims(Plane::Luma);
+    let lp =
+        RefPlane::new(list.ref_pic.plane(Plane::Luma), lw, lh).map_err(ReconError::InterPred)?;
+    let (cb, cr) = if chroma_array_type != 0 {
+        let (cw, ch) = list.ref_pic.plane_dims(Plane::Cb);
+        (
+            Some(
+                RefPlane::new(list.ref_pic.plane(Plane::Cb), cw, ch)
+                    .map_err(ReconError::InterPred)?,
+            ),
+            Some(
+                RefPlane::new(list.ref_pic.plane(Plane::Cr), cw, ch)
+                    .map_err(ReconError::InterPred)?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(ListPrediction {
+        pred_flag: list.pred_flag,
+        luma: lp,
+        cb,
+        cr,
+        mv_l: list.mv_l,
+        mv_c: list.mv_c,
+    })
+}
+
+/// §8.5.3.3 — reconstruct one inter prediction unit's motion-compensated
+/// prediction into `pic`, then (when a residual block is supplied) add
+/// the §8.6.2 residual and §8.6.5 / §8.4.4.1 clip.
+///
+/// `(x_pb, y_pb)` is the PU's luma top-left; `(n_pb_w, n_pb_h)` its luma
+/// size. The L0 / L1 lists carry the resolved motion + reference picture.
+/// `residual_luma` / `residual_cb` / `residual_cr` are the optional
+/// §8.6.2-output residual arrays (already dequantized + inverse
+/// transformed) for the PU's covering transform blocks; pass `None` for a
+/// skip / zero-residual PU (the prediction is written directly).
+///
+/// # Errors
+/// Propagates [`ReconError::InterNotSupported`] reuse is avoided here; the
+/// §8.5.3.3 interpolation failures surface as [`ReconError`] via the
+/// `InterPred` variant carrying the [`crate::inter_pred::InterPredError`].
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_pu(
+    pic: &mut Picture,
+    params: &ReconParams,
+    x_pb: usize,
+    y_pb: usize,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    l0: ResolvedList<'_>,
+    l1: ResolvedList<'_>,
+    residual_luma: Option<&[i32]>,
+    residual_cb: Option<&[i32]>,
+    residual_cr: Option<&[i32]>,
+) -> Result<(), ReconError> {
+    let cat = params.chroma_array_type;
+    // Build the §8.5.3.3.2 reference planes for each used list.
+    let lp0 = build_list_prediction(&l0, cat)?;
+    let lp1 = build_list_prediction(&l1, cat)?;
+    let geom = InterPredGeometry {
+        x_pb: x_pb as i32,
+        y_pb: y_pb as i32,
+        n_pb_w,
+        n_pb_h,
+        chroma_array_type: cat,
+        bit_depth_luma: params.bit_depth_luma,
+        bit_depth_chroma: params.bit_depth_chroma,
+    };
+    let InterPrediction { luma, cb, cr } =
+        predict_inter_pu(&lp0, &lp1, &geom).map_err(ReconError::InterPred)?;
+
+    // §8.6.5 / §8.4.4.1: recSamples = Clip1( predSamples + resSamples ).
+    write_inter_plane(
+        pic,
+        Plane::Luma,
+        x_pb,
+        y_pb,
+        n_pb_w,
+        n_pb_h,
+        &luma,
+        residual_luma,
+    );
+    if cat != 0 {
+        let (sw, sh) = sub_wh_c(cat);
+        let xc = x_pb / sw;
+        let yc = y_pb / sh;
+        let pcw = n_pb_w / sw;
+        let pch = n_pb_h / sh;
+        write_inter_plane(pic, Plane::Cb, xc, yc, pcw, pch, &cb, residual_cb);
+        write_inter_plane(pic, Plane::Cr, xc, yc, pcw, pch, &cr, residual_cr);
+    }
+    Ok(())
+}
+
+/// Write one motion-compensated prediction plane plus its optional
+/// residual into `pic` with the §8.4.4.1 clip.
+#[allow(clippy::too_many_arguments)]
+fn write_inter_plane(
+    pic: &mut Picture,
+    plane: Plane,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    pred: &[i32],
+    residual: Option<&[i32]>,
+) {
+    let bit_depth = pic.bit_depth(plane);
+    for y in 0..h {
+        for x in 0..w {
+            let p = pred[y * w + x];
+            let r = residual.map_or(0, |r| r[y * w + x]);
+            pic.set_sample(plane, x0 + x, y0 + y, clip1(p + r, bit_depth));
+        }
+    }
 }
 
 /// Map an `IpComponent` for the plane / cIdx pair.
@@ -725,6 +877,110 @@ mod tests {
             reconstruct_intra_ctu(&mut pic, &params, &ctu),
             Err(ReconError::InterNotSupported)
         );
+    }
+
+    /// End-to-end §8.5 inter reconstruction: a uni-L0 P-block with a
+    /// full-pel motion vector copies a shifted reference window, then a
+    /// uniform residual is added and clipped.
+    #[test]
+    fn inter_uni_l0_full_pel_reconstructs() {
+        let params = tiny_params();
+        // Reference picture: luma ramp sample(x,y) == x (mod 256), flat
+        // chroma 128.
+        let mut refpic = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                refpic.set_sample(Plane::Luma, x, y, x as i32);
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                refpic.set_sample(Plane::Cb, x, y, 128);
+                refpic.set_sample(Plane::Cr, x, y, 128);
+            }
+        }
+        let l0 = ResolvedList {
+            pred_flag: true,
+            mv_l: [8, 0], // +2 full luma samples right.
+            mv_c: [8, 0], // 4:2:0 ⇒ mvC = mvL.
+            ref_pic: &refpic,
+        };
+        // Unused L1 points at the same picture but pred_flag is false.
+        let l1 = ResolvedList {
+            pred_flag: false,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+            ref_pic: &refpic,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        // A flat +5 luma residual over the 8x8 PU at (0,0).
+        let res = vec![5i32; 8 * 8];
+        reconstruct_inter_pu(
+            &mut pic,
+            &params,
+            0,
+            0,
+            8,
+            8,
+            l0,
+            l1,
+            Some(&res),
+            None,
+            None,
+        )
+        .unwrap();
+        // predSamples[xL] reads ref column xPb + 2 + xL = 2 + xL; + 5 res.
+        for yl in 0..8 {
+            for xl in 0..8 {
+                assert_eq!(
+                    pic.sample(Plane::Luma, xl, yl),
+                    (2 + xl as i32) + 5,
+                    "luma ({xl},{yl})"
+                );
+            }
+        }
+        // Chroma: flat 128 prediction, no residual ⇒ 128.
+        for yc in 0..4 {
+            for xc in 0..4 {
+                assert_eq!(pic.sample(Plane::Cb, xc, yc), 128);
+                assert_eq!(pic.sample(Plane::Cr, xc, yc), 128);
+            }
+        }
+    }
+
+    /// Bi-prediction averages two reference windows; a clip guards the
+    /// out-of-range sum.
+    #[test]
+    fn inter_bi_averages_and_clips() {
+        let params = tiny_params();
+        let mut a = Picture::new(16, 16, 1, 8, 8);
+        let mut b = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                a.set_sample(Plane::Luma, x, y, 40);
+                b.set_sample(Plane::Luma, x, y, 200);
+            }
+        }
+        let l0 = ResolvedList {
+            pred_flag: true,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+            ref_pic: &a,
+        };
+        let l1 = ResolvedList {
+            pred_flag: true,
+            mv_l: [0, 0],
+            mv_c: [0, 0],
+            ref_pic: &b,
+        };
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        reconstruct_inter_pu(&mut pic, &params, 0, 0, 8, 8, l0, l1, None, None, None).unwrap();
+        // (40 + 200) >> 1 == 120.
+        for yl in 0..8 {
+            for xl in 0..8 {
+                assert_eq!(pic.sample(Plane::Luma, xl, yl), 120);
+            }
+        }
     }
 
     #[test]
