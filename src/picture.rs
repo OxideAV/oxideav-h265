@@ -201,6 +201,14 @@ impl Picture {
         self.plane_slice(plane).0
     }
 
+    /// Borrow the raw row-major plane buffer + its row stride (mutable).
+    ///
+    /// Used by the §8.7.2 deblocking driver to wrap a component plane in a
+    /// [`crate::deblock::SamplePlane`] for in-place edge filtering.
+    pub fn plane_mut(&mut self, plane: Plane) -> (&mut [i32], usize) {
+        self.plane_slice_mut(plane)
+    }
+
     /// Pack the three planes into a single planar 8-bit buffer in
     /// `Y` then `Cb` then `Cr` order, each plane row-major. Only valid
     /// for `BitDepth == 8` planes (the common `yuv420p` / `yuv444p`

@@ -27,6 +27,7 @@
 
 use crate::binarization::PartMode;
 use crate::motion::MotionField;
+use crate::picture::{sub_wh_c, Picture, Plane};
 
 /// §8.7.2.1 — the edge orientation being filtered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,6 +958,203 @@ pub fn filter_chroma_block_edge(
     tc
 }
 
+/// The §8.7.2.5.1 / .2 per-CU deblocking context: the QP + offset state a
+/// coding unit contributes to its edge filtering.
+///
+/// `qp_y` is the CU's `QpY`; the `*_offset_div2` are the per-slice
+/// `slice_beta_offset_div2` / `slice_tc_offset_div2`; the `pps_c*_qp_offset`
+/// are the picture chroma QP offsets; the bit depths are `BitDepthY` /
+/// `BitDepthC`. The driver reads neighbour `QpY` from `qp_y_at` so a
+/// boundary edge can use the p-side CU's `QpY` for `qP,p` (eq. 8-347).
+#[derive(Debug, Clone, Copy)]
+pub struct DeblockCuParams {
+    /// The CU's `QpY` (the q-side QP at every edge inside the CU).
+    pub qp_y: i32,
+    /// `slice_beta_offset_div2`.
+    pub beta_offset_div2: i32,
+    /// `slice_tc_offset_div2`.
+    pub tc_offset_div2: i32,
+    /// `pps_cb_qp_offset + slice_cb_qp_offset` for the Cb component.
+    pub cb_qp_offset: i32,
+    /// `pps_cr_qp_offset + slice_cr_qp_offset` for the Cr component.
+    pub cr_qp_offset: i32,
+    /// `BitDepthY`.
+    pub bit_depth_luma: u8,
+    /// `BitDepthC`.
+    pub bit_depth_chroma: u8,
+    /// `ChromaArrayType` (selects Table 8-10 / `Min(qPi,51)` + subsampling).
+    pub chroma_array_type: u8,
+}
+
+/// The geometry + QP context of one coding unit for the §8.7.2.5.1 / .2
+/// edge-filtering driver.
+#[derive(Debug, Clone, Copy)]
+pub struct DeblockCu {
+    /// The CU's luma top-left x.
+    pub x_cb: usize,
+    /// The CU's luma top-left y.
+    pub y_cb: usize,
+    /// `log2CbSize`.
+    pub log2_cb_size: u32,
+    /// The CU QP / offset / chroma context.
+    pub params: DeblockCuParams,
+    /// The p-side CU's `QpY` at the coding-block boundary edge
+    /// (xDk == 0 / yDm == 0); interior edges use `params.qp_y` on both
+    /// sides.
+    pub qp_y_p: i32,
+}
+
+/// §8.7.2.5.1 / .2 — filter all edges of one coding unit in one direction.
+///
+/// Applies the §8.7.2.5.4 luma block-edge filter at every `bS > 0` sampled
+/// position, then (when `ChromaArrayType != 0`) the §8.7.2.5.5 chroma
+/// block-edge filter at every `bS == 2`, 8-luma-sample-aligned position.
+/// The luma sampling grid is 8-stride along the edge axis and 4-stride
+/// across; the chroma grid steps `8 / SubWidthC` (vertical) /
+/// `8 / SubHeightC` (horizontal) in the edge axis.
+///
+/// `cu` carries the CU's geometry + QP context; `bs` is the §8.7.2.4 grid
+/// for `edge_type`.
+///
+/// # Panics
+/// Panics if a filtered edge segment reads/writes outside a plane.
+pub fn filter_cu_edges(
+    pic: &mut Picture,
+    cu: &DeblockCu,
+    edge_type: EdgeType,
+    bs: &BoundaryStrength,
+) {
+    let DeblockCu {
+        x_cb,
+        y_cb,
+        log2_cb_size,
+        params,
+        qp_y_p,
+    } = *cu;
+    let n_d = 1usize << (log2_cb_size - 3);
+    let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
+
+    // ----- luma (§8.7.2.5.1 step 2 / §8.7.2.5.2 step 2) -----
+    // EDGE_VER: xDk = k<<3 (k=0..nD-1), yDm = m<<2 (m=0..2nD-1).
+    // EDGE_HOR: yDm = m<<3 (m=0..nD-1), xDk = k<<2 (k=0..2nD-1).
+    // `edges` indexes the 8-strided axis (nD); `segs` the 4-strided axis.
+    let (n_edges, n_segs) = (n_d, n_d * 2);
+    for e in 0..n_edges {
+        for s_idx in 0..n_segs {
+            let (x_dk, y_dm) = match edge_type {
+                EdgeType::Vertical => (e << 3, s_idx << 2),
+                EdgeType::Horizontal => (s_idx << 2, e << 3),
+            };
+            let s = bs.at(x_dk, y_dm);
+            if s == 0 {
+                continue;
+            }
+            // p-side QpY: the neighbour CU only at the coding-block
+            // boundary edge; interior edges share the CU's QpY.
+            let boundary = match edge_type {
+                EdgeType::Vertical => x_dk == 0,
+                EdgeType::Horizontal => y_dm == 0,
+            };
+            let qp_p = if boundary { qp_y_p } else { params.qp_y };
+            let qp = EdgeQp {
+                qp_q: params.qp_y,
+                qp_p,
+                beta_offset_div2: params.beta_offset_div2,
+                tc_offset_div2: params.tc_offset_div2,
+                bit_depth: params.bit_depth_luma,
+            };
+            let (buf, stride) = pic.plane_mut(Plane::Luma);
+            let mut plane = SamplePlane {
+                samples: buf,
+                width: stride,
+                stride,
+            };
+            let pos = EdgePos {
+                ex: x_cb + x_dk,
+                ey: y_cb + y_dm,
+                edge: edge_type,
+            };
+            filter_luma_block_edge(&mut plane, pos, s, qp);
+        }
+    }
+
+    // ----- chroma (§8.7.2.5.1 / .2 chroma steps) -----
+    if params.chroma_array_type == 0 {
+        return;
+    }
+    let (xc_cb, yc_cb) = (x_cb / sub_w, y_cb / sub_h);
+    // edgeSpacing / edgeSections per direction.
+    let (spacing, sections, n_edges) = match edge_type {
+        EdgeType::Vertical => (8 / sub_w, n_d * (2 / sub_h), n_d),
+        EdgeType::Horizontal => (8 / sub_h, n_d * (2 / sub_w), n_d),
+    };
+    for plane in [Plane::Cb, Plane::Cr] {
+        let c_qp_offset = if plane == Plane::Cb {
+            params.cb_qp_offset
+        } else {
+            params.cr_qp_offset
+        };
+        // EDGE_VER: xDk = k*spacing (k=0..nD-1), yDm = m<<2 (m=0..sections-1).
+        // EDGE_HOR: yDm = m*spacing, xDk = k<<2.
+        let (k_max, m_max) = match edge_type {
+            EdgeType::Vertical => (n_edges, sections),
+            EdgeType::Horizontal => (sections, n_edges),
+        };
+        for kk in 0..k_max {
+            for mm in 0..m_max {
+                let (x_dk, y_dm) = match edge_type {
+                    EdgeType::Vertical => (kk * spacing, mm << 2),
+                    EdgeType::Horizontal => (kk << 2, mm * spacing),
+                };
+                // bS[xDk*SubWidthC][yDm*SubHeightC] == 2.
+                let bx = x_dk * sub_w;
+                let by = y_dm * sub_h;
+                if bs.at(bx, by) != 2 {
+                    continue;
+                }
+                // 8-luma-grid alignment of the chroma edge position.
+                let aligned = match edge_type {
+                    EdgeType::Vertical => ((xc_cb + x_dk) >> 3) << 3 == xc_cb + x_dk,
+                    EdgeType::Horizontal => ((yc_cb + y_dm) >> 3) << 3 == yc_cb + y_dm,
+                };
+                if !aligned {
+                    continue;
+                }
+                let boundary = match edge_type {
+                    EdgeType::Vertical => bx == 0,
+                    EdgeType::Horizontal => by == 0,
+                };
+                let qp_p = if boundary { qp_y_p } else { params.qp_y };
+                let qp = EdgeQp {
+                    qp_q: params.qp_y,
+                    qp_p,
+                    beta_offset_div2: params.beta_offset_div2,
+                    tc_offset_div2: params.tc_offset_div2,
+                    bit_depth: params.bit_depth_chroma,
+                };
+                let (buf, stride) = pic.plane_mut(plane);
+                let mut cplane = SamplePlane {
+                    samples: buf,
+                    width: stride,
+                    stride,
+                };
+                let pos = EdgePos {
+                    ex: xc_cb + x_dk,
+                    ey: yc_cb + y_dm,
+                    edge: edge_type,
+                };
+                filter_chroma_block_edge(
+                    &mut cplane,
+                    pos,
+                    qp,
+                    c_qp_offset,
+                    params.chroma_array_type,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,5 +1869,228 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----- §8.7.2.5.1 / .2 CU-level edge filtering driver -----
+
+    fn cu_params_420(qp_y: i32) -> DeblockCuParams {
+        DeblockCuParams {
+            qp_y,
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            chroma_array_type: 1,
+        }
+    }
+
+    /// A `DeblockCu` for a 16×16 CU at `(x_cb, y_cb)`, QpY = 37 both sides.
+    fn cu16(x_cb: usize, y_cb: usize) -> DeblockCu {
+        DeblockCu {
+            x_cb,
+            y_cb,
+            log2_cb_size: 4,
+            params: cu_params_420(37),
+            qp_y_p: 37,
+        }
+    }
+
+    /// Build a 16×16 4:2:0 picture whose luma has a vertical 120/128 step
+    /// at column 8 and flat chroma planes.
+    fn stepped_pic() -> Picture {
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Luma, x, y, if x < 8 { 120 } else { 128 });
+                if x < 8 && y < 8 {
+                    pic.set_sample(Plane::Cb, x, y, if x < 4 { 124 } else { 128 });
+                    pic.set_sample(Plane::Cr, x, y, if x < 4 { 124 } else { 128 });
+                }
+            }
+        }
+        pic
+    }
+
+    /// §8.7.2.5.1: a 16×16 CU's internal vertical luma edge at column 8
+    /// (bS=2) is filtered, smoothing the 120/128 step; the picture-left
+    /// edge (bS grid zero there) is left untouched.
+    #[test]
+    fn cu_driver_vertical_luma_internal_edge() {
+        let mut pic = stepped_pic();
+        // bS grid: internal vertical edge at column 8, all 4 row-segments.
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let mut tb_edge = vec![false; n * n];
+        for yj in (0..16).step_by(4) {
+            edge_flags[yj * n + 8] = true;
+            tb_edge[yj * n + 8] = true;
+        }
+        // Intra both sides ⇒ bS=2 at the internal edge.
+        let field = MotionField::new(16, 16);
+        let bs =
+            derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
+        assert_eq!(bs.at(8, 0), 2);
+        let before7 = pic.sample(Plane::Luma, 7, 0);
+        let before8 = pic.sample(Plane::Luma, 8, 0);
+        filter_cu_edges(&mut pic, &cu16(0, 0), EdgeType::Vertical, &bs);
+        // The internal seam smoothed: col 7 rose, col 8 fell.
+        assert!(pic.sample(Plane::Luma, 7, 0) > before7);
+        assert!(pic.sample(Plane::Luma, 8, 0) < before8);
+        // Picture-left column 0 unfiltered (bS=0 there).
+        assert_eq!(pic.sample(Plane::Luma, 0, 0), 120);
+    }
+
+    /// §8.7.2.5.1 chroma 4:2:0: an *internal* CU edge at luma column 8 maps
+    /// to chroma column 4, which is NOT on the 8-chroma-sample grid, so the
+    /// chroma filter is correctly skipped (only luma is touched). 4:2:0
+    /// chroma deblocking falls only every 16 luma samples.
+    #[test]
+    fn cu_driver_chroma_skips_non_8_aligned_edge() {
+        let mut pic = stepped_pic();
+        let before_cb3 = pic.sample(Plane::Cb, 3, 0);
+        let before_cb4 = pic.sample(Plane::Cb, 4, 0);
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let mut tb_edge = vec![false; n * n];
+        for yj in (0..16).step_by(4) {
+            edge_flags[yj * n + 8] = true;
+            tb_edge[yj * n + 8] = true;
+        }
+        let field = MotionField::new(16, 16);
+        let bs =
+            derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
+        filter_cu_edges(&mut pic, &cu16(0, 0), EdgeType::Vertical, &bs);
+        // Chroma col 4 is not 8-aligned ⇒ untouched; luma seam moved.
+        assert_eq!(pic.sample(Plane::Cb, 3, 0), before_cb3);
+        assert_eq!(pic.sample(Plane::Cb, 4, 0), before_cb4);
+        assert!(pic.sample(Plane::Luma, 7, 0) > 120);
+    }
+
+    /// §8.7.2.5.1 chroma 4:2:0: a CU boundary edge that DOES land on the
+    /// 8-chroma grid (the right CU's left edge at luma column 16 ⇒ chroma
+    /// column 8) fires the chroma filter; p0/q0 (chroma cols 7/8) move.
+    #[test]
+    fn cu_driver_chroma_filters_8_aligned_edge() {
+        // 32×16 picture: left CU 120, right CU 128; chroma 124/128 step at
+        // chroma column 8 (= luma column 16).
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..32 {
+                pic.set_sample(Plane::Luma, x, y, if x < 16 { 120 } else { 128 });
+            }
+        }
+        // 4:2:0 chroma plane is 16×8.
+        for y in 0..8 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Cb, x, y, if x < 8 { 124 } else { 128 });
+                pic.set_sample(Plane::Cr, x, y, if x < 8 { 124 } else { 128 });
+            }
+        }
+        // Right CU at luma (16,0), 16×16. Its left CB-boundary vertical edge
+        // (xDk=0) is filtered (filterLeftCbEdgeFlag = 1, intra both sides).
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let mut tb_edge = vec![false; n * n];
+        for yj in (0..16).step_by(4) {
+            edge_flags[yj * n] = true; // column 0 = the CU's left boundary
+            tb_edge[yj * n] = true;
+        }
+        // Motion field: left half (cols 0..16) and right CU intra ⇒ bS=2.
+        let field = MotionField::new(32, 16);
+        let bs =
+            derive_boundary_strength(&field, 16, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
+        assert_eq!(bs.at(0, 0), 2);
+        filter_cu_edges(&mut pic, &cu16(16, 0), EdgeType::Vertical, &bs);
+        // Chroma edge at chroma column 8 (8-aligned): p0 (col 7) rose,
+        // q0 (col 8) fell.
+        assert!(pic.sample(Plane::Cb, 7, 0) > 124);
+        assert!(pic.sample(Plane::Cb, 8, 0) < 128);
+        assert!(pic.sample(Plane::Cr, 7, 0) > 124);
+        // p1 (col 6) untouched.
+        assert_eq!(pic.sample(Plane::Cb, 6, 0), 124);
+    }
+
+    /// §8.7.2.5.2: the horizontal driver mirrors the vertical one — an
+    /// internal horizontal luma edge at row 8 is smoothed.
+    #[test]
+    fn cu_driver_horizontal_luma_internal_edge() {
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Luma, x, y, if y < 8 { 120 } else { 128 });
+            }
+        }
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let mut tb_edge = vec![false; n * n];
+        for xi in (0..16).step_by(4) {
+            edge_flags[8 * n + xi] = true;
+            tb_edge[8 * n + xi] = true;
+        }
+        let field = MotionField::new(16, 16);
+        let bs =
+            derive_boundary_strength(&field, 0, 0, 4, EdgeType::Horizontal, &edge_flags, &tb_edge);
+        assert_eq!(bs.at(0, 8), 2);
+        filter_cu_edges(&mut pic, &cu16(0, 0), EdgeType::Horizontal, &bs);
+        assert!(pic.sample(Plane::Luma, 0, 7) > 120); // p0 row rose
+        assert!(pic.sample(Plane::Luma, 0, 8) < 128); // q0 row fell
+    }
+
+    /// A bS=1 edge filters luma but NOT chroma (chroma fires only at
+    /// bS==2).
+    #[test]
+    fn cu_driver_bs1_skips_chroma() {
+        let mut pic = stepped_pic();
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let tb_edge = vec![false; n * n];
+        for yj in (0..16).step_by(4) {
+            edge_flags[yj * n + 8] = true;
+        }
+        // Two inter blocks, MV diff ⇒ bS=1.
+        let mut field = MotionField::new(16, 16);
+        field.fill_rect(0, 0, 8, 16, inter_cell([0, 0], 0));
+        field.fill_rect(8, 0, 8, 16, inter_cell([4, 0], 0));
+        let bs =
+            derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
+        assert_eq!(bs.at(8, 0), 1);
+        filter_cu_edges(&mut pic, &cu16(0, 0), EdgeType::Vertical, &bs);
+        // Chroma untouched (bS=1 < 2).
+        assert_eq!(pic.sample(Plane::Cb, 3, 0), 124);
+        assert_eq!(pic.sample(Plane::Cb, 4, 0), 128);
+    }
+
+    /// Monochrome (ChromaArrayType 0): the driver filters luma and never
+    /// touches a chroma plane (there is none).
+    #[test]
+    fn cu_driver_monochrome_luma_only() {
+        let mut pic = Picture::new(16, 16, 0, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Luma, x, y, if x < 8 { 120 } else { 128 });
+            }
+        }
+        let n = 16;
+        let mut edge_flags = vec![false; n * n];
+        let tb_edge = vec![false; n * n];
+        for yj in (0..16).step_by(4) {
+            edge_flags[yj * n + 8] = true;
+        }
+        let field = MotionField::new(16, 16);
+        let bs =
+            derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
+        let mut p = cu_params_420(37);
+        p.chroma_array_type = 0;
+        let cu = DeblockCu {
+            x_cb: 0,
+            y_cb: 0,
+            log2_cb_size: 4,
+            params: p,
+            qp_y_p: 37,
+        };
+        filter_cu_edges(&mut pic, &cu, EdgeType::Vertical, &bs);
+        assert!(pic.sample(Plane::Luma, 7, 0) > 120);
     }
 }

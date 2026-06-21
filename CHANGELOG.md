@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — clean-room rebuild round 356 (2026-06-21)
 
+- `deblock` §8.7.2.5.1 / §8.7.2.5.2 CU-level edge-filtering driver —
+  `filter_cu_edges` filters every edge of one coding unit in one direction
+  directly into a `Picture` (luma + Cb + Cr planes):
+  - Luma: the §8.7.2.5.4 block-edge filter at every `bS > 0` sampled
+    position (8-stride along the edge axis, 4-stride across).
+  - Chroma (`ChromaArrayType != 0`): the §8.7.2.5.5 filter at every
+    `bS == 2` position whose chroma edge is on the 8-chroma-sample grid,
+    stepping `8 / SubWidthC` (EDGE_VER) / `8 / SubHeightC` (EDGE_HOR) in
+    the edge axis, for both Cb and Cr with their `pps_c*_qp_offset`.
+  - `DeblockCu` (CU geometry + neighbour p-side `QpY`) + `DeblockCuParams`
+    (QpY, slice β/tC offsets, chroma QP offsets, bit depths,
+    ChromaArrayType) carry the per-CU context; `Picture::plane_mut`
+    exposes a mutable component plane for in-place filtering.
+  6 new tests: vertical/horizontal internal luma seam smoothing,
+  4:2:0 chroma skipping a non-8-aligned internal edge vs. filtering an
+  8-aligned CU-boundary edge, bS=1 luma-only (chroma skipped), and
+  monochrome luma-only.
+
 - `deblock` §8.7.2.2 / §8.7.2.3 edge-flag derivation — the missing input
   to the §8.7.2.4 bS stage, produced from the coding block's geometry:
   - `TransformSplit`: the transform-tree split geometry of a coding
