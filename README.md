@@ -32,10 +32,17 @@ pixels), the §8.7.2.4 deblocking boundary-strength derivation lands, and
 the §8.7.2.5 deblocking edge-filtering process (luma strong/weak +
 chroma sample filters, Table 8-12 β′/tC′, Table 8-10 chroma QpC, applied
 in place across a `SamplePlane` by `filter_luma_block_edge` /
-`filter_chroma_block_edge`) is implemented.
+`filter_chroma_block_edge`) is implemented. The **in-loop deblocking
+filter is now complete end to end**: the §8.7.2.2/.3 edge-flag derivation
+(`derive_edge_flags`: transform-tree split + prediction `PartMode`
+boundaries), the §8.7.2.5.1/.2 CU-level luma + chroma edge-filtering
+driver (`filter_cu_edges`, into a `Picture`), and the §8.7.2.1
+picture-level driver (`deblock_picture`: all vertical edges, then all
+horizontal, walking the CUs) wire the bS + sample filters into a
+whole-picture process.
 What remains for an end-to-end inter fixture is the §8.5.3.2.2/.3/.6/.7
 merge/MVP **candidate** derivation (needs neighbour + collocated state),
-the §8.7.2.2/.3 edge-flag + picture-level deblock driver, SAO apply, a
+wiring `deblock_picture` into the recon CU walk, SAO apply, a
 full DPB, and multi-CTU /
 multi-slice / tile / WPP picture assembly. The runtime registration hook
 (`register`) is a no-op and the top-level decode entry point still
@@ -239,10 +246,21 @@ reconstruction are usable directly through the public `recon` /
   `filter_chroma_sample` (§8.7.2.5.8). The plane-level drivers
   `filter_luma_block_edge` (§8.7.2.5.4) and `filter_chroma_block_edge`
   (§8.7.2.5.5) gather and apply those primitives in place across a 4-row
-  edge segment of a `SamplePlane`, for both EDGE_VER and EDGE_HOR. What
-  is still missing for a full in-loop deblock is the §8.7.2.2/.3
-  edge-flag derivation and the picture-level edge-walk driver (which
-  needs the decoded partition tree + per-CU QP map).
+  edge segment of a `SamplePlane`, for both EDGE_VER and EDGE_HOR.
+* **In-loop deblocking driver (§8.7.2.1/.2/.3/.5.1/.5.2)** — the whole
+  filter end to end. `derive_edge_flags` runs the §8.7.2.2 transform-block
+  boundary recursion (over a `TransformSplit` tree, gating the
+  coding-block boundary by `filterEdgeFlag`) and the §8.7.2.3 prediction
+  block boundary (`PartMode` internal partition column/row, incl. AMP),
+  producing the `edge_flags` + `tb_edge` grids the bS stage consumes.
+  `filter_cu_edges` is the §8.7.2.5.1/.2 CU-level driver: it filters one
+  CU's luma (every bS>0 sampled position) and chroma (every bS==2,
+  8-chroma-grid-aligned position, Cb + Cr) directly into a `Picture`.
+  `deblock_picture` is the §8.7.2.1 picture-level driver: all vertical
+  edges first, then all horizontal, walking a `&[DeblockCuDesc]` in coding
+  order. What remains is wiring it into the recon CU walk (supplying each
+  CU's `TransformSplit` / `PartMode` / QP + picture/tile/slice boundary
+  flags).
 
 ## Not yet implemented
 
@@ -250,9 +268,9 @@ reconstruction are usable directly through the public `recon` /
   §8.4 intra-block / §8.5 inter-block sample-write passes that turn the
   `slice_data` module's `CodingTreeUnit` → `CodingQuadtree` →
   `CodingUnit` tree (now decoded end to end; see "What's implemented")
-  into reconstructed luma / chroma planes, the picture-level in-loop
-  deblock edge-walk (the §8.7.2.5 sample filters now exist; the
-  §8.7.2.2/.3 edge-flag + driver do not) / SAO application, and DPB
+  into reconstructed luma / chroma planes, the wiring of the (now
+  complete) picture-level in-loop deblock driver `deblock_picture` into
+  that CU walk / SAO application, and DPB
   management. The §7.3.8 slice-data CABAC
   syntax-element walk itself — the §7.3.8.3 `sao()`, §7.3.8.2
   `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, §7.3.8.5
@@ -267,8 +285,9 @@ reconstruction are usable directly through the public `recon` /
   The §8.5.3.3.3 interpolation, §8.5.3.3.4.2 default combine, §8.5.3.3.1
   block-walk driver, §8.5.3.2.1 MV reconstruction, §8.5.3.2.10 chroma MV,
   §8.5.3.2.5 zero-merge, and the §8.5/§8.6.5 inter PU reconstruction are
-  implemented (see above). The in-loop filters past §8.7.2.4 bS
-  (§8.7.2.5 edge filtering, SAO apply) and DPB management remain.
+  implemented (see above). The in-loop deblocking filter is complete
+  (§8.7.2.1/.2/.3/.4/.5); its wiring into the recon CU walk, SAO apply,
+  and DPB management remain.
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
   the typed flags are decoded but the bodies surface as opaque bytes.
 * Encoder.

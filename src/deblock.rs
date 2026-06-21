@@ -1155,6 +1155,96 @@ pub fn filter_cu_edges(
     }
 }
 
+/// One coding unit's full §8.7.2 deblocking description, as the
+/// picture-level driver [`deblock_picture`] consumes it.
+///
+/// Carries everything the §8.7.2.2 / .3 edge-flag derivation, the §8.7.2.4
+/// bS derivation and the §8.7.2.5.1 / .2 filtering need for one CU: its
+/// geometry + QP context ([`DeblockCu`]), its transform-tree split
+/// ([`TransformSplit`]) + prediction [`PartMode`], and the §8.7.2.1
+/// `filterLeftCbEdgeFlag` / `filterTopCbEdgeFlag` the caller computes from
+/// the picture / tile / slice geometry (`false` at a non-filtered
+/// boundary).
+#[derive(Debug, Clone)]
+pub struct DeblockCuDesc {
+    /// Geometry + QP context.
+    pub cu: DeblockCu,
+    /// The CU's transform-tree split structure.
+    pub transform_split: TransformSplit,
+    /// The CU's prediction partition mode.
+    pub part_mode: PartMode,
+    /// §8.7.2.1 `filterLeftCbEdgeFlag` (gates the left CB-boundary
+    /// vertical edge).
+    pub filter_left: bool,
+    /// §8.7.2.1 `filterTopCbEdgeFlag` (gates the top CB-boundary
+    /// horizontal edge).
+    pub filter_top: bool,
+}
+
+/// §8.7.2.1 — the picture-level deblocking filter driver.
+///
+/// Filters all vertical edges of the picture first, then all horizontal
+/// edges (with the vertically-filtered samples as input), per §8.7.2.1.
+/// Each pass walks `cus` in order and, for each CU: derives the
+/// §8.7.2.2 / .3 edge flags, the §8.7.2.4 boundary strengths from `field`,
+/// then applies the §8.7.2.5.1 / .2 luma + chroma filters via
+/// [`filter_cu_edges`].
+///
+/// `cus` must be in coding (z-scan) order; the caller is responsible for
+/// the §8.7.2.1 boundary exclusions (picture / tile / slice edges, and the
+/// `slice_deblocking_filter_disabled_flag` skip) by setting each
+/// descriptor's `filter_left` / `filter_top` (and omitting CUs whose slice
+/// disables deblocking).
+///
+/// # Panics
+/// Panics if a CU's edges read/write outside a `pic` plane.
+pub fn deblock_picture(pic: &mut Picture, field: &MotionField, cus: &[DeblockCuDesc]) {
+    // Pass 1: all vertical edges.
+    for desc in cus {
+        apply_cu_direction(pic, field, desc, EdgeType::Vertical);
+    }
+    // Pass 2: all horizontal edges (on the vertically-filtered samples).
+    for desc in cus {
+        apply_cu_direction(pic, field, desc, EdgeType::Horizontal);
+    }
+}
+
+/// Derive the edge flags + bS for one CU in one direction and filter it.
+fn apply_cu_direction(
+    pic: &mut Picture,
+    field: &MotionField,
+    desc: &DeblockCuDesc,
+    edge_type: EdgeType,
+) {
+    let DeblockCu {
+        x_cb,
+        y_cb,
+        log2_cb_size,
+        ..
+    } = desc.cu;
+    let filter_edge_flag = match edge_type {
+        EdgeType::Vertical => desc.filter_left,
+        EdgeType::Horizontal => desc.filter_top,
+    };
+    let ef = derive_edge_flags(
+        &desc.transform_split,
+        desc.part_mode,
+        log2_cb_size,
+        edge_type,
+        filter_edge_flag,
+    );
+    let bs = derive_boundary_strength(
+        field,
+        x_cb,
+        y_cb,
+        log2_cb_size,
+        edge_type,
+        ef.edge_flags(),
+        ef.tb_edge(),
+    );
+    filter_cu_edges(pic, &desc.cu, edge_type, &bs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2092,5 +2182,110 @@ mod tests {
         };
         filter_cu_edges(&mut pic, &cu, EdgeType::Vertical, &bs);
         assert!(pic.sample(Plane::Luma, 7, 0) > 120);
+    }
+
+    // ----- §8.7.2.1 picture-level deblocking driver -----
+
+    /// §8.7.2.1: a 2×1 grid of 16×16 CUs with a 120/128 vertical step at
+    /// the CU boundary (luma column 16). The driver derives the bS=2
+    /// boundary edge (intra both sides) and smooths the seam; the picture's
+    /// outer-left edge (filter_left=false on CU 0) stays untouched.
+    #[test]
+    fn picture_driver_two_cu_vertical_seam() {
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..32 {
+                pic.set_sample(Plane::Luma, x, y, if x < 16 { 120 } else { 128 });
+            }
+        }
+        for y in 0..8 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Cb, x, y, if x < 8 { 124 } else { 128 });
+                pic.set_sample(Plane::Cr, x, y, if x < 8 { 124 } else { 128 });
+            }
+        }
+        // Whole picture intra ⇒ every block boundary is bS=2.
+        let field = MotionField::new(32, 16);
+        let cus = vec![
+            DeblockCuDesc {
+                cu: cu16(0, 0),
+                transform_split: TransformSplit::leaf(),
+                part_mode: PartMode::Part2Nx2N,
+                filter_left: false, // picture-left boundary
+                filter_top: false,  // picture-top boundary
+            },
+            DeblockCuDesc {
+                cu: cu16(16, 0),
+                transform_split: TransformSplit::leaf(),
+                part_mode: PartMode::Part2Nx2N,
+                filter_left: true, // internal CU boundary at column 16
+                filter_top: false,
+            },
+        ];
+        deblock_picture(&mut pic, &field, &cus);
+        // The CU-boundary luma seam at column 16 smoothed.
+        assert!(pic.sample(Plane::Luma, 15, 0) > 120);
+        assert!(pic.sample(Plane::Luma, 16, 0) < 128);
+        // The picture-left column 0 untouched.
+        assert_eq!(pic.sample(Plane::Luma, 0, 0), 120);
+        // Chroma seam at chroma column 8 (8-aligned, bS=2) smoothed.
+        assert!(pic.sample(Plane::Cb, 7, 0) > 124);
+        assert!(pic.sample(Plane::Cb, 8, 0) < 128);
+    }
+
+    /// §8.7.2.1: with every `filter_left` / `filter_top` false and a single
+    /// un-split PART_2Nx2N CU, no internal edge exists, so the picture is
+    /// byte-identical after deblocking (the entire CU is one transform /
+    /// prediction block at the picture origin).
+    #[test]
+    fn picture_driver_single_cu_no_internal_edge_is_noop() {
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        for y in 0..16 {
+            for x in 0..16 {
+                pic.set_sample(Plane::Luma, x, y, if x < 8 { 0 } else { 255 });
+            }
+        }
+        let snapshot: Vec<i32> = pic.plane(Plane::Luma).to_vec();
+        let field = MotionField::new(16, 16);
+        let cus = vec![DeblockCuDesc {
+            cu: cu16(0, 0),
+            transform_split: TransformSplit::leaf(),
+            part_mode: PartMode::Part2Nx2N,
+            filter_left: false,
+            filter_top: false,
+        }];
+        deblock_picture(&mut pic, &field, &cus);
+        assert_eq!(pic.plane(Plane::Luma), snapshot.as_slice());
+    }
+
+    /// §8.7.2.1: a single CU with a one-level transform split has an
+    /// internal vertical + horizontal TB edge at the 8-sample mid-lines;
+    /// the driver smooths both the vertical seam (pass 1) and then the
+    /// horizontal seam (pass 2) on the already-modified samples.
+    #[test]
+    fn picture_driver_internal_split_both_directions() {
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        // Four quadrants stepping in both x and y for a cross seam.
+        for y in 0..16 {
+            for x in 0..16 {
+                let v = 120 + 4 * i32::from(x >= 8) + 4 * i32::from(y >= 8);
+                pic.set_sample(Plane::Luma, x, y, v);
+            }
+        }
+        let field = MotionField::new(16, 16);
+        let cus = vec![DeblockCuDesc {
+            cu: cu16(0, 0),
+            transform_split: TransformSplit::split_once(),
+            part_mode: PartMode::Part2Nx2N,
+            filter_left: false,
+            filter_top: false,
+        }];
+        deblock_picture(&mut pic, &field, &cus);
+        // Vertical seam at column 8 (rows 0..) smoothed: col 7 rose.
+        assert!(pic.sample(Plane::Luma, 7, 0) > 120);
+        // Horizontal seam at row 8 smoothed: row 7 rose at a left column.
+        assert!(pic.sample(Plane::Luma, 0, 7) > 120);
+        // A corner far from both seams is untouched.
+        assert_eq!(pic.sample(Plane::Luma, 0, 0), 120);
     }
 }

@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — clean-room rebuild round 356 (2026-06-21)
 
+- `deblock` §8.7.2.1 picture-level deblocking driver — `deblock_picture`
+  ties the round's pieces into the whole-picture process: it filters all
+  vertical edges first, then all horizontal edges (on the
+  vertically-filtered samples), walking a `&[DeblockCuDesc]` in coding
+  order. Each CU contributes its `TransformSplit` + `PartMode` +
+  `filter_left`/`filter_top` boundary flags; per CU per pass the driver
+  derives the §8.7.2.2/.3 edge flags, the §8.7.2.4 bS from the
+  `MotionField`, and applies `filter_cu_edges`. The caller owns the
+  §8.7.2.1 boundary exclusions (picture/tile/slice edges + the
+  `slice_deblocking_filter_disabled_flag` skip). 3 new tests: a two-CU
+  vertical-seam smooth (luma + 8-aligned 4:2:0 chroma), a single-CU
+  no-internal-edge byte-identical no-op, and a one-level-split cross-seam
+  smoothed in both passes.
+
 - `deblock` §8.7.2.5.1 / §8.7.2.5.2 CU-level edge-filtering driver —
   `filter_cu_edges` filters every edge of one coding unit in one direction
   directly into a `Picture` (luma + Cb + Cr planes):

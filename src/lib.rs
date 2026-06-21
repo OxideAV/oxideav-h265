@@ -260,8 +260,9 @@ pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
 pub use ctx_init::SliceContexts;
 pub use deblock::{
-    derive_boundary_strength, derive_edge_flags, filter_cu_edges, BoundaryStrength, DeblockCu,
-    DeblockCuParams, EdgeFlags, EdgeType, TransformSplit,
+    deblock_picture, derive_boundary_strength, derive_edge_flags, filter_cu_edges,
+    BoundaryStrength, DeblockCu, DeblockCuDesc, DeblockCuParams, EdgeFlags, EdgeType,
+    TransformSplit,
 };
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
