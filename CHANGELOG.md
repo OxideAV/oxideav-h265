@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 356 (2026-06-21)
+
+- `deblock` §8.7.2.2 / §8.7.2.3 edge-flag derivation — the missing input
+  to the §8.7.2.4 bS stage, produced from the coding block's geometry:
+  - `TransformSplit`: the transform-tree split geometry of a coding
+    block (`Split` quadrants / `Leaf` transform blocks), with `leaf()` /
+    `split_once()` constructors.
+  - `transform_block_boundary` (§8.7.2.2): the recursive descent that
+    marks each transform-block leading edge into the `edge_flags` +
+    `tb_edge` grids, gating the coding-block boundary (xB0/yB0 == 0) by
+    `filterEdgeFlag` and marking interior transform splits unconditionally.
+  - `prediction_block_boundary` (§8.7.2.3): the `PartMode` internal
+    prediction partition column/row (PART_Nx2N/NxN at nCbS/2, AMP
+    PART_nLx2N/nRx2N at nCbS/4 · {1,3}, PART_2NxN/2NxnU/2NxnD likewise),
+    set in `edge_flags` only (a prediction edge is not a TB edge).
+  - `derive_edge_flags` → `EdgeFlags`: the public entry that runs both
+    derivations for one CB + edge direction and exposes the
+    `edge_flags()` / `tb_edge()` grids that feed `derive_boundary_strength`.
+  9 new tests: single-TB left boundary + gating, one-level + nested
+  transform splits (EDGE_VER / EDGE_HOR), PART_Nx2N prediction edge (not
+  a TB edge), AMP columns/rows, and an end-to-end edge-flags → bS=2 check.
+
 ### Added — clean-room rebuild round 350 (2026-06-20)
 
 - `deblock` module — the §8.7.2.5 deblocking edge-filtering process, the

@@ -25,6 +25,7 @@
 //! [`filter_chroma_block_edge`] (§8.7.2.5.5) gather/apply those
 //! primitives across a 4-row edge segment of a [`SamplePlane`] in place.
 
+use crate::binarization::PartMode;
 use crate::motion::MotionField;
 
 /// §8.7.2.1 — the edge orientation being filtered.
@@ -34,6 +35,221 @@ pub enum EdgeType {
     Vertical,
     /// `EDGE_HOR` — a horizontal edge (filtered top-to-bottom).
     Horizontal,
+}
+
+/// The transform-tree split geometry of one luma coding block, used by the
+/// §8.7.2.2 edge-flag derivation.
+///
+/// Each node is either a `Split` (a `split_transform_flag == 1` node whose
+/// four quadrants recurse) or a `Leaf` (a `split_transform_flag == 0`
+/// transform block). The deblocker only needs the split structure, not the
+/// residual coefficients — the leaves mark where transform-block edges
+/// fall on the 8×8 grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransformSplit {
+    /// A `split_transform_flag == 1` node: four quadrants in raster order
+    /// (top-left, top-right, bottom-left, bottom-right), each spanning
+    /// `1 << (log2TrafoSize − 1)` luma samples.
+    Split(Box<[TransformSplit; 4]>),
+    /// A `split_transform_flag == 0` transform-block leaf.
+    Leaf,
+}
+
+impl TransformSplit {
+    /// A leaf spanning the whole coding block (no transform split).
+    #[inline]
+    #[must_use]
+    pub fn leaf() -> Self {
+        TransformSplit::Leaf
+    }
+
+    /// A single-level split into four equal quadrants, each a leaf.
+    #[inline]
+    #[must_use]
+    pub fn split_once() -> Self {
+        TransformSplit::Split(Box::new([
+            TransformSplit::Leaf,
+            TransformSplit::Leaf,
+            TransformSplit::Leaf,
+            TransformSplit::Leaf,
+        ]))
+    }
+}
+
+/// The invariant context threaded through the §8.7.2.2 recursion.
+struct TbBoundaryCtx<'a> {
+    filter_edge_flag: bool,
+    edge_type: EdgeType,
+    n_cbs: usize,
+    edge_flags: &'a mut [bool],
+    tb_edge: &'a mut [bool],
+}
+
+/// §8.7.2.2 transform-block-boundary recursion: walk one node of the
+/// transform tree, marking the `edge_flags` (any block boundary the edge
+/// falls on) and `tb_edge` (transform-block boundaries only) grids.
+///
+/// `(xb0, yb0)` is the node's top-left luma sample relative to the coding
+/// block; `log2_trafo_size` is the node side. The `ctx.filter_edge_flag`
+/// is the §8.7.2.1 `filterLeftCbEdgeFlag` / `filterTopCbEdgeFlag` that
+/// gates the coding-block boundary (xB0/yB0 == 0) edge.
+fn transform_block_boundary(
+    node: &TransformSplit,
+    xb0: usize,
+    yb0: usize,
+    log2_trafo_size: u32,
+    ctx: &mut TbBoundaryCtx<'_>,
+) {
+    if let TransformSplit::Split(children) = node {
+        let half = 1usize << (log2_trafo_size - 1);
+        let xb1 = xb0 + half;
+        let yb1 = yb0 + half;
+        let quad_origins = [(xb0, yb0), (xb1, yb0), (xb0, yb1), (xb1, yb1)];
+        for (child, &(cx, cy)) in children.iter().zip(quad_origins.iter()) {
+            transform_block_boundary(child, cx, cy, log2_trafo_size - 1, ctx);
+        }
+        return;
+    }
+    // Leaf: mark the leading edge of this transform block. EDGE_VER marks
+    // the column xB0 for k = 0..size; EDGE_HOR marks the row yB0.
+    let size = 1usize << log2_trafo_size;
+    let n_cbs = ctx.n_cbs;
+    match ctx.edge_type {
+        EdgeType::Vertical => {
+            // edgeFlags[xB0][yB0+k]: filterEdgeFlag at the CB boundary
+            // (xB0 == 0), else 1.
+            let val = if xb0 == 0 { ctx.filter_edge_flag } else { true };
+            for k in 0..size {
+                let idx = (yb0 + k) * n_cbs + xb0;
+                ctx.edge_flags[idx] = val;
+                ctx.tb_edge[idx] = val;
+            }
+        }
+        EdgeType::Horizontal => {
+            let val = if yb0 == 0 { ctx.filter_edge_flag } else { true };
+            for k in 0..size {
+                let idx = yb0 * n_cbs + (xb0 + k);
+                ctx.edge_flags[idx] = val;
+                ctx.tb_edge[idx] = val;
+            }
+        }
+    }
+}
+
+/// §8.7.2.3 prediction-block-boundary derivation: mark the internal
+/// prediction-partition edge of a coding block into `edge_flags` (a
+/// prediction edge is *not* a transform-block edge, so `tb_edge` is left
+/// untouched).
+fn prediction_block_boundary(
+    part_mode: PartMode,
+    log2_cb_size: u32,
+    edge_type: EdgeType,
+    n_cbs: usize,
+    edge_flags: &mut [bool],
+) {
+    // The internal partition column (EDGE_VER) / row (EDGE_HOR), if any.
+    let half = 1usize << (log2_cb_size - 1);
+    let quarter = 1usize << (log2_cb_size.saturating_sub(2));
+    let pos = match (edge_type, part_mode) {
+        (EdgeType::Vertical, PartMode::PartNx2N | PartMode::PartNxN) => Some(half),
+        (EdgeType::Vertical, PartMode::PartNLx2N) => Some(quarter),
+        (EdgeType::Vertical, PartMode::PartNRx2N) => Some(3 * quarter),
+        (EdgeType::Horizontal, PartMode::Part2NxN | PartMode::PartNxN) => Some(half),
+        (EdgeType::Horizontal, PartMode::Part2NxnU) => Some(quarter),
+        (EdgeType::Horizontal, PartMode::Part2NxnD) => Some(3 * quarter),
+        _ => None,
+    };
+    if let Some(p) = pos {
+        for k in 0..n_cbs {
+            let idx = match edge_type {
+                EdgeType::Vertical => k * n_cbs + p,
+                EdgeType::Horizontal => p * n_cbs + k,
+            };
+            edge_flags[idx] = true;
+        }
+    }
+}
+
+/// The §8.7.2.2 / §8.7.2.3 edge-flag grids for one coding block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeFlags {
+    n_cbs: usize,
+    /// Row-major `n_cbs²`, `true` where a transform / prediction block
+    /// boundary falls (the §8.7.2.4 bS input).
+    edge_flags: Vec<bool>,
+    /// Row-major `n_cbs²`, `true` where the edge is *also* a
+    /// transform-block boundary (the §8.7.2.4 second-bullet `cbf` test).
+    tb_edge: Vec<bool>,
+}
+
+impl EdgeFlags {
+    /// The `edge_flags` grid (row-major, `[y * nCbS + x]`).
+    #[inline]
+    #[must_use]
+    pub fn edge_flags(&self) -> &[bool] {
+        &self.edge_flags
+    }
+
+    /// The `tb_edge` grid (row-major, `[y * nCbS + x]`).
+    #[inline]
+    #[must_use]
+    pub fn tb_edge(&self) -> &[bool] {
+        &self.tb_edge
+    }
+
+    /// `edge_flags[x][y]`.
+    #[inline]
+    #[must_use]
+    pub fn edge_at(&self, x: usize, y: usize) -> bool {
+        self.edge_flags[y * self.n_cbs + x]
+    }
+
+    /// `tb_edge[x][y]`.
+    #[inline]
+    #[must_use]
+    pub fn tb_at(&self, x: usize, y: usize) -> bool {
+        self.tb_edge[y * self.n_cbs + x]
+    }
+}
+
+/// §8.7.2.2 + §8.7.2.3 — derive the `edge_flags` + `tb_edge` grids for one
+/// coding block in one edge direction.
+///
+/// `transform_split` is the coding block's transform-tree split geometry
+/// ([`TransformSplit`]); `part_mode` is the prediction `PartMode`;
+/// `log2_cb_size` is the luma coding-block side; `filter_edge_flag` is the
+/// §8.7.2.1 `filterLeftCbEdgeFlag` (EDGE_VER) / `filterTopCbEdgeFlag`
+/// (EDGE_HOR) gating the coding-block boundary edge.
+///
+/// The result feeds [`derive_boundary_strength`] (`edge_flags` + `tb_edge`)
+/// and, after bS, the §8.7.2.5.1 / .2 CU edge filtering driver.
+#[must_use]
+pub fn derive_edge_flags(
+    transform_split: &TransformSplit,
+    part_mode: PartMode,
+    log2_cb_size: u32,
+    edge_type: EdgeType,
+    filter_edge_flag: bool,
+) -> EdgeFlags {
+    let n_cbs = 1usize << log2_cb_size;
+    let mut edge_flags = vec![false; n_cbs * n_cbs];
+    let mut tb_edge = vec![false; n_cbs * n_cbs];
+    {
+        let mut ctx = TbBoundaryCtx {
+            filter_edge_flag,
+            edge_type,
+            n_cbs,
+            edge_flags: &mut edge_flags,
+            tb_edge: &mut tb_edge,
+        };
+        transform_block_boundary(transform_split, 0, 0, log2_cb_size, &mut ctx);
+    }
+    prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, &mut edge_flags);
+    EdgeFlags {
+        n_cbs,
+        edge_flags,
+        tb_edge,
+    }
 }
 
 /// The §8.7.2.4 boundary filtering strength for one CU's edges, a
@@ -925,6 +1141,203 @@ mod tests {
         let bs =
             derive_boundary_strength(&field, 0, 0, 4, EdgeType::Vertical, &edge_flags, &tb_edge);
         assert_eq!(bs.at(8, 0), 1);
+    }
+
+    // ----- §8.7.2.2 / §8.7.2.3 edge-flag derivation -----
+
+    /// §8.7.2.2: an un-split 16×16 CB marks only its left CB-boundary
+    /// column (EDGE_VER), gated by filterEdgeFlag. No internal TB edges.
+    #[test]
+    fn edge_flags_single_tb_left_boundary() {
+        let n = 16;
+        // filterEdgeFlag = true ⇒ the CB-left column (x=0) is an edge.
+        let ef = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::Part2Nx2N,
+            4,
+            EdgeType::Vertical,
+            true,
+        );
+        for y in 0..n {
+            assert!(ef.edge_at(0, y), "left CB-boundary column must be set");
+            assert!(ef.tb_at(0, y), "left CB-boundary is a TB edge");
+        }
+        // No internal column is set (no split, PART_2Nx2N).
+        for x in 1..n {
+            for y in 0..n {
+                assert!(!ef.edge_at(x, y), "interior ({x},{y}) must be clear");
+            }
+        }
+    }
+
+    /// filterEdgeFlag = false suppresses the CB-boundary edge entirely.
+    #[test]
+    fn edge_flags_cb_boundary_gated_off() {
+        let ef = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::Part2Nx2N,
+            4,
+            EdgeType::Vertical,
+            false,
+        );
+        for y in 0..16 {
+            assert!(!ef.edge_at(0, y), "gated-off CB boundary stays clear");
+        }
+    }
+
+    /// §8.7.2.2: a one-level transform split of a 16×16 CB marks the
+    /// internal vertical TB edge at column 8 (always 1, not gated), plus
+    /// the gated left boundary.
+    #[test]
+    fn edge_flags_split_marks_internal_tb_edge() {
+        let ef = derive_edge_flags(
+            &TransformSplit::split_once(),
+            PartMode::Part2Nx2N,
+            4,
+            EdgeType::Vertical,
+            true,
+        );
+        for y in 0..16 {
+            assert!(ef.edge_at(0, y), "left boundary set");
+            assert!(ef.edge_at(8, y), "internal split column 8 set");
+            assert!(ef.tb_at(8, y), "internal split is a TB edge");
+        }
+    }
+
+    /// §8.7.2.2 EDGE_HOR: the split marks the internal horizontal TB edge
+    /// at row 8.
+    #[test]
+    fn edge_flags_split_horizontal() {
+        let ef = derive_edge_flags(
+            &TransformSplit::split_once(),
+            PartMode::Part2Nx2N,
+            4,
+            EdgeType::Horizontal,
+            true,
+        );
+        for x in 0..16 {
+            assert!(ef.edge_at(x, 0), "top boundary set");
+            assert!(ef.edge_at(x, 8), "internal split row 8 set");
+            assert!(ef.tb_at(x, 8), "internal split is a TB edge");
+        }
+    }
+
+    /// §8.7.2.3 PART_Nx2N marks the prediction column at nCbS/2 — and it
+    /// is NOT a transform-block edge (tb_edge stays clear there).
+    #[test]
+    fn edge_flags_part_nx2n_prediction_edge() {
+        let ef = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::PartNx2N,
+            4,
+            EdgeType::Vertical,
+            true,
+        );
+        for y in 0..16 {
+            assert!(ef.edge_at(8, y), "PART_Nx2N prediction column 8 set");
+            assert!(!ef.tb_at(8, y), "prediction edge is not a TB edge");
+        }
+    }
+
+    /// §8.7.2.3 AMP PART_nLx2N marks column nCbS/4; PART_nRx2N marks
+    /// 3·nCbS/4.
+    #[test]
+    fn edge_flags_amp_columns() {
+        let l = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::PartNLx2N,
+            4,
+            EdgeType::Vertical,
+            true,
+        );
+        assert!(l.edge_at(4, 0), "PART_nLx2N column 4");
+        let r = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::PartNRx2N,
+            4,
+            EdgeType::Vertical,
+            true,
+        );
+        assert!(r.edge_at(12, 0), "PART_nRx2N column 12");
+    }
+
+    /// §8.7.2.3 horizontal AMP: PART_2NxnU row nCbS/4, PART_2NxnD row
+    /// 3·nCbS/4.
+    #[test]
+    fn edge_flags_amp_rows() {
+        let u = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::Part2NxnU,
+            4,
+            EdgeType::Horizontal,
+            true,
+        );
+        assert!(u.edge_at(0, 4), "PART_2NxnU row 4");
+        let d = derive_edge_flags(
+            &TransformSplit::leaf(),
+            PartMode::Part2NxnD,
+            4,
+            EdgeType::Horizontal,
+            true,
+        );
+        assert!(d.edge_at(0, 12), "PART_2NxnD row 12");
+    }
+
+    /// A nested split (one quadrant splits again) marks the deeper TB edge
+    /// at the 4-sample sub-block column.
+    #[test]
+    fn edge_flags_nested_split() {
+        // 16×16 CB: TL quadrant (8×8) splits into four 4×4; others leaf.
+        let nested = TransformSplit::Split(Box::new([
+            TransformSplit::split_once(), // TL 8×8 → 4×4 leaves
+            TransformSplit::Leaf,
+            TransformSplit::Leaf,
+            TransformSplit::Leaf,
+        ]));
+        let ef = derive_edge_flags(&nested, PartMode::Part2Nx2N, 4, EdgeType::Vertical, true);
+        // The TL quadrant's internal vertical edge is at column 4.
+        for y in 0..8 {
+            assert!(ef.edge_at(4, y), "nested TB edge at column 4, row {y}");
+            assert!(ef.tb_at(4, y));
+        }
+        // The CB-internal split at column 8 is still present.
+        for y in 0..16 {
+            assert!(ef.edge_at(8, y), "CB-level split column 8");
+        }
+        // Column 4 below the TL quadrant (y>=8) is not an edge (BL leaf is
+        // 8 wide, its only internal edge would be column 8, not 4).
+        assert!(!ef.edge_at(4, 8), "column 4 row 8 clear (BL leaf)");
+    }
+
+    /// The §8.7.2.4 bS derivation consumes the derived flags: an
+    /// intra/inter split CU with a derived internal TB edge yields bS=2
+    /// at the internal column.
+    #[test]
+    fn edge_flags_feed_boundary_strength() {
+        // filterEdgeFlag = false: this CB is at the picture's left edge, so
+        // only the internal split column (8) is an edge — the bS sampler
+        // never reads a p-sample at x = −1.
+        let ef = derive_edge_flags(
+            &TransformSplit::split_once(),
+            PartMode::Part2Nx2N,
+            4,
+            EdgeType::Vertical,
+            false,
+        );
+        let mut field = MotionField::new(32, 32);
+        // Left half intra (background), right half inter.
+        field.fill_rect(8, 0, 8, 16, inter_cell([0, 0], 0));
+        let bs = derive_boundary_strength(
+            &field,
+            0,
+            0,
+            4,
+            EdgeType::Vertical,
+            ef.edge_flags(),
+            ef.tb_edge(),
+        );
+        // Internal column 8: p (col 7, intra) vs q (col 8, inter) ⇒ bS 2.
+        assert_eq!(bs.at(8, 0), 2);
     }
 
     // ----- §8.7.2.5.3 / .6 / .7 luma filtering primitives -----

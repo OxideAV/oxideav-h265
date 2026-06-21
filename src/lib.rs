@@ -259,7 +259,10 @@ pub use availability::{AvailabilityError, PictureTiling, TilingParams};
 pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
 pub use ctx_init::SliceContexts;
-pub use deblock::{derive_boundary_strength, BoundaryStrength, EdgeType};
+pub use deblock::{
+    derive_boundary_strength, derive_edge_flags, BoundaryStrength, EdgeFlags, EdgeType,
+    TransformSplit,
+};
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
