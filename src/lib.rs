@@ -235,6 +235,7 @@ pub mod ctx_init;
 pub mod deblock;
 pub mod hrd;
 pub mod inter_pred;
+pub mod intra_mode_field;
 pub mod intra_pred;
 pub mod motion;
 pub mod nal;
@@ -272,6 +273,7 @@ pub use inter_pred::{
     default_weighted_pred, interp_chroma_block, interp_luma_block, predict_inter_pu,
     InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, RefPlane,
 };
+pub use intra_mode_field::{IntraModeField, Neighbour, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE};
 pub use motion::{
     append_zero_merge_candidates, derive_chroma_mv, reconstruct_mv, MergeCandidate, MotionCell,
     MotionField, Mv,
