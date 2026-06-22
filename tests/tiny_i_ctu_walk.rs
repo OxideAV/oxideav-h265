@@ -247,3 +247,68 @@ fn tiny_i_reconstructs_expected_yuv_end_to_end() {
     expected.extend(std::iter::repeat_n(0xf0u8, 64));
     assert_eq!(packed, expected, "reconstructed planes match expected.yuv");
 }
+
+/// The same `tiny-i` IDR slice, but driven through the picture-level
+/// [`oxideav_h265::reconstruct_intra_picture`] driver (recon + §8.7.3 SAO)
+/// instead of the single-CTU helper. SAO is enabled in the slice
+/// (`slice_sao_*_flag` both set) but the CTU's SAO type is 0 on every
+/// component, so the SAO pass is a no-op and the output must still match
+/// `expected.yuv` byte for byte — exercising the shared-`ReconCtx`
+/// neighbour path, the per-CTB SAO resolve, and the `apply_sao_picture`
+/// integration end to end.
+#[test]
+fn tiny_i_picture_driver_reconstructs_expected_yuv_with_sao() {
+    use oxideav_h265::availability::TilingParams;
+    use oxideav_h265::recon::{
+        reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconParams,
+    };
+
+    let rbsp = strip_emulation_prevention(&SLICE_NAL[2..]);
+    let cabac_offset = slice_header_cabac_offset(&rbsp);
+    let params = tiny_i_params();
+    let mut engine = CabacEngine::new(BitReader::new(&rbsp[cabac_offset..])).unwrap();
+    let mut ctx = SliceContexts::init(0, 25);
+    let ctu = decode_coding_tree_unit(&mut engine, &mut ctx, &params, 0, 0, false, false).unwrap();
+    let eos = oxideav_h265::slice_data::end_of_slice_segment_flag(&mut engine).unwrap();
+    assert!(
+        eos,
+        "single-CTU slice terminates at end_of_slice_segment_flag"
+    );
+
+    let recon_params = ReconParams {
+        chroma_array_type: 1,
+        bit_depth_luma: 8,
+        bit_depth_chroma: 8,
+        intra_smoothing_disabled: false,
+        strong_intra_smoothing_enabled: true,
+        slice_qp_y: 25,
+        cb_qp_offset: 0,
+        cr_qp_offset: 0,
+        transform_skip_rotation_enabled: false,
+        extended_precision: false,
+    };
+    let pic_params = IntraPictureParams {
+        ctb_log2_size_y: 4,
+        min_tb_log2_size_y: 2,
+        tiles: TilingParams::single_tile(),
+        slice_sao_luma_flag: true,
+        slice_sao_chroma_flag: true,
+        log2_sao_offset_scale_luma: 0,
+        log2_sao_offset_scale_chroma: 0,
+    };
+    let placed = [PlacedCtu {
+        x_ctb: 0,
+        y_ctb: 0,
+        ctu: &ctu,
+    }];
+    let out = reconstruct_intra_picture(16, 16, &recon_params, &pic_params, &placed).unwrap();
+
+    let packed = out.to_planar_u8().unwrap();
+    let mut expected = vec![0x51u8; 256];
+    expected.extend(std::iter::repeat_n(0x5au8, 64));
+    expected.extend(std::iter::repeat_n(0xf0u8, 64));
+    assert_eq!(
+        packed, expected,
+        "picture-driver (recon + SAO) output matches expected.yuv"
+    );
+}

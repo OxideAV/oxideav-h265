@@ -282,7 +282,9 @@ pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
 pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
 pub use recon::{
-    reconstruct_inter_pu, reconstruct_intra_ctu, ReconError, ReconParams, ResolvedList,
+    reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
+    reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams,
+    ResolvedList,
 };
 pub use sao::{apply_sao_ctb, apply_sao_picture, ResolvedSao, ResolvedSaoComponent};
 pub use scaling_list::{

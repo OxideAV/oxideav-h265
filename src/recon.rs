@@ -618,6 +618,121 @@ pub fn reconstruct_intra_ctu(
     reconstruct_intra_ctu_ctx(pic, params, &mut ctx, ctu)
 }
 
+/// Picture-level intra decode parameters — the SPS/PPS/slice constants the
+/// multi-CTU driver [`reconstruct_intra_picture`] needs beyond the
+/// per-block [`ReconParams`].
+#[derive(Debug, Clone)]
+pub struct IntraPictureParams {
+    /// `CtbLog2SizeY`.
+    pub ctb_log2_size_y: u32,
+    /// `MinTbLog2SizeY` (= `log2_min_luma_transform_block_size_minus2 + 2`).
+    pub min_tb_log2_size_y: u32,
+    /// The active PPS tile layout (§6.5.1).
+    pub tiles: crate::availability::TilingParams,
+    /// `slice_sao_luma_flag` (§8.7.3.1 luma gate).
+    pub slice_sao_luma_flag: bool,
+    /// `slice_sao_chroma_flag` (§8.7.3.1 chroma gate).
+    pub slice_sao_chroma_flag: bool,
+    /// `log2_sao_offset_scale_luma` (§7.4.3.3.2; 0 for 8-bit Main).
+    pub log2_sao_offset_scale_luma: u8,
+    /// `log2_sao_offset_scale_chroma`.
+    pub log2_sao_offset_scale_chroma: u8,
+}
+
+/// One decoded CTU positioned in the picture for the multi-CTU driver.
+#[derive(Debug)]
+pub struct PlacedCtu<'a> {
+    /// The CTB's luma top-left `( x_ctb, y_ctb )`.
+    pub x_ctb: u32,
+    /// The CTB's luma top-left `( x_ctb, y_ctb )`.
+    pub y_ctb: u32,
+    /// The decoded coding tree unit.
+    pub ctu: &'a CodingTreeUnit,
+}
+
+/// Reconstruct a full intra picture from its decoded CTUs and apply the
+/// §8.7.3 sample-adaptive-offset in-loop filter.
+///
+/// `ctus` are the picture's decoded coding tree units **in tile-scan
+/// (decode) order** — each one's left / above neighbours must already be
+/// reconstructed when it is processed, which the tile-scan order
+/// guarantees. The driver shares one [`ReconCtx`] across all CTUs so the
+/// §8.4.2 most-probable-mode derivation sees the true neighbour modes, then
+/// resolves each CTB's [`crate::sao::ResolvedSao`] (honouring
+/// `sao_merge_left_flag` / `sao_merge_up_flag`) and runs
+/// [`crate::sao::apply_sao_picture`].
+///
+/// The returned picture is the §8.7.3 SAO output (the in-loop deblocking
+/// filter, §8.7.2, is applied by the caller via
+/// [`crate::deblock::deblock_picture`] before SAO when deblocking is
+/// enabled; this driver covers the recon + SAO stages).
+///
+/// # Errors
+/// Propagates [`ReconError`] from the per-CTU reconstruction (including
+/// [`ReconError::Tiling`] for degenerate geometry).
+pub fn reconstruct_intra_picture(
+    pic_width_luma: usize,
+    pic_height_luma: usize,
+    params: &ReconParams,
+    pic_params: &IntraPictureParams,
+    ctus: &[PlacedCtu<'_>],
+) -> Result<Picture, ReconError> {
+    let mut pic = Picture::new(
+        pic_width_luma,
+        pic_height_luma,
+        params.chroma_array_type,
+        params.bit_depth_luma,
+        params.bit_depth_chroma,
+    );
+    let mut ctx = ReconCtx::new(
+        pic_width_luma,
+        pic_height_luma,
+        pic_params.ctb_log2_size_y,
+        pic_params.min_tb_log2_size_y,
+        &pic_params.tiles,
+    )?;
+
+    let ctb_size = 1usize << pic_params.ctb_log2_size_y;
+    let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
+    let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
+
+    // §8.7.3.1 resolved-SAO grid (raster order), default all-off so a CTU
+    // not present in `ctus` leaves its CTB unmodified.
+    let mut sao_grid = vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
+
+    for placed in ctus {
+        reconstruct_intra_ctu_ctx(&mut pic, params, &mut ctx, placed.ctu)?;
+
+        // §7.4.9.3 SAO merge: resolve against the already-resolved left /
+        // above CTB in the grid.
+        let rx = (placed.x_ctb as usize) >> pic_params.ctb_log2_size_y;
+        let ry = (placed.y_ctb as usize) >> pic_params.ctb_log2_size_y;
+        if let Some(sao_params) = &placed.ctu.sao {
+            let left = (rx > 0).then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
+            let above = (ry > 0).then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
+            sao_grid[ry * pic_w_ctbs + rx] = crate::sao::ResolvedSao::resolve(
+                sao_params,
+                left.as_ref(),
+                above.as_ref(),
+                pic_params.log2_sao_offset_scale_luma,
+                pic_params.log2_sao_offset_scale_chroma,
+            );
+        }
+    }
+
+    // §8.7.3.1 — apply SAO across the whole picture (no-op when both slice
+    // SAO flags are clear or every CTB resolved to type 0).
+    let filtered = crate::sao::apply_sao_picture(
+        &pic,
+        &sao_grid,
+        pic_params.ctb_log2_size_y,
+        params.chroma_array_type,
+        pic_params.slice_sao_luma_flag,
+        pic_params.slice_sao_chroma_flag,
+    );
+    Ok(filtered)
+}
+
 fn reconstruct_quadtree(
     pic: &mut Picture,
     params: &ReconParams,
@@ -1346,5 +1461,86 @@ mod tests {
         assert_eq!(packed.len(), 384);
         assert!(packed[..256].iter().all(|&v| v == 81));
         assert!(packed[256..320].iter().all(|&v| v == 90));
+    }
+
+    /// Picture-level driver with SAO off: a single flat CTU reconstructs to
+    /// the same constant field as the per-CTU path, and the SAO pass (type
+    /// 0 / both flags clear) is a no-op.
+    #[test]
+    fn picture_driver_single_ctu_matches_per_ctu_no_sao() {
+        let params = tiny_params();
+        let ctu = flat_intra_ctu(-67, Some(-27), Some(64));
+        let pic_params = IntraPictureParams {
+            ctb_log2_size_y: 4,
+            min_tb_log2_size_y: 2,
+            tiles: TilingParams::single_tile(),
+            slice_sao_luma_flag: false,
+            slice_sao_chroma_flag: false,
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+        };
+        let placed = [PlacedCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            ctu: &ctu,
+        }];
+        let out = reconstruct_intra_picture(16, 16, &params, &pic_params, &placed).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(out.sample(Plane::Luma, x, y), 81);
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out.sample(Plane::Cb, x, y), 90);
+            }
+        }
+    }
+
+    /// Picture-level driver applies the §8.7.3 SAO band offset: a flat luma
+    /// field at 81 with a band-offset CTB shifts every covered sample by the
+    /// band's offset.
+    #[test]
+    fn picture_driver_applies_sao_band_offset() {
+        use crate::slice_data::{SaoComponent, SaoCtbParams};
+        let params = tiny_params();
+        let ctu = flat_intra_ctu(-67, Some(-27), Some(64));
+        // SAO band offset on luma: band_position chosen so the 81-valued
+        // luma band gets a +7 offset. band_shift = bitDepth-5 = 3, so
+        // sample 81 >> 3 == 10 falls in band 10; bandTable maps four
+        // consecutive bands from sao_band_position. Pick band_position 10 so
+        // band 10 → bandTable index 1 → offset_val[1].
+        let mut luma_sao = SaoComponent {
+            sao_type_idx: 1, // band offset
+            ..Default::default()
+        };
+        luma_sao.band_position = 10;
+        luma_sao.offset_abs = [7, 0, 0, 0];
+        luma_sao.offset_sign = [0, 0, 0, 0];
+        let ctu_sao = CodingTreeUnit {
+            sao: Some(SaoCtbParams {
+                merge_left: false,
+                merge_up: false,
+                components: [luma_sao, SaoComponent::default(), SaoComponent::default()],
+            }),
+            quadtree: ctu.quadtree.clone(),
+        };
+        let pic_params = IntraPictureParams {
+            ctb_log2_size_y: 4,
+            min_tb_log2_size_y: 2,
+            tiles: TilingParams::single_tile(),
+            slice_sao_luma_flag: true,
+            slice_sao_chroma_flag: false,
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+        };
+        let placed = [PlacedCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            ctu: &ctu_sao,
+        }];
+        let out = reconstruct_intra_picture(16, 16, &params, &pic_params, &placed).unwrap();
+        // Luma 81 (band 10, bandTable idx 1) + offset 7 = 88.
+        assert_eq!(out.sample(Plane::Luma, 4, 4), 88, "SAO band offset applied");
     }
 }
