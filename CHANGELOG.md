@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 360 (2026-06-22)
+
+- `intra_mode_field` §8.4.2 most-probable-mode neighbour state — the new
+  `IntraModeField` records each decoded luma prediction block's
+  `IntraPredModeY` / `CuPredMode` / `pcm_flag` on the 4×4 luma min-block
+  grid and implements the §8.4.2 step-1/step-2 `candIntraPredModeX`
+  derivation: out-of-picture / `available == FALSE` / non-`MODE_INTRA` /
+  `pcm_flag` / above-CTB-row neighbours all map to `INTRA_DC`, otherwise the
+  recorded neighbour mode. 9 unit tests cover every branch.
+
+- `recon` §8.4.2 neighbour-aware intra driver — a per-picture `ReconCtx`
+  (the `IntraModeField` + the §6.4.1 `PictureTiling`) is shared across CTUs.
+  `reconstruct_cu` now derives each luma PB's `IntraPredModeY` from the
+  actual left/above neighbours (most-probable-mode) and records it back,
+  for both `PART_2Nx2N` (one PB) and `PART_NxN` (four PBs mapped onto the
+  four top-level transform-tree children), replacing the flat-single-CU
+  `INTRA_DC` hardcode. `gather_reference_samples` switches to the true
+  §6.4.1 z-scan availability (mapping chroma plane coords to luma) instead
+  of the raster approximation. `reconstruct_intra_ctu_ctx` is the new
+  shared-ctx entry; the single-CTU `reconstruct_intra_ctu` keeps its
+  signature. Adds `ReconError::Tiling`. Two tests prove a right CU's
+  `mpm_idx == 0` inherits the left neighbour's angular mode through
+  `candModeList[0]`, whereas an isolated CU derives `INTRA_PLANAR`.
+
+- `recon` picture-level intra driver — `reconstruct_intra_picture` allocates
+  the `Picture`, reconstructs each `PlacedCtu` through the shared
+  `ReconCtx`, resolves each CTB's §7.4.9.3 `ResolvedSao` with left/above
+  merge, then runs the §8.7.3 `apply_sao_picture` in-loop SAO pass.
+  `IntraPictureParams` carries the CTB/min-TB log2 sizes, tile layout,
+  slice SAO flags, and SAO offset scales. The real `tiny-i` IDR fixture now
+  decodes byte-exact to `expected.yuv` through the full recon + SAO path (a
+  new integration test), and a unit test confirms a band-offset CTB shifts
+  samples by the resolved offset.
+
 ### Added — clean-room rebuild round 356 (2026-06-21)
 
 - `deblock` §8.7.2.1 picture-level deblocking driver — `deblock_picture`

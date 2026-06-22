@@ -23,6 +23,24 @@ decoded `CodingTreeUnit` and writes reconstructed samples into a
 prediction, §8.6.2 dequant + inverse transform, §8.6.1 QP derivation,
 §8.4.4.1 add-and-clip.
 
+The intra mode derivation is now **neighbour-aware**: an `IntraModeField`
+records each luma prediction block's `IntraPredModeY` / `CuPredMode` /
+`pcm_flag` on the 4×4 min-block grid, and the §8.4.2 step-1/step-2
+`candIntraPredModeA/B` derivation reads the actual left / above neighbour
+modes (mapping out-of-picture / unavailable / non-`MODE_INTRA` / `pcm` /
+above-CTB-row neighbours to `INTRA_DC`) — the spec-exact most-probable-mode
+derivation, replacing the flat-single-CU `INTRA_DC` assumption.
+`reconstruct_cu` handles both `PART_2Nx2N` (one PB) and `PART_NxN` (four
+PBs, mapped onto the four top-level transform-tree children), and
+`gather_reference_samples` uses the true §6.4.1 z-scan availability
+(via the `availability` module's `PictureTiling`) instead of the raster
+approximation. A **picture-level driver** (`reconstruct_intra_picture`)
+ties it together: it shares one `ReconCtx` across every CTU (so the MPM
+derivation sees neighbours in tile-scan order), resolves each CTB's
+§7.4.9.3 SAO parameters with left/above merge, and runs the §8.7.3
+`apply_sao_picture` in-loop SAO pass. The real `tiny-i` IDR fixture decodes
+byte-exact to `expected.yuv` through this full recon + SAO path.
+
 Inter sample prediction (§8.5) now reconstructs a P / B prediction unit
 to pixels: the §8.5.3.3.1 block-walk driver, §8.5.3.2 motion-vector
 reconstruction / chroma-MV derivation, and the §8.5/§8.6.5 inter PU
@@ -42,14 +60,16 @@ horizontal, walking the CUs) wire the bS + sample filters into a
 whole-picture process.
 What remains for an end-to-end inter fixture is the §8.5.3.2.2/.3/.6/.7
 merge/MVP **candidate** derivation (needs neighbour + collocated state),
-wiring `deblock_picture` into the recon CU walk, SAO apply, a
-full DPB, and multi-CTU /
-multi-slice / tile / WPP picture assembly. The runtime registration hook
-(`register`) is a no-op and the top-level decode entry point still
-returns `Error::NotImplemented` until the picture-level driver and DPB
-land; the per-CTU intra reconstruction and the per-PU inter
-reconstruction are usable directly through the public `recon` /
-`inter_pred` / `motion` / `picture` API.
+wiring `deblock_picture` into the picture-level driver ahead of SAO, a
+full DPB, and multi-slice / tile / WPP picture assembly (the
+`reconstruct_intra_picture` driver already handles a single-slice
+multi-CTU intra picture with shared-`ReconCtx` neighbour state + SAO). The
+runtime registration hook (`register`) is a no-op and the top-level decode
+entry point still returns `Error::NotImplemented` until the bitstream
+demux loop, deblock-in-driver, and DPB land; the per-CTU and picture-level
+intra reconstruction and the per-PU inter reconstruction are usable
+directly through the public `recon` / `inter_pred` / `motion` / `picture`
+API.
 
 ## What's implemented
 
