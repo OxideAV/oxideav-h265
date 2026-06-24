@@ -58,6 +58,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (eq. 7-35) and `PpsSccExtension::pps_act_qp_offset_{y,cb,cr}`
   (eq. 7-39/40/41). Three new rejection tests plus accessor assertions.
 
+- `slice` §7.3.6.1 SCC / RExt slice-header QP-offset fields — now that
+  the PPS surfaces the SCC and range-extension bodies, the slice header
+  decodes the `slice_act_{y,cb,cr}_qp_offset` se(v) fields (present when
+  `pps_slice_act_qp_offsets_present_flag`, with the §7.4.7.1 sum bound
+  `PpsActQpOffset* + slice_act_*` enforced to −12..=12) and the
+  `cu_chroma_qp_offset_enabled_flag` u(1) (present when the
+  range-extension `chroma_qp_offset_list_enabled_flag` is set), instead
+  of leaving them unparsed. Three new slice-header tests cover the ACT
+  offsets, the `cu_chroma_qp_offset_enabled_flag` gate, and the
+  out-of-range ACT-sum rejection.
+
 ### Added — clean-room rebuild round 364 (2026-06-24)
 
 - `motion` §8.5.3.2.3 spatial merging candidates — `NeighbourPu` snapshots

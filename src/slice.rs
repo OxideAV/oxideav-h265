@@ -1411,6 +1411,21 @@ pub struct SliceSegmentHeader {
     /// `slice_cr_qp_offset` (`se(v)`, range −12..=12). Inferred to 0
     /// when not present.
     pub slice_cr_qp_offset: i8,
+    /// `slice_act_y_qp_offset` (`se(v)`, §7.3.6.1). Present only when
+    /// `pps_slice_act_qp_offsets_present_flag` (the SCC PPS body);
+    /// inferred to 0 otherwise. §7.4.7.1 bounds
+    /// `PpsActQpOffsetY + slice_act_y_qp_offset` to −12..=12.
+    pub slice_act_y_qp_offset: i32,
+    /// `slice_act_cb_qp_offset` (`se(v)`, §7.3.6.1). Present only when
+    /// `pps_slice_act_qp_offsets_present_flag`; inferred to 0 otherwise.
+    pub slice_act_cb_qp_offset: i32,
+    /// `slice_act_cr_qp_offset` (`se(v)`, §7.3.6.1). Present only when
+    /// `pps_slice_act_qp_offsets_present_flag`; inferred to 0 otherwise.
+    pub slice_act_cr_qp_offset: i32,
+    /// `cu_chroma_qp_offset_enabled_flag` (`u(1)`, §7.3.6.1). Present
+    /// only when the range-extension `chroma_qp_offset_list_enabled_flag`
+    /// is set; inferred to 0 otherwise.
+    pub cu_chroma_qp_offset_enabled_flag: bool,
     /// Deblocking-filter values, carrying the §7.4.7.1 inferred
     /// defaults when the slice override block is absent. `None` when
     /// the parser stopped before this point.
@@ -1647,6 +1662,10 @@ impl SliceSegmentHeader {
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
                 slice_cr_qp_offset: 0,
+                slice_act_y_qp_offset: 0,
+                slice_act_cb_qp_offset: 0,
+                slice_act_cr_qp_offset: 0,
+                cu_chroma_qp_offset_enabled_flag: false,
                 deblocking: None,
                 slice_loop_filter_across_slices_enabled_flag: None,
                 entry_point_offsets: None,
@@ -1836,6 +1855,10 @@ impl SliceSegmentHeader {
                         slice_qp_delta: None,
                         slice_cb_qp_offset: 0,
                         slice_cr_qp_offset: 0,
+                        slice_act_y_qp_offset: 0,
+                        slice_act_cb_qp_offset: 0,
+                        slice_act_cr_qp_offset: 0,
+                        cu_chroma_qp_offset_enabled_flag: false,
                         deblocking: None,
                         slice_loop_filter_across_slices_enabled_flag: None,
                         entry_point_offsets: None,
@@ -2013,10 +2036,59 @@ impl SliceSegmentHeader {
             slice_cr_qp_offset = parse_qp_offset(&mut br, "slice_cr_qp_offset")?;
         }
 
-        // Deblocking override (§7.3.6.1). The PPS range-extension
-        // `chroma_qp_offset_list_enabled_flag` and the act-QP-offset
-        // block are not signalled by a base-profile PPS and are not
-        // surfaced by this crate yet, so they are absent here.
+        // SCC adaptive-colour-transform per-slice QP offsets (§7.3.6.1),
+        // present only when the SCC PPS body set
+        // `pps_slice_act_qp_offsets_present_flag`. §7.4.7.1 bounds the
+        // sum `PpsActQpOffset{Y,Cb,Cr} + slice_act_{y,cb,cr}_qp_offset`
+        // to −12..=12; the per-element offsets themselves are se(v) with
+        // no independent bound, so the conformance check is applied to
+        // the combined value using the PPS-level offsets.
+        let mut slice_act_y_qp_offset = 0i32;
+        let mut slice_act_cb_qp_offset = 0i32;
+        let mut slice_act_cr_qp_offset = 0i32;
+        let pps_slice_act_qp_offsets_present_flag = pps
+            .pps_scc_extension
+            .as_ref()
+            .map(|scc| scc.pps_slice_act_qp_offsets_present_flag)
+            .unwrap_or(false);
+        if pps_slice_act_qp_offsets_present_flag {
+            // The presence of the offsets implies a decoded SCC body.
+            let scc = pps
+                .pps_scc_extension
+                .as_ref()
+                .expect("pps_slice_act_qp_offsets_present_flag implies SCC body");
+            slice_act_y_qp_offset = parse_slice_act_qp_offset(
+                &mut br,
+                "slice_act_y_qp_offset",
+                scc.pps_act_qp_offset_y(),
+            )?;
+            slice_act_cb_qp_offset = parse_slice_act_qp_offset(
+                &mut br,
+                "slice_act_cb_qp_offset",
+                scc.pps_act_qp_offset_cb(),
+            )?;
+            slice_act_cr_qp_offset = parse_slice_act_qp_offset(
+                &mut br,
+                "slice_act_cr_qp_offset",
+                scc.pps_act_qp_offset_cr(),
+            )?;
+        }
+
+        // `cu_chroma_qp_offset_enabled_flag` (§7.3.6.1), present only
+        // when the range-extension `chroma_qp_offset_list_enabled_flag`
+        // is set; inferred to 0 otherwise (§7.4.7.1).
+        let chroma_qp_offset_list_enabled_flag = pps
+            .pps_range_extension
+            .as_ref()
+            .map(|re| re.chroma_qp_offset_list_enabled_flag)
+            .unwrap_or(false);
+        let cu_chroma_qp_offset_enabled_flag = if chroma_qp_offset_list_enabled_flag {
+            br.u1()? != 0
+        } else {
+            false
+        };
+
+        // Deblocking override (§7.3.6.1).
         let deblocking = parse_slice_deblocking(&mut br, pps)?;
 
         // slice_loop_filter_across_slices_enabled_flag gate (§7.3.6.1).
@@ -2127,6 +2199,10 @@ impl SliceSegmentHeader {
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,
             slice_cr_qp_offset,
+            slice_act_y_qp_offset,
+            slice_act_cb_qp_offset,
+            slice_act_cr_qp_offset,
+            cu_chroma_qp_offset_enabled_flag,
             deblocking: Some(deblocking),
             slice_loop_filter_across_slices_enabled_flag: Some(
                 slice_loop_filter_across_slices_enabled_flag,
@@ -2237,6 +2313,25 @@ fn parse_qp_offset(br: &mut BitReader<'_>, field: &'static str) -> Result<i8, Sl
         });
     }
     Ok(v as i8)
+}
+
+/// Parse a `slice_act_*_qp_offset` (`se(v)`, §7.3.6.1) and enforce the
+/// §7.4.7.1 conformance bound on its sum with the PPS-level offset:
+/// `pps_act_qp_offset + slice_act_qp_offset` must lie in −12..=12.
+fn parse_slice_act_qp_offset(
+    br: &mut BitReader<'_>,
+    field: &'static str,
+    pps_act_qp_offset: i32,
+) -> Result<i32, SliceError> {
+    let v = br.se()?;
+    let sum = pps_act_qp_offset + v;
+    if !(-12..=12).contains(&sum) {
+        return Err(SliceError::ValueOutOfRange {
+            field,
+            got: sum as i64,
+        });
+    }
+    Ok(v)
 }
 
 /// Parse the deblocking-filter override block of §7.3.6.1, applying the
@@ -2630,6 +2725,119 @@ mod tests {
         // before alignment, alignment consumes bits 13..16 (one '1'
         // plus zero pad), so slice data begins at byte 2.
         assert_eq!(sh.byte_offset_to_slice_data, Some(2));
+    }
+
+    /// I-slice whose PPS carries an SCC body with
+    /// `pps_slice_act_qp_offsets_present_flag == 1`: the three
+    /// `slice_act_{y,cb,cr}_qp_offset` se(v) fields (§7.3.6.1) are
+    /// parsed after `slice_qp_delta`, with the §7.4.7.1 sum bound
+    /// enforced against the PPS-level offsets.
+    #[test]
+    fn parses_slice_act_qp_offsets_when_pps_signals_them() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.pps_scc_extension = Some(crate::pps::PpsSccExtension {
+            pps_slice_act_qp_offsets_present_flag: true,
+            ..Default::default()
+        });
+        let bits = concat_bits(&[
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output_of_prior_pics_flag (IRAP)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (0, 1),     // slice_temporal_mvp_enabled_flag
+            (1, 1),     // slice_sao_luma_flag
+            (0, 1),     // slice_sao_chroma_flag
+            (0b011, 3), // slice_qp_delta se '011' -> -1
+            // pps_slice_chroma_qp_offsets_present_flag = 0 → absent.
+            // slice_act_*_qp_offset (PpsActQpOffset* all 0 here):
+            (0b1, 1),   // slice_act_y_qp_offset se '1' -> 0
+            (0b010, 3), // slice_act_cb_qp_offset se '010' -> +1
+            (0b011, 3), // slice_act_cr_qp_offset se '011' -> -1
+            // chroma_qp_offset_list_enabled_flag = 0 →
+            // cu_chroma_qp_offset_enabled_flag absent.
+            (1, 1), // slice_loop_filter_across_slices_enabled_flag
+            (1, 1), // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::I));
+        assert_eq!(sh.slice_qp_delta, Some(-1));
+        assert_eq!(sh.slice_act_y_qp_offset, 0);
+        assert_eq!(sh.slice_act_cb_qp_offset, 1);
+        assert_eq!(sh.slice_act_cr_qp_offset, -1);
+        assert!(!sh.cu_chroma_qp_offset_enabled_flag);
+        assert!(sh.opaque_tail.is_none());
+        assert!(sh.byte_offset_to_slice_data.is_some());
+    }
+
+    /// I-slice whose PPS range-extension sets
+    /// `chroma_qp_offset_list_enabled_flag == 1`: the
+    /// `cu_chroma_qp_offset_enabled_flag` u(1) (§7.3.6.1) is parsed
+    /// after the QP-offset block.
+    #[test]
+    fn parses_cu_chroma_qp_offset_enabled_flag_when_list_enabled() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        pps.pps_range_extension = Some(crate::pps::PpsRangeExtension {
+            chroma_qp_offset_list_enabled_flag: true,
+            ..Default::default()
+        });
+        let bits = concat_bits(&[
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output_of_prior_pics_flag
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (0, 1),     // slice_temporal_mvp_enabled_flag
+            (1, 1),     // slice_sao_luma_flag
+            (0, 1),     // slice_sao_chroma_flag
+            (0b011, 3), // slice_qp_delta se -> -1
+            // act offsets absent (pps_slice_act_qp_offsets_present_flag 0)
+            (1, 1), // cu_chroma_qp_offset_enabled_flag = 1
+            (1, 1), // slice_loop_filter_across_slices_enabled_flag
+            (1, 1), // byte_alignment '1'
+        ]);
+        let rbsp = pack_bits(&bits);
+        let sh = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect("slice header");
+        assert_eq!(sh.slice_type, Some(SliceType::I));
+        assert!(sh.cu_chroma_qp_offset_enabled_flag);
+        assert!(sh.opaque_tail.is_none());
+    }
+
+    /// §7.4.7.1: a `slice_act_y_qp_offset` whose sum with the PPS-level
+    /// `PpsActQpOffsetY` falls outside −12..=12 is rejected.
+    #[test]
+    fn rejects_out_of_range_slice_act_qp_offset_sum() {
+        let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
+        let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
+        // PpsActQpOffsetY = +10 (pps_act_y_qp_offset_plus5 = 15).
+        pps.pps_scc_extension = Some(crate::pps::PpsSccExtension {
+            pps_slice_act_qp_offsets_present_flag: true,
+            pps_act_y_qp_offset_plus5: 15,
+            ..Default::default()
+        });
+        let bits = concat_bits(&[
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output_of_prior_pics_flag
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (0, 1),     // slice_temporal_mvp_enabled_flag
+            (1, 1),     // slice_sao_luma_flag
+            (0, 1),     // slice_sao_chroma_flag
+            (0b011, 3), // slice_qp_delta se -> -1
+            // slice_act_y_qp_offset = +5 (se '0001010') → sum 10+5 = 15 > 12
+            (0b0001010, 7),
+        ]);
+        let rbsp = pack_bits(&bits);
+        let err =
+            SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect_err("act sum range");
+        assert!(matches!(
+            err,
+            SliceError::ValueOutOfRange {
+                field: "slice_act_y_qp_offset",
+                got: 15
+            }
+        ));
     }
 
     /// Non-IDR **I-slice** (CRA, type 21 — in the IRAP range so
