@@ -6,6 +6,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 364 (2026-06-24)
+
+- `motion` §8.5.3.2.3 spatial merging candidates — `NeighbourPu` snapshots
+  the `(MvLX, RefIdxLX, PredFlagLX)` motion of a neighbour PU;
+  `SpatialMergeNeighbours` carries the five §6.4.2-gated neighbour
+  positions (A1, B1, B0, A0, B2); `derive_spatial_merge_candidates`
+  implements the eq 8-128..8-142 derivation with the full redundancy
+  pruning (B1≠A1, B0≠B1, A0≠A1, B2≠A1/B1, B2 dropped when four already
+  available), the `PartitionContext` A1/B1 exclusion for the second
+  partition of vertical/horizontal-split `PartMode`s, and the
+  `Log2ParMrgLevel` same-region forcing. Output `SpatialMergeCandidates`
+  appends in the eq 8-119 order.
+
+- `motion` §8.5.3.2.4 combined bi-predictive candidates —
+  `append_combined_bi_candidates` pairs each new candidate's L0 motion and
+  L1 motion from existing candidates per Table 8-7, gated on the eq 8-143
+  `DiffPicOrderCnt(...) != 0 || mvL0 != mvL1` distinctness test (B slices,
+  `2 <= numOrig < MaxNumMergeCand`), stopping at
+  `combIdx == numOrig*(numOrig−1)` or a full list.
+
+- `motion` §8.5.3.2.2 merge-list driver — `build_merge_candidate`
+  assembles the full `mergeCandList` (steps 5–8: spatial, then temporal
+  `Col`, then combined bi-pred, then zero-MV padding to `MaxNumMergeCand`)
+  and selects `mergeCandList[ merge_idx ]` (step 9) with the step-10
+  `(nOrigPbW + nOrigPbH == 12)` bi→uni-L0 reduction. `MergeListParams`
+  carries the per-slice inputs. 12 new unit tests cover pruning, partition
+  exclusion, same-region forcing, Table 8-7 pairing, the degenerate
+  skip, index selection into the zero padding, and the 8x4/4x8 step-10
+  reduction. The temporal `Col` candidate is supplied by the caller
+  (`None` until the §8.5.3.2.8 collocated-picture path lands).
+
 ### Added — clean-room rebuild round 360 (2026-06-22)
 
 - `intra_mode_field` §8.4.2 most-probable-mode neighbour state — the new
