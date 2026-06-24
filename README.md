@@ -338,8 +338,11 @@ API.
   step. The in-loop deblocking filter is complete
   (§8.7.2.1/.2/.3/.4/.5); its wiring into the recon CU walk, SAO apply,
   and DPB management remain.
-* SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
-  the typed flags are decoded but the bodies surface as opaque bytes.
+* SPS / PPS / VPS extension bodies — the `sps_range_extension()`
+  (§7.3.2.2.2), `pps_range_extension()` (§7.3.2.3.2), and
+  `sps_scc_extension()` (§7.3.2.2.3, Screen Content Coding) bodies are
+  decoded in place; the multilayer / 3D bodies (and an SCC body that a
+  multilayer / 3D body precedes) still surface as opaque bytes.
 * Encoder.
 
 ## License

@@ -671,17 +671,131 @@ impl SpsExtensionFlags {
             || self.sps_extension_4bits != 0
     }
 
-    /// True when an extension body still follows the
-    /// `sps_range_extension()` block in the bit stream — i.e. some
-    /// later body remains surfaced opaquely after the (now-decoded)
-    /// range-extension nine flags. Used by the parser to decide
-    /// whether an opaque tail must still be captured once the range
-    /// extension has been consumed.
-    fn has_body_after_range(&self) -> bool {
-        self.sps_multilayer_extension_flag
-            || self.sps_3d_extension_flag
-            || self.sps_scc_extension_flag
-            || self.sps_extension_4bits != 0
+    /// True when the `sps_scc_extension()` body can be decoded in
+    /// place — it is signalled and no still-opaque body
+    /// (`sps_multilayer_extension()` / `sps_3d_extension()`) precedes
+    /// it in the bit stream. When a multilayer / 3D body precedes it,
+    /// the SCC body stays inside the opaque tail.
+    fn scc_decodable_in_place(&self) -> bool {
+        self.sps_scc_extension_flag
+            && !self.sps_multilayer_extension_flag
+            && !self.sps_3d_extension_flag
+    }
+
+    /// True when an extension body still follows the (range +
+    /// optionally SCC) bodies decoded in place — i.e. a multilayer /
+    /// 3D body, the `sps_extension_data_flag` while-loop, or an
+    /// SCC body whose multilayer/3D predecessor kept it opaque.
+    fn has_opaque_body_after_decoded(&self) -> bool {
+        if self.sps_multilayer_extension_flag || self.sps_3d_extension_flag {
+            // The first un-decoded body is the multilayer / 3D one;
+            // everything from there (incl. any SCC body) is opaque.
+            return true;
+        }
+        // No multilayer / 3D body: SCC (if present) was decoded in
+        // place, so only the sps_extension_data_flag while-loop may
+        // remain.
+        self.sps_extension_4bits != 0
+    }
+}
+
+/// Decoded `sps_scc_extension()` body per §7.3.2.2.3, present when
+/// [`SpsExtensionFlags::sps_scc_extension_flag`] is set and no opaque
+/// multilayer / 3D body precedes it. Per §7.4.3.2.3 the absent fields
+/// are inferred to 0 / empty when this struct is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpsSccExtension {
+    /// `sps_curr_pic_ref_enabled_flag` — when 1, a picture referring
+    /// to the SPS may be in a reference picture list of one of its own
+    /// slices (intra block copy).
+    pub sps_curr_pic_ref_enabled_flag: bool,
+    /// `palette_mode_enabled_flag` — when 1, the palette-mode decoding
+    /// process may be used for intra blocks.
+    pub palette_mode_enabled_flag: bool,
+    /// `palette_max_size` (`ue(v)`), present only when
+    /// `palette_mode_enabled_flag`; the maximum allowed palette size
+    /// (inferred 0 otherwise).
+    pub palette_max_size: u32,
+    /// `delta_palette_max_predictor_size` (`ue(v)`), present only when
+    /// `palette_mode_enabled_flag`. `PaletteMaxPredictorSize =
+    /// palette_max_size + value` (eq. 7-35).
+    pub delta_palette_max_predictor_size: u32,
+    /// `sps_palette_predictor_initializers_present_flag` — when 1, the
+    /// sequence palette predictor is initialised from
+    /// [`Self::sps_palette_predictor_initializer`].
+    pub sps_palette_predictor_initializers_present_flag: bool,
+    /// `sps_num_palette_predictor_initializers_minus1` (`ue(v)`),
+    /// present only when the initializers-present flag is set; the
+    /// initializer table then holds `value + 1` entries per component.
+    pub sps_num_palette_predictor_initializers_minus1: u32,
+    /// `sps_palette_predictor_initializer[comp][i]` (§7.3.2.2.3),
+    /// indexed `[comp][i]`. `comp` runs over `numComps` (1 when
+    /// `chroma_format_idc == 0`, else 3). Each value is `u(v)` —
+    /// `BitDepthY` bits for `comp == 0`, `BitDepthC` bits otherwise.
+    /// Empty when no initializers are signalled.
+    pub sps_palette_predictor_initializer: Vec<Vec<u32>>,
+    /// `motion_vector_resolution_control_idc` (`u(2)`) — controls the
+    /// presence / inference of `use_integer_mv_flag`.
+    pub motion_vector_resolution_control_idc: u8,
+    /// `intra_boundary_filtering_disabled_flag` — when 1, the intra
+    /// boundary filtering process is unconditionally disabled.
+    pub intra_boundary_filtering_disabled_flag: bool,
+}
+
+impl SpsSccExtension {
+    /// Decode `sps_scc_extension()` (§7.3.2.2.3). `chroma_format_idc`
+    /// selects `numComps` (1 if 0, else 3) and `bit_depth_luma` /
+    /// `bit_depth_chroma` give the `u(v)` width of each palette
+    /// predictor initializer component.
+    fn parse(
+        br: &mut BitReader,
+        chroma_format_idc: u8,
+        bit_depth_luma: u8,
+        bit_depth_chroma: u8,
+    ) -> Result<Self, SpsError> {
+        let sps_curr_pic_ref_enabled_flag = br.u1()? != 0;
+        let palette_mode_enabled_flag = br.u1()? != 0;
+        let mut palette_max_size = 0u32;
+        let mut delta_palette_max_predictor_size = 0u32;
+        let mut sps_palette_predictor_initializers_present_flag = false;
+        let mut sps_num_palette_predictor_initializers_minus1 = 0u32;
+        let mut sps_palette_predictor_initializer = Vec::new();
+        if palette_mode_enabled_flag {
+            palette_max_size = br.ue()?;
+            delta_palette_max_predictor_size = br.ue()?;
+            sps_palette_predictor_initializers_present_flag = br.u1()? != 0;
+            if sps_palette_predictor_initializers_present_flag {
+                sps_num_palette_predictor_initializers_minus1 = br.ue()?;
+                let num_comps = if chroma_format_idc == 0 { 1 } else { 3 };
+                let num_entries = sps_num_palette_predictor_initializers_minus1 as usize + 1;
+                sps_palette_predictor_initializer.reserve(num_comps);
+                for comp in 0..num_comps {
+                    let width = if comp == 0 {
+                        bit_depth_luma
+                    } else {
+                        bit_depth_chroma
+                    };
+                    let mut row = Vec::with_capacity(num_entries);
+                    for _ in 0..num_entries {
+                        row.push(br.u(width)?);
+                    }
+                    sps_palette_predictor_initializer.push(row);
+                }
+            }
+        }
+        let motion_vector_resolution_control_idc = br.u(2)? as u8;
+        let intra_boundary_filtering_disabled_flag = br.u1()? != 0;
+        Ok(Self {
+            sps_curr_pic_ref_enabled_flag,
+            palette_mode_enabled_flag,
+            palette_max_size,
+            delta_palette_max_predictor_size,
+            sps_palette_predictor_initializers_present_flag,
+            sps_num_palette_predictor_initializers_minus1,
+            sps_palette_predictor_initializer,
+            motion_vector_resolution_control_idc,
+            intra_boundary_filtering_disabled_flag,
+        })
     }
 }
 
@@ -871,6 +985,11 @@ pub struct SeqParameterSet {
     /// `extension_flags.sps_range_extension_flag` is set. `None`
     /// otherwise; per §7.4.3.2.2 every field is then inferred to 0.
     pub sps_range_extension: Option<SpsRangeExtension>,
+    /// Decoded `sps_scc_extension()` body (§7.3.2.2.3), present when
+    /// `extension_flags.sps_scc_extension_flag` is set **and** no
+    /// opaque multilayer / 3D body precedes it. `None` otherwise; per
+    /// §7.4.3.2.3 every field is then inferred to 0 / empty.
+    pub sps_scc_extension: Option<SpsSccExtension>,
     /// Opaque suffix of the SPS RBSP. Populated when
     /// `sps_extension_present_flag == 1` **and**
     /// [`SpsExtensionFlags::has_body`] is true on the decoded flags —
@@ -1247,60 +1366,78 @@ impl SeqParameterSet {
             None
         };
 
-        let (sps_extension_present_flag, extension_flags, sps_range_extension, opaque_tail) =
-            if br.bits_left() == 0 {
-                // The fixture corpus encoders sometimes elide the
-                // sps_extension_present_flag if no extension is signalled
-                // and the rbsp_trailing_bits happens to land on a byte
-                // boundary; the field is still required, so a buffer with
-                // no bits left here is a truncation.
-                return Err(SpsError::Truncated);
-            } else {
-                let gate = br.u1()? != 0;
-                if gate {
-                    // §7.3.2.2.1: when the gate is open, decode the eight
-                    // bits of typed extension flags first.
-                    let sps_range_extension_flag = br.u1()? != 0;
-                    let sps_multilayer_extension_flag = br.u1()? != 0;
-                    let sps_3d_extension_flag = br.u1()? != 0;
-                    let sps_scc_extension_flag = br.u1()? != 0;
-                    let sps_extension_4bits = br.u(4)? as u8;
-                    let flags = SpsExtensionFlags {
-                        sps_range_extension_flag,
-                        sps_multilayer_extension_flag,
-                        sps_3d_extension_flag,
-                        sps_scc_extension_flag,
-                        sps_extension_4bits,
-                    };
-                    // §7.3.2.2.1: the range extension body (if signalled)
-                    // is the first to follow the eight typed flag bits, so
-                    // decode it in full before deciding on an opaque tail.
-                    let range_ext = if flags.sps_range_extension_flag {
-                        Some(SpsRangeExtension::parse(br)?)
-                    } else {
-                        None
-                    };
-                    // If any *remaining* extension body (multilayer / 3d /
-                    // scc) or the sps_extension_data_flag while-loop
-                    // follows, capture the rest of the RBSP (those bodies +
-                    // rbsp_trailing_bits) as an opaque tail starting at the
-                    // first un-decoded body's bit position. Otherwise only
-                    // rbsp_trailing_bits remains and we consume it
-                    // implicitly.
-                    let tail = if flags.has_body_after_range() {
-                        Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
-                    } else {
-                        None
-                    };
-                    (true, Some(flags), range_ext, tail)
+        let (
+            sps_extension_present_flag,
+            extension_flags,
+            sps_range_extension,
+            sps_scc_extension,
+            opaque_tail,
+        ) = if br.bits_left() == 0 {
+            // The fixture corpus encoders sometimes elide the
+            // sps_extension_present_flag if no extension is signalled
+            // and the rbsp_trailing_bits happens to land on a byte
+            // boundary; the field is still required, so a buffer with
+            // no bits left here is a truncation.
+            return Err(SpsError::Truncated);
+        } else {
+            let gate = br.u1()? != 0;
+            if gate {
+                // §7.3.2.2.1: when the gate is open, decode the eight
+                // bits of typed extension flags first.
+                let sps_range_extension_flag = br.u1()? != 0;
+                let sps_multilayer_extension_flag = br.u1()? != 0;
+                let sps_3d_extension_flag = br.u1()? != 0;
+                let sps_scc_extension_flag = br.u1()? != 0;
+                let sps_extension_4bits = br.u(4)? as u8;
+                let flags = SpsExtensionFlags {
+                    sps_range_extension_flag,
+                    sps_multilayer_extension_flag,
+                    sps_3d_extension_flag,
+                    sps_scc_extension_flag,
+                    sps_extension_4bits,
+                };
+                // §7.3.2.2.1: the range extension body (if signalled)
+                // is the first to follow the eight typed flag bits, so
+                // decode it in full.
+                let range_ext = if flags.sps_range_extension_flag {
+                    Some(SpsRangeExtension::parse(br)?)
                 } else {
-                    // No extension present. Only the rbsp_trailing_bits
-                    // remain — a single `1` bit followed by zero-padding
-                    // to a byte boundary. We do not require the caller to
-                    // have validated it; surface nothing for the opaque tail.
-                    (false, None, None, None)
-                }
-            };
+                    None
+                };
+                // §7.3.2.2.1 body order is range, multilayer, 3d, scc.
+                // The SCC body can be decoded in place only when no
+                // (still-opaque) multilayer / 3D body precedes it;
+                // otherwise it stays inside the opaque tail.
+                let scc_ext = if flags.scc_decodable_in_place() {
+                    Some(SpsSccExtension::parse(
+                        br,
+                        chroma_format_idc,
+                        8 + bit_depth_luma_minus8_raw as u8,
+                        8 + bit_depth_chroma_minus8_raw as u8,
+                    )?)
+                } else {
+                    None
+                };
+                // If any still-opaque body (a multilayer / 3D body, an
+                // SCC body kept opaque by such a predecessor, or the
+                // sps_extension_data_flag while-loop) follows, capture
+                // the rest of the RBSP as an opaque tail starting at
+                // the first un-decoded body's bit position. Otherwise
+                // only rbsp_trailing_bits remains, consumed implicitly.
+                let tail = if flags.has_opaque_body_after_decoded() {
+                    Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+                } else {
+                    None
+                };
+                (true, Some(flags), range_ext, scc_ext, tail)
+            } else {
+                // No extension present. Only the rbsp_trailing_bits
+                // remain — a single `1` bit followed by zero-padding
+                // to a byte boundary. We do not require the caller to
+                // have validated it; surface nothing for the opaque tail.
+                (false, None, None, None, None)
+            }
+        };
 
         Ok(Self {
             vps_id,
@@ -1344,6 +1481,7 @@ impl SeqParameterSet {
             sps_extension_present_flag,
             extension_flags,
             sps_range_extension,
+            sps_scc_extension,
             opaque_tail,
         })
     }
@@ -2646,11 +2784,13 @@ mod tests {
     }
 
     /// `sps_range_extension_flag == 1` followed by `sps_scc_extension_flag
-    /// == 1`: the nine range-extension flags are decoded, and the
-    /// still-opaque `sps_scc_extension()` body is captured as a tail
-    /// starting right after them.
+    /// == 1` (no multilayer/3D body between them): the nine
+    /// range-extension flags AND the `sps_scc_extension()` body
+    /// (§7.3.2.2.3) are both decoded in place — no opaque tail remains.
+    /// Palette mode disabled, so only the three leading/trailing fields
+    /// are present.
     #[test]
-    fn decodes_range_extension_then_captures_scc_tail() {
+    fn decodes_range_extension_then_scc_body_no_palette() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
@@ -2664,7 +2804,11 @@ mod tests {
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
         s += "000000000"; // sps_range_extension() nine flags, all 0
-        s += "10101010"; // opaque sps_scc_extension() body sentinel
+                          // sps_scc_extension():
+        s += "1"; // sps_curr_pic_ref_enabled_flag = 1
+        s += "0"; // palette_mode_enabled_flag = 0 (palette block absent)
+        s += "10"; // motion_vector_resolution_control_idc = 2 (u(2))
+        s += "1"; // intra_boundary_filtering_disabled_flag = 1
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
@@ -2673,10 +2817,72 @@ mod tests {
         assert!(flags.sps_scc_extension_flag);
         let re = sps.sps_range_extension.expect("range extension body");
         assert_eq!(re, SpsRangeExtension::default());
-        // The SCC body remains opaque and is captured after the
-        // decoded range-extension flags.
-        let tail = sps.opaque_tail.expect("opaque scc tail");
-        assert!(!tail.bytes.is_empty());
+        // Both bodies are decoded in place; nothing is left opaque.
+        assert!(sps.opaque_tail.is_none());
+        let scc = sps.sps_scc_extension.expect("scc extension body");
+        assert!(scc.sps_curr_pic_ref_enabled_flag);
+        assert!(!scc.palette_mode_enabled_flag);
+        assert_eq!(scc.palette_max_size, 0);
+        assert_eq!(scc.delta_palette_max_predictor_size, 0);
+        assert!(!scc.sps_palette_predictor_initializers_present_flag);
+        assert!(scc.sps_palette_predictor_initializer.is_empty());
+        assert_eq!(scc.motion_vector_resolution_control_idc, 2);
+        assert!(scc.intra_boundary_filtering_disabled_flag);
+    }
+
+    /// `sps_scc_extension()` with `palette_mode_enabled_flag == 1` and
+    /// palette predictor initializers present: the `palette_max_size`,
+    /// `delta_palette_max_predictor_size`, and per-component initializer
+    /// table (§7.3.2.2.3) are decoded, each `u(v)` sized by `BitDepthY` /
+    /// `BitDepthC`. `chroma_format_idc == 1` here gives `numComps == 3`.
+    #[test]
+    fn decodes_scc_extension_palette_initializers() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0001"; // range/multilayer/3d = 0, scc = 1
+        s += "0000"; // sps_extension_4bits = 0
+                     // sps_scc_extension():
+        s += "0"; // sps_curr_pic_ref_enabled_flag = 0
+        s += "1"; // palette_mode_enabled_flag = 1
+        s += "00100"; // palette_max_size = ue(3) → "00100"
+        s += "010"; // delta_palette_max_predictor_size = ue(1) → "010"
+        s += "1"; // sps_palette_predictor_initializers_present_flag = 1
+        s += "010"; // sps_num_palette_predictor_initializers_minus1 = ue(1) → 1
+                    // numComps = 3, num_entries = 2; default BitDepthY/C = 8.
+                    // comp 0 (8-bit): 0x01, 0x02
+        s += "00000001";
+        s += "00000010";
+        // comp 1 (8-bit): 0x03, 0x04
+        s += "00000011";
+        s += "00000100";
+        // comp 2 (8-bit): 0x05, 0x06
+        s += "00000101";
+        s += "00000110";
+        s += "11"; // motion_vector_resolution_control_idc = 3 (u(2))
+        s += "0"; // intra_boundary_filtering_disabled_flag = 0
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        assert!(sps.opaque_tail.is_none());
+        let scc = sps.sps_scc_extension.expect("scc extension body");
+        assert!(!scc.sps_curr_pic_ref_enabled_flag);
+        assert!(scc.palette_mode_enabled_flag);
+        assert_eq!(scc.palette_max_size, 3);
+        assert_eq!(scc.delta_palette_max_predictor_size, 1);
+        assert!(scc.sps_palette_predictor_initializers_present_flag);
+        assert_eq!(scc.sps_num_palette_predictor_initializers_minus1, 1);
+        assert_eq!(
+            scc.sps_palette_predictor_initializer,
+            vec![vec![1, 2], vec![3, 4], vec![5, 6]],
+        );
+        assert_eq!(scc.motion_vector_resolution_control_idc, 3);
+        assert!(!scc.intra_boundary_filtering_disabled_flag);
     }
 
     /// `sps_extension_present_flag == 1` with every typed extension
@@ -2710,11 +2916,12 @@ mod tests {
     }
 
     /// `sps_extension_present_flag == 1` with `sps_scc_extension_flag
-    /// == 1` selects the §A.3.7 Screen Content Coding profile family;
-    /// the typed block decodes cleanly and the `sps_scc_extension()`
-    /// body lands in the opaque tail.
+    /// == 1` (and no preceding range/multilayer/3D body) selects the
+    /// §A.3.7 Screen Content Coding profile family; the typed block
+    /// decodes cleanly and the `sps_scc_extension()` body (§7.3.2.2.3)
+    /// is decoded in place with no opaque tail. Palette mode disabled.
     #[test]
-    fn captures_scc_extension_opaque_tail() {
+    fn decodes_scc_extension_body_no_range() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
@@ -2728,7 +2935,11 @@ mod tests {
         s += "0"; // sps_3d_extension_flag = 0
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
-        s += "11001100"; // sentinel sps_scc_extension() body bits
+                     // sps_scc_extension():
+        s += "1"; // sps_curr_pic_ref_enabled_flag = 1
+        s += "0"; // palette_mode_enabled_flag = 0
+        s += "01"; // motion_vector_resolution_control_idc = 1 (u(2))
+        s += "0"; // intra_boundary_filtering_disabled_flag = 0
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
@@ -2739,6 +2950,43 @@ mod tests {
         assert!(flags.sps_scc_extension_flag);
         assert_eq!(flags.sps_extension_4bits, 0);
         assert!(flags.has_body());
+        assert!(sps.opaque_tail.is_none());
+        let scc = sps.sps_scc_extension.expect("scc extension body");
+        assert!(scc.sps_curr_pic_ref_enabled_flag);
+        assert!(!scc.palette_mode_enabled_flag);
+        assert_eq!(scc.motion_vector_resolution_control_idc, 1);
+        assert!(!scc.intra_boundary_filtering_disabled_flag);
+    }
+
+    /// When `sps_scc_extension_flag == 1` but a `sps_multilayer_extension()`
+    /// body precedes it (§7.3.2.2.1 body order), the SCC body cannot be
+    /// decoded in place and the whole multilayer-onward span — including
+    /// the SCC body — stays in the opaque tail.
+    #[test]
+    fn scc_stays_opaque_behind_multilayer_body() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0"; // sps_range_extension_flag = 0
+        s += "1"; // sps_multilayer_extension_flag = 1
+        s += "0"; // sps_3d_extension_flag = 0
+        s += "1"; // sps_scc_extension_flag = 1
+        s += "0000"; // sps_extension_4bits = 0
+        s += "11001100"; // opaque multilayer + scc span sentinel
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let flags = sps.extension_flags.expect("extension flag block");
+        assert!(flags.sps_multilayer_extension_flag);
+        assert!(flags.sps_scc_extension_flag);
+        // Multilayer body is still opaque, so the SCC body cannot be
+        // decoded in place; both stay in the captured tail.
+        assert!(sps.sps_scc_extension.is_none());
         assert!(sps.opaque_tail.is_some());
     }
 

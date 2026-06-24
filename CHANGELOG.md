@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 369 (2026-06-25)
+
+- `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags
+  (`transform_skip_rotation_enabled_flag` … `cabac_bypass_alignment_enabled_flag`)
+  are decoded in place into `SpsRangeExtension` rather than left opaque,
+  surfaced on `SeqParameterSet::sps_range_extension`.
+
+- `pps` §7.3.2.3.2 `pps_range_extension()` — the RExt PPS body
+  (`log2_max_transform_skip_block_size_minus2`, the cross-component and
+  chroma-QP-offset-list controls, and the
+  `log2_sao_offset_scale_{luma,chroma}` fields) is decoded into the PPS.
+
+- `sps` §7.3.2.2.3 `sps_scc_extension()` — the Screen Content Coding SPS
+  body is decoded in place into the new `SpsSccExtension`
+  (`sps_curr_pic_ref_enabled_flag`, `palette_mode_enabled_flag` with the
+  `palette_max_size` / `delta_palette_max_predictor_size` /
+  per-component `sps_palette_predictor_initializer[comp][i]` table sized
+  `u(v)` by `BitDepthY` / `BitDepthC`, `motion_vector_resolution_control_idc`,
+  `intra_boundary_filtering_disabled_flag`), surfaced on
+  `SeqParameterSet::sps_scc_extension`. Per the §7.3.2.2.1 body order
+  (range, multilayer, 3D, scc) the SCC body is decoded only when no
+  still-opaque multilayer / 3D body precedes it; otherwise the whole
+  span stays in the opaque tail. Four new unit tests cover the
+  range-then-SCC, SCC-only, palette-initializer, and
+  SCC-behind-multilayer paths.
+
 ### Added — clean-room rebuild round 364 (2026-06-24)
 
 - `motion` §8.5.3.2.3 spatial merging candidates — `NeighbourPu` snapshots
