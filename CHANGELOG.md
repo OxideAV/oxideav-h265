@@ -37,6 +37,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reduction. The temporal `Col` candidate is supplied by the caller
   (`None` until the §8.5.3.2.8 collocated-picture path lands).
 
+- `motion` §8.5.3.2.6 / §8.5.3.2.7 luma motion-vector prediction —
+  `derive_mvp_candidate` builds the `mvpListLX` (eq 8-170: A, then B when
+  `mvLXA != mvLXB`, then the temporal `Col`, then zero padding to two
+  entries) and selects `mvpListLX[ mvp_lX_flag ]`. The §8.5.3.2.7 A
+  derivation runs its two passes (eqs 8-171/8-172 same-POC, then
+  8-173..8-183 long-term-matched + scaling) over A0/A1; the B derivation
+  runs the same-POC pass (eqs 8-184/8-185), the `isScaledFlag == 0`
+  step-4 B→A promotion (eq 8-186), and the step-5 long-term/scaling
+  re-derivation over B0/B1/B2 (eqs 8-187..8-197). `scale_temporal_mv`
+  implements the eq 8-179..8-183 / 8-193..8-197 distance scaling.
+  `RefPicId` + `MvpContext` carry the per-list reference picture and the
+  POC / long-term / short-term resolvers the picture driver supplies. 8
+  new unit tests cover zero padding, same-POC pick, B→A promotion, Col
+  insertion / suppression, and the short-term scaling arithmetic. The
+  §8.5.3.2.8 temporal predictor `mvLXCol` is passed in (`None` until the
+  collocated path lands).
+
 ### Added — clean-room rebuild round 360 (2026-06-22)
 
 - `intra_mode_field` §8.4.2 most-probable-mode neighbour state — the new

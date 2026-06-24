@@ -22,12 +22,20 @@
 //!   list out to `MaxNumMergeCand` when the spatial / temporal / combined
 //!   candidates do not fill it.
 //!
-//! The §8.5.3.2.2 merge-mode driver, the §8.5.3.2.3 spatial / §8.5.3.2.8
-//! temporal candidate derivation, and the §8.5.3.2.6 / §8.5.3.2.7 MVP
-//! candidate construction depend on the neighbour reconstruction state
-//! (the spatial neighbour PUs and the collocated picture) and are the
-//! picture-driver's follow-up; this module provides the arithmetic the
-//! drivers compose.
+//! The §8.5.3.2.3 spatial-merge candidate derivation
+//! ([`derive_spatial_merge_candidates`]), the §8.5.3.2.4 combined
+//! bi-predictive step ([`append_combined_bi_candidates`]), the §8.5.3.2.2
+//! merge-list driver ([`build_merge_candidate`]), and the §8.5.3.2.6 /
+//! §8.5.3.2.7 luma-MVP candidate derivation ([`derive_mvp_candidate`])
+//! also live here. They take the neighbour PU motion as data ([`NeighbourPu`]
+//! snapshots gathered by the picture driver from the per-block motion
+//! field) plus closures resolving a `(list, ref_idx)` to its POC /
+//! long-term flag, so the arithmetic stays self-contained and unit-tested
+//! while the picture driver owns the neighbour-location plumbing.
+//!
+//! The §8.5.3.2.8 temporal (collocated-picture) candidate is still the
+//! picture-driver's follow-up — its `Col` candidate is passed in as an
+//! `Option` (`None` until the collocated-MV path lands).
 
 /// A `[mv[0], mv[1]]` motion vector. Luma MVs are in quarter-luma-sample
 /// units; chroma MVs are in eighth-chroma-sample units.
@@ -509,6 +517,321 @@ where
     chosen
 }
 
+/// Reference-picture identity for the §8.5.3.2.7 motion-vector scaling:
+/// the picture order count plus whether it is a long-term reference.
+///
+/// The §8.5.3.2.7 derivation reads two things about each candidate
+/// reference picture: its POC (for `DiffPicOrderCnt`, eqs 8-179..8-197)
+/// and whether it is marked "used for long-term reference" (the
+/// `LongTermRefPic(...)` equality test and the short-term gate on
+/// scaling). The picture driver resolves a `(list, ref_idx)` to this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefPicId {
+    /// `PicOrderCntVal` of the reference picture.
+    pub poc: i32,
+    /// `true` iff the picture is marked "used for long-term reference".
+    pub long_term: bool,
+}
+
+/// §8.5.3.2.7 motion-vector scaling (eqs 8-179..8-183 / 8-193..8-197):
+/// scale `mv` from the temporal distance `td = currPic − neighRefPic` to
+/// `tb = currPic − curRefPic`.
+///
+/// `td`/`tb` are the §8.5.3.2.7 `DiffPicOrderCnt` distances (clipped to
+/// `[−128, 127]` per eqs 8-182/8-183). Returns the eq 8-181 scaled MV.
+#[must_use]
+fn scale_temporal_mv(mv: Mv, curr_poc: i32, neigh_ref_poc: i32, cur_ref_poc: i32) -> Mv {
+    // eqs 8-182 / 8-196 and 8-183 / 8-197.
+    let td = (curr_poc - neigh_ref_poc).clamp(-128, 127);
+    let tb = (curr_poc - cur_ref_poc).clamp(-128, 127);
+    if td == 0 {
+        // td == 0 means same picture; the caller only scales when the
+        // POCs differ, so this guard is defensive (avoids /0).
+        return mv;
+    }
+    // eq 8-179 / 8-193: tx = (16384 + (|td| >> 1)) / td.
+    let tx = (16384 + (td.abs() >> 1)) / td;
+    // eq 8-180 / 8-194.
+    let dist_scale = (((tb * tx) + 32) >> 6).clamp(-4096, 4095);
+    // eq 8-181 / 8-195: per component.
+    [
+        scale_component(dist_scale, mv[0]),
+        scale_component(dist_scale, mv[1]),
+    ]
+}
+
+#[inline]
+#[must_use]
+fn scale_component(dist_scale: i32, mv: i32) -> i32 {
+    let v = dist_scale * mv;
+    let sign = if v < 0 { -1 } else { 1 };
+    (sign * ((v.abs() + 127) >> 8)).clamp(-32768, 32767)
+}
+
+/// The motion of one MVP source neighbour, paired with which list its MV
+/// was taken from, so the §8.5.3.2.7 scaling can resolve the source
+/// reference picture. Produced by [`mvp_neighbour_mv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MvpSource {
+    mv: Mv,
+    /// The list (0 or 1) the MV / refIdx were drawn from at the neighbour.
+    src_list: usize,
+    /// `RefIdxLY[ xNb ][ yNb ]` for that source list.
+    src_ref_idx: i32,
+}
+
+/// §8.5.3.2.7 — the "same POC" (no-scaling) neighbour-MV pick used by the
+/// A pass-1 (eqs 8-171/8-172) and the B step-3 (eqs 8-184/8-185): take the
+/// neighbour's L`X` MV when its L`X` reference picture has the same POC as
+/// the current reference picture; otherwise its L`Y` (Y = 1−X) MV under
+/// the same POC test. Returns `None` when neither matches.
+#[must_use]
+fn mvp_neighbour_mv_same_poc(
+    n: NeighbourPu,
+    x: usize,
+    cur_ref_poc: i32,
+    neigh_ref_poc: &dyn Fn(usize, i32) -> i32,
+) -> Option<Mv> {
+    let (px, ix, mx) = list_fields(n, x);
+    if px && neigh_ref_poc(x, ix) == cur_ref_poc {
+        return Some(mx);
+    }
+    let y = 1 - x;
+    let (py, iy, my) = list_fields(n, y);
+    if py && neigh_ref_poc(y, iy) == cur_ref_poc {
+        return Some(my);
+    }
+    None
+}
+
+/// §8.5.3.2.7 — the long-term-matched neighbour-MV pick used by A pass-2
+/// (eqs 8-173..8-178) and B step-5 (eqs 8-187..8-192): take the
+/// neighbour's L`X` MV when the current ref and the neighbour's L`X` ref
+/// have equal long-term status; else its L`Y` MV under the same test.
+/// Returns the source MV + which list it came from (for later scaling).
+#[must_use]
+fn mvp_neighbour_mv_long_term(
+    n: NeighbourPu,
+    x: usize,
+    cur_long_term: bool,
+    neigh_long_term: &dyn Fn(usize, i32) -> bool,
+) -> Option<MvpSource> {
+    let (px, ix, mx) = list_fields(n, x);
+    if px && cur_long_term == neigh_long_term(x, ix) {
+        return Some(MvpSource {
+            mv: mx,
+            src_list: x,
+            src_ref_idx: ix,
+        });
+    }
+    let y = 1 - x;
+    let (py, iy, my) = list_fields(n, y);
+    if py && cur_long_term == neigh_long_term(y, iy) {
+        return Some(MvpSource {
+            mv: my,
+            src_list: y,
+            src_ref_idx: iy,
+        });
+    }
+    None
+}
+
+/// `(predFlagLL, refIdxLL, mvLL)` of a neighbour for list `l` (0 or 1).
+#[inline]
+#[must_use]
+fn list_fields(n: NeighbourPu, l: usize) -> (bool, i32, Mv) {
+    if l == 0 {
+        (n.pred_flag_l0, n.ref_idx_l0, n.mv_l0)
+    } else {
+        (n.pred_flag_l1, n.ref_idx_l1, n.mv_l1)
+    }
+}
+
+/// The §8.5.3.2.7 inputs for one list `X`: the current PU's reference
+/// picture and the §8.5.3.2.7 ref-pic resolvers.
+pub struct MvpContext<'a> {
+    /// `X` — the list being predicted (0 or 1).
+    pub x: usize,
+    /// `PicOrderCntVal` of the current picture.
+    pub curr_poc: i32,
+    /// The current PU's reference picture `RefPicListX[ refIdxLX ]`.
+    pub cur_ref: RefPicId,
+    /// Resolve a neighbour's `(list, ref_idx)` to its reference POC.
+    pub neigh_ref_poc: &'a dyn Fn(usize, i32) -> i32,
+    /// Resolve a neighbour's `(list, ref_idx)` to its long-term flag.
+    pub neigh_ref_long_term: &'a dyn Fn(usize, i32) -> bool,
+    /// Resolve a `(list, ref_idx)` to whether it is a short-term picture
+    /// (the §8.5.3.2.7 scaling gate requires both refs short-term).
+    pub neigh_ref_short_term: &'a dyn Fn(usize, i32) -> bool,
+}
+
+impl std::fmt::Debug for MvpContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvpContext")
+            .field("x", &self.x)
+            .field("curr_poc", &self.curr_poc)
+            .field("cur_ref", &self.cur_ref)
+            .finish_non_exhaustive()
+    }
+}
+
+/// §8.5.3.2.7 — derive `mvLXA` and `availableFlagLXA` from the left
+/// neighbours A0 (`xPb−1, yPb+nPbH`) then A1 (`xPb−1, yPb+nPbH−1`).
+///
+/// `a0`/`a1` are the §6.4.2-gated neighbour PUs (`None` when unavailable).
+/// Returns `(availableFlagLXA, mvLXA, isScaledFlagLX)`.
+#[must_use]
+fn derive_mvp_a(
+    a0: Option<NeighbourPu>,
+    a1: Option<NeighbourPu>,
+    ctx: &MvpContext,
+) -> (bool, Mv, bool) {
+    // step 5: isScaledFlagLX = (availableA0 || availableA1).
+    let is_scaled = a0.is_some() || a1.is_some();
+    // step 6 (pass 1): same-POC, no scaling, first match over A0 then A1.
+    for n in [a0, a1].into_iter().flatten() {
+        if let Some(mv) = mvp_neighbour_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
+            return (true, mv, is_scaled);
+        }
+    }
+    // step 7 (pass 2): long-term-matched, then scale when both short-term.
+    for n in [a0, a1].into_iter().flatten() {
+        if let Some(src) =
+            mvp_neighbour_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
+        {
+            let mv = maybe_scale(src, ctx);
+            return (true, mv, is_scaled);
+        }
+    }
+    (false, [0, 0], is_scaled)
+}
+
+/// §8.5.3.2.7 — derive `mvLXB` and `availableFlagLXB` from the above
+/// neighbours B0 (`xPb+nPbW, yPb−1`), B1 (`xPb+nPbW−1, yPb−1`), B2
+/// (`xPb−1, yPb−1`), with the `isScaledFlag` interaction (steps 3–5).
+///
+/// Returns `(availableFlagLXB, mvLXB, mvLXA_override)` where the override
+/// is `Some(mvLXB)` when step 4 copies B into A (isScaledFlag == 0 path).
+#[must_use]
+fn derive_mvp_b(
+    b0: Option<NeighbourPu>,
+    b1: Option<NeighbourPu>,
+    b2: Option<NeighbourPu>,
+    is_scaled: bool,
+    ctx: &MvpContext,
+) -> (bool, Mv, Option<Mv>) {
+    // step 3: same-POC, no scaling, first match over B0, B1, B2.
+    let mut avail_b = false;
+    let mut mv_b = [0, 0];
+    for n in [b0, b1, b2].into_iter().flatten() {
+        if let Some(mv) = mvp_neighbour_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
+            avail_b = true;
+            mv_b = mv;
+            break;
+        }
+    }
+    // step 4: when isScaledFlagLX == 0 and availableFlagLXB == 1, copy B
+    // into A (mvLXA = mvLXB, availableFlagLXA = 1).
+    let mut a_override = None;
+    if !is_scaled && avail_b {
+        a_override = Some(mv_b);
+    }
+    // step 5: when isScaledFlagLX == 0, reset B and re-derive with the
+    // long-term-match + scaling pass (this is the B that becomes the
+    // scaled candidate when A was unscaled).
+    if !is_scaled {
+        avail_b = false;
+        mv_b = [0, 0];
+        for n in [b0, b1, b2].into_iter().flatten() {
+            if let Some(src) =
+                mvp_neighbour_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
+            {
+                avail_b = true;
+                mv_b = maybe_scale(src, ctx);
+                break;
+            }
+        }
+    }
+    (avail_b, mv_b, a_override)
+}
+
+/// Apply the §8.5.3.2.7 eq 8-181/8-195 scaling to a long-term-matched
+/// source MV when the POCs differ and both pictures are short-term;
+/// otherwise return the MV unchanged (eqs 8-173..8-178 / 8-187..8-192).
+#[must_use]
+fn maybe_scale(src: MvpSource, ctx: &MvpContext) -> Mv {
+    let neigh_poc = (ctx.neigh_ref_poc)(src.src_list, src.src_ref_idx);
+    let neigh_short = (ctx.neigh_ref_short_term)(src.src_list, src.src_ref_idx);
+    let both_short = neigh_short && !ctx.cur_ref.long_term;
+    if neigh_poc != ctx.cur_ref.poc && both_short {
+        scale_temporal_mv(src.mv, ctx.curr_poc, neigh_poc, ctx.cur_ref.poc)
+    } else {
+        src.mv
+    }
+}
+
+/// §8.5.3.2.6 / §8.5.3.2.7 — derive the luma motion-vector predictor
+/// `mvpLX` for one list `X`.
+///
+/// `neigh` carries the five §6.4.2-gated spatial neighbour PUs (the A/B
+/// derivation reads A0/A1 and B0/B1/B2); `ctx` carries `X`, the current
+/// PU's reference picture, and the ref-pic resolvers. `col` is the
+/// §8.5.3.2.8 temporal predictor `mvLXCol` (`None` when
+/// `availableFlagLXCol == 0`). `mvp_lx_flag` selects `mvpListLX[ flag ]`.
+///
+/// The §8.5.3.2.6 list (eq 8-170) is built as: A (if available); B (if
+/// available and `mvLXA != mvLXB`); the temporal Col (if fewer than 2 and
+/// available); zero-MV padding to two entries.
+#[must_use]
+pub fn derive_mvp_candidate(
+    neigh: &SpatialMergeNeighbours,
+    ctx: &MvpContext,
+    col: Option<Mv>,
+    mvp_lx_flag: bool,
+) -> Mv {
+    let (avail_a, mv_a, is_scaled) = derive_mvp_a(neigh.a0, neigh.a1, ctx);
+    let (avail_b, mv_b, a_override) = derive_mvp_b(neigh.b0, neigh.b1, neigh.b2, is_scaled, ctx);
+    // step 4 of B can promote A from B's same-POC match.
+    let (avail_a, mv_a) = if !avail_a {
+        match a_override {
+            Some(mv) => (true, mv),
+            None => (avail_a, mv_a),
+        }
+    } else {
+        (avail_a, mv_a)
+    };
+
+    // §8.5.3.2.6 step 2: Col is suppressed when A and B are both available
+    // with different MVs.
+    let col = if avail_a && avail_b && mv_a != mv_b {
+        None
+    } else {
+        col
+    };
+
+    // §8.5.3.2.6 step 3: assemble mvpListLX (eq 8-170).
+    let mut list: Vec<Mv> = Vec::with_capacity(2);
+    if avail_a {
+        list.push(mv_a);
+        if avail_b && mv_a != mv_b {
+            list.push(mv_b);
+        }
+    } else if avail_b {
+        list.push(mv_b);
+    }
+    if list.len() < 2 {
+        if let Some(c) = col {
+            list.push(c);
+        }
+    }
+    while list.len() < 2 {
+        list.push([0, 0]);
+    }
+
+    // step 4: mvpLX = mvpListLX[ mvp_lX_flag ].
+    list[usize::from(mvp_lx_flag)]
+}
+
 /// Per-4×4-block motion / mode information for one decoded picture, the
 /// store the §8.7.2.4 boundary-strength derivation and the inter
 /// reconstruction driver read out of.
@@ -820,6 +1143,144 @@ mod tests {
         assert!(chosen.pred_flag_l0);
         assert!(!chosen.pred_flag_l1, "8x4/4x8 bi ⇒ uni-L0");
         assert_eq!(chosen.ref_idx_l1, -1);
+    }
+
+    /// Build an [`MvpContext`] for list 0 where every neighbour reference
+    /// at `(list, ref_idx)` resolves to the same short-term POC `ref_poc`
+    /// and the current reference is short-term at `cur_poc`.
+    fn mvp_ctx_same<'a>(
+        curr_poc: i32,
+        cur_poc: i32,
+        ref_poc: &'a dyn Fn(usize, i32) -> i32,
+        long_term: &'a dyn Fn(usize, i32) -> bool,
+        short_term: &'a dyn Fn(usize, i32) -> bool,
+    ) -> MvpContext<'a> {
+        MvpContext {
+            x: 0,
+            curr_poc,
+            cur_ref: RefPicId {
+                poc: cur_poc,
+                long_term: false,
+            },
+            neigh_ref_poc: ref_poc,
+            neigh_ref_long_term: long_term,
+            neigh_ref_short_term: short_term,
+        }
+    }
+
+    #[test]
+    fn mvp_no_neighbours_pads_zero() {
+        let neigh = SpatialMergeNeighbours::default();
+        let rp = |_: usize, _: i32| 0;
+        let lt = |_: usize, _: i32| false;
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
+        // Both list entries are zero MVs.
+        assert_eq!(derive_mvp_candidate(&neigh, &ctx, None, false), [0, 0]);
+        assert_eq!(derive_mvp_candidate(&neigh, &ctx, None, true), [0, 0]);
+    }
+
+    #[test]
+    fn mvp_a_same_poc_no_scaling() {
+        // A1 available, same-POC ⇒ mvpListLX[0] = A1's MV unchanged.
+        let neigh = SpatialMergeNeighbours {
+            a1: Some(uni_l0(0, [12, -8])),
+            ..Default::default()
+        };
+        let rp = |_: usize, _: i32| 0; // neighbour ref POC == cur ref POC.
+        let lt = |_: usize, _: i32| false;
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
+        assert_eq!(derive_mvp_candidate(&neigh, &ctx, None, false), [12, -8]);
+    }
+
+    #[test]
+    fn mvp_b_promotes_to_a_when_no_left_neighbour() {
+        // No A0/A1 ⇒ isScaledFlag == 0. B1 same-POC ⇒ step 4 copies B
+        // into A, so mvpListLX[0] = B's MV.
+        let neigh = SpatialMergeNeighbours {
+            b1: Some(uni_l0(0, [5, 5])),
+            ..Default::default()
+        };
+        let rp = |_: usize, _: i32| 0;
+        let lt = |_: usize, _: i32| false;
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
+        assert_eq!(derive_mvp_candidate(&neigh, &ctx, None, false), [5, 5]);
+    }
+
+    #[test]
+    fn mvp_col_inserted_when_a_b_agree() {
+        // A and B both available with the SAME MV ⇒ list has one entry
+        // from A, Col fills slot 1 (step 2 keeps Col because mvA == mvB).
+        let neigh = SpatialMergeNeighbours {
+            a1: Some(uni_l0(0, [3, 3])),
+            b1: Some(uni_l0(0, [3, 3])),
+            ..Default::default()
+        };
+        let rp = |_: usize, _: i32| 0;
+        let lt = |_: usize, _: i32| false;
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
+        // slot 0 = A's MV, slot 1 = Col.
+        assert_eq!(
+            derive_mvp_candidate(&neigh, &ctx, Some([9, 9]), false),
+            [3, 3]
+        );
+        assert_eq!(
+            derive_mvp_candidate(&neigh, &ctx, Some([9, 9]), true),
+            [9, 9]
+        );
+    }
+
+    #[test]
+    fn mvp_col_suppressed_when_a_b_differ() {
+        // A and B available with DIFFERENT MVs ⇒ Col suppressed (step 2);
+        // list = [mvA, mvB].
+        let neigh = SpatialMergeNeighbours {
+            a1: Some(uni_l0(0, [1, 0])),
+            b1: Some(uni_l0(0, [2, 0])),
+            ..Default::default()
+        };
+        let rp = |_: usize, _: i32| 0;
+        let lt = |_: usize, _: i32| false;
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
+        assert_eq!(
+            derive_mvp_candidate(&neigh, &ctx, Some([9, 9]), false),
+            [1, 0]
+        );
+        assert_eq!(
+            derive_mvp_candidate(&neigh, &ctx, Some([9, 9]), true),
+            [2, 0]
+        );
+    }
+
+    #[test]
+    fn mvp_a_scales_when_poc_differs_short_term() {
+        // A0 unavailable for same-POC (neighbour ref POC != cur ref POC),
+        // but long-term status matches ⇒ pass-2 picks A1 + scales.
+        // curr_poc = 8, cur ref POC = 4 ⇒ tb = 4. Neighbour ref POC = 2
+        // ⇒ td = 6. mv = [64, 0].
+        // tx = (16384 + 3)/6 = 2731; distScale = clip((4*2731+32)>>6) =
+        // (10956>>6) = 171; comp = (171*64 + 127)>>8 = (10944+127)>>8 =
+        // 11071>>8 = 43.
+        let neigh = SpatialMergeNeighbours {
+            a1: Some(uni_l0(0, [64, 0])),
+            ..Default::default()
+        };
+        // Same-POC pass fails: neighbour ref POC (2) != cur ref POC (4).
+        let rp = |_: usize, _: i32| 2;
+        let lt = |_: usize, _: i32| false; // long-term status matches (both short).
+        let st = |_: usize, _: i32| true;
+        let ctx = mvp_ctx_same(8, 4, &rp, &lt, &st);
+        assert_eq!(derive_mvp_candidate(&neigh, &ctx, None, false), [43, 0]);
+    }
+
+    #[test]
+    fn scale_temporal_mv_known_vector() {
+        // Same arithmetic as the test above, exercised directly.
+        assert_eq!(scale_temporal_mv([64, 0], 8, 2, 4), [43, 0]);
     }
 
     #[test]
