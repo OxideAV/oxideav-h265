@@ -282,7 +282,10 @@ pub use motion::{
 };
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
-pub use pps::{DeblockingFilterControl, PicParameterSet, PpsError, TileInfo};
+pub use pps::{
+    ChromaQpOffsetListEntry, DeblockingFilterControl, PicParameterSet, PpsError, PpsRangeExtension,
+    TileInfo,
+};
 pub use recon::{
     reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
     reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams,

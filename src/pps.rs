@@ -271,6 +271,131 @@ impl PpsExtensionFlags {
             || self.pps_scc_extension_flag
             || self.pps_extension_4bits != 0
     }
+
+    /// True when an extension body still follows the
+    /// `pps_range_extension()` block in the bit stream — i.e. some
+    /// later body (multilayer / 3d / scc) or the
+    /// `pps_extension_data_flag` while-loop remains surfaced opaquely
+    /// after the (now-decoded) range-extension body.
+    fn has_body_after_range(&self) -> bool {
+        self.pps_multilayer_extension_flag
+            || self.pps_3d_extension_flag
+            || self.pps_scc_extension_flag
+            || self.pps_extension_4bits != 0
+    }
+}
+
+/// One `( cb_qp_offset_list[i], cr_qp_offset_list[i] )` pair from the
+/// `pps_range_extension()` chroma-QP-offset list (§7.3.2.3.2). Both
+/// offsets are `se(v)` values constrained to −12..=+12 (§7.4.3.3.2),
+/// used in the §8.6.1 derivation of `Qp′Cb` / `Qp′Cr` when
+/// `cu_chroma_qp_offset_flag` selects entry `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChromaQpOffsetListEntry {
+    /// `cb_qp_offset_list[i]` (`se(v)`, −12..=+12).
+    pub cb_qp_offset: i8,
+    /// `cr_qp_offset_list[i]` (`se(v)`, −12..=+12).
+    pub cr_qp_offset: i8,
+}
+
+/// Decoded `pps_range_extension()` body per §7.3.2.3.2, present when
+/// [`PpsExtensionFlags::pps_range_extension_flag`] is set. Per
+/// §7.4.3.3.2 the absent fields are inferred to 0 / empty when this
+/// struct is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PpsRangeExtension {
+    /// `log2_max_transform_skip_block_size_minus2` (`ue(v)`), present
+    /// only when `transform_skip_enabled_flag` is set; inferred to 0
+    /// otherwise. `Log2MaxTransformSkipSize = value + 2` (eq. 7-38).
+    pub log2_max_transform_skip_block_size_minus2: u32,
+    /// `cross_component_prediction_enabled_flag` — when 1,
+    /// `log2_res_scale_abs_plus1` / `res_scale_sign_flag` may be
+    /// present in the transform-unit syntax.
+    pub cross_component_prediction_enabled_flag: bool,
+    /// `chroma_qp_offset_list_enabled_flag` — when 1,
+    /// `cu_chroma_qp_offset_flag` may be present in the transform-unit
+    /// syntax and [`Self::chroma_qp_offset_list`] is populated.
+    pub chroma_qp_offset_list_enabled_flag: bool,
+    /// `diff_cu_chroma_qp_offset_depth` (`ue(v)`), present only when
+    /// `chroma_qp_offset_list_enabled_flag`. `Log2MinCuChromaQpOffsetSize
+    /// = CtbLog2SizeY − value` (eq. 7-39).
+    pub diff_cu_chroma_qp_offset_depth: u32,
+    /// `chroma_qp_offset_list_len_minus1` (`ue(v)`, 0..=5), present
+    /// only when `chroma_qp_offset_list_enabled_flag`. The
+    /// [`Self::chroma_qp_offset_list`] then holds `value + 1` entries.
+    pub chroma_qp_offset_list_len_minus1: u32,
+    /// The `cb_qp_offset_list[] / cr_qp_offset_list[]` pairs
+    /// (§7.3.2.3.2). Empty when `chroma_qp_offset_list_enabled_flag`
+    /// is 0; otherwise holds `chroma_qp_offset_list_len_minus1 + 1`
+    /// entries.
+    pub chroma_qp_offset_list: Vec<ChromaQpOffsetListEntry>,
+    /// `log2_sao_offset_scale_luma` (`ue(v)`) — base-2 log of the SAO
+    /// luma-offset scaling parameter (range 0..=Max(0, BitDepthY−10)).
+    pub log2_sao_offset_scale_luma: u32,
+    /// `log2_sao_offset_scale_chroma` (`ue(v)`) — base-2 log of the
+    /// SAO chroma-offset scaling parameter (0..=Max(0, BitDepthC−10)).
+    pub log2_sao_offset_scale_chroma: u32,
+}
+
+impl PpsRangeExtension {
+    /// Maximum permitted `chroma_qp_offset_list_len_minus1` (§7.4.3.3.2).
+    const MAX_CHROMA_QP_OFFSET_LIST_LEN_MINUS1: u32 = 5;
+
+    /// Decode `pps_range_extension()` (§7.3.2.3.2). The leading
+    /// `log2_max_transform_skip_block_size_minus2` is present only when
+    /// `transform_skip_enabled_flag` (a general-body field) is set.
+    fn parse(br: &mut BitReader, transform_skip_enabled_flag: bool) -> Result<Self, PpsError> {
+        let log2_max_transform_skip_block_size_minus2 = if transform_skip_enabled_flag {
+            br.ue()?
+        } else {
+            0
+        };
+        let cross_component_prediction_enabled_flag = br.u1()? != 0;
+        let chroma_qp_offset_list_enabled_flag = br.u1()? != 0;
+        let mut diff_cu_chroma_qp_offset_depth = 0u32;
+        let mut chroma_qp_offset_list_len_minus1 = 0u32;
+        let mut chroma_qp_offset_list = Vec::new();
+        if chroma_qp_offset_list_enabled_flag {
+            diff_cu_chroma_qp_offset_depth = br.ue()?;
+            chroma_qp_offset_list_len_minus1 = br.ue()?;
+            if chroma_qp_offset_list_len_minus1 > Self::MAX_CHROMA_QP_OFFSET_LIST_LEN_MINUS1 {
+                return Err(PpsError::ValueOutOfRange {
+                    field: "chroma_qp_offset_list_len_minus1",
+                    got: chroma_qp_offset_list_len_minus1 as i64,
+                });
+            }
+            let len = chroma_qp_offset_list_len_minus1 as usize + 1;
+            chroma_qp_offset_list.reserve(len);
+            for _ in 0..len {
+                let cb = br.se()?;
+                let cr = br.se()?;
+                for (field, v) in [("cb_qp_offset_list", cb), ("cr_qp_offset_list", cr)] {
+                    if !(-12..=12).contains(&v) {
+                        return Err(PpsError::ValueOutOfRange {
+                            field,
+                            got: v as i64,
+                        });
+                    }
+                }
+                chroma_qp_offset_list.push(ChromaQpOffsetListEntry {
+                    cb_qp_offset: cb as i8,
+                    cr_qp_offset: cr as i8,
+                });
+            }
+        }
+        let log2_sao_offset_scale_luma = br.ue()?;
+        let log2_sao_offset_scale_chroma = br.ue()?;
+        Ok(Self {
+            log2_max_transform_skip_block_size_minus2,
+            cross_component_prediction_enabled_flag,
+            chroma_qp_offset_list_enabled_flag,
+            diff_cu_chroma_qp_offset_depth,
+            chroma_qp_offset_list_len_minus1,
+            chroma_qp_offset_list,
+            log2_sao_offset_scale_luma,
+            log2_sao_offset_scale_chroma,
+        })
+    }
 }
 
 /// Parsed Picture Parameter Set per §7.3.2.3.1.
@@ -367,6 +492,11 @@ pub struct PicParameterSet {
     /// absent; in that case every flag is inferred to 0 per the
     /// §7.4.3.3.1 inference rules.
     pub extension_flags: Option<PpsExtensionFlags>,
+    /// Decoded `pps_range_extension()` body (§7.3.2.3.2), present when
+    /// `extension_flags.pps_range_extension_flag` is set. `None`
+    /// otherwise; per §7.4.3.3.2 every field is then inferred to 0 /
+    /// empty.
+    pub pps_range_extension: Option<PpsRangeExtension>,
     /// Opaque suffix of the PPS RBSP. Populated when
     /// `pps_extension_present_flag == 1` **and**
     /// [`PpsExtensionFlags::has_body`] is true on the decoded flags
@@ -588,7 +718,7 @@ impl PicParameterSet {
         let slice_segment_header_extension_present_flag = br.u1()? != 0;
 
         let pps_extension_present_flag = br.u1()? != 0;
-        let (extension_flags, opaque_tail) = if pps_extension_present_flag {
+        let (extension_flags, pps_range_extension, opaque_tail) = if pps_extension_present_flag {
             // §7.3.2.3.1: when the gate is open, decode the eight bits
             // of typed extension flags first.
             let pps_range_extension_flag = br.u1()? != 0;
@@ -603,22 +733,33 @@ impl PicParameterSet {
                 pps_scc_extension_flag,
                 pps_extension_4bits,
             };
-            // If any extension body or the pps_extension_data_flag
-            // while-loop follows, capture the remainder of the RBSP
-            // (those bodies + rbsp_trailing_bits) as an opaque tail
-            // starting at the first body's bit position. Otherwise
-            // only rbsp_trailing_bits remains and we consume it
-            // implicitly.
-            let tail = if flags.has_body() {
+            // §7.3.2.3.1: the range extension (if signalled) is the
+            // first body to follow the eight typed flag bits, so decode
+            // it in full before deciding on an opaque tail. Its leading
+            // log2_max_transform_skip_block_size_minus2 is present only
+            // when transform_skip_enabled_flag was set in the general
+            // body.
+            let range_ext = if flags.pps_range_extension_flag {
+                Some(PpsRangeExtension::parse(br, transform_skip_enabled_flag)?)
+            } else {
+                None
+            };
+            // If any *remaining* extension body (multilayer / 3d / scc)
+            // or the pps_extension_data_flag while-loop follows, capture
+            // the rest of the RBSP (those bodies + rbsp_trailing_bits)
+            // as an opaque tail starting at the first un-decoded body's
+            // bit position. Otherwise only rbsp_trailing_bits remains
+            // and we consume it implicitly.
+            let tail = if flags.has_body_after_range() {
                 Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
             } else {
                 None
             };
-            (Some(flags), tail)
+            (Some(flags), range_ext, tail)
         } else {
             // §7.4.3.3.1: every extension flag inferred to 0; only
             // rbsp_trailing_bits remains, consumed implicitly.
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
@@ -656,6 +797,7 @@ impl PicParameterSet {
             slice_segment_header_extension_present_flag,
             pps_extension_present_flag,
             extension_flags,
+            pps_range_extension,
             opaque_tail,
         })
     }
@@ -944,21 +1086,23 @@ mod tests {
     }
 
     /// `pps_extension_present_flag == 1` with
-    /// `pps_range_extension_flag == 1` decodes the flag block and
-    /// surfaces an opaque tail starting at the first byte of the
-    /// `pps_range_extension()` body.
+    /// `pps_range_extension_flag == 1` decodes the flag block then the
+    /// `pps_range_extension()` body (§7.3.2.3.2). The prefix has
+    /// `transform_skip_enabled_flag == 0`, so the body opens directly
+    /// with `cross_component_prediction_enabled_flag`. With no body
+    /// after the range extension, no opaque tail is captured.
     #[test]
-    fn captures_range_extension_opaque_tail() {
+    fn decodes_pps_range_extension_body() {
         let mut bits = minimal_pps_prefix_bits();
         bits += "1"; // pps_extension_present_flag = 1
         bits += "1"; // pps_range_extension_flag = 1
         bits += "000"; // pps_multilayer/3d/scc = 0
         bits += "0000"; // pps_extension_4bits = 0
-                        // Sentinel for the opaque pps_range_extension() body — the
-                        // parser must not interpret it. Use a recognisable pattern
-                        // (0xAA = 10101010) and ensure the rbsp_trailing_bits stop
-                        // bit follows so the buffer is well-formed RBSP.
-        bits += "10101010";
+                        // pps_range_extension() body (transform_skip off):
+        bits += "1"; // cross_component_prediction_enabled_flag = 1
+        bits += "0"; // chroma_qp_offset_list_enabled_flag = 0
+        bits += "010"; // log2_sao_offset_scale_luma = 1 (ue)
+        bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
         bits += "1"; // rbsp_trailing_bits stop bit
         while bits.len() % 8 != 0 {
             bits += "0";
@@ -968,13 +1112,83 @@ mod tests {
         assert!(pps.pps_extension_present_flag);
         let flags = pps.extension_flags.expect("extension flag block");
         assert!(flags.pps_range_extension_flag);
-        assert!(!flags.pps_multilayer_extension_flag);
-        assert!(!flags.pps_3d_extension_flag);
-        assert!(!flags.pps_scc_extension_flag);
-        assert_eq!(flags.pps_extension_4bits, 0);
         assert!(flags.has_body());
-        let tail = pps.opaque_tail.as_ref().expect("range-ext opaque tail");
-        assert!(!tail.bytes.is_empty());
+        // No body after the range extension → no opaque tail.
+        assert!(pps.opaque_tail.is_none());
+        let re = pps.pps_range_extension.expect("range extension body");
+        assert_eq!(re.log2_max_transform_skip_block_size_minus2, 0);
+        assert!(re.cross_component_prediction_enabled_flag);
+        assert!(!re.chroma_qp_offset_list_enabled_flag);
+        assert!(re.chroma_qp_offset_list.is_empty());
+        assert_eq!(re.log2_sao_offset_scale_luma, 1);
+        assert_eq!(re.log2_sao_offset_scale_chroma, 0);
+    }
+
+    /// `pps_range_extension()` with `chroma_qp_offset_list_enabled_flag
+    /// == 1` decodes the `diff_cu_chroma_qp_offset_depth`,
+    /// `chroma_qp_offset_list_len_minus1`, and the `cb/cr_qp_offset_list`
+    /// se(v) pairs (§7.3.2.3.2).
+    #[test]
+    fn decodes_pps_range_extension_chroma_qp_offset_list() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "1"; // pps_range_extension_flag = 1
+        bits += "0000000"; // multilayer/3d/scc + 4bits = 0
+                           // pps_range_extension() body (transform_skip off):
+        bits += "0"; // cross_component_prediction_enabled_flag = 0
+        bits += "1"; // chroma_qp_offset_list_enabled_flag = 1
+        bits += "1"; // diff_cu_chroma_qp_offset_depth = 0 (ue)
+        bits += "010"; // chroma_qp_offset_list_len_minus1 = 1 (ue) → 2 entries
+                       // entry 0: cb=+1 (se '010'), cr=-1 (se '011')
+        bits += "010";
+        bits += "011";
+        // entry 1: cb=+2 (se '00100'), cr=0 (se '1')
+        bits += "00100";
+        bits += "1";
+        bits += "1"; // log2_sao_offset_scale_luma = 0 (ue)
+        bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("range-ext PPS parse");
+        let re = pps.pps_range_extension.expect("range extension body");
+        assert!(re.chroma_qp_offset_list_enabled_flag);
+        assert_eq!(re.diff_cu_chroma_qp_offset_depth, 0);
+        assert_eq!(re.chroma_qp_offset_list_len_minus1, 1);
+        assert_eq!(re.chroma_qp_offset_list.len(), 2);
+        assert_eq!(re.chroma_qp_offset_list[0].cb_qp_offset, 1);
+        assert_eq!(re.chroma_qp_offset_list[0].cr_qp_offset, -1);
+        assert_eq!(re.chroma_qp_offset_list[1].cb_qp_offset, 2);
+        assert_eq!(re.chroma_qp_offset_list[1].cr_qp_offset, 0);
+    }
+
+    /// `chroma_qp_offset_list_len_minus1` above its §7.4.3.3.2 cap of 5
+    /// is rejected.
+    #[test]
+    fn rejects_oversized_chroma_qp_offset_list_len() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "1"; // pps_range_extension_flag = 1
+        bits += "0000000"; // multilayer/3d/scc + 4bits = 0
+        bits += "0"; // cross_component_prediction_enabled_flag = 0
+        bits += "1"; // chroma_qp_offset_list_enabled_flag = 1
+        bits += "1"; // diff_cu_chroma_qp_offset_depth = 0 (ue)
+        bits += "00111"; // chroma_qp_offset_list_len_minus1 = 6 (ue) → > 5
+        bits += "1"; // padding to keep a well-formed buffer
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let err = PicParameterSet::parse(&rbsp).expect_err("len out of range");
+        assert!(matches!(
+            err,
+            PpsError::ValueOutOfRange {
+                field: "chroma_qp_offset_list_len_minus1",
+                got: 6
+            }
+        ));
     }
 
     /// `pps_extension_present_flag == 1` with the four typed
