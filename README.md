@@ -58,8 +58,22 @@ driver (`filter_cu_edges`, into a `Picture`), and the §8.7.2.1
 picture-level driver (`deblock_picture`: all vertical edges, then all
 horizontal, walking the CUs) wire the bS + sample filters into a
 whole-picture process.
-What remains for an end-to-end inter fixture is the §8.5.3.2.2/.3/.6/.7
-merge/MVP **candidate** derivation (needs neighbour + collocated state),
+The §8.5.3.2.2/.3/.4/.6/.7 merge / MVP **candidate** derivation now lands
+in the `motion` module: `derive_spatial_merge_candidates` (§8.5.3.2.3, the
+five A1/B1/B0/A0/B2 spatial neighbours with full redundancy pruning,
+`PartMode`/`partIdx` exclusion, and `Log2ParMrgLevel` same-region
+forcing), `append_combined_bi_candidates` (§8.5.3.2.4 Table 8-7 bi-pred
+pairing), `build_merge_candidate` (§8.5.3.2.2 steps 5–10: spatial +
+temporal `Col` + combined + zero-pad, select at `merge_idx`, the
+8x4/4x8 bi→uni reduction), and `derive_mvp_candidate` (§8.5.3.2.6/.7 the
+spatial MVP A/B two-pass derivation with eq 8-179..8-197 distance scaling
+and the `mvpListLX` assembly). All take neighbour PU motion as data
+(`NeighbourPu` snapshots + POC / long-term resolvers), so the §8.5.3.2.8
+**temporal** (collocated-picture) `Col` candidate — passed in as an
+`Option` — is what remains for the merge/MVP path.
+What remains for an end-to-end inter fixture is the §8.5.3.2.8 collocated
+temporal candidate (needs DPB collocated-picture state), wiring the
+picture driver to gather the spatial `NeighbourPu`s from the motion field,
 wiring `deblock_picture` into the picture-level driver ahead of SAO, a
 full DPB, and multi-slice / tile / WPP picture assembly (the
 `reconstruct_intra_picture` driver already handles a single-slice
@@ -243,6 +257,20 @@ API.
   P uni-L0 / B bi forms), and `MotionField` — a per-4×4-block store of
   mode + `predFlagLX` / reference-picture identity / `mvLX` that the
   §8.7.2.4 boundary-strength derivation and the inter reconstruction read.
+* **Merge / MVP candidate derivation (§8.5.3.2.2/.3/.4/.6/.7)** — the
+  `motion` module: `derive_spatial_merge_candidates` (§8.5.3.2.3 the five
+  A1/B1/B0/A0/B2 spatial neighbours, eq 8-128..8-142, with the redundancy
+  pruning, `PartMode`/`partIdx` A1/B1 exclusion, and `Log2ParMrgLevel`
+  same-region forcing), `append_combined_bi_candidates` (§8.5.3.2.4
+  Table 8-7 bi-pred pairing gated on eq 8-143), `build_merge_candidate`
+  (§8.5.3.2.2 steps 5–10 list assembly + `merge_idx` selection + the
+  8x4/4x8 bi→uni reduction), and `derive_mvp_candidate` (§8.5.3.2.6/.7 the
+  spatial MVP A/B two-pass derivation, eq 8-170..8-197, with the
+  eq 8-179..8-183 distance scaling and the `mvpListLX` build). `NeighbourPu`
+  snapshots a neighbour PU's `(MvLX, RefIdxLX, PredFlagLX)`; `RefPicId` /
+  `MvpContext` carry the per-list reference picture and the POC /
+  long-term / short-term resolvers. The §8.5.3.2.8 temporal `Col`
+  candidate is passed in as an `Option` (collocated-picture path pending).
 * **Inter PU reconstruction (§8.5 / §8.6.5)** — `recon::reconstruct_inter_pu`
   builds the §8.5.3.3.2 reference planes from a `ResolvedList`
   (`predFlagLX` + `mvLX` / `mvCLX` + reference `Picture`), runs the
@@ -298,14 +326,16 @@ API.
   implemented and runs end to end on real HEVC bitstream (the
   `tiny-i-only-16x16-main` fixture's single intra CTU + SAO decode
   bit-exactly through it).
-* The rest of inter prediction (§8.5): the §8.5.3.2.2 / §8.5.3.2.3 /
-  §8.5.3.2.6 / §8.5.3.2.7 / §8.5.3.2.8 merge / spatial / temporal / MVP
-  **candidate** derivation (which needs the neighbour-PU and collocated
-  picture state), and the §8.5.3.3.4.3 explicit weighted-prediction path.
-  The §8.5.3.3.3 interpolation, §8.5.3.3.4.2 default combine, §8.5.3.3.1
-  block-walk driver, §8.5.3.2.1 MV reconstruction, §8.5.3.2.10 chroma MV,
-  §8.5.3.2.5 zero-merge, and the §8.5/§8.6.5 inter PU reconstruction are
-  implemented (see above). The in-loop deblocking filter is complete
+* The rest of inter prediction (§8.5): the §8.5.3.2.8 **temporal**
+  (collocated-picture) merge / MVP candidate derivation (which needs the
+  DPB collocated-picture motion field), and the §8.5.3.3.4.3 explicit
+  weighted-prediction path. The §8.5.3.2.2/.3/.4/.6/.7 spatial merge / MVP
+  candidate derivation, the §8.5.3.3.3 interpolation, §8.5.3.3.4.2 default
+  combine, §8.5.3.3.1 block-walk driver, §8.5.3.2.1 MV reconstruction,
+  §8.5.3.2.10 chroma MV, §8.5.3.2.5 zero-merge, and the §8.5/§8.6.5 inter
+  PU reconstruction are implemented (see above). The driver wiring that
+  gathers the spatial `NeighbourPu`s from the motion field is the next
+  step. The in-loop deblocking filter is complete
   (§8.7.2.1/.2/.3/.4/.5); its wiring into the recon CU walk, SAO apply,
   and DPB management remain.
 * SPS / PPS / VPS extension bodies (range / multilayer / 3D / SCC) —
