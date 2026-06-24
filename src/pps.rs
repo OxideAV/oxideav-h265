@@ -272,16 +272,31 @@ impl PpsExtensionFlags {
             || self.pps_extension_4bits != 0
     }
 
-    /// True when an extension body still follows the
-    /// `pps_range_extension()` block in the bit stream — i.e. some
-    /// later body (multilayer / 3d / scc) or the
-    /// `pps_extension_data_flag` while-loop remains surfaced opaquely
-    /// after the (now-decoded) range-extension body.
-    fn has_body_after_range(&self) -> bool {
-        self.pps_multilayer_extension_flag
-            || self.pps_3d_extension_flag
-            || self.pps_scc_extension_flag
-            || self.pps_extension_4bits != 0
+    /// True when the `pps_scc_extension()` body can be decoded in
+    /// place — it is signalled and no still-opaque body
+    /// (`pps_multilayer_extension()` / `pps_3d_extension()`) precedes it
+    /// in the bit stream. When a multilayer / 3D body precedes it, the
+    /// SCC body stays inside the opaque tail.
+    fn scc_decodable_in_place(&self) -> bool {
+        self.pps_scc_extension_flag
+            && !self.pps_multilayer_extension_flag
+            && !self.pps_3d_extension_flag
+    }
+
+    /// True when an extension body still follows the (range + optionally
+    /// SCC) bodies decoded in place — i.e. a multilayer / 3D body, the
+    /// `pps_extension_data_flag` while-loop, or an SCC body whose
+    /// multilayer / 3D predecessor kept it opaque.
+    fn has_opaque_body_after_decoded(&self) -> bool {
+        if self.pps_multilayer_extension_flag || self.pps_3d_extension_flag {
+            // The first un-decoded body is the multilayer / 3D one;
+            // everything from there (incl. any SCC body) is opaque.
+            return true;
+        }
+        // No multilayer / 3D body: SCC (if present) was decoded in
+        // place, so only the pps_extension_data_flag while-loop may
+        // remain.
+        self.pps_extension_4bits != 0
     }
 }
 
@@ -398,6 +413,125 @@ impl PpsRangeExtension {
     }
 }
 
+/// Decoded `pps_scc_extension()` body per §7.3.2.3.3, present when
+/// [`PpsExtensionFlags::pps_scc_extension_flag`] is set and no opaque
+/// multilayer / 3D body precedes it. Per §7.4.3.3.3 the absent fields
+/// are inferred to 0 / empty when this struct is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PpsSccExtension {
+    /// `pps_curr_pic_ref_enabled_flag` — when 1, a picture referring to
+    /// the PPS may appear in one of its own slices' reference picture
+    /// lists (intra block copy at the picture level).
+    pub pps_curr_pic_ref_enabled_flag: bool,
+    /// `residual_adaptive_colour_transform_enabled_flag` — when 1, the
+    /// adaptive colour transform may be applied to residuals.
+    pub residual_adaptive_colour_transform_enabled_flag: bool,
+    /// `pps_slice_act_qp_offsets_present_flag` — present only when
+    /// `residual_adaptive_colour_transform_enabled_flag`; when 1, the
+    /// `slice_act_*_qp_offset` fields are present in slice headers.
+    pub pps_slice_act_qp_offsets_present_flag: bool,
+    /// `pps_act_y_qp_offset_plus5` (`se(v)`), present only when
+    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `PpsActQpOffsetY = value − 5` (eq. 7-39).
+    pub pps_act_y_qp_offset_plus5: i32,
+    /// `pps_act_cb_qp_offset_plus5` (`se(v)`), present only when
+    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `PpsActQpOffsetCb = value − 5` (eq. 7-40).
+    pub pps_act_cb_qp_offset_plus5: i32,
+    /// `pps_act_cr_qp_offset_plus3` (`se(v)`), present only when
+    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `PpsActQpOffsetCr = value − 3` (eq. 7-41).
+    pub pps_act_cr_qp_offset_plus3: i32,
+    /// `pps_palette_predictor_initializers_present_flag` — when 1, the
+    /// picture palette predictor is initialised from
+    /// [`Self::pps_palette_predictor_initializer`].
+    pub pps_palette_predictor_initializers_present_flag: bool,
+    /// `pps_num_palette_predictor_initializers` (`ue(v)`), present only
+    /// when the initializers-present flag is set; the initializer table
+    /// then holds this many entries per component.
+    pub pps_num_palette_predictor_initializers: u32,
+    /// `monochrome_palette_flag` — present only when there is at least
+    /// one initializer; selects `numComps` (1 when set, else 3).
+    pub monochrome_palette_flag: bool,
+    /// `luma_bit_depth_entry_minus8` (`ue(v)`); the initializer's luma
+    /// component is `u(v)` of `luma_bit_depth_entry_minus8 + 8` bits.
+    pub luma_bit_depth_entry_minus8: u32,
+    /// `chroma_bit_depth_entry_minus8` (`ue(v)`), present only when not
+    /// `monochrome_palette_flag`; chroma components are `u(v)` of
+    /// `chroma_bit_depth_entry_minus8 + 8` bits.
+    pub chroma_bit_depth_entry_minus8: u32,
+    /// `pps_palette_predictor_initializer[comp][i]` (§7.3.2.3.3),
+    /// indexed `[comp][i]`. `comp` runs over `numComps`. Empty when no
+    /// initializers are signalled.
+    pub pps_palette_predictor_initializer: Vec<Vec<u32>>,
+}
+
+impl PpsSccExtension {
+    /// Decode `pps_scc_extension()` (§7.3.2.3.3). Unlike the SPS variant,
+    /// the palette predictor initializer `u(v)` widths come from this
+    /// body's own `luma_bit_depth_entry_minus8` /
+    /// `chroma_bit_depth_entry_minus8`, so no SPS context is needed.
+    fn parse(br: &mut BitReader) -> Result<Self, PpsError> {
+        let pps_curr_pic_ref_enabled_flag = br.u1()? != 0;
+        let residual_adaptive_colour_transform_enabled_flag = br.u1()? != 0;
+        let mut pps_slice_act_qp_offsets_present_flag = false;
+        let mut pps_act_y_qp_offset_plus5 = 0i32;
+        let mut pps_act_cb_qp_offset_plus5 = 0i32;
+        let mut pps_act_cr_qp_offset_plus3 = 0i32;
+        if residual_adaptive_colour_transform_enabled_flag {
+            pps_slice_act_qp_offsets_present_flag = br.u1()? != 0;
+            pps_act_y_qp_offset_plus5 = br.se()?;
+            pps_act_cb_qp_offset_plus5 = br.se()?;
+            pps_act_cr_qp_offset_plus3 = br.se()?;
+        }
+        let pps_palette_predictor_initializers_present_flag = br.u1()? != 0;
+        let mut pps_num_palette_predictor_initializers = 0u32;
+        let mut monochrome_palette_flag = false;
+        let mut luma_bit_depth_entry_minus8 = 0u32;
+        let mut chroma_bit_depth_entry_minus8 = 0u32;
+        let mut pps_palette_predictor_initializer = Vec::new();
+        if pps_palette_predictor_initializers_present_flag {
+            pps_num_palette_predictor_initializers = br.ue()?;
+            if pps_num_palette_predictor_initializers > 0 {
+                monochrome_palette_flag = br.u1()? != 0;
+                luma_bit_depth_entry_minus8 = br.ue()?;
+                if !monochrome_palette_flag {
+                    chroma_bit_depth_entry_minus8 = br.ue()?;
+                }
+                let num_comps = if monochrome_palette_flag { 1 } else { 3 };
+                let num_entries = pps_num_palette_predictor_initializers as usize;
+                pps_palette_predictor_initializer.reserve(num_comps);
+                for comp in 0..num_comps {
+                    let width = if comp == 0 {
+                        (luma_bit_depth_entry_minus8 + 8) as u8
+                    } else {
+                        (chroma_bit_depth_entry_minus8 + 8) as u8
+                    };
+                    let mut row = Vec::with_capacity(num_entries);
+                    for _ in 0..num_entries {
+                        row.push(br.u(width)?);
+                    }
+                    pps_palette_predictor_initializer.push(row);
+                }
+            }
+        }
+        Ok(Self {
+            pps_curr_pic_ref_enabled_flag,
+            residual_adaptive_colour_transform_enabled_flag,
+            pps_slice_act_qp_offsets_present_flag,
+            pps_act_y_qp_offset_plus5,
+            pps_act_cb_qp_offset_plus5,
+            pps_act_cr_qp_offset_plus3,
+            pps_palette_predictor_initializers_present_flag,
+            pps_num_palette_predictor_initializers,
+            monochrome_palette_flag,
+            luma_bit_depth_entry_minus8,
+            chroma_bit_depth_entry_minus8,
+            pps_palette_predictor_initializer,
+        })
+    }
+}
+
 /// Parsed Picture Parameter Set per §7.3.2.3.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PicParameterSet {
@@ -497,6 +631,11 @@ pub struct PicParameterSet {
     /// otherwise; per §7.4.3.3.2 every field is then inferred to 0 /
     /// empty.
     pub pps_range_extension: Option<PpsRangeExtension>,
+    /// Decoded `pps_scc_extension()` body (§7.3.2.3.3), present when
+    /// `extension_flags.pps_scc_extension_flag` is set **and** no opaque
+    /// multilayer / 3D body precedes it. `None` otherwise; per
+    /// §7.4.3.3.3 every field is then inferred to 0 / empty.
+    pub pps_scc_extension: Option<PpsSccExtension>,
     /// Opaque suffix of the PPS RBSP. Populated when
     /// `pps_extension_present_flag == 1` **and**
     /// [`PpsExtensionFlags::has_body`] is true on the decoded flags
@@ -718,49 +857,59 @@ impl PicParameterSet {
         let slice_segment_header_extension_present_flag = br.u1()? != 0;
 
         let pps_extension_present_flag = br.u1()? != 0;
-        let (extension_flags, pps_range_extension, opaque_tail) = if pps_extension_present_flag {
-            // §7.3.2.3.1: when the gate is open, decode the eight bits
-            // of typed extension flags first.
-            let pps_range_extension_flag = br.u1()? != 0;
-            let pps_multilayer_extension_flag = br.u1()? != 0;
-            let pps_3d_extension_flag = br.u1()? != 0;
-            let pps_scc_extension_flag = br.u1()? != 0;
-            let pps_extension_4bits = br.u(4)? as u8;
-            let flags = PpsExtensionFlags {
-                pps_range_extension_flag,
-                pps_multilayer_extension_flag,
-                pps_3d_extension_flag,
-                pps_scc_extension_flag,
-                pps_extension_4bits,
-            };
-            // §7.3.2.3.1: the range extension (if signalled) is the
-            // first body to follow the eight typed flag bits, so decode
-            // it in full before deciding on an opaque tail. Its leading
-            // log2_max_transform_skip_block_size_minus2 is present only
-            // when transform_skip_enabled_flag was set in the general
-            // body.
-            let range_ext = if flags.pps_range_extension_flag {
-                Some(PpsRangeExtension::parse(br, transform_skip_enabled_flag)?)
+        let (extension_flags, pps_range_extension, pps_scc_extension, opaque_tail) =
+            if pps_extension_present_flag {
+                // §7.3.2.3.1: when the gate is open, decode the eight bits
+                // of typed extension flags first.
+                let pps_range_extension_flag = br.u1()? != 0;
+                let pps_multilayer_extension_flag = br.u1()? != 0;
+                let pps_3d_extension_flag = br.u1()? != 0;
+                let pps_scc_extension_flag = br.u1()? != 0;
+                let pps_extension_4bits = br.u(4)? as u8;
+                let flags = PpsExtensionFlags {
+                    pps_range_extension_flag,
+                    pps_multilayer_extension_flag,
+                    pps_3d_extension_flag,
+                    pps_scc_extension_flag,
+                    pps_extension_4bits,
+                };
+                // §7.3.2.3.1: the range extension (if signalled) is the
+                // first body to follow the eight typed flag bits, so decode
+                // it in full. Its leading
+                // log2_max_transform_skip_block_size_minus2 is present only
+                // when transform_skip_enabled_flag was set in the general
+                // body.
+                let range_ext = if flags.pps_range_extension_flag {
+                    Some(PpsRangeExtension::parse(br, transform_skip_enabled_flag)?)
+                } else {
+                    None
+                };
+                // §7.3.2.3.1 body order is range, multilayer, 3d, scc. The
+                // SCC body can be decoded in place only when no
+                // (still-opaque) multilayer / 3D body precedes it;
+                // otherwise it stays inside the opaque tail.
+                let scc_ext = if flags.scc_decodable_in_place() {
+                    Some(PpsSccExtension::parse(br)?)
+                } else {
+                    None
+                };
+                // If any still-opaque body (a multilayer / 3D body, an SCC
+                // body kept opaque by such a predecessor, or the
+                // pps_extension_data_flag while-loop) follows, capture the
+                // rest of the RBSP as an opaque tail starting at the first
+                // un-decoded body's bit position. Otherwise only
+                // rbsp_trailing_bits remains, consumed implicitly.
+                let tail = if flags.has_opaque_body_after_decoded() {
+                    Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+                } else {
+                    None
+                };
+                (Some(flags), range_ext, scc_ext, tail)
             } else {
-                None
+                // §7.4.3.3.1: every extension flag inferred to 0; only
+                // rbsp_trailing_bits remains, consumed implicitly.
+                (None, None, None, None)
             };
-            // If any *remaining* extension body (multilayer / 3d / scc)
-            // or the pps_extension_data_flag while-loop follows, capture
-            // the rest of the RBSP (those bodies + rbsp_trailing_bits)
-            // as an opaque tail starting at the first un-decoded body's
-            // bit position. Otherwise only rbsp_trailing_bits remains
-            // and we consume it implicitly.
-            let tail = if flags.has_body_after_range() {
-                Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
-            } else {
-                None
-            };
-            (Some(flags), range_ext, tail)
-        } else {
-            // §7.4.3.3.1: every extension flag inferred to 0; only
-            // rbsp_trailing_bits remains, consumed implicitly.
-            (None, None, None)
-        };
 
         Ok(Self {
             pps_id: pps_id_raw as u8,
@@ -798,6 +947,7 @@ impl PicParameterSet {
             pps_extension_present_flag,
             extension_flags,
             pps_range_extension,
+            pps_scc_extension,
             opaque_tail,
         })
     }
@@ -1162,6 +1312,180 @@ mod tests {
         assert_eq!(re.chroma_qp_offset_list[0].cr_qp_offset, -1);
         assert_eq!(re.chroma_qp_offset_list[1].cb_qp_offset, 2);
         assert_eq!(re.chroma_qp_offset_list[1].cr_qp_offset, 0);
+    }
+
+    /// `pps_scc_extension()` (§7.3.2.3.3) with no preceding
+    /// range/multilayer/3D body: the body is decoded in place with no
+    /// opaque tail. Adaptive colour transform off, palette initializers
+    /// absent — only the leading flag and the two trailing flags.
+    #[test]
+    fn decodes_pps_scc_extension_minimal() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0"; // pps_range_extension_flag = 0
+        bits += "0"; // pps_multilayer_extension_flag = 0
+        bits += "0"; // pps_3d_extension_flag = 0
+        bits += "1"; // pps_scc_extension_flag = 1
+        bits += "0000"; // pps_extension_4bits = 0
+                        // pps_scc_extension():
+        bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
+        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("scc PPS parse");
+        let flags = pps.extension_flags.expect("extension flag block");
+        assert!(flags.pps_scc_extension_flag);
+        assert!(pps.opaque_tail.is_none());
+        let scc = pps.pps_scc_extension.expect("scc extension body");
+        assert!(scc.pps_curr_pic_ref_enabled_flag);
+        assert!(!scc.residual_adaptive_colour_transform_enabled_flag);
+        assert!(!scc.pps_palette_predictor_initializers_present_flag);
+        assert!(scc.pps_palette_predictor_initializer.is_empty());
+    }
+
+    /// `pps_scc_extension()` with
+    /// `residual_adaptive_colour_transform_enabled_flag == 1` decodes the
+    /// `pps_slice_act_qp_offsets_present_flag` and the three
+    /// `pps_act_*_qp_offset_*` se(v) fields (§7.3.2.3.3).
+    #[test]
+    fn decodes_pps_scc_extension_act_offsets() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0001"; // range/multilayer/3d = 0, scc = 1
+        bits += "0000"; // pps_extension_4bits = 0
+                        // pps_scc_extension():
+        bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
+        bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
+        bits += "1"; // pps_slice_act_qp_offsets_present_flag = 1
+        bits += "010"; // pps_act_y_qp_offset_plus5 = +1 (se '010')
+        bits += "011"; // pps_act_cb_qp_offset_plus5 = -1 (se '011')
+        bits += "00100"; // pps_act_cr_qp_offset_plus3 = +2 (se '00100')
+        bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("scc PPS parse");
+        assert!(pps.opaque_tail.is_none());
+        let scc = pps.pps_scc_extension.expect("scc extension body");
+        assert!(!scc.pps_curr_pic_ref_enabled_flag);
+        assert!(scc.residual_adaptive_colour_transform_enabled_flag);
+        assert!(scc.pps_slice_act_qp_offsets_present_flag);
+        assert_eq!(scc.pps_act_y_qp_offset_plus5, 1);
+        assert_eq!(scc.pps_act_cb_qp_offset_plus5, -1);
+        assert_eq!(scc.pps_act_cr_qp_offset_plus3, 2);
+    }
+
+    /// `pps_scc_extension()` with palette predictor initializers
+    /// present: the per-component `pps_palette_predictor_initializer`
+    /// table is sized `u(v)` from this body's own
+    /// `luma_bit_depth_entry_minus8` / `chroma_bit_depth_entry_minus8`.
+    /// `monochrome_palette_flag == 0` → `numComps == 3`.
+    #[test]
+    fn decodes_pps_scc_extension_palette_initializers() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0001"; // range/multilayer/3d = 0, scc = 1
+        bits += "0000"; // pps_extension_4bits = 0
+                        // pps_scc_extension():
+        bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
+        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "1"; // pps_palette_predictor_initializers_present_flag = 1
+        bits += "011"; // pps_num_palette_predictor_initializers = 2 (ue)
+        bits += "0"; // monochrome_palette_flag = 0 → numComps = 3
+        bits += "1"; // luma_bit_depth_entry_minus8 = 0 (ue) → 8-bit luma
+        bits += "1"; // chroma_bit_depth_entry_minus8 = 0 (ue) → 8-bit chroma
+                     // comp 0 (8-bit): 0x0A, 0x0B
+        bits += "00001010";
+        bits += "00001011";
+        // comp 1 (8-bit): 0x0C, 0x0D
+        bits += "00001100";
+        bits += "00001101";
+        // comp 2 (8-bit): 0x0E, 0x0F
+        bits += "00001110";
+        bits += "00001111";
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("scc PPS parse");
+        assert!(pps.opaque_tail.is_none());
+        let scc = pps.pps_scc_extension.expect("scc extension body");
+        assert!(scc.pps_palette_predictor_initializers_present_flag);
+        assert_eq!(scc.pps_num_palette_predictor_initializers, 2);
+        assert!(!scc.monochrome_palette_flag);
+        assert_eq!(scc.luma_bit_depth_entry_minus8, 0);
+        assert_eq!(scc.chroma_bit_depth_entry_minus8, 0);
+        assert_eq!(
+            scc.pps_palette_predictor_initializer,
+            vec![vec![0x0A, 0x0B], vec![0x0C, 0x0D], vec![0x0E, 0x0F]],
+        );
+    }
+
+    /// `pps_range_extension_flag == 1` followed by
+    /// `pps_scc_extension_flag == 1` (no multilayer/3D between): both
+    /// bodies are decoded in place per the §7.3.2.3.1 body order, with
+    /// no opaque tail.
+    #[test]
+    fn decodes_pps_range_then_scc_body() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "1"; // pps_range_extension_flag = 1
+        bits += "00"; // pps_multilayer/3d = 0
+        bits += "1"; // pps_scc_extension_flag = 1
+        bits += "0000"; // pps_extension_4bits = 0
+                        // pps_range_extension() body (transform_skip off):
+        bits += "0"; // cross_component_prediction_enabled_flag = 0
+        bits += "0"; // chroma_qp_offset_list_enabled_flag = 0
+        bits += "1"; // log2_sao_offset_scale_luma = 0 (ue)
+        bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
+                     // pps_scc_extension():
+        bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
+        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("range+scc PPS parse");
+        assert!(pps.opaque_tail.is_none());
+        let re = pps.pps_range_extension.expect("range extension body");
+        assert_eq!(re, PpsRangeExtension::default());
+        let scc = pps.pps_scc_extension.expect("scc extension body");
+        assert!(scc.pps_curr_pic_ref_enabled_flag);
+    }
+
+    /// When a `pps_multilayer_extension()` body precedes the SCC body,
+    /// the SCC body cannot be decoded in place; the whole span stays in
+    /// the opaque tail.
+    #[test]
+    fn pps_scc_stays_opaque_behind_multilayer_body() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0"; // pps_range_extension_flag = 0
+        bits += "1"; // pps_multilayer_extension_flag = 1
+        bits += "0"; // pps_3d_extension_flag = 0
+        bits += "1"; // pps_scc_extension_flag = 1
+        bits += "0000"; // pps_extension_4bits = 0
+        bits += "11001100"; // opaque multilayer + scc span sentinel
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("multilayer PPS parse");
+        let flags = pps.extension_flags.expect("extension flag block");
+        assert!(flags.pps_multilayer_extension_flag);
+        assert!(flags.pps_scc_extension_flag);
+        assert!(pps.pps_scc_extension.is_none());
+        assert!(pps.opaque_tail.is_some());
     }
 
     /// `chroma_qp_offset_list_len_minus1` above its §7.4.3.3.2 cap of 5

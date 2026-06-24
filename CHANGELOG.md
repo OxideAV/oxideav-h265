@@ -32,6 +32,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   range-then-SCC, SCC-only, palette-initializer, and
   SCC-behind-multilayer paths.
 
+- `pps` §7.3.2.3.3 `pps_scc_extension()` — the Screen Content Coding PPS
+  body is decoded in place into the new `PpsSccExtension`
+  (`pps_curr_pic_ref_enabled_flag`,
+  `residual_adaptive_colour_transform_enabled_flag` with the
+  `pps_slice_act_qp_offsets_present_flag` /
+  `pps_act_{y,cb,cr}_qp_offset_*` se(v) offsets, and the picture
+  palette-predictor initializers — `monochrome_palette_flag`,
+  `luma_bit_depth_entry_minus8` / `chroma_bit_depth_entry_minus8`, and
+  the per-component `pps_palette_predictor_initializer[comp][i]` table
+  sized `u(v)` from this body's own entry bit-depths). Surfaced on
+  `PicParameterSet::pps_scc_extension`, decoded only when no opaque
+  multilayer / 3D body precedes it (§7.3.2.3.1 body order). Five new
+  unit tests cover the minimal, ACT-offset, palette-initializer,
+  range-then-SCC, and SCC-behind-multilayer paths.
+
 ### Added — clean-room rebuild round 364 (2026-06-24)
 
 - `motion` §8.5.3.2.3 spatial merging candidates — `NeighbourPu` snapshots
