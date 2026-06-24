@@ -310,7 +310,8 @@ pub use slice_data::{
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
     SeqParameterSet, ShortTermRefPicSet, ShortTermRefPicSetMaterializeError, SpsError,
-    SpsExtensionFlags, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
+    SpsExtensionFlags, SpsRangeExtension, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS,
+    HEVC_MAX_RPS_PICS,
 };
 pub use transform_tree::{decode_transform_tree, TransformTree, TransformTreeParams};
 pub use transform_unit::{

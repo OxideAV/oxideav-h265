@@ -670,6 +670,85 @@ impl SpsExtensionFlags {
             || self.sps_scc_extension_flag
             || self.sps_extension_4bits != 0
     }
+
+    /// True when an extension body still follows the
+    /// `sps_range_extension()` block in the bit stream — i.e. some
+    /// later body remains surfaced opaquely after the (now-decoded)
+    /// range-extension nine flags. Used by the parser to decide
+    /// whether an opaque tail must still be captured once the range
+    /// extension has been consumed.
+    fn has_body_after_range(&self) -> bool {
+        self.sps_multilayer_extension_flag
+            || self.sps_3d_extension_flag
+            || self.sps_scc_extension_flag
+            || self.sps_extension_4bits != 0
+    }
+}
+
+/// Decoded `sps_range_extension()` body per §7.3.2.2.2, present when
+/// [`SpsExtensionFlags::sps_range_extension_flag`] is set. Every field
+/// is a single `u(1)` flag; per §7.4.3.2.2 each is inferred to 0 when
+/// the `sps_range_extension()` body is absent (i.e. when
+/// [`SeqParameterSet::sps_range_extension`] is `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpsRangeExtension {
+    /// `transform_skip_rotation_enabled_flag` — when 1, a rotation is
+    /// applied to the residual of intra 4×4 transform-skip /
+    /// transform-bypass blocks.
+    pub transform_skip_rotation_enabled_flag: bool,
+    /// `transform_skip_context_enabled_flag` — when 1, a particular
+    /// context is used for parsing `sig_coeff_flag` / coefficient
+    /// magnitudes of transform-skip / transform-bypass blocks.
+    pub transform_skip_context_enabled_flag: bool,
+    /// `implicit_rdpcm_enabled_flag` — when 1, residual modification
+    /// for blocks using a transform-bypass may be used for intra
+    /// blocks referring to the SPS.
+    pub implicit_rdpcm_enabled_flag: bool,
+    /// `explicit_rdpcm_enabled_flag` — when 1, residual modification
+    /// for blocks using a transform-bypass may be used for inter
+    /// blocks referring to the SPS.
+    pub explicit_rdpcm_enabled_flag: bool,
+    /// `extended_precision_processing_flag` — when 1, an extended
+    /// dynamic range is used for coefficient parsing and inverse
+    /// transform processing.
+    pub extended_precision_processing_flag: bool,
+    /// `intra_smoothing_disabled_flag` — when 1, the filtering process
+    /// of neighbouring samples is unconditionally disabled for intra
+    /// prediction.
+    pub intra_smoothing_disabled_flag: bool,
+    /// `high_precision_offsets_enabled_flag` — when 1, weighted
+    /// prediction offsets and SAO offsets use a bit depth of
+    /// `BitDepth` rather than the default precision.
+    pub high_precision_offsets_enabled_flag: bool,
+    /// `persistent_rice_adaptation_enabled_flag` — when 1, the Rice
+    /// parameter derivation for the binarization of
+    /// `coeff_abs_level_remaining[]` is initialised at the start of
+    /// each sub-block using mode-dependent statistics accumulated from
+    /// previous sub-blocks.
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    /// `cabac_bypass_alignment_enabled_flag` — when 1, a CABAC
+    /// alignment process is used prior to bypass decoding of the
+    /// syntax elements `coeff_sign_flag[]` and
+    /// `coeff_abs_level_remaining[]`.
+    pub cabac_bypass_alignment_enabled_flag: bool,
+}
+
+impl SpsRangeExtension {
+    /// Decode the nine `u(1)` flags of `sps_range_extension()`
+    /// (§7.3.2.2.2) in bit-stream order.
+    fn parse(br: &mut BitReader) -> Result<Self, SpsError> {
+        Ok(Self {
+            transform_skip_rotation_enabled_flag: br.u1()? != 0,
+            transform_skip_context_enabled_flag: br.u1()? != 0,
+            implicit_rdpcm_enabled_flag: br.u1()? != 0,
+            explicit_rdpcm_enabled_flag: br.u1()? != 0,
+            extended_precision_processing_flag: br.u1()? != 0,
+            intra_smoothing_disabled_flag: br.u1()? != 0,
+            high_precision_offsets_enabled_flag: br.u1()? != 0,
+            persistent_rice_adaptation_enabled_flag: br.u1()? != 0,
+            cabac_bypass_alignment_enabled_flag: br.u1()? != 0,
+        })
+    }
 }
 
 /// Parsed Sequence Parameter Set per §7.3.2.2.
@@ -788,6 +867,10 @@ pub struct SeqParameterSet {
     /// `sps_extension_present_flag == 1` per §7.3.2.2.1. `None` when
     /// the gate is 0; every flag is then inferred to 0 per §7.4.3.2.1.
     pub extension_flags: Option<SpsExtensionFlags>,
+    /// Decoded `sps_range_extension()` body (§7.3.2.2.2), present when
+    /// `extension_flags.sps_range_extension_flag` is set. `None`
+    /// otherwise; per §7.4.3.2.2 every field is then inferred to 0.
+    pub sps_range_extension: Option<SpsRangeExtension>,
     /// Opaque suffix of the SPS RBSP. Populated when
     /// `sps_extension_present_flag == 1` **and**
     /// [`SpsExtensionFlags::has_body`] is true on the decoded flags —
@@ -1164,50 +1247,60 @@ impl SeqParameterSet {
             None
         };
 
-        let (sps_extension_present_flag, extension_flags, opaque_tail) = if br.bits_left() == 0 {
-            // The fixture corpus encoders sometimes elide the
-            // sps_extension_present_flag if no extension is signalled
-            // and the rbsp_trailing_bits happens to land on a byte
-            // boundary; the field is still required, so a buffer with
-            // no bits left here is a truncation.
-            return Err(SpsError::Truncated);
-        } else {
-            let gate = br.u1()? != 0;
-            if gate {
-                // §7.3.2.2.1: when the gate is open, decode the eight
-                // bits of typed extension flags first.
-                let sps_range_extension_flag = br.u1()? != 0;
-                let sps_multilayer_extension_flag = br.u1()? != 0;
-                let sps_3d_extension_flag = br.u1()? != 0;
-                let sps_scc_extension_flag = br.u1()? != 0;
-                let sps_extension_4bits = br.u(4)? as u8;
-                let flags = SpsExtensionFlags {
-                    sps_range_extension_flag,
-                    sps_multilayer_extension_flag,
-                    sps_3d_extension_flag,
-                    sps_scc_extension_flag,
-                    sps_extension_4bits,
-                };
-                // If any extension body or the sps_extension_data_flag
-                // while-loop follows, capture the remainder of the RBSP
-                // (those bodies + rbsp_trailing_bits) as an opaque tail
-                // starting at the first body's bit position. Otherwise
-                // only rbsp_trailing_bits remains and we consume it
-                // implicitly.
-                let tail = if flags.has_body() {
-                    Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
-                } else {
-                    None
-                };
-                (true, Some(flags), tail)
+        let (sps_extension_present_flag, extension_flags, sps_range_extension, opaque_tail) =
+            if br.bits_left() == 0 {
+                // The fixture corpus encoders sometimes elide the
+                // sps_extension_present_flag if no extension is signalled
+                // and the rbsp_trailing_bits happens to land on a byte
+                // boundary; the field is still required, so a buffer with
+                // no bits left here is a truncation.
+                return Err(SpsError::Truncated);
             } else {
-                // No extension present. Only the rbsp_trailing_bits
-                // remain — a single `1` bit followed by zero-padding
-                // to a byte boundary. We do not require the caller to
-                // have validated it; surface nothing for the opaque tail.
-                (false, None, None)
-            }
-        };
+                let gate = br.u1()? != 0;
+                if gate {
+                    // §7.3.2.2.1: when the gate is open, decode the eight
+                    // bits of typed extension flags first.
+                    let sps_range_extension_flag = br.u1()? != 0;
+                    let sps_multilayer_extension_flag = br.u1()? != 0;
+                    let sps_3d_extension_flag = br.u1()? != 0;
+                    let sps_scc_extension_flag = br.u1()? != 0;
+                    let sps_extension_4bits = br.u(4)? as u8;
+                    let flags = SpsExtensionFlags {
+                        sps_range_extension_flag,
+                        sps_multilayer_extension_flag,
+                        sps_3d_extension_flag,
+                        sps_scc_extension_flag,
+                        sps_extension_4bits,
+                    };
+                    // §7.3.2.2.1: the range extension body (if signalled)
+                    // is the first to follow the eight typed flag bits, so
+                    // decode it in full before deciding on an opaque tail.
+                    let range_ext = if flags.sps_range_extension_flag {
+                        Some(SpsRangeExtension::parse(br)?)
+                    } else {
+                        None
+                    };
+                    // If any *remaining* extension body (multilayer / 3d /
+                    // scc) or the sps_extension_data_flag while-loop
+                    // follows, capture the rest of the RBSP (those bodies +
+                    // rbsp_trailing_bits) as an opaque tail starting at the
+                    // first un-decoded body's bit position. Otherwise only
+                    // rbsp_trailing_bits remains and we consume it
+                    // implicitly.
+                    let tail = if flags.has_body_after_range() {
+                        Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+                    } else {
+                        None
+                    };
+                    (true, Some(flags), range_ext, tail)
+                } else {
+                    // No extension present. Only the rbsp_trailing_bits
+                    // remain — a single `1` bit followed by zero-padding
+                    // to a byte boundary. We do not require the caller to
+                    // have validated it; surface nothing for the opaque tail.
+                    (false, None, None, None)
+                }
+            };
 
         Ok(Self {
             vps_id,
@@ -1250,6 +1343,7 @@ impl SeqParameterSet {
             vui_parameters,
             sps_extension_present_flag,
             extension_flags,
+            sps_range_extension,
             opaque_tail,
         })
     }
@@ -2471,13 +2565,13 @@ mod tests {
         s += "0"; // bitstream_restriction_flag = 0
                   // sps_extension_present_flag = 1, followed by the
                   // typed extension flag block. Set the range-extension
-                  // flag so a non-empty opaque tail is captured for the
-                  // `sps_range_extension()` body.
+                  // flag so the nine `sps_range_extension()` flags are
+                  // decoded; with no further body, no opaque tail follows.
         s += "1"; // sps_extension_present_flag
         s += "1"; // sps_range_extension_flag = 1
         s += "000"; // sps_multilayer / sps_3d / sps_scc = 0
         s += "0000"; // sps_extension_4bits = 0
-        s += "10101010"; // sentinel sps_range_extension() body
+        s += "101010101"; // sps_range_extension() nine flags
         s += "1"; // rbsp_trailing_bits stop bit
 
         let bytes = bits_to_bytes(&s);
@@ -2494,16 +2588,27 @@ mod tests {
         assert!(!flags.sps_scc_extension_flag);
         assert_eq!(flags.sps_extension_4bits, 0);
         assert!(flags.has_body());
-        let tail = sps.opaque_tail.as_ref().expect("opaque extension tail");
-        assert!(!tail.bytes.is_empty());
+        // The range-extension body is now decoded, not opaque: with no
+        // multilayer/3d/scc/4bits body after it, no opaque tail remains.
+        assert!(sps.opaque_tail.is_none());
+        let re = sps.sps_range_extension.expect("range extension body");
+        assert!(re.transform_skip_rotation_enabled_flag); // 1
+        assert!(!re.transform_skip_context_enabled_flag); // 0
+        assert!(re.implicit_rdpcm_enabled_flag); // 1
+        assert!(!re.explicit_rdpcm_enabled_flag); // 0
+        assert!(re.extended_precision_processing_flag); // 1
+        assert!(!re.intra_smoothing_disabled_flag); // 0
+        assert!(re.high_precision_offsets_enabled_flag); // 1
+        assert!(!re.persistent_rice_adaptation_enabled_flag); // 0
+        assert!(re.cabac_bypass_alignment_enabled_flag); // 1
     }
 
     /// `sps_extension_present_flag == 1` with `sps_range_extension_flag
-    /// == 1` decodes the typed flag block and surfaces an opaque tail
-    /// starting at the first byte of the `sps_range_extension()` body.
+    /// == 1` decodes the typed flag block then the nine
+    /// `sps_range_extension()` flags (§7.3.2.2.2) in bit-stream order.
     /// This is the RExt-profile entry point (§A.3.5).
     #[test]
-    fn captures_extension_opaque_tail() {
+    fn decodes_sps_range_extension_body() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
@@ -2515,11 +2620,9 @@ mod tests {
         s += "1"; // sps_range_extension_flag = 1
         s += "000"; // sps_multilayer / sps_3d / sps_scc = 0
         s += "0000"; // sps_extension_4bits = 0
-                     // Sentinel for the opaque sps_range_extension() body — the
-                     // parser must not interpret it. Use a recognisable pattern
-                     // (0xAA = 10101010) and ensure the rbsp_trailing_bits stop
-                     // bit follows so the buffer is well-formed RBSP.
-        s += "10101010";
+                     // sps_range_extension() nine `u(1)` flags, all set —
+                     // every RExt tool enabled.
+        s += "111111111";
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
@@ -2527,12 +2630,52 @@ mod tests {
         assert!(sps.sps_extension_present_flag);
         let flags = sps.extension_flags.expect("extension flag block");
         assert!(flags.sps_range_extension_flag);
-        assert!(!flags.sps_multilayer_extension_flag);
-        assert!(!flags.sps_3d_extension_flag);
-        assert!(!flags.sps_scc_extension_flag);
         assert_eq!(flags.sps_extension_4bits, 0);
-        assert!(flags.has_body());
-        let tail = sps.opaque_tail.expect("opaque extension tail");
+        // No body after the range extension → no opaque tail.
+        assert!(sps.opaque_tail.is_none());
+        let re = sps.sps_range_extension.expect("range extension body");
+        assert!(re.transform_skip_rotation_enabled_flag);
+        assert!(re.transform_skip_context_enabled_flag);
+        assert!(re.implicit_rdpcm_enabled_flag);
+        assert!(re.explicit_rdpcm_enabled_flag);
+        assert!(re.extended_precision_processing_flag);
+        assert!(re.intra_smoothing_disabled_flag);
+        assert!(re.high_precision_offsets_enabled_flag);
+        assert!(re.persistent_rice_adaptation_enabled_flag);
+        assert!(re.cabac_bypass_alignment_enabled_flag);
+    }
+
+    /// `sps_range_extension_flag == 1` followed by `sps_scc_extension_flag
+    /// == 1`: the nine range-extension flags are decoded, and the
+    /// still-opaque `sps_scc_extension()` body is captured as a tail
+    /// starting right after them.
+    #[test]
+    fn decodes_range_extension_then_captures_scc_tail() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "1"; // sps_range_extension_flag = 1
+        s += "00"; // sps_multilayer / sps_3d = 0
+        s += "1"; // sps_scc_extension_flag = 1
+        s += "0000"; // sps_extension_4bits = 0
+        s += "000000000"; // sps_range_extension() nine flags, all 0
+        s += "10101010"; // opaque sps_scc_extension() body sentinel
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let flags = sps.extension_flags.expect("extension flag block");
+        assert!(flags.sps_range_extension_flag);
+        assert!(flags.sps_scc_extension_flag);
+        let re = sps.sps_range_extension.expect("range extension body");
+        assert_eq!(re, SpsRangeExtension::default());
+        // The SCC body remains opaque and is captured after the
+        // decoded range-extension flags.
+        let tail = sps.opaque_tail.expect("opaque scc tail");
         assert!(!tail.bytes.is_empty());
     }
 
