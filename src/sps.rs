@@ -763,7 +763,25 @@ impl SpsSccExtension {
         if palette_mode_enabled_flag {
             palette_max_size = br.ue()?;
             delta_palette_max_predictor_size = br.ue()?;
+            // §7.4.3.2.3: when palette_max_size == 0 the
+            // delta_palette_max_predictor_size must be 0 (bitstream
+            // conformance — a zero-size palette cannot grow the
+            // predictor).
+            if palette_max_size == 0 && delta_palette_max_predictor_size != 0 {
+                return Err(SpsError::ValueOutOfRange {
+                    field: "delta_palette_max_predictor_size",
+                    got: delta_palette_max_predictor_size,
+                });
+            }
             sps_palette_predictor_initializers_present_flag = br.u1()? != 0;
+            // §7.4.3.2.3: likewise the initializers-present flag must be
+            // 0 when palette_max_size == 0.
+            if palette_max_size == 0 && sps_palette_predictor_initializers_present_flag {
+                return Err(SpsError::ValueOutOfRange {
+                    field: "sps_palette_predictor_initializers_present_flag",
+                    got: 1,
+                });
+            }
             if sps_palette_predictor_initializers_present_flag {
                 sps_num_palette_predictor_initializers_minus1 = br.ue()?;
                 let num_comps = if chroma_format_idc == 0 { 1 } else { 3 };
@@ -784,6 +802,14 @@ impl SpsSccExtension {
             }
         }
         let motion_vector_resolution_control_idc = br.u(2)? as u8;
+        // §7.4.3.2.3: the value 3 is reserved for future use and must
+        // not appear in a conforming bitstream of this version.
+        if motion_vector_resolution_control_idc == 3 {
+            return Err(SpsError::ValueOutOfRange {
+                field: "motion_vector_resolution_control_idc",
+                got: 3,
+            });
+        }
         let intra_boundary_filtering_disabled_flag = br.u1()? != 0;
         Ok(Self {
             sps_curr_pic_ref_enabled_flag,
@@ -796,6 +822,13 @@ impl SpsSccExtension {
             motion_vector_resolution_control_idc,
             intra_boundary_filtering_disabled_flag,
         })
+    }
+
+    /// `PaletteMaxPredictorSize` (eq. 7-35) — the maximum allowed
+    /// palette predictor size, `palette_max_size +
+    /// delta_palette_max_predictor_size`.
+    pub fn palette_max_predictor_size(&self) -> u32 {
+        self.palette_max_size + self.delta_palette_max_predictor_size
     }
 }
 
@@ -2864,7 +2897,7 @@ mod tests {
         // comp 2 (8-bit): 0x05, 0x06
         s += "00000101";
         s += "00000110";
-        s += "11"; // motion_vector_resolution_control_idc = 3 (u(2))
+        s += "10"; // motion_vector_resolution_control_idc = 2 (u(2))
         s += "0"; // intra_boundary_filtering_disabled_flag = 0
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
@@ -2875,14 +2908,82 @@ mod tests {
         assert!(scc.palette_mode_enabled_flag);
         assert_eq!(scc.palette_max_size, 3);
         assert_eq!(scc.delta_palette_max_predictor_size, 1);
+        // PaletteMaxPredictorSize = 3 + 1 (eq. 7-35).
+        assert_eq!(scc.palette_max_predictor_size(), 4);
         assert!(scc.sps_palette_predictor_initializers_present_flag);
         assert_eq!(scc.sps_num_palette_predictor_initializers_minus1, 1);
         assert_eq!(
             scc.sps_palette_predictor_initializer,
             vec![vec![1, 2], vec![3, 4], vec![5, 6]],
         );
-        assert_eq!(scc.motion_vector_resolution_control_idc, 3);
+        assert_eq!(scc.motion_vector_resolution_control_idc, 2);
         assert!(!scc.intra_boundary_filtering_disabled_flag);
+    }
+
+    /// §7.4.3.2.3: `motion_vector_resolution_control_idc == 3` is
+    /// reserved and rejected as out-of-range.
+    #[test]
+    fn rejects_reserved_motion_vector_resolution_control_idc() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0001"; // range/multilayer/3d = 0, scc = 1
+        s += "0000"; // sps_extension_4bits = 0
+                     // sps_scc_extension():
+        s += "0"; // sps_curr_pic_ref_enabled_flag = 0
+        s += "0"; // palette_mode_enabled_flag = 0
+        s += "11"; // motion_vector_resolution_control_idc = 3 (reserved)
+        s += "0"; // intra_boundary_filtering_disabled_flag = 0
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).expect_err("reserved mvr idc");
+        assert!(matches!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "motion_vector_resolution_control_idc",
+                got: 3
+            }
+        ));
+    }
+
+    /// §7.4.3.2.3: when `palette_max_size == 0`, a non-zero
+    /// `delta_palette_max_predictor_size` violates bitstream
+    /// conformance and is rejected.
+    #[test]
+    fn rejects_delta_palette_when_max_size_zero() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0001"; // range/multilayer/3d = 0, scc = 1
+        s += "0000"; // sps_extension_4bits = 0
+                     // sps_scc_extension():
+        s += "0"; // sps_curr_pic_ref_enabled_flag = 0
+        s += "1"; // palette_mode_enabled_flag = 1
+        s += "1"; // palette_max_size = 0 (ue)
+        s += "010"; // delta_palette_max_predictor_size = 1 (ue) → illegal
+        s += "0"; // sps_palette_predictor_initializers_present_flag = 0
+        s += "00"; // motion_vector_resolution_control_idc = 0
+        s += "0"; // intra_boundary_filtering_disabled_flag = 0
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).expect_err("delta vs max_size 0");
+        assert!(matches!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "delta_palette_max_predictor_size",
+                got: 1
+            }
+        ));
     }
 
     /// `sps_extension_present_flag == 1` with every typed extension

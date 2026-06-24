@@ -47,6 +47,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   unit tests cover the minimal, ACT-offset, palette-initializer,
   range-then-SCC, and SCC-behind-multilayer paths.
 
+- `sps` / `pps` SCC §7.4.3.2.3 / §7.4.3.3.3 conformance checks +
+  derived-value accessors — the SPS SCC parse now rejects the reserved
+  `motion_vector_resolution_control_idc == 3` and the
+  `palette_max_size == 0` violations (a non-zero
+  `delta_palette_max_predictor_size` or a set
+  `sps_palette_predictor_initializers_present_flag`); the PPS SCC parse
+  rejects `PpsActQpOffset{Y,Cb,Cr}` outside −12..=12. New accessors
+  expose the spec equations: `SpsSccExtension::palette_max_predictor_size`
+  (eq. 7-35) and `PpsSccExtension::pps_act_qp_offset_{y,cb,cr}`
+  (eq. 7-39/40/41). Three new rejection tests plus accessor assertions.
+
 ### Added — clean-room rebuild round 364 (2026-06-24)
 
 - `motion` §8.5.3.2.3 spatial merging candidates — `NeighbourPu` snapshots

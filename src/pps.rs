@@ -483,6 +483,21 @@ impl PpsSccExtension {
             pps_act_y_qp_offset_plus5 = br.se()?;
             pps_act_cb_qp_offset_plus5 = br.se()?;
             pps_act_cr_qp_offset_plus3 = br.se()?;
+            // §7.4.3.3.3: PpsActQpOffsetY/Cb/Cr (eq. 7-39/40/41 — the
+            // raw values minus 5/5/3) must each lie in −12..=12 in a
+            // conforming bitstream.
+            for (field, qp) in [
+                ("pps_act_y_qp_offset_plus5", pps_act_y_qp_offset_plus5 - 5),
+                ("pps_act_cb_qp_offset_plus5", pps_act_cb_qp_offset_plus5 - 5),
+                ("pps_act_cr_qp_offset_plus3", pps_act_cr_qp_offset_plus3 - 3),
+            ] {
+                if !(-12..=12).contains(&qp) {
+                    return Err(PpsError::ValueOutOfRange {
+                        field,
+                        got: qp as i64,
+                    });
+                }
+            }
         }
         let pps_palette_predictor_initializers_present_flag = br.u1()? != 0;
         let mut pps_num_palette_predictor_initializers = 0u32;
@@ -529,6 +544,21 @@ impl PpsSccExtension {
             chroma_bit_depth_entry_minus8,
             pps_palette_predictor_initializer,
         })
+    }
+
+    /// `PpsActQpOffsetY` (eq. 7-39) — `pps_act_y_qp_offset_plus5 − 5`.
+    pub fn pps_act_qp_offset_y(&self) -> i32 {
+        self.pps_act_y_qp_offset_plus5 - 5
+    }
+
+    /// `PpsActQpOffsetCb` (eq. 7-40) — `pps_act_cb_qp_offset_plus5 − 5`.
+    pub fn pps_act_qp_offset_cb(&self) -> i32 {
+        self.pps_act_cb_qp_offset_plus5 - 5
+    }
+
+    /// `PpsActQpOffsetCr` (eq. 7-41) — `pps_act_cr_qp_offset_plus3 − 3`.
+    pub fn pps_act_qp_offset_cr(&self) -> i32 {
+        self.pps_act_cr_qp_offset_plus3 - 3
     }
 }
 
@@ -1379,6 +1409,45 @@ mod tests {
         assert_eq!(scc.pps_act_y_qp_offset_plus5, 1);
         assert_eq!(scc.pps_act_cb_qp_offset_plus5, -1);
         assert_eq!(scc.pps_act_cr_qp_offset_plus3, 2);
+        // PpsActQpOffset{Y,Cb,Cr} = plus5−5 / plus5−5 / plus3−3.
+        assert_eq!(scc.pps_act_qp_offset_y(), -4);
+        assert_eq!(scc.pps_act_qp_offset_cb(), -6);
+        assert_eq!(scc.pps_act_qp_offset_cr(), -1);
+    }
+
+    /// §7.4.3.3.3: a `PpsActQpOffsetY` (here from a large
+    /// `pps_act_y_qp_offset_plus5`) outside −12..=12 violates bitstream
+    /// conformance and is rejected.
+    #[test]
+    fn rejects_out_of_range_pps_act_qp_offset() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0001"; // range/multilayer/3d = 0, scc = 1
+        bits += "0000"; // pps_extension_4bits = 0
+                        // pps_scc_extension():
+        bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
+        bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
+        bits += "0"; // pps_slice_act_qp_offsets_present_flag = 0
+                     // pps_act_y_qp_offset_plus5 = +30 (se → codeNum 59,
+                     // ue '00000111100') → PpsActQpOffsetY = 25 > 12,
+                     // illegal
+        bits += "00000111100";
+        bits += "1"; // pps_act_cb_qp_offset_plus5 = 0 (se)
+        bits += "1"; // pps_act_cr_qp_offset_plus3 = 0 (se)
+        bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let err = PicParameterSet::parse(&rbsp).expect_err("act qp out of range");
+        assert!(matches!(
+            err,
+            PpsError::ValueOutOfRange {
+                field: "pps_act_y_qp_offset_plus5",
+                got: 25
+            }
+        ));
     }
 
     /// `pps_scc_extension()` with palette predictor initializers
