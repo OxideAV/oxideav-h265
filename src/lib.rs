@@ -295,9 +295,9 @@ pub use pps::{
     TileInfo,
 };
 pub use recon::{
-    reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
+    build_slice_addr_map, reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
     reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams,
-    ResolvedList,
+    ResolvedList, SliceSegmentBoundary,
 };
 pub use sao::{apply_sao_ctb, apply_sao_picture, ResolvedSao, ResolvedSaoComponent};
 pub use scaling_list::{

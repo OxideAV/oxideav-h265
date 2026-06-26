@@ -58,6 +58,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   from the placed CTUs and threads it through, also gating the §7.4.9.3
   SAO merge-left / merge-up candidates on the same-slice test.
 
+- `recon::build_slice_addr_map` (§7.4.7.1) — builds the per-CTB
+  `SliceAddrRs[ ctbAddrRs ]` map for a picture from its ordered
+  `SliceSegmentBoundary` list (`slice_segment_address` +
+  `dependent_slice_segment_flag`). An independent segment sets
+  `SliceAddrRs = slice_segment_address`; a dependent segment inherits the
+  active independent segment's `SliceAddrRs`; CTBs are partitioned in
+  tile-scan order via the `PictureTiling` address maps. Validated against
+  the `multi-slice-per-frame` fixture geometry (4×4 CTB grid, four
+  row-wise slices at addresses 0 / 4 / 8 / 12).
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

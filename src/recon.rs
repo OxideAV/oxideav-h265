@@ -650,6 +650,70 @@ pub fn reconstruct_intra_ctu(
     reconstruct_intra_ctu_ctx(pic, params, &mut ctx, ctu)
 }
 
+/// One slice segment's §7.4.7.1 `SliceAddrRs`-derivation inputs: the
+/// `slice_segment_address` (raster CTB address of its first CTB) and the
+/// `dependent_slice_segment_flag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceSegmentBoundary {
+    /// `slice_segment_address` (raster CTB address).
+    pub slice_segment_address: u32,
+    /// `dependent_slice_segment_flag`.
+    pub dependent: bool,
+}
+
+/// §7.4.7.1 — build the per-CTB `SliceAddrRs[ ctbAddrRs ]` map for a
+/// picture from its ordered slice segments.
+///
+/// `segments` are the picture's coded slice segments **in decode
+/// (tile-scan-start) order**; each carries its `slice_segment_address`
+/// (raster) and `dependent_slice_segment_flag`. An independent segment
+/// (`dependent == false`) sets `SliceAddrRs = slice_segment_address`; a
+/// dependent segment inherits the active independent segment's
+/// `SliceAddrRs`. CTBs are partitioned in tile-scan order, so the run of
+/// CTBs owned by a segment starts at `CtbAddrRsToTs[slice_segment_address]`
+/// and extends until the next segment's tile-scan start.
+///
+/// Returns a `PicSizeInCtbsY`-long vector indexed by CTB **raster**
+/// address. CTBs before the first segment (which shouldn't happen for a
+/// well-formed picture, since the first segment starts at address 0) carry
+/// `SliceAddrRs = 0`.
+#[must_use]
+pub fn build_slice_addr_map(tiling: &PictureTiling, segments: &[SliceSegmentBoundary]) -> Vec<u32> {
+    let pic_size = (tiling.pic_width_in_ctbs_y() * tiling.pic_height_in_ctbs_y()) as usize;
+    let mut map = vec![0u32; pic_size];
+
+    // Resolve each segment's SliceAddrRs and its tile-scan start address.
+    // (slice_addr_rs, ctb_addr_ts_start)
+    let mut resolved: Vec<(u32, u32)> = Vec::with_capacity(segments.len());
+    let mut active_slice_addr_rs = 0u32;
+    for seg in segments {
+        let slice_addr_rs = if seg.dependent {
+            active_slice_addr_rs
+        } else {
+            seg.slice_segment_address
+        };
+        active_slice_addr_rs = slice_addr_rs;
+        let ts_start = tiling.ctb_addr_rs_to_ts(seg.slice_segment_address);
+        resolved.push((slice_addr_rs, ts_start));
+    }
+    // Sort by tile-scan start so the run boundaries are monotonic.
+    resolved.sort_by_key(|&(_, ts)| ts);
+
+    // Walk every CTB in tile-scan order, assigning the SliceAddrRs of the
+    // latest segment whose tile-scan start is <= the CTB's tile-scan addr.
+    for ts in 0..pic_size as u32 {
+        // The owning segment is the last one with ts_start <= ts.
+        let owner = resolved
+            .iter()
+            .rev()
+            .find(|&&(_, ts_start)| ts_start <= ts)
+            .map_or(0, |&(addr, _)| addr);
+        let rs = tiling.ctb_addr_ts_to_rs(ts);
+        map[rs as usize] = owner;
+    }
+    map
+}
+
 /// Picture-level intra decode parameters — the SPS/PPS/slice constants the
 /// multi-CTU driver [`reconstruct_intra_picture`] needs beyond the
 /// per-block [`ReconParams`].
@@ -1656,6 +1720,79 @@ mod tests {
             Some(0),
             "cross-slice right CTU falls back to PLANAR (no cross-slice MPM)"
         );
+    }
+
+    /// §7.4.7.1 SliceAddrRs map for the `multi-slice-per-frame` fixture
+    /// geometry: a 64×64 picture, 16×16 CTBs ⇒ a 4×4 CTB raster grid, four
+    /// row-wise independent slices at addresses 0, 4, 8, 12 (no tiles).
+    /// Each CTB's SliceAddrRs is the address of its slice's first CTB.
+    #[test]
+    fn slice_addr_map_partitions_four_row_slices() {
+        let tiling = PictureTiling::new(4, 4, 64, 64, 4, 2, &TilingParams::single_tile()).unwrap();
+        let segs = [
+            SliceSegmentBoundary {
+                slice_segment_address: 0,
+                dependent: false,
+            },
+            SliceSegmentBoundary {
+                slice_segment_address: 4,
+                dependent: false,
+            },
+            SliceSegmentBoundary {
+                slice_segment_address: 8,
+                dependent: false,
+            },
+            SliceSegmentBoundary {
+                slice_segment_address: 12,
+                dependent: false,
+            },
+        ];
+        let map = build_slice_addr_map(&tiling, &segs);
+        // Row 0 (CTBs 0..3) ⇒ SliceAddrRs 0; row 1 (4..7) ⇒ 4; etc.
+        assert_eq!(
+            map,
+            vec![0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12]
+        );
+    }
+
+    /// A dependent slice segment inherits the SliceAddrRs of the preceding
+    /// independent segment.
+    #[test]
+    fn slice_addr_map_dependent_inherits() {
+        // 4×1 CTB row. Independent slice at 0, dependent continuation at 2.
+        let tiling = PictureTiling::new(4, 1, 64, 16, 4, 2, &TilingParams::single_tile()).unwrap();
+        let segs = [
+            SliceSegmentBoundary {
+                slice_segment_address: 0,
+                dependent: false,
+            },
+            SliceSegmentBoundary {
+                slice_segment_address: 2,
+                dependent: true,
+            },
+        ];
+        let map = build_slice_addr_map(&tiling, &segs);
+        // The dependent segment inherits SliceAddrRs 0 ⇒ the whole row is
+        // one slice (SliceAddrRs 0).
+        assert_eq!(map, vec![0, 0, 0, 0]);
+    }
+
+    /// Two independent slices split a single CTB row.
+    #[test]
+    fn slice_addr_map_two_independent_in_a_row() {
+        let tiling = PictureTiling::new(4, 1, 64, 16, 4, 2, &TilingParams::single_tile()).unwrap();
+        let segs = [
+            SliceSegmentBoundary {
+                slice_segment_address: 0,
+                dependent: false,
+            },
+            SliceSegmentBoundary {
+                slice_segment_address: 2,
+                dependent: false,
+            },
+        ];
+        let map = build_slice_addr_map(&tiling, &segs);
+        assert_eq!(map, vec![0, 0, 2, 2]);
     }
 
     /// A 16×16 PART_2Nx2N intra CU at `(x0, y0)` with a uniform DC luma
