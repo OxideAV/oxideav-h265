@@ -68,6 +68,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the `multi-slice-per-frame` fixture geometry (4×4 CTB grid, four
   row-wise slices at addresses 0 / 4 / 8 / 12).
 
+- `decode` (new module) — the picture-sequence decode state machine.
+  `PictureSequenceState` threads the cross-picture `PocState`
+  (`prevTid0Pic`) + `Dpb` across a coded video sequence;
+  `begin_picture(header, slice)` runs the per-picture §8.3.1 → §8.3.2 →
+  §8.3.4 → §8.3.5 chain (POC derivation, RPS list build + DPB marking,
+  `RefPicList0` / `RefPicList1` construction for P / B slices, and `ColPic`
+  + `NoBackwardPredFlag` selection for temporal MV), returning a
+  `PictureRefState`; `store_picture` inserts the reconstructed picture +
+  its per-PU `MotionField` into the DPB as a short-term reference. Tests
+  cover the IDR→P RefPicList resolution, temporal-MVP ColPic selection,
+  and second-IDR reference unmarking.
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

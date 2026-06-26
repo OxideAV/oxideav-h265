@@ -68,22 +68,35 @@ temporal `Col` + combined + zero-pad, select at `merge_idx`, the
 8x4/4x8 bi→uni reduction), and `derive_mvp_candidate` (§8.5.3.2.6/.7 the
 spatial MVP A/B two-pass derivation with eq 8-179..8-197 distance scaling
 and the `mvpListLX` assembly). All take neighbour PU motion as data
-(`NeighbourPu` snapshots + POC / long-term resolvers), so the §8.5.3.2.8
-**temporal** (collocated-picture) `Col` candidate — passed in as an
-`Option` — is what remains for the merge/MVP path.
-What remains for an end-to-end inter fixture is the §8.5.3.2.8 collocated
-temporal candidate (needs DPB collocated-picture state), wiring the
-picture driver to gather the spatial `NeighbourPu`s from the motion field,
-wiring `deblock_picture` into the picture-level driver ahead of SAO, a
-full DPB, and multi-slice / tile / WPP picture assembly (the
-`reconstruct_intra_picture` driver already handles a single-slice
-multi-CTU intra picture with shared-`ReconCtx` neighbour state + SAO). The
+(`NeighbourPu` snapshots + POC / long-term resolvers).
+
+The **decoded-picture-buffer subsystem** now lands the per-picture
+reference machinery the inter path needs: the §8.3.1 picture-order-count
+derivation (`poc` module: `PocState` threading `prevTid0Pic` across the
+sequence + the Table 7-1 `NalKind` classification), the §8.3.2 reference-
+picture-set marking + §8.3.4 reference-picture-list construction + §8.3.5
+collocated-picture selection (`dpb` module: `Dpb` storing each decoded
+picture with its POC / marking / per-PU motion field, the five RPS POC
+lists, the four-step marking, `RefPicList0` / `RefPicList1`, `ColPic`,
+`NoBackwardPredFlag`), the §8.5.3.2.8 / §8.5.3.2.9 **temporal**
+(collocated) motion-vector predictor (`motion::derive_temporal_mv`: the
+bottom-right-then-center location search + the collocated-MV
+copy-or-scale), and the `decode::PictureSequenceState` state machine that
+runs the §8.3.1 → §8.3.2 → §8.3.4 → §8.3.5 chain per picture. Multi-slice
+picture assembly is wired: `ReconCtx` carries a per-CTB `SliceAddrRs` map
+(`recon::build_slice_addr_map` derives it from the slice segments per
+§7.4.7.1) so the §6.4.1 z-scan availability denies cross-slice neighbours.
+
+What remains for an end-to-end inter fixture is wiring the picture driver
+to gather the spatial `NeighbourPu`s + temporal `Col` candidate from the
+motion field during reconstruction, `deblock_picture` into the
+picture-level driver ahead of SAO, and the bitstream demux loop. The
 runtime registration hook (`register`) is a no-op and the top-level decode
-entry point still returns `Error::NotImplemented` until the bitstream
-demux loop, deblock-in-driver, and DPB land; the per-CTU and picture-level
-intra reconstruction and the per-PU inter reconstruction are usable
-directly through the public `recon` / `inter_pred` / `motion` / `picture`
-API.
+entry point still returns `Error::NotImplemented` until that demux loop
+lands; the per-CTU and picture-level intra reconstruction, the per-PU
+inter reconstruction, and the POC / DPB / RPS / temporal-MV subsystem are
+usable directly through the public `recon` / `inter_pred` / `motion` /
+`poc` / `dpb` / `decode` / `picture` API.
 
 ## What's implemented
 
