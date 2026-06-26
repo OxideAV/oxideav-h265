@@ -282,9 +282,10 @@ pub use inter_pred::{
 pub use intra_mode_field::{IntraModeField, Neighbour, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE};
 pub use motion::{
     append_combined_bi_candidates, append_zero_merge_candidates, build_merge_candidate,
-    derive_chroma_mv, derive_mvp_candidate, derive_spatial_merge_candidates, reconstruct_mv,
-    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
-    PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbours,
+    derive_chroma_mv, derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv,
+    reconstruct_mv, MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext,
+    NeighbourPu, PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbours,
+    TemporalMvContext,
 };
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};

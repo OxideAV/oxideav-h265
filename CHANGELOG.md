@@ -34,6 +34,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `select_col_pic` (§8.3.5) picks `ColPic` and `no_backward_pred_flag`
   derives `NoBackwardPredFlag`.
 
+- `motion` §8.5.3.2.8 / §8.5.3.2.9 temporal (collocated) luma
+  motion-vector prediction: `derive_temporal_mv` runs the
+  bottom-right-then-center §8.5.3.2.8 location search (the equation-8-198
+  / 8-199 `(xPb+nPbW, yPb+nPbH)` bottom-right candidate gated on the
+  same-CTB-row / in-picture test and snapped to the 16×16 grid, falling
+  back to the equation-8-200 / 8-201 center) reading the collocated
+  picture's `MotionField`. The §8.5.3.2.9 `collocated_mv` selects
+  `mvCol` / `listCol` from the col cell's `predFlagL0Col` / `predFlagL1Col`
+  + `NoBackwardPredFlag` / `collocated_from_l0_flag`, applies the
+  long-term-status equality gate, and either copies (equation 8-204) or
+  scales (equations 8-205..8-209, via the `td=colPocDiff` / `tb=currPocDiff`
+  distances) `mvLXCol`. `TemporalMvContext` carries the geometry + POC +
+  long-term inputs.
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

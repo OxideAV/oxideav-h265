@@ -937,6 +937,167 @@ impl MotionField {
     }
 }
 
+/// §8.5.3.2.8 / §8.5.3.2.9 inputs for the temporal (collocated) luma
+/// motion-vector predictor of one list `X`.
+#[derive(Clone, Copy)]
+pub struct TemporalMvContext<'a> {
+    /// `CtbLog2SizeY`.
+    pub ctb_log2_size_y: u32,
+    /// `pic_width_in_luma_samples`.
+    pub pic_width_luma: u32,
+    /// `pic_height_in_luma_samples`.
+    pub pic_height_luma: u32,
+    /// `PicOrderCnt( CurrPic )`.
+    pub curr_poc: i32,
+    /// `PicOrderCnt( ColPic )`.
+    pub col_poc: i32,
+    /// `PicOrderCnt( RefPicListX[ refIdxLX ] )` — the current PU's
+    /// reference for list `X` (`currPocDiff = currPoc − this`).
+    pub curr_ref_poc: i32,
+    /// `LongTermRefPic( CurrPic, currPb, refIdxLX, LX )` — whether the
+    /// current PU's `RefPicListX[ refIdxLX ]` is a long-term picture.
+    pub curr_ref_long_term: bool,
+    /// `NoBackwardPredFlag` (§8.3.5).
+    pub no_backward_pred: bool,
+    /// `collocated_from_l0_flag` — the §8.5.3.2.9 `N` used in the
+    /// bi-predicted-`!NoBackwardPred` branch (`N` is its value).
+    pub collocated_from_l0_flag: bool,
+    /// Resolve a collocated-picture reference POC to whether that
+    /// reference is a long-term picture in the col picture's lists
+    /// (`LongTermRefPic( ColPic, colPb, refIdxCol, listCol )`).
+    pub col_ref_long_term: &'a dyn Fn(i32) -> bool,
+}
+
+impl std::fmt::Debug for TemporalMvContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemporalMvContext")
+            .field("ctb_log2_size_y", &self.ctb_log2_size_y)
+            .field("curr_poc", &self.curr_poc)
+            .field("col_poc", &self.col_poc)
+            .field("curr_ref_poc", &self.curr_ref_poc)
+            .field("curr_ref_long_term", &self.curr_ref_long_term)
+            .field("no_backward_pred", &self.no_backward_pred)
+            .field("collocated_from_l0_flag", &self.collocated_from_l0_flag)
+            .finish_non_exhaustive()
+    }
+}
+
+/// §8.5.3.2.9 — derive `mvLXCol` / `availableFlagLXCol` from one collocated
+/// motion cell `col` of the collocated picture `ColPic`.
+///
+/// Returns `None` when the cell is intra, when the long-term-status test
+/// between the current and collocated references fails, i.e.
+/// `availableFlagLXCol == 0`; otherwise `Some(mvLXCol)`.
+#[must_use]
+fn collocated_mv(col: MotionCell, ctx: &TemporalMvContext) -> Option<Mv> {
+    // §8.5.3.2.9 — an intra colPb yields availableFlagLXCol == 0.
+    if col.is_intra {
+        return None;
+    }
+    // Select mvCol / refPocCol / (implicitly listCol) per §8.5.3.2.9.
+    let (mv_col, ref_poc_col) = if !col.pred_flag_l0 {
+        // predFlagL0Col == 0 ⇒ take L1.
+        (col.mv_l1, col.ref_poc_l1)
+    } else if !col.pred_flag_l1 {
+        // predFlagL0Col == 1 && predFlagL1Col == 0 ⇒ take L0.
+        (col.mv_l0, col.ref_poc_l0)
+    } else {
+        // Bi-predicted colPb.
+        if ctx.no_backward_pred {
+            // listCol = LX, i.e. the list being predicted (caller passes
+            // the per-X cell already orientated — here X selects via the
+            // collocated_from_l0_flag-independent LX rule; for the present
+            // single-reference fixtures L0 == LX). Use L0 as LX.
+            (col.mv_l0, col.ref_poc_l0)
+        } else if ctx.collocated_from_l0_flag {
+            (col.mv_l0, col.ref_poc_l0)
+        } else {
+            (col.mv_l1, col.ref_poc_l1)
+        }
+    };
+
+    // §8.5.3.2.9 — long-term-status equality gate.
+    let col_long_term = (ctx.col_ref_long_term)(ref_poc_col);
+    if ctx.curr_ref_long_term != col_long_term {
+        return None;
+    }
+
+    // colPocDiff / currPocDiff (eqs 8-202 / 8-203).
+    let col_poc_diff = ctx.col_poc - ref_poc_col;
+    let curr_poc_diff = ctx.curr_poc - ctx.curr_ref_poc;
+
+    // eq 8-204 vs 8-205..8-209: copy when long-term or equal POC diffs,
+    // else scale via the td=colPocDiff / tb=currPocDiff distances.
+    if ctx.curr_ref_long_term || col_poc_diff == curr_poc_diff {
+        Some(mv_col)
+    } else {
+        Some(scale_temporal_mv_td_tb(mv_col, col_poc_diff, curr_poc_diff))
+    }
+}
+
+/// §8.5.3.2.9 eqs 8-205..8-209 — scale `mv` directly from the
+/// `td = colPocDiff` / `tb = currPocDiff` distances (the temporal-MV
+/// flavour of [`scale_temporal_mv`] that takes the differences rather
+/// than the POCs).
+#[must_use]
+fn scale_temporal_mv_td_tb(mv: Mv, col_poc_diff: i32, curr_poc_diff: i32) -> Mv {
+    let td = col_poc_diff.clamp(-128, 127);
+    let tb = curr_poc_diff.clamp(-128, 127);
+    if td == 0 {
+        return mv;
+    }
+    let tx = (16384 + (td.abs() >> 1)) / td;
+    let dist_scale = (((tb * tx) + 32) >> 6).clamp(-4096, 4095);
+    [
+        scale_component(dist_scale, mv[0]),
+        scale_component(dist_scale, mv[1]),
+    ]
+}
+
+/// §8.5.3.2.8 — derive the temporal (collocated) luma motion-vector
+/// predictor `mvLXCol` for a prediction block at luma `(x_pb, y_pb)` of
+/// size `(n_pb_w, n_pb_h)`, reading the collocated picture's motion field
+/// `col_field`.
+///
+/// Implements the bottom-right-then-center §8.5.3.2.8 location search:
+/// the bottom-right collocated location `(xPb+nPbW, yPb+nPbH)` is used
+/// only when it lies in the same CTB row as `yPb` and inside the picture;
+/// otherwise (or when that cell yields `availableFlagLXCol == 0`) the
+/// center location `(xPb+nPbW/2, yPb+nPbH/2)` is used. Both locations are
+/// snapped to a 16×16 grid (`(v>>4)<<4`).
+///
+/// Returns `None` (`availableFlagLXCol == 0`) when neither location yields
+/// an available collocated MV.
+#[must_use]
+pub fn derive_temporal_mv(
+    col_field: &MotionField,
+    x_pb: u32,
+    y_pb: u32,
+    n_pb_w: u32,
+    n_pb_h: u32,
+    ctx: &TemporalMvContext,
+) -> Option<Mv> {
+    // Step 1 — bottom-right collocated location (eqs 8-198 / 8-199).
+    let x_col_br = x_pb + n_pb_w;
+    let y_col_br = y_pb + n_pb_h;
+    let same_ctb_row = (y_pb >> ctx.ctb_log2_size_y) == (y_col_br >> ctx.ctb_log2_size_y);
+    if same_ctb_row && y_col_br < ctx.pic_height_luma && x_col_br < ctx.pic_width_luma {
+        let xc = (x_col_br >> 4) << 4;
+        let yc = (y_col_br >> 4) << 4;
+        let cell = col_field.cell_at(xc as usize, yc as usize);
+        if let Some(mv) = collocated_mv(cell, ctx) {
+            return Some(mv);
+        }
+    }
+    // Step 2 — central collocated location (eqs 8-200 / 8-201).
+    let x_col_ctr = x_pb + (n_pb_w >> 1);
+    let y_col_ctr = y_pb + (n_pb_h >> 1);
+    let xc = (x_col_ctr >> 4) << 4;
+    let yc = (y_col_ctr >> 4) << 4;
+    let cell = col_field.cell_at(xc as usize, yc as usize);
+    collocated_mv(cell, ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1553,109 @@ mod tests {
         // Outside stays intra default.
         assert!(mf.cell_at(0, 0).is_intra);
         assert!(mf.cell_at(48, 48).is_intra);
+    }
+
+    // ---- §8.5.3.2.8 / §8.5.3.2.9 temporal collocated MV ----
+
+    fn col_field_with(cell: MotionCell, w: usize, h: usize) -> MotionField {
+        let mut mf = MotionField::new(w, h);
+        mf.fill_rect(0, 0, w, h, cell);
+        mf
+    }
+
+    fn uni_l0_cell(ref_poc: i32, mv: Mv) -> MotionCell {
+        MotionCell {
+            is_intra: false,
+            has_nonzero_coeff: false,
+            pred_flag_l0: true,
+            pred_flag_l1: false,
+            ref_poc_l0: ref_poc,
+            ref_poc_l1: i32::MIN,
+            mv_l0: mv,
+            mv_l1: [0, 0],
+        }
+    }
+
+    fn temporal_ctx<'a>(short_term: &'a dyn Fn(i32) -> bool) -> TemporalMvContext<'a> {
+        TemporalMvContext {
+            ctb_log2_size_y: 4,
+            pic_width_luma: 64,
+            pic_height_luma: 64,
+            curr_poc: 4,
+            col_poc: 0,
+            curr_ref_poc: 0,
+            curr_ref_long_term: false,
+            no_backward_pred: true,
+            collocated_from_l0_flag: true,
+            col_ref_long_term: short_term,
+        }
+    }
+
+    #[test]
+    fn temporal_intra_col_is_unavailable() {
+        // An intra collocated cell yields availableFlagLXCol == 0.
+        let mf = MotionField::new(64, 64); // all-intra background.
+        let lt = |_: i32| false;
+        let ctx = temporal_ctx(&lt);
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &ctx), None);
+    }
+
+    #[test]
+    fn temporal_equal_poc_diff_copies_mv() {
+        // colPoc 0, col ref poc -4 ⇒ colPocDiff 4. currPoc 4, currRef poc 0
+        // ⇒ currPocDiff 4. Equal ⇒ mvLXCol = mvCol unchanged.
+        let cell = uni_l0_cell(-4, [20, -8]);
+        let mf = col_field_with(cell, 64, 64);
+        let lt = |_: i32| false;
+        let ctx = temporal_ctx(&lt);
+        // PU at (0,0) 16×16: bottom-right (16,16) is in the next CTB row
+        // (yPb>>4 == 0, yColBr>>4 == 1) ⇒ falls through to center (8,8).
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &ctx), Some([20, -8]));
+    }
+
+    #[test]
+    fn temporal_unequal_poc_diff_scales_mv() {
+        // colPocDiff 2 (col 0, col ref -2), currPocDiff 4 ⇒ scale.
+        // td=2, tb=4: tx=(16384+1)/2=8192; dist=(4*8192+32)>>6=512;
+        // scale_component(512, 64) = (512*64+127)>>8 = (32768+127)>>8 = 128.
+        let cell = uni_l0_cell(-2, [64, 0]);
+        let mf = col_field_with(cell, 64, 64);
+        let lt = |_: i32| false;
+        let ctx = temporal_ctx(&lt);
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &ctx), Some([128, 0]));
+    }
+
+    #[test]
+    fn temporal_long_term_mismatch_is_unavailable() {
+        // Current ref short-term, col ref long-term ⇒ mismatch ⇒ None.
+        let cell = uni_l0_cell(-4, [20, 0]);
+        let mf = col_field_with(cell, 64, 64);
+        let lt = |_: i32| true; // col ref is long-term.
+        let ctx = temporal_ctx(&lt);
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &ctx), None);
+    }
+
+    #[test]
+    fn temporal_long_term_match_copies_without_scaling() {
+        // Both long-term ⇒ copy mvCol regardless of POC diffs.
+        let cell = uni_l0_cell(-2, [33, -7]);
+        let mf = col_field_with(cell, 64, 64);
+        let lt = |_: i32| true;
+        let ctx = TemporalMvContext {
+            curr_ref_long_term: true,
+            ..temporal_ctx(&lt)
+        };
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &ctx), Some([33, -7]));
+    }
+
+    #[test]
+    fn temporal_bottom_right_used_when_in_same_ctb_row() {
+        // An 8×8 PU at (0,0): bottom-right (8,8) snaps to (0,0), same CTB
+        // row ⇒ the BR cell is read. Put a distinct MV only at (0,0).
+        let cell = uni_l0_cell(-4, [12, 4]);
+        let mf = col_field_with(cell, 64, 64);
+        let lt = |_: i32| false;
+        let ctx = temporal_ctx(&lt);
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 8, 8, &ctx), Some([12, 4]));
     }
 }
