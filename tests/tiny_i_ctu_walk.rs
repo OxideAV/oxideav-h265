@@ -299,6 +299,7 @@ fn tiny_i_picture_driver_reconstructs_expected_yuv_with_sao() {
     let placed = [PlacedCtu {
         x_ctb: 0,
         y_ctb: 0,
+        slice_addr_rs: 0,
         ctu: &ctu,
     }];
     let out = reconstruct_intra_picture(16, 16, &recon_params, &pic_params, &placed).unwrap();

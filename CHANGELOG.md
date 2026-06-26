@@ -48,6 +48,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   distances) `mvLXCol`. `TemporalMvContext` carries the geometry + POC +
   long-term inputs.
 
+- `recon` multi-slice picture assembly: `ReconCtx` now carries a per-CTB
+  `SliceAddrRs` map (`ReconCtx::set_slice_addr_rs`) and the §6.4.1 z-scan
+  availability consults it (replacing the previous constant-`0`
+  single-slice assumption), so a neighbour in a different slice segment is
+  denied for both the §8.4.2 most-probable-mode derivation and the
+  §8.4.4.2.1 reference-sample gathering. `PlacedCtu` gains a
+  `slice_addr_rs` field and `reconstruct_intra_picture` builds the map
+  from the placed CTUs and threads it through, also gating the §7.4.9.3
+  SAO merge-left / merge-up candidates on the same-slice test.
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

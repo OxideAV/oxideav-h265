@@ -483,6 +483,12 @@ fn ip_component_of(cidx: TfComponent) -> IpComponent {
 pub struct ReconCtx {
     field: IntraModeField,
     tiling: PictureTiling,
+    /// `SliceAddrRs[ ctbAddrRs ]` — the raster address of the first CTB
+    /// of the independent slice segment that owns each CTB. All-zero for a
+    /// single-slice picture; the multi-slice driver populates it so the
+    /// §6.4.1 z-scan availability denies neighbours across slice
+    /// boundaries.
+    slice_addr_rs: Vec<u32>,
 }
 
 impl ReconCtx {
@@ -516,21 +522,47 @@ impl ReconCtx {
         Ok(Self {
             field: IntraModeField::new(pic_width_luma, pic_height_luma, ctb_log2_size_y),
             tiling,
+            slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
         })
+    }
+
+    /// Set the per-CTB `SliceAddrRs` map (one entry per CTB raster
+    /// address, `PicSizeInCtbsY` long). Each entry is the raster address
+    /// of the first CTB of the independent slice segment owning that CTB.
+    /// Used by the multi-slice driver so the §6.4.1 z-scan availability
+    /// denies cross-slice neighbours.
+    ///
+    /// # Panics
+    /// Panics if `map.len()` is not `PicSizeInCtbsY`.
+    pub fn set_slice_addr_rs(&mut self, map: Vec<u32>) {
+        assert_eq!(
+            map.len(),
+            self.slice_addr_rs.len(),
+            "SliceAddrRs map must be PicSizeInCtbsY long"
+        );
+        self.slice_addr_rs = map;
+    }
+
+    /// `SliceAddrRs[ ctbAddrRs ]` for the CTB raster address.
+    #[inline]
+    fn slice_addr_of(&self, ctb_rs: u32) -> u32 {
+        self.slice_addr_rs
+            .get(ctb_rs as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// §6.4.1 z-scan availability of the neighbour luma location
     /// `( x_nb, y_nb )` for the current prediction block at
-    /// `( x_curr, y_curr )`. A single-slice picture maps every CTB to the
-    /// same `SliceAddrRs` (the constant `0`); a multi-slice driver would
-    /// supply the per-CTB slice map instead.
+    /// `( x_curr, y_curr )`, consulting the per-CTB `SliceAddrRs` map so
+    /// neighbours in a different slice segment are unavailable.
     fn available(&self, x_curr: usize, y_curr: usize, x_nb: i64, y_nb: i64) -> bool {
         self.tiling.z_scan_availability(
             x_curr as u32,
             y_curr as u32,
             x_nb as i32,
             y_nb as i32,
-            |_ctb_rs| 0,
+            |ctb_rs| self.slice_addr_of(ctb_rs),
         )
     }
 
@@ -646,6 +678,12 @@ pub struct PlacedCtu<'a> {
     pub x_ctb: u32,
     /// The CTB's luma top-left `( x_ctb, y_ctb )`.
     pub y_ctb: u32,
+    /// `SliceAddrRs` — the raster address of the first CTB of the
+    /// independent slice segment that owns this CTB. `0` for a
+    /// single-slice picture; the multi-slice driver
+    /// ([`reconstruct_intra_multislice_picture`]) sets it to the slice's
+    /// `slice_segment_address` so cross-slice neighbours are denied.
+    pub slice_addr_rs: u32,
     /// The decoded coding tree unit.
     pub ctu: &'a CodingTreeUnit,
 }
@@ -696,6 +734,17 @@ pub fn reconstruct_intra_picture(
     let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
     let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
 
+    // Build the per-CTB SliceAddrRs map from the placed CTUs (default 0
+    // for any CTB not covered) and feed it to the neighbour context so the
+    // §6.4.1 z-scan availability denies cross-slice neighbours.
+    let mut slice_addr_map = vec![0u32; pic_w_ctbs * pic_h_ctbs];
+    for placed in ctus {
+        let rx = (placed.x_ctb as usize) >> pic_params.ctb_log2_size_y;
+        let ry = (placed.y_ctb as usize) >> pic_params.ctb_log2_size_y;
+        slice_addr_map[ry * pic_w_ctbs + rx] = placed.slice_addr_rs;
+    }
+    ctx.set_slice_addr_rs(slice_addr_map.clone());
+
     // §8.7.3.1 resolved-SAO grid (raster order), default all-off so a CTU
     // not present in `ctus` leaves its CTB unmodified.
     let mut sao_grid = vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
@@ -704,12 +753,18 @@ pub fn reconstruct_intra_picture(
         reconstruct_intra_ctu_ctx(&mut pic, params, &mut ctx, placed.ctu)?;
 
         // §7.4.9.3 SAO merge: resolve against the already-resolved left /
-        // above CTB in the grid.
+        // above CTB in the grid, but only when that neighbour is in the
+        // SAME slice segment (the merge candidate availability follows the
+        // §6.4.1 slice-boundary rule). A neighbour in a different slice is
+        // not a merge candidate.
         let rx = (placed.x_ctb as usize) >> pic_params.ctb_log2_size_y;
         let ry = (placed.y_ctb as usize) >> pic_params.ctb_log2_size_y;
+        let here = slice_addr_map[ry * pic_w_ctbs + rx];
         if let Some(sao_params) = &placed.ctu.sao {
-            let left = (rx > 0).then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
-            let above = (ry > 0).then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
+            let left = (rx > 0 && slice_addr_map[ry * pic_w_ctbs + (rx - 1)] == here)
+                .then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
+            let above = (ry > 0 && slice_addr_map[(ry - 1) * pic_w_ctbs + rx] == here)
+                .then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
             sao_grid[ry * pic_w_ctbs + rx] = crate::sao::ResolvedSao::resolve(
                 sao_params,
                 left.as_ref(),
@@ -1482,6 +1537,7 @@ mod tests {
         let placed = [PlacedCtu {
             x_ctb: 0,
             y_ctb: 0,
+            slice_addr_rs: 0,
             ctu: &ctu,
         }];
         let out = reconstruct_intra_picture(16, 16, &params, &pic_params, &placed).unwrap();
@@ -1537,10 +1593,94 @@ mod tests {
         let placed = [PlacedCtu {
             x_ctb: 0,
             y_ctb: 0,
+            slice_addr_rs: 0,
             ctu: &ctu_sao,
         }];
         let out = reconstruct_intra_picture(16, 16, &params, &pic_params, &placed).unwrap();
         // Luma 81 (band 10, bandTable idx 1) + offset 7 = 88.
         assert_eq!(out.sample(Plane::Luma, 4, 4), 88, "SAO band offset applied");
+    }
+
+    /// Multi-slice neighbour isolation: two 16×16 CTUs side by side in a
+    /// 32×16 picture. The right CTU's `mpm_idx == 0` inherits the left
+    /// CTU's angular mode 20 through the §8.4.2 MPM when both share a slice
+    /// (map `[0, 0]`), but falls back to INTRA_PLANAR when the right CTU is
+    /// in a different slice (map `[0, 1]`) — the §6.4.1 z-scan availability
+    /// denies a neighbour across the slice boundary.
+    #[test]
+    fn slice_boundary_blocks_neighbour_mpm() {
+        let params = tiny_params();
+        let left = IntraLumaMode {
+            prev_intra_luma_pred_flag: false,
+            mpm_idx: None,
+            rem_intra_luma_pred_mode: Some(18),
+        };
+        let right = IntraLumaMode {
+            prev_intra_luma_pred_flag: true,
+            mpm_idx: Some(0),
+            rem_intra_luma_pred_mode: None,
+        };
+        let make_ctus = || {
+            (
+                CodingTreeUnit {
+                    sao: None,
+                    quadtree: CodingQuadtree::Leaf(Box::new(intra_cu_16x16(0, 0, left))),
+                },
+                CodingTreeUnit {
+                    sao: None,
+                    quadtree: CodingQuadtree::Leaf(Box::new(intra_cu_16x16(16, 0, right))),
+                },
+            )
+        };
+
+        // Same-slice baseline (map [0, 0]): the right CTU inherits mode 20.
+        let (l0, r0) = make_ctus();
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        let mut ctx = ReconCtx::new(32, 16, 4, 2, &TilingParams::single_tile()).unwrap();
+        ctx.set_slice_addr_rs(vec![0, 0]);
+        reconstruct_intra_ctu_ctx(&mut pic, &params, &mut ctx, &l0).unwrap();
+        reconstruct_intra_ctu_ctx(&mut pic, &params, &mut ctx, &r0).unwrap();
+        assert_eq!(ctx.recorded_mode(16, 0), Some(20), "same-slice inherits 20");
+
+        // Cross-slice (map [0, 1]): the right CTU's left neighbour (15,*)
+        // is in slice 0 ⇒ denied ⇒ MPM falls back to PLANAR.
+        let (l1, r1) = make_ctus();
+        let mut pic2 = Picture::new(32, 16, 1, 8, 8);
+        let mut ctx2 = ReconCtx::new(32, 16, 4, 2, &TilingParams::single_tile()).unwrap();
+        ctx2.set_slice_addr_rs(vec![0, 1]);
+        reconstruct_intra_ctu_ctx(&mut pic2, &params, &mut ctx2, &l1).unwrap();
+        reconstruct_intra_ctu_ctx(&mut pic2, &params, &mut ctx2, &r1).unwrap();
+        assert_eq!(ctx2.recorded_mode(0, 0), Some(20), "left CTU mode 20");
+        assert_eq!(
+            ctx2.recorded_mode(16, 0),
+            Some(0),
+            "cross-slice right CTU falls back to PLANAR (no cross-slice MPM)"
+        );
+    }
+
+    /// A 16×16 PART_2Nx2N intra CU at `(x0, y0)` with a uniform DC luma
+    /// residual and the given luma-mode signalling (test helper).
+    fn intra_cu_16x16(x0: u32, y0: u32, luma: IntraLumaMode) -> CodingUnit {
+        let unit = TransformUnit {
+            residual_luma: Some(dc_block(4, 0)),
+            ..Default::default()
+        };
+        CodingUnit {
+            x0,
+            y0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: false,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            prediction_units: vec![],
+            intra_luma: vec![luma],
+            intra_chroma_pred_mode: vec![4],
+            rqt_root_cbf: true,
+            transform_tree: Some(TransformTree::Leaf {
+                cbf_luma: true,
+                unit,
+            }),
+        }
     }
 }
