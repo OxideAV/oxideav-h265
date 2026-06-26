@@ -74,6 +74,73 @@ impl PartMode {
     }
 }
 
+impl From<crate::binarization::PartMode> for PartMode {
+    fn from(m: crate::binarization::PartMode) -> Self {
+        use crate::binarization::PartMode as B;
+        match m {
+            B::Part2Nx2N => Self::Part2Nx2N,
+            B::Part2NxN => Self::Part2NxN,
+            B::PartNx2N => Self::PartNx2N,
+            B::PartNxN => Self::PartNxN,
+            B::Part2NxnU => Self::Part2NxnU,
+            B::Part2NxnD => Self::Part2NxnD,
+            B::PartNLx2N => Self::PartNLx2N,
+            B::PartNRx2N => Self::PartNRx2N,
+        }
+    }
+}
+
+/// §7.3.8.6 — the prediction-block partitioning of one inter coding unit:
+/// the per-`partIdx` `(xPb, yPb, nPbW, nPbH)` rectangles for the CU's
+/// `PartMode`, relative to the picture.
+///
+/// `(x0, y0)` is the CU's luma top-left; `n_cb_s` is `nCbS`. The returned
+/// vector has one entry per prediction unit in §7.3.8.6 invocation order
+/// (so its index is `partIdx`). Mirrors the §7.3.8.6
+/// `prediction_unit( … )` argument expressions exactly (including the AMP
+/// `nCbS/4` / `nCbS*3/4` splits).
+#[must_use]
+pub fn pu_partitions(x0: usize, y0: usize, n_cb_s: usize, part_mode: PartMode) -> Vec<PuRect> {
+    let n = n_cb_s;
+    let h = n / 2;
+    let q = n / 4;
+    let t = n * 3 / 4;
+    let rect = |x: usize, y: usize, w: usize, ht: usize| PuRect {
+        x_pb: x,
+        y_pb: y,
+        n_pb_w: w,
+        n_pb_h: ht,
+    };
+    match part_mode {
+        PartMode::Part2Nx2N => vec![rect(x0, y0, n, n)],
+        PartMode::Part2NxN => vec![rect(x0, y0, n, h), rect(x0, y0 + h, n, h)],
+        PartMode::PartNx2N => vec![rect(x0, y0, h, n), rect(x0 + h, y0, h, n)],
+        PartMode::Part2NxnU => vec![rect(x0, y0, n, q), rect(x0, y0 + q, n, t)],
+        PartMode::Part2NxnD => vec![rect(x0, y0, n, t), rect(x0, y0 + t, n, q)],
+        PartMode::PartNLx2N => vec![rect(x0, y0, q, n), rect(x0 + q, y0, t, n)],
+        PartMode::PartNRx2N => vec![rect(x0, y0, t, n), rect(x0 + t, y0, q, n)],
+        PartMode::PartNxN => vec![
+            rect(x0, y0, h, h),
+            rect(x0 + h, y0, h, h),
+            rect(x0, y0 + h, h, h),
+            rect(x0 + h, y0 + h, h, h),
+        ],
+    }
+}
+
+/// One §7.3.8.6 prediction-block rectangle (luma coordinates / sizes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PuRect {
+    /// `xPb` — luma top-left x.
+    pub x_pb: usize,
+    /// `yPb` — luma top-left y.
+    pub y_pb: usize,
+    /// `nPbW` — prediction-block width.
+    pub n_pb_w: usize,
+    /// `nPbH` — prediction-block height.
+    pub n_pb_h: usize,
+}
+
 /// The fully-resolved §8.5.3.2.1 output for one prediction unit: the
 /// per-list utilization flag, reference index and luma motion vector.
 ///
@@ -453,6 +520,83 @@ fn has_explicit_mv(pu: &PredictionUnit) -> bool {
     pu.mvp_l0_flag.is_some() || pu.mvp_l1_flag.is_some()
 }
 
+/// One inter coding unit's geometry for [`resolve_cu_motion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterCuDesc {
+    /// `(x0, y0)` — luma top-left of the coding block.
+    pub x0: usize,
+    /// `y0`.
+    pub y0: usize,
+    /// `nCbS` — luma coding-block size.
+    pub n_cb_s: usize,
+    /// `PartMode` of the coding unit.
+    pub part_mode: PartMode,
+}
+
+/// §7.3.8.6 + §8.5.3.2.1 — resolve every prediction unit of one inter
+/// coding unit and write the per-PU motion into `field` (eqs 8-80..8-85).
+///
+/// `cu` describes the CU; `pus` are the parsed prediction units in
+/// §7.3.8.6 order (one per `partIdx`). Each PU is resolved against the
+/// motion field *as updated by the earlier PUs of the same CU* (so the
+/// second partition's A1/B1 neighbours see the first partition's motion,
+/// modulo the §8.5.3.2.3 same-CU partition exclusion).
+///
+/// Returns the resolved [`PuMotion`] for each PU (same order as `pus`), so
+/// the caller can drive [`crate::recon::reconstruct_inter_pu`] per PU.
+#[must_use]
+pub fn resolve_cu_motion(
+    field: &mut MotionField,
+    cu: InterCuDesc,
+    pus: &[PredictionUnit],
+    ctx: &PuMvContext,
+    available: &dyn Fn(i32, i32) -> bool,
+) -> Vec<PuMotion> {
+    let InterCuDesc {
+        x0,
+        y0,
+        n_cb_s,
+        part_mode,
+    } = cu;
+    let rects = pu_partitions(x0, y0, n_cb_s, part_mode);
+    let mut out = Vec::with_capacity(pus.len());
+    for (part_idx, (rect, pu)) in rects.iter().zip(pus.iter()).enumerate() {
+        let geom = PuGeometry {
+            x_cb: x0,
+            y_cb: y0,
+            n_cb_s,
+            x_pb: rect.x_pb,
+            y_pb: rect.y_pb,
+            n_pb_w: rect.n_pb_w,
+            n_pb_h: rect.n_pb_h,
+            part_mode,
+            part_idx: part_idx as u32,
+        };
+        let motion = resolve_pu_motion(field, &geom, pu, ctx, available);
+        // eqs 8-80..8-85: store this PU's motion into the field for the
+        // later PUs / later CUs / deblocking / temporal-MV of future pics.
+        let ref_poc_l0 = if motion.pred_flag_l0 {
+            (ctx.ref_poc)(0, motion.ref_idx_l0)
+        } else {
+            i32::MIN
+        };
+        let ref_poc_l1 = if motion.pred_flag_l1 {
+            (ctx.ref_poc)(1, motion.ref_idx_l1)
+        } else {
+            i32::MIN
+        };
+        field.fill_rect(
+            rect.x_pb,
+            rect.y_pb,
+            rect.n_pb_w,
+            rect.n_pb_h,
+            motion.to_cell(ref_poc_l0, ref_poc_l1),
+        );
+        out.push(motion);
+    }
+    out
+}
+
 /// §8.5.3.2.2 — the merge-mode branch of §8.5.3.2.1.
 fn resolve_merge(
     field: &MotionField,
@@ -829,5 +973,146 @@ mod tests {
         assert_eq!(cell.ref_poc_l0, 2);
         assert_eq!(cell.ref_poc_l1, i32::MIN);
         assert_eq!(cell.mv_l0, [4, -8]);
+    }
+
+    #[test]
+    fn pu_partitions_match_spec_geometry() {
+        // §7.3.8.6: a 16x16 CU at (32, 16).
+        let p = pu_partitions(32, 16, 16, PartMode::Part2Nx2N);
+        assert_eq!(
+            p,
+            vec![PuRect {
+                x_pb: 32,
+                y_pb: 16,
+                n_pb_w: 16,
+                n_pb_h: 16
+            }]
+        );
+
+        let p = pu_partitions(0, 0, 16, PartMode::Part2NxN);
+        assert_eq!(
+            p,
+            vec![
+                PuRect {
+                    x_pb: 0,
+                    y_pb: 0,
+                    n_pb_w: 16,
+                    n_pb_h: 8
+                },
+                PuRect {
+                    x_pb: 0,
+                    y_pb: 8,
+                    n_pb_w: 16,
+                    n_pb_h: 8
+                },
+            ]
+        );
+
+        let p = pu_partitions(0, 0, 16, PartMode::PartNx2N);
+        assert_eq!(
+            p,
+            vec![
+                PuRect {
+                    x_pb: 0,
+                    y_pb: 0,
+                    n_pb_w: 8,
+                    n_pb_h: 16
+                },
+                PuRect {
+                    x_pb: 8,
+                    y_pb: 0,
+                    n_pb_w: 8,
+                    n_pb_h: 16
+                },
+            ]
+        );
+
+        // AMP PART_2NxnU: top quarter (4) + bottom three-quarters (12).
+        let p = pu_partitions(0, 0, 16, PartMode::Part2NxnU);
+        assert_eq!(
+            p,
+            vec![
+                PuRect {
+                    x_pb: 0,
+                    y_pb: 0,
+                    n_pb_w: 16,
+                    n_pb_h: 4
+                },
+                PuRect {
+                    x_pb: 0,
+                    y_pb: 4,
+                    n_pb_w: 16,
+                    n_pb_h: 12
+                },
+            ]
+        );
+
+        // PART_NxN: four quadrants.
+        let p = pu_partitions(0, 0, 16, PartMode::PartNxN);
+        assert_eq!(p.len(), 4);
+        assert_eq!(
+            p[3],
+            PuRect {
+                x_pb: 8,
+                y_pb: 8,
+                n_pb_w: 8,
+                n_pb_h: 8
+            }
+        );
+    }
+
+    #[test]
+    fn cu_driver_writes_motion_field_and_resolves_second_partition() {
+        // A PART_Nx2N CU: PU0 (left) merges with a zero-pad list (no
+        // neighbours); PU1 (right) merges and its A1 neighbour is PU0,
+        // so it inherits PU0's motion.
+        let mut field = intra_field(32, 32);
+        let ref_poc = |_l: usize, r: i32| if r == 0 { 5 } else { -999 };
+        let long = |_l: usize, _r: i32| false;
+        let short = |_l: usize, _r: i32| true;
+        let col_long = |_p: i32| false;
+        let ctx = base_ctx(&ref_poc, &long, &short, &col_long);
+        // PU0 is AMVP with an explicit MV (so it gets a deterministic, non-
+        // zero motion); PU1 is a merge PU that picks up PU0 from A1.
+        let mvd = |v: i32| MvdComponent {
+            greater0_flag: u8::from(v != 0),
+            greater1_flag: None,
+            minus2: None,
+            sign_flag: None,
+            value: v,
+        };
+        let pu0 = PredictionUnit {
+            merge_flag: false,
+            merge_idx: None,
+            inter_pred_idc: Some(InterPredIdc::PredL0),
+            ref_idx_l0: Some(0),
+            mvd_l0: Some([mvd(20), mvd(0)]),
+            mvp_l0_flag: Some(0),
+            ref_idx_l1: None,
+            mvd_l1: None,
+            mvp_l1_flag: None,
+        };
+        let pu1 = merge_pu(0);
+        // PU0 has no neighbours (zero MVP) ⇒ mv = [20, 0].
+        // PU1's A1 = (7, 15) lies in PU0 ⇒ inherits [20, 0]; but the
+        // §8.5.3.2.3 vertical-split exclusion drops A1 for partIdx 1, so
+        // PU1 falls back to B1/.../zero. Here only A1 is in-picture-left,
+        // so PU1 ends up zero-MV.
+        let avail = |x: i32, y: i32| (0..32).contains(&x) && (0..32).contains(&y);
+        let cu = InterCuDesc {
+            x0: 0,
+            y0: 0,
+            n_cb_s: 16,
+            part_mode: PartMode::PartNx2N,
+        };
+        let out = resolve_cu_motion(&mut field, cu, &[pu0, pu1], &ctx, &avail);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].mv_l0, [20, 0]);
+        // PU0's motion is written into the field.
+        assert_eq!(field.cell_at(0, 0).mv_l0, [20, 0]);
+        assert!(!field.cell_at(0, 0).is_intra);
+        // PU1: A1 excluded by the vertical-split rule ⇒ zero-MV merge.
+        assert_eq!(out[1].mv_l0, [0, 0]);
+        assert!(out[1].pred_flag_l0);
     }
 }

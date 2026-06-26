@@ -297,7 +297,10 @@ pub use pps::{
     ChromaQpOffsetListEntry, DeblockingFilterControl, PicParameterSet, PpsError, PpsRangeExtension,
     TileInfo,
 };
-pub use pu_mv::{resolve_pu_motion, PartMode as PuPartMode, PuGeometry, PuMotion, PuMvContext};
+pub use pu_mv::{
+    pu_partitions, resolve_cu_motion, resolve_pu_motion, InterCuDesc, PartMode as PuPartMode,
+    PuGeometry, PuMotion, PuMvContext, PuRect,
+};
 pub use recon::{
     build_slice_addr_map, reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
     reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams,
