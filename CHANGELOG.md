@@ -19,6 +19,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   RADL / SLNR categories the §8.3.x processes branch on, and
   `diff_pic_order_cnt` implements equation 8-4.
 
+- `dpb` (new module) — the decoded-picture buffer plus §8.3.2 reference-
+  picture-set marking, §8.3.4 reference-picture-list construction, and
+  §8.3.5 collocated-picture selection. `Dpb` stores each `DpbEntry`
+  (reconstructed `Picture`, `PicOrderCntVal`, `Marking`, per-PU
+  `MotionField`). `build_rps_poc_lists` builds the five §8.3.2 POC lists
+  (equation 8-5, the IDR short-circuit + long-term MSB-cycle resolution);
+  `Dpb::apply_rps` resolves them against the DPB and applies the four-step
+  §8.3.2 marking (IRAP-no-RASL unmark, long-term LSB/full-POC lookup,
+  short-term exact-POC lookup, "unused for reference" sweep);
+  `Dpb::build_ref_pic_lists` constructs `RefPicList0` / `RefPicList1`
+  (equations 8-8..8-11, including the `RefPicListTemp1` before/after swap
+  and the `list_entry_lX` modification) via `RefPicListParams`;
+  `select_col_pic` (§8.3.5) picks `ColPic` and `no_backward_pred_flag`
+  derives `NoBackwardPredFlag`.
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

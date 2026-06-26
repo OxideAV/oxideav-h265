@@ -233,6 +233,7 @@ pub mod bitreader;
 pub mod cabac;
 pub mod ctx_init;
 pub mod deblock;
+pub mod dpb;
 pub mod hrd;
 pub mod inter_pred;
 pub mod intra_mode_field;
@@ -265,6 +266,10 @@ pub use deblock::{
     deblock_picture, derive_boundary_strength, derive_edge_flags, filter_cu_edges,
     BoundaryStrength, DeblockCu, DeblockCuDesc, DeblockCuParams, EdgeFlags, EdgeType,
     TransformSplit,
+};
+pub use dpb::{
+    build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
+    Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
 };
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
