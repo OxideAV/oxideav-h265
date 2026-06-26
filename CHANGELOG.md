@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 372 (2026-06-26)
+
+- `poc` (new module) §8.3.1 picture-order-count derivation: `PocState`
+  threads `prevTid0Pic`'s `(slice_pic_order_cnt_lsb, PicOrderCntMsb)`
+  across the picture sequence and `PocState::decode_picture_poc` derives
+  each picture's `PicOrderCntVal = PicOrderCntMsb + slice_pic_order_cnt_lsb`
+  (equations 8-1 / 8-2), resetting the MSB for an IRAP with
+  `NoRaslOutputFlag == 1` and skipping the `prevTid0Pic` update for
+  RASL / RADL / SLNR / `TemporalId != 0` pictures. `NalKind` classifies
+  a `nal_unit_type` into the Table 7-1 IRAP / IDR / BLA / CRA / RASL /
+  RADL / SLNR categories the §8.3.x processes branch on, and
+  `diff_pic_order_cnt` implements equation 8-4.
+
 ### Added — clean-room rebuild round 369 (2026-06-25)
 
 - `sps` §7.3.2.2.2 `sps_range_extension()` — the nine RExt flags

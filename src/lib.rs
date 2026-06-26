@@ -240,6 +240,7 @@ pub mod intra_pred;
 pub mod motion;
 pub mod nal;
 pub mod picture;
+pub mod poc;
 pub mod pps;
 pub mod recon;
 pub mod residual;
@@ -282,6 +283,7 @@ pub use motion::{
 };
 pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
 pub use picture::{clip1, sub_wh_c, Picture, Plane};
+pub use poc::{diff_pic_order_cnt, NalKind, PicOrderCnt, PocState};
 pub use pps::{
     ChromaQpOffsetListEntry, DeblockingFilterControl, PicParameterSet, PpsError, PpsRangeExtension,
     TileInfo,
