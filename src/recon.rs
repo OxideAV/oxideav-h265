@@ -894,6 +894,20 @@ impl ReconCtx {
         self.available(x_curr_luma, y_curr_luma, x_nb_luma, y_nb_luma)
     }
 
+    /// Borrow the §6.4.1 / §6.5 picture tiling (the inter driver's §6.4.2
+    /// prediction-block availability reads it).
+    #[must_use]
+    pub fn tiling(&self) -> &PictureTiling {
+        &self.tiling
+    }
+
+    /// `SliceAddrRs[ ctbAddrRs ]` for the CTB containing the luma location
+    /// (the inter driver's §6.4.2 availability uses the same map).
+    #[must_use]
+    pub fn slice_addr_rs_of(&self, ctb_rs: u32) -> u32 {
+        self.slice_addr_of(ctb_rs)
+    }
+
     /// Test-only: the §8.4.2 `IntraPredModeY` recorded at a luma location.
     #[cfg(test)]
     #[must_use]
@@ -918,6 +932,26 @@ pub fn reconstruct_intra_ctu_ctx(
     ctu: &CodingTreeUnit,
 ) -> Result<(), ReconError> {
     reconstruct_quadtree(pic, params, ctx, &ctu.quadtree)
+}
+
+/// Reconstruct one **intra** leaf coding unit into `pic`, recording its
+/// §8.4.2 `IntraPredModeY` into the shared [`ReconCtx`] neighbour field.
+///
+/// This is the per-CU entry the §8.5 picture-level inter driver calls for
+/// an intra coding unit embedded in a P / B slice (mixed-mode pictures);
+/// the inter coding units of the same picture go through
+/// [`crate::inter_recon::resolve_and_reconstruct_inter_cu`].
+///
+/// # Errors
+/// [`ReconError::IntraPred`] / [`ReconError::Transform`] on a primitive
+/// failure; [`ReconError::InterNotSupported`] if `cu` is not intra.
+pub fn reconstruct_intra_cu_ctx(
+    pic: &mut Picture,
+    params: &ReconParams,
+    ctx: &mut ReconCtx,
+    cu: &CodingUnit,
+) -> Result<(), ReconError> {
+    reconstruct_cu(pic, params, ctx, cu)
 }
 
 /// Reconstruct one decoded coding tree unit's intra samples into `pic`.

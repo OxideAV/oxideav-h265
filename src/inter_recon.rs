@@ -62,7 +62,10 @@ impl<'a> RefListAccess<'a> {
         self.entry(list, ref_idx).map_or(i32::MIN, |e| e.poc)
     }
 
-    fn entry(&self, list: usize, ref_idx: i32) -> Option<&'a DpbEntry> {
+    /// Borrow `RefPicListX[ ref_idx ]`'s DPB entry, or `None` when the
+    /// list slot is "no reference picture" / out of range.
+    #[must_use]
+    pub fn entry(&self, list: usize, ref_idx: i32) -> Option<&'a DpbEntry> {
         if ref_idx < 0 {
             return None;
         }
@@ -244,6 +247,270 @@ pub fn resolve_and_reconstruct_inter_cu(
     )?;
 
     reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs)
+}
+
+/// Slice-level inputs constant across one P / B slice's inter
+/// reconstruction — every field a §8.5.3.2 / §8.3 input that does not vary
+/// per coding unit. The picture-level driver
+/// ([`reconstruct_inter_picture`]) binds the [`PuMvContext`] reference
+/// resolvers to the [`RefListAccess`] + collocated field internally.
+#[derive(Debug, Clone, Copy)]
+pub struct InterSliceContext {
+    /// `PicOrderCntVal` of the current picture.
+    pub curr_poc: i32,
+    /// `true` for a B slice (enables L1 + the §8.5.3.2.4 combined step).
+    pub slice_is_b: bool,
+    /// `CtbLog2SizeY`.
+    pub ctb_log2_size_y: u32,
+    /// `pic_width_in_luma_samples`.
+    pub pic_width_luma: u32,
+    /// `pic_height_in_luma_samples`.
+    pub pic_height_luma: u32,
+    /// `MaxNumMergeCand` (§7.4.7.1).
+    pub max_num_merge_cand: usize,
+    /// `num_ref_idx_l0_active`.
+    pub num_ref_idx_l0_active: i32,
+    /// `num_ref_idx_l1_active`.
+    pub num_ref_idx_l1_active: i32,
+    /// `Log2ParMrgLevel` (§7.4.3.3.1).
+    pub log2_par_mrg_level: u32,
+    /// `slice_temporal_mvp_enabled_flag`.
+    pub temporal_mvp_enabled: bool,
+    /// `collocated_from_l0_flag`.
+    pub collocated_from_l0_flag: bool,
+    /// `PicOrderCnt( ColPic )` (§8.5.3.2.9).
+    pub col_poc: i32,
+    /// `NoBackwardPredFlag` (§8.3.5).
+    pub no_backward_pred: bool,
+}
+
+/// One placed coding tree unit for the §8.5 picture-level inter driver.
+#[derive(Debug)]
+pub struct PlacedInterCtu<'a> {
+    /// CTB luma top-left x.
+    pub x_ctb: u32,
+    /// CTB luma top-left y.
+    pub y_ctb: u32,
+    /// `SliceAddrRs` of the independent slice segment owning this CTB.
+    pub slice_addr_rs: u32,
+    /// The decoded coding tree unit.
+    pub ctu: &'a crate::slice_data::CodingTreeUnit,
+}
+
+/// §8.5 — reconstruct a full P / B picture from its decoded CTUs.
+///
+/// Walks the placed CTUs in decode order, dispatching each leaf coding unit:
+/// an intra CU goes through the §8.4 intra path
+/// ([`crate::recon::reconstruct_intra_cu_ctx`]), an inter CU through
+/// [`resolve_and_reconstruct_inter_cu`] (§8.5.3.2 candidate derivation from
+/// the in-progress motion field + the collocated `col_field`, then §8.5.3.3
+/// motion-compensated reconstruction). The §6.4.2 prediction-block
+/// availability the candidate derivation needs is evaluated against the
+/// shared [`crate::recon::ReconCtx`] tiling + the per-cell intra / inter
+/// flag of the motion field built up so far.
+///
+/// Returns the reconstructed picture and its per-PU motion field (the
+/// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). The
+/// in-loop deblocking + SAO filters are applied by the caller (the
+/// picture-decode driver) after this recon pass.
+///
+/// # Errors
+/// Propagates [`ReconError`] from the per-CU reconstruction.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_picture(
+    pic_width_luma: usize,
+    pic_height_luma: usize,
+    params: &ReconParams,
+    slice: &InterSliceContext,
+    min_tb_log2_size_y: u32,
+    tiles: &crate::availability::TilingParams,
+    ctus: &[PlacedInterCtu<'_>],
+    refs: &RefListAccess,
+    col_field: Option<&MotionField>,
+) -> Result<(Picture, MotionField), ReconError> {
+    let mut pic = Picture::new(
+        pic_width_luma,
+        pic_height_luma,
+        params.chroma_array_type,
+        params.bit_depth_luma,
+        params.bit_depth_chroma,
+    );
+    let mut ctx = crate::recon::ReconCtx::new(
+        pic_width_luma,
+        pic_height_luma,
+        slice.ctb_log2_size_y,
+        min_tb_log2_size_y,
+        tiles,
+    )?;
+    let mut field = MotionField::new(pic_width_luma, pic_height_luma);
+
+    let ctb_size = 1usize << slice.ctb_log2_size_y;
+    let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
+    let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
+    let mut slice_addr_map = vec![0u32; pic_w_ctbs * pic_h_ctbs];
+    for placed in ctus {
+        let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
+        let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
+        slice_addr_map[ry * pic_w_ctbs + rx] = placed.slice_addr_rs;
+    }
+    ctx.set_slice_addr_rs(slice_addr_map);
+
+    // §8.5.3.2 reference-picture resolvers, bound to the §8.3.4 ref lists.
+    let ref_poc = |list: usize, ref_idx: i32| refs.ref_poc(list, ref_idx);
+    let ref_long_term = |list: usize, ref_idx: i32| {
+        refs.entry(list, ref_idx)
+            .is_some_and(|e| e.marking == crate::dpb::Marking::LongTerm)
+    };
+    let ref_short_term = |list: usize, ref_idx: i32| {
+        refs.entry(list, ref_idx)
+            .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
+    };
+    let col_ref_long_term = |_poc: i32| false;
+
+    let mv_ctx = PuMvContext {
+        curr_poc: slice.curr_poc,
+        slice_is_b: slice.slice_is_b,
+        ctb_log2_size_y: slice.ctb_log2_size_y,
+        pic_width_luma: slice.pic_width_luma,
+        pic_height_luma: slice.pic_height_luma,
+        max_num_merge_cand: slice.max_num_merge_cand,
+        num_ref_idx_l0_active: slice.num_ref_idx_l0_active,
+        num_ref_idx_l1_active: slice.num_ref_idx_l1_active,
+        log2_par_mrg_level: slice.log2_par_mrg_level,
+        temporal_mvp_enabled: slice.temporal_mvp_enabled,
+        collocated_from_l0_flag: slice.collocated_from_l0_flag,
+        col_poc: slice.col_poc,
+        no_backward_pred: slice.no_backward_pred,
+        ref_poc: &ref_poc,
+        ref_long_term: &ref_long_term,
+        ref_short_term: &ref_short_term,
+        col_field,
+        col_ref_long_term: &col_ref_long_term,
+    };
+
+    for placed in ctus {
+        reconstruct_inter_quadtree(
+            &mut pic,
+            &mut ctx,
+            &mut field,
+            params,
+            &mv_ctx,
+            refs,
+            &placed.ctu.quadtree,
+        )?;
+    }
+
+    Ok((pic, field))
+}
+
+/// Walk one §7.3.8.4 coding quadtree, dispatching each leaf coding unit to
+/// the intra or inter reconstruction path.
+fn reconstruct_inter_quadtree(
+    pic: &mut Picture,
+    ctx: &mut crate::recon::ReconCtx,
+    field: &mut MotionField,
+    params: &ReconParams,
+    mv_ctx: &PuMvContext,
+    refs: &RefListAccess,
+    qt: &crate::slice_data::CodingQuadtree,
+) -> Result<(), ReconError> {
+    use crate::slice_data::CodingQuadtree;
+    match qt {
+        CodingQuadtree::Split(children) => {
+            for child in children {
+                reconstruct_inter_quadtree(pic, ctx, field, params, mv_ctx, refs, child)?;
+            }
+            Ok(())
+        }
+        CodingQuadtree::Leaf(cu) => {
+            reconstruct_inter_leaf_cu(pic, ctx, field, params, mv_ctx, refs, cu)
+        }
+    }
+}
+
+/// Reconstruct one leaf coding unit (intra → §8.4 path + intra-stamp the
+/// motion field; inter → §8.5 path).
+fn reconstruct_inter_leaf_cu(
+    pic: &mut Picture,
+    ctx: &mut crate::recon::ReconCtx,
+    field: &mut MotionField,
+    params: &ReconParams,
+    mv_ctx: &PuMvContext,
+    refs: &RefListAccess,
+    cu: &CodingUnit,
+) -> Result<(), ReconError> {
+    use crate::binarization::CuPredMode;
+    let n_cb_s = 1usize << cu.log2_cb_size;
+    if matches!(cu.cu_pred_mode, CuPredMode::Intra) {
+        // §8.4 intra reconstruction; stamp the motion field intra so a
+        // later inter CU's §6.4.2 availability denies it as a candidate.
+        crate::recon::reconstruct_intra_cu_ctx(pic, params, ctx, cu)?;
+        field.fill_rect(
+            cu.x0 as usize,
+            cu.y0 as usize,
+            n_cb_s,
+            n_cb_s,
+            crate::motion::MotionCell {
+                is_intra: true,
+                ..crate::motion::MotionCell::default()
+            },
+        );
+        return Ok(());
+    }
+
+    // §6.4.2 prediction-block availability against the shared tiling + the
+    // per-cell intra / inter flag of the motion field. The candidate
+    // derivation also *mutates* `field` (writing each PU's resolved motion),
+    // so the closure cannot borrow `field` directly; snapshot the per-4×4
+    // intra-flag grid up front. A neighbour outside the current CU was
+    // decoded before it, so its intra flag is already final; positions
+    // inside the current CU are excluded by the §6.4.2 z-scan test.
+    let x_cb = cu.x0;
+    let y_cb = cu.y0;
+    let w4 = field.width_4();
+    let h4 = field.height_4();
+    let mut intra_grid = vec![false; w4 * h4];
+    for (gy, row) in intra_grid.chunks_mut(w4).enumerate() {
+        for (gx, cell) in row.iter_mut().enumerate() {
+            *cell = field.cell_at(gx * 4, gy * 4).is_intra;
+        }
+    }
+    let tiling = ctx.tiling();
+    let available = |x_nb: i32, y_nb: i32| -> bool {
+        let cu_pred_mode = |x: u32, y: u32| -> u8 {
+            let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
+            if gx < w4 && gy < h4 && intra_grid[gy * w4 + gx] {
+                crate::availability::MODE_INTRA
+            } else {
+                0
+            }
+        };
+        tiling.prediction_block_availability(
+            x_cb,
+            y_cb,
+            n_cb_s as u32,
+            x_cb,
+            y_cb,
+            n_cb_s as u32,
+            n_cb_s as u32,
+            0,
+            x_nb,
+            y_nb,
+            |ctb_rs| ctx.slice_addr_rs_of(ctb_rs),
+            cu_pred_mode,
+        )
+    };
+
+    resolve_and_reconstruct_inter_cu(
+        pic,
+        field,
+        params,
+        cu,
+        &cu.prediction_units,
+        mv_ctx,
+        &available,
+        refs,
+    )
 }
 
 /// Find the first transform-unit `cu_qp_delta` in a transform tree (the
@@ -499,5 +766,156 @@ mod tests {
                 assert_eq!(pic.sample(Plane::Luma, x, y), v, "uniform at ({x},{y})");
             }
         }
+    }
+
+    fn p_slice_ctx() -> InterSliceContext {
+        InterSliceContext {
+            curr_poc: 4,
+            slice_is_b: false,
+            ctb_log2_size_y: 5,
+            pic_width_luma: 32,
+            pic_height_luma: 32,
+            max_num_merge_cand: 5,
+            num_ref_idx_l0_active: 1,
+            num_ref_idx_l1_active: 0,
+            log2_par_mrg_level: 2,
+            temporal_mvp_enabled: false,
+            collocated_from_l0_flag: true,
+            col_poc: 0,
+            no_backward_pred: true,
+        }
+    }
+
+    /// The §8.5 picture-level driver reconstructs a single-CTU P picture
+    /// whose one 32×32 inter merge CU (zero-MV fallback) copies the flat
+    /// reference samples, and records the CU's motion into the returned
+    /// field.
+    #[test]
+    fn picture_driver_single_inter_ctu_copies_reference() {
+        let params = p_params();
+        let refpic = flat_ref(77, 99);
+        let entries = vec![dpb_entry(0, refpic)];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+
+        // One 32×32 inter merge CU at (0,0) — a single coding tree unit
+        // covering the whole picture.
+        let mut cu = inter_cu_16(merge_pu(0), None);
+        cu.log2_cb_size = 5;
+        let ctu = crate::slice_data::CodingTreeUnit {
+            sao: None,
+            quadtree: crate::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            ctu: &ctu,
+        }];
+
+        let slice = p_slice_ctx();
+        let tiles = crate::availability::TilingParams::single_tile();
+        let (pic, field) =
+            reconstruct_inter_picture(32, 32, &params, &slice, 2, &tiles, &placed, &refs, None)
+                .unwrap();
+
+        for y in 0..32 {
+            for x in 0..32 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 77, "luma ({x},{y})");
+            }
+        }
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Cb, x, y), 99, "cb ({x},{y})");
+            }
+        }
+        let cell = field.cell_at(16, 16);
+        assert!(!cell.is_intra && cell.pred_flag_l0);
+        assert_eq!(cell.mv_l0, [0, 0]);
+    }
+
+    /// A mixed P picture: an intra CU and an inter CU side by side both
+    /// reconstruct, and the intra CU is stamped intra in the motion field.
+    #[test]
+    fn picture_driver_mixed_intra_inter() {
+        let params = p_params();
+        let refpic = flat_ref(60, 90);
+        let entries = vec![dpb_entry(0, refpic)];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+
+        // CTU split into four 16×16 quadrants: top-left intra (DC), the
+        // other three inter merge.
+        let intra_cu = CodingUnit {
+            x0: 0,
+            y0: 0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: false,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            prediction_units: vec![],
+            intra_luma: vec![crate::slice_data::IntraLumaMode {
+                prev_intra_luma_pred_flag: true,
+                mpm_idx: Some(0),
+                rem_intra_luma_pred_mode: None,
+            }],
+            intra_chroma_pred_mode: vec![4],
+            rqt_root_cbf: true,
+            transform_tree: Some(TransformTree::Leaf {
+                cbf_luma: false,
+                unit: TransformUnit::default(),
+            }),
+        };
+        let mut inter_tr = inter_cu_16(merge_pu(0), None);
+        inter_tr.x0 = 16;
+        let mut inter_bl = inter_cu_16(merge_pu(0), None);
+        inter_bl.y0 = 16;
+        let mut inter_br = inter_cu_16(merge_pu(0), None);
+        inter_br.x0 = 16;
+        inter_br.y0 = 16;
+
+        let ctu = crate::slice_data::CodingTreeUnit {
+            sao: None,
+            quadtree: crate::slice_data::CodingQuadtree::Split(vec![
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(intra_cu)),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter_tr)),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter_bl)),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter_br)),
+            ]),
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            ctu: &ctu,
+        }];
+
+        let slice = p_slice_ctx();
+        let tiles = crate::availability::TilingParams::single_tile();
+        let (pic, field) =
+            reconstruct_inter_picture(32, 32, &params, &slice, 2, &tiles, &placed, &refs, None)
+                .unwrap();
+
+        // The three inter quadrants copy the reference value 60.
+        assert_eq!(pic.sample(Plane::Luma, 24, 8), 60, "top-right inter");
+        assert_eq!(pic.sample(Plane::Luma, 8, 24), 60, "bottom-left inter");
+        assert_eq!(pic.sample(Plane::Luma, 24, 24), 60, "bottom-right inter");
+        // The intra quadrant is stamped intra; the inter quadrants are not.
+        assert!(field.cell_at(0, 0).is_intra, "TL intra-stamped");
+        assert!(!field.cell_at(16, 0).is_intra, "TR inter");
+        assert!(!field.cell_at(16, 16).is_intra, "BR inter");
     }
 }
