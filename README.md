@@ -87,16 +87,45 @@ picture assembly is wired: `ReconCtx` carries a per-CTB `SliceAddrRs` map
 (`recon::build_slice_addr_map` derives it from the slice segments per
 §7.4.7.1) so the §6.4.1 z-scan availability denies cross-slice neighbours.
 
-What remains for an end-to-end inter fixture is wiring the picture driver
-to gather the spatial `NeighbourPu`s + temporal `Col` candidate from the
-motion field during reconstruction, `deblock_picture` into the
-picture-level driver ahead of SAO, and the bitstream demux loop. The
+The **picture-level inter reconstruction is now wired end to end** in the
+`inter_recon` module. `reconstruct_inter_picture` walks a P / B picture's
+decoded CTUs in decode order, dispatching each leaf coding unit: an intra
+CU through the §8.4 intra path (stamping the motion field intra so a later
+inter CU's §6.4.2 availability denies it as a candidate), an inter CU
+through `resolve_and_reconstruct_inter_cu` — which composes
+`pu_mv::resolve_cu_motion` (the §8.5.3.2 spatial merge / MVP candidate
+derivation reading the in-progress motion field + the collocated `ColPic`
+motion field for the temporal `Col` candidate) with `extract_cu_residual`
+(walking the §7.3.8.8 transform tree to dequant + inverse-transform each
+leaf block into per-component CU residual planes) and
+`reconstruct_inter_cu` (building the §8.5.3.3.2 reference planes from
+`RefPicListX[refIdx]`, the §8.5.3.2.10 chroma MV, motion-compensated
+interpolation + combine, residual add + clip). The §6.4.2 prediction-block
+availability is evaluated against the shared `ReconCtx` tiling + a per-4×4
+intra-flag snapshot of the motion field. The driver then runs the **full
+in-loop filter chain**: the §8.7.2 `deblock_picture` pass (collecting a
+per-CU `DeblockCuDesc` + marking the §8.7.2.4 `cbf` cells during the walk),
+then the §8.7.3 SAO pass (left/above-merge-resolved per CTB), returning the
+filtered picture + its per-PU motion field.
+
+`decode_inter_picture` closes the **§8.3 + §8.5 per-picture decode cycle**:
+it ties `decode::PictureSequenceState::begin_picture` (the §8.3.1 → §8.3.2
+→ §8.3.4 → §8.3.5 POC / RPS-marking / reference-list / `ColPic` derivation)
+to `reconstruct_inter_picture`, then `store_picture`s the result into the
+DPB as a short-term reference — a P picture decodes against an in-DPB
+reference and becomes a reference itself, its motion field available for a
+future picture's temporal MVP.
+
+What remains for a real-bitstream inter fixture is the NAL-demux + CABAC
+slice-data parse loop that feeds these drivers their decoded CTUs (the
+slice-data CABAC walk itself runs end to end on the `tiny-i` fixture). The
 runtime registration hook (`register`) is a no-op and the top-level decode
 entry point still returns `Error::NotImplemented` until that demux loop
-lands; the per-CTU and picture-level intra reconstruction, the per-PU
-inter reconstruction, and the POC / DPB / RPS / temporal-MV subsystem are
-usable directly through the public `recon` / `inter_pred` / `motion` /
-`poc` / `dpb` / `decode` / `picture` API.
+lands; the per-CTU and picture-level intra reconstruction, the
+picture-level inter reconstruction + in-loop filter chain + per-picture
+decode cycle, and the POC / DPB / RPS / temporal-MV subsystem are usable
+directly through the public `recon` / `inter_recon` / `inter_pred` /
+`motion` / `pu_mv` / `poc` / `dpb` / `decode` / `picture` API.
 
 ## What's implemented
 
@@ -325,32 +354,29 @@ usable directly through the public `recon` / `inter_pred` / `motion` /
 
 ## Not yet implemented
 
-* Picture reconstruction from the decoded slice-data parse tree: the
-  §8.4 intra-block / §8.5 inter-block sample-write passes that turn the
-  `slice_data` module's `CodingTreeUnit` → `CodingQuadtree` →
-  `CodingUnit` tree (now decoded end to end; see "What's implemented")
-  into reconstructed luma / chroma planes, the wiring of the (now
-  complete) picture-level in-loop deblock driver `deblock_picture` into
-  that CU walk / SAO application, and DPB
-  management. The §7.3.8 slice-data CABAC
-  syntax-element walk itself — the §7.3.8.3 `sao()`, §7.3.8.2
-  `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, §7.3.8.5
+* The NAL-demux + §7.3.8 CABAC slice-data parse loop that drives the
+  picture-level reconstruction drivers from a real bitstream. The
+  slice-data CABAC syntax-element walk itself — the §7.3.8.3 `sao()`,
+  §7.3.8.2 `coding_tree_unit()`, §7.3.8.4 `coding_quadtree()`, §7.3.8.5
   `coding_unit()` and §7.3.8.6 `prediction_unit()` structures — is
   implemented and runs end to end on real HEVC bitstream (the
   `tiny-i-only-16x16-main` fixture's single intra CTU + SAO decode
-  bit-exactly through it).
-* The rest of inter prediction (§8.5): the §8.5.3.2.8 **temporal**
-  (collocated-picture) merge / MVP candidate derivation (which needs the
-  DPB collocated-picture motion field), and the §8.5.3.3.4.3 explicit
-  weighted-prediction path. The §8.5.3.2.2/.3/.4/.6/.7 spatial merge / MVP
-  candidate derivation, the §8.5.3.3.3 interpolation, §8.5.3.3.4.2 default
-  combine, §8.5.3.3.1 block-walk driver, §8.5.3.2.1 MV reconstruction,
-  §8.5.3.2.10 chroma MV, §8.5.3.2.5 zero-merge, and the §8.5/§8.6.5 inter
-  PU reconstruction are implemented (see above). The driver wiring that
-  gathers the spatial `NeighbourPu`s from the motion field is the next
-  step. The in-loop deblocking filter is complete
-  (§8.7.2.1/.2/.3/.4/.5); its wiring into the recon CU walk, SAO apply,
-  and DPB management remain.
+  bit-exactly through it); the picture-level intra + inter reconstruction
+  drivers (`recon::reconstruct_intra_picture` /
+  `inter_recon::reconstruct_inter_picture`), the in-loop filter chain, and
+  the §8.3 DPB / reference cycle (`inter_recon::decode_inter_picture`) are
+  wired (see "Status"). What is left is feeding them the decoded
+  `CodingTreeUnit`s from a multi-picture bitstream (the per-slice
+  CABAC-state plumbing + entry-point / WPP handling).
+* The remaining inter-prediction corner: the §8.5.3.3.4.3 **explicit**
+  weighted-prediction path (`weighted_pred_flag == 1`); the
+  §8.5.3.3.4.2 default combine is wired. The §8.5.3.2.2/.3/.4/.6/.7
+  spatial + §8.5.3.2.8 temporal merge / MVP candidate derivation,
+  §8.5.3.3.3 interpolation, §8.5.3.3.1 block-walk driver, §8.5.3.2.1 MV
+  reconstruction, §8.5.3.2.10 chroma MV, §8.5.3.2.5 zero-merge, the
+  §8.5/§8.6.5 inter PU reconstruction, the picture-level driver that
+  gathers the spatial / temporal candidates from the motion field, and the
+  in-loop deblocking + SAO wiring are all implemented (see "Status").
 * SPS / PPS / VPS extension bodies — the `sps_range_extension()`
   (§7.3.2.2.2), `pps_range_extension()` (§7.3.2.3.2), `sps_scc_extension()`
   (§7.3.2.2.3), and `pps_scc_extension()` (§7.3.2.3.3) bodies (the latter
