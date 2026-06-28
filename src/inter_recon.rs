@@ -339,6 +339,14 @@ pub struct InterSliceContext {
     pub cb_qp_offset: i32,
     /// `pps_cr_qp_offset + slice_cr_qp_offset`.
     pub cr_qp_offset: i32,
+    /// `slice_sao_luma_flag` (§8.7.3.1 luma gate).
+    pub slice_sao_luma_flag: bool,
+    /// `slice_sao_chroma_flag` (§8.7.3.1 chroma gate).
+    pub slice_sao_chroma_flag: bool,
+    /// `log2_sao_offset_scale_luma` (§7.4.3.3.2; 0 for 8-bit Main).
+    pub log2_sao_offset_scale_luma: u8,
+    /// `log2_sao_offset_scale_chroma`.
+    pub log2_sao_offset_scale_chroma: u8,
 }
 
 /// One placed coding tree unit for the §8.5 picture-level inter driver.
@@ -367,10 +375,10 @@ pub struct PlacedInterCtu<'a> {
 /// flag of the motion field built up so far.
 ///
 /// Returns the reconstructed picture and its per-PU motion field (the
-/// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). When
-/// `slice.deblock_enabled` the §8.7.2 in-loop deblocking pass is run before
-/// returning; the §8.7.3 SAO filter is applied by the caller (the
-/// picture-decode driver) after this recon pass.
+/// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). The
+/// returned picture is the full in-loop-filtered output: when
+/// `slice.deblock_enabled` the §8.7.2 deblocking pass runs first, then the
+/// §8.7.3 SAO pass (a no-op when both slice SAO flags are clear).
 ///
 /// # Errors
 /// Propagates [`ReconError`] from the per-CU reconstruction.
@@ -410,7 +418,7 @@ pub fn reconstruct_inter_picture(
         let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
         slice_addr_map[ry * pic_w_ctbs + rx] = placed.slice_addr_rs;
     }
-    ctx.set_slice_addr_rs(slice_addr_map);
+    ctx.set_slice_addr_rs(slice_addr_map.clone());
 
     // §8.5.3.2 reference-picture resolvers, bound to the §8.3.4 ref lists.
     let ref_poc = |list: usize, ref_idx: i32| refs.ref_poc(list, ref_idx);
@@ -461,12 +469,43 @@ pub fn reconstruct_inter_picture(
     }
 
     // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
-    // ahead of the caller's §8.7.3 SAO pass.
+    // ahead of the §8.7.3 SAO pass.
     if slice.deblock_enabled {
         crate::deblock::deblock_picture(&mut pic, &field, &deblock_cus);
     }
 
-    Ok((pic, field))
+    // §8.7.3 — sample-adaptive offset (on the deblocked samples). Resolve
+    // each CTB's §7.4.9.3 SAO parameters with left / above merge (denied
+    // across slice boundaries), then run the picture-level filter.
+    let mut sao_grid = vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
+    for placed in ctus {
+        let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
+        let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
+        let here = slice_addr_map[ry * pic_w_ctbs + rx];
+        if let Some(sao_params) = &placed.ctu.sao {
+            let left = (rx > 0 && slice_addr_map[ry * pic_w_ctbs + (rx - 1)] == here)
+                .then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
+            let above = (ry > 0 && slice_addr_map[(ry - 1) * pic_w_ctbs + rx] == here)
+                .then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
+            sao_grid[ry * pic_w_ctbs + rx] = crate::sao::ResolvedSao::resolve(
+                sao_params,
+                left.as_ref(),
+                above.as_ref(),
+                slice.log2_sao_offset_scale_luma,
+                slice.log2_sao_offset_scale_chroma,
+            );
+        }
+    }
+    let filtered = crate::sao::apply_sao_picture(
+        &pic,
+        &sao_grid,
+        slice.ctb_log2_size_y,
+        params.chroma_array_type,
+        slice.slice_sao_luma_flag,
+        slice.slice_sao_chroma_flag,
+    );
+
+    Ok((filtered, field))
 }
 
 /// Walk one §7.3.8.4 coding quadtree, dispatching each leaf coding unit to
@@ -936,6 +975,10 @@ mod tests {
             slice_qp_y: 25,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
+            slice_sao_luma_flag: false,
+            slice_sao_chroma_flag: false,
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
         }
     }
 
@@ -1166,5 +1209,68 @@ mod tests {
         assert!(changed, "deblocking modifies samples at the CU boundary");
         // Far-from-edge interior samples are untouched.
         assert_eq!(filtered.sample(Plane::Luma, 28, 8), 140, "inter interior");
+    }
+
+    /// With `slice_sao_luma_flag` set and a band-offset SAO on the CTB, the
+    /// §8.7.3 SAO pass runs as part of the picture driver: the inter CU's
+    /// flat luma is shifted by the band offset covering its value.
+    #[test]
+    fn picture_driver_applies_sao() {
+        let params = p_params();
+        // Inter reference flat 100. Luma 100 is in band 100 >> 3 == 12.
+        let refpic = flat_ref(100, 128);
+        let entries = vec![dpb_entry(0, refpic)];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+
+        let mut cu = inter_cu_16(merge_pu(0), None);
+        cu.log2_cb_size = 5;
+        // Band-offset SAO on luma: band_position 12 (covers value 100),
+        // first offset +5 ⇒ luma 100 → 105.
+        let sao = crate::slice_data::SaoCtbParams {
+            merge_left: false,
+            merge_up: false,
+            components: [
+                crate::slice_data::SaoComponent {
+                    sao_type_idx: 1,
+                    offset_abs: [5, 0, 0, 0],
+                    offset_sign: [0, 0, 0, 0],
+                    band_position: 12,
+                    eo_class: 0,
+                },
+                crate::slice_data::SaoComponent::default(),
+                crate::slice_data::SaoComponent::default(),
+            ],
+        };
+        let ctu = crate::slice_data::CodingTreeUnit {
+            sao: Some(sao),
+            quadtree: crate::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            ctu: &ctu,
+        }];
+
+        let mut slice = p_slice_ctx();
+        slice.slice_sao_luma_flag = true;
+        let tiles = crate::availability::TilingParams::single_tile();
+        let (pic, _) =
+            reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
+                .unwrap();
+        // The reconstructed inter samples (100) fall in SAO band 12 and get
+        // the +5 offset.
+        assert_eq!(
+            pic.sample(Plane::Luma, 8, 8),
+            105,
+            "SAO band offset applied"
+        );
     }
 }
