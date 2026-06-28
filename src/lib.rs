@@ -237,6 +237,7 @@ pub mod decode;
 pub mod dpb;
 pub mod hrd;
 pub mod inter_pred;
+pub mod inter_recon;
 pub mod intra_mode_field;
 pub mod intra_pred;
 pub mod motion;
