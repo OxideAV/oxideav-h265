@@ -711,6 +711,76 @@ fn first_leaf_cu_qp_delta(tree: &crate::transform_tree::TransformTree) -> Option
     }
 }
 
+/// §8.3 + §8.5 — decode one inter (P / B) picture end to end against the
+/// decoded-picture buffer, completing the per-picture reference cycle.
+///
+/// Ties the §8.3.1 → §8.3.2 → §8.3.4 → §8.3.5 reference derivation
+/// ([`crate::decode::PictureSequenceState::begin_picture`]) to the
+/// picture-level inter reconstruction: it resolves `RefPicList0` /
+/// `RefPicList1` + `ColPic` into the [`RefListAccess`] + collocated motion
+/// field the inter driver reads, runs [`reconstruct_inter_picture`] (recon →
+/// deblock → SAO), then inserts the reconstructed picture + its motion field
+/// into the DPB ([`crate::decode::PictureSequenceState::store_picture`]) as a
+/// short-term reference for the next picture.
+///
+/// `header` / `slice_ref` carry the §8.3 inputs; `slice` the §8.5.3.2 /
+/// §8.7 slice-constant inputs; `ctus` the decoded CTUs in decode order.
+/// Returns the (output) reconstructed picture.
+///
+/// # Errors
+/// [`ReconError::InterNotSupported`] when the picture is an I picture (no
+/// reference lists were built — use the intra driver instead) or a used
+/// reference resolves to "no reference picture"; otherwise the per-CU
+/// reconstruction errors.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_inter_picture(
+    seq: &mut crate::decode::PictureSequenceState,
+    header: &crate::decode::PictureHeaderInfo,
+    slice_ref: &crate::decode::SliceRefParams,
+    pic_width_luma: usize,
+    pic_height_luma: usize,
+    params: &ReconParams,
+    slice: &InterSliceContext,
+    tiles: &crate::availability::TilingParams,
+    ctus: &[PlacedInterCtu<'_>],
+) -> Result<Picture, ReconError> {
+    // §8.3.1 → §8.3.5 — POC, RPS marking, reference lists, ColPic.
+    let ref_state = seq.begin_picture(header, slice_ref);
+    let lists = ref_state
+        .ref_pic_lists
+        .clone()
+        .ok_or(ReconError::InterNotSupported)?;
+    let layer_id = header.layer_id;
+    let poc = ref_state.poc;
+
+    // The collocated picture's motion field for the §8.5.3.2.9 temporal MVP.
+    let col_field = ref_state
+        .col_pic
+        .map(|idx| &seq.dpb().entries()[idx].motion);
+
+    let refs = RefListAccess {
+        lists: &lists,
+        entries: seq.dpb().entries(),
+    };
+
+    let (picture, motion) = reconstruct_inter_picture(
+        pic_width_luma,
+        pic_height_luma,
+        params,
+        slice,
+        tiles,
+        ctus,
+        &refs,
+        col_field,
+    )?;
+
+    // §8.3.2 — insert as a short-term reference for the following pictures.
+    // (The output picture is returned to the caller before the move.)
+    let output = picture.clone();
+    seq.store_picture(poc, layer_id, picture, motion);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,5 +1342,113 @@ mod tests {
             105,
             "SAO band offset applied"
         );
+    }
+
+    /// §8.3 + §8.5 end-to-end inter picture cycle: an IDR reference picture
+    /// is stored in the DPB, then a P picture (one 32×32 inter merge CU)
+    /// decodes against it via `decode_inter_picture` — resolving
+    /// RefPicList0[0] → the IDR, copying its samples, and landing in the DPB
+    /// as a short-term reference.
+    #[test]
+    fn decode_inter_picture_full_cycle() {
+        use crate::poc::NalKind;
+        use crate::sps::MaterializedShortTermRefPicSet;
+
+        let params = p_params();
+        let mut seq = crate::decode::PictureSequenceState::new();
+
+        // IDR (POC 0): a flat-110 reference picture stored directly.
+        let idr_header = crate::decode::PictureHeaderInfo {
+            nal_kind: NalKind::new(NalKind::IDR_N_LP),
+            temporal_id: 0,
+            layer_id: 0,
+            no_rasl_output: true,
+            poc_lsb: 0,
+            max_poc_lsb: 256,
+            short_term_rps: MaterializedShortTermRefPicSet {
+                delta_poc_s0: vec![],
+                used_by_curr_pic_s0: vec![],
+                delta_poc_s1: vec![],
+                used_by_curr_pic_s1: vec![],
+            },
+            long_term: vec![],
+        };
+        let i_slice = crate::decode::SliceRefParams {
+            is_inter: false,
+            is_b: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            num_pic_total_curr: 0,
+            temporal_mvp_enabled: false,
+            collocated_from_l0_flag: true,
+            collocated_ref_idx: 0,
+        };
+        let idr = seq.begin_picture(&idr_header, &i_slice);
+        seq.store_picture(idr.poc, 0, flat_ref(110, 128), MotionField::new(32, 32));
+
+        // P picture (POC 1): one short-term-before reference at POC 0.
+        let p_header = crate::decode::PictureHeaderInfo {
+            nal_kind: NalKind::new(NalKind::TRAIL_R),
+            no_rasl_output: false,
+            poc_lsb: 1,
+            short_term_rps: MaterializedShortTermRefPicSet {
+                delta_poc_s0: vec![-1],
+                used_by_curr_pic_s0: vec![true],
+                delta_poc_s1: vec![],
+                used_by_curr_pic_s1: vec![],
+            },
+            ..idr_header.clone()
+        };
+        let p_slice_ref = crate::decode::SliceRefParams {
+            is_inter: true,
+            num_pic_total_curr: 1,
+            ..i_slice
+        };
+
+        let mut cu = inter_cu_16(merge_pu(0), None);
+        cu.log2_cb_size = 5;
+        let ctu = crate::slice_data::CodingTreeUnit {
+            sao: None,
+            quadtree: crate::slice_data::CodingQuadtree::Leaf(Box::new(cu)),
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            ctu: &ctu,
+        }];
+        let slice = p_slice_ctx();
+        let tiles = crate::availability::TilingParams::single_tile();
+
+        let out = decode_inter_picture(
+            &mut seq,
+            &p_header,
+            &p_slice_ref,
+            32,
+            32,
+            &params,
+            &slice,
+            &tiles,
+            &placed,
+        )
+        .unwrap();
+
+        // The P picture copies the IDR reference's flat 110.
+        for y in 0..32 {
+            for x in 0..32 {
+                assert_eq!(out.sample(Plane::Luma, x, y), 110, "P luma ({x},{y})");
+            }
+        }
+        // The DPB now holds two pictures (IDR POC 0 + P POC 1), both
+        // short-term references.
+        assert_eq!(seq.dpb().entries().len(), 2);
+        assert_eq!(seq.dpb().entries()[1].poc, 1);
+        assert_eq!(
+            seq.dpb().entries()[1].marking,
+            crate::dpb::Marking::ShortTerm
+        );
+        // The P picture's motion field records the inter CU (for a future
+        // picture's temporal MVP).
+        assert!(!seq.dpb().entries()[1].motion.cell_at(16, 16).is_intra);
     }
 }
