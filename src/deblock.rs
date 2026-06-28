@@ -75,6 +75,25 @@ impl TransformSplit {
             TransformSplit::Leaf,
         ]))
     }
+
+    /// Map a parsed §7.3.8.8 [`crate::transform_tree::TransformTree`] to the
+    /// deblocking transform-split structure the §8.7.2.2 transform-block
+    /// boundary recursion consumes (only the split topology matters, not the
+    /// per-leaf residual). A CU with no transform tree (skip / `rqt_root_cbf
+    /// == 0`) is a single whole-CB leaf.
+    #[must_use]
+    pub fn from_tree(tree: Option<&crate::transform_tree::TransformTree>) -> Self {
+        use crate::transform_tree::TransformTree;
+        match tree {
+            None | Some(TransformTree::Leaf { .. }) => TransformSplit::Leaf,
+            Some(TransformTree::Split { children, .. }) => TransformSplit::Split(Box::new([
+                Self::from_tree(Some(&children[0])),
+                Self::from_tree(Some(&children[1])),
+                Self::from_tree(Some(&children[2])),
+                Self::from_tree(Some(&children[3])),
+            ])),
+        }
+    }
 }
 
 /// The invariant context threaded through the §8.7.2.2 recursion.

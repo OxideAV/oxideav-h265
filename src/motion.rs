@@ -935,6 +935,23 @@ impl MotionField {
             }
         }
     }
+
+    /// Mark every 4×4 cell covering the luma rectangle `[(x0, y0),
+    /// (x0 + w, y0 + h))` as carrying a non-zero transform coefficient
+    /// (the §8.7.2.4 `cbf` boundary-strength test reads this). ORs the flag
+    /// without disturbing the cell's motion. Coordinates are in luma
+    /// samples; the rectangle is clipped to the field.
+    pub fn mark_nonzero_coeff(&mut self, x0: usize, y0: usize, w: usize, h: usize) {
+        let bx0 = x0 / 4;
+        let by0 = y0 / 4;
+        let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
+        let by1 = ((y0 + h).min(self.height_4 * 4)).div_ceil(4);
+        for by in by0..by1 {
+            for bx in bx0..bx1 {
+                self.cells[by * self.width_4 + bx].has_nonzero_coeff = true;
+            }
+        }
+    }
 }
 
 /// §8.5.3.2.8 / §8.5.3.2.9 inputs for the temporal (collocated) luma

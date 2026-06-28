@@ -246,7 +246,48 @@ pub fn resolve_and_reconstruct_inter_cu(
         cu.cu_transquant_bypass_flag,
     )?;
 
+    // §8.7.2.4 — mark the per-4×4 cells covered by a transform block with a
+    // coded luma coefficient so the deblocking boundary-strength `cbf` test
+    // (bS = 1 at a transform-block edge with a non-zero coefficient) reads
+    // them.
+    if let Some(tree) = cu.transform_tree.as_ref() {
+        mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
+    }
+
     reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs)
+}
+
+/// Walk an inter CU's transform tree and mark each leaf transform block that
+/// carries a non-zero luma coefficient into the motion field
+/// ([`MotionField::mark_nonzero_coeff`]).
+fn mark_nonzero_luma(
+    field: &mut MotionField,
+    tree: &crate::transform_tree::TransformTree,
+    x0: usize,
+    y0: usize,
+    log2_trafo_size: u32,
+) {
+    use crate::transform_tree::TransformTree;
+    let n = 1usize << log2_trafo_size;
+    match tree {
+        TransformTree::Leaf { cbf_luma, unit } => {
+            let has_coeff = *cbf_luma
+                && unit
+                    .residual_luma
+                    .as_ref()
+                    .is_some_and(|rb| rb.levels.iter().any(|&l| l != 0));
+            if has_coeff {
+                field.mark_nonzero_coeff(x0, y0, n, n);
+            }
+        }
+        TransformTree::Split { children, .. } => {
+            let half = n / 2;
+            let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
+            for (child, (dx, dy)) in children.iter().zip(offsets) {
+                mark_nonzero_luma(field, child, x0 + dx, y0 + dy, log2_trafo_size - 1);
+            }
+        }
+    }
 }
 
 /// Slice-level inputs constant across one P / B slice's inter
@@ -282,6 +323,22 @@ pub struct InterSliceContext {
     pub col_poc: i32,
     /// `NoBackwardPredFlag` (§8.3.5).
     pub no_backward_pred: bool,
+    /// `MinTbLog2SizeY` (the transform-block grid base).
+    pub min_tb_log2_size_y: u32,
+    /// `slice_deblocking_filter_disabled_flag == 0` — run the §8.7.2
+    /// in-loop deblocking pass after reconstruction.
+    pub deblock_enabled: bool,
+    /// `slice_beta_offset_div2` (§8.7.2.5.3).
+    pub beta_offset_div2: i32,
+    /// `slice_tc_offset_div2` (§8.7.2.5.3).
+    pub tc_offset_div2: i32,
+    /// `SliceQpY` — the per-CU QP for the single-quantization-group case
+    /// (the deblocking β/tC derivation reads it).
+    pub slice_qp_y: i32,
+    /// `pps_cb_qp_offset + slice_cb_qp_offset`.
+    pub cb_qp_offset: i32,
+    /// `pps_cr_qp_offset + slice_cr_qp_offset`.
+    pub cr_qp_offset: i32,
 }
 
 /// One placed coding tree unit for the §8.5 picture-level inter driver.
@@ -310,8 +367,9 @@ pub struct PlacedInterCtu<'a> {
 /// flag of the motion field built up so far.
 ///
 /// Returns the reconstructed picture and its per-PU motion field (the
-/// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). The
-/// in-loop deblocking + SAO filters are applied by the caller (the
+/// §8.5.3.2.9 collocated arrays a later picture's temporal MVP reads). When
+/// `slice.deblock_enabled` the §8.7.2 in-loop deblocking pass is run before
+/// returning; the §8.7.3 SAO filter is applied by the caller (the
 /// picture-decode driver) after this recon pass.
 ///
 /// # Errors
@@ -322,7 +380,6 @@ pub fn reconstruct_inter_picture(
     pic_height_luma: usize,
     params: &ReconParams,
     slice: &InterSliceContext,
-    min_tb_log2_size_y: u32,
     tiles: &crate::availability::TilingParams,
     ctus: &[PlacedInterCtu<'_>],
     refs: &RefListAccess,
@@ -339,7 +396,7 @@ pub fn reconstruct_inter_picture(
         pic_width_luma,
         pic_height_luma,
         slice.ctb_log2_size_y,
-        min_tb_log2_size_y,
+        slice.min_tb_log2_size_y,
         tiles,
     )?;
     let mut field = MotionField::new(pic_width_luma, pic_height_luma);
@@ -388,6 +445,7 @@ pub fn reconstruct_inter_picture(
         col_ref_long_term: &col_ref_long_term,
     };
 
+    let mut deblock_cus: Vec<crate::deblock::DeblockCuDesc> = Vec::new();
     for placed in ctus {
         reconstruct_inter_quadtree(
             &mut pic,
@@ -396,8 +454,16 @@ pub fn reconstruct_inter_picture(
             params,
             &mv_ctx,
             refs,
+            slice,
+            &mut deblock_cus,
             &placed.ctu.quadtree,
         )?;
+    }
+
+    // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
+    // ahead of the caller's §8.7.3 SAO pass.
+    if slice.deblock_enabled {
+        crate::deblock::deblock_picture(&mut pic, &field, &deblock_cus);
     }
 
     Ok((pic, field))
@@ -405,6 +471,7 @@ pub fn reconstruct_inter_picture(
 
 /// Walk one §7.3.8.4 coding quadtree, dispatching each leaf coding unit to
 /// the intra or inter reconstruction path.
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_quadtree(
     pic: &mut Picture,
     ctx: &mut crate::recon::ReconCtx,
@@ -412,24 +479,85 @@ fn reconstruct_inter_quadtree(
     params: &ReconParams,
     mv_ctx: &PuMvContext,
     refs: &RefListAccess,
+    slice: &InterSliceContext,
+    deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
     qt: &crate::slice_data::CodingQuadtree,
 ) -> Result<(), ReconError> {
     use crate::slice_data::CodingQuadtree;
     match qt {
         CodingQuadtree::Split(children) => {
             for child in children {
-                reconstruct_inter_quadtree(pic, ctx, field, params, mv_ctx, refs, child)?;
+                reconstruct_inter_quadtree(
+                    pic,
+                    ctx,
+                    field,
+                    params,
+                    mv_ctx,
+                    refs,
+                    slice,
+                    deblock_cus,
+                    child,
+                )?;
             }
             Ok(())
         }
-        CodingQuadtree::Leaf(cu) => {
-            reconstruct_inter_leaf_cu(pic, ctx, field, params, mv_ctx, refs, cu)
-        }
+        CodingQuadtree::Leaf(cu) => reconstruct_inter_leaf_cu(
+            pic,
+            ctx,
+            field,
+            params,
+            mv_ctx,
+            refs,
+            slice,
+            deblock_cus,
+            cu,
+        ),
     }
 }
 
+/// Build the §8.7.2 [`crate::deblock::DeblockCuDesc`] for one coding unit
+/// (its geometry, transform-split topology, partition mode, QP context, and
+/// the CB-boundary edge-flag gates) and append it to `deblock_cus`.
+fn collect_deblock_cu(
+    cu: &CodingUnit,
+    slice: &InterSliceContext,
+    chroma_array_type: u8,
+    bit_depth_luma: u8,
+    bit_depth_chroma: u8,
+    deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
+) {
+    let cu_params = crate::deblock::DeblockCuParams {
+        qp_y: slice.slice_qp_y,
+        beta_offset_div2: slice.beta_offset_div2,
+        tc_offset_div2: slice.tc_offset_div2,
+        cb_qp_offset: slice.cb_qp_offset,
+        cr_qp_offset: slice.cr_qp_offset,
+        bit_depth_luma,
+        bit_depth_chroma,
+        chroma_array_type,
+    };
+    deblock_cus.push(crate::deblock::DeblockCuDesc {
+        cu: crate::deblock::DeblockCu {
+            x_cb: cu.x0 as usize,
+            y_cb: cu.y0 as usize,
+            log2_cb_size: cu.log2_cb_size,
+            params: cu_params,
+            qp_y_p: slice.slice_qp_y,
+        },
+        transform_split: crate::deblock::TransformSplit::from_tree(cu.transform_tree.as_ref()),
+        part_mode: cu.part_mode,
+        // §8.7.2.1 — the CB-boundary edges are filtered except at the
+        // picture's left / top border (the single-slice / single-tile case;
+        // a slice / tile boundary with loop-filter-across disabled would
+        // additionally clear these, threaded by the caller).
+        filter_left: cu.x0 != 0,
+        filter_top: cu.y0 != 0,
+    });
+}
+
 /// Reconstruct one leaf coding unit (intra → §8.4 path + intra-stamp the
-/// motion field; inter → §8.5 path).
+/// motion field; inter → §8.5 path), and collect its deblocking descriptor.
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_leaf_cu(
     pic: &mut Picture,
     ctx: &mut crate::recon::ReconCtx,
@@ -437,10 +565,22 @@ fn reconstruct_inter_leaf_cu(
     params: &ReconParams,
     mv_ctx: &PuMvContext,
     refs: &RefListAccess,
+    slice: &InterSliceContext,
+    deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
     cu: &CodingUnit,
 ) -> Result<(), ReconError> {
     use crate::binarization::CuPredMode;
     let n_cb_s = 1usize << cu.log2_cb_size;
+    if slice.deblock_enabled {
+        collect_deblock_cu(
+            cu,
+            slice,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+            deblock_cus,
+        );
+    }
     if matches!(cu.cu_pred_mode, CuPredMode::Intra) {
         // §8.4 intra reconstruction; stamp the motion field intra so a
         // later inter CU's §6.4.2 availability denies it as a candidate.
@@ -455,6 +595,12 @@ fn reconstruct_inter_leaf_cu(
                 ..crate::motion::MotionCell::default()
             },
         );
+        // §8.7.2.4 — mark the intra CU's coded transform blocks (intra
+        // neighbours give bS = 2 regardless, but the cbf flag is read for
+        // an inter-side q neighbour at the shared edge).
+        if let Some(tree) = cu.transform_tree.as_ref() {
+            mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
+        }
         return Ok(());
     }
 
@@ -783,6 +929,13 @@ mod tests {
             collocated_from_l0_flag: true,
             col_poc: 0,
             no_backward_pred: true,
+            min_tb_log2_size_y: 2,
+            deblock_enabled: false,
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            slice_qp_y: 25,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
         }
     }
 
@@ -822,7 +975,7 @@ mod tests {
         let slice = p_slice_ctx();
         let tiles = crate::availability::TilingParams::single_tile();
         let (pic, field) =
-            reconstruct_inter_picture(32, 32, &params, &slice, 2, &tiles, &placed, &refs, None)
+            reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
                 .unwrap();
 
         for y in 0..32 {
@@ -906,7 +1059,7 @@ mod tests {
         let slice = p_slice_ctx();
         let tiles = crate::availability::TilingParams::single_tile();
         let (pic, field) =
-            reconstruct_inter_picture(32, 32, &params, &slice, 2, &tiles, &placed, &refs, None)
+            reconstruct_inter_picture(32, 32, &params, &slice, &tiles, &placed, &refs, None)
                 .unwrap();
 
         // The three inter quadrants copy the reference value 60.
@@ -917,5 +1070,101 @@ mod tests {
         assert!(field.cell_at(0, 0).is_intra, "TL intra-stamped");
         assert!(!field.cell_at(16, 0).is_intra, "TR inter");
         assert!(!field.cell_at(16, 16).is_intra, "BR inter");
+    }
+
+    /// With deblocking enabled, the §8.7.2 in-loop pass runs as part of the
+    /// picture driver: a strong luma step at the intra/inter CU boundary
+    /// (bS = 2) is smoothed, so the boundary samples differ from the
+    /// undeblocked reconstruction.
+    #[test]
+    fn picture_driver_deblock_smooths_cu_boundary() {
+        let params = p_params();
+        // Reference for the inter CUs: flat 140 — a modest step from the
+        // intra DC (128) so the §8.7.2.5.3 dE decision classifies the
+        // boundary as a blocking artifact (small gradient) rather than a
+        // true edge, and the weak filter engages.
+        let refpic = flat_ref(140, 128);
+        let entries = vec![dpb_entry(0, refpic)];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+
+        // CTU split into four 16×16 quadrants: the two left quadrants intra
+        // (DC ⇒ mid-grey 128, no neighbours), the two right inter (copy 200).
+        let intra = |x0: u32, y0: u32| CodingUnit {
+            x0,
+            y0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: false,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            prediction_units: vec![],
+            intra_luma: vec![crate::slice_data::IntraLumaMode {
+                prev_intra_luma_pred_flag: false,
+                mpm_idx: None,
+                rem_intra_luma_pred_mode: Some(1),
+            }],
+            intra_chroma_pred_mode: vec![4],
+            rqt_root_cbf: false,
+            transform_tree: Some(TransformTree::Leaf {
+                cbf_luma: false,
+                unit: TransformUnit::default(),
+            }),
+        };
+        let inter = |x0: u32, y0: u32| {
+            let mut c = inter_cu_16(merge_pu(0), None);
+            c.x0 = x0;
+            c.y0 = y0;
+            c
+        };
+        let ctu = crate::slice_data::CodingTreeUnit {
+            sao: None,
+            quadtree: crate::slice_data::CodingQuadtree::Split(vec![
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 0))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 0))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(intra(0, 16))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 16))),
+            ]),
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            ctu: &ctu,
+        }];
+
+        let tiles = crate::availability::TilingParams::single_tile();
+        // Undeblocked baseline.
+        let mut undeb = p_slice_ctx();
+        undeb.deblock_enabled = false;
+        let (plain, _) =
+            reconstruct_inter_picture(32, 32, &params, &undeb, &tiles, &placed, &refs, None)
+                .unwrap();
+        // Deblocked.
+        let mut deb = p_slice_ctx();
+        deb.deblock_enabled = true;
+        let (filtered, _) =
+            reconstruct_inter_picture(32, 32, &params, &deb, &tiles, &placed, &refs, None).unwrap();
+
+        // The vertical boundary at x == 16 separates intra (128) from inter
+        // (200); the deblock pass adjusts samples on at least one side, so
+        // the filtered picture differs from the plain one near the edge.
+        let mut changed = false;
+        for y in 0..32 {
+            for x in 13..19 {
+                if filtered.sample(Plane::Luma, x, y) != plain.sample(Plane::Luma, x, y) {
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed, "deblocking modifies samples at the CU boundary");
+        // Far-from-edge interior samples are untouched.
+        assert_eq!(filtered.sample(Plane::Luma, 28, 8), 140, "inter interior");
     }
 }
