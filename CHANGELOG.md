@@ -6,6 +6,74 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 387 (2026-07-03)
+
+- `hvcc` (new module) — `HEVCDecoderConfigurationRecord` parse
+  (ISO/IEC 14496-15 §8.3.3.1: fixed prefix, profile/tier/level
+  mirrors, `lengthSizeMinusOne`, parameter-set NAL arrays with the
+  reserved-type-skip tolerance) plus length-prefixed sample-data
+  re-framing. The registry decoder accepts both extradata forms; an
+  `hvcC` extradata switches packets to `lengthSizeMinusOne + 1`-byte
+  big-endian NAL framing. Pinned byte-exact with the corpus'
+  `iso-mp4-vs-annexb-pair` MP4 form.
+
+- §8.5.3.3.4.3 **explicit weighted sample prediction** end to end:
+  `explicit_weighted_pred` (equations 8-265..8-277),
+  `predict_inter_pu_weighted` / `reconstruct_inter_pu_weighted`
+  dispatch, and the §7.4.7.3 slice-table resolution
+  (`SliceWpTables`: weight-flag inference, equation-7-58
+  `ChromaOffsetLX`, `WpOffsetBdShiftY/C` scaling). Two self-built
+  fade fixtures pin the P (uni) and B (uni + bi) explicit paths
+  byte-exact.
+
+- Fixed §8.5.3.2.3 spatial-merge redundancy gates: the B0 / A0 / B2
+  "same motion" comparisons are gated on the earlier position's *raw*
+  `availableN`, not its post-redundancy `availableFlagN` — a B1
+  pruned as a duplicate of A1 still prunes an identical B0 (the
+  phantom candidate shifted the temporal candidate down the list).
+
+- `encoder` (new module tree) — the write side: `BitWriter` (`u(n)`,
+  `ue(v)` / `se(v)`, `rbsp_trailing_bits()`), NAL encapsulation
+  (§7.4.1.1 emulation-prevention insertion + Annex B framing), and
+  the §9.3.5 CABAC arithmetic *encoding* engine (InitEncoder /
+  EncodeDecision / EncodeBypass / EncodeTerminate with the
+  Figure 9-11/9-12 renormalization + PutBit carry control), all
+  pinned by bit-exact roundtrips through the crate's own decoders.
+
+- §7.3.8.7 **PCM samples** end to end: parse (`pcm_alignment_zero_bit`
+  run, `u(v)` rasters at `PcmBitDepthY/C`, §9.3.1 / §9.3.2.6 engine
+  re-init), §8.4.1 equation-8-12 reconstruction, and the §8.7.2.5.4 /
+  §8.7.3.1 loop-filter suppression of PCM
+  (`pcm_loop_filter_disabled_flag`) and transquant-bypass coding
+  units (`NoFilterMap` threaded through deblocking and SAO).
+
+- **PCM-only IDR encoder** (`encoder::pcm` + registry
+  `make_encoder` / `H265PcmEncoder`): fully conformant Main-profile
+  Annex B IDR access units (real VPS / SPS / PPS / slice headers /
+  §7.3.8 slice data through the §9.3.5 engine) in which every CTB is
+  a 16×16 PCM coding unit — bit-exact lossless, one keyframe packet
+  per frame. Options cover dependent slice segments, independent
+  multi-slice plans with per-slice loop-filter flags, deblocking, and
+  band / edge SAO syntax. A black-box reference decoder reproduces
+  the exact input from every encoded shape.
+
+- **Dependent slice segments** decode: §7.4.7.1 header + `SliceAddrRs`
+  inheritance from the preceding independent segment and the
+  §9.3.2.4 / §9.3.2.5 `TableStateIdxDs` context carry across segment
+  boundaries. Slice-header fix: the entry-point and header-extension
+  blocks sit outside the `!dependent` gate and are now parsed for
+  dependent segments too.
+
+- **Per-slice** `slice_loop_filter_across_slices_enabled_flag`:
+  deblocking consults the flag of the slice containing the current
+  coding block (per-CTB map); the §8.7.3.2 SAO cross-slice neighbour
+  rule is directional on the later (decode-order) slice's flag.
+  Pinned with a self-built two-AU fixture with opposite per-slice
+  flags. (Known corner: a black-box reference decoder disagrees with
+  the §8.7.3.2 text on which slice's flag gates the SAO read; this
+  implementation follows the spec text of both the 08/2021 and
+  01/2026 editions.)
+
 ### Added — clean-room rebuild round 384 (2026-07-03)
 
 - `sequence` (new module) — the whole-bitstream Annex B decode driver:

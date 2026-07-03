@@ -8,11 +8,17 @@
 //! [`SequenceDecoder`] decode whole Annex B byte streams to
 //! output-order pictures, and [`make_decoder`] exposes the same driver
 //! through the [`oxideav_core::Decoder`] registry contract (registered
-//! by [`register`] under `"h265"` / `"hevc"`). Every Annex B bitstream
-//! in the staged 16-fixture conformance corpus decodes byte-exact —
-//! see `README.md` for the corpus coverage and the remaining gaps
-//! (explicit weighted prediction, PCM samples, true multi-tile
-//! streams, dependent slice segments, encoder).
+//! by [`register`] under `"h265"` / `"hevc"`, accepting Annex B and
+//! `hvcC` / length-prefixed transport). Every Annex B bitstream in the
+//! staged 16-fixture conformance corpus decodes byte-exact, plus
+//! self-built pins for explicit weighted prediction, PCM, dependent
+//! slice segments and per-slice loop-filter flags. [`make_encoder`] is
+//! the PCM-only IDR encoder bootstrap (lossless, conformant, every
+//! packet a random access point) over the write-side stack in
+//! [`encoder`] (bit writer, NAL encapsulation, the §9.3.5 CABAC
+//! encoding engine, parameter-set / slice writers). See `README.md`
+//! for coverage and the remaining gaps (true multi-tile fixtures,
+//! encoder beyond the PCM bootstrap).
 //!
 //! The sections below record the per-round rebuild history of the
 //! subsystems the driver composes.
