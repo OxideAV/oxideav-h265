@@ -266,6 +266,34 @@ impl SequenceDecoder {
         Ok(())
     }
 
+    /// Decode any picture still being assembled (a flush point — call
+    /// when the input stream ends but the decoder object lives on).
+    ///
+    /// # Errors
+    /// Any decode error from the pending picture.
+    pub fn flush(&mut self) -> Result<(), SequenceError> {
+        self.finish_picture()
+    }
+
+    /// Drain the pictures decoded so far, in decode order. The caller
+    /// owns output reordering (the streaming [`crate::decoder`] holds a
+    /// `sps_max_num_reorder_pics`-deep queue; [`Self::finish`] sorts a
+    /// whole sequence at once).
+    pub fn take_decoded(&mut self) -> Vec<DecodedFrame> {
+        std::mem::take(&mut self.frames)
+    }
+
+    /// `sps_max_num_reorder_pics` of the highest sub-layer of the most
+    /// recently activated SPS (`None` before any SPS).
+    #[must_use]
+    pub fn max_num_reorder_pics(&self) -> Option<u32> {
+        self.sps.values().next_back().map(|sps| {
+            let idx =
+                usize::from(sps.max_sub_layers_minus1).min(sps.sub_layer_ordering_info.len() - 1);
+            sps.sub_layer_ordering_info[idx].max_num_reorder_pics
+        })
+    }
+
     /// Decode any picture still being assembled and return every
     /// decoded frame in output order.
     ///

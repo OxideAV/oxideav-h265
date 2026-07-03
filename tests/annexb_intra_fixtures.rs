@@ -129,3 +129,31 @@ fn multi_slice_per_frame_decodes_byte_exact() {
 fn tile_cols_2_decodes_byte_exact() {
     assert_decodes_byte_exact(TILE_COLS_HEVC, TILE_COLS_YUV, 2, "tile-cols-2");
 }
+
+/// The `oxideav_core::Decoder` contract over the same driver: feed the
+/// eight-picture B-pyramid stream as one packet, flush, and pull the
+/// frames in output order — byte-exact against the expected YUV.
+#[test]
+fn registry_decoder_decodes_bipred_byte_exact() {
+    use oxideav_core::{CodecParameters, Error, Frame, Packet, TimeBase};
+
+    let params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&params).expect("factory");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), BIPRED_HEVC.to_vec()))
+        .expect("send");
+    dec.flush().expect("flush");
+    let mut out = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for p in &v.planes {
+                    out.extend_from_slice(&p.data);
+                }
+            }
+            Ok(_) => panic!("non-video frame"),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("receive: {e}"),
+        }
+    }
+    assert_eq!(out, BIPRED_YUV, "registry decoder output byte-exact");
+}

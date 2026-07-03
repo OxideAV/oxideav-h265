@@ -234,6 +234,7 @@ pub mod cabac;
 pub mod ctx_init;
 pub mod deblock;
 pub mod decode;
+pub mod decoder;
 pub mod dpb;
 pub mod hrd;
 pub mod inter_pred;
@@ -272,6 +273,7 @@ pub use deblock::{
     TransformSplit,
 };
 pub use decode::{PictureHeaderInfo, PictureRefState, PictureSequenceState, SliceRefParams};
+pub use decoder::{make_decoder, H265Decoder};
 pub use dpb::{
     build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
     Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
@@ -439,8 +441,25 @@ impl From<VuiError> for Error {
     }
 }
 
-/// No-op codec registration — the clean-room rebuild has not yet
-/// registered a decoder or encoder factory.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec registration: the software H.265 / HEVC decoder under the
+/// `"h265"` id (aliased `"hevc"`), claiming the common container tags
+/// (`hvc1` / `hev1` sample entries, the MP4 ObjectTypeIndication for
+/// HEVC, and the `HEVC` FourCC).
+pub fn register(ctx: &mut RuntimeContext) {
+    use oxideav_core::{CodecInfo, CodecTag};
+    for id in ["h265", "hevc"] {
+        ctx.codecs.register(
+            CodecInfo::new(id.into())
+                .decoder(decoder::make_decoder)
+                .tags([
+                    CodecTag::fourcc(b"hvc1"),
+                    CodecTag::fourcc(b"hev1"),
+                    CodecTag::fourcc(b"HEVC"),
+                    CodecTag::mp4_object_type(0x23),
+                    CodecTag::matroska("V_MPEGH/ISO/HEVC"),
+                ]),
+        );
+    }
+}
 
 oxideav_core::register!("h265", register);
