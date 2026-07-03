@@ -232,44 +232,55 @@ pub fn derive_spatial_merge_candidates(
 ) -> SpatialMergeCandidates {
     let (smrg_a1, smrg_b1, smrg_b0, smrg_a0, smrg_b2) = same_par_mrg;
 
+    // §8.5.3.2.3 distinguishes `availableN` (the §6.4.2 result, forced
+    // FALSE by the parallel-merge-region / partition exclusions) from
+    // `availableFlagN` (additionally cleared by the redundancy tests).
+    // Every "the prediction units covering ( xNbN, yNbN ) ... have the
+    // same motion" comparison is gated on the *raw* `availableN` of the
+    // earlier position, NOT its post-redundancy flag — a B1 pruned as a
+    // duplicate of A1 still prunes an identical B0.
+
     // --- A1 (eqs 8-128..8-130) ---
     // availableA1 starts from §6.4.2, then is forced FALSE when the
     // neighbour is in the same parallel-merge region, or for the second
     // partition of a vertical-split PartMode.
     let a1_excluded = smrg_a1 || (part.part_mode_vertical_split && part.part_idx == 1);
-    let cand_a1 = if a1_excluded { None } else { neigh.a1 };
+    let raw_a1 = if a1_excluded { None } else { neigh.a1 };
+    let cand_a1 = raw_a1;
 
     // --- B1 (eqs 8-131..8-133) ---
-    // Forced FALSE in the same-region case, the second partition of a
-    // horizontal-split PartMode, or when A1 is available with identical
-    // motion (the redundancy check).
-    let b1_excluded = smrg_b1
-        || (part.part_mode_horizontal_split && part.part_idx == 1)
-        || same_motion(cand_a1, neigh.b1);
-    let cand_b1 = if b1_excluded { None } else { neigh.b1 };
+    // availableB1 is forced FALSE in the same-region case and for the
+    // second partition of a horizontal-split PartMode; availableFlagB1
+    // is additionally 0 when A1 is available with identical motion.
+    let b1_excluded = smrg_b1 || (part.part_mode_horizontal_split && part.part_idx == 1);
+    let raw_b1 = if b1_excluded { None } else { neigh.b1 };
+    let cand_b1 = if same_motion(raw_a1, raw_b1) {
+        None
+    } else {
+        raw_b1
+    };
 
     // --- B0 (eqs 8-134..8-136) ---
-    // Forced FALSE in the same-region case or when B1 is available with
-    // identical motion.
-    let b0_excluded = smrg_b0 || same_motion(cand_b1, neigh.b0);
+    // availableFlagB0 is 0 in the same-region case or when the raw B1
+    // is available with identical motion.
+    let b0_excluded = smrg_b0 || same_motion(raw_b1, neigh.b0);
     let cand_b0 = if b0_excluded { None } else { neigh.b0 };
 
     // --- A0 (eqs 8-137..8-139) ---
-    // Forced FALSE in the same-region case or when A1 is available with
-    // identical motion.
-    let a0_excluded = smrg_a0 || same_motion(cand_a1, neigh.a0);
+    // availableFlagA0 is 0 in the same-region case or when the raw A1
+    // is available with identical motion.
+    let a0_excluded = smrg_a0 || same_motion(raw_a1, neigh.a0);
     let cand_a0 = if a0_excluded { None } else { neigh.a0 };
 
     // --- B2 (eqs 8-140..8-142) ---
-    // Forced FALSE in the same-region case, when A1 or B1 is available
-    // with identical motion, or when all four of A0/A1/B0/B1 are already
-    // available (the list is full before B2).
+    // availableFlagB2 is 0 in the same-region case, when the raw A1 or
+    // raw B1 is available with identical motion, or when all four of
+    // A0/A1/B0/B1 already have availableFlag == 1 (the list is full
+    // before B2).
     let four_available =
         cand_a0.is_some() && cand_a1.is_some() && cand_b0.is_some() && cand_b1.is_some();
-    let b2_excluded = smrg_b2
-        || four_available
-        || same_motion(cand_a1, neigh.b2)
-        || same_motion(cand_b1, neigh.b2);
+    let b2_excluded =
+        smrg_b2 || four_available || same_motion(raw_a1, neigh.b2) || same_motion(raw_b1, neigh.b2);
     let cand_b2 = if b2_excluded { None } else { neigh.b2 };
 
     SpatialMergeCandidates {
@@ -1177,6 +1188,57 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].mv_l0, [4, 8]);
         assert_eq!(list[1].mv_l0, [4, 9]);
+    }
+
+    /// §8.5.3.2.3 — the redundancy comparisons are gated on the *raw*
+    /// `availableN` of the earlier position, not its post-redundancy
+    /// `availableFlagN`: when A1 == B1 == B0 (all covering PUs carry the
+    /// same motion), B1 is pruned against A1 AND B0 is still pruned
+    /// against the (pruned) B1, leaving only A1.
+    #[test]
+    fn spatial_merge_b0_pruned_against_raw_b1_even_when_b1_pruned() {
+        let pu = uni_l0(0, [0, 0]);
+        let neigh = SpatialMergeNeighbours {
+            a1: Some(pu),
+            b1: Some(pu),
+            b0: Some(pu),
+            a0: Some(pu),
+            b2: Some(pu),
+        };
+        let c = derive_spatial_merge_candidates(&neigh, no_split(), no_par_mrg());
+        assert!(c.a1.is_some());
+        assert!(c.b1.is_none(), "B1 == A1 ⇒ availableFlagB1 = 0");
+        assert!(c.b0.is_none(), "B0 == raw B1 ⇒ availableFlagB0 = 0");
+        assert!(c.a0.is_none(), "A0 == raw A1 ⇒ availableFlagA0 = 0");
+        assert!(c.b2.is_none(), "B2 == raw A1/B1 ⇒ availableFlagB2 = 0");
+        let mut list = Vec::new();
+        c.append_to(&mut list);
+        assert_eq!(list.len(), 1, "only A1 survives");
+    }
+
+    /// The B1-vs-A1 raw gate also holds when B1 is excluded by the
+    /// horizontal-split partition rule: an excluded B1 (raw available =
+    /// FALSE) does NOT prune an identical B0.
+    #[test]
+    fn spatial_merge_b0_kept_when_b1_raw_unavailable() {
+        let pu = uni_l0(0, [4, 0]);
+        let neigh = SpatialMergeNeighbours {
+            b1: Some(pu),
+            b0: Some(pu),
+            ..Default::default()
+        };
+        // partIdx 1 of a horizontal split forces availableB1 = FALSE.
+        let part = PartitionContext {
+            part_idx: 1,
+            part_mode_vertical_split: false,
+            part_mode_horizontal_split: true,
+        };
+        let c = derive_spatial_merge_candidates(&neigh, part, no_par_mrg());
+        assert!(c.b1.is_none(), "partition rule excludes B1");
+        assert!(
+            c.b0.is_some(),
+            "raw-unavailable B1 does not prune an identical B0"
+        );
     }
 
     #[test]
