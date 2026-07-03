@@ -1013,6 +1013,14 @@ impl ReconCtx {
         self.qp.as_ref().map(|q| q.qp_at(x_luma, y_luma))
     }
 
+    /// Debug: the recon-side §8.4.2 derived mode recorded at a luma
+    /// location.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_mode_at(&self, x_luma: usize, y_luma: usize) -> Option<u8> {
+        self.field.recorded_mode(x_luma, y_luma)
+    }
+
     /// Set the per-CTB `SliceAddrRs` map (one entry per CTB raster
     /// address, `PicSizeInCtbsY` long). Each entry is the raster address
     /// of the first CTB of the independent slice segment owning that CTB.

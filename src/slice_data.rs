@@ -503,6 +503,14 @@ impl PictureParseState {
         self.field
             .record_non_intra_cu(x0 as usize, y0 as usize, n_cb as usize, mode);
     }
+
+    /// Debug: the parse-time §8.4.2 derived mode recorded at a luma
+    /// location.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_mode_at(&self, x: u32, y: u32) -> Option<u8> {
+        self.field.recorded_mode(x as usize, y as usize)
+    }
 }
 
 /// Decode one §7.3.8.3 `sao( rx, ry )` syntax structure.

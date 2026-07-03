@@ -235,11 +235,10 @@ impl IntraModeField {
         cell.intra_pred_mode_y
     }
 
-    /// Test-only: the recorded `IntraPredModeY` at a luma location (or
-    /// `None` if no block covering it has been written yet).
-    #[cfg(test)]
+    /// The recorded `IntraPredModeY` at a luma location (or `None` if
+    /// no block covering it has been written yet).
     #[must_use]
-    pub(crate) fn recorded_mode(&self, x_luma: usize, y_luma: usize) -> Option<u8> {
+    pub fn recorded_mode(&self, x_luma: usize, y_luma: usize) -> Option<u8> {
         let cell = self.cells[self.cell_index(x_luma, y_luma)];
         cell.written.then_some(cell.intra_pred_mode_y)
     }

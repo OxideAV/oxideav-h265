@@ -505,7 +505,7 @@ pub fn residual_coding_scan_idx(
 
 /// Decode one `last_sig_coeff_*_{prefix,suffix}` pair through the bin
 /// source and return the §7.4.9.11 derived position (eqs. 7-74..7-77).
-fn read_last_sig<B: ResidualBinSource>(
+fn read_last_sig_prefix<B: ResidualBinSource>(
     bins: &mut B,
     log2_trafo_size: u32,
     is_chroma: bool,
@@ -518,6 +518,16 @@ fn read_last_sig<B: ResidualBinSource>(
         let ctx_inc = last_sig_coeff_prefix_ctx_inc(bin_idx, ctx_offset, ctx_shift);
         bins.decision(element, ctx_inc)
     })?;
+    Ok(prefix)
+}
+
+/// §7.3.8.11 — the conditional bypass suffix for one
+/// `last_sig_coeff_{x,y}_prefix` value (present when `prefix > 3`),
+/// folded into the §7.4.9.11 position.
+fn read_last_sig_suffix<B: ResidualBinSource>(
+    bins: &mut B,
+    prefix: u32,
+) -> Result<u32, ResidualCodingError> {
     let n_bits = last_sig_coeff_suffix_n_bits(prefix);
     let suffix = if n_bits > 0 {
         Some(bins.bypass_bits(n_bits as u8)?)
@@ -549,8 +559,14 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
 
     // last_sig_coeff_{x,y}_{prefix,suffix} → LastSignificantCoeff{X,Y}
     // (eqs. 7-74..7-77), then the eq.-7-78 swap for the vertical scan.
-    let wire_x = read_last_sig(bins, log2, is_chroma, ResidualElement::LastSigCoeffXPrefix)?;
-    let wire_y = read_last_sig(bins, log2, is_chroma, ResidualElement::LastSigCoeffYPrefix)?;
+    // §7.3.8.11 bin order: BOTH context-coded prefixes come first, then
+    // the two conditional bypass suffixes (x, then y).
+    let prefix_x =
+        read_last_sig_prefix(bins, log2, is_chroma, ResidualElement::LastSigCoeffXPrefix)?;
+    let prefix_y =
+        read_last_sig_prefix(bins, log2, is_chroma, ResidualElement::LastSigCoeffYPrefix)?;
+    let wire_x = read_last_sig_suffix(bins, prefix_x)?;
+    let wire_y = read_last_sig_suffix(bins, prefix_y)?;
     let (last_x, last_y) = if params.scan_idx == ScanIdx::Vertical {
         (wire_y, wire_x)
     } else {

@@ -54,3 +54,38 @@ fn qp_low_decodes_byte_exact() {
 fn main_still_picture_decodes_byte_exact() {
     assert_decodes_byte_exact(MAIN_STILL_HEVC, MAIN_STILL_YUV, 1, "main-still-picture");
 }
+
+/// 64×64 single-CTB IDR with SAO enabled, per-QG `cu_qp_delta` values,
+/// and `last_sig_coeff` suffixes (coordinates past 3 in 8×8 TBs).
+#[test]
+fn sao_on_decodes_byte_exact() {
+    assert_decodes_byte_exact(SAO_ON_HEVC, SAO_ON_YUV, 1, "sao-on");
+}
+
+/// Four-picture all-intra sequence (every frame IDR): multi-picture
+/// output ordering across coded-video-sequence boundaries.
+#[test]
+fn intra_only_allintra_decodes_byte_exact() {
+    assert_decodes_byte_exact(ALLINTRA_HEVC, ALLINTRA_YUV, 4, "intra-only-allintra");
+}
+
+/// IDR then TRAIL_R P-picture: the §8.3 reference cycle + §8.5 inter
+/// reconstruction (merge / MVP candidates, temporal MVP, quarter-pel
+/// interpolation) against the in-DPB reference, byte-exact.
+#[test]
+fn i_then_p_decodes_byte_exact() {
+    assert_decodes_byte_exact(I_THEN_P_HEVC, I_THEN_P_YUV, 2, "i-frame-then-p-frame-main");
+}
+
+/// Main10 profile, 10-bit 4:2:0 IDR + P picture (little-endian 16-bit
+/// planar): the §8.5 inter path at BitDepth 10.
+#[test]
+fn main10_decodes_byte_exact() {
+    let frames = decode_annexb_sequence(MAIN10_HEVC).expect("main10 decode");
+    assert_eq!(frames.len(), 2, "main10: frame count");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend(f.picture.to_planar_le16());
+    }
+    assert_eq!(out, MAIN10_YUV, "main10: byte-exact decode");
+}
