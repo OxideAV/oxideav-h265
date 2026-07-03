@@ -1,5 +1,7 @@
 # oxideav-h265
 
+[![CI](https://github.com/OxideAV/oxideav-h265/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-h265/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-h265.svg)](https://crates.io/crates/oxideav-h265) [![docs.rs](https://docs.rs/oxideav-h265/badge.svg)](https://docs.rs/oxideav-h265) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust H.265 / HEVC video codec for the
 [oxideav](https://github.com/OxideAV/oxideav) framework, built
 clean-room against ITU-T Recommendation H.265 | ISO/IEC 23008-2.
