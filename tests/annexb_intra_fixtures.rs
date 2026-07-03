@@ -89,3 +89,12 @@ fn main10_decodes_byte_exact() {
     }
     assert_eq!(out, MAIN10_YUV, "main10: byte-exact decode");
 }
+
+/// Eight-picture I/P/B sequence with two reference lists: bi-prediction,
+/// §8.5.3.2.8 temporal MVP against the collocated picture's motion
+/// field, AMVP with signalled MVDs, skip/merge CUs, and POC output
+/// reordering — byte-exact across all frames.
+#[test]
+fn bipred_b_frames_decode_byte_exact() {
+    assert_decodes_byte_exact(BIPRED_HEVC, BIPRED_YUV, 8, "bipred-b-frames-main");
+}

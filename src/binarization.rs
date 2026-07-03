@@ -4288,6 +4288,69 @@ pub fn decode_mvd_component(
     })
 }
 
+/// Decode one whole `mvd_coding( x0, y0, refList )` invocation
+/// (§7.3.8.9) — BOTH components in the spec's interleaved bin order:
+///
+/// ```text
+/// abs_mvd_greater0_flag[ 0 ]
+/// abs_mvd_greater0_flag[ 1 ]
+/// if( g0[0] ) abs_mvd_greater1_flag[ 0 ]
+/// if( g0[1] ) abs_mvd_greater1_flag[ 1 ]
+/// if( g0[0] ) { if( g1[0] ) abs_mvd_minus2[ 0 ]   mvd_sign_flag[ 0 ] }
+/// if( g0[1] ) { if( g1[1] ) abs_mvd_minus2[ 1 ]   mvd_sign_flag[ 1 ] }
+/// ```
+///
+/// A per-component decode (two [`decode_mvd_component`] calls) reads
+/// the same bins in the wrong order whenever `abs_mvd_greater0_flag[0]`
+/// is set, desynchronizing the engine.
+///
+/// # Errors
+/// Propagates [`CabacError`] from the engine.
+pub fn decode_mvd_pair(
+    engine: &mut CabacEngine<'_>,
+    ctx_greater0: &mut ContextModel,
+    ctx_greater1: &mut ContextModel,
+) -> Result<[MvdComponent; 2], CabacError> {
+    let g0_0 = engine.decode_decision(ctx_greater0)?;
+    let g0_1 = engine.decode_decision(ctx_greater0)?;
+    let g1_0 = if g0_0 == 1 {
+        Some(engine.decode_decision(ctx_greater1)?)
+    } else {
+        None
+    };
+    let g1_1 = if g0_1 == 1 {
+        Some(engine.decode_decision(ctx_greater1)?)
+    } else {
+        None
+    };
+    let mut out = [MvdComponent {
+        greater0_flag: 0,
+        greater1_flag: None,
+        minus2: None,
+        sign_flag: None,
+        value: 0,
+    }; 2];
+    for (comp, (g0, g1)) in [(g0_0, g1_0), (g0_1, g1_1)].into_iter().enumerate() {
+        if g0 == 0 {
+            continue;
+        }
+        let minus2 = if g1 == Some(1) {
+            Some(decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?)
+        } else {
+            None
+        };
+        let sign_flag = engine.decode_bypass()?;
+        out[comp] = MvdComponent {
+            greater0_flag: g0,
+            greater1_flag: g1,
+            minus2,
+            sign_flag: Some(sign_flag),
+            value: mvd_component_value(g0, minus2, Some(sign_flag)),
+        };
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

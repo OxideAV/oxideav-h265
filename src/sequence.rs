@@ -170,6 +170,9 @@ pub struct SequenceDecoder {
     pending: Vec<SegmentData>,
     cvs_index: u32,
     seen_picture: bool,
+    /// Debug: tolerate an end_of_slice_segment_flag mismatch (decode
+    /// as much as possible instead of erroring).
+    tolerant: bool,
 }
 
 impl SequenceDecoder {
@@ -177,6 +180,13 @@ impl SequenceDecoder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Debug: keep decoding past an `end_of_slice_segment_flag`
+    /// mismatch. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn set_tolerant(&mut self, tolerant: bool) {
+        self.tolerant = tolerant;
     }
 
     /// Feed a whole Annex B byte stream, decoding every access unit.
@@ -336,6 +346,7 @@ impl SequenceDecoder {
                 &mut parse_state,
                 &mut decoded,
                 &mut slice_addr_of,
+                self.tolerant,
             )?;
         }
 
@@ -477,14 +488,29 @@ pub fn decode_annexb_sequence(data: &[u8]) -> Result<Vec<DecodedFrame>, Sequence
 pub fn decode_annexb_sequence_debug(
     data: &[u8],
 ) -> Result<Vec<(u32, u32, CodingTreeUnit)>, SequenceError> {
+    // Which picture (1-based) to CABAC-decode; earlier pictures are
+    // fully decoded through the normal driver so the DPB and parse
+    // state are real.
+    let target: usize = std::env::var("H265_DEBUG_PIC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let mut dec = SequenceDecoder::new();
     let mut segs: Vec<SegmentData> = Vec::new();
+    let mut pic_no = 0usize;
     for unit in NalIter::new(data) {
         let unit = unit?;
         if unit.header.is_vcl() {
             let first = unit.rbsp.first().is_some_and(|b| b & 0x80 != 0);
-            if first && !segs.is_empty() {
-                break;
+            if first {
+                pic_no += 1;
+                if pic_no > target && !segs.is_empty() {
+                    break;
+                }
+            }
+            if pic_no < target {
+                dec.push_nal_unit(unit.header, unit.rbsp)?;
+                continue;
             }
             let pps_id = peek_slice_pps_id(&unit.rbsp, unit.header.nal_unit_type)?;
             let pps = dec.pps.get(&pps_id).unwrap();
@@ -520,6 +546,7 @@ pub fn decode_annexb_sequence_debug(
         &mut parse_state,
         &mut decoded,
         &mut slice_addr_of,
+        false,
     );
     if let Err(e) = res {
         eprintln!("(walk error: {e})");
@@ -583,6 +610,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
         &mut parse_state,
         &mut decoded,
         &mut slice_addr_of,
+        true,
     ) {
         eprintln!("(walk error: {e})");
     }
@@ -968,6 +996,7 @@ fn build_slice_data_params(
 /// §7.3.8.1 — CABAC-decode one slice segment's `slice_segment_data()`,
 /// appending its CTUs (in tile-scan order) to `decoded` and recording
 /// each CTB's `SliceAddrRs` in `slice_addr_of`.
+#[allow(clippy::too_many_arguments)]
 fn decode_slice_segment_data(
     seg: &SegmentData,
     sps: &SeqParameterSet,
@@ -976,6 +1005,7 @@ fn decode_slice_segment_data(
     state: &mut PictureParseState,
     decoded: &mut Vec<(u32, u32, CodingTreeUnit)>,
     slice_addr_of: &mut [Option<u32>],
+    tolerant: bool,
 ) -> Result<(), SequenceError> {
     let header = &seg.header;
     let slice_type = header
@@ -1067,6 +1097,10 @@ fn decode_slice_segment_data(
             break;
         }
         if (ctb_addr_ts as usize) >= pic_size_in_ctbs {
+            if tolerant {
+                eprintln!("(tolerant: end_of_slice_segment_flag not set on the last CTB)");
+                break;
+            }
             return Err(SequenceError::Malformed(
                 "end_of_slice_segment_flag not set on the last CTB",
             ));

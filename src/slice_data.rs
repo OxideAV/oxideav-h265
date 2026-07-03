@@ -32,13 +32,13 @@ use crate::binarization::{
     cu_pred_mode_from_flag, cu_pred_mode_from_skip, cu_skip_flag_ctx_inc, decode_cu_skip_flag,
     decode_cu_transquant_bypass_flag, decode_end_of_slice_segment_flag, decode_inter_pred_idc,
     decode_intra_chroma_pred_mode, decode_merge_flag, decode_merge_idx, decode_mpm_idx,
-    decode_mvd_component, decode_mvp_flag, decode_part_mode, decode_pcm_flag,
-    decode_pred_mode_flag, decode_prev_intra_luma_pred_flag, decode_ref_idx,
-    decode_rem_intra_luma_pred_mode, decode_rqt_root_cbf, decode_sao_band_position,
-    decode_sao_eo_class, decode_sao_merge_flag, decode_sao_offset_abs, decode_sao_offset_sign,
-    decode_sao_type_idx, decode_split_cu_flag, derive_intra_pred_mode_c, derive_intra_pred_mode_y,
-    intra_luma_cand_mode_list, luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc, CuPredMode,
-    InterPredIdc, LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
+    decode_mvd_pair, decode_mvp_flag, decode_part_mode, decode_pcm_flag, decode_pred_mode_flag,
+    decode_prev_intra_luma_pred_flag, decode_ref_idx, decode_rem_intra_luma_pred_mode,
+    decode_rqt_root_cbf, decode_sao_band_position, decode_sao_eo_class, decode_sao_merge_flag,
+    decode_sao_offset_abs, decode_sao_offset_sign, decode_sao_type_idx, decode_split_cu_flag,
+    derive_intra_pred_mode_c, derive_intra_pred_mode_y, intra_luma_cand_mode_list,
+    luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc, CuPredMode, InterPredIdc,
+    LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
 };
 use crate::cabac::CabacEngine;
 use crate::ctx_init::SliceContexts;
@@ -711,9 +711,7 @@ fn decode_prediction_unit(
         } else {
             pu.ref_idx_l0 = Some(0);
         }
-        let c0 = decode_mvd_l(engine, ctx)?;
-        let c1 = decode_mvd_l(engine, ctx)?;
-        pu.mvd_l0 = Some([c0, c1]);
+        pu.mvd_l0 = Some(decode_mvd_pair_banked(engine, ctx)?);
         pu.mvp_l0_flag = Some(decode_mvp_flag(engine, &mut ctx.mvp_flag[0])?);
     }
     if pred_idc != InterPredIdc::PredL0 {
@@ -727,9 +725,7 @@ fn decode_prediction_unit(
             // MvdL1 inferred zero; mvd_coding not read.
             pu.mvd_l1 = None;
         } else {
-            let c0 = decode_mvd_l(engine, ctx)?;
-            let c1 = decode_mvd_l(engine, ctx)?;
-            pu.mvd_l1 = Some([c0, c1]);
+            pu.mvd_l1 = Some(decode_mvd_pair_banked(engine, ctx)?);
         }
         pu.mvp_l1_flag = Some(decode_mvp_flag(engine, &mut ctx.mvp_flag[0])?);
     }
@@ -767,13 +763,14 @@ fn decode_inter_pred_idc_banked(
     Ok(decode_inter_pred_idc(engine, b0, b1, n_pb_w, n_pb_h)?)
 }
 
-/// Decode one `mvd_coding( )` component, borrowing the two
+/// Decode one `mvd_coding( )` invocation (both components in the
+/// §7.3.8.9 interleaved bin order), borrowing the two
 /// `abs_mvd_greater0_flag` / `abs_mvd_greater1_flag` contexts.
-fn decode_mvd_l(
+fn decode_mvd_pair_banked(
     engine: &mut CabacEngine<'_>,
     ctx: &mut SliceContexts,
-) -> Result<MvdComponent, ResidualCodingError> {
-    Ok(decode_mvd_component(
+) -> Result<[MvdComponent; 2], ResidualCodingError> {
+    Ok(decode_mvd_pair(
         engine,
         &mut ctx.abs_mvd_greater0_flag[0],
         &mut ctx.abs_mvd_greater1_flag[0],
