@@ -1608,17 +1608,21 @@ impl SliceSegmentHeader {
                     num_long_term_pics = Some(nl_pics);
                     long_term_ref_pics = entries;
                 }
-            }
-
-            if sps.sps_temporal_mvp_enabled_flag {
-                slice_temporal_mvp_enabled_flag = br.u1()? != 0;
+                // §7.3.6.1: slice_temporal_mvp_enabled_flag is signalled
+                // inside the non-IDR block — an IDR picture never
+                // carries it and §7.4.7.1 infers it to 0.
+                if sps.sps_temporal_mvp_enabled_flag {
+                    slice_temporal_mvp_enabled_flag = br.u1()? != 0;
+                }
             }
         }
 
-        // SAO block (§7.3.6.1) — outside the !dependent gate.
+        // SAO block (§7.3.6.1) — inside the !dependent gate: a dependent
+        // slice segment inherits the SAO flags from the associated
+        // independent slice segment and does not re-signal them.
         let mut slice_sao_luma_flag = false;
         let mut slice_sao_chroma_flag = false;
-        if sps.sample_adaptive_offset_enabled_flag {
+        if !dependent_slice_segment_flag && sps.sample_adaptive_offset_enabled_flag {
             slice_sao_luma_flag = br.u1()? != 0;
             if chroma_array_type(sps) != 0 {
                 slice_sao_chroma_flag = br.u1()? != 0;
@@ -2697,7 +2701,8 @@ mod tests {
             (0, 1),     // no_output_of_prior_pics_flag (IRAP)
             (0b1, 1),   // pps_id ue(v) '1' -> 0
             (0b011, 3), // slice_type ue(v) '011' -> 2 (I)
-            (0, 1),     // slice_temporal_mvp_enabled_flag (mvp gate on)
+            // slice_temporal_mvp_enabled_flag: absent for an IDR — the
+            // §7.3.6.1 flag sits inside the non-IDR block.
             (1, 1),     // slice_sao_luma_flag
             (0, 1),     // slice_sao_chroma_flag (chroma!=0)
             (0b011, 3), // slice_qp_delta se(v) '011' -> -1
@@ -2721,8 +2726,8 @@ mod tests {
         assert!(sh.opaque_tail.is_none());
         // init_qp from the fixture PPS is 26, so SliceQpY = 26 + -1 = 25.
         assert_eq!(sh.slice_qp_y(&pps), Some(25));
-        // The header must byte-align: with 1+1+1+3+1+1+1+3+1=13 bits
-        // before alignment, alignment consumes bits 13..16 (one '1'
+        // The header must byte-align: with 1+1+1+3+1+1+3+1=12 bits
+        // before alignment, alignment consumes bits 12..16 (one '1'
         // plus zero pad), so slice data begins at byte 2.
         assert_eq!(sh.byte_offset_to_slice_data, Some(2));
     }
@@ -2745,7 +2750,7 @@ mod tests {
             (0, 1),     // no_output_of_prior_pics_flag (IRAP)
             (0b1, 1),   // pps_id ue -> 0
             (0b011, 3), // slice_type ue -> I
-            (0, 1),     // slice_temporal_mvp_enabled_flag
+            // slice_temporal_mvp_enabled_flag: absent for an IDR.
             (1, 1),     // slice_sao_luma_flag
             (0, 1),     // slice_sao_chroma_flag
             (0b011, 3), // slice_qp_delta se '011' -> -1
@@ -2788,7 +2793,7 @@ mod tests {
             (0, 1),     // no_output_of_prior_pics_flag
             (0b1, 1),   // pps_id ue -> 0
             (0b011, 3), // slice_type ue -> I
-            (0, 1),     // slice_temporal_mvp_enabled_flag
+            // slice_temporal_mvp_enabled_flag: absent for an IDR.
             (1, 1),     // slice_sao_luma_flag
             (0, 1),     // slice_sao_chroma_flag
             (0b011, 3), // slice_qp_delta se -> -1
@@ -2821,7 +2826,7 @@ mod tests {
             (0, 1),     // no_output_of_prior_pics_flag
             (0b1, 1),   // pps_id ue -> 0
             (0b011, 3), // slice_type ue -> I
-            (0, 1),     // slice_temporal_mvp_enabled_flag
+            // slice_temporal_mvp_enabled_flag: absent for an IDR.
             (1, 1),     // slice_sao_luma_flag
             (0, 1),     // slice_sao_chroma_flag
             (0b011, 3), // slice_qp_delta se -> -1
@@ -3404,11 +3409,13 @@ mod tests {
         assert!(sh.opaque_tail.is_none());
     }
 
-    /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 0`
-    /// (single L0 entry): §7.4.7.1 infers `collocated_from_l0_flag = 1`
-    /// (no bit consumed since slice_type != B) and the
-    /// `collocated_ref_idx` field is absent (only signalled when the
-    /// active list has more than one entry).
+    /// Non-IDR (TRAIL_R) P-slice with `mvp == 1` and
+    /// `num_ref_idx_l0_active_minus1 == 0` (single L0 entry): §7.4.7.1
+    /// infers `collocated_from_l0_flag = 1` (no bit consumed since
+    /// slice_type != B) and the `collocated_ref_idx` field is absent
+    /// (only signalled when the active list has more than one entry).
+    /// `slice_temporal_mvp_enabled_flag` sits inside the §7.3.6.1
+    /// non-IDR block, after the POC + RPS fields.
     #[test]
     fn parses_p_slice_temporal_mvp_single_ref_collocated_inferred() {
         // mvp = true via the ctx_sps argument.
@@ -3417,9 +3424,14 @@ mod tests {
         pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
-            (0, 1),     // no_output (IDR)
             (0b1, 1),   // pps_id -> 0
             (0b010, 3), // slice_type -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
             (1, 1),     // slice_temporal_mvp_enabled_flag = 1
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
@@ -3436,7 +3448,8 @@ mod tests {
             (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
-        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        // TRAIL_R (NAL type 1) — a non-IDR picture.
+        let sh = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).expect("slice header");
         assert!(sh.slice_temporal_mvp_enabled_flag);
         // P slice + mvp on: §7.4.7.1 infers collocated_from_l0 = 1.
         assert_eq!(sh.collocated_from_l0_flag, Some(true));
@@ -3447,9 +3460,10 @@ mod tests {
         assert!(sh.opaque_tail.is_none());
     }
 
-    /// IDR P-slice with `mvp == 1` and `num_ref_idx_l0_active_minus1 == 2`
-    /// (three L0 entries): `collocated_from_l0_flag` is inferred to 1
-    /// (P slice) and `collocated_ref_idx` is signalled `ue(v)`.
+    /// Non-IDR (TRAIL_R) P-slice with `mvp == 1` and
+    /// `num_ref_idx_l0_active_minus1 == 2` (three L0 entries):
+    /// `collocated_from_l0_flag` is inferred to 1 (P slice) and
+    /// `collocated_ref_idx` is signalled `ue(v)`.
     #[test]
     fn parses_p_slice_temporal_mvp_collocated_ref_idx_signalled() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
@@ -3457,9 +3471,14 @@ mod tests {
         pps.weighted_pred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
-            (0, 1),     // no_output (IDR)
             (0b1, 1),   // pps_id -> 0
             (0b010, 3), // slice_type -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
             (1, 1),     // slice_temporal_mvp_enabled_flag = 1
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
@@ -3481,7 +3500,8 @@ mod tests {
             (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
-        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        // TRAIL_R (NAL type 1) — a non-IDR picture.
+        let sh = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).expect("slice header");
         assert_eq!(sh.num_ref_idx_l0_active_minus1, Some(2));
         // P slice + mvp on: §7.4.7.1 infers collocated_from_l0 = 1.
         assert_eq!(sh.collocated_from_l0_flag, Some(true));
@@ -3491,9 +3511,9 @@ mod tests {
         assert!(sh.opaque_tail.is_none());
     }
 
-    /// IDR B-slice with `mvp == 1`, `collocated_from_l0_flag = 0` (L1
-    /// path), and an L1 with more than one entry: `collocated_ref_idx`
-    /// indexes L1.
+    /// Non-IDR (TRAIL_R) B-slice with `mvp == 1`,
+    /// `collocated_from_l0_flag = 0` (L1 path), and an L1 with more
+    /// than one entry: `collocated_ref_idx` indexes L1.
     #[test]
     fn parses_b_slice_temporal_mvp_collocated_from_l1() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
@@ -3501,9 +3521,14 @@ mod tests {
         pps.weighted_bipred_flag = true;
         let bits = concat_bits(&[
             (1, 1),     // first
-            (0, 1),     // no_output (IDR)
             (0b1, 1),   // pps_id -> 0
             (0b1, 1),   // slice_type -> B
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
             (1, 1),     // slice_temporal_mvp_enabled_flag = 1
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
@@ -3528,7 +3553,8 @@ mod tests {
             (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
-        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        // TRAIL_R (NAL type 1) — a non-IDR picture.
+        let sh = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).expect("slice header");
         assert_eq!(sh.mvd_l1_zero_flag, Some(false));
         assert_eq!(sh.collocated_from_l0_flag, Some(false));
         // L1 active_minus1 == 1 → 2 entries; ref_idx = 1 indexes the
@@ -3548,9 +3574,14 @@ mod tests {
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         let bits = concat_bits(&[
             (1, 1),     // first
-            (0, 1),     // no_output (IDR)
             (0b1, 1),   // pps_id -> 0
             (0b010, 3), // slice_type -> P
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
             (1, 1),     // mvp = 1
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
@@ -3559,7 +3590,8 @@ mod tests {
             (0b011, 3), // collocated_ref_idx ue -> 2 (out of range)
         ]);
         let rbsp = pack_bits(&bits);
-        let err = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).unwrap_err();
+        // TRAIL_R (NAL type 1) — a non-IDR picture.
+        let err = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).unwrap_err();
         assert_eq!(
             err,
             SliceError::ValueOutOfRange {
@@ -3919,8 +3951,8 @@ mod tests {
         assert!(sh.byte_offset_to_slice_data.is_some());
     }
 
-    /// IDR B-slice walking the full inter-slice tail through
-    /// `byte_alignment()` with `pps.weighted_bipred_flag == 0`:
+    /// Non-IDR (TRAIL_R) B-slice walking the full inter-slice tail
+    /// through `byte_alignment()` with `pps.weighted_bipred_flag == 0`:
     /// exercises the B-only `mvd_l1_zero_flag` bit and the temporal-MVP
     /// `collocated_from_l0_flag` signalling, then walks straight to
     /// `five_minus_max_num_merge_cand` and the shared I-slice tail.
@@ -3930,9 +3962,14 @@ mod tests {
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         let bits = concat_bits(&[
             (1, 1),     // first
-            (0, 1),     // no_output (IDR)
             (0b1, 1),   // pps_id ue -> 0
             (0b1, 1),   // slice_type ue -> B
+            (0, 8),     // slice_pic_order_cnt_lsb u(8) = 0
+            (0, 1),     // short_term_ref_pic_set_sps_flag = 0
+            (0b010, 3), // num_negative_pics ue -> 1
+            (0b1, 1),   // num_positive_pics ue -> 0
+            (0b1, 1),   // delta_poc_s0_minus1[0] ue -> 0
+            (1, 1),     // used_by_curr_pic_s0_flag[0] = 1
             (1, 1),     // slice_temporal_mvp_enabled_flag = 1
             (1, 1),     // sao_luma
             (1, 1),     // sao_chroma
@@ -3949,7 +3986,8 @@ mod tests {
             (1, 1),     // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
-        let sh = SliceSegmentHeader::parse(&rbsp, IDR_W_RADL, &sps, &pps).expect("slice header");
+        // TRAIL_R (NAL type 1) — a non-IDR picture.
+        let sh = SliceSegmentHeader::parse(&rbsp, 1, &sps, &pps).expect("slice header");
         assert_eq!(sh.slice_type, Some(SliceType::B));
         assert!(sh.slice_temporal_mvp_enabled_flag);
         assert_eq!(sh.mvd_l1_zero_flag, Some(false));
@@ -4182,16 +4220,16 @@ mod tests {
         let sps = ctx_sps(1, false, true, true, 32, 32, 1, 0, 4); // 32/16=2 -> 2x2=4 CTBs
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         pps.dependent_slice_segments_enabled_flag = true;
-        // first=0, dependent=1, slice_segment_address u(2)=2,
-        // (dependent: skip slice_type etc.), SAO block: sao_l, sao_c,
-        // byte_alignment.
+        // first=0, dependent=1, slice_segment_address u(2)=2, then the
+        // header ends: every remaining §7.3.6.1 field (slice_type, SAO
+        // flags, QP, …) lives inside the !dependent gate and is
+        // inherited from the associated independent slice segment. The
+        // header goes straight to byte_alignment().
         let bits = concat_bits(&[
             (0, 1),    // first_slice_segment_in_pic_flag = 0
             (0b1, 1),  // pps_id ue -> 0
             (1, 1),    // dependent_slice_segment_flag
             (0b10, 2), // slice_segment_address = 2
-            (1, 1),    // sao_luma
-            (0, 1),    // sao_chroma
             (1, 1),    // byte_alignment one bit
         ]);
         let rbsp = pack_bits(&bits);
@@ -4203,7 +4241,9 @@ mod tests {
         assert!(sh.dependent_slice_segment_flag);
         assert_eq!(sh.slice_segment_address, 2);
         assert_eq!(sh.slice_type, None);
-        assert!(sh.slice_sao_luma_flag);
+        // SAO flags are not signalled in a dependent segment — they are
+        // inherited by the caller; the struct leaves them false.
+        assert!(!sh.slice_sao_luma_flag);
         assert!(!sh.slice_sao_chroma_flag);
         assert!(sh.opaque_tail.is_none());
         assert_eq!(sh.byte_offset_to_slice_data, Some(1));
@@ -4251,16 +4291,15 @@ mod tests {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         let pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         let bits = concat_bits(&[
-            (1, 1),
-            (0, 1),
-            (0b1, 1),
-            (0b011, 3),
-            (0, 1),
-            (1, 1),
-            (0, 1),
-            (0b011, 3),
-            (1, 1),
-            (1, 1),
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output_of_prior_pics_flag (IRAP)
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (1, 1),     // slice_sao_luma_flag
+            (0, 1),     // slice_sao_chroma_flag
+            (0b011, 3), // slice_qp_delta se -> -1
+            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            (1, 1),     // byte_alignment one bit
         ]);
         let body = pack_bits(&bits);
         // NAL header for IDR_N_LP (type 20), layer 0, temporal_id 0.
@@ -5324,11 +5363,11 @@ mod tests {
             (0, 1),     // no_output (IRAP)
             (0b1, 1),   // pps_id ue -> 0
             (0b011, 3), // slice_type ue -> I
-            (0, 1),     // slice_temporal_mvp_enabled_flag
-            (1, 1),     // sao_luma
-            (0, 1),     // sao_chroma
-            (0b1, 1),   // slice_qp_delta se -> 0
-            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
+            // slice_temporal_mvp_enabled_flag: absent for an IDR.
+            (1, 1),   // sao_luma
+            (0, 1),   // sao_chroma
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
             // Entry-point block.
             (0b011, 3),   // num_entry_point_offsets ue -> 2
             (0b00100, 5), // offset_len_minus1 ue -> 3 (entries are u(4))
@@ -5368,13 +5407,13 @@ mod tests {
             (0, 1),     // no_output
             (0b1, 1),   // pps_id ue -> 0
             (0b011, 3), // slice_type ue -> I
-            (0, 1),     // slice_temporal_mvp_enabled_flag
-            (1, 1),     // sao_luma
-            (0, 1),     // sao_chroma
-            (0b1, 1),   // slice_qp_delta se -> 0
-            (1, 1),     // slice_loop_filter_across_slices_enabled_flag
-            (0b1, 1),   // num_entry_point_offsets ue -> 0
-            (1, 1),     // byte_alignment '1'
+            // slice_temporal_mvp_enabled_flag: absent for an IDR.
+            (1, 1),   // sao_luma
+            (0, 1),   // sao_chroma
+            (0b1, 1), // slice_qp_delta se -> 0
+            (1, 1),   // slice_loop_filter_across_slices_enabled_flag
+            (0b1, 1), // num_entry_point_offsets ue -> 0
+            (1, 1),   // byte_alignment '1'
         ]);
         let rbsp = pack_bits(&bits);
         let sh = SliceSegmentHeader::parse(&rbsp, IDR_N_LP, &sps, &pps).expect("slice header");
@@ -5397,13 +5436,12 @@ mod tests {
         pps.entropy_coding_sync_enabled_flag = true;
 
         let bits = concat_bits(&[
-            (1, 1),
-            (0, 1),
-            (0b1, 1),
-            (0b011, 3),
-            (0, 1),
-            (1, 1),
-            (0, 1),
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output (IRAP); tmvp flag absent for an IDR
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (1, 1),     // sao_luma
+            (0, 1),     // sao_chroma
             (0b1, 1),   // slice_qp_delta se -> 0
             (1, 1),     // lf_across
             (0b010, 3), // num_entry_point_offsets ue -> 1, breaches bound 0
@@ -5429,15 +5467,14 @@ mod tests {
         pps.entropy_coding_sync_enabled_flag = true;
 
         let bits = concat_bits(&[
-            (1, 1),
-            (0, 1),
-            (0b1, 1),
-            (0b011, 3),
-            (0, 1),
-            (1, 1),
-            (0, 1),
-            (0b1, 1),
-            (1, 1),
+            (1, 1),     // first_slice_segment_in_pic_flag
+            (0, 1),     // no_output (IRAP); tmvp flag absent for an IDR
+            (0b1, 1),   // pps_id ue -> 0
+            (0b011, 3), // slice_type ue -> I
+            (1, 1),     // sao_luma
+            (0, 1),     // sao_chroma
+            (0b1, 1),   // slice_qp_delta se -> 0
+            (1, 1),     // lf_across
             (0b010, 3), // num_entry_point_offsets ue -> 1
             // offset_len_minus1 = 32, encoded ue: codeNum 32 has
             // M = floor(log2(33)) = 5 leading zeros, then '1', then
