@@ -486,16 +486,25 @@ impl PpsSccExtension {
             // §7.4.3.3.3: PpsActQpOffsetY/Cb/Cr (eq. 7-39/40/41 — the
             // raw values minus 5/5/3) must each lie in −12..=12 in a
             // conforming bitstream.
+            // Widened arithmetic: se(v) can carry the full i32 range on
+            // a malformed stream, so the eq.-7-39..7-41 "minus 5/5/3"
+            // must not overflow before the range check rejects it.
             for (field, qp) in [
-                ("pps_act_y_qp_offset_plus5", pps_act_y_qp_offset_plus5 - 5),
-                ("pps_act_cb_qp_offset_plus5", pps_act_cb_qp_offset_plus5 - 5),
-                ("pps_act_cr_qp_offset_plus3", pps_act_cr_qp_offset_plus3 - 3),
+                (
+                    "pps_act_y_qp_offset_plus5",
+                    i64::from(pps_act_y_qp_offset_plus5) - 5,
+                ),
+                (
+                    "pps_act_cb_qp_offset_plus5",
+                    i64::from(pps_act_cb_qp_offset_plus5) - 5,
+                ),
+                (
+                    "pps_act_cr_qp_offset_plus3",
+                    i64::from(pps_act_cr_qp_offset_plus3) - 3,
+                ),
             ] {
                 if !(-12..=12).contains(&qp) {
-                    return Err(PpsError::ValueOutOfRange {
-                        field,
-                        got: qp as i64,
-                    });
+                    return Err(PpsError::ValueOutOfRange { field, got: qp });
                 }
             }
         }
@@ -507,11 +516,39 @@ impl PpsSccExtension {
         let mut pps_palette_predictor_initializer = Vec::new();
         if pps_palette_predictor_initializers_present_flag {
             pps_num_palette_predictor_initializers = br.ue()?;
+            // §7.4.3.3.3: bounded by PaletteMaxPredictorSize, itself
+            // capped by the profile limits (palette_max_size +
+            // delta_palette_max_predictor_size); reject anything past
+            // the largest representable predictor so a malformed count
+            // cannot drive the initializer allocation.
+            if pps_num_palette_predictor_initializers > 128 {
+                return Err(PpsError::ValueOutOfRange {
+                    field: "pps_num_palette_predictor_initializers",
+                    got: i64::from(pps_num_palette_predictor_initializers),
+                });
+            }
             if pps_num_palette_predictor_initializers > 0 {
                 monochrome_palette_flag = br.u1()? != 0;
                 luma_bit_depth_entry_minus8 = br.ue()?;
                 if !monochrome_palette_flag {
                     chroma_bit_depth_entry_minus8 = br.ue()?;
+                }
+                // §7.4.3.3.3: the entry bit depths are BitDepth values
+                // (8..=16), i.e. the minus8 fields lie in 0..=8 — checked
+                // before the `+ 8` width arithmetic below.
+                for (field, v) in [
+                    ("luma_bit_depth_entry_minus8", luma_bit_depth_entry_minus8),
+                    (
+                        "chroma_bit_depth_entry_minus8",
+                        chroma_bit_depth_entry_minus8,
+                    ),
+                ] {
+                    if v > 8 {
+                        return Err(PpsError::ValueOutOfRange {
+                            field,
+                            got: i64::from(v),
+                        });
+                    }
                 }
                 let num_comps = if monochrome_palette_flag { 1 } else { 3 };
                 let num_entries = pps_num_palette_predictor_initializers as usize;
