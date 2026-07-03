@@ -113,9 +113,13 @@ fn coding_quadtree_at_min_cb_is_a_leaf() {
     let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
     let mut ctx = fresh_contexts();
     let mut grid = CtuGrid::new(&params, 0, 0);
+    let mut state = PictureParseState::new(&params);
+    state.begin_ctu(0, 0, 0, 0);
     let mut qg = QuantGroupState::default();
-    let qt = decode_coding_quadtree(&mut eng, &mut ctx, &params, &mut grid, &mut qg, 0, 0, 4, 0)
-        .unwrap();
+    let qt = decode_coding_quadtree(
+        &mut eng, &mut ctx, &params, &mut grid, &mut state, &mut qg, 0, 0, 4, 0,
+    )
+    .unwrap();
     match qt {
         CodingQuadtree::Leaf(cu) => {
             assert_eq!(cu.cu_pred_mode, CuPredMode::Intra);

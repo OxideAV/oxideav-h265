@@ -80,6 +80,24 @@ pub struct IntraModeField {
 }
 
 impl IntraModeField {
+    /// Grid width in 4×4 min blocks.
+    #[must_use]
+    pub fn w_blocks(&self) -> usize {
+        self.w_blocks
+    }
+
+    /// Grid height in 4×4 min blocks.
+    #[must_use]
+    pub fn h_blocks(&self) -> usize {
+        self.h_blocks
+    }
+
+    /// `CtbLog2SizeY` the field was allocated with.
+    #[must_use]
+    pub fn ctb_log2(&self) -> u32 {
+        self.ctb_log2_size_y
+    }
+
     /// Allocate the field for a picture `pic_width_in_luma_samples` ×
     /// `pic_height_in_luma_samples` with the given `CtbLog2SizeY`. All
     /// cells start unwritten (every neighbour lookup before a write

@@ -81,6 +81,23 @@ pub struct TransformTreeParams {
     /// (`log2_trafo_size`, `trafo_depth`, `blk_idx`, the cbf flags) are
     /// overwritten by the recursion before each leaf invocation.
     pub tu_template: TransformUnitParams,
+    /// The coding unit's luma top-left `x` (constant across the tree) —
+    /// with [`Self::log2_cb_size`], locates each leaf's prediction block
+    /// for the per-PB intra-mode selection.
+    pub cu_x0: u32,
+    /// The coding unit's luma top-left `y`.
+    pub cu_y0: u32,
+    /// `log2CbSize` of the coding unit.
+    pub log2_cb_size: u32,
+    /// The §8.4.2-derived `IntraPredModeY` of the CU's prediction
+    /// blocks, `[tl, tr, bl, br]`. For `PART_2Nx2N` all four entries
+    /// carry the single PB's mode. Consumed by the §7.4.9.11
+    /// mode-dependent scan selection of each leaf's `residual_coding()`.
+    pub intra_pred_mode_y_corners: [u32; 4],
+    /// The §8.4.3-derived `IntraPredModeC` per prediction block,
+    /// `[tl, tr, bl, br]` (all equal outside `ChromaArrayType == 3`
+    /// `PART_NxN`).
+    pub intra_pred_mode_c_corners: [u32; 4],
 }
 
 /// One node of the decoded §7.3.8.8 transform tree: either an internal
@@ -293,6 +310,21 @@ pub fn decode_transform_tree(
         tu_params.cbf_cb_lower = cbf_cb_lower;
         tu_params.cbf_cr = cbf_cr;
         tu_params.cbf_cr_lower = cbf_cr_lower;
+
+        // §7.4.9.11 — the mode-dependent scan reads the prediction
+        // block THIS leaf lies in: with `IntraSplitFlag` the CU has four
+        // PBs at the quarter positions, otherwise one.
+        let pb_idx = if params.intra_split_flag && params.log2_cb_size > 0 {
+            let half = 1u32 << (params.log2_cb_size - 1);
+            (usize::from(y0.wrapping_sub(params.cu_y0) >= half) << 1)
+                | usize::from(x0.wrapping_sub(params.cu_x0) >= half)
+        } else {
+            0
+        };
+        tu_params.intra_pred_mode_y = params.intra_pred_mode_y_corners[pb_idx];
+        tu_params.intra_pred_mode_c = params.intra_pred_mode_c_corners[pb_idx];
+        tu_params.intra_chroma_pred_mode =
+            params.tu_template.intra_chroma_pred_mode_corners[pb_idx];
 
         let unit = decode_transform_unit(engine, ctx, &tu_params, qg)?;
         Ok(TransformTree::Leaf { cbf_luma, unit })

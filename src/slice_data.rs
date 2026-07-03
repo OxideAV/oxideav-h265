@@ -36,11 +36,13 @@ use crate::binarization::{
     decode_pred_mode_flag, decode_prev_intra_luma_pred_flag, decode_ref_idx,
     decode_rem_intra_luma_pred_mode, decode_rqt_root_cbf, decode_sao_band_position,
     decode_sao_eo_class, decode_sao_merge_flag, decode_sao_offset_abs, decode_sao_offset_sign,
-    decode_sao_type_idx, decode_split_cu_flag, split_cu_flag_ctx_inc, CuPredMode, InterPredIdc,
-    MvdComponent, PartMode, PartModeResult,
+    decode_sao_type_idx, decode_split_cu_flag, derive_intra_pred_mode_c, derive_intra_pred_mode_y,
+    intra_luma_cand_mode_list, luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc, CuPredMode,
+    InterPredIdc, LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
 };
 use crate::cabac::CabacEngine;
 use crate::ctx_init::SliceContexts;
+use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::residual::ResidualCodingError;
 use crate::transform_tree::{decode_transform_tree, TransformTree, TransformTreeParams};
 use crate::transform_unit::{CuPredMode as TuCuPredMode, QuantGroupState, TransformUnitParams};
@@ -373,6 +375,136 @@ impl CtuGrid {
     }
 }
 
+/// Picture-level parse state threaded across the CTUs of a picture.
+///
+/// The §7.3.8 walk needs the **derived** `IntraPredModeY` /
+/// `IntraPredModeC` of every intra prediction block *during* parsing:
+/// the §7.4.9.11 `residual_coding( )` scan order of a 4×4 / 8×8 intra
+/// transform block depends on the actual prediction mode, and that mode
+/// comes from the §8.4.2 most-probable-mode derivation over the left /
+/// above neighbour blocks — potentially in a different CTU. This state
+/// carries the per-4×4 [`IntraModeField`] plus the per-CTB
+/// `SliceAddrRs` / `TileId` grids that gate the §6.4.1 neighbour
+/// availability.
+#[derive(Debug)]
+pub struct PictureParseState {
+    field: IntraModeField,
+    ctb_log2: u32,
+    pic_width: u32,
+    pic_height: u32,
+    pic_w_ctbs: u32,
+    /// Per-CTB `(SliceAddrRs, TileId)`, `None` until the CTU is begun.
+    ctb_info: Vec<Option<(u32, u32)>>,
+    /// The current CTU's `(SliceAddrRs, TileId)`.
+    cur: (u32, u32),
+}
+
+impl PictureParseState {
+    /// A fresh per-picture state sized from the slice-data params.
+    #[must_use]
+    pub fn new(params: &SliceDataParams) -> Self {
+        let ctb = 1u32 << params.ctb_log2_size_y;
+        let w_ctbs = params.pic_width_in_luma_samples.div_ceil(ctb);
+        let h_ctbs = params.pic_height_in_luma_samples.div_ceil(ctb);
+        Self {
+            field: IntraModeField::new(
+                params.pic_width_in_luma_samples as usize,
+                params.pic_height_in_luma_samples as usize,
+                params.ctb_log2_size_y,
+            ),
+            ctb_log2: params.ctb_log2_size_y,
+            pic_width: params.pic_width_in_luma_samples,
+            pic_height: params.pic_height_in_luma_samples,
+            pic_w_ctbs: w_ctbs,
+            ctb_info: vec![None; (w_ctbs * h_ctbs) as usize],
+            cur: (0, 0),
+        }
+    }
+
+    /// Mark the CTU at `(x_ctb, y_ctb)` as belonging to slice segment
+    /// sequence `slice_addr_rs` and tile `tile_id` — called before its
+    /// syntax decode so same-CTU neighbour queries resolve.
+    pub fn begin_ctu(&mut self, x_ctb: u32, y_ctb: u32, slice_addr_rs: u32, tile_id: u32) {
+        let rs = (y_ctb >> self.ctb_log2) * self.pic_w_ctbs + (x_ctb >> self.ctb_log2);
+        if let Some(slot) = self.ctb_info.get_mut(rs as usize) {
+            *slot = Some((slice_addr_rs, tile_id));
+        }
+        self.cur = (slice_addr_rs, tile_id);
+    }
+
+    /// §6.4.1 availability of the left / above neighbour of the block at
+    /// `(x_pb, y_pb)`: in-picture, already decoded (the mode field's
+    /// `written` test), same slice and same tile.
+    fn neighbour_available(&self, x_pb: u32, y_pb: u32, neighbour: Neighbour) -> bool {
+        let (x_nb, y_nb) = match neighbour {
+            Neighbour::Left => (x_pb as i64 - 1, y_pb as i64),
+            Neighbour::Above => (x_pb as i64, y_pb as i64 - 1),
+        };
+        if x_nb < 0
+            || y_nb < 0
+            || x_nb >= i64::from(self.pic_width)
+            || y_nb >= i64::from(self.pic_height)
+        {
+            return false;
+        }
+        let rs =
+            ((y_nb as u32) >> self.ctb_log2) * self.pic_w_ctbs + ((x_nb as u32) >> self.ctb_log2);
+        match self.ctb_info.get(rs as usize).copied().flatten() {
+            // §6.4.1: a neighbour in a different slice segment sequence
+            // or a different tile is unavailable.
+            Some(info) => info == self.cur,
+            // The neighbour's CTU has not been decoded yet.
+            None => false,
+        }
+    }
+
+    /// §8.4.2 — derive `IntraPredModeY` for one luma prediction block
+    /// from the decoded signalling + the neighbour mode field, then
+    /// record it for later neighbours.
+    fn derive_and_record_luma_mode(
+        &mut self,
+        x_pb: u32,
+        y_pb: u32,
+        n_pb: u32,
+        luma: &IntraLumaMode,
+    ) -> u8 {
+        let avail_a = self.neighbour_available(x_pb, y_pb, Neighbour::Left);
+        let avail_b = self.neighbour_available(x_pb, y_pb, Neighbour::Above);
+        let cand_a =
+            self.field
+                .cand_intra_pred_mode(x_pb as usize, y_pb as usize, Neighbour::Left, avail_a);
+        let cand_b = self.field.cand_intra_pred_mode(
+            x_pb as usize,
+            y_pb as usize,
+            Neighbour::Above,
+            avail_b,
+        );
+        let cand_list = intra_luma_cand_mode_list(cand_a, cand_b);
+        let source = luma_intra_mode_source_from_flag(u8::from(luma.prev_intra_luma_pred_flag));
+        let field_val = match source {
+            LumaIntraModeSource::Mpm => luma.mpm_idx.unwrap_or(0),
+            LumaIntraModeSource::Remaining => luma.rem_intra_luma_pred_mode.unwrap_or(0),
+        };
+        let mode = derive_intra_pred_mode_y(cand_list, source, field_val);
+        self.field
+            .record_intra_pb(x_pb as usize, y_pb as usize, n_pb as usize, mode, false);
+        mode
+    }
+
+    /// Record a PCM coding unit (its neighbours see `INTRA_DC`).
+    fn record_pcm_cu(&mut self, x0: u32, y0: u32, n_cb: u32) {
+        self.field
+            .record_intra_pb(x0 as usize, y0 as usize, n_cb as usize, 1, true);
+    }
+
+    /// Record an inter / skip coding unit (its neighbours see
+    /// `INTRA_DC`).
+    fn record_non_intra_cu(&mut self, x0: u32, y0: u32, n_cb: u32, mode: CuPredMode) {
+        self.field
+            .record_non_intra_cu(x0 as usize, y0 as usize, n_cb as usize, mode);
+    }
+}
+
 /// Decode one §7.3.8.3 `sao( rx, ry )` syntax structure.
 ///
 /// `merge_left_allowed` / `merge_up_allowed` are the §7.3.8.3 presence
@@ -675,6 +807,7 @@ fn decode_coding_unit(
     ctx: &mut SliceContexts,
     params: &SliceDataParams,
     grid: &mut CtuGrid,
+    state: &mut PictureParseState,
     qg: &mut QuantGroupState,
     x0: u32,
     y0: u32,
@@ -718,6 +851,7 @@ fn decode_coding_unit(
     if cu_skip_flag {
         // §7.4.9.5: MODE_SKIP. One prediction_unit covering the CU.
         cu.cu_pred_mode = cu_pred_mode_from_skip(params.slice_type_is_i, 1).unwrap();
+        state.record_non_intra_cu(x0, y0, n_cb_s, cu.cu_pred_mode);
         let pu = decode_prediction_unit(engine, ctx, params, true, ct_depth, n_cb_s, n_cb_s)?;
         cu.prediction_units.push(pu);
         return Ok(cu);
@@ -747,6 +881,7 @@ fn decode_coding_unit(
             engine,
             ctx,
             params,
+            state,
             &mut cu,
             x0,
             y0,
@@ -755,6 +890,7 @@ fn decode_coding_unit(
             qg,
         )?;
     } else {
+        state.record_non_intra_cu(x0, y0, n_cb_s, cu_pred_mode);
         decode_inter_cu(
             engine,
             ctx,
@@ -808,6 +944,7 @@ fn decode_intra_cu(
     engine: &mut CabacEngine<'_>,
     ctx: &mut SliceContexts,
     params: &SliceDataParams,
+    state: &mut PictureParseState,
     cu: &mut CodingUnit,
     x0: u32,
     y0: u32,
@@ -829,6 +966,7 @@ fn decode_intra_cu(
         // PCM samples are byte-aligned raw u(v) reads — out of scope for
         // the CABAC syntax walk (handled by the reconstruction pass that
         // re-aligns the bit reader). Mark and return.
+        state.record_pcm_cu(x0, y0, n_cb_s);
         return Ok(());
     }
 
@@ -878,10 +1016,64 @@ fn decode_intra_cu(
             )?);
     }
 
+    // §8.4.2 / §8.4.3 — derive the actual `IntraPredModeY` per luma
+    // prediction block (recording each into the picture-level mode
+    // field so later blocks' MPM derivation sees it) and the derived
+    // `IntraPredModeC`: the §7.4.9.11 mode-dependent scan of the
+    // `residual_coding( )` invocations below reads them.
+    let pb_offsets: [(u32, u32); 4] = [
+        (0, 0),
+        (pb_offset, 0),
+        (0, pb_offset),
+        (pb_offset, pb_offset),
+    ];
+    let mut modes_y = [0u32; 4];
+    for (i, luma) in cu.intra_luma.iter().enumerate() {
+        let (dx, dy) = pb_offsets[i];
+        modes_y[i] =
+            u32::from(state.derive_and_record_luma_mode(x0 + dx, y0 + dy, pb_offset, luma));
+    }
+    for i in cu.intra_luma.len()..4 {
+        modes_y[i] = modes_y[0];
+    }
+    let mut raw_chroma = [0u8; 4];
+    let mut modes_c = [0u32; 4];
+    for i in 0..4 {
+        let raw = if cu.intra_chroma_pred_mode.len() == 4 {
+            cu.intra_chroma_pred_mode[i]
+        } else {
+            cu.intra_chroma_pred_mode.first().copied().unwrap_or(0)
+        };
+        raw_chroma[i] = raw;
+        // §8.4.3: IntraPredModeC derives from the co-located luma mode —
+        // per PB for the ChromaArrayType == 3 PART_NxN case, else from
+        // the CU's first PB.
+        let luma_for_c = if cu.intra_chroma_pred_mode.len() == 4 {
+            modes_y[i]
+        } else {
+            modes_y[0]
+        };
+        modes_c[i] = u32::from(derive_intra_pred_mode_c(
+            raw,
+            luma_for_c as u8,
+            params.chroma_array_type == 2,
+        ));
+    }
+
     // Intra CUs always enter the transform tree (rqt_root_cbf is not
     // coded; cbf_luma presence at the root is unconditional).
     let max_trafo_depth =
         params.max_transform_hierarchy_depth_intra + part_result.intra_split_flag as u32;
+    let mut template = tu_template(
+        params,
+        CuPredMode::Intra,
+        cu.cu_transquant_bypass_flag,
+        part_result.part_mode == PartMode::Part2Nx2N,
+    );
+    template.intra_pred_mode_y = modes_y[0];
+    template.intra_pred_mode_c = modes_c[0];
+    template.intra_chroma_pred_mode = raw_chroma[0];
+    template.intra_chroma_pred_mode_corners = raw_chroma;
     let tt_params = TransformTreeParams {
         max_tb_log2_size_y: params.max_tb_log2_size_y,
         min_tb_log2_size_y: params.min_tb_log2_size_y,
@@ -890,12 +1082,12 @@ fn decode_intra_cu(
         inter_split_flag: false,
         cu_pred_mode: TuCuPredMode::Intra,
         chroma_array_type: params.chroma_array_type,
-        tu_template: tu_template(
-            params,
-            CuPredMode::Intra,
-            cu.cu_transquant_bypass_flag,
-            part_result.part_mode == PartMode::Part2Nx2N,
-        ),
+        tu_template: template,
+        cu_x0: x0,
+        cu_y0: y0,
+        log2_cb_size,
+        intra_pred_mode_y_corners: modes_y,
+        intra_pred_mode_c_corners: modes_c,
     };
     let tree = decode_transform_tree(
         engine,
@@ -987,6 +1179,12 @@ fn decode_inter_cu(
                 cu.cu_transquant_bypass_flag,
                 pm == PartMode::Part2Nx2N,
             ),
+            cu_x0: x0,
+            cu_y0: y0,
+            log2_cb_size,
+            // Inter CUs never take the §7.4.9.11 intra-scan branch.
+            intra_pred_mode_y_corners: [0; 4],
+            intra_pred_mode_c_corners: [0; 4],
         };
         let tree = decode_transform_tree(
             engine,
@@ -1015,6 +1213,7 @@ pub fn decode_coding_quadtree(
     ctx: &mut SliceContexts,
     params: &SliceDataParams,
     grid: &mut CtuGrid,
+    state: &mut PictureParseState,
     qg: &mut QuantGroupState,
     x0: u32,
     y0: u32,
@@ -1062,6 +1261,7 @@ pub fn decode_coding_quadtree(
             ctx,
             params,
             grid,
+            state,
             qg,
             x0,
             y0,
@@ -1074,6 +1274,7 @@ pub fn decode_coding_quadtree(
                 ctx,
                 params,
                 grid,
+                state,
                 qg,
                 x1,
                 y0,
@@ -1087,6 +1288,7 @@ pub fn decode_coding_quadtree(
                 ctx,
                 params,
                 grid,
+                state,
                 qg,
                 x0,
                 y1,
@@ -1100,6 +1302,7 @@ pub fn decode_coding_quadtree(
                 ctx,
                 params,
                 grid,
+                state,
                 qg,
                 x1,
                 y1,
@@ -1114,6 +1317,7 @@ pub fn decode_coding_quadtree(
             ctx,
             params,
             grid,
+            state,
             qg,
             x0,
             y0,
@@ -1140,8 +1344,46 @@ pub fn decode_coding_tree_unit(
     sao_merge_left_allowed: bool,
     sao_merge_up_allowed: bool,
 ) -> Result<CodingTreeUnit, ResidualCodingError> {
+    // Standalone entry point: a fresh per-picture parse state (no
+    // cross-CTU intra-mode memory). Multi-CTU pictures must use
+    // [`decode_coding_tree_unit_in_picture`] with a shared
+    // [`PictureParseState`] so the §8.4.2 MPM derivation sees the true
+    // cross-CTU neighbour modes.
+    let mut state = PictureParseState::new(params);
+    decode_coding_tree_unit_in_picture(
+        engine,
+        ctx,
+        params,
+        &mut state,
+        x_ctb,
+        y_ctb,
+        0,
+        0,
+        sao_merge_left_allowed,
+        sao_merge_up_allowed,
+    )
+}
+
+/// Decode one §7.3.8.2 `coding_tree_unit( )` with the shared per-picture
+/// parse state (the §8.4.2 intra-mode neighbour field + the per-CTB
+/// slice / tile availability grids). `slice_addr_rs` is the CTB's
+/// `SliceAddrRs`; `tile_id` its §6.5.1 `TileId`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_coding_tree_unit_in_picture(
+    engine: &mut CabacEngine<'_>,
+    ctx: &mut SliceContexts,
+    params: &SliceDataParams,
+    state: &mut PictureParseState,
+    x_ctb: u32,
+    y_ctb: u32,
+    slice_addr_rs: u32,
+    tile_id: u32,
+    sao_merge_left_allowed: bool,
+    sao_merge_up_allowed: bool,
+) -> Result<CodingTreeUnit, ResidualCodingError> {
     let mut grid = CtuGrid::new(params, x_ctb, y_ctb);
     let mut qg = QuantGroupState::default();
+    state.begin_ctu(x_ctb, y_ctb, slice_addr_rs, tile_id);
 
     let sao = if params.slice_sao_luma_flag || params.slice_sao_chroma_flag {
         Some(decode_sao(
@@ -1160,6 +1402,7 @@ pub fn decode_coding_tree_unit(
         ctx,
         params,
         &mut grid,
+        state,
         &mut qg,
         x_ctb,
         y_ctb,

@@ -41,6 +41,11 @@ fn base_params() -> TransformTreeParams {
         cu_pred_mode: CuPredMode::Intra,
         chroma_array_type: 1,
         tu_template: template(),
+        cu_x0: 0,
+        cu_y0: 0,
+        log2_cb_size: 5,
+        intra_pred_mode_y_corners: [0; 4],
+        intra_pred_mode_c_corners: [0; 4],
     }
 }
 
