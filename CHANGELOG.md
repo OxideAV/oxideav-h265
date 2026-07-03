@@ -6,6 +6,81 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 384 (2026-07-03)
+
+- `sequence` (new module) — the whole-bitstream Annex B decode driver:
+  NAL demux → parameter-set activation → §7.3.6.1 slice headers → the
+  §7.3.8.1 CTU CABAC loop (tile-scan addressing, per-slice init, WPP
+  entry-point substreams with the §7.4.1.1 coded-byte → RBSP boundary
+  mapping, `end_of_subset_one_bit`, the §9.3.2.4 / §9.3.2.5 context
+  storage / synchronization) → picture reconstruction → the
+  §8.3.1..§8.3.5 reference cycle → output-order frames.
+  `decode_annexb_sequence` (one-shot) and `SequenceDecoder`
+  (streaming: `push_nal_unit` / `flush` / `take_decoded`). Every
+  Annex B bitstream in the staged 16-fixture corpus decodes
+  byte-exact, including Main10 / 4:2:2 / 4:4:4 10-bit, the
+  eight-picture B pyramid, four-slice pictures, and WPP.
+
+- `decoder` (new module) — the `oxideav_core::Decoder` registry entry:
+  Annex B packets in, output-order `VideoFrame`s out with a
+  `sps_max_num_reorder_pics`-deep reorder queue, packet-PTS
+  re-attachment, Annex B extradata, and flush-then-`Eof` semantics.
+  `register()` is live (ids `h265` / `hevc`; `hvc1` / `hev1` / `HEVC`
+  FourCCs, MP4 OTI, Matroska tag); `make_decoder` is the direct
+  factory endpoint.
+
+- `slice_data::PictureParseState` — picture-level parse state: the
+  §8.4.2 intra-mode field derived DURING the CABAC walk (the
+  §7.4.9.11 mode-dependent residual scans need real
+  `IntraPredModeY`/`C` values), plus picture-level `CtDepth` /
+  `cu_skip_flag` grids with §6.4.1 slice / tile availability so the
+  §9.3.4.2.2 ctxInc neighbour reads cross CTU boundaries (the
+  per-CTU `CtuGrid` is gone).
+
+- §8.6.1 quantization-parameter derivation in `ReconCtx`: per-4×4
+  `QpY` map, decode-order `qPY_PREV` threading with slice / WPP-row
+  resets, `qPY_A` / `qPY_B` same-CTB-gated neighbour reads, and
+  §7.4.9.14 `CuQpDeltaVal` scoping from the delta-carrying CU to the
+  end of its quantization group. Deblocking reads per-position
+  `QpQ` / `QpP` from the map.
+
+- §7.3.8.10 deferred-chroma reconstruction (an 8×8 luma node with 4×4
+  children carries its chroma on `blkIdx == 3` covering the node) and
+  cbf-clear chroma intra prediction; `ChromaArrayType == 2` stacks the
+  two square blocks vertically.
+
+- §8.7.2.1 / §8.7.3.2 loop-filter boundary gating: deblocking
+  `filterLeft/TopCbEdgeFlag` and the SAO edge-offset neighbour test
+  honour slice / tile boundaries when filtering across them is
+  disabled.
+
+- `Picture::to_planar_le16` for the >8-bit planar fixture layout.
+
+### Fixed — clean-room rebuild round 384
+
+- §7.3.6.1: `slice_temporal_mvp_enabled_flag` was read outside the
+  non-IDR block (one spurious bit on every IDR slice under a
+  temporal-MVP SPS), and the SAO flag pair was read for dependent
+  slice segments; both gates now match the syntax table.
+- §9.3.4.2.5 eq. 9-42: the DC coefficient's sigCtx is 0 — the
+  eqs. 9-49..9-53 size/colour/scan modifications belong to the fourth
+  branch only (ctxInc 0 luma / 27 chroma for every `log2TrafoSize > 2`
+  DC position).
+- §8.6.4.2 eq. 8-316: the printed DST-VII matrix follows the eq. 8-318
+  `[column][row]` convention — the multiplication reads the printed
+  rows transposed, matching the in-code DCT read (verified against
+  the conformance output of the qp-high fixture's first 4×4 block).
+- §7.3.8.11: both `last_sig_coeff_{x,y}_prefix` bins precede the two
+  bypass suffixes; the interleave desynchronized any TB whose last
+  coordinate exceeds 3.
+- §7.3.8.9: `mvd_coding()` reads both components'
+  `abs_mvd_greater0_flag` bins first, then both greater1 bins, then
+  the per-component suffix/sign blocks (`decode_mvd_pair`).
+- §7.3.2.3.3: SCC PPS ACT-offset range checks run in i64 (fuzz-found
+  subtract-overflow on se(v) extremes); palette-predictor initializer
+  counts and entry bit depths are §7.4.3.3.3-bounded before
+  allocation / width arithmetic.
+
 ### Added — clean-room rebuild round 372 (2026-06-26)
 
 - `poc` (new module) §8.3.1 picture-order-count derivation: `PocState`

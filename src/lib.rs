@@ -4,7 +4,20 @@
 //! decoder, for the [oxideav](https://github.com/OxideAV/oxideav)
 //! framework.
 //!
-//! **Status:** clean-room rebuild in progress (post 2026-05-18 audit).
+//! **Status:** the decoder is end-to-end. [`decode_annexb_sequence`] /
+//! [`SequenceDecoder`] decode whole Annex B byte streams to
+//! output-order pictures, and [`make_decoder`] exposes the same driver
+//! through the [`oxideav_core::Decoder`] registry contract (registered
+//! by [`register`] under `"h265"` / `"hevc"`). Every Annex B bitstream
+//! in the staged 16-fixture conformance corpus decodes byte-exact —
+//! see `README.md` for the corpus coverage and the remaining gaps
+//! (explicit weighted prediction, PCM samples, true multi-tile
+//! streams, dependent slice segments, encoder).
+//!
+//! The sections below record the per-round rebuild history of the
+//! subsystems the driver composes.
+//!
+//! **History:** clean-room rebuild (post 2026-05-18 audit).
 //! The latest round adds the §8.6.2 / §8.6.3 / §8.6.4 scaling,
 //! transformation and residual-array construction step — the new
 //! [`transform`] module. [`transform::scale_coefficients`] implements
@@ -64,9 +77,7 @@
 //! both the SPS (`sps_scaling_list_data_present_flag`) and PPS
 //! (`pps_scaling_list_data_present_flag`) paths. The P/B
 //! reference-list / weighted-prediction sub-structures are still
-//! surfaced as an opaque tail. Slice data and CABAC are *not*
-//! implemented yet; the public decoder and encoder entry points still
-//! return [`Error::NotImplemented`].
+//! surfaced as an opaque tail.
 //!
 //! ## What works today
 //!
@@ -349,15 +360,15 @@ pub use vui::{
     VuiParameters, VuiTimingInfo, EXTENDED_SAR,
 };
 
-/// Crate-local error type. The decoder and encoder paths still
-/// return [`Error::NotImplemented`] while the clean-room rebuild
-/// progresses; structural utilities (the NAL walker and parameter-set
-/// parsers) surface their own [`NalError`] / [`VpsError`] types
-/// directly.
+/// Crate-local error type for the structural utilities (the NAL
+/// walker and parameter-set parsers surface their own [`NalError`] /
+/// [`VpsError`] types directly; the decode drivers use
+/// [`sequence::SequenceError`] and the registry decoder maps into
+/// [`oxideav_core::Error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// The crate has been reset to a scaffold pending clean-room
-    /// rebuild; no decoder or encoder functionality is wired up yet.
+    /// The requested functionality is not implemented (the encoder,
+    /// and the remaining decoder gaps listed in `README.md`).
     NotImplemented,
     /// A NAL-walker error surfaced through the top-level entry
     /// points.
