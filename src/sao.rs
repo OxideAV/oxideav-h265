@@ -264,9 +264,37 @@ pub fn apply_sao_ctb_with_boundaries(
     n_h: usize,
     boundaries: Option<&SaoBoundaries>,
 ) {
+    apply_sao_ctb_full(
+        rec, sao_out, plane, comp, x_ctb, y_ctb, n_w, n_h, boundaries, None,
+    );
+}
+
+/// [`apply_sao_ctb_with_boundaries`] with the per-CU loop-filter
+/// suppression map: samples of PCM (`pcm_loop_filter_disabled_flag`) /
+/// transquant-bypass coding units keep their reconstructed values
+/// (§8.7.3.1 treats both `SaoTypeIdx` components as 0 for them).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_ctb_full(
+    rec: &Picture,
+    sao_out: &mut Picture,
+    plane: Plane,
+    comp: &ResolvedSaoComponent,
+    x_ctb: usize,
+    y_ctb: usize,
+    n_w: usize,
+    n_h: usize,
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) {
     if comp.sao_type_idx == 0 {
         return;
     }
+    let (nf_sw, nf_sh) = match plane {
+        Plane::Luma => (1, 1),
+        _ => crate::picture::sub_wh_c(rec.chroma_array_type()),
+    };
+    let suppressed =
+        |x: usize, y: usize| -> bool { no_filter.is_some_and(|m| m.at_luma(x * nf_sw, y * nf_sh)) };
     let bit_depth = rec.bit_depth(plane);
     let max = (1i32 << bit_depth) - 1;
     let (pw, ph) = rec.plane_dims(plane);
@@ -317,6 +345,9 @@ pub fn apply_sao_ctb_with_boundaries(
                     edge_idx = if edge_idx == 2 { 0 } else { edge_idx + 1 };
                 }
                 // equation 8-413.
+                if suppressed(xsi as usize, ysj as usize) {
+                    continue; // §8.7.3.1 PCM / bypass suppression
+                }
                 let off = comp.offset_val[edge_idx as usize];
                 let v = (cur + off).clamp(0, max);
                 sao_out.set_sample(plane, xsi as usize, ysj as usize, v);
@@ -335,6 +366,9 @@ pub fn apply_sao_ctb_with_boundaries(
             for i in 0..w {
                 let xsi = x_ctb + i;
                 let ysj = y_ctb + j;
+                if suppressed(xsi, ysj) {
+                    continue; // §8.7.3.1 PCM / bypass suppression
+                }
                 let cur = rec.sample(plane, xsi, ysj);
                 let band_idx = band_table[(cur >> band_shift) as usize];
                 // equation 8-415.
@@ -392,6 +426,32 @@ pub fn apply_sao_picture_with_boundaries(
     slice_sao_chroma_flag: bool,
     boundaries: Option<&SaoBoundaries>,
 ) -> Picture {
+    apply_sao_picture_full(
+        pic,
+        ctb_sao,
+        ctb_log2_size_y,
+        chroma_array_type,
+        slice_sao_luma_flag,
+        slice_sao_chroma_flag,
+        boundaries,
+        None,
+    )
+}
+
+/// [`apply_sao_picture_with_boundaries`] with the per-CU loop-filter
+/// suppression map (§8.7.3.1 PCM / transquant-bypass sample skip).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn apply_sao_picture_full(
+    pic: &Picture,
+    ctb_sao: &[ResolvedSao],
+    ctb_log2_size_y: u32,
+    chroma_array_type: u8,
+    slice_sao_luma_flag: bool,
+    slice_sao_chroma_flag: bool,
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) -> Picture {
     let ctb_size_y = 1usize << ctb_log2_size_y;
     let pic_width_in_ctbs = pic.width_luma().div_ceil(ctb_size_y);
     let pic_height_in_ctbs = pic.height_luma().div_ceil(ctb_size_y);
@@ -413,7 +473,7 @@ pub fn apply_sao_picture_with_boundaries(
         for rx in 0..pic_width_in_ctbs {
             let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
             if slice_sao_luma_flag {
-                apply_sao_ctb_with_boundaries(
+                apply_sao_ctb_full(
                     &rec,
                     &mut out,
                     Plane::Luma,
@@ -423,10 +483,11 @@ pub fn apply_sao_picture_with_boundaries(
                     ctb_size_y,
                     ctb_size_y,
                     boundaries,
+                    no_filter,
                 );
             }
             if chroma_array_type != 0 && slice_sao_chroma_flag {
-                apply_sao_ctb_with_boundaries(
+                apply_sao_ctb_full(
                     &rec,
                     &mut out,
                     Plane::Cb,
@@ -436,8 +497,9 @@ pub fn apply_sao_picture_with_boundaries(
                     n_ctb_chroma_w,
                     n_ctb_chroma_h,
                     boundaries,
+                    no_filter,
                 );
-                apply_sao_ctb_with_boundaries(
+                apply_sao_ctb_full(
                     &rec,
                     &mut out,
                     Plane::Cr,
@@ -447,6 +509,7 @@ pub fn apply_sao_picture_with_boundaries(
                     n_ctb_chroma_w,
                     n_ctb_chroma_h,
                     boundaries,
+                    no_filter,
                 );
             }
         }

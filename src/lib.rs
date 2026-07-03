@@ -281,9 +281,9 @@ pub use bitreader::{BitReader, BitReaderError};
 pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
 pub use ctx_init::SliceContexts;
 pub use deblock::{
-    deblock_picture, derive_boundary_strength, derive_edge_flags, filter_cu_edges,
-    BoundaryStrength, DeblockCu, DeblockCuDesc, DeblockCuParams, EdgeFlags, EdgeType,
-    TransformSplit,
+    deblock_picture, deblock_picture_full, derive_boundary_strength, derive_edge_flags,
+    filter_cu_edges, filter_cu_edges_full, BoundaryStrength, DeblockCu, DeblockCuDesc,
+    DeblockCuParams, EdgeFlags, EdgeType, NoFilterMap, TransformSplit,
 };
 pub use decode::{PictureHeaderInfo, PictureRefState, PictureSequenceState, SliceRefParams};
 pub use decoder::{make_decoder, H265Decoder};
@@ -331,7 +331,9 @@ pub use recon::{
     IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams, ResolvedList,
     SliceSegmentBoundary,
 };
-pub use sao::{apply_sao_ctb, apply_sao_picture, ResolvedSao, ResolvedSaoComponent};
+pub use sao::{
+    apply_sao_ctb, apply_sao_picture, apply_sao_picture_full, ResolvedSao, ResolvedSaoComponent,
+};
 pub use scaling_list::{
     ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,
     MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS,

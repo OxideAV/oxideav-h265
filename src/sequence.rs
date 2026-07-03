@@ -1002,6 +1002,10 @@ fn build_inter_slice_context(
         log2_sao_offset_scale_luma: pps_range.map_or(0, |r| r.log2_sao_offset_scale_luma as u8),
         log2_sao_offset_scale_chroma: pps_range.map_or(0, |r| r.log2_sao_offset_scale_chroma as u8),
         wp,
+        pcm_loop_filter_disabled: sps
+            .pcm
+            .as_ref()
+            .is_some_and(|p| p.loop_filter_disabled_flag),
     }
 }
 

@@ -37,6 +37,35 @@ const CTB: usize = 1 << CTB_LOG2;
 /// QP only seeds context initialization.
 const SLICE_QP: i32 = 26;
 
+/// Per-AU shape options for the PCM encoder.
+#[derive(Debug, Clone, Copy)]
+pub struct PcmAuOptions {
+    /// Number of slice segments (1 = a single independent segment;
+    /// more = one independent + N−1 dependent segments).
+    pub segments: usize,
+    /// Enable the §8.7.2 deblocking filter (PPS
+    /// `pps_deblocking_filter_disabled_flag == 0`). With every CU a
+    /// PCM block and `pcm_loop_filter_disabled_flag == 1`, a
+    /// conforming decoder must leave all samples untouched — this
+    /// exercises the §8.7.2.5.4 `nDp`/`nDq` PCM suppression.
+    pub deblocking: bool,
+    /// Enable luma band-offset SAO (SPS SAO on,
+    /// `slice_sao_luma_flag == 1`, per-CTB §7.3.8.3 band parameters
+    /// with non-zero offsets). Same contract: the §8.7.3.1 PCM
+    /// suppression must keep every sample.
+    pub sao_luma_band: bool,
+}
+
+impl Default for PcmAuOptions {
+    fn default() -> Self {
+        Self {
+            segments: 1,
+            deblocking: false,
+            sao_luma_band: false,
+        }
+    }
+}
+
 /// Errors from the PCM encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmEncodeError {
@@ -148,7 +177,7 @@ fn write_vps(level_idc: u8) -> Vec<u8> {
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM on).
-fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
+fn write_sps(width: usize, height: usize, level_idc: u8, sao_enabled: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -174,7 +203,7 @@ fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
     w.ue(0); // max_transform_hierarchy_depth_intra
     w.put_bit(0); // scaling_list_enabled_flag
     w.put_bit(0); // amp_enabled_flag
-    w.put_bit(0); // sample_adaptive_offset_enabled_flag
+    w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
     w.put_bit(1); // pcm_enabled_flag
     w.put_bits(7, 4); // pcm_sample_bit_depth_luma_minus1 (8-bit)
     w.put_bits(7, 4); // pcm_sample_bit_depth_chroma_minus1
@@ -192,7 +221,7 @@ fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
 }
 
 /// §7.3.2.3 — the all-defaults PPS (deblocking disabled).
-fn write_pps(dependent_slice_segments_enabled: bool) -> Vec<u8> {
+fn write_pps(dependent_slice_segments_enabled: bool, deblocking_enabled: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -218,7 +247,11 @@ fn write_pps(dependent_slice_segments_enabled: bool) -> Vec<u8> {
     w.put_bit(1); // pps_loop_filter_across_slices_enabled_flag
     w.put_bit(1); // deblocking_filter_control_present_flag
     w.put_bit(0); // deblocking_filter_override_enabled_flag
-    w.put_bit(1); // pps_deblocking_filter_disabled_flag
+    w.put_bit(u8::from(!deblocking_enabled)); // pps_deblocking_filter_disabled_flag
+    if deblocking_enabled {
+        w.se(0); // pps_beta_offset_div2
+        w.se(0); // pps_tc_offset_div2
+    }
     w.put_bit(0); // pps_scaling_list_data_present_flag
     w.put_bit(0); // lists_modification_present_flag
     w.ue(0); // log2_parallel_merge_level_minus2
@@ -244,8 +277,9 @@ fn write_idr_slice_segments(
     cr: &[u8],
     width: usize,
     height: usize,
-    segments: usize,
+    opts: PcmAuOptions,
 ) -> Vec<Vec<u8>> {
+    let segments = opts.segments;
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
@@ -281,7 +315,17 @@ fn write_idr_slice_segments(
         }
         if first {
             w.ue(2); // slice_type = I
+            if opts.sao_luma_band {
+                // SPS SAO enabled: the slice SAO flags are present.
+                w.put_bit(1); // slice_sao_luma_flag
+                w.put_bit(0); // slice_sao_chroma_flag (4:2:0 present)
+            }
             w.se(SLICE_QP - 26); // slice_qp_delta
+            if opts.deblocking || opts.sao_luma_band {
+                // §7.3.6.1 gate: pps_loop_filter_across_slices == 1 and
+                // (SAO on or deblocking not disabled).
+                w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+            }
         }
         // No tiles / WPP: no entry points. No header extension.
         w.rbsp_trailing_bits(); // byte_alignment() before slice data
@@ -291,6 +335,36 @@ fn write_idr_slice_segments(
         for addr in start..end {
             let x0 = (addr % ctbs_x) * CTB;
             let y0 = (addr / ctbs_x) * CTB;
+            if opts.sao_luma_band {
+                // §7.3.8.3 sao( rx, ry ): decline the merges, then a
+                // luma band offset with non-zero offsets — the PCM
+                // suppression must keep the samples anyway.
+                let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
+                if rx > 0 {
+                    cabac.encode_decision(&mut w, &mut ctxs.sao_merge_flag[0], 0);
+                }
+                if ry > 0 {
+                    cabac.encode_decision(&mut w, &mut ctxs.sao_merge_flag[0], 0);
+                }
+                // sao_type_idx_luma = 1 (band): TR bins "1" (ctx), "0"
+                // (bypass).
+                cabac.encode_decision(&mut w, &mut ctxs.sao_type_idx[0], 1);
+                cabac.encode_bypass(&mut w, 0);
+                // sao_offset_abs[0][i] — TR(cMax 7, bypass): values
+                // 1, 2, 3, 4.
+                for v in 1..=4u32 {
+                    for _ in 0..v {
+                        cabac.encode_bypass(&mut w, 1);
+                    }
+                    cabac.encode_bypass(&mut w, 0); // v < cMax terminator
+                }
+                // sao_offset_sign[0][i]: +, −, +, −.
+                for sign in [0u8, 1, 0, 1] {
+                    cabac.encode_bypass(&mut w, sign);
+                }
+                // sao_band_position[0]: FL(5) = 8.
+                cabac.encode_bypass_bits(&mut w, 8, 5);
+            }
             // coding_quadtree: CtbLog2SizeY == MinCbLog2SizeY, so no
             // split_cu_flag. coding_unit( x0, y0, 4 ):
             // part_mode — §9.3.3.7 intra at MinCb: bin "1" = PART_2Nx2N.
@@ -340,7 +414,7 @@ pub fn encode_idr_pcm_au(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, PcmEncodeError> {
-    encode_au(y, cb, cr, width, height, 1)
+    encode_au(y, cb, cr, width, height, PcmAuOptions::default())
 }
 
 /// As [`encode_idr_pcm_au`], with the picture split into `segments`
@@ -361,7 +435,33 @@ pub fn encode_idr_pcm_au_segmented(
     height: usize,
     segments: usize,
 ) -> Result<Vec<u8>, PcmEncodeError> {
-    encode_au(y, cb, cr, width, height, segments)
+    encode_au(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        PcmAuOptions {
+            segments,
+            ..PcmAuOptions::default()
+        },
+    )
+}
+
+/// As [`encode_idr_pcm_au`], with the full [`PcmAuOptions`] shape
+/// control (slice segmentation, deblocking on, luma band-offset SAO).
+///
+/// # Errors
+/// [`PcmEncodeError`] as for [`encode_idr_pcm_au_segmented`].
+pub fn encode_idr_pcm_au_opts(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    opts: PcmAuOptions,
+) -> Result<Vec<u8>, PcmEncodeError> {
+    encode_au(y, cb, cr, width, height, opts)
 }
 
 fn encode_au(
@@ -370,8 +470,9 @@ fn encode_au(
     cr: &[u8],
     width: usize,
     height: usize,
-    segments: usize,
+    opts: PcmAuOptions,
 ) -> Result<Vec<u8>, PcmEncodeError> {
+    let segments = opts.segments;
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
@@ -396,10 +497,15 @@ fn encode_au(
     let level_idc = level_idc_for(width * height);
     let mut units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
-        nal_unit(33, 0, 0, &write_sps(width, height, level_idc)), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(segments > 1)), // PPS_NUT
+        nal_unit(
+            33,
+            0,
+            0,
+            &write_sps(width, height, level_idc, opts.sao_luma_band),
+        ), // SPS_NUT
+        nal_unit(34, 0, 0, &write_pps(segments > 1, opts.deblocking)), // PPS_NUT
     ];
-    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, segments) {
+    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, opts) {
         units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
     }
     Ok(annexb(&units))
@@ -521,6 +627,37 @@ mod tests {
             broken.extend(coded);
         }
         assert!(crate::sequence::decode_annexb_sequence(&broken).is_err());
+    }
+
+    /// §8.7.2.5.4 / §8.7.3.1 — with deblocking and luma band-offset
+    /// SAO ENABLED over an all-PCM picture and
+    /// `pcm_loop_filter_disabled_flag == 1`, a conforming decoder must
+    /// leave every reconstructed sample untouched. This pins the
+    /// per-CU loop-filter suppression map end to end (a decoder that
+    /// filtered the PCM samples would corrupt the smooth gradient).
+    #[test]
+    fn pcm_loop_filter_suppression_keeps_samples_exact() {
+        let (w, h) = (48usize, 32usize);
+        let (y, cb, cr) = gradient_planes(w, h);
+        for (deblocking, sao_luma_band) in [(true, false), (false, true), (true, true)] {
+            let opts = PcmAuOptions {
+                segments: 1,
+                deblocking,
+                sao_luma_band,
+            };
+            let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
+            let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
+            assert_eq!(frames.len(), 1);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&y);
+            expected.extend_from_slice(&cb);
+            expected.extend_from_slice(&cr);
+            assert_eq!(
+                frames[0].picture.to_planar_u8().expect("8-bit"),
+                expected,
+                "deblocking={deblocking} sao={sao_luma_band}: PCM samples survive the loop filters"
+            );
+        }
     }
 
     #[test]

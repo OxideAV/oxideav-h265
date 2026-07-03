@@ -873,6 +873,21 @@ pub fn filter_luma_block_edge(
     bs: u8,
     qp: EdgeQp,
 ) -> LumaEdgeDecision {
+    filter_luma_block_edge_gated(plane, pos, bs, qp, None)
+}
+
+/// [`filter_luma_block_edge`] with the per-CU loop-filter suppression
+/// map: a p- / q-side sample whose cell is flagged is left unmodified
+/// (the §8.7.2.5.4 `nDp = 0` / `nDq = 0` rule for PCM /
+/// transquant-bypass / palette coding units); the filter decision
+/// itself still reads both sides.
+pub fn filter_luma_block_edge_gated(
+    plane: &mut SamplePlane<'_>,
+    pos: EdgePos,
+    bs: u8,
+    qp: EdgeQp,
+    no_filter: Option<&NoFilterMap<'_>>,
+) -> LumaEdgeDecision {
     let EdgePos { ex, ey, edge } = pos;
     let zero = LumaEdgeDecision {
         de: 0,
@@ -921,10 +936,16 @@ pub fn filter_luma_block_edge(
         let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
         for i in 0..out.ndp {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+            if no_filter.is_some_and(|m| m.at_luma(px, py)) {
+                continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
+            }
             plane.set(px, py, out.p[i]);
         }
         for j in 0..out.ndq {
             let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
+            if no_filter.is_some_and(|m| m.at_luma(qx, qy)) {
+                continue; // §8.7.2.5.4 nDq = 0
+            }
             plane.set(qx, qy, out.q[j]);
         }
     }
@@ -949,6 +970,23 @@ pub fn filter_chroma_block_edge(
     c_qp_pic_offset: i32,
     chroma_array_type: u8,
 ) -> i32 {
+    filter_chroma_block_edge_gated(plane, pos, qp, c_qp_pic_offset, chroma_array_type, None)
+}
+
+/// [`filter_chroma_block_edge`] with the per-CU loop-filter
+/// suppression map (§8.7.2.5.5: the flagged side's `p0'` / `q0'` is
+/// not written). Chroma sample positions map onto the luma cell grid
+/// through the `SubWidthC` / `SubHeightC` factors of
+/// `chroma_array_type`.
+pub fn filter_chroma_block_edge_gated(
+    plane: &mut SamplePlane<'_>,
+    pos: EdgePos,
+    qp: EdgeQp,
+    c_qp_pic_offset: i32,
+    chroma_array_type: u8,
+    no_filter: Option<&NoFilterMap<'_>>,
+) -> i32 {
+    let (sub_w, sub_h) = sub_wh_c(chroma_array_type);
     let EdgePos { ex, ey, edge } = pos;
     let bit_depth = qp.bit_depth;
     let tc = chroma_tc(
@@ -971,8 +1009,12 @@ pub fn filter_chroma_block_edge(
         let (p0p, q0p) = filter_chroma_sample(p, q, tc, bit_depth);
         let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
         let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
-        plane.set(px, py, p0p);
-        plane.set(qx, qy, q0p);
+        if !no_filter.is_some_and(|m| m.at_luma(px * sub_w, py * sub_h)) {
+            plane.set(px, py, p0p);
+        }
+        if !no_filter.is_some_and(|m| m.at_luma(qx * sub_w, qy * sub_h)) {
+            plane.set(qx, qy, q0p);
+        }
     }
     tc
 }
@@ -1058,6 +1100,19 @@ pub fn filter_cu_edges_with_qp_map(
     bs: &BoundaryStrength,
     qp_map: Option<QpMap<'_>>,
 ) {
+    filter_cu_edges_full(pic, cu, edge_type, bs, qp_map, None);
+}
+
+/// [`filter_cu_edges_with_qp_map`] with the per-CU loop-filter
+/// suppression map (§8.7.2.5.4 / §8.7.2.5.5 `nDp` / `nDq` zeroing).
+pub fn filter_cu_edges_full(
+    pic: &mut Picture,
+    cu: &DeblockCu,
+    edge_type: EdgeType,
+    bs: &BoundaryStrength,
+    qp_map: Option<QpMap<'_>>,
+    no_filter: Option<&NoFilterMap<'_>>,
+) {
     let DeblockCu {
         x_cb,
         y_cb,
@@ -1122,7 +1177,7 @@ pub fn filter_cu_edges_with_qp_map(
                 ey: y_cb + y_dm,
                 edge: edge_type,
             };
-            filter_luma_block_edge(&mut plane, pos, s, qp);
+            filter_luma_block_edge_gated(&mut plane, pos, s, qp, no_filter);
         }
     }
 
@@ -1203,12 +1258,13 @@ pub fn filter_cu_edges_with_qp_map(
                     ey: yc_cb + y_dm,
                     edge: edge_type,
                 };
-                filter_chroma_block_edge(
+                filter_chroma_block_edge_gated(
                     &mut cplane,
                     pos,
                     qp,
                     c_qp_offset,
                     params.chroma_array_type,
+                    no_filter,
                 );
             }
         }
@@ -1282,6 +1338,33 @@ impl QpMap<'_> {
     }
 }
 
+/// Per-4×4-luma-cell in-loop-filter suppression map: `true` cells
+/// belong to a coding unit whose reconstructed samples the loop
+/// filters must not modify — a `pcm_flag == 1` CU when
+/// `pcm_loop_filter_disabled_flag == 1` (§7.4.3.2.1), or a
+/// `cu_transquant_bypass_flag == 1` CU (§7.4.9.5). The §8.7.2.5.4 /
+/// §8.7.2.5.5 filters zero `nDp` / `nDq` on the flagged side (the
+/// decision still reads both sides); §8.7.3 SAO skips flagged samples.
+#[derive(Debug, Clone, Copy)]
+pub struct NoFilterMap<'a> {
+    /// Per-cell suppression flags, row-major.
+    pub cells: &'a [bool],
+    /// Cell-grid width (`ceil(pic_width / 4)`).
+    pub w_cells: usize,
+}
+
+impl NoFilterMap<'_> {
+    /// Suppression flag of the cell covering luma sample
+    /// `(x_luma, y_luma)` (out-of-range positions are not suppressed).
+    #[must_use]
+    pub fn at_luma(&self, x_luma: usize, y_luma: usize) -> bool {
+        self.cells
+            .get((y_luma >> 2) * self.w_cells + (x_luma >> 2))
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
 /// [`deblock_picture`] with the per-position QP map.
 pub fn deblock_picture_with_qp_map(
     pic: &mut Picture,
@@ -1289,13 +1372,27 @@ pub fn deblock_picture_with_qp_map(
     cus: &[DeblockCuDesc],
     qp_map: Option<QpMap<'_>>,
 ) {
+    deblock_picture_full(pic, field, cus, qp_map, None);
+}
+
+/// [`deblock_picture_with_qp_map`] with the per-CU loop-filter
+/// suppression map (§8.7.2.5.4 / §8.7.2.5.5 — PCM with
+/// `pcm_loop_filter_disabled_flag` and transquant-bypass coding units
+/// keep their reconstructed samples).
+pub fn deblock_picture_full(
+    pic: &mut Picture,
+    field: &MotionField,
+    cus: &[DeblockCuDesc],
+    qp_map: Option<QpMap<'_>>,
+    no_filter: Option<&NoFilterMap<'_>>,
+) {
     // Pass 1: all vertical edges.
     for desc in cus {
-        apply_cu_direction(pic, field, desc, EdgeType::Vertical, qp_map);
+        apply_cu_direction(pic, field, desc, EdgeType::Vertical, qp_map, no_filter);
     }
     // Pass 2: all horizontal edges (on the vertically-filtered samples).
     for desc in cus {
-        apply_cu_direction(pic, field, desc, EdgeType::Horizontal, qp_map);
+        apply_cu_direction(pic, field, desc, EdgeType::Horizontal, qp_map, no_filter);
     }
 }
 
@@ -1306,6 +1403,7 @@ fn apply_cu_direction(
     desc: &DeblockCuDesc,
     edge_type: EdgeType,
     qp_map: Option<QpMap<'_>>,
+    no_filter: Option<&NoFilterMap<'_>>,
 ) {
     let DeblockCu {
         x_cb,
@@ -1333,7 +1431,7 @@ fn apply_cu_direction(
         ef.edge_flags(),
         ef.tb_edge(),
     );
-    filter_cu_edges_with_qp_map(pic, &desc.cu, edge_type, &bs, qp_map);
+    filter_cu_edges_full(pic, &desc.cu, edge_type, &bs, qp_map, no_filter);
 }
 
 #[cfg(test)]

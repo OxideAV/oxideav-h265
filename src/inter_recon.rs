@@ -428,6 +428,10 @@ pub struct InterSliceContext {
     /// The slice's §8.5.3.3.4.3 explicit weighted-prediction tables —
     /// `Some` exactly when `weightedPredFlag` (§8.5.3.3.4.1) is 1.
     pub wp: Option<SliceWpTables>,
+    /// `pcm_loop_filter_disabled_flag` (§7.4.3.2.1) — with it set, the
+    /// §8.7 loop filters must not modify the reconstructed samples of
+    /// `pcm_flag == 1` coding units.
+    pub pcm_loop_filter_disabled: bool,
 }
 
 /// One placed coding tree unit for the §8.5 picture-level inter driver.
@@ -541,6 +545,10 @@ pub fn reconstruct_inter_picture(
     };
 
     let mut deblock_cus: Vec<crate::deblock::DeblockCuDesc> = Vec::new();
+    // §8.7.2.5.4 / §8.7.3.1 — per-4×4-cell loop-filter suppression for
+    // PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
+    let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
+    let mut no_filter_cells = vec![false; w4 * h4];
     let mut prev_slice_addr: Option<u32> = None;
     for placed in ctus {
         // §8.6.1 step-1 — qPY_PREV resets to SliceQpY at the first
@@ -561,9 +569,18 @@ pub fn reconstruct_inter_picture(
             refs,
             slice,
             &mut deblock_cus,
+            &mut no_filter_cells,
+            w4,
             &placed.ctu.quadtree,
         )?;
     }
+    let no_filter_map = no_filter_cells
+        .iter()
+        .any(|&b| b)
+        .then_some(crate::deblock::NoFilterMap {
+            cells: &no_filter_cells,
+            w_cells: w4,
+        });
 
     // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
     // ahead of the §8.7.3 SAO pass.
@@ -571,7 +588,13 @@ pub fn reconstruct_inter_picture(
         let qp_map = ctx
             .qp_cells()
             .map(|(cells, w_cells)| crate::deblock::QpMap { cells, w_cells });
-        crate::deblock::deblock_picture_with_qp_map(&mut pic, &field, &deblock_cus, qp_map);
+        crate::deblock::deblock_picture_full(
+            &mut pic,
+            &field,
+            &deblock_cus,
+            qp_map,
+            no_filter_map.as_ref(),
+        );
     }
 
     // §8.7.3 — sample-adaptive offset (on the deblocked samples). Resolve
@@ -609,7 +632,7 @@ pub fn reconstruct_inter_picture(
         across_slices: slice.filter_across_slices,
         across_tiles: slice.filter_across_tiles,
     };
-    let filtered = crate::sao::apply_sao_picture_with_boundaries(
+    let filtered = crate::sao::apply_sao_picture_full(
         &pic,
         &sao_grid,
         slice.ctb_log2_size_y,
@@ -617,6 +640,7 @@ pub fn reconstruct_inter_picture(
         slice.slice_sao_luma_flag,
         slice.slice_sao_chroma_flag,
         Some(&sao_boundaries),
+        no_filter_map.as_ref(),
     );
 
     Ok((filtered, field))
@@ -634,6 +658,8 @@ fn reconstruct_inter_quadtree(
     refs: &RefListAccess,
     slice: &InterSliceContext,
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
+    no_filter_cells: &mut [bool],
+    w4: usize,
     qt: &crate::slice_data::CodingQuadtree,
 ) -> Result<(), ReconError> {
     use crate::slice_data::CodingQuadtree;
@@ -649,22 +675,39 @@ fn reconstruct_inter_quadtree(
                     refs,
                     slice,
                     deblock_cus,
+                    no_filter_cells,
+                    w4,
                     child,
                 )?;
             }
             Ok(())
         }
-        CodingQuadtree::Leaf(cu) => reconstruct_inter_leaf_cu(
-            pic,
-            ctx,
-            field,
-            params,
-            mv_ctx,
-            refs,
-            slice,
-            deblock_cus,
-            cu,
-        ),
+        CodingQuadtree::Leaf(cu) => {
+            // §8.7.2.5.4 / §8.7.3.1 — mark the CU's cells when the loop
+            // filters must leave its reconstructed samples untouched.
+            if (cu.pcm_flag && slice.pcm_loop_filter_disabled) || cu.cu_transquant_bypass_flag {
+                let n = 1usize << cu.log2_cb_size;
+                for j in (0..n).step_by(4) {
+                    for i in (0..n).step_by(4) {
+                        let (gx, gy) = ((cu.x0 as usize + i) >> 2, (cu.y0 as usize + j) >> 2);
+                        if let Some(cell) = no_filter_cells.get_mut(gy * w4 + gx) {
+                            *cell = true;
+                        }
+                    }
+                }
+            }
+            reconstruct_inter_leaf_cu(
+                pic,
+                ctx,
+                field,
+                params,
+                mv_ctx,
+                refs,
+                slice,
+                deblock_cus,
+                cu,
+            )
+        }
     }
 }
 
@@ -1213,6 +1256,7 @@ mod tests {
             log2_sao_offset_scale_luma: 0,
             log2_sao_offset_scale_chroma: 0,
             wp: None,
+            pcm_loop_filter_disabled: false,
         }
     }
 
