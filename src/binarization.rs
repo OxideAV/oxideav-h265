@@ -3657,34 +3657,22 @@ pub fn sig_coeff_flag_sig_ctx_general(
 }
 
 /// §9.3.4.2.5 DC sigCtx for `log2TrafoSize > 2` and `xC + yC == 0`
-/// (equation 9-42 plus the equations-9-49..9-53 tail). The DC
-/// coefficient skips the equation-9-43..9-48 neighbour walk;
-/// equation 9-42 sets `sigCtx = 0` directly and the size / colour
-/// tail is applied unchanged.
+/// (equation 9-42). The DC coefficient takes the third branch of the
+/// §9.3.4.2.5 cascade: `sigCtx = 0`, full stop — the
+/// equations-9-49..9-53 size / colour / scan modifications are nested
+/// inside the *fourth* ("Otherwise") branch and do **not** apply to the
+/// DC position. The resulting ctxInc is 0 for luma and 27 for chroma
+/// (equations 9-54 / 9-55): every `log2TrafoSize > 2` transform block
+/// shares one dedicated DC context per colour component.
 ///
-/// Inputs: `is_chroma`, `log2_trafo_size` (`3..=5`), `scan_idx`
-/// (only matters for the luma `log2 == 3` branch via eq. 9-50).
+/// The `is_chroma` / `log2_trafo_size` / `scan_idx` inputs are retained
+/// for signature parity with the sibling branch helpers; equation 9-42
+/// uses none of them.
 #[must_use]
 pub fn sig_coeff_flag_sig_ctx_dc(is_chroma: bool, log2_trafo_size: u32, scan_idx: u32) -> u32 {
-    // Eq. 9-42: sigCtx = 0. For (xS, yS) == (0, 0) the eq.-9-49
-    // luma bump never fires.
-    let mut sig_ctx: u32 = 0;
-    if !is_chroma {
-        // Eq. 9-50 / 9-51.
-        if log2_trafo_size == 3 {
-            sig_ctx += if scan_idx == 0 { 9 } else { 15 };
-        } else {
-            sig_ctx += 21;
-        }
-    } else {
-        // Eq. 9-52 / 9-53.
-        if log2_trafo_size == 3 {
-            sig_ctx += 9;
-        } else {
-            sig_ctx += 12;
-        }
-    }
-    sig_ctx
+    let _ = (is_chroma, log2_trafo_size, scan_idx);
+    // Eq. 9-42: sigCtx = 0.
+    0
 }
 
 /// §9.3.4.2.5 ctxInc from sigCtx (equations 9-54, 9-55):
@@ -5559,28 +5547,30 @@ mod tests {
 
     #[test]
     fn sig_coeff_flag_dc_eq_9_42_luma_log2_3() {
-        // Eq. 9-42 sigCtx = 0. Eq. 9-50 with scan_idx = 0 ⇒ + 9.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 0), 9);
-        // scan_idx = 1 ⇒ + 15.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 1), 15);
+        // Eq. 9-42: sigCtx = 0 — the third branch of the §9.3.4.2.5
+        // cascade; the eq.-9-49..9-53 modifications belong to the
+        // fourth branch only, so neither log2TrafoSize nor scanIdx
+        // moves the DC context.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 0), 0);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 3, 1), 0);
     }
 
     #[test]
     fn sig_coeff_flag_dc_eq_9_42_luma_large_size() {
-        // Eq. 9-51 + 21.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 0), 21);
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 5, 0), 21);
-        // scan_idx irrelevant for the eq.-9-51 branch.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 2), 21);
+        // Eq. 9-42: sigCtx = 0 for every log2TrafoSize > 2 — the DC
+        // position shares one luma context (ctxInc 0).
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 0), 0);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 5, 0), 0);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(false, 4, 2), 0);
     }
 
     #[test]
     fn sig_coeff_flag_dc_eq_9_42_chroma() {
-        // Eq. 9-52 + 9.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 3, 0), 9);
-        // Eq. 9-53 + 12.
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 4, 0), 12);
-        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 5, 0), 12);
+        // Eq. 9-42: sigCtx = 0 for chroma too; eq. 9-55 then lands the
+        // DC position on ctxInc 27.
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 3, 0), 0);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 4, 0), 0);
+        assert_eq!(sig_coeff_flag_sig_ctx_dc(true, 5, 0), 0);
     }
 
     #[test]
@@ -5622,9 +5612,10 @@ mod tests {
     #[test]
     fn sig_coeff_flag_general_composes_with_ctx_inc_full_pipe_chroma() {
         // log2 = 4, chroma, (xC, yC) = (0, 0) DC → must route via
-        // sig_coeff_flag_sig_ctx_dc. ctxInc = 27 + 12 = 39.
+        // sig_coeff_flag_sig_ctx_dc (eq. 9-42: sigCtx = 0).
+        // ctxInc = 27 + 0 = 27 (eq. 9-55).
         let sig_dc = sig_coeff_flag_sig_ctx_dc(true, 4, 0);
-        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig_dc, true), 39);
+        assert_eq!(sig_coeff_flag_ctx_inc_from_sig_ctx(sig_dc, true), 27);
     }
 
     // -----------------------------------------------------------------

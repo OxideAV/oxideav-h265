@@ -325,10 +325,20 @@ fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
     if tr_type {
         // §8.6.4.2 eq. 8-315/8-316: y[i] = Σ_j transMatrix[i][j] * x[j],
         // the 4x4 DST. trType == 1 is only ever invoked with nTbS == 4.
+        //
+        // The printed eq.-8-316 matrix follows the same index convention
+        // eq. 8-318 states for the DCT base table ("transMatrix[ m ][ n ]
+        // ... with m = 0..15" — the first printed index is the column):
+        // each printed brace row is a *column* of transMatrix, so
+        // `transMatrix[ i ][ j ]` reads the in-code row-major [`DST4`]
+        // at `[ j ][ i ]`, exactly like the transposed [`DCT32`] read
+        // below. Verified byte-exact against the qp-high / qp-low
+        // fixture decodes (a literal `[ i ][ j ]` read of the printed
+        // rows diverges from the conformance output).
         for (i, oi) in out.iter_mut().enumerate() {
             let mut acc = 0i64;
             for (j, &xj) in input.iter().enumerate() {
-                acc += DST4[i][j] as i64 * xj;
+                acc += DST4[j][i] as i64 * xj;
             }
             *oi = acc;
         }
