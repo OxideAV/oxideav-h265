@@ -1017,10 +1017,13 @@ pub struct DeblockCu {
     pub log2_cb_size: u32,
     /// The CU QP / offset / chroma context.
     pub params: DeblockCuParams,
-    /// The p-side CU's `QpY` at the coding-block boundary edge
-    /// (xDk == 0 / yDm == 0); interior edges use `params.qp_y` on both
-    /// sides.
-    pub qp_y_p: i32,
+    /// The left-neighbour CU's `QpY` at the vertical coding-block
+    /// boundary edge (xDk == 0); interior edges use `params.qp_y` on
+    /// both sides.
+    pub qp_y_p_left: i32,
+    /// The above-neighbour CU's `QpY` at the horizontal coding-block
+    /// boundary edge (yDm == 0).
+    pub qp_y_p_top: i32,
 }
 
 /// §8.7.2.5.1 / .2 — filter all edges of one coding unit in one direction.
@@ -1048,7 +1051,8 @@ pub fn filter_cu_edges(
         y_cb,
         log2_cb_size,
         params,
-        qp_y_p,
+        qp_y_p_left,
+        qp_y_p_top,
     } = *cu;
     let n_d = 1usize << (log2_cb_size - 3);
     let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
@@ -1070,9 +1074,9 @@ pub fn filter_cu_edges(
             }
             // p-side QpY: the neighbour CU only at the coding-block
             // boundary edge; interior edges share the CU's QpY.
-            let boundary = match edge_type {
-                EdgeType::Vertical => x_dk == 0,
-                EdgeType::Horizontal => y_dm == 0,
+            let (boundary, qp_y_p) = match edge_type {
+                EdgeType::Vertical => (x_dk == 0, qp_y_p_left),
+                EdgeType::Horizontal => (y_dm == 0, qp_y_p_top),
             };
             let qp_p = if boundary { qp_y_p } else { params.qp_y };
             let qp = EdgeQp {
@@ -1139,9 +1143,9 @@ pub fn filter_cu_edges(
                 if !aligned {
                     continue;
                 }
-                let boundary = match edge_type {
-                    EdgeType::Vertical => bx == 0,
-                    EdgeType::Horizontal => by == 0,
+                let (boundary, qp_y_p) = match edge_type {
+                    EdgeType::Vertical => (bx == 0, qp_y_p_left),
+                    EdgeType::Horizontal => (by == 0, qp_y_p_top),
                 };
                 let qp_p = if boundary { qp_y_p } else { params.qp_y };
                 let qp = EdgeQp {
@@ -2002,7 +2006,8 @@ mod tests {
             y_cb,
             log2_cb_size: 4,
             params: cu_params_420(37),
-            qp_y_p: 37,
+            qp_y_p_left: 37,
+            qp_y_p_top: 37,
         }
     }
 
@@ -2197,7 +2202,8 @@ mod tests {
             y_cb: 0,
             log2_cb_size: 4,
             params: p,
-            qp_y_p: 37,
+            qp_y_p_left: 37,
+            qp_y_p_top: 37,
         };
         filter_cu_edges(&mut pic, &cu, EdgeType::Vertical, &bs);
         assert!(pic.sample(Plane::Luma, 7, 0) > 120);

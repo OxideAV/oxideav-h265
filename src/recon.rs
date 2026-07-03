@@ -132,16 +132,21 @@ fn qp_bd_offset(bit_depth: u8) -> i32 {
 /// threads `cu_qp_delta_val` so the general single-CU-per-QG case is
 /// exact.
 #[inline]
-fn luma_qp(params: &ReconParams, cu_qp_delta_val: i32) -> u32 {
+fn luma_qp(params: &ReconParams, qp_y: i32) -> u32 {
+    // §8.6.1 eq. 8-284: Qp′Y = QpY + QpBdOffsetY, with `qp_y` the
+    // already-derived (eq. 8-283) luma quantization parameter.
     let qp_bd = qp_bd_offset(params.bit_depth_luma);
-    // §8.6.1 eq. 8-258: QpY = ((qPY_PRED + CuQpDeltaVal + 52 + 2*QpBdOffsetY)
-    //                          % (52 + QpBdOffsetY)) − QpBdOffsetY.
-    // With qPY_PRED == SliceQpY (single-QG picture) this is the slice QP
-    // plus the (already in-range) delta.
-    let qpy_pred = params.slice_qp_y;
+    (qp_y + qp_bd) as u32
+}
+
+/// §8.6.1 eq. 8-283 with `qPY_PRED == SliceQpY` — the single-QG
+/// fallback used when no picture-level QP state is initialized (the
+/// standalone per-CTU helpers).
+#[inline]
+fn fallback_qp_y(params: &ReconParams, cu_qp_delta_val: i32) -> i32 {
+    let qp_bd = qp_bd_offset(params.bit_depth_luma);
     let modulus = 52 + qp_bd;
-    let qpy = (qpy_pred + cu_qp_delta_val + 52 + 2 * qp_bd).rem_euclid(modulus) - qp_bd;
-    (qpy + qp_bd) as u32
+    (params.slice_qp_y + cu_qp_delta_val + 52 + 2 * qp_bd).rem_euclid(modulus) - qp_bd
 }
 
 /// Table 8-10 — `ChromaArrayType == 1` chroma-QP mapping `QpC = f(qPi)`.
@@ -174,14 +179,11 @@ fn qpc_420(qpi: i32) -> i32 {
 /// the other chroma types `qPCx = Min( qPiCx, 51 )`; then
 /// `Qp′Cx = qPCx + QpBdOffsetC` (eq. 8-260).
 #[inline]
-fn chroma_qp(params: &ReconParams, cu_qp_delta_val: i32, cidx: TfComponent) -> u32 {
-    let qp_bd_y = qp_bd_offset(params.bit_depth_luma);
+fn chroma_qp(params: &ReconParams, qp_y: i32, cidx: TfComponent) -> u32 {
     let qp_bd_c = qp_bd_offset(params.bit_depth_chroma);
-    // QpY (without the luma BdOffset) — the §8.6.1 chroma input.
-    let qpy = {
-        let modulus = 52 + qp_bd_y;
-        (params.slice_qp_y + cu_qp_delta_val + 52 + 2 * qp_bd_y).rem_euclid(modulus) - qp_bd_y
-    };
+    // `qp_y` is the already-derived (eq. 8-283) QpY — the §8.6.1
+    // chroma input.
+    let qpy = qp_y;
     let offset = match cidx {
         TfComponent::Cb => params.cb_qp_offset,
         TfComponent::Cr => params.cr_qp_offset,
@@ -581,7 +583,7 @@ impl CuResidual {
 /// position.
 ///
 /// `(x_cb, y_cb)` is the CU's luma top-left; `n_cb_s` its luma side.
-/// `cu_qp_delta_val` is the §7.4.9.14 delta carried by the CU (`0` for the
+/// `qp_y` is the §8.6.1-derived `QpY` of the CU (`SliceQpY` for the
 /// single-QG case). Returns `CuResidual` with the luma plane and — for a
 /// non-monochrome `ChromaArrayType` — the Cb / Cr planes.
 ///
@@ -593,7 +595,7 @@ pub fn extract_cu_residual(
     x_cb: usize,
     y_cb: usize,
     n_cb_s: usize,
-    cu_qp_delta_val: i32,
+    qp_y: i32,
     transquant_bypass: bool,
 ) -> Result<CuResidual, ReconError> {
     let cat = params.chroma_array_type;
@@ -619,7 +621,7 @@ pub fn extract_cu_residual(
             x_cb,
             y_cb,
             log2_cb,
-            cu_qp_delta_val,
+            qp_y,
             transquant_bypass,
             &mut luma,
             cb.as_mut(),
@@ -643,7 +645,7 @@ fn extract_residual_tree(
     x0: usize,
     y0: usize,
     log2_trafo_size: u32,
-    cu_qp_delta_val: i32,
+    qp_y: i32,
     transquant_bypass: bool,
     luma: &mut CuResidualPlane,
     mut cb: Option<&mut CuResidualPlane>,
@@ -660,7 +662,7 @@ fn extract_residual_tree(
                     x0 + dx,
                     y0 + dy,
                     log2_trafo_size - 1,
-                    cu_qp_delta_val,
+                    qp_y,
                     transquant_bypass,
                     luma,
                     cb.as_deref_mut(),
@@ -673,7 +675,7 @@ fn extract_residual_tree(
             let n_tbs = 1usize << log2_trafo_size;
             // Luma residual (§8.6.2 with the MODE_INTER path).
             if let Some(rb) = &unit.residual_luma {
-                let qp = luma_qp(params, cu_qp_delta_val);
+                let qp = luma_qp(params, qp_y);
                 let res =
                     inter_residual_block(params, rb, TfComponent::Luma, qp, transquant_bypass)?;
                 luma.write_block(x0, y0, n_tbs, &res);
@@ -684,7 +686,7 @@ fn extract_residual_tree(
                 let (sw, sh) = sub_wh_c(params.chroma_array_type);
                 let (xc, yc) = (x0 / sw, y0 / sh);
                 if let Some(plane) = cb {
-                    let qp = chroma_qp(params, cu_qp_delta_val, TfComponent::Cb);
+                    let qp = chroma_qp(params, qp_y, TfComponent::Cb);
                     write_chroma_residual_blocks(
                         params,
                         &unit.residual_cb,
@@ -698,7 +700,7 @@ fn extract_residual_tree(
                     )?;
                 }
                 if let Some(plane) = cr {
-                    let qp = chroma_qp(params, cu_qp_delta_val, TfComponent::Cr);
+                    let qp = chroma_qp(params, qp_y, TfComponent::Cr);
                     write_chroma_residual_blocks(
                         params,
                         &unit.residual_cr,
@@ -791,6 +793,54 @@ pub struct ReconCtx {
     /// §6.4.1 z-scan availability denies neighbours across slice
     /// boundaries.
     slice_addr_rs: Vec<u32>,
+    /// §8.6.1 per-picture luma-QP derivation state (`None` for the
+    /// standalone per-CTU helpers, which fall back to the
+    /// `qPY_PRED == SliceQpY` single-QG shortcut).
+    qp: Option<QpState>,
+}
+
+/// §8.6.1 quantization-parameter derivation state: the per-4×4 `QpY`
+/// map (feeding the `qPY_A` / `qPY_B` neighbour reads and the §8.7.2
+/// deblocking QP), the decode-order `qPY_PREV` thread, and the current
+/// quantization group.
+#[derive(Debug)]
+struct QpState {
+    /// Per-4×4-cell `QpY`.
+    map: Vec<i8>,
+    w_cells: usize,
+    h_cells: usize,
+    /// `Log2MinCuQpDeltaSize`.
+    qg_log2: u32,
+    /// `CtbLog2SizeY` (the §8.6.1 same-CTB gate on `qPY_A` / `qPY_B`).
+    ctb_log2: u32,
+    /// `SliceQpY`.
+    slice_qp_y: i32,
+    /// `QpBdOffsetY`.
+    qp_bd_offset_y: i32,
+    /// `QpY` of the most recent coding unit (becomes `qPY_PREV` when the
+    /// next quantization group starts). `None` before the first QG of
+    /// the slice.
+    last_cu_qp: Option<i32>,
+    /// The current quantization group's grid cell + its `qPY_PRED`.
+    cur_qg: Option<(usize, usize)>,
+    cur_pred: i32,
+    /// `CuQpDeltaVal` accumulated for the current QG (0 until a CU in
+    /// the group carries the decoded delta).
+    cur_delta: i32,
+    /// The most recent CU origin `derive_cu_qp` resolved (idempotence
+    /// guard: the intra path may query the same CU twice).
+    last_cu: Option<(usize, usize)>,
+    last_qp: i32,
+}
+
+impl QpState {
+    fn cell(&self, x: usize, y: usize) -> usize {
+        (y >> 2).min(self.h_cells - 1) * self.w_cells + (x >> 2).min(self.w_cells - 1)
+    }
+
+    fn qp_at(&self, x: usize, y: usize) -> i32 {
+        i32::from(self.map[self.cell(x, y)])
+    }
 }
 
 impl ReconCtx {
@@ -825,7 +875,142 @@ impl ReconCtx {
             field: IntraModeField::new(pic_width_luma, pic_height_luma, ctb_log2_size_y),
             tiling,
             slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
+            qp: None,
         })
+    }
+
+    /// Initialize the §8.6.1 per-picture QP-derivation state.
+    ///
+    /// `slice_qp_y` is `SliceQpY`; `qg_log2` is `Log2MinCuQpDeltaSize`
+    /// (§7.4.3.3.1: `CtbLog2SizeY − diff_cu_qp_delta_depth`);
+    /// `qp_bd_offset_y` is `QpBdOffsetY`. Must be called before the CU
+    /// walk when the picture carries `cu_qp_delta` values; without it
+    /// the per-CU derivation falls back to the `qPY_PRED == SliceQpY`
+    /// single-QG shortcut.
+    pub fn init_qp_state(&mut self, slice_qp_y: i32, qg_log2: u32, qp_bd_offset_y: i32) {
+        // The 4×4 cell grid matches the intra-mode field's min-block grid.
+        let w_cells = self.field.w_blocks();
+        let h_cells = self.field.h_blocks();
+        self.qp = Some(QpState {
+            map: vec![slice_qp_y as i8; w_cells * h_cells],
+            w_cells,
+            h_cells,
+            qg_log2,
+            ctb_log2: self.field.ctb_log2(),
+            slice_qp_y,
+            qp_bd_offset_y,
+            last_cu_qp: None,
+            cur_qg: None,
+            cur_pred: slice_qp_y,
+            cur_delta: 0,
+            last_cu: None,
+            last_qp: slice_qp_y,
+        });
+    }
+
+    /// §8.6.1 — derive `QpY` for the coding unit at `(x_cb, y_cb)` of
+    /// side `1 << log2_cb_size`, whose transform tree carries
+    /// `cu_delta` (`Some` when a `cu_qp_delta` was decoded in it).
+    ///
+    /// Must be invoked once per coding unit **in decode order**; the
+    /// derivation threads `qPY_PREV` across quantization groups and
+    /// stamps the per-4×4 QP map. Re-invoking for the same CU origin
+    /// returns the cached value. Returns the fallback single-QG value
+    /// when [`Self::init_qp_state`] was not called.
+    pub fn derive_cu_qp(
+        &mut self,
+        params: &ReconParams,
+        x_cb: usize,
+        y_cb: usize,
+        log2_cb_size: u32,
+        cu_delta: Option<i32>,
+    ) -> i32 {
+        let Some(_) = self.qp else {
+            return fallback_qp_y(params, cu_delta.unwrap_or(0));
+        };
+        // Idempotence: the picture drivers may resolve the same CU twice
+        // (once for the deblock descriptor, once inside the intra path).
+        if let Some(qp) = self
+            .qp
+            .as_ref()
+            .and_then(|q| (q.last_cu == Some((x_cb, y_cb))).then_some(q.last_qp))
+        {
+            return qp;
+        }
+        // The quantization-group origin (§8.6.1): xQg = xCb − (xCb &
+        // ((1 << Log2MinCuQpDeltaSize) − 1)).
+        let (qg_log2, cur_qg, ctb_log2) = {
+            let q = self.qp.as_ref().unwrap();
+            (q.qg_log2, q.cur_qg, q.ctb_log2)
+        };
+        let x_qg = x_cb & !((1usize << qg_log2) - 1);
+        let y_qg = y_cb & !((1usize << qg_log2) - 1);
+        let qg = (x_qg >> qg_log2, y_qg >> qg_log2);
+        if cur_qg != Some(qg) {
+            // New quantization group: derive qPY_PRED (steps 1–4).
+            let q = self.qp.as_ref().unwrap();
+            // Step 1 — qPY_PREV (first QG in slice ⇒ SliceQpY; the tile
+            // / WPP CTB-row resets are follow-ups of those subsystems).
+            let qp_prev = q.last_cu_qp.unwrap_or(q.slice_qp_y);
+            // Step 2 — qPY_A from (xQg − 1, yQg), same-CTB gated.
+            let same_ctb_a = x_qg > 0
+                && (x_qg - 1) >> ctb_log2 == x_cb >> ctb_log2
+                && y_qg >> ctb_log2 == y_cb >> ctb_log2;
+            let avail_a =
+                x_qg > 0 && same_ctb_a && self.available(x_cb, y_cb, x_qg as i64 - 1, y_qg as i64);
+            let q = self.qp.as_ref().unwrap();
+            let qp_a = if avail_a {
+                q.qp_at(x_qg - 1, y_qg)
+            } else {
+                qp_prev
+            };
+            // Step 3 — qPY_B from (xQg, yQg − 1), same-CTB gated.
+            let same_ctb_b = y_qg > 0
+                && (y_qg - 1) >> ctb_log2 == y_cb >> ctb_log2
+                && x_qg >> ctb_log2 == x_cb >> ctb_log2;
+            let avail_b =
+                y_qg > 0 && same_ctb_b && self.available(x_cb, y_cb, x_qg as i64, y_qg as i64 - 1);
+            let q = self.qp.as_mut().unwrap();
+            let qp_b = if avail_b {
+                q.qp_at(x_qg, y_qg - 1)
+            } else {
+                qp_prev
+            };
+            // Step 4 — qPY_PRED (eq. 8-282).
+            q.cur_pred = (qp_a + qp_b + 1) >> 1;
+            q.cur_qg = Some(qg);
+            q.cur_delta = 0;
+        }
+        let q = self.qp.as_mut().unwrap();
+        // §7.4.9.14: CuQpDeltaVal applies from the CU that decodes it to
+        // the end of the quantization group.
+        if let Some(delta) = cu_delta {
+            q.cur_delta = delta;
+        }
+        // Eq. 8-283.
+        let modulus = 52 + q.qp_bd_offset_y;
+        let qp_y = (q.cur_pred + q.cur_delta + 52 + 2 * q.qp_bd_offset_y).rem_euclid(modulus)
+            - q.qp_bd_offset_y;
+        // Stamp the CU area for later qPY_A / qPY_B reads + deblocking.
+        let n = 1usize << log2_cb_size;
+        for y in (y_cb..(y_cb + n).min(q.h_cells * 4)).step_by(4) {
+            for x in (x_cb..(x_cb + n).min(q.w_cells * 4)).step_by(4) {
+                let idx = q.cell(x, y);
+                q.map[idx] = qp_y as i8;
+            }
+        }
+        q.last_cu_qp = Some(qp_y);
+        q.last_cu = Some((x_cb, y_cb));
+        q.last_qp = qp_y;
+        qp_y
+    }
+
+    /// The §8.6.1-derived `QpY` recorded at a luma location (for the
+    /// deblocking p-side QP). Returns `None` when no QP state is
+    /// initialized.
+    #[must_use]
+    pub fn qp_y_at(&self, x_luma: usize, y_luma: usize) -> Option<i32> {
+        self.qp.as_ref().map(|q| q.qp_at(x_luma, y_luma))
     }
 
     /// Set the per-CTB `SliceAddrRs` map (one entry per CTB raster
@@ -1309,6 +1494,12 @@ fn reconstruct_cu(
         params.chroma_array_type == 2,
     );
 
+    // §8.6.1 — derive the CU's QpY (threading qPY_PREV across
+    // quantization groups when the picture-level QP state is
+    // initialized; single-QG fallback otherwise).
+    let cu_delta = cu.transform_tree.as_ref().and_then(first_tree_cu_qp_delta);
+    let qp_y = ctx.derive_cu_qp(params, x_cb, y_cb, cu.log2_cb_size, cu_delta);
+
     // Walk the transform tree, reconstructing each leaf transform block.
     // For PART_NxN the top-level tree is a Split whose four children map to
     // the four luma PBs (each carrying that PB's luma mode); chroma uses
@@ -1317,6 +1508,14 @@ fn reconstruct_cu(
         if is_nxn {
             if let TransformTree::Split { children, .. } = tree {
                 let half = n_cb / 2;
+                // §7.3.8.10: when the four children are 4×4 luma leaves
+                // (and ChromaArrayType != 3), the CU's chroma transform
+                // blocks are decoded once, deferred to blkIdx == 3 — the
+                // children carry no chroma of their own.
+                let child_log2 = cu.log2_cb_size - 1;
+                let defer_chroma = child_log2 == 2
+                    && params.chroma_array_type != 0
+                    && params.chroma_array_type != 3;
                 let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
                 for (i, (child, (dx, dy))) in children.iter().zip(offsets).enumerate() {
                     reconstruct_transform_tree(
@@ -1326,9 +1525,25 @@ fn reconstruct_cu(
                         child,
                         x_cb + dx,
                         y_cb + dy,
-                        cu.log2_cb_size - 1,
+                        child_log2,
                         pb_modes[i],
                         intra_pred_mode_c,
+                        qp_y,
+                        cu.cu_transquant_bypass_flag,
+                        defer_chroma,
+                    )?;
+                }
+                if defer_chroma {
+                    reconstruct_deferred_chroma(
+                        pic,
+                        params,
+                        ctx,
+                        children,
+                        x_cb,
+                        y_cb,
+                        cu.log2_cb_size,
+                        intra_pred_mode_c,
+                        qp_y,
                         cu.cu_transquant_bypass_flag,
                     )?;
                 }
@@ -1345,9 +1560,77 @@ fn reconstruct_cu(
             cu.log2_cb_size,
             pb_modes[0],
             intra_pred_mode_c,
+            qp_y,
             cu.cu_transquant_bypass_flag,
+            false,
         )?;
     }
+    Ok(())
+}
+
+/// The §7.4.9.14 `cu_qp_delta` decoded inside a CU's transform tree
+/// (the first leaf carrying one, in z-scan order), if any.
+pub(crate) fn first_tree_cu_qp_delta(tree: &TransformTree) -> Option<i32> {
+    match tree {
+        TransformTree::Leaf { unit, .. } => unit.cu_qp_delta.as_ref().map(|d| d.value),
+        TransformTree::Split { children, .. } => children.iter().find_map(first_tree_cu_qp_delta),
+    }
+}
+
+/// §7.3.8.10 deferred-chroma reconstruction: the chroma transform blocks
+/// of an 8×8 luma node whose children are 4×4 leaves are carried by the
+/// `blkIdx == 3` child's transform unit and cover the whole node.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_deferred_chroma(
+    pic: &mut Picture,
+    params: &ReconParams,
+    ctx: &ReconCtx,
+    children: &[TransformTree; 4],
+    x0: usize,
+    y0: usize,
+    log2_trafo_size: u32,
+    intra_pred_mode_c: u8,
+    qp_y: i32,
+    transquant_bypass: bool,
+) -> Result<(), ReconError> {
+    let TransformTree::Leaf { unit, .. } = &children[3] else {
+        // A malformed tree (blkIdx 3 split below 4×4) cannot occur; the
+        // §7.3.8.8 recursion bottoms out at MinTbLog2SizeY >= 2.
+        return Ok(());
+    };
+    let (sw, sh) = sub_wh_c(params.chroma_array_type);
+    let xc = x0 / sw;
+    let yc = y0 / sh;
+    // Chroma TB side: half the 8×8 node for 4:2:0 / 4:2:2 → 4.
+    let n_tbs_c = (1usize << log2_trafo_size) / 2;
+    reconstruct_chroma_blocks(
+        pic,
+        params,
+        ctx,
+        Plane::Cb,
+        TfComponent::Cb,
+        &unit.residual_cb,
+        xc,
+        yc,
+        n_tbs_c,
+        intra_pred_mode_c,
+        qp_y,
+        transquant_bypass,
+    )?;
+    reconstruct_chroma_blocks(
+        pic,
+        params,
+        ctx,
+        Plane::Cr,
+        TfComponent::Cr,
+        &unit.residual_cr,
+        xc,
+        yc,
+        n_tbs_c,
+        intra_pred_mode_c,
+        qp_y,
+        transquant_bypass,
+    )?;
     Ok(())
 }
 
@@ -1362,11 +1645,20 @@ fn reconstruct_transform_tree(
     log2_trafo_size: u32,
     intra_pred_mode_y: u8,
     intra_pred_mode_c: u8,
+    qp_y: i32,
     transquant_bypass: bool,
+    skip_chroma: bool,
 ) -> Result<(), ReconError> {
     match tree {
         TransformTree::Split { children, .. } => {
-            let half = 1usize << (log2_trafo_size - 1);
+            let child_log2 = log2_trafo_size - 1;
+            // §7.3.8.10: 4×4 luma children (ChromaArrayType != 3) defer
+            // their chroma to blkIdx == 3, covering this whole node.
+            let defer_chroma = !skip_chroma
+                && child_log2 == 2
+                && params.chroma_array_type != 0
+                && params.chroma_array_type != 3;
+            let half = 1usize << child_log2;
             // raster order [tl, tr, bl, br].
             let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
             for (child, (dx, dy)) in children.iter().zip(offsets) {
@@ -1377,9 +1669,25 @@ fn reconstruct_transform_tree(
                     child,
                     x0 + dx,
                     y0 + dy,
-                    log2_trafo_size - 1,
+                    child_log2,
                     intra_pred_mode_y,
                     intra_pred_mode_c,
+                    qp_y,
+                    transquant_bypass,
+                    skip_chroma || defer_chroma,
+                )?;
+            }
+            if defer_chroma {
+                reconstruct_deferred_chroma(
+                    pic,
+                    params,
+                    ctx,
+                    children,
+                    x0,
+                    y0,
+                    log2_trafo_size,
+                    intra_pred_mode_c,
+                    qp_y,
                     transquant_bypass,
                 )?;
             }
@@ -1395,7 +1703,9 @@ fn reconstruct_transform_tree(
             log2_trafo_size,
             intra_pred_mode_y,
             intra_pred_mode_c,
+            qp_y,
             transquant_bypass,
+            skip_chroma,
         ),
     }
 }
@@ -1411,18 +1721,15 @@ fn reconstruct_transform_unit(
     log2_trafo_size: u32,
     intra_pred_mode_y: u8,
     intra_pred_mode_c: u8,
+    qp_y: i32,
     transquant_bypass: bool,
+    skip_chroma: bool,
 ) -> Result<(), ReconError> {
     let n_tbs = 1usize << log2_trafo_size;
-    // §7.4.9.14 CuQpDeltaVal — the delta carried by this TU when its
-    // §7.3.8.14 gate fired (once per quantization group), else 0. The
-    // single-CU-per-QG fixtures resolve this to the CU's one decoded
-    // delta; a deeper multi-CU-per-QG picture threads the accumulated
-    // value (a DPB-level followup).
-    let cu_qp_delta_val = unit.cu_qp_delta.as_ref().map_or(0, |d| d.value);
+    let _ = unit.cu_qp_delta.as_ref();
 
-    // Luma block.
-    let luma_qp = luma_qp(params, cu_qp_delta_val);
+    // Luma block: `qp_y` is the CU's §8.6.1-derived QpY.
+    let luma_qp = luma_qp(params, qp_y);
     let luma_levels = unit.residual_luma.as_ref().map(|rb| rb.levels.as_slice());
     reconstruct_intra_block(
         pic,
@@ -1446,10 +1753,18 @@ fn reconstruct_transform_unit(
     // 4:2:0; the §7.3.8.10 driver collects the chroma residual at the
     // parent node, so a chroma block is reconstructed once per luma node
     // that carries chroma residual (the residual_cb / residual_cr lists).
-    if params.chroma_array_type != 0 {
+    if params.chroma_array_type != 0 && !skip_chroma {
         let (sw, sh) = sub_wh_c(params.chroma_array_type);
         let xc = x0 / sw;
         let yc = y0 / sh;
+        // §7.3.8.10 log2TrafoSizeC = Max( 2, log2TrafoSize −
+        // ( ChromaArrayType == 3 ? 0 : 1 ) ); the log2TrafoSize == 2
+        // deferred case is handled by the parent (skip_chroma).
+        let n_tbs_c = if params.chroma_array_type == 3 {
+            1usize << log2_trafo_size
+        } else {
+            (1usize << log2_trafo_size) / 2
+        };
         reconstruct_chroma_blocks(
             pic,
             params,
@@ -1459,8 +1774,9 @@ fn reconstruct_transform_unit(
             &unit.residual_cb,
             xc,
             yc,
+            n_tbs_c,
             intra_pred_mode_c,
-            cu_qp_delta_val,
+            qp_y,
             transquant_bypass,
         )?;
         reconstruct_chroma_blocks(
@@ -1472,8 +1788,9 @@ fn reconstruct_transform_unit(
             &unit.residual_cr,
             xc,
             yc,
+            n_tbs_c,
             intra_pred_mode_c,
-            cu_qp_delta_val,
+            qp_y,
             transquant_bypass,
         )?;
     }
@@ -1490,29 +1807,23 @@ fn reconstruct_chroma_blocks(
     residual_blocks: &[crate::residual::ResidualBlock],
     xc: usize,
     yc: usize,
+    n_tbs_c: usize,
     intra_pred_mode_c: u8,
-    cu_qp_delta_val: i32,
+    qp_y: i32,
     transquant_bypass: bool,
 ) -> Result<(), ReconError> {
-    let qp = chroma_qp(params, cu_qp_delta_val, cidx);
-    // The chroma transform-block side is derived from the residual block's
-    // own log2 size; when no residual is coded the chroma TB still needs
-    // prediction, so synthesize one zero-residual block of the chroma TB
-    // size derived from the luma node geometry handled by the caller.
-    if residual_blocks.is_empty() {
-        // No coded chroma residual at this node — prediction only. The TB
-        // side equals the chroma plane sub-sampling of the parent luma
-        // node; the caller passes the node geometry implicitly through
-        // xc/yc, so we cannot know the size here. This branch is only
-        // reached for chroma-cbf-clear nodes; the flat single-CU fixtures
-        // always carry the chroma residual at the CU root, so leave the
-        // (already-zero / previously-written) prediction in place by
-        // doing nothing. A full DPB build wires the cbf-clear prediction
-        // path; see the module followups.
-        return Ok(());
-    }
-    for rb in residual_blocks {
-        let n_tbs = rb.size();
+    let qp = chroma_qp(params, qp_y, cidx);
+    // `ChromaArrayType == 2` stacks two square chroma TBs vertically per
+    // luma node (upper then lower); every other type has one. A block
+    // with no coded residual (cbf clear) is still intra-PREDICTED — only
+    // the residual add is skipped.
+    let vertical_blocks = if params.chroma_array_type == 2 { 2 } else { 1 };
+    for v in 0..vertical_blocks {
+        // §7.3.8.10 residual order is upper-then-lower; a single coded
+        // block with `ChromaArrayType == 2` is ambiguous without the cbf
+        // pair, so pair positionally (exact for 0- and 2-entry lists —
+        // the 4:2:2 single-cbf case is a tracked follow-up).
+        let levels = residual_blocks.get(v).map(|rb| rb.levels.as_slice());
         reconstruct_intra_block(
             pic,
             params,
@@ -1521,10 +1832,10 @@ fn reconstruct_chroma_blocks(
             cidx,
             ip_component_of(cidx),
             xc,
-            yc,
-            n_tbs,
+            yc + v * n_tbs_c,
+            n_tbs_c,
             intra_pred_mode_c,
-            Some(rb.levels.as_slice()),
+            levels,
             qp,
             transquant_bypass,
             false,

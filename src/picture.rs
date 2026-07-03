@@ -230,6 +230,24 @@ impl Picture {
         out.extend(self.cr.iter().map(|&v| v as u8));
         Some(out)
     }
+
+    /// Pack the three planes into a single planar little-endian 16-bit
+    /// buffer in `Y` then `Cb` then `Cr` order, each plane row-major —
+    /// the `yuv420p10le` / `yuv422p10le` / `yuv444p10le` fixture layout
+    /// for bit depths above 8. Samples are already clipped to
+    /// `[0, (1 << BitDepth) − 1]` by the reconstruction step so the
+    /// `u16` cast is exact.
+    #[must_use]
+    pub fn to_planar_le16(&self) -> Vec<u8> {
+        let n = self.luma.len() + self.cb.len() + self.cr.len();
+        let mut out = Vec::with_capacity(n * 2);
+        for plane in [&self.luma, &self.cb, &self.cr] {
+            for &v in plane.iter() {
+                out.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+        }
+        out
+    }
 }
 
 /// `Clip3( 0, (1 << bitDepth) − 1, x )` — the §8 `Clip1Y` / `Clip1C`

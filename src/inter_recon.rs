@@ -218,6 +218,7 @@ pub fn resolve_and_reconstruct_inter_cu(
     ctx: &PuMvContext,
     available: &dyn Fn(i32, i32) -> bool,
     refs: &RefListAccess,
+    qp_y: i32,
 ) -> Result<(), ReconError> {
     let n_cb_s = 1usize << cu.log2_cb_size;
     let desc = InterCuDesc {
@@ -230,19 +231,13 @@ pub fn resolve_and_reconstruct_inter_cu(
     let rects =
         crate::pu_mv::pu_partitions(cu.x0 as usize, cu.y0 as usize, n_cb_s, cu.part_mode.into());
 
-    // §7.4.9.14 CuQpDeltaVal carried by the CU (0 for the single-QG case).
-    let cu_qp_delta_val = cu
-        .transform_tree
-        .as_ref()
-        .and_then(first_leaf_cu_qp_delta)
-        .unwrap_or(0);
     let residual = extract_cu_residual(
         params,
         cu.transform_tree.as_ref(),
         cu.x0 as usize,
         cu.y0 as usize,
         n_cb_s,
-        cu_qp_delta_val,
+        qp_y,
         cu.cu_transquant_bypass_flag,
     )?;
 
@@ -325,6 +320,9 @@ pub struct InterSliceContext {
     pub no_backward_pred: bool,
     /// `MinTbLog2SizeY` (the transform-block grid base).
     pub min_tb_log2_size_y: u32,
+    /// `Log2MinCuQpDeltaSize` (§7.4.3.3.1) — the §8.6.1
+    /// quantization-group size.
+    pub log2_min_cu_qp_delta_size: u32,
     /// `slice_deblocking_filter_disabled_flag == 0` — run the §8.7.2
     /// in-loop deblocking pass after reconstruction.
     pub deblock_enabled: bool,
@@ -407,6 +405,12 @@ pub fn reconstruct_inter_picture(
         slice.min_tb_log2_size_y,
         tiles,
     )?;
+    // §8.6.1 QP-derivation state (QpBdOffsetY = 6 * bit_depth_minus8).
+    ctx.init_qp_state(
+        slice.slice_qp_y,
+        slice.log2_min_cu_qp_delta_size,
+        6 * (i32::from(params.bit_depth_luma) - 8),
+    );
     let mut field = MotionField::new(pic_width_luma, pic_height_luma);
 
     let ctb_size = 1usize << slice.ctb_log2_size_y;
@@ -557,16 +561,20 @@ fn reconstruct_inter_quadtree(
 /// Build the §8.7.2 [`crate::deblock::DeblockCuDesc`] for one coding unit
 /// (its geometry, transform-split topology, partition mode, QP context, and
 /// the CB-boundary edge-flag gates) and append it to `deblock_cus`.
+#[allow(clippy::too_many_arguments)]
 fn collect_deblock_cu(
     cu: &CodingUnit,
     slice: &InterSliceContext,
     chroma_array_type: u8,
     bit_depth_luma: u8,
     bit_depth_chroma: u8,
+    qp_y: i32,
+    qp_y_p_left: i32,
+    qp_y_p_top: i32,
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
 ) {
     let cu_params = crate::deblock::DeblockCuParams {
-        qp_y: slice.slice_qp_y,
+        qp_y,
         beta_offset_div2: slice.beta_offset_div2,
         tc_offset_div2: slice.tc_offset_div2,
         cb_qp_offset: slice.cb_qp_offset,
@@ -581,7 +589,8 @@ fn collect_deblock_cu(
             y_cb: cu.y0 as usize,
             log2_cb_size: cu.log2_cb_size,
             params: cu_params,
-            qp_y_p: slice.slice_qp_y,
+            qp_y_p_left,
+            qp_y_p_top,
         },
         transform_split: crate::deblock::TransformSplit::from_tree(cu.transform_tree.as_ref()),
         part_mode: cu.part_mode,
@@ -610,13 +619,44 @@ fn reconstruct_inter_leaf_cu(
 ) -> Result<(), ReconError> {
     use crate::binarization::CuPredMode;
     let n_cb_s = 1usize << cu.log2_cb_size;
+    // §8.6.1 — the CU's QpY (in decode order, before anything reads the
+    // QP map for this CU).
+    let cu_delta = cu
+        .transform_tree
+        .as_ref()
+        .and_then(crate::recon::first_tree_cu_qp_delta);
+    let qp_y = ctx.derive_cu_qp(
+        params,
+        cu.x0 as usize,
+        cu.y0 as usize,
+        cu.log2_cb_size,
+        cu_delta,
+    );
     if slice.deblock_enabled {
+        // Deblocking p-side QPs from the already-stamped neighbour map
+        // (§8.7.2.5.3 QpP); the picture boundary rows fall back to the
+        // CU's own QP (those edges are not filtered).
+        let x0 = cu.x0 as usize;
+        let y0 = cu.y0 as usize;
+        let qp_p_left = if x0 > 0 {
+            ctx.qp_y_at(x0 - 1, y0).unwrap_or(slice.slice_qp_y)
+        } else {
+            qp_y
+        };
+        let qp_p_top = if y0 > 0 {
+            ctx.qp_y_at(x0, y0 - 1).unwrap_or(slice.slice_qp_y)
+        } else {
+            qp_y
+        };
         collect_deblock_cu(
             cu,
             slice,
             params.chroma_array_type,
             params.bit_depth_luma,
             params.bit_depth_chroma,
+            qp_y,
+            qp_p_left,
+            qp_p_top,
             deblock_cus,
         );
     }
@@ -695,20 +735,8 @@ fn reconstruct_inter_leaf_cu(
         mv_ctx,
         &available,
         refs,
+        qp_y,
     )
-}
-
-/// Find the first transform-unit `cu_qp_delta` in a transform tree (the
-/// single-quantization-group case threads exactly one delta per CU).
-fn first_leaf_cu_qp_delta(tree: &crate::transform_tree::TransformTree) -> Option<i32> {
-    match tree {
-        crate::transform_tree::TransformTree::Leaf { unit, .. } => {
-            unit.cu_qp_delta.as_ref().map(|d| d.value)
-        }
-        crate::transform_tree::TransformTree::Split { children, .. } => {
-            children.iter().find_map(first_leaf_cu_qp_delta)
-        }
-    }
 }
 
 /// §8.3 + §8.5 — decode one inter (P / B) picture end to end against the
@@ -953,6 +981,7 @@ mod tests {
             &ctx,
             &available,
             &refs,
+            25,
         )
         .unwrap();
 
@@ -1009,6 +1038,7 @@ mod tests {
             &ctx,
             &available,
             &refs,
+            25,
         )
         .unwrap();
 
@@ -1025,6 +1055,7 @@ mod tests {
 
     fn p_slice_ctx() -> InterSliceContext {
         InterSliceContext {
+            log2_min_cu_qp_delta_size: 4,
             curr_poc: 4,
             slice_is_b: false,
             ctb_log2_size_y: 5,
