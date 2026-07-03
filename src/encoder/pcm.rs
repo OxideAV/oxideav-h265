@@ -192,11 +192,11 @@ fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
 }
 
 /// §7.3.2.3 — the all-defaults PPS (deblocking disabled).
-fn write_pps() -> Vec<u8> {
+fn write_pps(dependent_slice_segments_enabled: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
-    w.put_bit(0); // dependent_slice_segments_enabled_flag
+    w.put_bit(u8::from(dependent_slice_segments_enabled)); // dependent_slice_segments_enabled_flag
     w.put_bit(0); // output_flag_present_flag
     w.put_bits(0, 3); // num_extra_slice_header_bits
     w.put_bit(0); // sign_data_hiding_enabled_flag
@@ -228,35 +228,69 @@ fn write_pps() -> Vec<u8> {
     w.finish()
 }
 
-/// §7.3.6.1 + §7.3.8.1 — one whole-picture IDR I-slice whose every CTB
-/// is a PCM coding unit.
-fn write_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut w = BitWriter::new();
-
-    // ---- slice_segment_header() ----
-    w.put_bit(1); // first_slice_segment_in_pic_flag
-    w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
-    w.ue(0); // slice_pic_parameter_set_id
-    w.ue(2); // slice_type = I
-             // IDR: no POC / RPS syntax. SAO off in SPS: no slice SAO flags.
-    w.se(SLICE_QP - 26); // slice_qp_delta
-                         // Deblocking: control present but override disabled — no per-slice
-                         // deblocking syntax; slice_loop_filter_across_slices gate is false
-                         // (SAO off + deblocking disabled). No tiles / WPP: no entry points.
-    w.rbsp_trailing_bits(); // byte_alignment() before slice data
-
-    // ---- slice_segment_data() ----
+/// §7.3.6.1 + §7.3.8.1 — the picture's slice segments: one
+/// independent I-slice segment followed by `segments − 1` dependent
+/// slice segments (§7.4.7.1 inheritance), every CTB a PCM coding
+/// unit. Returns one RBSP per segment.
+///
+/// The CABAC context variables carry across the segment boundary per
+/// §9.3.1 / §9.3.2.4 (`TableStateIdxDs` storage at each segment's
+/// `end_of_slice_segment_flag == 1`, §9.3.2.5 synchronization at the
+/// next dependent segment's start) — each segment gets a fresh
+/// §9.3.5.2 arithmetic engine over the shared context state.
+fn write_idr_slice_segments(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    segments: usize,
+) -> Vec<Vec<u8>> {
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
+    let total = ctbs_x * ctbs_y;
     let cw = width / 2;
-    let mut cabac = CabacEncoder::new();
-    // initType 0 (I slice, equation 9-7), SliceQpY = 26.
+    // Ceil(Log2(PicSizeInCtbsY)) — the slice_segment_address width.
+    let addr_bits = (usize::BITS - (total - 1).leading_zeros()).max(1) as u8;
+
+    // Segment boundaries: split the CTB raster as evenly as possible.
+    let seg_len = total.div_ceil(segments);
+    let starts: Vec<usize> = (0..segments).map(|i| i * seg_len).collect();
+
+    // initType 0 (I slice, equation 9-7), SliceQpY = 26. Shared across
+    // the picture's segments (§9.3.2.4 / §9.3.2.5).
     let mut ctxs = SliceContexts::init(init_type(2, false), SLICE_QP);
 
-    for ctb_row in 0..ctbs_y {
-        for ctb_col in 0..ctbs_x {
-            let x0 = ctb_col * CTB;
-            let y0 = ctb_row * CTB;
+    let mut out = Vec::with_capacity(segments);
+    for (seg_idx, &start) in starts.iter().enumerate() {
+        let end = (start + seg_len).min(total);
+        let mut w = BitWriter::new();
+
+        // ---- slice_segment_header() ----
+        let first = seg_idx == 0;
+        w.put_bit(u8::from(first)); // first_slice_segment_in_pic_flag
+        w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
+        w.ue(0); // slice_pic_parameter_set_id
+        if !first {
+            // dependent_slice_segments_enabled_flag == 1 in the PPS.
+            w.put_bit(1); // dependent_slice_segment_flag
+            w.put_bits(start as u32, addr_bits); // slice_segment_address
+        } else if segments > 1 {
+            // (first segment of a multi-segment picture: the address
+            // syntax is absent for first_slice_segment_in_pic_flag.)
+        }
+        if first {
+            w.ue(2); // slice_type = I
+            w.se(SLICE_QP - 26); // slice_qp_delta
+        }
+        // No tiles / WPP: no entry points. No header extension.
+        w.rbsp_trailing_bits(); // byte_alignment() before slice data
+
+        // ---- slice_segment_data() ----
+        let mut cabac = CabacEncoder::new();
+        for addr in start..end {
+            let x0 = (addr % ctbs_x) * CTB;
+            let y0 = (addr / ctbs_x) * CTB;
             // coding_quadtree: CtbLog2SizeY == MinCbLog2SizeY, so no
             // split_cu_flag. coding_unit( x0, y0, 4 ):
             // part_mode — §9.3.3.7 intra at MinCb: bin "1" = PART_2Nx2N.
@@ -281,15 +315,15 @@ fn write_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usize) 
             }
             // §9.3.5.2: re-init the arithmetic engine after PCM data.
             cabac.reinit();
-            // end_of_slice_segment_flag: 1 only at the last CTB.
-            let last = ctb_row == ctbs_y - 1 && ctb_col == ctbs_x - 1;
-            cabac.encode_terminate(&mut w, u8::from(last));
+            // end_of_slice_segment_flag: 1 only at the segment's last CTB.
+            cabac.encode_terminate(&mut w, u8::from(addr == end - 1));
         }
+        // The final terminate-1 flush wrote the rbsp_stop_one_bit;
+        // rbsp_slice_segment_trailing_bits() is alignment zeros from here.
+        w.align_zero();
+        out.push(w.finish());
     }
-    // The final terminate-1 flush wrote the rbsp_stop_one_bit;
-    // rbsp_slice_segment_trailing_bits() is alignment zeros from here.
-    w.align_zero();
-    w.finish()
+    out
 }
 
 /// Encode one 4:2:0 8-bit frame as a self-contained IDR access unit
@@ -306,7 +340,42 @@ pub fn encode_idr_pcm_au(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, PcmEncodeError> {
+    encode_au(y, cb, cr, width, height, 1)
+}
+
+/// As [`encode_idr_pcm_au`], with the picture split into `segments`
+/// slice segments: the first independent, the rest §7.3.6.1
+/// *dependent* slice segments (`dependent_slice_segment_flag == 1`,
+/// header inherited per §7.4.7.1, CABAC contexts carried across the
+/// boundary per §9.3.2.4 / §9.3.2.5).
+///
+/// # Errors
+/// [`PcmEncodeError`] as for [`encode_idr_pcm_au`], or
+/// [`PcmEncodeError::BadDimensions`] when `segments` is 0 or exceeds
+/// the picture's CTB count.
+pub fn encode_idr_pcm_au_segmented(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    segments: usize,
+) -> Result<Vec<u8>, PcmEncodeError> {
+    encode_au(y, cb, cr, width, height, segments)
+}
+
+fn encode_au(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    segments: usize,
+) -> Result<Vec<u8>, PcmEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+        return Err(PcmEncodeError::BadDimensions { width, height });
+    }
+    if segments == 0 || segments > (width / CTB) * (height / CTB) {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
     let check = |plane: &'static str, buf: &[u8], expected: usize| {
@@ -325,12 +394,14 @@ pub fn encode_idr_pcm_au(
     check("cr", cr, width * height / 4)?;
 
     let level_idc = level_idc_for(width * height);
-    let units = [
+    let mut units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
         nal_unit(33, 0, 0, &write_sps(width, height, level_idc)), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps()),          // PPS_NUT
-        nal_unit(20, 0, 0, &write_idr_slice(y, cb, cr, width, height)), // IDR_N_LP
+        nal_unit(34, 0, 0, &write_pps(segments > 1)), // PPS_NUT
     ];
+    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, segments) {
+        units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
+    }
     Ok(annexb(&units))
 }
 
@@ -396,6 +467,60 @@ mod tests {
         assert_eq!(&p0[..y0.len()], &y0[..]);
         assert_eq!(&p1[..y1.len()], &y1[..]);
         assert_ne!(p0, p1);
+    }
+
+    /// Dependent slice segments: the picture splits into an independent
+    /// segment + dependent segments whose CABAC contexts continue
+    /// across the NAL boundary (§9.3.2.4 / §9.3.2.5) and whose header
+    /// values inherit per §7.4.7.1 — still bit-exact lossless.
+    #[test]
+    fn dependent_slice_segments_roundtrip_losslessly() {
+        let (w, h) = (48usize, 48usize); // 9 CTBs
+        let (y, cb, cr) = gradient_planes(w, h);
+        for segments in [2usize, 3, 9] {
+            let au = encode_idr_pcm_au_segmented(&y, &cb, &cr, w, h, segments).expect("encode");
+            // One IDR NAL per segment behind the parameter sets.
+            let units = crate::nal::collect_nal_units(&au).expect("walk");
+            assert_eq!(units.len(), 3 + segments, "{segments} segments");
+            assert!(units[4..].iter().all(|u| u.header.nal_unit_type == 20));
+            let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
+            assert_eq!(frames.len(), 1);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&y);
+            expected.extend_from_slice(&cb);
+            expected.extend_from_slice(&cr);
+            assert_eq!(
+                frames[0].picture.to_planar_u8().expect("8-bit"),
+                expected,
+                "{segments}-segment lossless roundtrip"
+            );
+        }
+    }
+
+    /// A dependent segment decoded WITHOUT the preceding segment's
+    /// stored context state is rejected, not misdecoded.
+    #[test]
+    fn dependent_segment_without_predecessor_is_rejected() {
+        let (y, cb, cr) = gradient_planes(32, 32);
+        let au = encode_idr_pcm_au_segmented(&y, &cb, &cr, 32, 32, 2).expect("encode");
+        let units = crate::nal::collect_nal_units(&au).expect("walk");
+        // Drop the independent slice segment (unit 3), keep the
+        // dependent one: the driver must refuse.
+        let mut broken = Vec::new();
+        for (i, u) in units.iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
+            let mut coded = vec![0, 0, 0, 1];
+            coded.extend(crate::encoder::nal::nal_unit(
+                u.header.nal_unit_type,
+                u.header.nuh_layer_id,
+                u.header.temporal_id,
+                &u.rbsp,
+            ));
+            broken.extend(coded);
+        }
+        assert!(crate::sequence::decode_annexb_sequence(&broken).is_err());
     }
 
     #[test]

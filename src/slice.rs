@@ -1633,6 +1633,11 @@ impl SliceSegmentHeader {
         // dependent slice segment the header ends after the SAO block,
         // before byte_alignment() (the rest of the header is inherited).
         if dependent_slice_segment_flag {
+            // §7.3.6.1: the entry-point block and the header-extension
+            // block sit OUTSIDE the !dependent gate — a dependent slice
+            // segment signals its own substream entry points.
+            let entry_point_offsets = parse_entry_point_offsets(&mut br, sps, pps)?;
+            let slice_segment_header_extension_length = parse_header_extension(&mut br, pps)?;
             let byte_offset = consume_byte_alignment(&mut br)?;
             return Ok(Self {
                 first_slice_segment_in_pic_flag,
@@ -1672,8 +1677,8 @@ impl SliceSegmentHeader {
                 cu_chroma_qp_offset_enabled_flag: false,
                 deblocking: None,
                 slice_loop_filter_across_slices_enabled_flag: None,
-                entry_point_offsets: None,
-                slice_segment_header_extension_length: None,
+                entry_point_offsets,
+                slice_segment_header_extension_length,
                 byte_offset_to_slice_data: Some(byte_offset),
                 ref_pic_lists_modification: None,
                 opaque_tail: None,
@@ -2120,54 +2125,10 @@ impl SliceSegmentHeader {
         // byte length of subset `i` follows as
         // `entry_point_offset_minus1[i] + 1` (§7.4.7.1) and is exposed
         // via [`EntryPointOffsets::subset_length`].
-        let entry_point_offsets = if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag
-        {
-            let num_entry_point_offsets = br.ue()?;
-            let max_num_entry_point_offsets = num_entry_point_offsets_upper_bound(sps, pps);
-            if num_entry_point_offsets > max_num_entry_point_offsets {
-                return Err(SliceError::ValueOutOfRange {
-                    field: "num_entry_point_offsets",
-                    got: num_entry_point_offsets as i64,
-                });
-            }
-            let (offset_len_minus1, entry_point_offset_minus1) = if num_entry_point_offsets > 0 {
-                let v = br.ue()?;
-                if v > 31 {
-                    return Err(SliceError::ValueOutOfRange {
-                        field: "offset_len_minus1",
-                        got: v as i64,
-                    });
-                }
-                let len = v as u8;
-                let bits = len + 1;
-                let mut offsets = Vec::with_capacity(num_entry_point_offsets as usize);
-                for _ in 0..num_entry_point_offsets {
-                    offsets.push(br.u(bits)?);
-                }
-                (len, offsets)
-            } else {
-                (0, Vec::new())
-            };
-            Some(EntryPointOffsets {
-                num_entry_point_offsets,
-                offset_len_minus1,
-                entry_point_offset_minus1,
-            })
-        } else {
-            None
-        };
+        let entry_point_offsets = parse_entry_point_offsets(&mut br, sps, pps)?;
 
         // Slice-segment-header extension block (§7.3.6.1).
-        let slice_segment_header_extension_length =
-            if pps.slice_segment_header_extension_present_flag {
-                let len = br.ue()?;
-                for _ in 0..len {
-                    br.skip(8)?;
-                }
-                Some(len)
-            } else {
-                None
-            };
+        let slice_segment_header_extension_length = parse_header_extension(&mut br, pps)?;
 
         let byte_offset = consume_byte_alignment(&mut br)?;
 
@@ -2263,6 +2224,68 @@ fn pic_size_in_ctbs_y(sps: &SeqParameterSet) -> u32 {
 fn pic_height_in_ctbs_y(sps: &SeqParameterSet) -> u32 {
     let ctb_size = 1u32 << sps.log2_ctb_size();
     sps.pic_height_in_luma_samples.div_ceil(ctb_size)
+}
+
+/// §7.3.6.1 — the entry-point-offset block (`num_entry_point_offsets`,
+/// `offset_len_minus1`, `entry_point_offset_minus1[i]`), present when
+/// tiles or entropy-coding sync are enabled. Signalled by BOTH
+/// independent and dependent slice segments.
+fn parse_entry_point_offsets(
+    br: &mut BitReader<'_>,
+    sps: &SeqParameterSet,
+    pps: &PicParameterSet,
+) -> Result<Option<EntryPointOffsets>, SliceError> {
+    if !(pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag) {
+        return Ok(None);
+    }
+    let num_entry_point_offsets = br.ue()?;
+    let max_num_entry_point_offsets = num_entry_point_offsets_upper_bound(sps, pps);
+    if num_entry_point_offsets > max_num_entry_point_offsets {
+        return Err(SliceError::ValueOutOfRange {
+            field: "num_entry_point_offsets",
+            got: num_entry_point_offsets as i64,
+        });
+    }
+    let (offset_len_minus1, entry_point_offset_minus1) = if num_entry_point_offsets > 0 {
+        let v = br.ue()?;
+        if v > 31 {
+            return Err(SliceError::ValueOutOfRange {
+                field: "offset_len_minus1",
+                got: v as i64,
+            });
+        }
+        let len = v as u8;
+        let bits = len + 1;
+        let mut offsets = Vec::with_capacity(num_entry_point_offsets as usize);
+        for _ in 0..num_entry_point_offsets {
+            offsets.push(br.u(bits)?);
+        }
+        (len, offsets)
+    } else {
+        (0, Vec::new())
+    };
+    Ok(Some(EntryPointOffsets {
+        num_entry_point_offsets,
+        offset_len_minus1,
+        entry_point_offset_minus1,
+    }))
+}
+
+/// §7.3.6.1 — the slice-segment-header extension block (length +
+/// skipped payload bytes), present for BOTH independent and dependent
+/// slice segments when the PPS signals it.
+fn parse_header_extension(
+    br: &mut BitReader<'_>,
+    pps: &PicParameterSet,
+) -> Result<Option<u32>, SliceError> {
+    if !pps.slice_segment_header_extension_present_flag {
+        return Ok(None);
+    }
+    let len = br.ue()?;
+    for _ in 0..len {
+        br.skip(8)?;
+    }
+    Ok(Some(len))
 }
 
 /// §7.4.7.1 upper bound on the slice header's

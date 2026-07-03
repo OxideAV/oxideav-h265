@@ -368,20 +368,33 @@ impl SequenceDecoder {
             first_slice_type,
         ));
 
+        // §7.4.7.1 — a dependent slice segment inherits the slice-level
+        // header values (and SliceAddrRs) from the preceding independent
+        // slice segment; §9.3.2.2 restores its CABAC context variables
+        // from the state stored at the end of the previous segment
+        // (TableStateIdxDs, §9.3.2.4).
+        let mut cur_indep: &SegmentData = indep;
+        let mut ds_stored: Option<SliceContexts> = None;
         for seg in segs {
             if seg.header.dependent_slice_segment_flag {
-                return Err(SequenceError::Unsupported(
-                    "dependent slice segments (SliceAddrRs inheritance) are not decoded yet",
-                ));
+                if ds_stored.is_none() {
+                    return Err(SequenceError::Malformed(
+                        "dependent slice segment without a preceding segment's context state",
+                    ));
+                }
+            } else {
+                cur_indep = seg;
             }
             decode_slice_segment_data(
                 seg,
+                &cur_indep.header,
                 sps,
                 pps,
                 &geom,
                 &mut parse_state,
                 &mut decoded,
                 &mut slice_addr_of,
+                &mut ds_stored,
                 self.tolerant,
             )?;
         }
@@ -575,14 +588,17 @@ pub fn decode_annexb_sequence_debug(
     let st = seg.header.slice_type.unwrap();
     let mut parse_state =
         PictureParseState::new(&build_slice_data_params(&seg.header, sps, pps, &geom, st));
+    let mut ds_stored = None;
     let res = decode_slice_segment_data(
         seg,
+        &seg.header,
         sps,
         pps,
         &geom,
         &mut parse_state,
         &mut decoded,
         &mut slice_addr_of,
+        &mut ds_stored,
         false,
     );
     if let Err(e) = res {
@@ -640,14 +656,17 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
         &geom,
         st0,
     ));
+    let mut ds_stored = None;
     if let Err(e) = decode_slice_segment_data(
         seg,
+        &seg.header,
         &sps,
         &pps,
         &geom,
         &mut parse_state,
         &mut decoded,
         &mut slice_addr_of,
+        &mut ds_stored,
         true,
     ) {
         eprintln!("(walk error: {e})");
@@ -1126,18 +1145,29 @@ fn build_slice_data_params(
 /// §7.3.8.1 — CABAC-decode one slice segment's `slice_segment_data()`,
 /// appending its CTUs (in tile-scan order) to `decoded` and recording
 /// each CTB's `SliceAddrRs` in `slice_addr_of`.
+///
+/// `effective_header` supplies the slice-level values — for an
+/// independent segment it is `seg.header` itself; for a dependent
+/// segment it is the preceding independent segment's header (§7.4.7.1
+/// inheritance). `ds_stored` is the picture's §9.3.2.4
+/// `TableStateIdxDs` context store: read (synchronized, §9.3.2.5 /
+/// §9.3.2.2) at a dependent segment's start, written at every
+/// segment's `end_of_slice_segment_flag == 1` while
+/// `dependent_slice_segments_enabled_flag` is set.
 #[allow(clippy::too_many_arguments)]
 fn decode_slice_segment_data(
     seg: &SegmentData,
+    effective_header: &SliceSegmentHeader,
     sps: &SeqParameterSet,
     pps: &PicParameterSet,
     geom: &Geometry,
     state: &mut PictureParseState,
     decoded: &mut Vec<(u32, u32, CodingTreeUnit)>,
     slice_addr_of: &mut [Option<u32>],
+    ds_stored: &mut Option<SliceContexts>,
     tolerant: bool,
 ) -> Result<(), SequenceError> {
-    let header = &seg.header;
+    let header = effective_header;
     let slice_type = header
         .slice_type
         .ok_or(SequenceError::Malformed("independent slice without type"))?;
@@ -1146,7 +1176,8 @@ fn decode_slice_segment_data(
         .slice_qp_y(pps)
         .ok_or(SequenceError::Malformed("slice header without slice_qp"))?;
 
-    let data_offset = header
+    let data_offset = seg
+        .header
         .byte_offset_to_slice_data
         .ok_or(SequenceError::Malformed("slice header without data offset"))?;
     if data_offset >= seg.rbsp.len() {
@@ -1156,11 +1187,13 @@ fn decode_slice_segment_data(
     // §7.4.7.1 — split `slice_segment_data( )` into its subsets. The
     // entry-point offsets count CODED bytes (emulation-prevention bytes
     // included), so map each escaped boundary onto the stripped RBSP.
+    // (Entry points are per-segment syntax: read them from the
+    // segment's own header even when it is dependent.)
     let substreams = split_substreams(
         &seg.escaped,
         seg.rbsp.len(),
         data_offset,
-        header.entry_point_offsets.as_ref(),
+        seg.header.entry_point_offsets.as_ref(),
     )?;
 
     // Table 9-4 initType: I => 0; P => cabac_init ? 2 : 1;
@@ -1175,8 +1208,11 @@ fn decode_slice_segment_data(
 
     let tiling = geom.tiling()?;
     let wpp = pps.entropy_coding_sync_enabled_flag;
+    // §7.4.7.1: SliceAddrRs is the INDEPENDENT segment's address; a
+    // dependent segment starts decoding at its own segment address but
+    // its CTBs belong to the inherited slice.
     let slice_addr_rs = header.slice_segment_address;
-    let mut ctb_addr_ts = tiling.ctb_addr_rs_to_ts(slice_addr_rs);
+    let mut ctb_addr_ts = tiling.ctb_addr_rs_to_ts(seg.header.slice_segment_address);
     let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
 
     let sub_range = |idx: usize| -> Result<&[u8], SequenceError> {
@@ -1190,7 +1226,16 @@ fn decode_slice_segment_data(
     let mut sub_idx = 0usize;
     let mut engine = CabacEngine::new(BitReader::new(sub_range(0)?))
         .map_err(|_| SequenceError::Malformed("slice data too short for CABAC init"))?;
-    let mut ctx = SliceContexts::init(it, slice_qp_y);
+    // §9.3.2.2 — a dependent slice segment synchronizes its context
+    // variables from TableStateIdxDs (§9.3.2.5) instead of
+    // re-initializing.
+    let mut ctx = if seg.header.dependent_slice_segment_flag {
+        ds_stored.clone().ok_or(SequenceError::Malformed(
+            "dependent segment without Ds state",
+        ))?
+    } else {
+        SliceContexts::init(it, slice_qp_y)
+    };
     // §9.3.2.4 / §9.3.2.5 — the WPP context storage (stored after the
     // second CTB of a row; synchronized at the next row's start when
     // the above-right CTB is available).
@@ -1281,6 +1326,11 @@ fn decode_slice_segment_data(
             .map_err(|_| SequenceError::Malformed("CABAC underrun at end_of_slice_segment"))?;
         ctb_addr_ts += 1;
         if eos {
+            // §9.3.1 / §9.3.2.4 — store the context variables into
+            // TableStateIdxDs for a following dependent slice segment.
+            if pps.dependent_slice_segments_enabled_flag {
+                *ds_stored = Some(ctx.clone());
+            }
             break;
         }
         if (ctb_addr_ts as usize) >= pic_size_in_ctbs {
