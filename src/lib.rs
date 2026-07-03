@@ -247,6 +247,7 @@ pub mod deblock;
 pub mod decode;
 pub mod decoder;
 pub mod dpb;
+pub mod encoder;
 pub mod hrd;
 pub mod hvcc;
 pub mod inter_pred;

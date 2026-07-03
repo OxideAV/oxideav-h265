@@ -195,7 +195,7 @@ impl ContextModel {
 /// 4 quantized-range columns. Transcribed from the H.265 specification
 /// text (§9.3.4.3.2.1).
 #[rustfmt::skip]
-const RANGE_TAB_LPS: [[u8; 4]; 64] = [
+pub(crate) const RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240], [128, 167, 197, 227], [128, 158, 187, 216], [123, 150, 178, 205],
     [116, 142, 169, 195], [111, 135, 160, 185], [105, 128, 152, 175], [100, 122, 144, 166],
     [ 95, 116, 137, 158], [ 90, 110, 130, 150], [ 85, 104, 123, 142], [ 81,  99, 117, 135],
@@ -218,7 +218,7 @@ const RANGE_TAB_LPS: [[u8; 4]; 64] = [
 /// transition after decoding the LPS (`1 − valMps`). Transcribed from
 /// the H.265 specification text (§9.3.4.3.2.2).
 #[rustfmt::skip]
-const TRANS_IDX_LPS: [u8; 64] = [
+pub(crate) const TRANS_IDX_LPS: [u8; 64] = [
      0,  0,  1,  2,  2,  4,  4,  5,  6,  7,  8,  9,  9, 11, 11, 12,
     13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24,
     24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33,
@@ -229,7 +229,7 @@ const TRANS_IDX_LPS: [u8; 64] = [
 /// transition after decoding the MPS (`valMps`). Transcribed from the
 /// H.265 specification text (§9.3.4.3.2.2).
 #[rustfmt::skip]
-const TRANS_IDX_MPS: [u8; 64] = [
+pub(crate) const TRANS_IDX_MPS: [u8; 64] = [
      1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
     33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
@@ -305,6 +305,38 @@ impl<'a> CabacEngine<'a> {
     #[must_use]
     pub fn bit_pos(&self) -> usize {
         self.reader.bit_pos()
+    }
+
+    /// §7.3.8.7 support — consume `pcm_alignment_zero_bit` from the
+    /// raw bit source until it is byte-aligned. Called right after a
+    /// `pcm_flag == 1` terminate bin: §9.3.4.3.5 leaves the bitstream
+    /// pointer directly after the terminating one bit, so the raw
+    /// reader position is authoritative for `byte_aligned()`.
+    ///
+    /// # Errors
+    /// [`CabacError::EndOfBuffer`] on a truncated stream.
+    pub fn pcm_align(&mut self) -> Result<(), CabacError> {
+        while self.reader.bit_pos() % 8 != 0 {
+            let _ = self.reader.u1()?;
+        }
+        Ok(())
+    }
+
+    /// §7.3.8.7 support — read one raw `u(n)` field (a
+    /// `pcm_sample_luma` / `pcm_sample_chroma` value) directly from the
+    /// bit source, bypassing the arithmetic engine.
+    ///
+    /// # Errors
+    /// [`CabacError::EndOfBuffer`] on a truncated stream.
+    pub fn read_raw_bits(&mut self, n: u8) -> Result<u32, CabacError> {
+        Ok(self.reader.u(n)?)
+    }
+
+    /// Consume the engine and hand back its bit source (tests / callers
+    /// that continue non-CABAC parsing after termination).
+    #[must_use]
+    pub fn into_reader(self) -> BitReader<'a> {
+        self.reader
     }
 
     /// §9.3.4.3.3 — renormalization in the arithmetic decoding engine
