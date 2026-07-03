@@ -191,3 +191,23 @@ fn registry_decoder_decodes_hvcc_mp4_sample_byte_exact() {
     }
     assert_eq!(out, ISO_PAIR_YUV, "hvcC-path decode byte-exact");
 }
+
+/// Explicit weighted prediction, P slices (§8.5.3.3.4.3): an 8-frame
+/// fade whose seven P slices carry `weighted_pred_flag == 1` with
+/// non-default per-slice `pred_weight_table()` denominators, weights
+/// and offsets (luma and chroma) — byte-exact through the whole
+/// decode chain, including the temporal merge candidates the fade's
+/// skip CUs select.
+#[test]
+fn weighted_pred_p_decodes_byte_exact() {
+    assert_decodes_byte_exact(WEIGHTED_P_HEVC, WEIGHTED_P_YUV, 8, "weighted-pred-p");
+}
+
+/// Explicit weighted bi-prediction (§8.5.3.3.4.3 equation 8-277): the
+/// same fade coded as an I/P/B pyramid with `weighted_bipred_flag == 1`
+/// — every B-slice PU combine (uni L0, uni L1 and bi) runs the
+/// explicit path with two reference lists' weights.
+#[test]
+fn weighted_bipred_b_decodes_byte_exact() {
+    assert_decodes_byte_exact(WEIGHTED_B_HEVC, WEIGHTED_B_YUV, 8, "weighted-bipred-b");
+}

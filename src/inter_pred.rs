@@ -1,10 +1,10 @@
-//! §8.5.3.3.3 — fractional sample interpolation, plus the §8.5.3.3.4.2
-//! default weighted sample prediction combine.
+//! §8.5.3.3.3 — fractional sample interpolation, plus the §8.5.3.3.4
+//! weighted sample prediction combines (default and explicit).
 //!
 //! This module turns a reference-picture sample plane and a motion vector
-//! into an `(nPbW)x(nPbH)` array of inter-predicted samples. Three ITU-T
-//! H.265 (08/2021) subclauses are implemented, in the order
-//! §8.5.3.3.3.1 invokes them:
+//! into an `(nPbW)x(nPbH)` array of inter-predicted samples. Four ITU-T
+//! H.265 subclauses are implemented, in the order §8.5.3.3.3.1 invokes
+//! them:
 //!
 //! * §8.5.3.3.3.2 **luma sample interpolation** ([`interp_luma_block`]) —
 //!   the separable 8-tap quarter-pel filter of equations 8-224..8-238,
@@ -17,27 +17,31 @@
 //!   `shift2 = 6`, `shift3 = Max(2, 14 − BitDepthC)`.
 //! * §8.5.3.3.4.2 **default weighted sample prediction**
 //!   ([`default_weighted_pred`]) — the uni- / bi-predictive combine of
-//!   equations 8-262..8-264 (`weighted_pred_flag == 0`), with
+//!   equations 8-262..8-264 (`weightedPredFlag == 0`), with
 //!   `shift1 = Max(2, 14 − bitDepth)`, `shift2 = Max(3, 15 − bitDepth)`.
+//! * §8.5.3.3.4.3 **explicit weighted sample prediction**
+//!   ([`explicit_weighted_pred`]) — the per-reference weight / offset
+//!   combine of equations 8-265..8-277 (`weightedPredFlag == 1`, i.e.
+//!   `weighted_pred_flag` for P slices / `weighted_bipred_flag` for B
+//!   slices), with `log2Wd = log2WeightDenom + shift1`.
 //!
 //! The interpolation processes emit *intermediate* sample values at the
 //! `14 − BitDepth`-bit internal precision the spec carries between
 //! §8.5.3.3.3 and §8.5.3.3.4 (i.e. the `>> shift1` / `>> shift2` outputs,
 //! `A << shift3` for full-pel — they are **not** yet clipped to the
-//! sample range). The default-weighted combine consumes those
-//! intermediate arrays and produces the final `[0, (1 << bitDepth) − 1]`
-//! prediction samples.
+//! sample range). The weighted combines consume those intermediate
+//! arrays and produce the final `[0, (1 << bitDepth) − 1]` prediction
+//! samples.
 //!
 //! ## Scope
 //!
 //! The numerics are self-contained. The §8.5.3.2 merge / §8.5.3.1 MV
 //! derivation that produces `mvLX`, the §8.5.3.3.1 driver that splits a
 //! motion vector into its integer / fractional parts and walks the
-//! prediction block, the §8.5.3.3.4.3 explicit weighted-prediction path,
-//! and the §8.6.5 picture-construction step that adds the residual are
-//! the caller's / follow-ups' responsibility — this module starts at a
-//! `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and stops
-//! at the prediction sample arrays.
+//! prediction block, and the §8.6.5 picture-construction step that adds
+//! the residual are the caller's responsibility — this module starts at
+//! a `(xInt, yInt, xFrac, yFrac)` location and a reference plane, and
+//! stops at the prediction sample arrays.
 
 /// A reference-picture luma / chroma sample plane with the §8.5.3.3.3
 /// `Clip3( 0, dim − 1, … )` edge-extension border (equations 8-222 /
@@ -516,6 +520,131 @@ pub fn default_weighted_pred(
 }
 
 // ---------------------------------------------------------------------------
+// §8.5.3.3.4.3 — explicit weighted sample prediction
+// ---------------------------------------------------------------------------
+
+/// §8.5.3.3.4.3 — combine the L0 / L1 intermediate prediction arrays with
+/// per-reference explicit weights and offsets (the `weightedPredFlag == 1`
+/// path, equations 8-265..8-277).
+///
+/// `log2_weight_denom` is the component's raw denominator
+/// (`luma_log2_weight_denom` for luma, `ChromaLog2WeightDenom` for
+/// chroma); the process adds `shift1 = Max(2, 14 − bitDepth)` internally
+/// (equations 8-265 / 8-270). `w0` / `w1` are `LumaWeightLX[refIdxLX]` or
+/// `ChromaWeightLX[refIdxLX][cIdx−1]`; `o0` / `o1` are the offsets
+/// **already scaled** by `WpOffsetBdShiftY` / `WpOffsetBdShiftC`
+/// (equations 8-268 / 8-269 / 8-273 / 8-274). An unused list's weight /
+/// offset values are ignored.
+///
+/// # Errors
+/// Same contract as [`default_weighted_pred`].
+#[allow(clippy::too_many_arguments)]
+pub fn explicit_weighted_pred(
+    pred_l0: &[i32],
+    pred_l1: &[i32],
+    pred_flag_l0: bool,
+    pred_flag_l1: bool,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    log2_weight_denom: u8,
+    w0: i32,
+    o0: i32,
+    w1: i32,
+    o1: i32,
+    bit_depth: u8,
+) -> Result<Vec<i32>, InterPredError> {
+    if n_pb_w == 0 || n_pb_h == 0 {
+        return Err(InterPredError::EmptyBlock);
+    }
+    if !(8..=16).contains(&bit_depth) {
+        return Err(InterPredError::InvalidBitDepth(bit_depth));
+    }
+    let count = n_pb_w * n_pb_h;
+    if pred_flag_l0 && pred_l0.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l0.len(),
+        });
+    }
+    if pred_flag_l1 && pred_l1.len() != count {
+        return Err(InterPredError::ArrayLengthMismatch {
+            expected: count,
+            got: pred_l1.len(),
+        });
+    }
+
+    // Equations 8-265 / 8-270: log2Wd = log2WeightDenom + shift1.
+    let shift1 = core::cmp::max(2, 14 - i64::from(bit_depth));
+    let log2_wd = i64::from(log2_weight_denom) + shift1;
+    let max_val = (1i64 << bit_depth) - 1;
+    let (w0, o0, w1, o1) = (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
+
+    let mut out = vec![0i32; count];
+    match (pred_flag_l0, pred_flag_l1) {
+        // Uni-predictive from L0 (equation 8-275).
+        (true, false) => {
+            let round = 1i64 << (log2_wd - 1);
+            for (o, &p0) in out.iter_mut().zip(pred_l0) {
+                *o = ((((i64::from(p0) * w0 + round) >> log2_wd) + o0).clamp(0, max_val)) as i32;
+            }
+        }
+        // Uni-predictive from L1 (equation 8-276).
+        (false, true) => {
+            let round = 1i64 << (log2_wd - 1);
+            for (o, &p1) in out.iter_mut().zip(pred_l1) {
+                *o = ((((i64::from(p1) * w1 + round) >> log2_wd) + o1).clamp(0, max_val)) as i32;
+            }
+        }
+        // Bi-predictive (equation 8-277).
+        (true, true) => {
+            let round = (o0 + o1 + 1) << log2_wd;
+            for ((o, &p0), &p1) in out.iter_mut().zip(pred_l0).zip(pred_l1) {
+                *o = (((i64::from(p0) * w0 + i64::from(p1) * w1 + round) >> (log2_wd + 1))
+                    .clamp(0, max_val)) as i32;
+            }
+        }
+        (false, false) => return Err(InterPredError::EmptyPlane),
+    }
+    Ok(out)
+}
+
+/// One reference list's §8.5.3.3.4.3 weights / offsets for one PU,
+/// resolved for its `refIdxLX`: `w` is `LumaWeightLX[refIdx]` /
+/// `ChromaWeightLX[refIdx][j]`; `o` is the corresponding offset already
+/// scaled by `WpOffsetBdShiftY` / `WpOffsetBdShiftC` (equations
+/// 8-268 / 8-269 / 8-273 / 8-274).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WpListWeights {
+    /// `LumaWeightLX[refIdxLX]` (equations 8-266 / 8-267).
+    pub w_luma: i32,
+    /// `luma_offset_lX[refIdxLX] << WpOffsetBdShiftY`.
+    pub o_luma: i32,
+    /// `ChromaWeightLX[refIdxLX][0]` (Cb).
+    pub w_cb: i32,
+    /// `ChromaOffsetLX[refIdxLX][0] << WpOffsetBdShiftC` (Cb).
+    pub o_cb: i32,
+    /// `ChromaWeightLX[refIdxLX][1]` (Cr).
+    pub w_cr: i32,
+    /// `ChromaOffsetLX[refIdxLX][1] << WpOffsetBdShiftC` (Cr).
+    pub o_cr: i32,
+}
+
+/// The complete §8.5.3.3.4.3 inputs for one PU's weighted combine: the
+/// two log2 denominators plus each list's per-component weights, already
+/// resolved for the PU's reference indices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PuWeights {
+    /// `luma_log2_weight_denom` (§7.4.7.3).
+    pub luma_log2_weight_denom: u8,
+    /// `ChromaLog2WeightDenom` (§7.4.7.3).
+    pub chroma_log2_weight_denom: u8,
+    /// L0 weights (ignored when `predFlagL0 == 0`).
+    pub l0: WpListWeights,
+    /// L1 weights (ignored when `predFlagL1 == 0`).
+    pub l1: WpListWeights,
+}
+
+// ---------------------------------------------------------------------------
 // §8.5.3.3.1 — inter prediction sample block-walk driver
 // ---------------------------------------------------------------------------
 
@@ -650,11 +779,9 @@ fn list_chroma_pred(
 /// present) Cb / Cr, then combine the L0 / L1 intermediate arrays with
 /// the §8.5.3.3.4.2 default weighted sample prediction.
 ///
-/// This is the block-walk driver that turns resolved per-PU motion data
-/// (`mvLX`, `mvCLX`, `predFlagLX`, and the §8.5.3.3.2-selected reference
-/// planes) into the final clipped prediction-sample planes — the
-/// `weighted_pred_flag == 0` / `weighted_bipred_flag == 0` path of
-/// §8.5.3.3.4.1. The §8.5.3.3.4.3 explicit-weighting path is a follow-up.
+/// This is the `weightedPredFlag == 0` path of §8.5.3.3.4.1; see
+/// [`predict_inter_pu_weighted`] for the full dispatch including the
+/// §8.5.3.3.4.3 explicit-weighting path.
 ///
 /// # Errors
 ///
@@ -666,6 +793,24 @@ pub fn predict_inter_pu(
     l1: &ListPrediction<'_>,
     geom: &InterPredGeometry,
 ) -> Result<InterPrediction, InterPredError> {
+    predict_inter_pu_weighted(l0, l1, geom, None)
+}
+
+/// §8.5.3.3.1 + §8.5.3.3.4.1 — as [`predict_inter_pu`], with the
+/// weighted-sample-prediction dispatch: `weights == None` is the
+/// `weightedPredFlag == 0` default combine (§8.5.3.3.4.2);
+/// `weights == Some(..)` is the explicit per-reference combine
+/// (§8.5.3.3.4.3), with the PU's `refIdxLX`-resolved weights carried in
+/// the [`PuWeights`].
+///
+/// # Errors
+/// Same contract as [`predict_inter_pu`].
+pub fn predict_inter_pu_weighted(
+    l0: &ListPrediction<'_>,
+    l1: &ListPrediction<'_>,
+    geom: &InterPredGeometry,
+    weights: Option<&PuWeights>,
+) -> Result<InterPrediction, InterPredError> {
     if geom.n_pb_w == 0 || geom.n_pb_h == 0 {
         return Err(InterPredError::EmptyBlock);
     }
@@ -673,7 +818,7 @@ pub fn predict_inter_pu(
         return Err(InterPredError::EmptyPlane);
     }
 
-    // Luma: interpolate each used list, then default-weighted combine.
+    // Luma: interpolate each used list, then combine per §8.5.3.3.4.1.
     let pred_l0_luma = if l0.pred_flag {
         list_luma_pred(l0, geom)?
     } else {
@@ -684,34 +829,71 @@ pub fn predict_inter_pu(
     } else {
         Vec::new()
     };
-    let luma = default_weighted_pred(
-        &pred_l0_luma,
-        &pred_l1_luma,
-        l0.pred_flag,
-        l1.pred_flag,
-        geom.n_pb_w,
-        geom.n_pb_h,
-        geom.bit_depth_luma,
-    )?;
+    let luma = match weights {
+        None => default_weighted_pred(
+            &pred_l0_luma,
+            &pred_l1_luma,
+            l0.pred_flag,
+            l1.pred_flag,
+            geom.n_pb_w,
+            geom.n_pb_h,
+            geom.bit_depth_luma,
+        )?,
+        Some(wp) => explicit_weighted_pred(
+            &pred_l0_luma,
+            &pred_l1_luma,
+            l0.pred_flag,
+            l1.pred_flag,
+            geom.n_pb_w,
+            geom.n_pb_h,
+            wp.luma_log2_weight_denom,
+            wp.l0.w_luma,
+            wp.l0.o_luma,
+            wp.l1.w_luma,
+            wp.l1.o_luma,
+            geom.bit_depth_luma,
+        )?,
+    };
 
     let (mut cb, mut cr) = (Vec::new(), Vec::new());
     if geom.chroma_array_type != 0 {
         let (sub_w, sub_h) = sub_wh_c_local(geom.chroma_array_type);
-        cb = combine_chroma(l0, l1, geom, sub_w, sub_h, |lp| lp.cb)?;
-        cr = combine_chroma(l0, l1, geom, sub_w, sub_h, |lp| lp.cr)?;
+        let wp_cb = weights.map(|wp| {
+            (
+                wp.chroma_log2_weight_denom,
+                wp.l0.w_cb,
+                wp.l0.o_cb,
+                wp.l1.w_cb,
+                wp.l1.o_cb,
+            )
+        });
+        let wp_cr = weights.map(|wp| {
+            (
+                wp.chroma_log2_weight_denom,
+                wp.l0.w_cr,
+                wp.l0.o_cr,
+                wp.l1.w_cr,
+                wp.l1.o_cr,
+            )
+        });
+        cb = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cb, |lp| lp.cb)?;
+        cr = combine_chroma(l0, l1, geom, sub_w, sub_h, wp_cr, |lp| lp.cr)?;
     }
 
     Ok(InterPrediction { luma, cb, cr })
 }
 
-/// Interpolate and §8.5.3.3.4.2-combine one chroma component for a PU.
-/// `select` picks the Cb or Cr reference plane from a [`ListPrediction`].
+/// Interpolate and §8.5.3.3.4-combine one chroma component for a PU.
+/// `select` picks the Cb or Cr reference plane from a [`ListPrediction`];
+/// `wp` is `Some((ChromaLog2WeightDenom, w0, o0, w1, o1))` for the
+/// §8.5.3.3.4.3 explicit path, `None` for the §8.5.3.3.4.2 default.
 fn combine_chroma<'a>(
     l0: &ListPrediction<'a>,
     l1: &ListPrediction<'a>,
     geom: &InterPredGeometry,
     sub_w: i32,
     sub_h: i32,
+    wp: Option<(u8, i32, i32, i32, i32)>,
     select: impl Fn(&ListPrediction<'a>) -> Option<RefPlane<'a>>,
 ) -> Result<Vec<i32>, InterPredError> {
     let cw = geom.n_pb_w / sub_w as usize;
@@ -728,15 +910,31 @@ fn combine_chroma<'a>(
     } else {
         Vec::new()
     };
-    default_weighted_pred(
-        &p0,
-        &p1,
-        l0.pred_flag,
-        l1.pred_flag,
-        cw,
-        ch,
-        geom.bit_depth_chroma,
-    )
+    match wp {
+        None => default_weighted_pred(
+            &p0,
+            &p1,
+            l0.pred_flag,
+            l1.pred_flag,
+            cw,
+            ch,
+            geom.bit_depth_chroma,
+        ),
+        Some((denom, w0, o0, w1, o1)) => explicit_weighted_pred(
+            &p0,
+            &p1,
+            l0.pred_flag,
+            l1.pred_flag,
+            cw,
+            ch,
+            denom,
+            w0,
+            o0,
+            w1,
+            o1,
+            geom.bit_depth_chroma,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -865,6 +1063,88 @@ mod tests {
         let out = default_weighted_pred(&p0, &[], true, false, 2, 1, 8).unwrap();
         assert_eq!(out[0], 0);
         assert_eq!(out[1], 255);
+    }
+
+    /// Explicit uni-predictive L0 weight (equation 8-275): 8-bit,
+    /// denom 3 → log2Wd = 9, w0 = 7, o0 = 2:
+    /// `((100·64·7 + 256) >> 9) + 2 = 88 + 2`.
+    #[test]
+    fn explicit_weighted_uni_l0() {
+        let p0 = vec![100 << 6];
+        let out = explicit_weighted_pred(&p0, &[], true, false, 1, 1, 3, 7, 2, 0, 0, 8).unwrap();
+        assert_eq!(out[0], 90);
+    }
+
+    /// Explicit uni-predictive L1 weight (equation 8-276) mirrors L0.
+    #[test]
+    fn explicit_weighted_uni_l1() {
+        let p1 = vec![100 << 6];
+        let out = explicit_weighted_pred(&[], &p1, false, true, 1, 1, 3, 0, 0, 7, 2, 8).unwrap();
+        assert_eq!(out[0], 90);
+    }
+
+    /// Explicit bi-predictive combine (equation 8-277): denom 0 →
+    /// log2Wd = 6, w0 = 1, w1 = 3, zero offsets:
+    /// `(50·64 + 100·64·3 + 64) >> 7 = 175`.
+    #[test]
+    fn explicit_weighted_bi() {
+        let p0 = vec![50 << 6];
+        let p1 = vec![100 << 6];
+        let out = explicit_weighted_pred(&p0, &p1, true, true, 1, 1, 0, 1, 0, 3, 0, 8).unwrap();
+        assert_eq!(out[0], 175);
+        // Bi offsets enter as ((o0 + o1 + 1) << log2Wd) >> (log2Wd + 1)
+        // ≈ (o0 + o1 + 1) / 2 added to the weighted mean.
+        let out = explicit_weighted_pred(&p0, &p1, true, true, 1, 1, 0, 1, 10, 3, 9, 8).unwrap();
+        assert_eq!(out[0], 175 + 10);
+    }
+
+    /// The explicit combine clips to the sample range on both sides.
+    #[test]
+    fn explicit_weighted_clips() {
+        let p0 = vec![100 << 6, 200 << 6];
+        // Large negative offset floors at 0; weight 127 saturates at 255.
+        let out = explicit_weighted_pred(&p0, &[], true, false, 2, 1, 0, 1, -128, 0, 0, 8).unwrap();
+        assert_eq!(out[0], 0);
+        let out = explicit_weighted_pred(&p0, &[], true, false, 2, 1, 0, 127, 0, 0, 0, 8).unwrap();
+        assert_eq!(out[1], 255);
+    }
+
+    /// With weight `1 << denom` and zero offset, the explicit combine
+    /// degenerates to the default uni combine (§7.4.7.3 inferred values).
+    #[test]
+    fn explicit_default_weights_match_default_combine() {
+        let p0: Vec<i32> = (0..16).map(|v| v << 6).collect();
+        for denom in 0..=7u8 {
+            let explicit =
+                explicit_weighted_pred(&p0, &[], true, false, 4, 4, denom, 1 << denom, 0, 0, 0, 8)
+                    .unwrap();
+            let default = default_weighted_pred(&p0, &[], true, false, 4, 4, 8).unwrap();
+            assert_eq!(explicit, default, "denom={denom}");
+        }
+    }
+
+    /// Explicit-combine argument validation matches the default combine.
+    #[test]
+    fn explicit_weighted_errors() {
+        assert_eq!(
+            explicit_weighted_pred(&[], &[], false, false, 1, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::EmptyPlane)
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1, 2], &[], true, false, 1, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::ArrayLengthMismatch {
+                expected: 1,
+                got: 2
+            })
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1], &[], true, false, 0, 1, 0, 1, 0, 1, 0, 8),
+            Err(InterPredError::EmptyBlock)
+        );
+        assert_eq!(
+            explicit_weighted_pred(&[1], &[], true, false, 1, 1, 0, 1, 0, 1, 0, 7),
+            Err(InterPredError::InvalidBitDepth(7))
+        );
     }
 
     /// 10-bit full-pel luma uses shift3 = Max(2, 4) = 4.

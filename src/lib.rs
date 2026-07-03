@@ -299,9 +299,11 @@ pub use hvcc::{
     HvccRecord,
 };
 pub use inter_pred::{
-    default_weighted_pred, interp_chroma_block, interp_luma_block, predict_inter_pu,
-    InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, RefPlane,
+    default_weighted_pred, explicit_weighted_pred, interp_chroma_block, interp_luma_block,
+    predict_inter_pu, predict_inter_pu_weighted, InterPredError, InterPredGeometry,
+    InterPrediction, ListPrediction, MotionVector, PuWeights, RefPlane, WpListWeights,
 };
+pub use inter_recon::SliceWpTables;
 pub use intra_mode_field::{IntraModeField, Neighbour, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE};
 pub use motion::{
     append_combined_bi_candidates, append_zero_merge_candidates, build_merge_candidate,
@@ -322,9 +324,10 @@ pub use pu_mv::{
     PuGeometry, PuMotion, PuMvContext, PuRect,
 };
 pub use recon::{
-    build_slice_addr_map, reconstruct_inter_pu, reconstruct_intra_ctu, reconstruct_intra_ctu_ctx,
-    reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams,
-    ResolvedList, SliceSegmentBoundary,
+    build_slice_addr_map, reconstruct_inter_pu, reconstruct_inter_pu_weighted,
+    reconstruct_intra_ctu, reconstruct_intra_ctu_ctx, reconstruct_intra_picture,
+    IntraPictureParams, PlacedCtu, ReconCtx, ReconError, ReconParams, ResolvedList,
+    SliceSegmentBoundary,
 };
 pub use sao::{apply_sao_ctb, apply_sao_picture, ResolvedSao, ResolvedSaoComponent};
 pub use scaling_list::{

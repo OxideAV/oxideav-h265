@@ -22,8 +22,9 @@ use crate::cabac::{init_type, CabacEngine};
 use crate::ctx_init::SliceContexts;
 use crate::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
 use crate::dpb::{LongTermEntry, RefPicLists};
+use crate::inter_pred::WpListWeights;
 use crate::inter_recon::{
-    reconstruct_inter_picture, InterSliceContext, PlacedInterCtu, RefListAccess,
+    reconstruct_inter_picture, InterSliceContext, PlacedInterCtu, RefListAccess, SliceWpTables,
 };
 use crate::nal::{NalError, NalIter, NalUnit};
 use crate::picture::Picture;
@@ -927,7 +928,21 @@ fn build_inter_slice_context(
 ) -> InterSliceContext {
     let pps_range = pps.pps_range_extension.as_ref();
     let deblock = header.deblocking.as_ref();
-    let _ = sps;
+    // §8.5.3.3.4.1 — weightedPredFlag: weighted_pred_flag for P slices,
+    // weighted_bipred_flag for B slices.
+    let weighted_pred_flag = match slice_type {
+        SliceType::P => pps.weighted_pred_flag,
+        SliceType::B => pps.weighted_bipred_flag,
+        SliceType::I => false,
+    };
+    let wp = if weighted_pred_flag {
+        header
+            .pred_weight_table
+            .as_ref()
+            .map(|pwt| build_slice_wp_tables(pwt, sps))
+    } else {
+        None
+    };
     InterSliceContext {
         curr_poc,
         slice_is_b: slice_type == SliceType::B,
@@ -967,6 +982,71 @@ fn build_inter_slice_context(
         slice_sao_chroma_flag: header.slice_sao_chroma_flag,
         log2_sao_offset_scale_luma: pps_range.map_or(0, |r| r.log2_sao_offset_scale_luma as u8),
         log2_sao_offset_scale_chroma: pps_range.map_or(0, |r| r.log2_sao_offset_scale_chroma as u8),
+        wp,
+    }
+}
+
+/// §7.4.7.3 — resolve a parsed `pred_weight_table()` into the
+/// per-reference values the §8.5.3.3.4.3 combine reads: `LumaWeightLX[i]`
+/// / `ChromaWeightLX[i][j]` (weight-flag inference included), the
+/// `WpOffsetBdShiftY`- / `WpOffsetBdShiftC`-scaled offsets (equations
+/// 7-31 / 7-32 + 8-268 / 8-269 / 8-273 / 8-274), and the equation-7-58
+/// `ChromaOffsetLX` derivation.
+fn build_slice_wp_tables(
+    pwt: &crate::slice::PredWeightTable,
+    sps: &SeqParameterSet,
+) -> SliceWpTables {
+    let hp = sps
+        .sps_range_extension
+        .as_ref()
+        .is_some_and(|r| r.high_precision_offsets_enabled_flag);
+    let bd_y = i32::from(sps.bit_depth_luma_minus8) + 8;
+    let bd_c = i32::from(sps.bit_depth_chroma_minus8) + 8;
+    // Equations 7-31 / 7-32 / 7-34.
+    let bd_shift_y = if hp { 0 } else { bd_y - 8 };
+    let bd_shift_c = if hp { 0 } else { bd_c - 8 };
+    let half_range_c = 1i32 << (if hp { bd_c - 1 } else { 7 });
+    let chroma_denom = pwt.chroma_log2_weight_denom();
+
+    let resolve = |l0: bool, n: usize| -> Vec<WpListWeights> {
+        (0..n)
+            .map(|i| {
+                let (lw, lo, cw0, cw1, co0, co1) = if l0 {
+                    (
+                        pwt.luma_weight_l0(i),
+                        pwt.entries_l0.get(i).map(|e| e.luma_offset),
+                        pwt.chroma_weight_l0(i, 0),
+                        pwt.chroma_weight_l0(i, 1),
+                        pwt.chroma_offset_l0(i, 0, half_range_c),
+                        pwt.chroma_offset_l0(i, 1, half_range_c),
+                    )
+                } else {
+                    (
+                        pwt.luma_weight_l1(i),
+                        pwt.entries_l1.get(i).map(|e| e.luma_offset),
+                        pwt.chroma_weight_l1(i, 0),
+                        pwt.chroma_weight_l1(i, 1),
+                        pwt.chroma_offset_l1(i, 0, half_range_c),
+                        pwt.chroma_offset_l1(i, 1, half_range_c),
+                    )
+                };
+                WpListWeights {
+                    w_luma: lw.unwrap_or(1 << pwt.luma_log2_weight_denom),
+                    o_luma: lo.unwrap_or(0) << bd_shift_y,
+                    w_cb: cw0.unwrap_or(1 << chroma_denom),
+                    o_cb: co0.unwrap_or(0) << bd_shift_c,
+                    w_cr: cw1.unwrap_or(1 << chroma_denom),
+                    o_cr: co1.unwrap_or(0) << bd_shift_c,
+                }
+            })
+            .collect()
+    };
+
+    SliceWpTables {
+        luma_log2_weight_denom: pwt.luma_log2_weight_denom,
+        chroma_log2_weight_denom: chroma_denom,
+        l0: resolve(true, pwt.entries_l0.len()),
+        l1: resolve(false, pwt.entries_l1.len()),
     }
 }
 

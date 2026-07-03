@@ -25,13 +25,72 @@
 //! §6.4.2 prediction-block availability denies them as motion neighbours.
 
 use crate::dpb::{DpbEntry, RefPicLists};
+use crate::inter_pred::{PuWeights, WpListWeights};
 use crate::motion::{derive_chroma_mv, MotionField};
 use crate::picture::{sub_wh_c, Picture};
 use crate::pu_mv::{resolve_cu_motion, InterCuDesc, PuMotion, PuMvContext, PuRect};
 use crate::recon::{
-    extract_cu_residual, reconstruct_inter_pu, CuResidual, ReconError, ReconParams, ResolvedList,
+    extract_cu_residual, reconstruct_inter_pu_weighted, CuResidual, ReconError, ReconParams,
+    ResolvedList,
 };
 use crate::slice_data::{CodingUnit, PredictionUnit};
+
+/// The slice's §7.4.7.3-derived weighted-prediction tables, resolved
+/// from the parsed `pred_weight_table()` into the per-reference values
+/// the §8.5.3.3.4.3 combine reads: `LumaWeightLX[i]`,
+/// `luma_offset_lX[i] << WpOffsetBdShiftY` (equations 8-268 / 8-269),
+/// `ChromaWeightLX[i][j]` and `ChromaOffsetLX[i][j] << WpOffsetBdShiftC`
+/// (equations 8-273 / 8-274).
+///
+/// Present on an [`InterSliceContext`] exactly when `weightedPredFlag`
+/// (§8.5.3.3.4.1: `weighted_pred_flag` for P slices,
+/// `weighted_bipred_flag` for B slices) is 1 — `None` selects the
+/// §8.5.3.3.4.2 default combine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SliceWpTables {
+    /// `luma_log2_weight_denom` (§7.4.7.3).
+    pub luma_log2_weight_denom: u8,
+    /// `ChromaLog2WeightDenom` (§7.4.7.3).
+    pub chroma_log2_weight_denom: u8,
+    /// Per-`refIdxL0` weights, length `num_ref_idx_l0_active`.
+    pub l0: Vec<WpListWeights>,
+    /// Per-`refIdxL1` weights, length `num_ref_idx_l1_active` (empty
+    /// for P slices).
+    pub l1: Vec<WpListWeights>,
+}
+
+impl SliceWpTables {
+    /// Resolve one PU's [`PuWeights`] from its reference indices. An
+    /// unused list (or an index past the table, which a conforming
+    /// stream never produces) falls back to the §7.4.7.3 inferred
+    /// values `w = 1 << denom, o = 0` — the identity weighting.
+    #[must_use]
+    pub fn resolve_pu(&self, motion: &PuMotion) -> PuWeights {
+        let identity = |denom: u8| WpListWeights {
+            w_luma: 1 << self.luma_log2_weight_denom,
+            o_luma: 0,
+            w_cb: 1 << denom,
+            o_cb: 0,
+            w_cr: 1 << denom,
+            o_cr: 0,
+        };
+        let pick = |list: &[WpListWeights], used: bool, idx: i32| {
+            if used {
+                list.get(idx.max(0) as usize)
+                    .copied()
+                    .unwrap_or_else(|| identity(self.chroma_log2_weight_denom))
+            } else {
+                identity(self.chroma_log2_weight_denom)
+            }
+        };
+        PuWeights {
+            luma_log2_weight_denom: self.luma_log2_weight_denom,
+            chroma_log2_weight_denom: self.chroma_log2_weight_denom,
+            l0: pick(&self.l0, motion.pred_flag_l0, motion.ref_idx_l0),
+            l1: pick(&self.l1, motion.pred_flag_l1, motion.ref_idx_l1),
+        }
+    }
+}
 
 /// The resolved reference-picture access an inter CU reconstruction needs:
 /// `RefPicListX[ refIdx ]` → a borrowed reference [`Picture`] and its POC.
@@ -88,8 +147,13 @@ impl<'a> RefListAccess<'a> {
 /// each list's reference picture. Each PU's covering residual is sliced from
 /// the CU residual planes and added onto the motion-compensated prediction.
 ///
+/// `wp` carries the slice's §8.5.3.3.4.3 weighted-prediction tables when
+/// `weightedPredFlag == 1`; `None` selects the §8.5.3.3.4.2 default
+/// combine.
+///
 /// # Errors
 /// Propagates [`ReconError`] from the §8.5.3.3 interpolation / combine.
+#[allow(clippy::too_many_arguments)]
 pub fn reconstruct_inter_cu(
     pic: &mut Picture,
     params: &ReconParams,
@@ -98,6 +162,7 @@ pub fn reconstruct_inter_cu(
     motions: &[PuMotion],
     residual: &CuResidual,
     refs: &RefListAccess,
+    wp: Option<&SliceWpTables>,
 ) -> Result<(), ReconError> {
     let cat = params.chroma_array_type;
     let (sub_w, sub_h) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
@@ -135,7 +200,10 @@ pub fn reconstruct_inter_cu(
             (None, None)
         };
 
-        reconstruct_inter_pu(
+        // §8.5.3.3.4.1 — resolve the PU's explicit weights from its
+        // reference indices when the slice's weightedPredFlag is 1.
+        let pu_weights = wp.map(|t| t.resolve_pu(motion));
+        reconstruct_inter_pu_weighted(
             pic,
             params,
             rect.x_pb,
@@ -147,6 +215,7 @@ pub fn reconstruct_inter_cu(
             Some(res_luma.as_slice()),
             res_cb.as_deref(),
             res_cr.as_deref(),
+            pu_weights.as_ref(),
         )?;
     }
     let _ = cu;
@@ -204,7 +273,8 @@ fn resolve_list<'a>(
 /// in-progress `field`) with [`extract_cu_residual`] + [`reconstruct_inter_cu`].
 /// `pus` are the parsed §7.3.8.6 prediction units; `ctx` carries the
 /// reference-picture resolvers + slice context; `available` is the §6.4.2
-/// prediction-block availability test.
+/// prediction-block availability test; `wp` the slice's §8.5.3.3.4.3
+/// weighted-prediction tables (`None` for the default combine).
 ///
 /// # Errors
 /// Propagates [`ReconError`] from the residual extraction / reconstruction.
@@ -219,6 +289,7 @@ pub fn resolve_and_reconstruct_inter_cu(
     available: &dyn Fn(i32, i32) -> bool,
     refs: &RefListAccess,
     qp_y: i32,
+    wp: Option<&SliceWpTables>,
 ) -> Result<(), ReconError> {
     let n_cb_s = 1usize << cu.log2_cb_size;
     let desc = InterCuDesc {
@@ -249,7 +320,7 @@ pub fn resolve_and_reconstruct_inter_cu(
         mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
     }
 
-    reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs)
+    reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs, wp)
 }
 
 /// Walk an inter CU's transform tree and mark each leaf transform block that
@@ -290,7 +361,7 @@ fn mark_nonzero_luma(
 /// per coding unit. The picture-level driver
 /// ([`reconstruct_inter_picture`]) binds the [`PuMvContext`] reference
 /// resolvers to the [`RefListAccess`] + collocated field internally.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InterSliceContext {
     /// `PicOrderCntVal` of the current picture.
     pub curr_poc: i32,
@@ -354,6 +425,9 @@ pub struct InterSliceContext {
     pub log2_sao_offset_scale_luma: u8,
     /// `log2_sao_offset_scale_chroma`.
     pub log2_sao_offset_scale_chroma: u8,
+    /// The slice's §8.5.3.3.4.3 explicit weighted-prediction tables —
+    /// `Some` exactly when `weightedPredFlag` (§8.5.3.3.4.1) is 1.
+    pub wp: Option<SliceWpTables>,
 }
 
 /// One placed coding tree unit for the §8.5 picture-level inter driver.
@@ -787,6 +861,7 @@ fn reconstruct_inter_leaf_cu(
         &available,
         refs,
         qp_y,
+        slice.wp.as_ref(),
     )
 }
 
@@ -1033,6 +1108,7 @@ mod tests {
             &available,
             &refs,
             25,
+            None,
         )
         .unwrap();
 
@@ -1090,6 +1166,7 @@ mod tests {
             &available,
             &refs,
             25,
+            None,
         )
         .unwrap();
 
@@ -1134,6 +1211,7 @@ mod tests {
             slice_sao_chroma_flag: false,
             log2_sao_offset_scale_luma: 0,
             log2_sao_offset_scale_chroma: 0,
+            wp: None,
         }
     }
 

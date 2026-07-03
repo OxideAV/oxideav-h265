@@ -317,9 +317,7 @@ fn reconstruct_intra_block(
 // §8.5 inter sample reconstruction
 // ---------------------------------------------------------------------------
 
-use crate::inter_pred::{
-    predict_inter_pu, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
-};
+use crate::inter_pred::{InterPredGeometry, InterPrediction, ListPrediction, RefPlane};
 
 /// One reference list's fully-resolved per-PU motion: the
 /// §8.5.3.2-derived luma motion vector, the §8.5.3.2.10 chroma motion
@@ -400,6 +398,44 @@ pub fn reconstruct_inter_pu(
     residual_cb: Option<&[i32]>,
     residual_cr: Option<&[i32]>,
 ) -> Result<(), ReconError> {
+    reconstruct_inter_pu_weighted(
+        pic,
+        params,
+        x_pb,
+        y_pb,
+        n_pb_w,
+        n_pb_h,
+        l0,
+        l1,
+        residual_luma,
+        residual_cb,
+        residual_cr,
+        None,
+    )
+}
+
+/// §8.5.3.3 — as [`reconstruct_inter_pu`], with the §8.5.3.3.4.1
+/// weighted-sample-prediction dispatch: `weights == None` uses the
+/// §8.5.3.3.4.2 default combine, `weights == Some(..)` the §8.5.3.3.4.3
+/// explicit per-reference combine.
+///
+/// # Errors
+/// Same contract as [`reconstruct_inter_pu`].
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_pu_weighted(
+    pic: &mut Picture,
+    params: &ReconParams,
+    x_pb: usize,
+    y_pb: usize,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    l0: ResolvedList<'_>,
+    l1: ResolvedList<'_>,
+    residual_luma: Option<&[i32]>,
+    residual_cb: Option<&[i32]>,
+    residual_cr: Option<&[i32]>,
+    weights: Option<&crate::inter_pred::PuWeights>,
+) -> Result<(), ReconError> {
     let cat = params.chroma_array_type;
     // Build the §8.5.3.3.2 reference planes for each used list.
     let lp0 = build_list_prediction(&l0, cat)?;
@@ -414,7 +450,8 @@ pub fn reconstruct_inter_pu(
         bit_depth_chroma: params.bit_depth_chroma,
     };
     let InterPrediction { luma, cb, cr } =
-        predict_inter_pu(&lp0, &lp1, &geom).map_err(ReconError::InterPred)?;
+        crate::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
+            .map_err(ReconError::InterPred)?;
 
     // §8.6.5 / §8.4.4.1: recSamples = Clip1( predSamples + resSamples ).
     write_inter_plane(
