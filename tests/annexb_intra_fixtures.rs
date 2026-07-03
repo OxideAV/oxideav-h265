@@ -1,0 +1,56 @@
+//! End-to-end whole-bitstream decode: Annex B in, YUV out, byte-exact.
+//!
+//! Drives [`oxideav_h265::decode_annexb_sequence`] over embedded
+//! public-test-corpus HEVC bitstreams (Main-profile intra pictures at
+//! several geometries and QPs) and compares the decoded, in-loop-filtered
+//! output against the corresponding expected planar YUV byte for byte.
+//! This exercises the full §8.1 chain: NAL demux, parameter-set
+//! activation, §7.3.6.1 slice-header parse, the §7.3.8 CABAC slice-data
+//! walk (with the §7.4.9.11 mode-dependent scans and §8.4.2 parse-time
+//! mode derivation), the §8.4 / §8.6 reconstruction, the §8.6.1 QP
+//! derivation, and the §8.7.2 / §8.7.3 in-loop filters.
+
+mod fixture_bytes;
+
+use fixture_bytes::*;
+use oxideav_h265::decode_annexb_sequence;
+
+fn assert_decodes_byte_exact(hevc: &[u8], expected_yuv: &[u8], frames_expected: usize, what: &str) {
+    let frames = decode_annexb_sequence(hevc).unwrap_or_else(|e| panic!("{what}: decode: {e}"));
+    assert_eq!(frames.len(), frames_expected, "{what}: frame count");
+    let mut out = Vec::new();
+    for f in &frames {
+        assert!(f.output, "{what}: every frame is an output frame");
+        out.extend(f.picture.to_planar_u8().expect("8-bit planes"));
+    }
+    assert_eq!(out.len(), expected_yuv.len(), "{what}: output size");
+    assert_eq!(out, expected_yuv, "{what}: byte-exact decode");
+}
+
+/// 16×16 single-CTU IDR (flat frame): the minimal Main-profile decode.
+#[test]
+fn tiny_i_decodes_byte_exact() {
+    assert_decodes_byte_exact(TINY_I_HEVC, TINY_I_YUV, 1, "tiny-i-only-16x16-main");
+}
+
+/// 32×32 IDR at slice QP 45: sparse residual over 4×4 / 8×8 / 16×16
+/// intra TBs with directional modes (vertical / horizontal §7.4.9.11
+/// scans), SAO edge offsets, and deblocking.
+#[test]
+fn qp_high_decodes_byte_exact() {
+    assert_decodes_byte_exact(QP_HIGH_HEVC, QP_HIGH_YUV, 1, "qp-high");
+}
+
+/// 32×32 IDR at slice QP 1: dense residual through every coefficient
+/// coding path (multi-sub-block scans, sign hiding, high `coeff_abs`
+/// escapes) plus the 4×4 DST-VII.
+#[test]
+fn qp_low_decodes_byte_exact() {
+    assert_decodes_byte_exact(QP_LOW_HEVC, QP_LOW_YUV, 1, "qp-low");
+}
+
+/// Main Still Picture profile 32×32 IDR.
+#[test]
+fn main_still_picture_decodes_byte_exact() {
+    assert_decodes_byte_exact(MAIN_STILL_HEVC, MAIN_STILL_YUV, 1, "main-still-picture");
+}

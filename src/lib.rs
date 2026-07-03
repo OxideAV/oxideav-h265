@@ -252,6 +252,7 @@ pub mod sao;
 pub mod scaling_list;
 pub mod scan;
 pub mod sei;
+pub mod sequence;
 pub mod slice;
 pub mod slice_data;
 pub mod sps;
@@ -315,6 +316,7 @@ pub use scaling_list::{
 pub use scan::{
     horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
 };
+pub use sequence::{decode_annexb_sequence, DecodedFrame, SequenceDecoder, SequenceError};
 pub use slice::{
     EntryPointOffsets, NumPicTotalCurrInputs, PredWeightEntry, PredWeightTable,
     PredWeightTableInputs, RefPicListsModification, SliceDeblocking, SliceError,
@@ -322,9 +324,9 @@ pub use slice::{
     IDR_N_LP, IDR_W_RADL, RSV_IRAP_VCL23,
 };
 pub use slice_data::{
-    decode_coding_quadtree, decode_coding_tree_unit, decode_sao, CodingQuadtree, CodingTreeUnit,
-    CodingUnit, CtuGrid, IntraLumaMode, PredictionUnit, SaoComponent, SaoCtbParams,
-    SliceDataParams,
+    decode_coding_quadtree, decode_coding_tree_unit, decode_coding_tree_unit_in_picture,
+    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, CtuGrid, IntraLumaMode,
+    PictureParseState, PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
