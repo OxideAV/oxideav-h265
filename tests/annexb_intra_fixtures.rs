@@ -157,3 +157,37 @@ fn registry_decoder_decodes_bipred_byte_exact() {
     }
     assert_eq!(out, BIPRED_YUV, "registry decoder output byte-exact");
 }
+
+/// The ISO-BMFF transport form (`iso-mp4-vs-annexb-pair`): `hvcC`
+/// extradata (ISO/IEC 14496-15 §8.3.3.1) activates the out-of-band
+/// VPS/SPS/PPS and switches packets to 4-byte length-prefixed NAL
+/// runs — the decoded frame is byte-identical to the Annex B decode.
+#[test]
+fn registry_decoder_decodes_hvcc_mp4_sample_byte_exact() {
+    use oxideav_core::{CodecParameters, Error, Frame, Packet, TimeBase};
+
+    let mut params = CodecParameters::video("h265".into());
+    params.extradata = ISO_PAIR_HVCC.to_vec();
+    let mut dec = oxideav_h265::make_decoder(&params).expect("factory");
+    dec.send_packet(&Packet::new(
+        0,
+        TimeBase::new(1, 25),
+        ISO_PAIR_SAMPLE.to_vec(),
+    ))
+    .expect("send");
+    dec.flush().expect("flush");
+    let mut out = Vec::new();
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for p in &v.planes {
+                    out.extend_from_slice(&p.data);
+                }
+            }
+            Ok(_) => panic!("non-video frame"),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("receive: {e}"),
+        }
+    }
+    assert_eq!(out, ISO_PAIR_YUV, "hvcC-path decode byte-exact");
+}

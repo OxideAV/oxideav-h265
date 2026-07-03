@@ -248,6 +248,7 @@ pub mod decode;
 pub mod decoder;
 pub mod dpb;
 pub mod hrd;
+pub mod hvcc;
 pub mod inter_pred;
 pub mod inter_recon;
 pub mod intra_mode_field;
@@ -292,6 +293,10 @@ pub use dpb::{
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
+};
+pub use hvcc::{
+    extradata_is_hvcc, nal_unit_from_coded, parse_hvcc, split_length_prefixed, HvccError,
+    HvccRecord,
 };
 pub use inter_pred::{
     default_weighted_pred, interp_chroma_block, interp_luma_block, predict_inter_pu,
