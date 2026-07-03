@@ -436,14 +436,32 @@ impl SequenceDecoder {
             slice_type,
         );
 
+        // Per-slice slice_loop_filter_across_slices_enabled_flag
+        // (§7.4.7.1: inferred from the PPS flag when absent).
+        let mut across_of_slice: BTreeMap<u32, bool> = BTreeMap::new();
+        for seg in segs {
+            if !seg.header.dependent_slice_segment_flag {
+                across_of_slice.insert(
+                    seg.header.slice_segment_address,
+                    seg.header
+                        .slice_loop_filter_across_slices_enabled_flag
+                        .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
+                );
+            }
+        }
         let placed: Vec<PlacedInterCtu<'_>> = decoded
             .iter()
             .map(|(x, y, ctu)| {
                 let rs = (y >> geom.ctb_log2) * geom.pic_w_ctbs + (x >> geom.ctb_log2);
+                let slice_addr_rs = slice_addr_of[rs as usize].unwrap_or(0);
                 PlacedInterCtu {
                     x_ctb: *x,
                     y_ctb: *y,
-                    slice_addr_rs: slice_addr_of[rs as usize].unwrap_or(0),
+                    slice_addr_rs,
+                    filter_across_slices: across_of_slice
+                        .get(&slice_addr_rs)
+                        .copied()
+                        .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
                     ctu,
                 }
             })
@@ -690,6 +708,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
             x_ctb: *x,
             y_ctb: *y,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu,
         })
         .collect();

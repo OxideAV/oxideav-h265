@@ -443,6 +443,9 @@ pub struct PlacedInterCtu<'a> {
     pub y_ctb: u32,
     /// `SliceAddrRs` of the independent slice segment owning this CTB.
     pub slice_addr_rs: u32,
+    /// `slice_loop_filter_across_slices_enabled_flag` of the slice
+    /// owning this CTB (§7.4.7.1 — per-slice, not per-picture).
+    pub filter_across_slices: bool,
     /// The decoded coding tree unit.
     pub ctu: &'a crate::slice_data::CodingTreeUnit,
 }
@@ -504,10 +507,15 @@ pub fn reconstruct_inter_picture(
     let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
     let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
     let mut slice_addr_map = vec![0u32; pic_w_ctbs * pic_h_ctbs];
+    // Per-CTB slice_loop_filter_across_slices_enabled_flag (§7.4.7.1 —
+    // a per-slice value; the §8.7.2.1 / §8.7.3.2 boundary gates consult
+    // the owning slice's flag, not a picture-level one).
+    let mut filter_across_map = vec![true; pic_w_ctbs * pic_h_ctbs];
     for placed in ctus {
         let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
         let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
         slice_addr_map[ry * pic_w_ctbs + rx] = placed.slice_addr_rs;
+        filter_across_map[ry * pic_w_ctbs + rx] = placed.filter_across_slices;
     }
     ctx.set_slice_addr_rs(slice_addr_map.clone());
 
@@ -571,6 +579,7 @@ pub fn reconstruct_inter_picture(
             &mut deblock_cus,
             &mut no_filter_cells,
             w4,
+            &filter_across_map,
             &placed.ctu.quadtree,
         )?;
     }
@@ -631,6 +640,12 @@ pub fn reconstruct_inter_picture(
         ctb_log2_size_y: slice.ctb_log2_size_y,
         across_slices: slice.filter_across_slices,
         across_tiles: slice.filter_across_tiles,
+        filter_across_of_ctb: Some(filter_across_map.clone()),
+        ctb_ts_of_rs: Some(
+            (0..(pic_w_ctbs * pic_h_ctbs) as u32)
+                .map(|rs| ctx.tiling().ctb_addr_rs_to_ts(rs))
+                .collect(),
+        ),
     };
     let filtered = crate::sao::apply_sao_picture_full(
         &pic,
@@ -660,6 +675,7 @@ fn reconstruct_inter_quadtree(
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
     no_filter_cells: &mut [bool],
     w4: usize,
+    filter_across_of_ctb: &[bool],
     qt: &crate::slice_data::CodingQuadtree,
 ) -> Result<(), ReconError> {
     use crate::slice_data::CodingQuadtree;
@@ -677,6 +693,7 @@ fn reconstruct_inter_quadtree(
                     deblock_cus,
                     no_filter_cells,
                     w4,
+                    filter_across_of_ctb,
                     child,
                 )?;
             }
@@ -705,6 +722,7 @@ fn reconstruct_inter_quadtree(
                 refs,
                 slice,
                 deblock_cus,
+                filter_across_of_ctb,
                 cu,
             )
         }
@@ -770,6 +788,7 @@ fn reconstruct_inter_leaf_cu(
     refs: &RefListAccess,
     slice: &InterSliceContext,
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
+    filter_across_of_ctb: &[bool],
     cu: &CodingUnit,
 ) -> Result<(), ReconError> {
     use crate::binarization::CuPredMode;
@@ -806,11 +825,19 @@ fn reconstruct_inter_leaf_cu(
         // §8.7.2.1 filterLeftCbEdgeFlag / filterTopCbEdgeFlag: a
         // picture-boundary edge is never filtered; a slice / tile
         // boundary edge only when filtering across it is enabled.
+        // §8.7.2.1 — the slice-boundary gate consults the CURRENT
+        // slice's slice_loop_filter_across_slices_enabled_flag (the
+        // slice containing this coding block), a per-slice value.
+        let pic_w_ctbs = (slice.pic_width_luma as usize).div_ceil(1 << slice.ctb_log2_size_y);
+        let cu_across = {
+            let rs = (y0 >> slice.ctb_log2_size_y) * pic_w_ctbs + (x0 >> slice.ctb_log2_size_y);
+            filter_across_of_ctb.get(rs).copied().unwrap_or(true)
+        };
         let boundary_ok = |x_nb: usize, y_nb: usize| -> bool {
             let same_slice =
                 ctx.slice_addr_rs_of_luma(x0, y0) == ctx.slice_addr_rs_of_luma(x_nb, y_nb);
             let same_tile = ctx.tile_id_of_luma(x0, y0) == ctx.tile_id_of_luma(x_nb, y_nb);
-            (same_slice || slice.filter_across_slices) && (same_tile || slice.filter_across_tiles)
+            (same_slice || cu_across) && (same_tile || slice.filter_across_tiles)
         };
         let filter_left = x0 != 0 && boundary_ok(x0 - 1, y0);
         let filter_top = y0 != 0 && boundary_ok(x0, y0 - 1);
@@ -1290,6 +1317,7 @@ mod tests {
             x_ctb: 0,
             y_ctb: 0,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu: &ctu,
         }];
 
@@ -1375,6 +1403,7 @@ mod tests {
             x_ctb: 0,
             y_ctb: 0,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu: &ctu,
         }];
 
@@ -1459,6 +1488,7 @@ mod tests {
             x_ctb: 0,
             y_ctb: 0,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu: &ctu,
         }];
 
@@ -1536,6 +1566,7 @@ mod tests {
             x_ctb: 0,
             y_ctb: 0,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu: &ctu,
         }];
 
@@ -1625,6 +1656,7 @@ mod tests {
             x_ctb: 0,
             y_ctb: 0,
             slice_addr_rs: 0,
+            filter_across_slices: true,
             ctu: &ctu,
         }];
         let slice = p_slice_ctx();

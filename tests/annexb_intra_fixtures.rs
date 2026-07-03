@@ -211,3 +211,16 @@ fn weighted_pred_p_decodes_byte_exact() {
 fn weighted_bipred_b_decodes_byte_exact() {
     assert_decodes_byte_exact(WEIGHTED_B_HEVC, WEIGHTED_B_YUV, 8, "weighted-bipred-b");
 }
+
+/// Per-slice `slice_loop_filter_across_slices_enabled_flag` (§7.4.7.1 /
+/// §8.7.2.1): two IDR pictures, each split into two independent slices
+/// with OPPOSITE across-flags (1/0 then 0/1) over an all-PCM picture
+/// with deblocking enabled and `pcm_loop_filter_disabled_flag == 0` —
+/// the slice-boundary edge filters exactly when the flag of the slice
+/// containing the current (q-side) coding block allows it. A decoder
+/// using a picture-level flag decodes both pictures identically; the
+/// expected YUV distinguishes them.
+#[test]
+fn per_slice_loop_filter_across_flags_decode_byte_exact() {
+    assert_decodes_byte_exact(PERSLICE_LF_HEVC, PERSLICE_LF_YUV, 2, "per-slice-lf-across");
+}

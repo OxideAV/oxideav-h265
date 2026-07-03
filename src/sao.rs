@@ -220,10 +220,22 @@ pub struct SaoBoundaries {
     pub pic_w_ctbs: usize,
     /// `CtbLog2SizeY`.
     pub ctb_log2_size_y: u32,
-    /// `slice_loop_filter_across_slices_enabled_flag`.
+    /// `slice_loop_filter_across_slices_enabled_flag` — the uniform
+    /// fallback used when [`Self::filter_across_of_ctb`] is `None`.
     pub across_slices: bool,
     /// `loop_filter_across_tiles_enabled_flag`.
     pub across_tiles: bool,
+    /// Per-CTB (raster order) `slice_loop_filter_across_slices_enabled_
+    /// flag` of the slice owning each CTB. When present, the §8.7.3.2
+    /// cross-slice rule is evaluated per slice pair: the neighbour read
+    /// is denied when the LATER slice (decode order) of the two has its
+    /// flag equal to 0.
+    pub filter_across_of_ctb: Option<Vec<bool>>,
+    /// Per-CTB (raster order) tile-scan address `CtbAddrRsToTs` — the
+    /// decode-order key for the §8.7.3.2 `MinTbAddrZs` comparison.
+    /// `None` falls back to raster order (exact for single-tile
+    /// pictures).
+    pub ctb_ts_of_rs: Option<Vec<u32>>,
 }
 
 impl SaoBoundaries {
@@ -239,8 +251,24 @@ impl SaoBoundaries {
         if a == b {
             return true;
         }
-        if !self.across_slices && self.slice_addr_of_ctb.get(a) != self.slice_addr_of_ctb.get(b) {
-            return false;
+        if self.slice_addr_of_ctb.get(a) != self.slice_addr_of_ctb.get(b) {
+            match &self.filter_across_of_ctb {
+                None => {
+                    if !self.across_slices {
+                        return false;
+                    }
+                }
+                Some(flags) => {
+                    // §8.7.3.2 — the read is denied when the later (in
+                    // decode order) of the two slices has
+                    // slice_loop_filter_across_slices_enabled_flag == 0.
+                    let ts = |i: usize| self.ctb_ts_of_rs.as_ref().map_or(i as u32, |m| m[i]);
+                    let later = if ts(b) < ts(a) { a } else { b };
+                    if !flags.get(later).copied().unwrap_or(true) {
+                        return false;
+                    }
+                }
+            }
         }
         if !self.across_tiles && self.tile_id_of_ctb.get(a) != self.tile_id_of_ctb.get(b) {
             return false;

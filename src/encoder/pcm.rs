@@ -38,11 +38,17 @@ const CTB: usize = 1 << CTB_LOG2;
 const SLICE_QP: i32 = 26;
 
 /// Per-AU shape options for the PCM encoder.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PcmAuOptions {
     /// Number of slice segments (1 = a single independent segment;
-    /// more = one independent + N−1 dependent segments).
+    /// more = one independent + N−1 dependent segments). Ignored when
+    /// [`Self::independent_slices`] is non-empty.
     pub segments: usize,
+    /// Independent slices as `(start_ctb, slice_loop_filter_across_
+    /// slices_enabled_flag)` pairs (sorted, first start 0). Empty =
+    /// the [`Self::segments`] split. Heterogeneous per-slice flags
+    /// exercise the §8.7.2.1 / §8.7.3.2 per-slice boundary gates.
+    pub independent_slices: Vec<(usize, bool)>,
     /// Enable the §8.7.2 deblocking filter (PPS
     /// `pps_deblocking_filter_disabled_flag == 0`). With every CU a
     /// PCM block and `pcm_loop_filter_disabled_flag == 1`, a
@@ -51,17 +57,28 @@ pub struct PcmAuOptions {
     pub deblocking: bool,
     /// Enable luma band-offset SAO (SPS SAO on,
     /// `slice_sao_luma_flag == 1`, per-CTB §7.3.8.3 band parameters
-    /// with non-zero offsets). Same contract: the §8.7.3.1 PCM
-    /// suppression must keep every sample.
+    /// with non-zero offsets).
     pub sao_luma_band: bool,
+    /// Enable luma vertical-class edge-offset SAO (`sao_type_idx_luma
+    /// == 2`, `sao_eo_class_luma == 1`): the classification reads
+    /// above / below neighbours, exercising the §8.7.3.2 cross-slice
+    /// availability at horizontal slice boundaries. Mutually exclusive
+    /// with [`Self::sao_luma_band`].
+    pub sao_luma_eo_vertical: bool,
+    /// `pcm_loop_filter_disabled_flag` (§7.4.3.2.1). `false` lets the
+    /// enabled loop filters modify the PCM samples like any other CU's.
+    pub pcm_loop_filter_disabled: bool,
 }
 
 impl Default for PcmAuOptions {
     fn default() -> Self {
         Self {
             segments: 1,
+            independent_slices: Vec::new(),
             deblocking: false,
             sao_luma_band: false,
+            sao_luma_eo_vertical: false,
+            pcm_loop_filter_disabled: true,
         }
     }
 }
@@ -177,7 +194,13 @@ fn write_vps(level_idc: u8) -> Vec<u8> {
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM on).
-fn write_sps(width: usize, height: usize, level_idc: u8, sao_enabled: bool) -> Vec<u8> {
+fn write_sps(
+    width: usize,
+    height: usize,
+    level_idc: u8,
+    sao_enabled: bool,
+    pcm_loop_filter_disabled: bool,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -209,7 +232,7 @@ fn write_sps(width: usize, height: usize, level_idc: u8, sao_enabled: bool) -> V
     w.put_bits(7, 4); // pcm_sample_bit_depth_chroma_minus1
     w.ue(CTB_LOG2 - 3); // log2_min_pcm_luma_coding_block_size_minus3 (16)
     w.ue(0); // log2_diff_max_min_pcm_luma_coding_block_size
-    w.put_bit(1); // pcm_loop_filter_disabled_flag
+    w.put_bit(u8::from(pcm_loop_filter_disabled)); // pcm_loop_filter_disabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
     w.put_bit(0); // long_term_ref_pics_present_flag
     w.put_bit(0); // sps_temporal_mvp_enabled_flag
@@ -277,9 +300,9 @@ fn write_idr_slice_segments(
     cr: &[u8],
     width: usize,
     height: usize,
-    opts: PcmAuOptions,
+    opts: &PcmAuOptions,
 ) -> Vec<Vec<u8>> {
-    let segments = opts.segments;
+    let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
@@ -287,17 +310,33 @@ fn write_idr_slice_segments(
     // Ceil(Log2(PicSizeInCtbsY)) — the slice_segment_address width.
     let addr_bits = (usize::BITS - (total - 1).leading_zeros()).max(1) as u8;
 
-    // Segment boundaries: split the CTB raster as evenly as possible.
-    let seg_len = total.div_ceil(segments);
-    let starts: Vec<usize> = (0..segments).map(|i| i * seg_len).collect();
+    // Segment plan: (start_ctb, Some(across_flag) for an independent
+    // slice header / None for a dependent segment).
+    let plan: Vec<(usize, Option<bool>)> = if opts.independent_slices.is_empty() {
+        // Even split; segment 0 independent, the rest dependent.
+        let seg_len = total.div_ceil(opts.segments);
+        (0..opts.segments)
+            .map(|i| (i * seg_len, (i == 0).then_some(true)))
+            .collect()
+    } else {
+        opts.independent_slices
+            .iter()
+            .map(|&(start, across)| (start, Some(across)))
+            .collect()
+    };
+    let dependent_mode = opts.independent_slices.is_empty() && opts.segments > 1;
 
-    // initType 0 (I slice, equation 9-7), SliceQpY = 26. Shared across
-    // the picture's segments (§9.3.2.4 / §9.3.2.5).
+    // initType 0 (I slice, equation 9-7), SliceQpY = 26. Carried across
+    // dependent segments (§9.3.2.4 / §9.3.2.5); re-initialized at each
+    // independent slice.
     let mut ctxs = SliceContexts::init(init_type(2, false), SLICE_QP);
+    // Start CTB of the current independent slice (SAO merge / left
+    // availability is denied across independent slices).
+    let mut cur_slice_start = 0usize;
 
-    let mut out = Vec::with_capacity(segments);
-    for (seg_idx, &start) in starts.iter().enumerate() {
-        let end = (start + seg_len).min(total);
+    let mut out = Vec::with_capacity(plan.len());
+    for (seg_idx, &(start, indep)) in plan.iter().enumerate() {
+        let end = plan.get(seg_idx + 1).map_or(total, |&(next, _)| next);
         let mut w = BitWriter::new();
 
         // ---- slice_segment_header() ----
@@ -306,25 +345,27 @@ fn write_idr_slice_segments(
         w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
         w.ue(0); // slice_pic_parameter_set_id
         if !first {
-            // dependent_slice_segments_enabled_flag == 1 in the PPS.
-            w.put_bit(1); // dependent_slice_segment_flag
+            if dependent_mode {
+                w.put_bit(1); // dependent_slice_segment_flag
+            }
             w.put_bits(start as u32, addr_bits); // slice_segment_address
-        } else if segments > 1 {
-            // (first segment of a multi-segment picture: the address
-            // syntax is absent for first_slice_segment_in_pic_flag.)
         }
-        if first {
+        if let Some(across) = indep {
+            // Independent slice: fresh CABAC contexts (§9.3.2.2) and a
+            // full slice-level header.
+            ctxs = SliceContexts::init(init_type(2, false), SLICE_QP);
+            cur_slice_start = start;
             w.ue(2); // slice_type = I
-            if opts.sao_luma_band {
+            if sao {
                 // SPS SAO enabled: the slice SAO flags are present.
                 w.put_bit(1); // slice_sao_luma_flag
                 w.put_bit(0); // slice_sao_chroma_flag (4:2:0 present)
             }
             w.se(SLICE_QP - 26); // slice_qp_delta
-            if opts.deblocking || opts.sao_luma_band {
+            if opts.deblocking || sao {
                 // §7.3.6.1 gate: pps_loop_filter_across_slices == 1 and
                 // (SAO on or deblocking not disabled).
-                w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+                w.put_bit(u8::from(across)); // slice_loop_filter_across_slices_enabled_flag
             }
         }
         // No tiles / WPP: no entry points. No header extension.
@@ -335,35 +376,53 @@ fn write_idr_slice_segments(
         for addr in start..end {
             let x0 = (addr % ctbs_x) * CTB;
             let y0 = (addr / ctbs_x) * CTB;
-            if opts.sao_luma_band {
-                // §7.3.8.3 sao( rx, ry ): decline the merges, then a
-                // luma band offset with non-zero offsets — the PCM
-                // suppression must keep the samples anyway.
+            if sao {
+                // §7.3.8.3 sao( rx, ry ): decline the available merges
+                // (left / above must lie in the same slice + tile),
+                // then explicit luma parameters.
                 let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
-                if rx > 0 {
+                if rx > 0 && addr > cur_slice_start {
                     cabac.encode_decision(&mut w, &mut ctxs.sao_merge_flag[0], 0);
                 }
-                if ry > 0 {
+                if ry > 0 && addr - ctbs_x >= cur_slice_start {
                     cabac.encode_decision(&mut w, &mut ctxs.sao_merge_flag[0], 0);
                 }
-                // sao_type_idx_luma = 1 (band): TR bins "1" (ctx), "0"
-                // (bypass).
-                cabac.encode_decision(&mut w, &mut ctxs.sao_type_idx[0], 1);
-                cabac.encode_bypass(&mut w, 0);
-                // sao_offset_abs[0][i] — TR(cMax 7, bypass): values
-                // 1, 2, 3, 4.
-                for v in 1..=4u32 {
-                    for _ in 0..v {
-                        cabac.encode_bypass(&mut w, 1);
+                if opts.sao_luma_band {
+                    // sao_type_idx_luma = 1 (band): TR bins "1" (ctx),
+                    // "0" (bypass).
+                    cabac.encode_decision(&mut w, &mut ctxs.sao_type_idx[0], 1);
+                    cabac.encode_bypass(&mut w, 0);
+                    // sao_offset_abs[0][i] — TR(cMax 7, bypass): values
+                    // 1, 2, 3, 4.
+                    for v in 1..=4u32 {
+                        for _ in 0..v {
+                            cabac.encode_bypass(&mut w, 1);
+                        }
+                        cabac.encode_bypass(&mut w, 0); // v < cMax terminator
                     }
-                    cabac.encode_bypass(&mut w, 0); // v < cMax terminator
+                    // sao_offset_sign[0][i]: +, −, +, −.
+                    for sign in [0u8, 1, 0, 1] {
+                        cabac.encode_bypass(&mut w, sign);
+                    }
+                    // sao_band_position[0]: FL(5) = 8.
+                    cabac.encode_bypass_bits(&mut w, 8, 5);
+                } else {
+                    // sao_type_idx_luma = 2 (edge): TR bins "1" (ctx),
+                    // "1" (bypass).
+                    cabac.encode_decision(&mut w, &mut ctxs.sao_type_idx[0], 1);
+                    cabac.encode_bypass(&mut w, 1);
+                    // sao_offset_abs[0][i]: 1, 2, 1, 2 (edge offsets
+                    // carry implicit signs per §7.4.9.3).
+                    for v in [1u32, 2, 1, 2] {
+                        for _ in 0..v {
+                            cabac.encode_bypass(&mut w, 1);
+                        }
+                        cabac.encode_bypass(&mut w, 0);
+                    }
+                    // sao_eo_class_luma: FL(2) = 1 (vertical — reads
+                    // the above / below neighbours).
+                    cabac.encode_bypass_bits(&mut w, 1, 2);
                 }
-                // sao_offset_sign[0][i]: +, −, +, −.
-                for sign in [0u8, 1, 0, 1] {
-                    cabac.encode_bypass(&mut w, sign);
-                }
-                // sao_band_position[0]: FL(5) = 8.
-                cabac.encode_bypass_bits(&mut w, 8, 5);
             }
             // coding_quadtree: CtbLog2SizeY == MinCbLog2SizeY, so no
             // split_cu_flag. coding_unit( x0, y0, 4 ):
@@ -476,7 +535,22 @@ fn encode_au(
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
-    if segments == 0 || segments > (width / CTB) * (height / CTB) {
+    let total_ctbs = (width / CTB) * (height / CTB);
+    if segments == 0 || segments > total_ctbs {
+        return Err(PcmEncodeError::BadDimensions { width, height });
+    }
+    // Independent-slice plans must be sorted, start at CTB 0 and stay
+    // in range; band and edge SAO are mutually exclusive.
+    if !opts.independent_slices.is_empty() {
+        let starts: Vec<usize> = opts.independent_slices.iter().map(|&(s, _)| s).collect();
+        if starts[0] != 0
+            || starts.windows(2).any(|w| w[1] <= w[0])
+            || starts.iter().any(|&s| s >= total_ctbs)
+        {
+            return Err(PcmEncodeError::BadDimensions { width, height });
+        }
+    }
+    if opts.sao_luma_band && opts.sao_luma_eo_vertical {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
     let check = |plane: &'static str, buf: &[u8], expected: usize| {
@@ -495,17 +569,19 @@ fn encode_au(
     check("cr", cr, width * height / 4)?;
 
     let level_idc = level_idc_for(width * height);
+    let dependent_mode = opts.independent_slices.is_empty() && segments > 1;
+    let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
     let mut units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
         nal_unit(
             33,
             0,
             0,
-            &write_sps(width, height, level_idc, opts.sao_luma_band),
+            &write_sps(width, height, level_idc, sao, opts.pcm_loop_filter_disabled),
         ), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(segments > 1, opts.deblocking)), // PPS_NUT
+        nal_unit(34, 0, 0, &write_pps(dependent_mode, opts.deblocking)), // PPS_NUT
     ];
-    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, opts) {
+    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, &opts) {
         units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
     }
     Ok(annexb(&units))
@@ -644,6 +720,7 @@ mod tests {
                 segments: 1,
                 deblocking,
                 sao_luma_band,
+                ..PcmAuOptions::default()
             };
             let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
             let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
@@ -658,6 +735,35 @@ mod tests {
                 "deblocking={deblocking} sao={sao_luma_band}: PCM samples survive the loop filters"
             );
         }
+    }
+
+    /// Independent multi-slice pictures with heterogeneous per-slice
+    /// `slice_loop_filter_across_slices_enabled_flag` values roundtrip
+    /// through the crate's own decoder (which implements the §8.7.2.1
+    /// per-slice gate), and the opposite flag layouts produce
+    /// different pictures (the boundary edge filters on exactly one
+    /// side of the pair).
+    #[test]
+    fn independent_slices_with_heterogeneous_across_flags() {
+        let (w, h) = (48usize, 32usize);
+        let (y, cb, cr) = gradient_planes(w, h);
+        let mut decoded = Vec::new();
+        for flags in [(true, false), (false, true)] {
+            let opts = PcmAuOptions {
+                independent_slices: vec![(0, flags.0), (3, flags.1)],
+                deblocking: true,
+                pcm_loop_filter_disabled: false,
+                ..PcmAuOptions::default()
+            };
+            let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
+            let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
+            assert_eq!(frames.len(), 1);
+            decoded.push(frames[0].picture.to_planar_u8().expect("8-bit"));
+        }
+        assert_ne!(
+            decoded[0], decoded[1],
+            "opposite per-slice flags gate the boundary deblocking differently"
+        );
     }
 
     #[test]
