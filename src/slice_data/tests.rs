@@ -31,6 +31,8 @@ fn i_slice_params(ctb_log2: u32, min_cb_log2: u32) -> SliceDataParams {
         pcm_enabled_flag: false,
         log2_min_ipcm_cb_size_y: 3,
         log2_max_ipcm_cb_size_y: 5,
+        pcm_bit_depth_luma: 8,
+        pcm_bit_depth_chroma: 8,
         max_transform_hierarchy_depth_intra: 0,
         max_transform_hierarchy_depth_inter: 0,
         max_num_merge_cand: 5,

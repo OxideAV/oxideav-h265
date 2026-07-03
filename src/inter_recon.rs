@@ -1032,6 +1032,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![pu],
             intra_luma: vec![],
             intra_chroma_pred_mode: vec![],
@@ -1295,6 +1296,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![],
             intra_luma: vec![crate::slice_data::IntraLumaMode {
                 prev_intra_luma_pred_flag: true,
@@ -1380,6 +1382,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![],
             intra_luma: vec![crate::slice_data::IntraLumaMode {
                 prev_intra_luma_pred_flag: false,

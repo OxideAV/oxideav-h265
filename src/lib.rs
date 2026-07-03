@@ -291,6 +291,7 @@ pub use dpb::{
     build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
     Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
 };
+pub use encoder::{make_encoder, H265PcmEncoder};
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
@@ -347,8 +348,8 @@ pub use slice::{
 };
 pub use slice_data::{
     decode_coding_quadtree, decode_coding_tree_unit, decode_coding_tree_unit_in_picture,
-    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode, PictureParseState,
-    PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
+    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode, PcmSamples,
+    PictureParseState, PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
@@ -471,6 +472,7 @@ pub fn register(ctx: &mut RuntimeContext) {
         ctx.codecs.register(
             CodecInfo::new(id.into())
                 .decoder(decoder::make_decoder)
+                .encoder(encoder::make_encoder)
                 .tags([
                     CodecTag::fourcc(b"hvc1"),
                     CodecTag::fourcc(b"hev1"),

@@ -65,6 +65,8 @@ fn tiny_i_params() -> SliceDataParams {
         pcm_enabled_flag: false,
         log2_min_ipcm_cb_size_y: 3,
         log2_max_ipcm_cb_size_y: 5,
+        pcm_bit_depth_luma: 8,
+        pcm_bit_depth_chroma: 8,
         // SPS: max_transform_hierarchy_depth_intra = 0.
         max_transform_hierarchy_depth_intra: 0,
         max_transform_hierarchy_depth_inter: 0,

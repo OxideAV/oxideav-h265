@@ -1094,6 +1094,14 @@ fn build_slice_data_params(
         pcm_enabled_flag: sps.pcm_enabled_flag,
         log2_min_ipcm_cb_size_y: log2_min_ipcm,
         log2_max_ipcm_cb_size_y: log2_max_ipcm,
+        pcm_bit_depth_luma: sps
+            .pcm
+            .as_ref()
+            .map_or(8, |p| u32::from(p.bit_depth_luma_minus1) + 1),
+        pcm_bit_depth_chroma: sps
+            .pcm
+            .as_ref()
+            .map_or(8, |p| u32::from(p.bit_depth_chroma_minus1) + 1),
         max_transform_hierarchy_depth_intra: u32::from(sps.max_transform_hierarchy_depth_intra),
         max_transform_hierarchy_depth_inter: u32::from(sps.max_transform_hierarchy_depth_inter),
         max_num_merge_cand: u32::from(header.max_num_merge_cand().unwrap_or(5)),

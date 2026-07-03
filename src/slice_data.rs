@@ -114,6 +114,11 @@ pub struct SliceDataParams {
     pub log2_min_ipcm_cb_size_y: u32,
     /// `Log2MaxIpcmCbSizeY` (§7.4.3.2.1).
     pub log2_max_ipcm_cb_size_y: u32,
+    /// `PcmBitDepthY` (§7.4.3.2.1 equation 7-25; meaningful only when
+    /// [`Self::pcm_enabled_flag`]).
+    pub pcm_bit_depth_luma: u32,
+    /// `PcmBitDepthC` (§7.4.3.2.1 equation 7-26).
+    pub pcm_bit_depth_chroma: u32,
     /// `max_transform_hierarchy_depth_intra` (§7.4.3.2.1).
     pub max_transform_hierarchy_depth_intra: u32,
     /// `max_transform_hierarchy_depth_inter` (§7.4.3.2.1).
@@ -182,6 +187,10 @@ pub struct CodingUnit {
     pub part_mode: PartMode,
     /// `pcm_flag[x0][y0]`.
     pub pcm_flag: bool,
+    /// §7.3.8.7 PCM sample payload (`Some` iff [`Self::pcm_flag`]),
+    /// already scaled to the picture bit depth per §8.4.1
+    /// equation 8-12 (`pcm_sample << (BitDepth − PcmBitDepth)`).
+    pub pcm: Option<PcmSamples>,
     /// Decoded prediction units (intra: empty — the luma/chroma intra
     /// modes carry the prediction; inter: 1..=4 entries).
     pub prediction_units: Vec<PredictionUnit>,
@@ -796,6 +805,7 @@ fn decode_coding_unit(
         cu_transquant_bypass_flag,
         part_mode: PartMode::Part2Nx2N,
         pcm_flag: false,
+        pcm: None,
         prediction_units: Vec::new(),
         intra_luma: Vec::new(),
         intra_chroma_pred_mode: Vec::new(),
@@ -894,6 +904,69 @@ fn decode_part_mode_banked(
     )?)
 }
 
+/// §7.3.8.7 PCM sample payload of one coding unit. Values are stored
+/// already scaled to the picture bit depth (§8.4.1 equation 8-12 for
+/// luma and its chroma analogue): `pcm_sample << (BitDepth −
+/// PcmBitDepth)` — the reconstruction writes them into the picture
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PcmSamples {
+    /// `pcm_sample_luma[i]` in raster order, `nCbS * nCbS` values.
+    pub luma: Vec<u16>,
+    /// Cb samples in raster order, `(nCbS / SubWidthC) * (nCbS /
+    /// SubHeightC)` values (empty when `ChromaArrayType == 0`).
+    pub cb: Vec<u16>,
+    /// Cr samples in raster order (same count as `cb`).
+    pub cr: Vec<u16>,
+}
+
+/// §7.3.8.7 `pcm_sample( x0, y0, log2CbSize )` — the byte-aligned raw
+/// sample payload of a `pcm_flag == 1` coding unit, plus the §9.3.1
+/// engine re-initialization that follows it.
+fn decode_pcm_sample(
+    engine: &mut CabacEngine<'_>,
+    params: &SliceDataParams,
+    log2_cb_size: u32,
+) -> Result<PcmSamples, ResidualCodingError> {
+    // §9.3.4.3.5 leaves the raw bit position immediately after the
+    // pcm_flag terminate bin; the pcm_alignment_zero_bit run pads it
+    // to the byte boundary.
+    engine.pcm_align()?;
+
+    let n = 1usize << log2_cb_size;
+    let shift_y = params
+        .bit_depth_luma
+        .saturating_sub(params.pcm_bit_depth_luma) as u16;
+    let mut luma = Vec::with_capacity(n * n);
+    for _ in 0..n * n {
+        let v = engine.read_raw_bits(params.pcm_bit_depth_luma as u8)? as u16;
+        luma.push(v << shift_y);
+    }
+
+    let (mut cb, mut cr) = (Vec::new(), Vec::new());
+    if params.chroma_array_type != 0 {
+        let (sub_w, sub_h) = crate::picture::sub_wh_c(params.chroma_array_type);
+        let count = (n / sub_w) * (n / sub_h);
+        let shift_c = params
+            .bit_depth_chroma
+            .saturating_sub(params.pcm_bit_depth_chroma) as u16;
+        // §7.4.9.7: the first half of pcm_sample_chroma is Cb, the
+        // second half Cr, each in raster order.
+        for plane in [&mut cb, &mut cr] {
+            plane.reserve(count);
+            for _ in 0..count {
+                let v = engine.read_raw_bits(params.pcm_bit_depth_chroma as u8)? as u16;
+                plane.push(v << shift_c);
+            }
+        }
+    }
+
+    // §9.3.1: the decoding engine is re-initialized (§9.3.2.6) after
+    // the PCM data; context variables persist.
+    engine.init_engine()?;
+    Ok(PcmSamples { luma, cb, cr })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_intra_cu(
     engine: &mut CabacEngine<'_>,
@@ -918,10 +991,10 @@ fn decode_intra_cu(
         cu.pcm_flag = decode_pcm_flag(engine)? != 0;
     }
     if cu.pcm_flag {
-        // PCM samples are byte-aligned raw u(v) reads — out of scope for
-        // the CABAC syntax walk (handled by the reconstruction pass that
-        // re-aligns the bit reader). Mark and return.
+        // §7.3.8.7: pcm_alignment_zero_bit run, the raw u(v) sample
+        // payload, then the §9.3.2.6 engine re-initialization (§9.3.1).
         state.record_pcm_cu(x0, y0, n_cb_s);
+        cu.pcm = Some(decode_pcm_sample(engine, params, log2_cb_size)?);
         return Ok(());
     }
 

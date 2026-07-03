@@ -1508,6 +1508,42 @@ fn derive_and_record_luma_mode(
 /// prediction block's `IntraPredModeY` is derived per §8.4.2 from the
 /// [`ReconCtx`] neighbour field (most-probable-mode), and chroma
 /// `IntraPredModeC` per §8.4.3 from the first PB's luma mode.
+/// §8.4.1 — write a PCM coding unit's (already scaled) samples into
+/// the picture: `SL[xCb+i][yCb+j] = pcm_sample_luma[nCbS*j + i] <<
+/// (BitDepthY − PcmBitDepthY)` (equation 8-12; the shift was applied
+/// at parse time) and the chroma analogues.
+fn write_pcm_cu(
+    pic: &mut Picture,
+    chroma_array_type: u8,
+    x_cb: usize,
+    y_cb: usize,
+    n_cb: usize,
+    pcm: &crate::slice_data::PcmSamples,
+) {
+    for j in 0..n_cb {
+        for i in 0..n_cb {
+            pic.set_sample(
+                Plane::Luma,
+                x_cb + i,
+                y_cb + j,
+                i32::from(pcm.luma[n_cb * j + i]),
+            );
+        }
+    }
+    if chroma_array_type != 0 {
+        let (sub_w, sub_h) = sub_wh_c(chroma_array_type);
+        let (cw, ch) = (n_cb / sub_w, n_cb / sub_h);
+        let (cx, cy) = (x_cb / sub_w, y_cb / sub_h);
+        for (plane, samples) in [(Plane::Cb, &pcm.cb), (Plane::Cr, &pcm.cr)] {
+            for j in 0..ch {
+                for i in 0..cw {
+                    pic.set_sample(plane, cx + i, cy + j, i32::from(samples[cw * j + i]));
+                }
+            }
+        }
+    }
+}
+
 fn reconstruct_cu(
     pic: &mut Picture,
     params: &ReconParams,
@@ -1532,9 +1568,14 @@ fn reconstruct_cu(
     let y_cb = cu.y0 as usize;
 
     if cu.pcm_flag {
-        // PCM sample reconstruction (§8.4.5.2) is a separate path; still
-        // stamp the field so neighbours see a written pcm block (→ DC).
+        // §8.4.1 — PCM reconstruction: the parsed (already
+        // bit-depth-scaled, equation 8-12) samples ARE the
+        // reconstructed picture; stamp the mode field so neighbours
+        // see a written block (→ DC).
         ctx.field.record_intra_pb(x_cb, y_cb, n_cb, INTRA_DC, true);
+        if let Some(pcm) = cu.pcm.as_ref() {
+            write_pcm_cu(pic, params.chroma_array_type, x_cb, y_cb, n_cb, pcm);
+        }
         return Ok(());
     }
 
@@ -1989,6 +2030,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![],
             // prev_intra_luma_pred_flag + mpm_idx 0 ⇒ candModeList[0] =
             // PLANAR for the all-DC neighbour fallback.
@@ -2088,6 +2130,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![],
             intra_luma: vec![luma],
             intra_chroma_pred_mode: vec![chroma_pred_mode],
@@ -2537,6 +2580,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
+            pcm: None,
             prediction_units: vec![],
             intra_luma: vec![luma],
             intra_chroma_pred_mode: vec![4],
