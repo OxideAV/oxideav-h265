@@ -1005,6 +1005,41 @@ impl ReconCtx {
         qp_y
     }
 
+    /// The `SliceAddrRs` of the CTB containing the luma position.
+    #[must_use]
+    pub fn slice_addr_rs_of_luma(&self, x_luma: usize, y_luma: usize) -> u32 {
+        let ctb_log2 = self.field.ctb_log2();
+        let w = self.tiling.pic_width_in_ctbs_y() as usize;
+        let rs = (y_luma >> ctb_log2) * w + (x_luma >> ctb_log2);
+        self.slice_addr_of(rs as u32)
+    }
+
+    /// The §6.5.1 `TileId` of the CTB containing the luma position.
+    #[must_use]
+    pub fn tile_id_of_luma(&self, x_luma: usize, y_luma: usize) -> u32 {
+        let ctb_log2 = self.field.ctb_log2();
+        let w = self.tiling.pic_width_in_ctbs_y() as usize;
+        let rs = (y_luma >> ctb_log2) * w + (x_luma >> ctb_log2);
+        self.tiling
+            .tile_id(self.tiling.ctb_addr_rs_to_ts(rs as u32))
+    }
+
+    /// The per-4×4-cell §8.6.1 `QpY` map (for the §8.7.2 per-position
+    /// `QpQ` / `QpP` reads). `None` when no QP state is initialized.
+    #[must_use]
+    pub fn qp_cells(&self) -> Option<(&[i8], usize)> {
+        self.qp.as_ref().map(|q| (q.map.as_slice(), q.w_cells))
+    }
+
+    /// §8.6.1 step-1 — reset `qPY_PREV` to `SliceQpY` (invoked at the
+    /// first quantization group of a CTB row when
+    /// `entropy_coding_sync_enabled_flag` is set, and at tile starts).
+    pub fn reset_qp_prev(&mut self) {
+        if let Some(q) = self.qp.as_mut() {
+            q.last_cu_qp = None;
+        }
+    }
+
     /// The §8.6.1-derived `QpY` recorded at a luma location (for the
     /// deblocking p-side QP). Returns `None` when no QP state is
     /// initialized.

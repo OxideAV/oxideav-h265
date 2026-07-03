@@ -323,6 +323,15 @@ pub struct InterSliceContext {
     /// `Log2MinCuQpDeltaSize` (§7.4.3.3.1) — the §8.6.1
     /// quantization-group size.
     pub log2_min_cu_qp_delta_size: u32,
+    /// `entropy_coding_sync_enabled_flag` — the §8.6.1 third bullet
+    /// resets `qPY_PREV` to `SliceQpY` at the first quantization group
+    /// of each CTB row.
+    pub wpp_qp_row_reset: bool,
+    /// `slice_loop_filter_across_slices_enabled_flag` (§8.7.2.1 /
+    /// §8.7.3.2 — slice-boundary edges are filtered only when set).
+    pub filter_across_slices: bool,
+    /// `loop_filter_across_tiles_enabled_flag`.
+    pub filter_across_tiles: bool,
     /// `slice_deblocking_filter_disabled_flag == 0` — run the §8.7.2
     /// in-loop deblocking pass after reconstruction.
     pub deblock_enabled: bool,
@@ -458,7 +467,17 @@ pub fn reconstruct_inter_picture(
     };
 
     let mut deblock_cus: Vec<crate::deblock::DeblockCuDesc> = Vec::new();
+    let mut prev_slice_addr: Option<u32> = None;
     for placed in ctus {
+        // §8.6.1 step-1 — qPY_PREV resets to SliceQpY at the first
+        // quantization group of a slice and (with entropy_coding_sync)
+        // of each CTB row.
+        if prev_slice_addr != Some(placed.slice_addr_rs)
+            || (slice.wpp_qp_row_reset && placed.x_ctb == 0)
+        {
+            ctx.reset_qp_prev();
+        }
+        prev_slice_addr = Some(placed.slice_addr_rs);
         reconstruct_inter_quadtree(
             &mut pic,
             &mut ctx,
@@ -475,7 +494,10 @@ pub fn reconstruct_inter_picture(
     // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
     // ahead of the §8.7.3 SAO pass.
     if slice.deblock_enabled {
-        crate::deblock::deblock_picture(&mut pic, &field, &deblock_cus);
+        let qp_map = ctx
+            .qp_cells()
+            .map(|(cells, w_cells)| crate::deblock::QpMap { cells, w_cells });
+        crate::deblock::deblock_picture_with_qp_map(&mut pic, &field, &deblock_cus, qp_map);
     }
 
     // §8.7.3 — sample-adaptive offset (on the deblocked samples). Resolve
@@ -500,13 +522,27 @@ pub fn reconstruct_inter_picture(
             );
         }
     }
-    let filtered = crate::sao::apply_sao_picture(
+    let sao_boundaries = crate::sao::SaoBoundaries {
+        slice_addr_of_ctb: slice_addr_map.clone(),
+        tile_id_of_ctb: (0..(pic_w_ctbs * pic_h_ctbs) as u32)
+            .map(|rs| {
+                let tiling = ctx.tiling();
+                tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs))
+            })
+            .collect(),
+        pic_w_ctbs,
+        ctb_log2_size_y: slice.ctb_log2_size_y,
+        across_slices: slice.filter_across_slices,
+        across_tiles: slice.filter_across_tiles,
+    };
+    let filtered = crate::sao::apply_sao_picture_with_boundaries(
         &pic,
         &sao_grid,
         slice.ctb_log2_size_y,
         params.chroma_array_type,
         slice.slice_sao_luma_flag,
         slice.slice_sao_chroma_flag,
+        Some(&sao_boundaries),
     );
 
     Ok((filtered, field))
@@ -571,6 +607,8 @@ fn collect_deblock_cu(
     qp_y: i32,
     qp_y_p_left: i32,
     qp_y_p_top: i32,
+    filter_left: bool,
+    filter_top: bool,
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
 ) {
     let cu_params = crate::deblock::DeblockCuParams {
@@ -598,8 +636,8 @@ fn collect_deblock_cu(
         // picture's left / top border (the single-slice / single-tile case;
         // a slice / tile boundary with loop-filter-across disabled would
         // additionally clear these, threaded by the caller).
-        filter_left: cu.x0 != 0,
-        filter_top: cu.y0 != 0,
+        filter_left,
+        filter_top,
     });
 }
 
@@ -648,6 +686,17 @@ fn reconstruct_inter_leaf_cu(
         } else {
             qp_y
         };
+        // §8.7.2.1 filterLeftCbEdgeFlag / filterTopCbEdgeFlag: a
+        // picture-boundary edge is never filtered; a slice / tile
+        // boundary edge only when filtering across it is enabled.
+        let boundary_ok = |x_nb: usize, y_nb: usize| -> bool {
+            let same_slice =
+                ctx.slice_addr_rs_of_luma(x0, y0) == ctx.slice_addr_rs_of_luma(x_nb, y_nb);
+            let same_tile = ctx.tile_id_of_luma(x0, y0) == ctx.tile_id_of_luma(x_nb, y_nb);
+            (same_slice || slice.filter_across_slices) && (same_tile || slice.filter_across_tiles)
+        };
+        let filter_left = x0 != 0 && boundary_ok(x0 - 1, y0);
+        let filter_top = y0 != 0 && boundary_ok(x0, y0 - 1);
         collect_deblock_cu(
             cu,
             slice,
@@ -657,6 +706,8 @@ fn reconstruct_inter_leaf_cu(
             qp_y,
             qp_p_left,
             qp_p_top,
+            filter_left,
+            filter_top,
             deblock_cus,
         );
     }
@@ -1056,6 +1107,9 @@ mod tests {
     fn p_slice_ctx() -> InterSliceContext {
         InterSliceContext {
             log2_min_cu_qp_delta_size: 4,
+            wpp_qp_row_reset: false,
+            filter_across_slices: true,
+            filter_across_tiles: true,
             curr_poc: 4,
             slice_is_b: false,
             ctb_log2_size_y: 5,

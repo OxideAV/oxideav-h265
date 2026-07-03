@@ -98,3 +98,34 @@ fn main10_decodes_byte_exact() {
 fn bipred_b_frames_decode_byte_exact() {
     assert_decodes_byte_exact(BIPRED_HEVC, BIPRED_YUV, 8, "bipred-b-frames-main");
 }
+
+/// `entropy_coding_sync_enabled_flag == 1` (WPP): an 8×4-CTB picture
+/// whose CTB rows are separate entry-point substreams with the §9.3.2.4
+/// context storage after each row's second CTB and the §9.3.2.5
+/// synchronization at the next row's start, plus per-QG cu_qp_delta
+/// chains and per-position deblocking QPs.
+#[test]
+fn wpp_on_decodes_byte_exact() {
+    assert_decodes_byte_exact(WPP_HEVC, WPP_YUV, 1, "wpp-on");
+}
+
+/// Four independent slice segments per picture: per-slice CABAC init,
+/// cross-slice neighbour denial (§6.4.1), per-slice qPY_PREV reset, and
+/// the §8.7.2.1 / §8.7.3.2 loop-filter suppression across slice
+/// boundaries (`slice_loop_filter_across_slices_enabled_flag == 0`).
+#[test]
+fn multi_slice_per_frame_decodes_byte_exact() {
+    assert_decodes_byte_exact(
+        MULTI_SLICE_HEVC,
+        MULTI_SLICE_YUV,
+        1,
+        "multi-slice-per-frame",
+    );
+}
+
+/// A 4×2-CTB I+P pair: multi-CTU slices exercising the cross-CTU
+/// `split_cu_flag` / `cu_skip_flag` ctxInc neighbour reads.
+#[test]
+fn tile_cols_2_decodes_byte_exact() {
+    assert_decodes_byte_exact(TILE_COLS_HEVC, TILE_COLS_YUV, 2, "tile-cols-2");
+}

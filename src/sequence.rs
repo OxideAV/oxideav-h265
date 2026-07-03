@@ -25,7 +25,7 @@ use crate::dpb::{LongTermEntry, RefPicLists};
 use crate::inter_recon::{
     reconstruct_inter_picture, InterSliceContext, PlacedInterCtu, RefListAccess,
 };
-use crate::nal::{NalError, NalHeader, NalIter};
+use crate::nal::{NalError, NalIter, NalUnit};
 use crate::picture::Picture;
 use crate::poc::NalKind;
 use crate::pps::{PicParameterSet, PpsError};
@@ -156,6 +156,9 @@ struct SegmentData {
     temporal_id: u8,
     layer_id: u8,
     rbsp: Vec<u8>,
+    /// Coded (escaped) payload — the §7.4.7.1 entry-point offsets are
+    /// expressed in this byte space.
+    escaped: Vec<u8>,
     header: SliceSegmentHeader,
 }
 
@@ -196,18 +199,21 @@ impl SequenceDecoder {
     /// unspecified after an error.
     pub fn push_annexb(&mut self, data: &[u8]) -> Result<(), SequenceError> {
         for unit in NalIter::new(data) {
-            let unit = unit?;
-            self.push_nal_unit(unit.header, unit.rbsp)?;
+            self.push_nal_unit(unit?)?;
         }
         Ok(())
     }
 
-    /// Feed one NAL unit (header already parsed, RBSP already
-    /// unescaped).
+    /// Feed one demuxed NAL unit.
     ///
     /// # Errors
     /// Any parse / decode error.
-    pub fn push_nal_unit(&mut self, header: NalHeader, rbsp: Vec<u8>) -> Result<(), SequenceError> {
+    pub fn push_nal_unit(&mut self, unit: NalUnit) -> Result<(), SequenceError> {
+        let NalUnit {
+            header,
+            rbsp,
+            escaped,
+        } = unit;
         if header.is_vcl() {
             // §7.4.2.4.4: a VCL NAL with first_slice_segment_in_pic_flag
             // set starts a new access unit.
@@ -236,6 +242,7 @@ impl SequenceDecoder {
                 temporal_id: header.temporal_id,
                 layer_id: header.nuh_layer_id,
                 rbsp,
+                escaped,
                 header: parsed,
             });
             return Ok(());
@@ -509,7 +516,7 @@ pub fn decode_annexb_sequence_debug(
                 }
             }
             if pic_no < target {
-                dec.push_nal_unit(unit.header, unit.rbsp)?;
+                dec.push_nal_unit(unit)?;
                 continue;
             }
             let pps_id = peek_slice_pps_id(&unit.rbsp, unit.header.nal_unit_type)?;
@@ -522,10 +529,11 @@ pub fn decode_annexb_sequence_debug(
                 temporal_id: unit.header.temporal_id,
                 layer_id: unit.header.nuh_layer_id,
                 rbsp: unit.rbsp,
+                escaped: unit.escaped,
                 header: parsed,
             });
         } else {
-            dec.push_nal_unit(unit.header, unit.rbsp)?;
+            dec.push_nal_unit(unit)?;
         }
     }
     let seg = &segs[0];
@@ -577,10 +585,11 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
                 temporal_id: unit.header.temporal_id,
                 layer_id: unit.header.nuh_layer_id,
                 rbsp: unit.rbsp,
+                escaped: unit.escaped,
                 header: parsed,
             });
         } else {
-            dec.push_nal_unit(unit.header, unit.rbsp)?;
+            dec.push_nal_unit(unit)?;
         }
     }
     let seg = &segs[0];
@@ -915,6 +924,11 @@ fn build_inter_slice_context(
         no_backward_pred,
         min_tb_log2_size_y: geom.min_tb_log2,
         log2_min_cu_qp_delta_size: geom.ctb_log2 - pps.diff_cu_qp_delta_depth,
+        wpp_qp_row_reset: pps.entropy_coding_sync_enabled_flag,
+        filter_across_slices: header
+            .slice_loop_filter_across_slices_enabled_flag
+            .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
+        filter_across_tiles: pps.loop_filter_across_tiles_enabled_flag,
         deblock_enabled: deblock.map_or(true, |d| !d.disabled_flag),
         beta_offset_div2: deblock.map_or(0, |d| i32::from(d.beta_offset_div2)),
         tc_offset_div2: deblock.map_or(0, |d| i32::from(d.tc_offset_div2)),
@@ -1016,18 +1030,22 @@ fn decode_slice_segment_data(
         .slice_qp_y(pps)
         .ok_or(SequenceError::Malformed("slice header without slice_qp"))?;
 
-    if pps.entropy_coding_sync_enabled_flag {
-        return Err(SequenceError::Unsupported(
-            "entropy_coding_sync (WPP) CABAC storage is not decoded yet",
-        ));
-    }
-
     let data_offset = header
         .byte_offset_to_slice_data
         .ok_or(SequenceError::Malformed("slice header without data offset"))?;
     if data_offset >= seg.rbsp.len() {
         return Err(SequenceError::Malformed("slice data offset out of range"));
     }
+
+    // §7.4.7.1 — split `slice_segment_data( )` into its subsets. The
+    // entry-point offsets count CODED bytes (emulation-prevention bytes
+    // included), so map each escaped boundary onto the stripped RBSP.
+    let substreams = split_substreams(
+        &seg.escaped,
+        seg.rbsp.len(),
+        data_offset,
+        header.entry_point_offsets.as_ref(),
+    )?;
 
     // Table 9-4 initType: I => 0; P => cabac_init ? 2 : 1;
     // B => cabac_init ? 1 : 2 (crate::cabac::init_type on the raw
@@ -1040,13 +1058,31 @@ fn decode_slice_segment_data(
     let it = init_type(raw_slice_type, header.cabac_init_flag.unwrap_or(false));
 
     let tiling = geom.tiling()?;
+    let wpp = pps.entropy_coding_sync_enabled_flag;
     let slice_addr_rs = header.slice_segment_address;
     let mut ctb_addr_ts = tiling.ctb_addr_rs_to_ts(slice_addr_rs);
     let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
 
-    let mut engine = CabacEngine::new(BitReader::new(&seg.rbsp[data_offset..]))
+    let sub_range = |idx: usize| -> Result<&[u8], SequenceError> {
+        let &(a, b) = substreams
+            .get(idx)
+            .ok_or(SequenceError::Malformed("more CTB rows than substreams"))?;
+        seg.rbsp
+            .get(a..b)
+            .ok_or(SequenceError::Malformed("substream range out of RBSP"))
+    };
+    let mut sub_idx = 0usize;
+    let mut engine = CabacEngine::new(BitReader::new(sub_range(0)?))
         .map_err(|_| SequenceError::Malformed("slice data too short for CABAC init"))?;
     let mut ctx = SliceContexts::init(it, slice_qp_y);
+    // §9.3.2.4 / §9.3.2.5 — the WPP context storage (stored after the
+    // second CTB of a row; synchronized at the next row's start when
+    // the above-right CTB is available).
+    let mut wpp_stored: Option<SliceContexts> = None;
+    let mut first_ctu = true;
+    // Set after the row-final CTU's end_of_subset_one_bit: the next CTU
+    // starts a new substream.
+    let mut advance_substream = false;
 
     loop {
         if (ctb_addr_ts as usize) >= pic_size_in_ctbs {
@@ -1060,6 +1096,35 @@ fn decode_slice_segment_data(
         let x_ctb = rx << geom.ctb_log2;
         let y_ctb = ry << geom.ctb_log2;
         slice_addr_of[ctb_addr_rs as usize] = Some(slice_addr_rs);
+
+        // §9.3.1 / §9.3.2.1 — at the first CTB of a CTB row (WPP), start
+        // the next substream and either synchronize the context
+        // variables from the stored above-right state (§9.3.2.5) or
+        // re-initialize (§9.3.2.2). The first CTU of the slice keeps the
+        // §9.3.1-item-1 slice initialization done above.
+        if wpp && !first_ctu && rx == 0 {
+            if !advance_substream {
+                return Err(SequenceError::Malformed(
+                    "CTB row start without end_of_subset_one_bit",
+                ));
+            }
+            sub_idx += 1;
+            engine = CabacEngine::new(BitReader::new(sub_range(sub_idx)?))
+                .map_err(|_| SequenceError::Malformed("substream too short for CABAC init"))?;
+            // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
+            // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
+            let t_avail = ry > 0 && geom.pic_w_ctbs > 1 && {
+                let t_rs = (ry - 1) * geom.pic_w_ctbs + 1;
+                slice_addr_of[t_rs as usize] == Some(slice_addr_rs)
+                    && tiling.tile_id(tiling.ctb_addr_rs_to_ts(t_rs)) == tiling.tile_id(ctb_addr_ts)
+            };
+            ctx = match (&wpp_stored, t_avail) {
+                (Some(stored), true) => stored.clone(),
+                _ => SliceContexts::init(it, slice_qp_y),
+            };
+        }
+        advance_substream = false;
+        first_ctu = false;
 
         // §7.3.8.3 SAO merge-candidate availability: the left / above
         // CTB must exist, lie in the same slice segment sequence
@@ -1090,6 +1155,12 @@ fn decode_slice_segment_data(
         )?;
         decoded.push((x_ctb, y_ctb, ctu));
 
+        // §9.3.2.4 — store the context state after the SECOND CTB of a
+        // row (CtbAddrInRs % PicWidthInCtbsY == 1).
+        if wpp && rx == 1 {
+            wpp_stored = Some(ctx.clone());
+        }
+
         let eos = end_of_slice_segment_flag(&mut engine)
             .map_err(|_| SequenceError::Malformed("CABAC underrun at end_of_slice_segment"))?;
         ctb_addr_ts += 1;
@@ -1105,6 +1176,78 @@ fn decode_slice_segment_data(
                 "end_of_slice_segment_flag not set on the last CTB",
             ));
         }
+        // §7.3.8.1 — end_of_subset_one_bit + byte alignment after the
+        // last CTB of a WPP row that does not end the slice; the next
+        // CTU reads from the following substream.
+        if wpp && rx == geom.pic_w_ctbs - 1 {
+            let one = end_of_slice_segment_flag(&mut engine)
+                .map_err(|_| SequenceError::Malformed("CABAC underrun at end_of_subset_one_bit"))?;
+            if !one && !tolerant {
+                return Err(SequenceError::Malformed("end_of_subset_one_bit not set"));
+            }
+            advance_substream = true;
+        }
     }
     Ok(())
+}
+
+/// §7.4.7.1 — the stripped-RBSP byte ranges of the
+/// `num_entry_point_offsets + 1` subsets of `slice_segment_data( )`.
+///
+/// The wire offsets count coded (escaped) bytes from the first byte of
+/// the slice segment data, so walk the escaped payload with the
+/// §7.4.1.1 emulation state machine and translate each boundary into
+/// the stripped-RBSP index space.
+fn split_substreams(
+    escaped: &[u8],
+    rbsp_len: usize,
+    stripped_data_offset: usize,
+    entry_points: Option<&crate::slice::EntryPointOffsets>,
+) -> Result<Vec<(usize, usize)>, SequenceError> {
+    let n_offsets = entry_points.map_or(0, |e| e.entry_point_offset_minus1.len());
+    if n_offsets == 0 {
+        return Ok(vec![(stripped_data_offset, rbsp_len)]);
+    }
+    // stripped index -> escaped index of the slice-data start.
+    let mut stripped_of_escaped = vec![0usize; escaped.len() + 1];
+    let mut zeros = 0u32;
+    let mut stripped = 0usize;
+    for (i, &b) in escaped.iter().enumerate() {
+        stripped_of_escaped[i] = stripped;
+        if zeros >= 2 && b == 0x03 {
+            // Emulation-prevention byte: consumed, not emitted.
+            zeros = 0;
+            continue;
+        }
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+        stripped += 1;
+    }
+    stripped_of_escaped[escaped.len()] = stripped;
+    // Escaped index of the slice-data start.
+    let escaped_start = stripped_of_escaped
+        .iter()
+        .position(|&sidx| sidx == stripped_data_offset)
+        .ok_or(SequenceError::Malformed("slice data offset unmappable"))?;
+
+    let entry_points = entry_points.expect("checked above");
+    let mut ranges = Vec::with_capacity(n_offsets + 1);
+    let mut first_escaped = escaped_start;
+    let mut first_stripped = stripped_data_offset;
+    for &off_m1 in &entry_points.entry_point_offset_minus1 {
+        let len = off_m1 as usize + 1;
+        let last_escaped = first_escaped
+            .checked_add(len)
+            .filter(|&e| e <= escaped.len())
+            .ok_or(SequenceError::Malformed("entry point past slice data"))?;
+        let last_stripped = stripped_of_escaped[last_escaped];
+        ranges.push((first_stripped, last_stripped));
+        first_escaped = last_escaped;
+        first_stripped = last_stripped;
+    }
+    ranges.push((first_stripped, rbsp_len));
+    Ok(ranges)
 }

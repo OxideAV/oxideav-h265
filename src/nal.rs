@@ -113,6 +113,11 @@ pub struct NalUnit {
     /// Emulation-prevention `0x03` bytes have been stripped per
     /// §7.4.1.1.
     pub rbsp: Vec<u8>,
+    /// The coded (still-escaped) payload bytes, excluding the two
+    /// header bytes. The §7.4.7.1 `entry_point_offset_minus1` subset
+    /// boundaries count emulation-prevention bytes, so the WPP / tile
+    /// substream split needs this form alongside the RBSP.
+    pub escaped: Vec<u8>,
 }
 
 /// Strip emulation-prevention bytes per §7.4.1.1.
@@ -205,7 +210,16 @@ impl Iterator for NalIter<'_> {
             Err(e) => return Some(Err(e)),
         };
         let rbsp = unescaped[2..].to_vec();
-        Some(Ok(NalUnit { header, rbsp }))
+        // The escaped form, aligned with `rbsp` (header bytes dropped).
+        // The two header bytes are never part of an emulation-prevention
+        // pattern's tail (`nuh_temporal_id_plus1 != 0` forbids 0x00 0x00
+        // at the header), so dropping them keeps the two forms in step.
+        let escaped = payload[2..].to_vec();
+        Some(Ok(NalUnit {
+            header,
+            rbsp,
+            escaped,
+        }))
     }
 }
 

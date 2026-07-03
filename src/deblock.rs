@@ -1046,6 +1046,18 @@ pub fn filter_cu_edges(
     edge_type: EdgeType,
     bs: &BoundaryStrength,
 ) {
+    filter_cu_edges_with_qp_map(pic, cu, edge_type, bs, None);
+}
+
+/// [`filter_cu_edges`] with the per-position [`QpMap`] (exact `QpQ` /
+/// `QpP` when quantization groups vary inside / around the CU).
+pub fn filter_cu_edges_with_qp_map(
+    pic: &mut Picture,
+    cu: &DeblockCu,
+    edge_type: EdgeType,
+    bs: &BoundaryStrength,
+    qp_map: Option<QpMap<'_>>,
+) {
     let DeblockCu {
         x_cb,
         y_cb,
@@ -1078,9 +1090,22 @@ pub fn filter_cu_edges(
                 EdgeType::Vertical => (x_dk == 0, qp_y_p_left),
                 EdgeType::Horizontal => (y_dm == 0, qp_y_p_top),
             };
-            let qp_p = if boundary { qp_y_p } else { params.qp_y };
+            // §8.7.2.5.3: QpQ / QpP are the QpY of the coding units
+            // containing the q0 / p0 samples — per position from the QP
+            // map when supplied, else the per-CU scalars.
+            let (qp_q, qp_p) = match qp_map {
+                Some(m) => {
+                    let (qx, qy) = (x_cb + x_dk, y_cb + y_dm);
+                    let (px, py) = match edge_type {
+                        EdgeType::Vertical => (qx - 1, qy),
+                        EdgeType::Horizontal => (qx, qy - 1),
+                    };
+                    (m.qp_at(qx, qy), m.qp_at(px, py))
+                }
+                None => (params.qp_y, if boundary { qp_y_p } else { params.qp_y }),
+            };
             let qp = EdgeQp {
-                qp_q: params.qp_y,
+                qp_q,
                 qp_p,
                 beta_offset_div2: params.beta_offset_div2,
                 tc_offset_div2: params.tc_offset_div2,
@@ -1147,9 +1172,21 @@ pub fn filter_cu_edges(
                     EdgeType::Vertical => (bx == 0, qp_y_p_left),
                     EdgeType::Horizontal => (by == 0, qp_y_p_top),
                 };
-                let qp_p = if boundary { qp_y_p } else { params.qp_y };
+                // §8.7.2.5.5: QpQ / QpP from the coding units containing
+                // the chroma edge's q0 / p0 samples (luma positions).
+                let (qp_q, qp_p) = match qp_map {
+                    Some(m) => {
+                        let (qx, qy) = ((xc_cb + x_dk) * sub_w, (yc_cb + y_dm) * sub_h);
+                        let (px, py) = match edge_type {
+                            EdgeType::Vertical => (qx - 1, qy),
+                            EdgeType::Horizontal => (qx, qy - 1),
+                        };
+                        (m.qp_at(qx, qy), m.qp_at(px, py))
+                    }
+                    None => (params.qp_y, if boundary { qp_y_p } else { params.qp_y }),
+                };
                 let qp = EdgeQp {
-                    qp_q: params.qp_y,
+                    qp_q,
                     qp_p,
                     beta_offset_div2: params.beta_offset_div2,
                     tc_offset_div2: params.tc_offset_div2,
@@ -1222,13 +1259,43 @@ pub struct DeblockCuDesc {
 /// # Panics
 /// Panics if a CU's edges read/write outside a `pic` plane.
 pub fn deblock_picture(pic: &mut Picture, field: &MotionField, cus: &[DeblockCuDesc]) {
+    deblock_picture_with_qp_map(pic, field, cus, None);
+}
+
+/// Per-4×4-cell `QpY` map for the §8.7.2.5.3 / §8.7.2.5.5 per-position
+/// `QpQ` / `QpP` reads (row-major over the picture's 4×4 cells). When a
+/// picture carries per-quantization-group `cu_qp_delta` values, the
+/// p-side QP can change along a single coding-block edge, so the
+/// per-CU scalar fallback in [`DeblockCu`] is not exact.
+#[derive(Debug, Clone, Copy)]
+pub struct QpMap<'a> {
+    /// Per-cell `QpY`.
+    pub cells: &'a [i8],
+    /// Cell-grid width (`ceil(pic_width / 4)`).
+    pub w_cells: usize,
+}
+
+impl QpMap<'_> {
+    fn qp_at(&self, x_luma: usize, y_luma: usize) -> i32 {
+        let idx = (y_luma >> 2) * self.w_cells + (x_luma >> 2);
+        self.cells.get(idx).copied().map_or(0, i32::from)
+    }
+}
+
+/// [`deblock_picture`] with the per-position QP map.
+pub fn deblock_picture_with_qp_map(
+    pic: &mut Picture,
+    field: &MotionField,
+    cus: &[DeblockCuDesc],
+    qp_map: Option<QpMap<'_>>,
+) {
     // Pass 1: all vertical edges.
     for desc in cus {
-        apply_cu_direction(pic, field, desc, EdgeType::Vertical);
+        apply_cu_direction(pic, field, desc, EdgeType::Vertical, qp_map);
     }
     // Pass 2: all horizontal edges (on the vertically-filtered samples).
     for desc in cus {
-        apply_cu_direction(pic, field, desc, EdgeType::Horizontal);
+        apply_cu_direction(pic, field, desc, EdgeType::Horizontal, qp_map);
     }
 }
 
@@ -1238,6 +1305,7 @@ fn apply_cu_direction(
     field: &MotionField,
     desc: &DeblockCuDesc,
     edge_type: EdgeType,
+    qp_map: Option<QpMap<'_>>,
 ) {
     let DeblockCu {
         x_cb,
@@ -1265,7 +1333,7 @@ fn apply_cu_direction(
         ef.edge_flags(),
         ef.tb_edge(),
     );
-    filter_cu_edges(pic, &desc.cu, edge_type, &bs);
+    filter_cu_edges_with_qp_map(pic, &desc.cu, edge_type, &bs, qp_map);
 }
 
 #[cfg(test)]

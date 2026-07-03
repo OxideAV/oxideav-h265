@@ -16,9 +16,10 @@
 //! is the prerequisite the §8.4 / §8.5 picture-reconstruction passes
 //! consume. Picture-level neighbour availability (§6.4.1) and the
 //! `CtDepth` / `cu_skip_flag` neighbour grids feeding the §9.3.4.2.2
-//! `split_cu_flag` / `cu_skip_flag` ctxInc derivations are threaded
-//! through a small per-CTU [`CtuGrid`] keyed at minimum-coding-block
-//! (`MinCbSizeY`) granularity.
+//! `split_cu_flag` / `cu_skip_flag` ctxInc derivations are carried by
+//! the picture-level [`PictureParseState`] (per-4×4-cell grids gated on
+//! the §6.4.1 slice / tile availability), so a coding block's left /
+//! above neighbour reads work across CTU boundaries.
 //!
 //! The §6.5.1 quantization-group reset (`IsCuQpDeltaCoded`,
 //! `CuQpDeltaVal`, `IsCuChromaQpOffsetCoded`) is performed by the
@@ -256,125 +257,6 @@ pub struct CodingTreeUnit {
     pub quadtree: CodingQuadtree,
 }
 
-/// Per-CTU neighbour-state grid at minimum-coding-block granularity.
-/// Records `CtDepth[x][y]` and `cu_skip_flag[x][y]` for the
-/// §9.3.4.2.2 `split_cu_flag` / `cu_skip_flag` left/above ctxInc
-/// derivations.
-///
-/// The grid spans one CTB (`(1 << CtbLog2SizeY)` luma samples square),
-/// addressed in `MinCb` units. Neighbour lookups that fall outside the
-/// CTB to the left or above are treated as unavailable for ctxInc
-/// purposes (a conservative within-CTU model: full cross-CTU
-/// availability is the picture-level §6.4.1 reconstruction pass's
-/// responsibility).
-#[derive(Debug, Clone)]
-pub struct CtuGrid {
-    min_cb_log2: u32,
-    ctb_log2: u32,
-    dim: u32,
-    ct_depth: Vec<u8>,
-    cu_skip: Vec<u8>,
-    x_ctb: u32,
-    y_ctb: u32,
-}
-
-impl CtuGrid {
-    /// Construct a fresh grid for the CTB whose top-left luma position
-    /// is `(x_ctb, y_ctb)`.
-    #[must_use]
-    pub fn new(params: &SliceDataParams, x_ctb: u32, y_ctb: u32) -> Self {
-        let dim = 1u32 << (params.ctb_log2_size_y - params.min_cb_log2_size_y);
-        let n = (dim * dim) as usize;
-        Self {
-            min_cb_log2: params.min_cb_log2_size_y,
-            ctb_log2: params.ctb_log2_size_y,
-            dim,
-            ct_depth: vec![0u8; n],
-            cu_skip: vec![0u8; n],
-            x_ctb,
-            y_ctb,
-        }
-    }
-
-    /// Convert an absolute luma position to a grid index, or `None`
-    /// when it lies outside this CTB.
-    fn idx(&self, x: u32, y: u32) -> Option<usize> {
-        if x < self.x_ctb || y < self.y_ctb {
-            return None;
-        }
-        let lx = (x - self.x_ctb) >> self.min_cb_log2;
-        let ly = (y - self.y_ctb) >> self.min_cb_log2;
-        if lx >= self.dim || ly >= self.dim {
-            return None;
-        }
-        Some((ly * self.dim + lx) as usize)
-    }
-
-    /// Mark a coding block covering `[x0, x0 + size) × [y0, y0 + size)`
-    /// with the given `CtDepth` and `cu_skip_flag`.
-    fn mark(&mut self, x0: u32, y0: u32, log2_cb_size: u32, ct_depth: u8, cu_skip: u8) {
-        let size = 1u32 << log2_cb_size;
-        let step = 1u32 << self.min_cb_log2;
-        let mut y = y0;
-        while y < y0 + size {
-            let mut x = x0;
-            while x < x0 + size {
-                if let Some(i) = self.idx(x, y) {
-                    self.ct_depth[i] = ct_depth;
-                    self.cu_skip[i] = cu_skip;
-                }
-                x += step;
-            }
-            y += step;
-        }
-        let _ = self.ctb_log2;
-    }
-
-    /// `(CtDepth, available)` for the block to the left of `(x0, y0)`.
-    fn left_ct_depth(&self, x0: u32, y0: u32) -> (u32, bool) {
-        if x0 == 0 {
-            return (0, false);
-        }
-        match self.idx(x0 - 1, y0) {
-            Some(i) => (self.ct_depth[i] as u32, true),
-            None => (0, false),
-        }
-    }
-
-    /// `(CtDepth, available)` for the block above `(x0, y0)`.
-    fn above_ct_depth(&self, x0: u32, y0: u32) -> (u32, bool) {
-        if y0 == 0 {
-            return (0, false);
-        }
-        match self.idx(x0, y0 - 1) {
-            Some(i) => (self.ct_depth[i] as u32, true),
-            None => (0, false),
-        }
-    }
-
-    /// `(cu_skip_flag, available)` for the block to the left.
-    fn left_cu_skip(&self, x0: u32, y0: u32) -> (u8, bool) {
-        if x0 == 0 {
-            return (0, false);
-        }
-        match self.idx(x0 - 1, y0) {
-            Some(i) => (self.cu_skip[i], true),
-            None => (0, false),
-        }
-    }
-
-    /// `(cu_skip_flag, available)` for the block above.
-    fn above_cu_skip(&self, x0: u32, y0: u32) -> (u8, bool) {
-        if y0 == 0 {
-            return (0, false);
-        }
-        match self.idx(x0, y0 - 1) {
-            Some(i) => (self.cu_skip[i], true),
-            None => (0, false),
-        }
-    }
-}
-
 /// Picture-level parse state threaded across the CTUs of a picture.
 ///
 /// The §7.3.8 walk needs the **derived** `IntraPredModeY` /
@@ -397,6 +279,14 @@ pub struct PictureParseState {
     ctb_info: Vec<Option<(u32, u32)>>,
     /// The current CTU's `(SliceAddrRs, TileId)`.
     cur: (u32, u32),
+    /// Per-4×4-cell `CtDepth` (−1 = not yet decoded) — the §9.3.4.2.2
+    /// `split_cu_flag` ctxInc neighbour reads.
+    ct_depth: Vec<i8>,
+    /// Per-4×4-cell `cu_skip_flag` — the §9.3.4.2.2 `cu_skip_flag`
+    /// ctxInc neighbour reads.
+    cu_skip: Vec<u8>,
+    w_cells: usize,
+    h_cells: usize,
 }
 
 impl PictureParseState {
@@ -406,6 +296,8 @@ impl PictureParseState {
         let ctb = 1u32 << params.ctb_log2_size_y;
         let w_ctbs = params.pic_width_in_luma_samples.div_ceil(ctb);
         let h_ctbs = params.pic_height_in_luma_samples.div_ceil(ctb);
+        let w_cells = (params.pic_width_in_luma_samples as usize).div_ceil(4);
+        let h_cells = (params.pic_height_in_luma_samples as usize).div_ceil(4);
         Self {
             field: IntraModeField::new(
                 params.pic_width_in_luma_samples as usize,
@@ -418,7 +310,66 @@ impl PictureParseState {
             pic_w_ctbs: w_ctbs,
             ctb_info: vec![None; (w_ctbs * h_ctbs) as usize],
             cur: (0, 0),
+            ct_depth: vec![-1; w_cells * h_cells],
+            cu_skip: vec![0; w_cells * h_cells],
+            w_cells,
+            h_cells,
         }
+    }
+
+    fn cell(&self, x: u32, y: u32) -> usize {
+        ((y as usize) >> 2).min(self.h_cells - 1) * self.w_cells
+            + ((x as usize) >> 2).min(self.w_cells - 1)
+    }
+
+    /// Record a coding block's `CtDepth` + `cu_skip_flag` over its area
+    /// (the §9.3.4.2.2 neighbour state for later blocks).
+    fn record_cu_depth(&mut self, x0: u32, y0: u32, log2_cb_size: u32, depth: u8, skip: u8) {
+        let n = 1u32 << log2_cb_size;
+        let x1 = (x0 + n).min(self.pic_width);
+        let y1 = (y0 + n).min(self.pic_height);
+        for y in (y0..y1).step_by(4) {
+            for x in (x0..x1).step_by(4) {
+                let c = self.cell(x, y);
+                self.ct_depth[c] = depth as i8;
+                self.cu_skip[c] = skip;
+            }
+        }
+    }
+
+    /// `(CtDepth, available)` of the neighbour of `(x0, y0)` — the
+    /// §9.3.4.2.2 `split_cu_flag` ctxInc read, gated on the §6.4.1
+    /// availability (in-picture, decoded, same slice, same tile).
+    fn neighbour_ct_depth(&self, x0: u32, y0: u32, neighbour: Neighbour) -> (u32, bool) {
+        let (x_nb, y_nb) = match neighbour {
+            Neighbour::Left => (x0.wrapping_sub(1), y0),
+            Neighbour::Above => (x0, y0.wrapping_sub(1)),
+        };
+        if !self.neighbour_available(x0, y0, neighbour) {
+            return (0, false);
+        }
+        let d = self.ct_depth[self.cell(x_nb, y_nb)];
+        if d < 0 {
+            return (0, false);
+        }
+        (d as u32, true)
+    }
+
+    /// `(cu_skip_flag, available)` of the neighbour of `(x0, y0)` — the
+    /// §9.3.4.2.2 `cu_skip_flag` ctxInc read.
+    fn neighbour_cu_skip(&self, x0: u32, y0: u32, neighbour: Neighbour) -> (u8, bool) {
+        let (x_nb, y_nb) = match neighbour {
+            Neighbour::Left => (x0.wrapping_sub(1), y0),
+            Neighbour::Above => (x0, y0.wrapping_sub(1)),
+        };
+        if !self.neighbour_available(x0, y0, neighbour) {
+            return (0, false);
+        }
+        let c = self.cell(x_nb, y_nb);
+        if self.ct_depth[c] < 0 {
+            return (0, false);
+        }
+        (self.cu_skip[c], true)
     }
 
     /// Mark the CTU at `(x_ctb, y_ctb)` as belonging to slice segment
@@ -811,7 +762,6 @@ fn decode_coding_unit(
     engine: &mut CabacEngine<'_>,
     ctx: &mut SliceContexts,
     params: &SliceDataParams,
-    grid: &mut CtuGrid,
     state: &mut PictureParseState,
     qg: &mut QuantGroupState,
     x0: u32,
@@ -829,14 +779,14 @@ fn decode_coding_unit(
 
     // cu_skip_flag (P/B only).
     let cu_skip_flag = if !params.slice_type_is_i {
-        let (l_skip, l_avail) = grid.left_cu_skip(x0, y0);
-        let (a_skip, a_avail) = grid.above_cu_skip(x0, y0);
+        let (l_skip, l_avail) = state.neighbour_cu_skip(x0, y0, Neighbour::Left);
+        let (a_skip, a_avail) = state.neighbour_cu_skip(x0, y0, Neighbour::Above);
         let inc = cu_skip_flag_ctx_inc(l_skip, l_avail, a_skip, a_avail) as usize;
         decode_cu_skip_flag(engine, &mut ctx.cu_skip_flag[inc])? != 0
     } else {
         false
     };
-    grid.mark(x0, y0, log2_cb_size, ct_depth as u8, cu_skip_flag as u8);
+    state.record_cu_depth(x0, y0, log2_cb_size, ct_depth as u8, cu_skip_flag as u8);
 
     let mut cu = CodingUnit {
         x0,
@@ -1217,7 +1167,6 @@ pub fn decode_coding_quadtree(
     engine: &mut CabacEngine<'_>,
     ctx: &mut SliceContexts,
     params: &SliceDataParams,
-    grid: &mut CtuGrid,
     state: &mut PictureParseState,
     qg: &mut QuantGroupState,
     x0: u32,
@@ -1232,8 +1181,8 @@ pub fn decode_coding_quadtree(
     // split_cu_flag presence gate (§7.3.8.4).
     let split_present = fits_w && fits_h && log2_cb_size > params.min_cb_log2_size_y;
     let split = if split_present {
-        let (l_depth, l_avail) = grid.left_ct_depth(x0, y0);
-        let (a_depth, a_avail) = grid.above_ct_depth(x0, y0);
+        let (l_depth, l_avail) = state.neighbour_ct_depth(x0, y0, Neighbour::Left);
+        let (a_depth, a_avail) = state.neighbour_ct_depth(x0, y0, Neighbour::Above);
         let inc = split_cu_flag_ctx_inc(l_depth, l_avail, a_depth, a_avail, cqt_depth) as usize;
         decode_split_cu_flag(engine, &mut ctx.split_cu_flag[inc])? != 0
     } else {
@@ -1265,7 +1214,6 @@ pub fn decode_coding_quadtree(
             engine,
             ctx,
             params,
-            grid,
             state,
             qg,
             x0,
@@ -1278,7 +1226,6 @@ pub fn decode_coding_quadtree(
                 engine,
                 ctx,
                 params,
-                grid,
                 state,
                 qg,
                 x1,
@@ -1292,7 +1239,6 @@ pub fn decode_coding_quadtree(
                 engine,
                 ctx,
                 params,
-                grid,
                 state,
                 qg,
                 x0,
@@ -1306,7 +1252,6 @@ pub fn decode_coding_quadtree(
                 engine,
                 ctx,
                 params,
-                grid,
                 state,
                 qg,
                 x1,
@@ -1321,7 +1266,6 @@ pub fn decode_coding_quadtree(
             engine,
             ctx,
             params,
-            grid,
             state,
             qg,
             x0,
@@ -1386,7 +1330,6 @@ pub fn decode_coding_tree_unit_in_picture(
     sao_merge_left_allowed: bool,
     sao_merge_up_allowed: bool,
 ) -> Result<CodingTreeUnit, ResidualCodingError> {
-    let mut grid = CtuGrid::new(params, x_ctb, y_ctb);
     let mut qg = QuantGroupState::default();
     state.begin_ctu(x_ctb, y_ctb, slice_addr_rs, tile_id);
 
@@ -1406,7 +1349,6 @@ pub fn decode_coding_tree_unit_in_picture(
         engine,
         ctx,
         params,
-        &mut grid,
         state,
         &mut qg,
         x_ctb,

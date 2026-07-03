@@ -325,8 +325,8 @@ pub use slice::{
 };
 pub use slice_data::{
     decode_coding_quadtree, decode_coding_tree_unit, decode_coding_tree_unit_in_picture,
-    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, CtuGrid, IntraLumaMode,
-    PictureParseState, PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
+    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode, PictureParseState,
+    PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
 };
 pub use sps::{
     ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,

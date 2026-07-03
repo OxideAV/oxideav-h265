@@ -202,6 +202,68 @@ pub fn apply_sao_ctb(
     n_w: usize,
     n_h: usize,
 ) {
+    apply_sao_ctb_with_boundaries(rec, sao_out, plane, comp, x_ctb, y_ctb, n_w, n_h, None);
+}
+
+/// §8.7.3.1 in-loop-filter boundary constraints: the per-CTB slice /
+/// tile identity grids and the across-boundary enable flags the
+/// §8.7.3.2 edge-offset neighbour test consults (a neighbouring sample
+/// in a different slice / tile with filtering-across disabled forces
+/// `edgeIdx = 0`).
+#[derive(Debug, Clone)]
+pub struct SaoBoundaries {
+    /// Per-CTB `SliceAddrRs` (raster order).
+    pub slice_addr_of_ctb: Vec<u32>,
+    /// Per-CTB §6.5.1 `TileId` (raster order).
+    pub tile_id_of_ctb: Vec<u32>,
+    /// `PicWidthInCtbsY`.
+    pub pic_w_ctbs: usize,
+    /// `CtbLog2SizeY`.
+    pub ctb_log2_size_y: u32,
+    /// `slice_loop_filter_across_slices_enabled_flag`.
+    pub across_slices: bool,
+    /// `loop_filter_across_tiles_enabled_flag`.
+    pub across_tiles: bool,
+}
+
+impl SaoBoundaries {
+    /// Whether the §8.7.3.2 edge-offset classification may read the
+    /// neighbour at luma position `(x_nb, y_nb)` from the sample at
+    /// luma position `(x, y)`.
+    fn neighbour_allowed(&self, x: usize, y: usize, x_nb: usize, y_nb: usize) -> bool {
+        let idx = |xx: usize, yy: usize| {
+            (yy >> self.ctb_log2_size_y) * self.pic_w_ctbs + (xx >> self.ctb_log2_size_y)
+        };
+        let a = idx(x, y);
+        let b = idx(x_nb, y_nb);
+        if a == b {
+            return true;
+        }
+        if !self.across_slices && self.slice_addr_of_ctb.get(a) != self.slice_addr_of_ctb.get(b) {
+            return false;
+        }
+        if !self.across_tiles && self.tile_id_of_ctb.get(a) != self.tile_id_of_ctb.get(b) {
+            return false;
+        }
+        true
+    }
+}
+
+/// [`apply_sao_ctb`] with the optional §8.7.3.2 slice / tile boundary
+/// constraints (edge-offset neighbours across a disallowed boundary
+/// force `edgeIdx = 0`, i.e. the sample is left unmodified).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_ctb_with_boundaries(
+    rec: &Picture,
+    sao_out: &mut Picture,
+    plane: Plane,
+    comp: &ResolvedSaoComponent,
+    x_ctb: usize,
+    y_ctb: usize,
+    n_w: usize,
+    n_h: usize,
+    boundaries: Option<&SaoBoundaries>,
+) {
     if comp.sao_type_idx == 0 {
         return;
     }
@@ -228,6 +290,22 @@ pub fn apply_sao_ctb(
                     |x: i32, y: i32| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
                 if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
                     continue;
+                }
+                // §8.7.3.2: a neighbour in a different slice / tile with
+                // loop filtering across that boundary disabled also
+                // forces edgeIdx = 0. Positions map to luma space for
+                // the CTB-grid lookup.
+                if let Some(b) = boundaries {
+                    let (sw, sh) = match plane {
+                        Plane::Luma => (1, 1),
+                        _ => crate::picture::sub_wh_c(rec.chroma_array_type()),
+                    };
+                    let (lx, ly) = (xsi as usize * sw, ysj as usize * sh);
+                    if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
+                        || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
+                    {
+                        continue;
+                    }
                 }
                 let cur = rec.sample(plane, xsi as usize, ysj as usize);
                 let s0 = rec.sample(plane, n0x as usize, n0y as usize);
@@ -290,6 +368,30 @@ pub fn apply_sao_picture(
     slice_sao_luma_flag: bool,
     slice_sao_chroma_flag: bool,
 ) -> Picture {
+    apply_sao_picture_with_boundaries(
+        pic,
+        ctb_sao,
+        ctb_log2_size_y,
+        chroma_array_type,
+        slice_sao_luma_flag,
+        slice_sao_chroma_flag,
+        None,
+    )
+}
+
+/// [`apply_sao_picture`] with the §8.7.3.2 slice / tile boundary
+/// constraints.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_picture_with_boundaries(
+    pic: &Picture,
+    ctb_sao: &[ResolvedSao],
+    ctb_log2_size_y: u32,
+    chroma_array_type: u8,
+    slice_sao_luma_flag: bool,
+    slice_sao_chroma_flag: bool,
+    boundaries: Option<&SaoBoundaries>,
+) -> Picture {
     let ctb_size_y = 1usize << ctb_log2_size_y;
     let pic_width_in_ctbs = pic.width_luma().div_ceil(ctb_size_y);
     let pic_height_in_ctbs = pic.height_luma().div_ceil(ctb_size_y);
@@ -311,7 +413,7 @@ pub fn apply_sao_picture(
         for rx in 0..pic_width_in_ctbs {
             let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
             if slice_sao_luma_flag {
-                apply_sao_ctb(
+                apply_sao_ctb_with_boundaries(
                     &rec,
                     &mut out,
                     Plane::Luma,
@@ -320,10 +422,11 @@ pub fn apply_sao_picture(
                     ry * ctb_size_y,
                     ctb_size_y,
                     ctb_size_y,
+                    boundaries,
                 );
             }
             if chroma_array_type != 0 && slice_sao_chroma_flag {
-                apply_sao_ctb(
+                apply_sao_ctb_with_boundaries(
                     &rec,
                     &mut out,
                     Plane::Cb,
@@ -332,8 +435,9 @@ pub fn apply_sao_picture(
                     ry * n_ctb_chroma_h,
                     n_ctb_chroma_w,
                     n_ctb_chroma_h,
+                    boundaries,
                 );
-                apply_sao_ctb(
+                apply_sao_ctb_with_boundaries(
                     &rec,
                     &mut out,
                     Plane::Cr,
@@ -342,6 +446,7 @@ pub fn apply_sao_picture(
                     ry * n_ctb_chroma_h,
                     n_ctb_chroma_w,
                     n_ctb_chroma_h,
+                    boundaries,
                 );
             }
         }

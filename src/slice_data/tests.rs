@@ -49,25 +49,29 @@ fn fresh_contexts() -> SliceContexts {
 }
 
 #[test]
-fn ctu_grid_left_above_unavailable_at_origin() {
+fn parse_state_left_above_unavailable_at_origin() {
     let params = i_slice_params(4, 3);
-    let grid = CtuGrid::new(&params, 0, 0);
-    assert_eq!(grid.left_ct_depth(0, 0), (0, false));
-    assert_eq!(grid.above_ct_depth(0, 0), (0, false));
-    assert_eq!(grid.left_cu_skip(0, 0), (0, false));
-    assert_eq!(grid.above_cu_skip(0, 0), (0, false));
+    let mut state = PictureParseState::new(&params);
+    state.begin_ctu(0, 0, 0, 0);
+    assert_eq!(state.neighbour_ct_depth(0, 0, Neighbour::Left), (0, false));
+    assert_eq!(state.neighbour_ct_depth(0, 0, Neighbour::Above), (0, false));
+    assert_eq!(state.neighbour_cu_skip(0, 0, Neighbour::Left), (0, false));
+    assert_eq!(state.neighbour_cu_skip(0, 0, Neighbour::Above), (0, false));
 }
 
 #[test]
-fn ctu_grid_marks_and_reads_back_neighbours() {
+fn parse_state_records_and_reads_back_neighbours() {
     let params = i_slice_params(5, 3); // 32x32 CTB, 8x8 min CB
-    let mut grid = CtuGrid::new(&params, 0, 0);
-    // Mark an 8x8 block at (0,0) with CtDepth 2.
-    grid.mark(0, 0, 3, 2, 0);
+    let mut state = PictureParseState::new(&params);
+    state.begin_ctu(0, 0, 0, 0);
+    // Record an 8x8 block at (0,0) with CtDepth 2.
+    state.record_cu_depth(0, 0, 3, 2, 0);
     // The block to the right at (8,0) sees (0,0) as its left neighbour.
-    assert_eq!(grid.left_ct_depth(8, 0), (2, true));
+    assert_eq!(state.neighbour_ct_depth(8, 0, Neighbour::Left), (2, true));
     // The block below at (0,8) sees (0,0) as its above neighbour.
-    assert_eq!(grid.above_ct_depth(0, 8), (2, true));
+    assert_eq!(state.neighbour_ct_depth(0, 8, Neighbour::Above), (2, true));
+    // A not-yet-decoded neighbour is unavailable.
+    assert_eq!(state.neighbour_ct_depth(16, 8, Neighbour::Left), (0, false));
 }
 
 #[test]
@@ -112,14 +116,11 @@ fn coding_quadtree_at_min_cb_is_a_leaf() {
     let buf = [0u8; 4096];
     let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
     let mut ctx = fresh_contexts();
-    let mut grid = CtuGrid::new(&params, 0, 0);
     let mut state = PictureParseState::new(&params);
     state.begin_ctu(0, 0, 0, 0);
     let mut qg = QuantGroupState::default();
-    let qt = decode_coding_quadtree(
-        &mut eng, &mut ctx, &params, &mut grid, &mut state, &mut qg, 0, 0, 4, 0,
-    )
-    .unwrap();
+    let qt = decode_coding_quadtree(&mut eng, &mut ctx, &params, &mut state, &mut qg, 0, 0, 4, 0)
+        .unwrap();
     match qt {
         CodingQuadtree::Leaf(cu) => {
             assert_eq!(cu.cu_pred_mode, CuPredMode::Intra);
