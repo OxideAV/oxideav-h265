@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — clean-room rebuild round 391 (2026-07-06)
 
+- **Real CABAC intra encoder** (`encoder::intra`), replacing the
+  PCM-only bootstrap as the compression path: per-CTU §8.4 intra
+  prediction over the encoder's own reconstruction (all 35 modes
+  through the decode-side §8.4.4.2 pipeline, SAD mode decision),
+  forward DCT-II (the §8.6.4.2 basis transposed) + reciprocal
+  quantization at any SliceQpY 0..=51 (chroma via the Table 8-10
+  mapping), decode-side §8.6.2 reconstruction (so the reference
+  buffer is bit-identical to any conforming decoder), and full
+  §7.3.8.5 syntax emission (`part_mode`, §8.4.2 MPM candidate list
+  with `prev_intra_luma_pred_flag` / `mpm_idx` /
+  `rem_intra_luma_pred_mode`, `intra_chroma_pred_mode`, cbf flags,
+  residual blocks). Pins: decoder output == encoder reconstruction
+  EXACTLY at QPs 4/22/32/45 across three geometries; a golden
+  interop stream (validated bit-exact against a black-box reference
+  decoder out of band) is CI-gated; PSNR/size track QP. New
+  `encode_intra` example.
+
+- **§7.3.8.11 `residual_coding( )` encoder**
+  (`encoder::residual::encode_residual_coding`) — the bin-exact dual
+  of the decoder: every element from
+  `last_sig_coeff_{x,y}_{prefix,suffix}` (eqs. 7-74..7-77 inverted)
+  through `coeff_abs_level_remaining` (§9.3.3.11 TR/EGk dual with
+  eq. 9-24 Rice adaptation), emitted with the same §9.3.4.2 ctxInc
+  helpers the decode side uses. Differential tests across
+  log2TrafoSize 2..=5, all scans, luma+chroma, Rice escapes to
+  CoeffMax, and the §7.4.9.11 DC-inference sub-block: identical
+  levels AND identical context-state evolution.
+
 - **Multi-tile slice segments** end to end. Decoder: the §7.3.8.1
   subset walk now fires on tile boundaries, not just WPP rows —
   `end_of_subset_one_bit` + byte alignment when the next CTB (in tile

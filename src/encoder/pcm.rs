@@ -139,7 +139,7 @@ impl std::error::Error for PcmEncodeError {}
 /// ceilings for large / high-rate content; this bootstrap levels by
 /// luma picture size, the binding constraint for its intended
 /// small-picture use.)
-fn level_idc_for(luma_ps: usize) -> u8 {
+pub(crate) fn level_idc_for(luma_ps: usize) -> u8 {
     const LEVELS: [(usize, u8); 9] = [
         (36_864, 30),      // 1
         (122_880, 60),     // 2
@@ -181,7 +181,7 @@ fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
 }
 
 /// §7.3.3 `profile_tier_level( 1, 0 )` — Main profile, Main tier.
-fn write_ptl(w: &mut BitWriter, level_idc: u8) {
+pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
     w.put_bits(0, 2); // general_profile_space
     w.put_bit(0); // general_tier_flag
     w.put_bits(1, 5); // general_profile_idc = 1 (Main)
@@ -205,7 +205,7 @@ fn write_ptl(w: &mut BitWriter, level_idc: u8) {
 }
 
 /// §7.3.2.1 — the minimal single-layer VPS.
-fn write_vps(level_idc: u8) -> Vec<u8> {
+pub(crate) fn write_vps(level_idc: u8) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // vps_video_parameter_set_id
     w.put_bit(1); // vps_base_layer_internal_flag
@@ -281,7 +281,7 @@ fn write_sps(
 /// with a uniform tile grid (`tiles_enabled_flag == 1`,
 /// `uniform_spacing_flag == 1`,
 /// `loop_filter_across_tiles_enabled_flag == 0`).
-fn write_pps(
+pub(crate) fn write_pps(
     dependent_slice_segments_enabled: bool,
     deblocking_enabled: bool,
     tiles: Option<(u32, u32)>,

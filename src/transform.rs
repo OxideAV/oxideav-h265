@@ -369,6 +369,25 @@ fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
     out
 }
 
+/// Encoder-side forward DCT-II 1-D over the same §8.6.4.2 basis the
+/// inverse synthesizes from: `y[ u ] = Σ_x DCT32[ u * stride ][ x ] *
+/// x[ x ]` — the transpose of the [`transform_1d`] `trType == 0`
+/// analysis, so an inverse-transformed forward output reproduces the
+/// input up to the normalization shifts the encoder applies.
+pub(crate) fn forward_dct_1d(input: &[i64], n_tbs: usize) -> Vec<i64> {
+    let log2 = log2_tbs(n_tbs).expect("forward_dct_1d called with non-2^k nTbS");
+    let stride = 1usize << (5 - log2);
+    (0..n_tbs)
+        .map(|u| {
+            input
+                .iter()
+                .enumerate()
+                .map(|(x, &xv)| DCT32[u * stride][x] as i64 * xv)
+                .sum()
+        })
+        .collect()
+}
+
 /// §8.6.4 — transformation process for scaled transform coefficients.
 ///
 /// Inputs:
