@@ -19,6 +19,7 @@ pub mod bitwriter;
 pub mod cabac;
 pub mod nal;
 pub mod pcm;
+pub mod residual;
 
 use std::collections::VecDeque;
 
