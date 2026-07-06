@@ -25,6 +25,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoder out of band) is CI-gated; PSNR/size track QP. New
   `encode_intra` example.
 
+- Intra encoder **PART_NxN**: each CTB now rate-distortion-competes
+  `PART_2Nx2N` against four independently-moded 8x8 luma PBs (§7.4.9.8
+  `IntraSplitFlag` forcing the transform tree to depth 1: four 8x8
+  luma + four 4x4 chroma TBs with their §7.4.9.11 mode-dependent
+  scans), with the §7.3.8.5 two-loop luma-mode group, per-PB §8.4.2
+  MPM chains inside the CTB, §7.3.8.8 cbf inheritance from the root
+  chroma flags, and true §6.4.1 z-scan reference availability
+  (quadrant order within the CTB). NxN streams decode bit-exact
+  through the crate's decoder and a black-box reference decoder;
+  golden interop pin regenerated and re-validated.
+
 - Registry encoder (`make_encoder` / `H265Encoder`, formerly
   `H265PcmEncoder`) gains the `mode` codec option: `"pcm"` (default,
   bit-exact lossless bootstrap) or `"intra"` (the real CABAC intra
