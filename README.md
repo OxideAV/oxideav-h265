@@ -27,6 +27,12 @@ conformance pins for the features the corpus lacks. Coverage:
   header inheritance), per-slice loop-filter-across flags, and
   `entropy_coding_sync_enabled_flag` (WPP) streams with per-row
   entry-point substreams;
+* **true tiles**: the staged `true-tiles-2x2` fixture (2×2 uniform
+  grid, one slice per tile, `loop_filter_across_tiles == 0`) decodes
+  byte-exact, and multi-tile SINGLE-slice streams work end to end —
+  §7.3.8.1 tile-boundary subsets (`end_of_subset_one_bit` + byte
+  alignment), §9.3.2.2 per-tile CABAC re-initialization, tile-relative
+  WPP row conditions, §8.6.1 per-tile `qPY_PREV` resets;
 * §8.5.3.3.4.3 explicit weighted prediction (P uni and B uni/bi, with
   non-default per-slice weights / offsets / denominators);
 * §7.3.8.7 PCM coding units, incl. the §8.7.2.5.4 / §8.7.3.1
@@ -36,17 +42,21 @@ conformance pins for the features the corpus lacks. Coverage:
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.
 
-**Encoder: PCM-only IDR bootstrap, registered.** `make_encoder` /
-`H265PcmEncoder` emit fully conformant Main-profile Annex B IDR
-access units in which every CTB is a 16×16 PCM coding unit —
-bit-exact lossless, every packet a random access point (4:2:0 8-bit,
-dimensions multiples of 16). The write stack underneath is real:
-`BitWriter` + §7.4.1.1 NAL encapsulation + the §9.3.5 CABAC
-arithmetic encoding engine + VPS/SPS/PPS/slice-header/slice-data
-writers, with options for dependent slice segments, independent
-multi-slice plans (per-slice loop-filter flags), deblocking, and
-band / edge SAO syntax. A black-box reference decoder reproduces the
-exact input from every encoded shape.
+**Encoder: real CABAC intra coding, registered.** `make_encoder` /
+`H265Encoder` (option `mode = "intra"`, `qp` 0..=51) emit Main-profile
+Annex B IDR access units with actual compression: per-CTU §8.4 intra
+prediction over the encoder's own reconstruction (all 35 modes,
+per-CTB `PART_2Nx2N` vs `PART_NxN` rate-distortion decision with
+per-PB modes, §8.4.2 MPM signalling, mode-dependent scans), forward
+DCT-II + reciprocal quantization, and full §7.3.8 syntax through the
+bin-exact §7.3.8.11 residual encoder (`encoder::residual`) — the
+crate's decoder AND a black-box reference decoder reproduce the
+encoder's reconstruction bit-exactly (golden interop stream CI-pinned).
+The default `mode = "pcm"` keeps the lossless PCM-IDR bootstrap
+(every CTB a 16×16 PCM CU; options for dependent segments,
+multi-slice plans, deblocking, band / edge SAO syntax, and true
+multi-tile single-slice pictures with §7.4.7.1 entry points).
+4:2:0 8-bit, dimensions multiples of 16.
 
 ## What's implemented
 
@@ -56,14 +66,16 @@ exact input from every encoded shape.
   per-slice CABAC init, the §9.3.2.4/.5 WPP and dependent-segment
   context storage/sync, WPP substreams via the §7.4.7.1 entry
   points) → picture reconstruction → §8.3.1..§8.3.5 reference
-  cycle → output reorder.
+  cycle → output reorder. Tile-scan CTU addressing with §9.3.2.2
+  per-tile context re-initialization and entry-point subsets shared
+  with WPP.
 * **Registry codec** (`decoder` / `encoder`) — the
   `oxideav_core::Decoder` + `Encoder` contracts: Annex B or
   hvcC/length-prefixed packets in, output-order `VideoFrame`s out
   (reorder queue bounded by `sps_max_num_reorder_pics`, packet-PTS
-  re-attachment, flush-then-`Eof`); frames in, lossless PCM IDR
-  keyframe packets out. `make_decoder` / `make_encoder` are the
-  direct factory endpoints.
+  re-attachment, flush-then-`Eof`); frames in, IDR keyframe packets
+  out (`mode = "pcm"` lossless or `mode = "intra"` at a chosen QP).
+  `make_decoder` / `make_encoder` are the direct factory endpoints.
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
   bodies), VUI + HRD (§E.2), slice segment headers (§7.3.6, all slice
   types, RPS forms, `ref_pic_lists_modification()`,
@@ -72,8 +84,10 @@ exact input from every encoded shape.
   the `hvcC` record (`hvcc`, ISO/IEC 14496-15 §8.3.3.1).
 * **CABAC, both directions** — the §9.3 decode engine and the §9.3.5
   encode engine (decision / bypass / terminate + flush, PCM
-  align-and-reinit), per-syntax-element binarizations (§9.3.4.2), and
-  the complete §7.3.8 syntax tree incl. §7.3.8.7 PCM sample payloads.
+  align-and-reinit), per-syntax-element binarizations (§9.3.4.2), the
+  complete §7.3.8 decode syntax tree, and the write-side §7.3.8.11
+  `residual_coding( )` dual (`encoder::residual`, differential-tested
+  to identical levels + context evolution).
 * **Reconstruction** — §8.4 intra prediction (all 35 modes), §8.4.1
   PCM sample write-back, §8.5 inter prediction (merge / MVP /
   temporal candidates with the §8.5.3.2.3 raw-availability redundancy
@@ -90,19 +104,19 @@ exact input from every encoded shape.
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Twenty-two embedded-fixture regression pins (the 16-stream staged
-corpus + self-built weighted-prediction, per-slice-loop-filter and
-hvcC pins), lossless encoder↔decoder roundtrips at multiple
-geometries / segmentations / filter shapes, and ~850 unit tests.
+Twenty-three embedded-fixture regression pins (the 17-stream staged
+corpus incl. true tiles + self-built weighted-prediction,
+per-slice-loop-filter, hvcC and golden-intra-interop pins), lossless
+PCM and exact-reconstruction intra encoder↔decoder roundtrips at
+multiple geometries / QPs / partitions, and ~870 unit tests.
 
 ## Not yet implemented
 
-* True multi-tile streams (the §6.5.1 tiling machinery and the
-  per-tile CABAC re-init points exist, but no tiles-enabled fixture
-  pins byte-exactness — the corpus encoder cannot emit tiles; fixture
-  ask filed).
-* Encoder beyond the PCM bootstrap (intra prediction + residual
-  coding write-side).
+* Encoder inter coding (P/B pictures) and encoder-side SAO /
+  deblocking-aware reconstruction (the intra encoder disables the
+  in-loop filters); larger encoder CTB sizes and 4x4-luma DST TUs.
+* Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
+  (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both
