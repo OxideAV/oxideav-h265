@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 391 (2026-07-06)
+
+- CI-gated the **true-tiles fixture** (`true-tiles-2x2`): a genuine
+  `tiles_enabled_flag == 1` bitstream (2×2 uniform tile grid, one
+  64×64 CTB per tile, one independent slice segment per tile,
+  `loop_filter_across_tiles_enabled_flag == 0`) decodes byte-exact on
+  both its IDR and P frames through the §6.5.1 tile scan
+  (`CtbAddrRsToTs` slice-address mapping), the §6.4.1 tile-boundary
+  availability denial, and the §8.7.2.1 / §8.7.3.2 loop-filter
+  suppression across tile edges.
+
 ### Added — clean-room rebuild round 387 (2026-07-03)
 
 - `hvcc` (new module) — `HEVCDecoderConfigurationRecord` parse

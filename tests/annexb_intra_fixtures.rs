@@ -130,6 +130,19 @@ fn tile_cols_2_decodes_byte_exact() {
     assert_decodes_byte_exact(TILE_COLS_HEVC, TILE_COLS_YUV, 2, "tile-cols-2");
 }
 
+/// True tiles (`tiles_enabled_flag == 1`): a 128×128 IDR + P pair on a
+/// 2×2 uniform tile grid (§6.5.1 tile scan, one 64×64 CTB per tile),
+/// each tile carried in its own independent slice segment whose
+/// `slice_segment_address` is mapped through `CtbAddrRsToTs`, with
+/// `loop_filter_across_tiles_enabled_flag == 0` suppressing the
+/// §8.7.2.1 / §8.7.3.2 deblock/SAO across tile edges and the §6.4.1
+/// availability denial isolating intra prediction and merge/MVP
+/// candidates at tile boundaries — byte-exact on both frames.
+#[test]
+fn true_tiles_2x2_decodes_byte_exact() {
+    assert_decodes_byte_exact(TRUE_TILES_HEVC, TRUE_TILES_YUV, 2, "true-tiles-2x2");
+}
+
 /// The `oxideav_core::Decoder` contract over the same driver: feed the
 /// eight-picture B-pyramid stream as one packet, flush, and pull the
 /// frames in output order — byte-exact against the expected YUV.
