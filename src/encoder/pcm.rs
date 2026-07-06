@@ -22,6 +22,7 @@
 //! `pcm_loop_filter_disabled_flag == 1` — a PCM-only picture
 //! reconstructs to the raw samples bit for bit.
 
+use crate::availability::{PictureTiling, TilingParams};
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
@@ -68,6 +69,16 @@ pub struct PcmAuOptions {
     /// `pcm_loop_filter_disabled_flag` (§7.4.3.2.1). `false` lets the
     /// enabled loop filters modify the PCM samples like any other CU's.
     pub pcm_loop_filter_disabled: bool,
+    /// Tile grid as `(columns, rows)` — `tiles_enabled_flag == 1` with
+    /// `uniform_spacing_flag == 1` and
+    /// `loop_filter_across_tiles_enabled_flag == 0`. The picture is
+    /// coded as ONE slice segment whose CTBs walk the §6.5.1 tile scan:
+    /// every tile is its own §7.3.8.1 subset (`end_of_subset_one_bit` +
+    /// byte alignment between tiles, §9.3.2.2 context re-initialization
+    /// at each tile start) and the slice header carries the §7.4.7.1
+    /// `entry_point_offset_minus1[]` block. Requires `columns * rows >=
+    /// 2`; incompatible with multi-segment / SAO options.
+    pub tiles: Option<(u32, u32)>,
 }
 
 impl Default for PcmAuOptions {
@@ -79,6 +90,7 @@ impl Default for PcmAuOptions {
             sao_luma_band: false,
             sao_luma_eo_vertical: false,
             pcm_loop_filter_disabled: true,
+            tiles: None,
         }
     }
 }
@@ -144,6 +156,28 @@ fn level_idc_for(luma_ps: usize) -> u8 {
         .find(|(max_ps, _)| luma_ps <= *max_ps)
         .map(|&(_, idc)| idc)
         .unwrap_or(186)
+}
+
+/// Table A.8 — the smallest `general_level_idc` whose `MaxTileCols` /
+/// `MaxTileRows` cover the requested tile grid (§A.4.2 item f:
+/// `num_tile_columns_minus1 < MaxTileCols`, `num_tile_rows_minus1 <
+/// MaxTileRows`). This bootstrap's tiny tiles can undercut the
+/// 256-sample minimum tile-column width; the level is chosen by tile
+/// count, the constraint a decoder actually dispatches on.
+fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
+    const LEVELS: [(u32, u32, u8); 6] = [
+        (1, 1, 30),    // 1 .. 2.1
+        (2, 2, 90),    // 3
+        (3, 3, 93),    // 3.1
+        (5, 5, 120),   // 4 / 4.1
+        (10, 11, 150), // 5 .. 5.2
+        (20, 22, 180), // 6 .. 6.2
+    ];
+    LEVELS
+        .iter()
+        .find(|&&(c, r, _)| cols <= c && rows <= r)
+        .map(|&(_, _, idc)| idc)
+        .unwrap_or(180)
 }
 
 /// §7.3.3 `profile_tier_level( 1, 0 )` — Main profile, Main tier.
@@ -243,8 +277,15 @@ fn write_sps(
     w.finish()
 }
 
-/// §7.3.2.3 — the all-defaults PPS (deblocking disabled).
-fn write_pps(dependent_slice_segments_enabled: bool, deblocking_enabled: bool) -> Vec<u8> {
+/// §7.3.2.3 — the all-defaults PPS (deblocking disabled), optionally
+/// with a uniform tile grid (`tiles_enabled_flag == 1`,
+/// `uniform_spacing_flag == 1`,
+/// `loop_filter_across_tiles_enabled_flag == 0`).
+fn write_pps(
+    dependent_slice_segments_enabled: bool,
+    deblocking_enabled: bool,
+    tiles: Option<(u32, u32)>,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -265,8 +306,14 @@ fn write_pps(dependent_slice_segments_enabled: bool, deblocking_enabled: bool) -
     w.put_bit(0); // weighted_pred_flag
     w.put_bit(0); // weighted_bipred_flag
     w.put_bit(0); // transquant_bypass_enabled_flag
-    w.put_bit(0); // tiles_enabled_flag
+    w.put_bit(u8::from(tiles.is_some())); // tiles_enabled_flag
     w.put_bit(0); // entropy_coding_sync_enabled_flag
+    if let Some((cols, rows)) = tiles {
+        w.ue(cols - 1); // num_tile_columns_minus1
+        w.ue(rows - 1); // num_tile_rows_minus1
+        w.put_bit(1); // uniform_spacing_flag
+        w.put_bit(0); // loop_filter_across_tiles_enabled_flag
+    }
     w.put_bit(1); // pps_loop_filter_across_slices_enabled_flag
     w.put_bit(1); // deblocking_filter_control_present_flag
     w.put_bit(0); // deblocking_filter_override_enabled_flag
@@ -306,7 +353,6 @@ fn write_idr_slice_segments(
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
-    let cw = width / 2;
     // Ceil(Log2(PicSizeInCtbsY)) — the slice_segment_address width.
     let addr_bits = (usize::BITS - (total - 1).leading_zeros()).max(1) as u8;
 
@@ -424,30 +470,7 @@ fn write_idr_slice_segments(
                     cabac.encode_bypass_bits(&mut w, 1, 2);
                 }
             }
-            // coding_quadtree: CtbLog2SizeY == MinCbLog2SizeY, so no
-            // split_cu_flag. coding_unit( x0, y0, 4 ):
-            // part_mode — §9.3.3.7 intra at MinCb: bin "1" = PART_2Nx2N.
-            cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
-            // pcm_flag — §9.3.5.6 terminate bin, value 1: flush.
-            cabac.encode_terminate(&mut w, 1);
-            // pcm_alignment_zero_bit run.
-            w.align_zero();
-            // pcm_sample( x0, y0, 4 ): 256 luma then 64 Cb + 64 Cr.
-            for j in 0..CTB {
-                for i in 0..CTB {
-                    w.put_bits(u32::from(y[(y0 + j) * width + x0 + i]), 8);
-                }
-            }
-            let (cx, cy) = (x0 / 2, y0 / 2);
-            for plane in [cb, cr] {
-                for j in 0..CTB / 2 {
-                    for i in 0..CTB / 2 {
-                        w.put_bits(u32::from(plane[(cy + j) * cw + cx + i]), 8);
-                    }
-                }
-            }
-            // §9.3.5.2: re-init the arithmetic engine after PCM data.
-            cabac.reinit();
+            write_pcm_ctu(&mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0);
             // end_of_slice_segment_flag: 1 only at the segment's last CTB.
             cabac.encode_terminate(&mut w, u8::from(addr == end - 1));
         }
@@ -457,6 +480,178 @@ fn write_idr_slice_segments(
         out.push(w.finish());
     }
     out
+}
+
+/// §7.3.8.2 + §7.3.8.5 — one all-PCM CTB (`CtbLog2SizeY ==
+/// MinCbLog2SizeY`, so the coding quadtree is the single unsplit CU):
+/// `part_mode` (§9.3.3.7 bin "1" = `PART_2Nx2N`), `pcm_flag` (a
+/// §9.3.5.6 terminate bin — value 1 flushes the codeword), the
+/// `pcm_alignment_zero_bit` run, the raw §7.3.8.7 samples (luma then
+/// Cb, Cr), and the §9.3.5.2 engine re-initialization.
+#[allow(clippy::too_many_arguments)]
+fn write_pcm_ctu(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    x0: usize,
+    y0: usize,
+) {
+    let cw = width / 2;
+    cabac.encode_decision(w, &mut ctxs.part_mode[0], 1);
+    cabac.encode_terminate(w, 1);
+    w.align_zero();
+    for j in 0..CTB {
+        for i in 0..CTB {
+            w.put_bits(u32::from(y[(y0 + j) * width + x0 + i]), 8);
+        }
+    }
+    let (cx, cy) = (x0 / 2, y0 / 2);
+    for plane in [cb, cr] {
+        for j in 0..CTB / 2 {
+            for i in 0..CTB / 2 {
+                w.put_bits(u32::from(plane[(cy + j) * cw + cx + i]), 8);
+            }
+        }
+    }
+    cabac.reinit();
+}
+
+/// §7.4.1.1 — the coded (emulation-prevention-escaped) byte length of
+/// `bytes`, given the zero-run carried in from the preceding coded
+/// bytes. Returns the length and the carry-out zero run. The dual of
+/// the counting the §7.4.7.1 `entry_point_offset_minus1[i]` values
+/// perform over the coded slice-segment data.
+fn escaped_len(bytes: &[u8], mut zero_run: u32) -> (usize, u32) {
+    let mut len = 0usize;
+    for &b in bytes {
+        if zero_run >= 2 && b <= 0x03 {
+            len += 1; // emulation_prevention_three_byte
+            zero_run = 0;
+        }
+        len += 1;
+        if b == 0 {
+            zero_run += 1;
+        } else {
+            zero_run = 0;
+        }
+    }
+    (len, zero_run)
+}
+
+/// §7.3.6.1 + §7.3.8.1 — the tiled picture as ONE independent I-slice
+/// segment whose CTBs walk the §6.5.1 tile scan. Every tile is its own
+/// subset: fresh §9.3.2.2 contexts and a fresh §9.3.5.2 arithmetic
+/// engine at each tile start, `end_of_subset_one_bit` + byte alignment
+/// after every tile but the last, and the §7.4.7.1
+/// `entry_point_offset_minus1[]` block (offsets in CODED bytes,
+/// emulation-prevention included) in the slice header.
+fn write_tiled_idr_slice(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    opts: &PcmAuOptions,
+) -> Vec<u8> {
+    let (cols, rows) = opts.tiles.expect("caller checked the tile grid");
+    let ctbs_x = width / CTB;
+    let ctbs_y = height / CTB;
+    let total = ctbs_x * ctbs_y;
+    let tiling = PictureTiling::new(
+        ctbs_x as u32,
+        ctbs_y as u32,
+        width as u32,
+        height as u32,
+        CTB_LOG2,
+        2, // MinTbLog2SizeY (SPS: log2_min_luma_transform_block_size = 4)
+        &TilingParams {
+            num_tile_columns_minus1: cols - 1,
+            num_tile_rows_minus1: rows - 1,
+            uniform_spacing_flag: true,
+            column_width_minus1: Vec::new(),
+            row_height_minus1: Vec::new(),
+        },
+    )
+    .expect("validated tile geometry");
+
+    // ---- slice_segment_data( ), one coded subset per tile ----
+    let mut subsets: Vec<Vec<u8>> = Vec::new();
+    let mut w = BitWriter::new();
+    let mut cabac = CabacEncoder::new();
+    let mut ctxs = SliceContexts::init(init_type(2, false), SLICE_QP);
+    for ts in 0..total as u32 {
+        let rs = tiling.ctb_addr_ts_to_rs(ts) as usize;
+        let x0 = (rs % ctbs_x) * CTB;
+        let y0 = (rs / ctbs_x) * CTB;
+        write_pcm_ctu(&mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0);
+        let last_of_pic = ts == total as u32 - 1;
+        // end_of_slice_segment_flag: 1 only at the picture's last CTB.
+        cabac.encode_terminate(&mut w, u8::from(last_of_pic));
+        let last_of_tile = last_of_pic || tiling.tile_id(ts + 1) != tiling.tile_id(ts);
+        if last_of_tile {
+            if !last_of_pic {
+                // §7.3.8.1 end_of_subset_one_bit (terminate-1 flush).
+                cabac.encode_terminate(&mut w, 1);
+            }
+            // byte_alignment( ) — the flush wrote the trailing one bit.
+            w.align_zero();
+            subsets.push(std::mem::take(&mut w).finish());
+            // §9.3.2.2 — fresh contexts + engine at the next tile start.
+            cabac = CabacEncoder::new();
+            ctxs = SliceContexts::init(init_type(2, false), SLICE_QP);
+        }
+    }
+
+    // §7.4.7.1 — entry_point_offset_minus1[i] counts CODED bytes; the
+    // emulation-prevention zero-run threads across subset boundaries
+    // (the slice header's byte_alignment one-bit makes its last byte
+    // nonzero, so the first subset starts with a zero run of 0).
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut zero_run = 0u32;
+    for s in &subsets[..subsets.len() - 1] {
+        let (len, zr) = escaped_len(s, zero_run);
+        zero_run = zr;
+        offsets.push(len as u32 - 1);
+    }
+    let offset_len = offsets
+        .iter()
+        .map(|&o| 32 - o.leading_zeros())
+        .max()
+        .unwrap_or(1)
+        .max(1) as u8;
+
+    // ---- slice_segment_header( ) ----
+    let mut h = BitWriter::new();
+    h.put_bit(1); // first_slice_segment_in_pic_flag
+    h.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
+    h.ue(0); // slice_pic_parameter_set_id
+    h.ue(2); // slice_type = I
+    h.se(SLICE_QP - 26); // slice_qp_delta
+    if opts.deblocking {
+        // §7.3.6.1 gate: pps_loop_filter_across_slices == 1 and
+        // deblocking not disabled.
+        h.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    // tiles_enabled_flag == 1: the entry-point block is present.
+    h.ue(offsets.len() as u32); // num_entry_point_offsets
+    if !offsets.is_empty() {
+        h.ue(u32::from(offset_len) - 1); // offset_len_minus1
+        for &o in &offsets {
+            h.put_bits(o, offset_len); // entry_point_offset_minus1[i]
+        }
+    }
+    h.rbsp_trailing_bits(); // byte_alignment() before slice data
+    debug_assert_ne!(h.as_bytes().last(), Some(&0), "aligned header byte");
+    for s in &subsets {
+        for &b in s {
+            h.put_bits(u32::from(b), 8);
+        }
+    }
+    h.finish()
 }
 
 /// Encode one 4:2:0 8-bit frame as a self-contained IDR access unit
@@ -553,6 +748,24 @@ fn encode_au(
     if opts.sao_luma_band && opts.sao_luma_eo_vertical {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
+    // Tile grid: at least two tiles, each column/row at least one CTB
+    // wide/tall; the tiled picture is a single slice segment with SAO
+    // off (the tile-scan SAO merge availability is out of this
+    // bootstrap's scope).
+    if let Some((cols, rows)) = opts.tiles {
+        let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
+        if cols == 0
+            || rows == 0
+            || cols * rows < 2
+            || cols as usize > width / CTB
+            || rows as usize > height / CTB
+            || segments != 1
+            || !opts.independent_slices.is_empty()
+            || sao
+        {
+            return Err(PcmEncodeError::BadDimensions { width, height });
+        }
+    }
     let check = |plane: &'static str, buf: &[u8], expected: usize| {
         if buf.len() != expected {
             Err(PcmEncodeError::PlaneSize {
@@ -568,7 +781,10 @@ fn encode_au(
     check("cb", cb, width * height / 4)?;
     check("cr", cr, width * height / 4)?;
 
-    let level_idc = level_idc_for(width * height);
+    let level_idc = opts.tiles.map_or_else(
+        || level_idc_for(width * height),
+        |(c, r)| level_idc_for(width * height).max(level_idc_for_tiles(c, r)),
+    );
     let dependent_mode = opts.independent_slices.is_empty() && segments > 1;
     let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
     let mut units = vec![
@@ -579,10 +795,20 @@ fn encode_au(
             0,
             &write_sps(width, height, level_idc, sao, opts.pcm_loop_filter_disabled),
         ), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(dependent_mode, opts.deblocking)), // PPS_NUT
+        nal_unit(
+            34,
+            0,
+            0,
+            &write_pps(dependent_mode, opts.deblocking, opts.tiles),
+        ), // PPS_NUT
     ];
-    for rbsp in write_idr_slice_segments(y, cb, cr, width, height, &opts) {
+    if opts.tiles.is_some() {
+        let rbsp = write_tiled_idr_slice(y, cb, cr, width, height, &opts);
         units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
+    } else {
+        for rbsp in write_idr_slice_segments(y, cb, cr, width, height, &opts) {
+            units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
+        }
     }
     Ok(annexb(&units))
 }
@@ -764,6 +990,114 @@ mod tests {
             decoded[0], decoded[1],
             "opposite per-slice flags gate the boundary deblocking differently"
         );
+    }
+
+    /// True multi-tile single-slice streams: the picture walks the
+    /// §6.5.1 tile scan inside ONE slice segment, every tile its own
+    /// §7.3.8.1 subset behind a §7.4.7.1 entry-point offset, with the
+    /// §9.3.2.2 per-tile CABAC context re-initialization on both the
+    /// encode and decode sides — bit-exact lossless through the
+    /// crate's own decoder.
+    #[test]
+    fn tiled_pcm_au_roundtrips_losslessly() {
+        for (w, h, cols, rows) in [
+            (64usize, 48usize, 2u32, 2u32), // uneven rows: 4x3 CTBs / 2x2
+            (96, 64, 3, 2),                 // 6x4 CTBs / 3x2
+            (32, 16, 2, 1),                 // single tile row
+            (80, 80, 5, 5),                 // one CTB per tile
+        ] {
+            let (y, cb, cr) = gradient_planes(w, h);
+            let opts = PcmAuOptions {
+                tiles: Some((cols, rows)),
+                ..PcmAuOptions::default()
+            };
+            let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
+            let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
+            assert_eq!(frames.len(), 1, "{cols}x{rows}: one IDR frame");
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&y);
+            expected.extend_from_slice(&cb);
+            expected.extend_from_slice(&cr);
+            assert_eq!(
+                frames[0].picture.to_planar_u8().expect("8-bit"),
+                expected,
+                "{w}x{h} {cols}x{rows} tiles: lossless roundtrip"
+            );
+        }
+    }
+
+    /// The tiled stream's parameter sets and slice header really carry
+    /// the tile syntax: `tiles_enabled_flag == 1`, the uniform 2x2
+    /// grid, and `num_entry_point_offsets == 3` with offsets that
+    /// partition the coded slice data.
+    #[test]
+    fn tiled_pcm_au_signals_tiles_and_entry_points() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = gradient_planes(w, h);
+        let opts = PcmAuOptions {
+            tiles: Some((2, 2)),
+            ..PcmAuOptions::default()
+        };
+        let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
+        let units = crate::nal::collect_nal_units(&au).expect("walk");
+        assert_eq!(units.len(), 4);
+        let sps = SeqParameterSet::parse(&units[1].rbsp).expect("sps");
+        let pps = PicParameterSet::parse(&units[2].rbsp).expect("pps");
+        assert!(pps.tiles_enabled_flag);
+        assert_eq!(pps.tiles.num_tile_columns_minus1, 1);
+        assert_eq!(pps.tiles.num_tile_rows_minus1, 1);
+        assert!(pps.tiles.uniform_spacing_flag);
+        assert!(!pps.loop_filter_across_tiles_enabled_flag);
+        let header = crate::slice::SliceSegmentHeader::parse(
+            &units[3].rbsp,
+            units[3].header.nal_unit_type,
+            &sps,
+            &pps,
+        )
+        .expect("slice header");
+        let eps = header.entry_point_offsets.expect("entry points present");
+        assert_eq!(eps.num_entry_point_offsets, 3);
+        assert_eq!(eps.entry_point_offset_minus1.len(), 3);
+    }
+
+    /// Tile-option validation: zero-sized grids, single-tile grids,
+    /// grids finer than the CTB grid, and combinations with
+    /// multi-segment or SAO options are rejected.
+    #[test]
+    fn tiled_pcm_au_rejects_bad_grids() {
+        let (y, cb, cr) = gradient_planes(32, 32);
+        for opts in [
+            PcmAuOptions {
+                tiles: Some((1, 1)),
+                ..PcmAuOptions::default()
+            },
+            PcmAuOptions {
+                tiles: Some((0, 2)),
+                ..PcmAuOptions::default()
+            },
+            PcmAuOptions {
+                tiles: Some((3, 1)), // 2x2 CTBs: only 2 columns exist
+                ..PcmAuOptions::default()
+            },
+            PcmAuOptions {
+                tiles: Some((2, 2)),
+                segments: 2,
+                ..PcmAuOptions::default()
+            },
+            PcmAuOptions {
+                tiles: Some((2, 2)),
+                sao_luma_band: true,
+                ..PcmAuOptions::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    encode_idr_pcm_au_opts(&y, &cb, &cr, 32, 32, opts.clone()),
+                    Err(PcmEncodeError::BadDimensions { .. })
+                ),
+                "{opts:?}"
+            );
+        }
     }
 
     #[test]

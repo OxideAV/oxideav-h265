@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — clean-room rebuild round 391 (2026-07-06)
 
+- **Multi-tile slice segments** end to end. Decoder: the §7.3.8.1
+  subset walk now fires on tile boundaries, not just WPP rows —
+  `end_of_subset_one_bit` + byte alignment when the next CTB (in tile
+  scan) starts a new tile, §9.3.2.2 context re-initialization at each
+  tile's first CTU (taking priority over the §9.3.2.5 WPP sync, whose
+  row-start / storage conditions are now the exact tile-relative
+  §9.3.1 forms), and the §8.6.1 `qPY_PREV` reset at the first
+  quantization group of a tile (and of each CTB row of a tile under
+  WPP). Encoder: `PcmAuOptions::tiles` codes the picture as ONE slice
+  segment over a uniform tile grid — §6.5.1 tile-scan CTB order,
+  per-tile CABAC engine + context resets, and the §7.4.7.1
+  `entry_point_offset_minus1[]` block with offsets in coded bytes
+  (emulation-prevention-aware, zero-run threaded across subsets).
+  Grids 2x2 / 3x2 / 2x1 / 5x5 roundtrip bit-exact through the crate's
+  decoder and decode losslessly through a black-box reference decoder.
+  New `encode_pcm` example drives the encoder from raw YUV.
+
 - CI-gated the **true-tiles fixture** (`true-tiles-2x2`): a genuine
   `tiles_enabled_flag == 1` bitstream (2×2 uniform tile grid, one
   64×64 CTB per tile, one independent slice segment per tile,

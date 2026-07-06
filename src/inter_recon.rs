@@ -558,16 +558,25 @@ pub fn reconstruct_inter_picture(
     let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
     let mut no_filter_cells = vec![false; w4 * h4];
     let mut prev_slice_addr: Option<u32> = None;
+    let mut prev_tile: Option<u32> = None;
     for placed in ctus {
         // §8.6.1 step-1 — qPY_PREV resets to SliceQpY at the first
-        // quantization group of a slice and (with entropy_coding_sync)
-        // of each CTB row.
+        // quantization group of a slice, of a tile, and (with
+        // entropy_coding_sync) of each CTB row of a tile.
+        let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
+        let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
+        let rs = (ry * pic_w_ctbs + rx) as u32;
+        let tiling = ctx.tiling();
+        let tile = tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs));
+        let tile_row_start = rx == 0 || tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs - 1)) != tile;
         if prev_slice_addr != Some(placed.slice_addr_rs)
-            || (slice.wpp_qp_row_reset && placed.x_ctb == 0)
+            || prev_tile != Some(tile)
+            || (slice.wpp_qp_row_reset && tile_row_start)
         {
             ctx.reset_qp_prev();
         }
         prev_slice_addr = Some(placed.slice_addr_rs);
+        prev_tile = Some(tile);
         reconstruct_inter_quadtree(
             &mut pic,
             &mut ctx,

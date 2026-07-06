@@ -1230,6 +1230,7 @@ fn decode_slice_segment_data(
     let it = init_type(raw_slice_type, header.cabac_init_flag.unwrap_or(false));
 
     let tiling = geom.tiling()?;
+    let tiles_on = pps.tiles_enabled_flag;
     let wpp = pps.entropy_coding_sync_enabled_flag;
     // §7.4.7.1: SliceAddrRs is the INDEPENDENT segment's address; a
     // dependent segment starts decoding at its own segment address but
@@ -1281,31 +1282,51 @@ fn decode_slice_segment_data(
         let y_ctb = ry << geom.ctb_log2;
         slice_addr_of[ctb_addr_rs as usize] = Some(slice_addr_rs);
 
-        // §9.3.1 / §9.3.2.1 — at the first CTB of a CTB row (WPP), start
-        // the next substream and either synchronize the context
-        // variables from the stored above-right state (§9.3.2.5) or
-        // re-initialize (§9.3.2.2). The first CTU of the slice keeps the
-        // §9.3.1-item-1 slice initialization done above.
-        if wpp && !first_ctu && rx == 0 {
-            if !advance_substream {
-                return Err(SequenceError::Malformed(
-                    "CTB row start without end_of_subset_one_bit",
-                ));
+        // §9.3.1 / §9.3.2.1 — subset-boundary context handling inside
+        // one slice segment. Item 2: the first CTU of a tile
+        // re-initializes the context variables (§9.3.2.2). Item 3
+        // (WPP): the first luma CTB of a CTU row of a tile either
+        // synchronizes from the stored above-right state (§9.3.2.5) or
+        // re-initializes (§9.3.2.2). Either way the next entry-point
+        // substream starts here. The first CTU of the segment keeps
+        // the §9.3.1-item-1 slice initialization done above.
+        if !first_ctu {
+            let tile_start =
+                tiles_on && tiling.tile_id(ctb_addr_ts) != tiling.tile_id(ctb_addr_ts - 1);
+            // §9.3.2.1: CtbAddrInRs % PicWidthInCtbsY == 0, or the
+            // raster-left neighbour lies in a different tile.
+            let wpp_row_start = wpp
+                && !tile_start
+                && (rx == 0
+                    || tiling.tile_id(tiling.ctb_addr_rs_to_ts(ctb_addr_rs - 1))
+                        != tiling.tile_id(ctb_addr_ts));
+            if tile_start || wpp_row_start {
+                if !advance_substream {
+                    return Err(SequenceError::Malformed(
+                        "subset start without end_of_subset_one_bit",
+                    ));
+                }
+                sub_idx += 1;
+                engine = CabacEngine::new(BitReader::new(sub_range(sub_idx)?))
+                    .map_err(|_| SequenceError::Malformed("substream too short for CABAC init"))?;
+                if tile_start {
+                    // §9.3.2.2 — fresh contexts at the tile start.
+                    ctx = SliceContexts::init(it, slice_qp_y);
+                } else {
+                    // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
+                    // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
+                    let t_avail = ry > 0 && rx + 1 < geom.pic_w_ctbs && {
+                        let t_rs = (ry - 1) * geom.pic_w_ctbs + rx + 1;
+                        slice_addr_of[t_rs as usize] == Some(slice_addr_rs)
+                            && tiling.tile_id(tiling.ctb_addr_rs_to_ts(t_rs))
+                                == tiling.tile_id(ctb_addr_ts)
+                    };
+                    ctx = match (&wpp_stored, t_avail) {
+                        (Some(stored), true) => stored.clone(),
+                        _ => SliceContexts::init(it, slice_qp_y),
+                    };
+                }
             }
-            sub_idx += 1;
-            engine = CabacEngine::new(BitReader::new(sub_range(sub_idx)?))
-                .map_err(|_| SequenceError::Malformed("substream too short for CABAC init"))?;
-            // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
-            // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
-            let t_avail = ry > 0 && geom.pic_w_ctbs > 1 && {
-                let t_rs = (ry - 1) * geom.pic_w_ctbs + 1;
-                slice_addr_of[t_rs as usize] == Some(slice_addr_rs)
-                    && tiling.tile_id(tiling.ctb_addr_rs_to_ts(t_rs)) == tiling.tile_id(ctb_addr_ts)
-            };
-            ctx = match (&wpp_stored, t_avail) {
-                (Some(stored), true) => stored.clone(),
-                _ => SliceContexts::init(it, slice_qp_y),
-            };
         }
         advance_substream = false;
         first_ctu = false;
@@ -1339,9 +1360,17 @@ fn decode_slice_segment_data(
         )?;
         decoded.push((x_ctb, y_ctb, ctu));
 
-        // §9.3.2.4 — store the context state after the SECOND CTB of a
-        // row (CtbAddrInRs % PicWidthInCtbsY == 1).
-        if wpp && rx == 1 {
+        // §9.3.1 / §9.3.2.4 — store the context state after the SECOND
+        // CTB of a CTU row of a tile: CtbAddrInRs % PicWidthInCtbsY
+        // == 1, or CtbAddrInRs > 1 and the CTB two to the raster-left
+        // lies in a different tile.
+        if wpp
+            && (rx == 1
+                || (ctb_addr_rs > 1
+                    && tiles_on
+                    && tiling.tile_id(ctb_addr_ts)
+                        != tiling.tile_id(tiling.ctb_addr_rs_to_ts(ctb_addr_rs - 2))))
+        {
             wpp_stored = Some(ctx.clone());
         }
 
@@ -1365,10 +1394,18 @@ fn decode_slice_segment_data(
                 "end_of_slice_segment_flag not set on the last CTB",
             ));
         }
-        // §7.3.8.1 — end_of_subset_one_bit + byte alignment after the
-        // last CTB of a WPP row that does not end the slice; the next
-        // CTU reads from the following substream.
-        if wpp && rx == geom.pic_w_ctbs - 1 {
+        // §7.3.8.1 — end_of_subset_one_bit + byte_alignment( ) when
+        // the NEXT CTB (CtbAddrInTs already incremented) starts a new
+        // tile, or (WPP) a new CTU row of a tile; the next CTU reads
+        // from the following substream.
+        let next_rs = tiling.ctb_addr_ts_to_rs(ctb_addr_ts);
+        let tile_boundary =
+            tiles_on && tiling.tile_id(ctb_addr_ts) != tiling.tile_id(ctb_addr_ts - 1);
+        let wpp_boundary = wpp
+            && (next_rs % geom.pic_w_ctbs == 0
+                || tiling.tile_id(ctb_addr_ts)
+                    != tiling.tile_id(tiling.ctb_addr_rs_to_ts(next_rs - 1)));
+        if tile_boundary || wpp_boundary {
             let one = end_of_slice_segment_flag(&mut engine)
                 .map_err(|_| SequenceError::Malformed("CABAC underrun at end_of_subset_one_bit"))?;
             if !one && !tolerant {
