@@ -25,6 +25,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoder out of band) is CI-gated; PSNR/size track QP. New
   `encode_intra` example.
 
+- Registry encoder (`make_encoder` / `H265Encoder`, formerly
+  `H265PcmEncoder`) gains the `mode` codec option: `"pcm"` (default,
+  bit-exact lossless bootstrap) or `"intra"` (the real CABAC intra
+  coder) with a `qp` option (`SliceQpY` 0..=51, default 26). Malformed
+  options are rejected at construction.
+
 - **§7.3.8.11 `residual_coding( )` encoder**
   (`encoder::residual::encode_residual_coding`) — the bin-exact dual
   of the decoder: every element from

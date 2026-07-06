@@ -22,44 +22,71 @@ pub mod nal;
 pub mod pcm;
 pub mod residual;
 
+/// Registry-encoder coding mode, selected by the `mode` codec option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodeMode {
+    /// PCM-only IDR bootstrap: bit-exact lossless, every CU a
+    /// §7.3.8.7 PCM block. The default (`mode` absent or `"pcm"`).
+    Pcm,
+    /// Real CABAC intra coding ([`intra::encode_idr_intra_au`]) at
+    /// the carried `SliceQpY` (`mode = "intra"`, `qp` option, default
+    /// 26).
+    Intra(i32),
+}
+
 use std::collections::VecDeque;
 
 use oxideav_core::{
     CodecId, CodecParameters, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
 };
 
-/// H.265 registry encoder — the PCM-only IDR bootstrap behind the
-/// [`oxideav_core::Encoder`] contract. Every input frame becomes one
-/// self-contained IDR access unit (`VPS + SPS + PPS + IDR_N_LP`, Annex
-/// B form) whose coding units are all §7.3.8.7 PCM blocks: the encode
-/// is bit-exact lossless and every packet is an independent random
-/// access point. 4:2:0 8-bit, dimensions multiples of 16.
-pub struct H265PcmEncoder {
+/// H.265 registry encoder behind the [`oxideav_core::Encoder`]
+/// contract. Every input frame becomes one self-contained IDR access
+/// unit (`VPS + SPS + PPS + IDR_N_LP`, Annex B form) — an independent
+/// random access point. Two coding modes, selected by the `mode`
+/// codec option:
+///
+/// * `"pcm"` (default) — the PCM-only bootstrap: every coding unit a
+///   §7.3.8.7 PCM block, bit-exact lossless.
+/// * `"intra"` — real CABAC intra coding (§8.4 prediction + forward
+///   transform/quant + §7.3.8 syntax) at the `qp` option's
+///   `SliceQpY` (0..=51, default 26).
+///
+/// 4:2:0 8-bit, dimensions multiples of 16.
+pub struct H265Encoder {
     codec_id: CodecId,
     output_params: CodecParameters,
     width: usize,
     height: usize,
+    mode: EncodeMode,
     ready: VecDeque<Packet>,
     frame_index: i64,
 }
 
-impl std::fmt::Debug for H265PcmEncoder {
+/// Former name of [`H265Encoder`] (from when the registry encoder was
+/// PCM-only).
+pub type H265PcmEncoder = H265Encoder;
+
+impl std::fmt::Debug for H265Encoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H265PcmEncoder")
+        f.debug_struct("H265Encoder")
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("mode", &self.mode)
             .field("ready", &self.ready.len())
             .finish()
     }
 }
 
-/// Direct factory endpoint: construct the software H.265 encoder
-/// (PCM-only IDR bootstrap).
+/// Direct factory endpoint: construct the software H.265 encoder.
+/// Codec options: `mode` (`"pcm"` lossless bootstrap, the default, or
+/// `"intra"` real CABAC intra coding) and `qp` (`SliceQpY` 0..=51 for
+/// the intra mode, default 26).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
-/// nonzero multiples of 16, or the pixel format is declared and is not
-/// 4:2:0 8-bit planar.
+/// nonzero multiples of 16, the pixel format is declared and is not
+/// 4:2:0 8-bit planar, or a codec option is malformed.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -81,22 +108,44 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )));
         }
     }
+    let mode = match params.options.get("mode") {
+        None | Some("pcm") => EncodeMode::Pcm,
+        Some("intra") => {
+            let qp = match params.options.get("qp") {
+                None => 26,
+                Some(v) => v
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|q| (0..=51).contains(q))
+                    .ok_or_else(|| {
+                        Error::InvalidData(format!("h265 encode: qp must be 0..=51, got {v:?}"))
+                    })?,
+            };
+            EncodeMode::Intra(qp)
+        }
+        Some(other) => {
+            return Err(Error::InvalidData(format!(
+                "h265 encode: unknown mode {other:?} (expected \"pcm\" or \"intra\")"
+            )))
+        }
+    };
     let mut output_params = params.clone();
     output_params.media_type = oxideav_core::MediaType::Video;
     output_params.pixel_format = Some(PixelFormat::Yuv420P);
     // Parameter sets ride in band in every access unit; no extradata.
     output_params.extradata.clear();
-    Ok(Box::new(H265PcmEncoder {
+    Ok(Box::new(H265Encoder {
         codec_id: params.codec_id.clone(),
         output_params,
         width,
         height,
+        mode,
         ready: VecDeque::new(),
         frame_index: 0,
     }))
 }
 
-impl Encoder for H265PcmEncoder {
+impl Encoder for H265Encoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
@@ -136,8 +185,15 @@ impl Encoder for H265PcmEncoder {
         let cb = pack(1, self.width / 2, self.height / 2)?;
         let cr = pack(2, self.width / 2, self.height / 2)?;
 
-        let au = pcm::encode_idr_pcm_au(&y, &cb, &cr, self.width, self.height)
-            .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+        let au = match self.mode {
+            EncodeMode::Pcm => pcm::encode_idr_pcm_au(&y, &cb, &cr, self.width, self.height)
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
+            EncodeMode::Intra(qp) => {
+                intra::encode_idr_intra_au(&y, &cb, &cr, self.width, self.height, qp)
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                    .au
+            }
+        };
         let mut pkt = Packet::new(0, TimeBase::new(1, 25), au);
         pkt.pts = v.pts.or(Some(self.frame_index));
         pkt.dts = pkt.pts;

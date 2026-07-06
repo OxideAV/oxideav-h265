@@ -64,3 +64,76 @@ fn encoder_rejects_unaligned_dimensions() {
     params.height = Some(32);
     assert!(oxideav_h265::make_encoder(&params).is_err());
 }
+
+/// `mode = "intra"`: the registry encoder runs the real CABAC intra
+/// coder. Multi-frame streams decode through the registry decoder to
+/// high-fidelity (not bit-exact — it is a lossy transform coder) at
+/// low QP, and a bad `qp` / `mode` option is rejected at construction.
+#[test]
+fn intra_mode_registry_roundtrip_is_high_fidelity() {
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(48);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "intra");
+    params.options.insert("qp", "8");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let frames: Vec<VideoFrame> = (0..2).map(|i| planes(48, 32, i * 0x21)).collect();
+    let mut aus = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        let pkt = enc.receive_packet().expect("packet per frame");
+        assert!(pkt.flags.keyframe, "every intra AU is an IDR");
+        aus.push(pkt);
+    }
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    for pkt in &aus {
+        dec.send_packet(pkt).expect("decode send");
+    }
+    dec.flush().expect("decode flush");
+    for (i, f) in frames.iter().enumerate() {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                assert_eq!(v.planes.len(), 3, "frame {i}");
+                for (pi, (p, q)) in v.planes.iter().zip(f.planes.iter()).enumerate() {
+                    let mse: f64 = p
+                        .data
+                        .iter()
+                        .zip(q.data.iter())
+                        .map(|(&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / p.data.len() as f64;
+                    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                    assert!(
+                        psnr > 38.0,
+                        "frame {i} plane {pi}: PSNR {psnr:.1} dB at qp 8"
+                    );
+                }
+            }
+            other => panic!("frame {i}: unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}
+
+#[test]
+fn encoder_rejects_bad_options() {
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(16);
+    params.height = Some(16);
+    params.options.insert("mode", "interpretive-dance");
+    assert!(oxideav_h265::make_encoder(&params).is_err());
+
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(16);
+    params.height = Some(16);
+    params.options.insert("mode", "intra");
+    params.options.insert("qp", "52");
+    assert!(oxideav_h265::make_encoder(&params).is_err());
+}

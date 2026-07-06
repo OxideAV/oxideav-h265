@@ -297,7 +297,7 @@ pub use dpb::{
     build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
     Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
 };
-pub use encoder::{make_encoder, H265PcmEncoder};
+pub use encoder::{make_encoder, H265Encoder, H265PcmEncoder};
 pub use hrd::{
     CpbEntry, HrdCommonInfo, HrdError, HrdParameters, SubLayerHrd, SubLayerHrdParameters,
     VpsHrdEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
