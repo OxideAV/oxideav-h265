@@ -26,6 +26,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoded byte-exact against a black-box reference decoder at QPs
   4/17/27/38/45 out of band. New `encode_low_delay_p` example.
 
+- **Rectangular inter partitions** (`PART_2NxN` / `PART_Nx2N`): every
+  CTU decision now also competes two-PU splits — per-PU merge/AMVP
+  election with the second PU resolved against the first PU's motion
+  (the §8.5.3.2 order), the §7.4.9.8 `interSplitFlag` forced depth-1
+  RQT (four 8x8 luma + 4x4 chroma TBs with §7.3.8.8 cbf
+  inheritance), and the three-bin §9.3.3.7 inter `part_mode`
+  binarization at MinCb. Decode-side fix: the §6.4.2 availability
+  mask now reports the current (inter) CU as `MODE_INTER`, so a
+  second partition's §8.5.3.2.7 AMVP neighbours correctly read the
+  first partition (the pre-CU snapshot used to report the
+  motion-field background there). `FrameStats::rect` counts the new
+  shape. Pins: split-motion content elects rectangular CUs in both
+  P and B modes and decodes bit-exactly; 12-configuration
+  cross-decode sweep (rect / B / P / scene-change, QPs 4..45)
+  byte-exact against the black-box reference decoder out of band;
+  golden P-GOP pin regenerated and re-validated.
+
 - **Low-delay B slices** (`LowDelayPEncoder::with_b_slices` /
   registry `bslices` option): non-IDR frames coded as B slices with
   both reference lists resolving to the previous picture (decode

@@ -907,6 +907,20 @@ fn reconstruct_inter_leaf_cu(
     let tiling = ctx.tiling();
     let available = |x_nb: i32, y_nb: i32| -> bool {
         let cu_pred_mode = |x: u32, y: u32| -> u8 {
+            // §6.4.2 final mask reads CuPredMode[ xNbY ][ yNbY ]. A
+            // location covered by the CURRENT (inter) coding block has
+            // CuPredMode == MODE_INTER by definition; the z-scan /
+            // sameCb steps already guard decode order, so only the
+            // earlier-partition region of this CU is ever consulted
+            // (e.g. the §8.5.3.2.7 AMVP neighbours of a 2NxN / Nx2N
+            // second partition read the first partition's motion). The
+            // pre-CU snapshot below would otherwise report the
+            // motion-field background (intra) there.
+            if (x_cb..x_cb + n_cb_s as u32).contains(&x)
+                && (y_cb..y_cb + n_cb_s as u32).contains(&y)
+            {
+                return 0;
+            }
             let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
             if gx < w4 && gy < h4 && intra_grid[gy * w4 + gx] {
                 crate::availability::MODE_INTRA

@@ -76,6 +76,9 @@ const BIT_DEPTH: u8 = 8;
 const MAX_MERGE: usize = 5;
 /// The greedy integer-search iteration cap (diamond steps).
 const ME_MAX_STEPS: usize = 24;
+/// The z-order offsets of the four depth-1 transform units within a
+/// CTB (§6.5.2 z-scan of the four halves).
+const Z_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 
 /// One 4:2:0 8-bit input frame (borrowed planes).
 #[derive(Debug, Clone, Copy)]
@@ -124,24 +127,66 @@ pub struct FrameStats {
     pub amvp: usize,
     /// Intra CUs (`pred_mode_flag == 1`, or every CU of the IDR).
     pub intra: usize,
-    /// Bi-predicted CUs (both `predFlagLX` set — B slices only; a
-    /// subset of `skip + merge`).
+    /// Bi-predicted CUs (both `predFlagLX` set on some PU — B slices
+    /// only; an overlay of the mode classes above).
     pub bi: usize,
+    /// Rectangular-partition CUs (`PART_2NxN` / `PART_Nx2N` — an
+    /// overlay counted in `merge` / `amvp` too).
+    pub rect: usize,
 }
 
-/// A resolved-and-coded CU candidate (one of skip / merge / AMVP).
+/// A resolved-and-coded CU candidate.
 struct CuCandidate {
-    /// How the PU is signalled.
+    /// How the CU is signalled.
     kind: CuKind,
-    /// The §8.5.3.2.1-resolved motion (what the decoder will derive).
-    motion: PuMotion,
-    /// Quantized levels: luma 16x16, cb 8x8, cr 8x8. All-empty ⇔ no
-    /// transform tree (skip, or AMVP with `rqt_root_cbf == 0`).
-    levels: Option<[Vec<i32>; 3]>,
+    /// The §8.5.3.2.1-resolved per-PU motion in §7.3.8.6 order (what
+    /// the decoder will derive); empty for an intra CU.
+    motions: Vec<PuMotion>,
+    /// The coded transform tree; `None` ⇔ no tree (skip, or
+    /// `rqt_root_cbf == 0`).
+    levels: Option<CuLevels>,
     /// The CTB reconstruction (y 16x16, cb 8x8, cr 8x8).
     recon: [Vec<u8>; 3],
     /// SSD + λ·rate cost.
     cost: u64,
+}
+
+/// The quantized levels of a CU candidate's transform tree.
+enum CuLevels {
+    /// One depth-0 TU: luma 16x16, cb 8x8, cr 8x8.
+    Depth0([Vec<i32>; 3]),
+    /// The §7.4.9.8 `interSplitFlag` forced depth-1 tree (rectangular
+    /// inter partitions at `max_transform_hierarchy_depth_inter == 0`):
+    /// four z-order 8x8 luma and 4x4 chroma TBs per plane (boxed to
+    /// keep the variant sizes comparable).
+    Depth1(Box<Depth1Levels>),
+}
+
+/// The four z-order leaves of a forced depth-1 transform tree.
+struct Depth1Levels {
+    luma: [Vec<i32>; 4],
+    cb: [Vec<i32>; 4],
+    cr: [Vec<i32>; 4],
+}
+
+impl CuLevels {
+    /// `true` iff the luma tree carries a non-zero coefficient.
+    fn luma_nonzero(&self) -> bool {
+        match self {
+            Self::Depth0(l) => l[0].iter().any(|&v| v != 0),
+            Self::Depth1(d) => d.luma.iter().any(|l| l.iter().any(|&v| v != 0)),
+        }
+    }
+}
+
+/// One prediction unit's §7.3.8.6 signalling (merge or AMVP).
+#[derive(Clone, Copy)]
+enum PuSyntax {
+    /// `merge_flag == 1`, `merge_idx`.
+    Merge { merge_idx: usize },
+    /// `merge_flag == 0`: (`inter_pred_idc` on B) + `mvd_coding` +
+    /// `mvp_l0_flag`.
+    Amvp { mvd: Mv, mvp_flag: u8 },
 }
 
 /// The signalling class of a chosen CU.
@@ -153,6 +198,10 @@ enum CuKind {
     Merge { merge_idx: usize },
     /// AMVP: `mvd_coding` + `mvp_l0_flag`; `rqt_root_cbf` signalled.
     Amvp { mvd: Mv, mvp_flag: u8 },
+    /// Rectangular inter partition (`PART_2NxN` when `vertical` is
+    /// `false`, `PART_Nx2N` when `true`): two prediction units, the
+    /// forced depth-1 RQT, `rqt_root_cbf` signalled.
+    Rect { vertical: bool, pus: [PuSyntax; 2] },
     /// Intra fallback (`pred_mode_flag == 1`, `PART_2Nx2N`): §8.4
     /// prediction with luma mode `mode`, chroma derived-from-luma.
     Intra { mode: u8 },
@@ -419,15 +468,18 @@ fn amvp_pu(mvd: Mv, mvp_flag: u8) -> PredictionUnit {
     }
 }
 
-/// §8.5.3.3 — the final clipped prediction for a whole 16x16 CTB PU
-/// with the resolved motion (uni-L0, uni-L1 or bi; the low-delay GOP
-/// has a single physical reference, so both lists read the same
-/// planes). `chroma` selects whether the Cb / Cr planes are predicted
-/// too (the SAD search runs luma-only).
-fn predict_ctb(
+/// §8.5.3.3 — the final clipped prediction for a `w`x`h` PU at
+/// `(x0, y0)` with the resolved motion (uni-L0, uni-L1 or bi; the
+/// low-delay GOP has a single physical reference, so both lists read
+/// the same planes). `chroma` selects whether the Cb / Cr planes are
+/// predicted too (the SAD search runs luma-only).
+#[allow(clippy::too_many_arguments)]
+fn predict_block(
     refp: &RefPlanes,
     x0: usize,
     y0: usize,
+    w: usize,
+    h: usize,
     motion: &PuMotion,
     chroma: bool,
 ) -> InterPrediction {
@@ -454,13 +506,29 @@ fn predict_ctb(
     let geom = InterPredGeometry {
         x_pb: x0 as i32,
         y_pb: y0 as i32,
-        n_pb_w: CTB,
-        n_pb_h: CTB,
+        n_pb_w: w,
+        n_pb_h: h,
         chroma_array_type: if chroma { 1 } else { 0 },
         bit_depth_luma: BIT_DEPTH,
         bit_depth_chroma: BIT_DEPTH,
     };
     predict_inter_pu(&l0, &l1, &geom).expect("legal prediction geometry")
+}
+
+/// Copy a `w`x`h` block into a `bw`-wide buffer at `(bx, by)`.
+fn blit(dst: &mut [i32], bw: usize, bx: usize, by: usize, src: &[i32], w: usize, h: usize) {
+    for j in 0..h {
+        dst[(by + j) * bw + bx..(by + j) * bw + bx + w].copy_from_slice(&src[j * w..(j + 1) * w]);
+    }
+}
+
+/// Extract an `n`x`n` sub-block of a `bw`-wide buffer at `(bx, by)`.
+fn sub_block(buf: &[i32], bw: usize, bx: usize, by: usize, n: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(n * n);
+    for j in 0..n {
+        out.extend_from_slice(&buf[(by + j) * bw + bx..(by + j) * bw + bx + n]);
+    }
+    out
 }
 
 /// A uni-L0 [`PuMotion`] for motion-search probes.
@@ -557,11 +625,14 @@ fn pred_recon(pred: &InterPrediction, src: &[Vec<i32>; 3]) -> ([Vec<u8>; 3], u64
 /// Greedy integer-pel motion search on luma SAD: seeds, then a
 /// small-diamond descent (capped). Returns the best full-pel MV in
 /// luma samples.
+#[allow(clippy::too_many_arguments)]
 fn integer_me(
     refp: &RefPlanes,
     src_y: &[i32],
     x0: usize,
     y0: usize,
+    w: usize,
+    h: usize,
     seeds: &[[i32; 2]],
     lambda_me: u64,
     mvp_q: &[Mv],
@@ -569,12 +640,12 @@ fn integer_me(
     // Full-pel prediction == direct (clamped) reference samples.
     let sad_at = |mx: i32, my: i32| -> u64 {
         let mut acc = 0u64;
-        for j in 0..CTB {
-            for i in 0..CTB {
+        for j in 0..h {
+            for i in 0..w {
                 let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
                 let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
                 let r = refp.y[ry as usize * refp.width + rx as usize];
-                acc += u64::from(r.abs_diff(src_y[j * CTB + i]));
+                acc += u64::from(r.abs_diff(src_y[j * w + i]));
             }
         }
         acc
@@ -617,17 +688,20 @@ fn integer_me(
 
 /// Half- then quarter-pel refinement around `best` (quarter-pel
 /// units), scoring with the real §8.5.3.3.3 interpolation.
+#[allow(clippy::too_many_arguments)]
 fn fractional_me(
     refp: &RefPlanes,
     src_y: &[i32],
     x0: usize,
     y0: usize,
+    w: usize,
+    h: usize,
     start: Mv,
     lambda_me: u64,
     mvp_q: &[Mv],
 ) -> Mv {
     let cost_at = |mv: Mv| -> u64 {
-        let pred = predict_ctb(refp, x0, y0, &uni_l0(mv), false);
+        let pred = predict_block(refp, x0, y0, w, h, &uni_l0(mv), false);
         let mv_rate = mvp_q
             .iter()
             .map(|p| mvd_bits([mv[0] - p[0], mv[1] - p[1]]))
@@ -662,6 +736,99 @@ fn fractional_me(
         }
     }
     best
+}
+
+/// Inputs shared by every per-PU decision of one slice.
+struct PuChooseCtx<'a> {
+    refp: &'a RefPlanes,
+    mv_ctx: &'a PuMvContext<'a>,
+    lambda_me: u64,
+    b_slice: bool,
+}
+
+/// Choose merge-vs-AMVP for one prediction unit against `field` (the
+/// motion state the decoder will have when resolving this PU), by
+/// luma SAD + λ·signalling-bins. Returns the syntax, the resolved
+/// motion, and the motion-rate proxy.
+fn choose_pu(
+    field: &MotionField,
+    geom: &PuGeometry,
+    available: &dyn Fn(i32, i32) -> bool,
+    src_y: &[i32],
+    ctx: &PuChooseCtx<'_>,
+) -> (PuSyntax, PuMotion, u64) {
+    let (x, y, w, h) = (geom.x_pb, geom.y_pb, geom.n_pb_w, geom.n_pb_h);
+    // ---- merge candidates (§8.5.3.2.2) ----
+    let mut merge_cands: Vec<(usize, PuMotion)> = Vec::with_capacity(MAX_MERGE);
+    for idx in 0..MAX_MERGE {
+        let m = resolve_pu_motion(field, geom, &merge_pu(idx), ctx.mv_ctx, available);
+        // A later duplicate can never beat the earlier index.
+        if !merge_cands.iter().any(|(_, prev)| *prev == m) {
+            merge_cands.push((idx, m));
+        }
+    }
+    let (merge_cost, merge_idx, merge_motion) = merge_cands
+        .iter()
+        .map(|&(idx, m)| {
+            let pred = predict_block(ctx.refp, x, y, w, h, &m, false);
+            (
+                sad(&pred.luma, src_y) + ctx.lambda_me * (idx as u64 + 2),
+                idx,
+                m,
+            )
+        })
+        .min_by_key(|&(cost, idx, _)| (cost, idx))
+        .expect("merge list is never empty");
+
+    // ---- AMVP: §8.5.3.2.6 predictors + motion estimation ----
+    let mvp = [
+        resolve_pu_motion(field, geom, &amvp_pu([0, 0], 0), ctx.mv_ctx, available).mv_l0,
+        resolve_pu_motion(field, geom, &amvp_pu([0, 0], 1), ctx.mv_ctx, available).mv_l0,
+    ];
+    let mut seeds: Vec<[i32; 2]> = vec![[0, 0]];
+    for p in &mvp {
+        seeds.push([p[0] >> 2, p[1] >> 2]);
+    }
+    for (_, m) in &merge_cands {
+        seeds.push([m.mv_l0[0] >> 2, m.mv_l0[1] >> 2]);
+    }
+    seeds.dedup();
+    let int_mv = integer_me(ctx.refp, src_y, x, y, w, h, &seeds, ctx.lambda_me, &mvp);
+    let me_mv = fractional_me(
+        ctx.refp,
+        src_y,
+        x,
+        y,
+        w,
+        h,
+        [int_mv[0] * 4, int_mv[1] * 4],
+        ctx.lambda_me,
+        &mvp,
+    );
+    // Choose the cheaper predictor for the found MV.
+    let (mvp_flag, mvd) = (0u8..2)
+        .map(|f| {
+            let p = mvp[f as usize];
+            (f, [me_mv[0] - p[0], me_mv[1] - p[1]])
+        })
+        .min_by_key(|&(_, d)| mvd_bits(d))
+        .expect("two predictors");
+    // Resolve through the decoder's derivation (mv wrap etc.).
+    let amvp_motion =
+        resolve_pu_motion(field, geom, &amvp_pu(mvd, mvp_flag), ctx.mv_ctx, available);
+    let amvp_rate = 2 + mvd_bits(mvd) + u64::from(ctx.b_slice) * 2;
+    let amvp_pred = predict_block(ctx.refp, x, y, w, h, &amvp_motion, false);
+    let amvp_cost = sad(&amvp_pred.luma, src_y) + ctx.lambda_me * amvp_rate;
+
+    if merge_cost <= amvp_cost {
+        (
+            PuSyntax::Merge { merge_idx },
+            merge_motion,
+            merge_idx as u64 + 2,
+        )
+    } else {
+        (PuSyntax::Amvp { mvd, mvp_flag }, amvp_motion, amvp_rate)
+    }
 }
 
 /// Encode `merge_idx` (§9.3.3.10 TR with `cMax = MaxNumMergeCand − 1`:
@@ -726,6 +893,37 @@ fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut Slice
                 encode_eg_k(w, cabac, a - 2, 1);
             }
             cabac.encode_bypass(w, u8::from(v < 0));
+        }
+    }
+}
+
+/// §7.3.8.6 — emit one prediction unit's syntax (merge_flag +
+/// merge_idx, or the AMVP group). `ref_idx_lX` is never present (one
+/// active reference per list) and a non-merge PU is `PRED_L0`
+/// (signalled as "00" `inter_pred_idc` on B slices — bin 0 ctxInc =
+/// CtDepth = 0, bin 1 ctxInc = 4; `nPbW + nPbH != 12` for every PU
+/// shape this encoder emits).
+fn encode_pu_syntax(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    pu: &PuSyntax,
+    b_slice: bool,
+) {
+    match pu {
+        PuSyntax::Merge { merge_idx } => {
+            cabac.encode_decision(w, &mut ctxs.merge_flag[0], 1);
+            encode_merge_idx(w, cabac, ctxs, *merge_idx);
+        }
+        PuSyntax::Amvp { mvd, mvp_flag } => {
+            cabac.encode_decision(w, &mut ctxs.merge_flag[0], 0);
+            if b_slice {
+                let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
+                cabac.encode_decision(w, &mut head[0], 0);
+                cabac.encode_decision(w, &mut tail[0], 0);
+            }
+            encode_mvd_pair(w, cabac, ctxs, *mvd);
+            cabac.encode_decision(w, &mut ctxs.mvp_flag[0], *mvp_flag);
         }
     }
 }
@@ -885,7 +1083,7 @@ fn encode_inter_slice(
             let (best_merge_idx, best_merge_motion) = merge_cands
                 .iter()
                 .map(|&(idx, m)| {
-                    let pred = predict_ctb(&refp, x0, y0, &m, false);
+                    let pred = predict_block(&refp, x0, y0, CTB, CTB, &m, false);
                     (
                         sad(&pred.luma, &src[0]) + lambda_me * (idx as u64 + 1),
                         idx,
@@ -909,12 +1107,14 @@ fn encode_inter_slice(
                 seeds.push([m.mv_l0[0] >> 2, m.mv_l0[1] >> 2]);
             }
             seeds.dedup();
-            let int_mv = integer_me(&refp, &src[0], x0, y0, &seeds, lambda_me, &mvp);
+            let int_mv = integer_me(&refp, &src[0], x0, y0, CTB, CTB, &seeds, lambda_me, &mvp);
             let me_mv = fractional_me(
                 &refp,
                 &src[0],
                 x0,
                 y0,
+                CTB,
+                CTB,
                 [int_mv[0] * 4, int_mv[1] * 4],
                 lambda_me,
                 &mvp,
@@ -932,16 +1132,16 @@ fn encode_inter_slice(
                 resolve_pu_motion(&field, &geom, &amvp_pu(mvd, mvp_flag), &mv_ctx, &available);
 
             // ---- fully code the finalists ----
-            let mut cands: Vec<CuCandidate> = Vec::with_capacity(3);
+            let mut cands: Vec<CuCandidate> = Vec::with_capacity(6);
 
             // Skip: best merge candidate, prediction only.
-            let merge_pred = predict_ctb(&refp, x0, y0, &best_merge_motion, true);
+            let merge_pred = predict_block(&refp, x0, y0, CTB, CTB, &best_merge_motion, true);
             let (skip_recon, skip_dist) = pred_recon(&merge_pred, &src);
             cands.push(CuCandidate {
                 kind: CuKind::Skip {
                     merge_idx: best_merge_idx,
                 },
-                motion: best_merge_motion,
+                motions: vec![best_merge_motion],
                 levels: None,
                 recon: skip_recon,
                 cost: skip_dist + lambda * (best_merge_idx as u64 + 2),
@@ -956,23 +1156,23 @@ fn encode_inter_slice(
                     kind: CuKind::Merge {
                         merge_idx: best_merge_idx,
                     },
-                    motion: best_merge_motion,
-                    levels: Some(m_levels),
+                    motions: vec![best_merge_motion],
+                    levels: Some(CuLevels::Depth0(m_levels)),
                     recon: m_recon,
                     cost: m_dist + lambda * (m_rate + best_merge_idx as u64 + 3),
                 });
             }
 
             // AMVP (with or without residual).
-            let amvp_pred = predict_ctb(&refp, x0, y0, &amvp_motion, true);
+            let amvp_pred = predict_block(&refp, x0, y0, CTB, CTB, &amvp_motion, true);
             let (a_levels, a_recon, a_dist, a_rate) =
                 code_ctb_residual(&amvp_pred, &src, qp_y, qp_c);
             let motion_rate = mvd_bits(mvd) + 4; // mvd + mvp/merge/skip/rqt flags
             if a_levels.iter().any(|l| l.iter().any(|&v| v != 0)) {
                 cands.push(CuCandidate {
                     kind: CuKind::Amvp { mvd, mvp_flag },
-                    motion: amvp_motion,
-                    levels: Some(a_levels),
+                    motions: vec![amvp_motion],
+                    levels: Some(CuLevels::Depth0(a_levels)),
                     recon: a_recon,
                     cost: a_dist + lambda * (a_rate + motion_rate),
                 });
@@ -981,10 +1181,193 @@ fn encode_inter_slice(
                 let (pr, pd) = pred_recon(&amvp_pred, &src);
                 cands.push(CuCandidate {
                     kind: CuKind::Amvp { mvd, mvp_flag },
-                    motion: amvp_motion,
+                    motions: vec![amvp_motion],
                     levels: None,
                     recon: pr,
                     cost: pd + lambda * motion_rate,
+                });
+            }
+
+            // ---- rectangular partitions (PART_2NxN / PART_Nx2N) ----
+            let choose_ctx = PuChooseCtx {
+                refp: &refp,
+                mv_ctx: &mv_ctx,
+                lambda_me,
+                b_slice,
+            };
+            for part in [PartMode::Part2NxN, PartMode::PartNx2N] {
+                let vertical = part == PartMode::PartNx2N;
+                let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
+                // The decoder resolves PU1 with PU0's motion already in
+                // the field (§8.5.3.2 order): stage the writes on a copy.
+                let mut tmp = field.clone();
+                let mut pus = [PuSyntax::Merge { merge_idx: 0 }; 2];
+                let mut motions_r = Vec::with_capacity(2);
+                let mut pred_y = vec![0i32; CTB * CTB];
+                let mut pred_cb = vec![0i32; 64];
+                let mut pred_cr = vec![0i32; 64];
+                let mut motion_rate_r = 3u64; // pred_mode + part_mode bins
+                for (k, r) in rects.iter().enumerate() {
+                    let g = PuGeometry {
+                        x_cb: x0,
+                        y_cb: y0,
+                        n_cb_s: CTB,
+                        x_pb: r.x_pb,
+                        y_pb: r.y_pb,
+                        n_pb_w: r.n_pb_w,
+                        n_pb_h: r.n_pb_h,
+                        part_mode: part,
+                        part_idx: k as u32,
+                    };
+                    // §6.4.2 availability against the staged field. The
+                    // decoder's closure passes the CU as the PU geometry
+                    // (the sameCb NxN clause never fires for 2-PU
+                    // shapes) and treats the current CU as MODE_INTER.
+                    let avail_k = |x_nb: i32, y_nb: i32| -> bool {
+                        tiling.prediction_block_availability(
+                            x0 as u32,
+                            y0 as u32,
+                            CTB as u32,
+                            x0 as u32,
+                            y0 as u32,
+                            CTB as u32,
+                            CTB as u32,
+                            0,
+                            x_nb,
+                            y_nb,
+                            |_ctb_rs| 0,
+                            |x, y| {
+                                let (xu, yu) = (x as usize, y as usize);
+                                let inside_cu =
+                                    (x0..x0 + CTB).contains(&xu) && (y0..y0 + CTB).contains(&yu);
+                                if !inside_cu && tmp.cell_at(xu, yu).is_intra {
+                                    MODE_INTRA
+                                } else {
+                                    0
+                                }
+                            },
+                        )
+                    };
+                    let mut src_pu = Vec::with_capacity(r.n_pb_w * r.n_pb_h);
+                    for j in 0..r.n_pb_h {
+                        for i in 0..r.n_pb_w {
+                            src_pu.push(i32::from(frame.y[(r.y_pb + j) * width + r.x_pb + i]));
+                        }
+                    }
+                    let (pu_syntax, motion, rate_k) =
+                        choose_pu(&tmp, &g, &avail_k, &src_pu, &choose_ctx);
+                    // eqs 8-80..8-85: PU1's derivation sees PU0's motion.
+                    tmp.fill_rect(
+                        r.x_pb,
+                        r.y_pb,
+                        r.n_pb_w,
+                        r.n_pb_h,
+                        motion.to_cell(poc - 1, poc - 1),
+                    );
+                    let p = predict_block(&refp, r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, &motion, true);
+                    blit(
+                        &mut pred_y,
+                        CTB,
+                        r.x_pb - x0,
+                        r.y_pb - y0,
+                        &p.luma,
+                        r.n_pb_w,
+                        r.n_pb_h,
+                    );
+                    blit(
+                        &mut pred_cb,
+                        8,
+                        (r.x_pb - x0) / 2,
+                        (r.y_pb - y0) / 2,
+                        &p.cb,
+                        r.n_pb_w / 2,
+                        r.n_pb_h / 2,
+                    );
+                    blit(
+                        &mut pred_cr,
+                        8,
+                        (r.x_pb - x0) / 2,
+                        (r.y_pb - y0) / 2,
+                        &p.cr,
+                        r.n_pb_w / 2,
+                        r.n_pb_h / 2,
+                    );
+                    pus[k] = pu_syntax;
+                    motions_r.push(motion);
+                    motion_rate_r += rate_k;
+                }
+                // §7.4.9.8 interSplitFlag: forced depth-1 tree — four
+                // z-order 8x8 luma + 4x4 chroma TBs.
+                let mut luma_l: [Vec<i32>; 4] = Default::default();
+                let mut cb_l: [Vec<i32>; 4] = Default::default();
+                let mut cr_l: [Vec<i32>; 4] = Default::default();
+                let mut recon_r = [vec![0u8; CTB * CTB], vec![0u8; 64], vec![0u8; 64]];
+                let mut rate_r = 0u64;
+                for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
+                    let (lx, ly8) = (zx * 8, zy * 8);
+                    let s_y = sub_block(&src[0], CTB, lx, ly8, 8);
+                    let p_y = sub_block(&pred_y, CTB, lx, ly8, 8);
+                    let (lv, rc) = code_tb(&s_y, &p_y, 8, qp_y, Component::Luma, PredMode::Inter);
+                    for j in 0..8 {
+                        recon_r[0][(ly8 + j) * CTB + lx..(ly8 + j) * CTB + lx + 8]
+                            .copy_from_slice(&rc[j * 8..(j + 1) * 8]);
+                    }
+                    rate_r += levels_rate(&lv);
+                    luma_l[k] = lv;
+                    for (plane, src_c, pred_c, out) in [
+                        (1usize, &src[1], &pred_cb, &mut cb_l),
+                        (2usize, &src[2], &pred_cr, &mut cr_l),
+                    ] {
+                        let s_c = sub_block(src_c, 8, zx * 4, zy * 4, 4);
+                        let p_c = sub_block(pred_c, 8, zx * 4, zy * 4, 4);
+                        let comp = if plane == 1 {
+                            Component::Cb
+                        } else {
+                            Component::Cr
+                        };
+                        let (lv_c, rc_c) = code_tb(&s_c, &p_c, 4, qp_c, comp, PredMode::Inter);
+                        for j in 0..4 {
+                            recon_r[plane]
+                                [(zy * 4 + j) * 8 + zx * 4..(zy * 4 + j) * 8 + zx * 4 + 4]
+                                .copy_from_slice(&rc_c[j * 4..(j + 1) * 4]);
+                        }
+                        rate_r += levels_rate(&lv_c);
+                        out[k] = lv_c;
+                    }
+                }
+                let any_nonzero = luma_l
+                    .iter()
+                    .chain(cb_l.iter())
+                    .chain(cr_l.iter())
+                    .any(|l| l.iter().any(|&v| v != 0));
+                let (levels_r, recon_final, dist_r) = if any_nonzero {
+                    let d = ssd(&recon_r[0], &src[0])
+                        + ssd(&recon_r[1], &src[1])
+                        + ssd(&recon_r[2], &src[2]);
+                    (
+                        Some(CuLevels::Depth1(Box::new(Depth1Levels {
+                            luma: luma_l,
+                            cb: cb_l,
+                            cr: cr_l,
+                        }))),
+                        recon_r,
+                        d + lambda * rate_r,
+                    )
+                } else {
+                    // rqt_root_cbf == 0: prediction-only reconstruction.
+                    let clip = |v: &[i32]| -> Vec<u8> {
+                        v.iter().map(|&p| p.clamp(0, 255) as u8).collect()
+                    };
+                    let rec = [clip(&pred_y), clip(&pred_cb), clip(&pred_cr)];
+                    let d = ssd(&rec[0], &src[0]) + ssd(&rec[1], &src[1]) + ssd(&rec[2], &src[2]);
+                    (None, rec, d)
+                };
+                cands.push(CuCandidate {
+                    kind: CuKind::Rect { vertical, pus },
+                    motions: motions_r,
+                    levels: levels_r,
+                    recon: recon_final,
+                    cost: dist_r + lambda * (motion_rate_r + 1),
                 });
             }
 
@@ -1022,8 +1405,8 @@ fn encode_inter_slice(
                 let rate = levels_rate(&ly) + levels_rate(&lcb) + levels_rate(&lcr) + 8;
                 cands.push(CuCandidate {
                     kind: CuKind::Intra { mode },
-                    motion: PuMotion::default(),
-                    levels: Some([ly, lcb, lcr]),
+                    motions: Vec::new(),
+                    levels: Some(CuLevels::Depth0([ly, lcb, lcr])),
                     recon: [ry, rcb, rcr],
                     cost: dist + lambda * rate,
                 });
@@ -1068,27 +1451,52 @@ fn encode_inter_slice(
                 // pred_mode_flag = 0 (MODE_INTER), part_mode "1" (2Nx2N).
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
-                // prediction_unit: merge_flag = 1, merge_idx.
-                cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 1);
-                encode_merge_idx(&mut w, &mut cabac, &mut ctxs, *merge_idx);
+                encode_pu_syntax(
+                    &mut w,
+                    &mut cabac,
+                    &mut ctxs,
+                    &PuSyntax::Merge {
+                        merge_idx: *merge_idx,
+                    },
+                    b_slice,
+                );
                 // rqt_root_cbf not present (2Nx2N merge ⇒ inferred 1).
             }
             CuKind::Amvp { mvd, mvp_flag } => {
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
-                cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 0);
-                if b_slice {
-                    // §9.3.3.9 inter_pred_idc = PRED_L0 ("00"):
-                    // nPbW + nPbH == 32, bin 0 ctxInc = CtDepth (0),
-                    // bin 1 ctxInc = 4.
-                    let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
-                    cabac.encode_decision(&mut w, &mut head[0], 0);
-                    cabac.encode_decision(&mut w, &mut tail[0], 0);
+                encode_pu_syntax(
+                    &mut w,
+                    &mut cabac,
+                    &mut ctxs,
+                    &PuSyntax::Amvp {
+                        mvd: *mvd,
+                        mvp_flag: *mvp_flag,
+                    },
+                    b_slice,
+                );
+                cabac.encode_decision(
+                    &mut w,
+                    &mut ctxs.rqt_root_cbf[0],
+                    u8::from(chosen.levels.is_some()),
+                );
+            }
+            CuKind::Rect { vertical, pus } => {
+                cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
+                // §9.3.3.7 inter part_mode at MinCb (log2CbSize 4 > 3):
+                // "01" = PART_2NxN, "001" = PART_Nx2N (bin 0 ctx 0,
+                // bin 1 ctx 1, bin 2 the MinCb slot 2).
+                cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 0);
+                if *vertical {
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], 0);
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[2], 1);
+                } else {
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], 1);
                 }
-                // PRED_L0 (inferred on P); one active ref ⇒ no
-                // ref_idx_l0. mvd_coding + mvp_l0_flag.
-                encode_mvd_pair(&mut w, &mut cabac, &mut ctxs, *mvd);
-                cabac.encode_decision(&mut w, &mut ctxs.mvp_flag[0], *mvp_flag);
+                for pu in pus {
+                    encode_pu_syntax(&mut w, &mut cabac, &mut ctxs, pu, b_slice);
+                }
+                // rqt_root_cbf: present (PartMode != PART_2Nx2N).
                 cabac.encode_decision(
                     &mut w,
                     &mut ctxs.rqt_root_cbf[0],
@@ -1146,80 +1554,158 @@ fn encode_inter_slice(
 
         // ---- §7.3.8.8 transform_tree + §7.3.8.10 transform_unit ----
         let cu_is_intra = matches!(chosen.kind, CuKind::Intra { .. });
-        if let Some(levels) = &chosen.levels {
-            // Depth-0 16x16 TU (split_transform_flag not present,
-            // inferred 0: 2Nx2N at MaxTrafoDepth 0).
-            let cbf_cb = levels[1].iter().any(|&v| v != 0);
-            let cbf_cr = levels[2].iter().any(|&v| v != 0);
-            let cbf_luma = levels[0].iter().any(|&v| v != 0);
-            cabac.encode_decision(
-                &mut w,
-                &mut ctxs.cbf_chroma[cbf_cb_ctx_inc(0) as usize],
-                u8::from(cbf_cb),
-            );
-            cabac.encode_decision(
-                &mut w,
-                &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
-                u8::from(cbf_cr),
-            );
-            // §7.3.8.8: an intra CU always signals cbf_luma; an inter
-            // depth-0 TU signals it only when a chroma cbf is set
-            // (otherwise it is inferred 1).
-            if cu_is_intra || cbf_cb || cbf_cr {
+        // §7.4.9.11: inter TBs use the up-right diagonal scan; the
+        // TB geometries the intra fallback emits are not
+        // mode-dependent-scan eligible so they come back diagonal
+        // through the same derivation.
+        let intra_mode = match &chosen.kind {
+            CuKind::Intra { mode } => u32::from(*mode),
+            _ => 0,
+        };
+        let rc_params = |log2: u32, c_idx: u8| ResidualCodingParams {
+            log2_trafo_size: log2,
+            is_chroma: c_idx != 0,
+            scan_idx: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, intra_mode),
+            sign_data_hiding_enabled_flag: false,
+            sign_hidden_suppressed: false,
+            transform_skip_sig_ctx: false,
+        };
+        match &chosen.levels {
+            Some(CuLevels::Depth0(levels)) => {
+                // Depth-0 16x16 TU (split_transform_flag not present,
+                // inferred 0: 2Nx2N at MaxTrafoDepth 0).
+                let cbf_cb = levels[1].iter().any(|&v| v != 0);
+                let cbf_cr = levels[2].iter().any(|&v| v != 0);
+                let cbf_luma = levels[0].iter().any(|&v| v != 0);
                 cabac.encode_decision(
                     &mut w,
-                    &mut ctxs.cbf_luma[cbf_luma_ctx_inc(0) as usize],
-                    u8::from(cbf_luma),
+                    &mut ctxs.cbf_chroma[cbf_cb_ctx_inc(0) as usize],
+                    u8::from(cbf_cb),
                 );
-            } else {
-                debug_assert!(cbf_luma, "all-zero transform tree must not be coded");
-            }
-            // §7.4.9.11: inter TBs use the up-right diagonal scan; the
-            // 16x16 luma / 8x8 chroma intra TBs are not
-            // mode-dependent-scan eligible so they come back diagonal
-            // through the same derivation.
-            let intra_mode = match &chosen.kind {
-                CuKind::Intra { mode } => u32::from(*mode),
-                _ => 0,
-            };
-            let rc_params = |log2: u32, c_idx: u8| ResidualCodingParams {
-                log2_trafo_size: log2,
-                is_chroma: c_idx != 0,
-                scan_idx: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, intra_mode),
-                sign_data_hiding_enabled_flag: false,
-                sign_hidden_suppressed: false,
-                transform_skip_sig_ctx: false,
-            };
-            if cbf_luma {
-                encode_residual_coding(
+                cabac.encode_decision(
                     &mut w,
-                    &mut cabac,
-                    &mut ctxs.residual,
-                    &rc_params(4, 0),
-                    &levels[0],
-                )
-                .expect("validated luma levels");
+                    &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
+                    u8::from(cbf_cr),
+                );
+                // §7.3.8.8: an intra CU always signals cbf_luma; an
+                // inter depth-0 TU signals it only when a chroma cbf is
+                // set (otherwise it is inferred 1).
+                if cu_is_intra || cbf_cb || cbf_cr {
+                    cabac.encode_decision(
+                        &mut w,
+                        &mut ctxs.cbf_luma[cbf_luma_ctx_inc(0) as usize],
+                        u8::from(cbf_luma),
+                    );
+                } else {
+                    debug_assert!(cbf_luma, "all-zero transform tree must not be coded");
+                }
+                if cbf_luma {
+                    encode_residual_coding(
+                        &mut w,
+                        &mut cabac,
+                        &mut ctxs.residual,
+                        &rc_params(4, 0),
+                        &levels[0],
+                    )
+                    .expect("validated luma levels");
+                }
+                if cbf_cb {
+                    encode_residual_coding(
+                        &mut w,
+                        &mut cabac,
+                        &mut ctxs.residual,
+                        &rc_params(3, 1),
+                        &levels[1],
+                    )
+                    .expect("validated cb levels");
+                }
+                if cbf_cr {
+                    encode_residual_coding(
+                        &mut w,
+                        &mut cabac,
+                        &mut ctxs.residual,
+                        &rc_params(3, 2),
+                        &levels[2],
+                    )
+                    .expect("validated cr levels");
+                }
             }
-            if cbf_cb {
-                encode_residual_coding(
+            Some(CuLevels::Depth1(d)) => {
+                let Depth1Levels { luma, cb, cr } = d.as_ref();
+                // §7.4.9.8 interSplitFlag == 1: split_transform_flag
+                // inferred 1 at depth 0; four 8x8 leaves at depth 1.
+                // Root cbf_cb / cbf_cr gate the per-leaf chroma flags
+                // (§7.3.8.8 inheritance); cbf_luma is signalled at
+                // every depth-1 leaf (trafoDepth != 0).
+                let leaf_nz = |lv: &Vec<i32>| lv.iter().any(|&v| v != 0);
+                let root_cb = cb.iter().any(&leaf_nz);
+                let root_cr = cr.iter().any(&leaf_nz);
+                cabac.encode_decision(
                     &mut w,
-                    &mut cabac,
-                    &mut ctxs.residual,
-                    &rc_params(3, 1),
-                    &levels[1],
-                )
-                .expect("validated cb levels");
-            }
-            if cbf_cr {
-                encode_residual_coding(
+                    &mut ctxs.cbf_chroma[cbf_cb_ctx_inc(0) as usize],
+                    u8::from(root_cb),
+                );
+                cabac.encode_decision(
                     &mut w,
-                    &mut cabac,
-                    &mut ctxs.residual,
-                    &rc_params(3, 2),
-                    &levels[2],
-                )
-                .expect("validated cr levels");
+                    &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
+                    u8::from(root_cr),
+                );
+                for k in 0..4 {
+                    let cbf_cb_k = leaf_nz(&cb[k]);
+                    let cbf_cr_k = leaf_nz(&cr[k]);
+                    let cbf_luma_k = leaf_nz(&luma[k]);
+                    if root_cb {
+                        cabac.encode_decision(
+                            &mut w,
+                            &mut ctxs.cbf_chroma[cbf_cb_ctx_inc(1) as usize],
+                            u8::from(cbf_cb_k),
+                        );
+                    }
+                    if root_cr {
+                        cabac.encode_decision(
+                            &mut w,
+                            &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(1) as usize],
+                            u8::from(cbf_cr_k),
+                        );
+                    }
+                    cabac.encode_decision(
+                        &mut w,
+                        &mut ctxs.cbf_luma[cbf_luma_ctx_inc(1) as usize],
+                        u8::from(cbf_luma_k),
+                    );
+                    if cbf_luma_k {
+                        encode_residual_coding(
+                            &mut w,
+                            &mut cabac,
+                            &mut ctxs.residual,
+                            &rc_params(3, 0),
+                            &luma[k],
+                        )
+                        .expect("validated luma levels");
+                    }
+                    if root_cb && cbf_cb_k {
+                        encode_residual_coding(
+                            &mut w,
+                            &mut cabac,
+                            &mut ctxs.residual,
+                            &rc_params(2, 1),
+                            &cb[k],
+                        )
+                        .expect("validated cb levels");
+                    }
+                    if root_cr && cbf_cr_k {
+                        encode_residual_coding(
+                            &mut w,
+                            &mut cabac,
+                            &mut ctxs.residual,
+                            &rc_params(2, 2),
+                            &cr[k],
+                        )
+                        .expect("validated cr levels");
+                    }
+                }
             }
+            None => {}
         }
 
         // ---- state update (eqs 8-80..8-85 + mode fields + recon) ----
@@ -1244,12 +1730,40 @@ fn encode_inter_slice(
                 match kind {
                     CuKind::Skip { .. } => stats.skip += 1,
                     CuKind::Merge { .. } => stats.merge += 1,
+                    CuKind::Rect { pus, .. } => {
+                        if pus.iter().any(|p| matches!(p, PuSyntax::Amvp { .. })) {
+                            stats.amvp += 1;
+                        } else {
+                            stats.merge += 1;
+                        }
+                        stats.rect += 1;
+                    }
                     _ => stats.amvp += 1,
                 }
-                if chosen.motion.pred_flag_l0 && chosen.motion.pred_flag_l1 {
+                if chosen
+                    .motions
+                    .iter()
+                    .any(|m| m.pred_flag_l0 && m.pred_flag_l1)
+                {
                     stats.bi += 1;
                 }
-                field.fill_rect(x0, y0, CTB, CTB, chosen.motion.to_cell(poc - 1, i32::MIN));
+                // eqs 8-80..8-85: one motion cell per PU rectangle (the
+                // reference lists both resolve to POC − 1).
+                let part = match kind {
+                    CuKind::Rect { vertical: true, .. } => PartMode::PartNx2N,
+                    CuKind::Rect { .. } => PartMode::Part2NxN,
+                    _ => PartMode::Part2Nx2N,
+                };
+                let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
+                for (r, m) in rects.iter().zip(chosen.motions.iter()) {
+                    field.fill_rect(
+                        r.x_pb,
+                        r.y_pb,
+                        r.n_pb_w,
+                        r.n_pb_h,
+                        m.to_cell(poc - 1, poc - 1),
+                    );
+                }
                 let cu_mode = if is_skip {
                     CuPredMode::Skip
                 } else {
@@ -1259,7 +1773,7 @@ fn encode_inter_slice(
             }
         }
         if let Some(levels) = &chosen.levels {
-            if levels[0].iter().any(|&v| v != 0) {
+            if levels.luma_nonzero() {
                 field.mark_nonzero_coeff(x0, y0, CTB, CTB);
             }
         }
@@ -1464,12 +1978,15 @@ mod tests {
         let frames = as_frames(&planes);
         let enc = encode_low_delay_p(&frames, w, h, 27).expect("encode");
 
-        // The scene-change P frame elects intra for most CTBs.
+        // The scene-change P frame elects intra for a meaningful share
+        // of its CTBs (the depth-1 rectangular-inter trees legitimately
+        // take the rest — the residual does the work there).
         let st = enc.stats[2];
         assert!(
-            st.intra > (w / 16) * (h / 16) / 2,
-            "scene change should be intra-dominated, got {st:?}"
+            st.intra >= (w / 16) * (h / 16) / 4,
+            "scene change should elect intra CUs, got {st:?}"
         );
+        assert_eq!(st.skip, 0, "nothing to skip across a scene change: {st:?}");
         // The steady frame before it stays inter-dominated (the CTBs
         // around the moving square may still legitimately elect intra
         // on the covered / uncovered texture).
@@ -1477,6 +1994,10 @@ mod tests {
         assert!(
             st1.intra < (w / 16) * (h / 16) / 2,
             "steady frame should be inter-dominated, got {st1:?}"
+        );
+        assert!(
+            st.intra > st1.intra,
+            "the scene change should elect more intra than the steady frame: {st:?} vs {st1:?}"
         );
 
         // And the whole stream still decodes to the encoder recon.
@@ -1491,6 +2012,66 @@ mod tests {
                 expect,
                 "frame {i}"
             );
+        }
+    }
+
+    /// Rectangular partitions are actually elected on content with
+    /// per-half motion (a horizontal boundary moving through CTBs),
+    /// and the streams stay bit-exact through our decoder — including
+    /// the §8.5.3.2 second-PU derivation reading the first PU.
+    #[test]
+    fn rect_partitions_are_selected_and_roundtrip() {
+        // Two texture fields moving in opposite directions: the top
+        // half scrolls right, the bottom half scrolls left, with the
+        // boundary offset from the CTB grid so 2NxN splits pay off.
+        let (w, h) = (64usize, 64usize);
+        let planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..4usize)
+            .map(|t| {
+                let y: Vec<u8> = (0..w * h)
+                    .map(|i| {
+                        let (x, yy) = (i % w, i / w);
+                        if yy < 24 {
+                            (((x + w - 2 * t) * 5 + yy * 3) % 220) as u8
+                        } else {
+                            (((x + 2 * t) * 7 + yy) % 220) as u8
+                        }
+                    })
+                    .collect();
+                let cb = vec![110u8; w * h / 4];
+                let cr = vec![150u8; w * h / 4];
+                (y, cb, cr)
+            })
+            .collect();
+        let frames = as_frames(&planes);
+        for (qp, b) in [(24i32, false), (30, true)] {
+            let mut enc = LowDelayPEncoder::new(w, h, qp, 0)
+                .expect("encoder")
+                .with_b_slices(b);
+            let mut stream = Vec::new();
+            let mut recons = Vec::new();
+            let mut rect_total = 0usize;
+            for f in &frames {
+                let out = enc.encode_frame(f).expect("encode");
+                stream.extend_from_slice(&out.au);
+                recons.push(out.recon);
+                rect_total += out.stats.rect;
+            }
+            assert!(
+                rect_total > 0,
+                "qp{qp} b={b}: expected rectangular partitions on split-motion content"
+            );
+            let decoded = decode_annexb_sequence(&stream).expect("decode");
+            assert_eq!(decoded.len(), 4, "qp{qp} b={b}");
+            for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+                let mut expect = rec.y.clone();
+                expect.extend_from_slice(&rec.cb);
+                expect.extend_from_slice(&rec.cr);
+                assert_eq!(
+                    dec.picture.to_planar_u8().expect("8-bit"),
+                    expect,
+                    "qp{qp} b={b} frame {i}"
+                );
+            }
         }
     }
 
