@@ -149,6 +149,132 @@ enum CuKind {
     Intra { mode: u8 },
 }
 
+/// One frame's output from the streaming [`LowDelayPEncoder`].
+#[derive(Debug, Clone)]
+pub struct EncodedPFrame {
+    /// The Annex B access unit (`VPS + SPS + PPS + IDR_N_LP` for a
+    /// keyframe, one `TRAIL_R` slice otherwise).
+    pub au: Vec<u8>,
+    /// `true` for an IDR access unit (a random access point).
+    pub keyframe: bool,
+    /// The frame's reconstruction (== a conforming decoder's output).
+    pub recon: FrameRecon,
+    /// The frame's CU mode-decision counters.
+    pub stats: FrameStats,
+}
+
+/// The streaming low-delay encoder: one frame in, one access unit
+/// out. The first frame (and every `gop`-th frame when `gop > 0`)
+/// becomes a self-contained IDR access unit; every other frame is a
+/// P slice referencing the previous frame's reconstruction.
+#[derive(Debug)]
+pub struct LowDelayPEncoder {
+    width: usize,
+    height: usize,
+    qp: i32,
+    /// GOP length in frames (`0` = a single leading IDR, endless P).
+    gop: usize,
+    /// POC of the NEXT frame within the current GOP (0 ⇒ IDR next).
+    poc: i32,
+    prev: Option<FrameRecon>,
+}
+
+impl LowDelayPEncoder {
+    /// Construct a streaming encoder for `width`x`height` 4:2:0 8-bit
+    /// content at constant `SliceQpY == qp`. `gop == 0` emits a
+    /// single leading IDR; `gop == n` re-emits an IDR every `n`
+    /// frames.
+    ///
+    /// # Errors
+    /// [`IntraEncodeError`] on bad dimensions / QP.
+    pub fn new(width: usize, height: usize, qp: i32, gop: usize) -> Result<Self, IntraEncodeError> {
+        if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+            return Err(IntraEncodeError::BadDimensions { width, height });
+        }
+        if !(0..=51).contains(&qp) {
+            return Err(IntraEncodeError::BadQp(qp));
+        }
+        Ok(Self {
+            width,
+            height,
+            qp,
+            gop,
+            poc: 0,
+            prev: None,
+        })
+    }
+
+    /// Encode the next frame in display order.
+    ///
+    /// # Errors
+    /// [`IntraEncodeError::PlaneSize`] when a plane length does not
+    /// match the 4:2:0 geometry.
+    pub fn encode_frame(
+        &mut self,
+        frame: &YuvFrame<'_>,
+    ) -> Result<EncodedPFrame, IntraEncodeError> {
+        let (cw, ch) = (self.width / 2, self.height / 2);
+        for (plane, buf, expected) in [
+            ("y", frame.y, self.width * self.height),
+            ("cb", frame.cb, cw * ch),
+            ("cr", frame.cr, cw * ch),
+        ] {
+            if buf.len() != expected {
+                return Err(IntraEncodeError::PlaneSize {
+                    plane,
+                    expected,
+                    got: buf.len(),
+                });
+            }
+        }
+        let idr_now = self.prev.is_none() || self.poc == 0;
+        let out = if idr_now {
+            let idr = encode_idr_intra_au(
+                frame.y,
+                frame.cb,
+                frame.cr,
+                self.width,
+                self.height,
+                self.qp,
+            )?;
+            let recon = FrameRecon {
+                y: idr.recon_y,
+                cb: idr.recon_cb,
+                cr: idr.recon_cr,
+            };
+            self.prev = Some(recon.clone());
+            self.poc = 1;
+            EncodedPFrame {
+                au: idr.au,
+                keyframe: true,
+                recon,
+                stats: FrameStats {
+                    intra: (self.width / CTB) * (self.height / CTB),
+                    ..FrameStats::default()
+                },
+            }
+        } else {
+            let prev = self.prev.as_ref().expect("IDR precedes every P frame");
+            let (rbsp, recon, stats) =
+                encode_p_slice(frame, prev, self.poc, self.width, self.height, self.qp);
+            let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
+            self.prev = Some(recon.clone());
+            self.poc += 1;
+            EncodedPFrame {
+                au,
+                keyframe: false,
+                recon,
+                stats,
+            }
+        };
+        // GOP wrap: schedule the next IDR.
+        if self.gop > 0 && self.poc >= self.gop as i32 {
+            self.poc = 0;
+        }
+        Ok(out)
+    }
+}
+
 /// Encode a low-delay `IDR, P, P, …` sequence at a constant
 /// `SliceQpY == qp` and return the Annex B stream plus the per-frame
 /// reconstructions a conforming decoder reproduces exactly.
@@ -162,62 +288,19 @@ pub fn encode_low_delay_p(
     height: usize,
     qp: i32,
 ) -> Result<LowDelayPEncoded, IntraEncodeError> {
-    if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
-        return Err(IntraEncodeError::BadDimensions { width, height });
-    }
-    if !(0..=51).contains(&qp) {
-        return Err(IntraEncodeError::BadQp(qp));
-    }
-    let (cw, ch) = (width / 2, height / 2);
-    for f in frames {
-        for (plane, buf, expected) in [
-            ("y", f.y, width * height),
-            ("cb", f.cb, cw * ch),
-            ("cr", f.cr, cw * ch),
-        ] {
-            if buf.len() != expected {
-                return Err(IntraEncodeError::PlaneSize {
-                    plane,
-                    expected,
-                    got: buf.len(),
-                });
-            }
-        }
-    }
-    let Some((first, rest)) = frames.split_first() else {
-        return Ok(LowDelayPEncoded {
-            stream: Vec::new(),
-            recon: Vec::new(),
-            stats: Vec::new(),
-        });
+    let mut enc = LowDelayPEncoder::new(width, height, qp, 0)?;
+    let mut out = LowDelayPEncoded {
+        stream: Vec::new(),
+        recon: Vec::new(),
+        stats: Vec::new(),
     };
-
-    // Frame 0: the intra IDR access unit (VPS + SPS + PPS + IDR_N_LP).
-    let idr = encode_idr_intra_au(first.y, first.cb, first.cr, width, height, qp)?;
-    let mut stream = idr.au.clone();
-    let mut recon = vec![FrameRecon {
-        y: idr.recon_y,
-        cb: idr.recon_cb,
-        cr: idr.recon_cr,
-    }];
-    let mut stats = vec![FrameStats {
-        intra: (width / CTB) * (height / CTB),
-        ..FrameStats::default()
-    }];
-
-    for (i, frame) in rest.iter().enumerate() {
-        let poc = i as i32 + 1;
-        let prev = recon.last().expect("frame 0 present");
-        let (rbsp, rec, st) = encode_p_slice(frame, prev, poc, width, height, qp);
-        stream.extend_from_slice(&annexb(&[nal_unit(1, 0, 0, &rbsp)])); // TRAIL_R
-        recon.push(rec);
-        stats.push(st);
+    for frame in frames {
+        let f = enc.encode_frame(frame)?;
+        out.stream.extend_from_slice(&f.au);
+        out.recon.push(f.recon);
+        out.stats.push(f.stats);
     }
-    Ok(LowDelayPEncoded {
-        stream,
-        recon,
-        stats,
-    })
+    Ok(out)
 }
 
 /// §7.3.6.1 — the P slice-segment header for POC `poc` (one inline

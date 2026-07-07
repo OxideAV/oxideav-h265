@@ -26,6 +26,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoded byte-exact against a black-box reference decoder at QPs
   4/17/27/38/45 out of band. New `encode_low_delay_p` example.
 
+- **Streaming GOP encoder + registry `mode = "inter"`**:
+  `encoder::inter::LowDelayPEncoder` encodes one frame per call
+  (IDR at GOP starts — `gop == 0` for a single leading IDR — P
+  slices in between), returning the access unit, keyframe flag,
+  reconstruction and mode stats; `encode_low_delay_p` is now a thin
+  wrapper. `make_encoder` grows `mode = "inter"` with `qp` / `gop`
+  options and per-packet keyframe flags. Pins: registry
+  encoder→decoder GOP roundtrip (gop 3: IDR/P/P/IDR/P with correct
+  keyframe flags, > 34 dB per plane at qp 12); multi-GOP
+  concatenated streams cross-decoded byte-exact against the
+  black-box reference decoder out of band.
+
 - P-slice **intra-CU fallback**: every CTU decision now also competes
   a `pred_mode_flag == 1` 2Nx2N intra candidate (all 35 §8.4 modes
   against the in-progress reconstruction, MPM signalling from the

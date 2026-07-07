@@ -24,7 +24,7 @@ pub mod pcm;
 pub mod residual;
 
 /// Registry-encoder coding mode, selected by the `mode` codec option.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum EncodeMode {
     /// PCM-only IDR bootstrap: bit-exact lossless, every CU a
     /// §7.3.8.7 PCM block. The default (`mode` absent or `"pcm"`).
@@ -33,6 +33,11 @@ enum EncodeMode {
     /// the carried `SliceQpY` (`mode = "intra"`, `qp` option, default
     /// 26).
     Intra(i32),
+    /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
+    /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
+    /// 26; `gop` option = GOP length in frames, default 0 = a single
+    /// leading IDR).
+    Inter(inter::LowDelayPEncoder),
 }
 
 use std::collections::VecDeque;
@@ -42,9 +47,10 @@ use oxideav_core::{
 };
 
 /// H.265 registry encoder behind the [`oxideav_core::Encoder`]
-/// contract. Every input frame becomes one self-contained IDR access
-/// unit (`VPS + SPS + PPS + IDR_N_LP`, Annex B form) — an independent
-/// random access point. Two coding modes, selected by the `mode`
+/// contract. Every input frame becomes one Annex B access unit — a
+/// self-contained IDR (`VPS + SPS + PPS + IDR_N_LP`) in the two intra
+/// modes and at inter-mode GOP starts, or a `TRAIL_R` P slice inside
+/// an inter-mode GOP. Three coding modes, selected by the `mode`
 /// codec option:
 ///
 /// * `"pcm"` (default) — the PCM-only bootstrap: every coding unit a
@@ -52,6 +58,10 @@ use oxideav_core::{
 /// * `"intra"` — real CABAC intra coding (§8.4 prediction + forward
 ///   transform/quant + §7.3.8 syntax) at the `qp` option's
 ///   `SliceQpY` (0..=51, default 26).
+/// * `"inter"` — low-delay `IDR, P, P, …` coding (§8.5 inter
+///   prediction with per-CTU skip / merge / AMVP / intra decisions)
+///   at the `qp` option's `SliceQpY`; the `gop` option sets the IDR
+///   period in frames (default 0 = a single leading IDR).
 ///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
@@ -80,9 +90,11 @@ impl std::fmt::Debug for H265Encoder {
 }
 
 /// Direct factory endpoint: construct the software H.265 encoder.
-/// Codec options: `mode` (`"pcm"` lossless bootstrap, the default, or
-/// `"intra"` real CABAC intra coding) and `qp` (`SliceQpY` 0..=51 for
-/// the intra mode, default 26).
+/// Codec options: `mode` (`"pcm"` lossless bootstrap, the default,
+/// `"intra"` real CABAC intra coding, or `"inter"` low-delay P GOPs),
+/// `qp` (`SliceQpY` 0..=51 for the intra / inter modes, default 26)
+/// and `gop` (inter mode IDR period, default 0 = single leading
+/// IDR).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
@@ -109,24 +121,38 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )));
         }
     }
+    let parse_qp = |params: &CodecParameters| -> Result<i32> {
+        match params.options.get("qp") {
+            None => Ok(26),
+            Some(v) => v
+                .parse::<i32>()
+                .ok()
+                .filter(|q| (0..=51).contains(q))
+                .ok_or_else(|| {
+                    Error::InvalidData(format!("h265 encode: qp must be 0..=51, got {v:?}"))
+                }),
+        }
+    };
     let mode = match params.options.get("mode") {
         None | Some("pcm") => EncodeMode::Pcm,
-        Some("intra") => {
-            let qp = match params.options.get("qp") {
-                None => 26,
-                Some(v) => v
-                    .parse::<i32>()
-                    .ok()
-                    .filter(|q| (0..=51).contains(q))
-                    .ok_or_else(|| {
-                        Error::InvalidData(format!("h265 encode: qp must be 0..=51, got {v:?}"))
-                    })?,
+        Some("intra") => EncodeMode::Intra(parse_qp(params)?),
+        Some("inter") => {
+            let qp = parse_qp(params)?;
+            let gop = match params.options.get("gop") {
+                None => 0usize,
+                Some(v) => v.parse::<usize>().map_err(|_| {
+                    Error::InvalidData(format!(
+                        "h265 encode: gop must be a non-negative integer, got {v:?}"
+                    ))
+                })?,
             };
-            EncodeMode::Intra(qp)
+            let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+            EncodeMode::Inter(enc)
         }
         Some(other) => {
             return Err(Error::InvalidData(format!(
-                "h265 encode: unknown mode {other:?} (expected \"pcm\" or \"intra\")"
+                "h265 encode: unknown mode {other:?} (expected \"pcm\", \"intra\" or \"inter\")"
             )))
         }
     };
@@ -186,19 +212,33 @@ impl Encoder for H265Encoder {
         let cb = pack(1, self.width / 2, self.height / 2)?;
         let cr = pack(2, self.width / 2, self.height / 2)?;
 
-        let au = match self.mode {
-            EncodeMode::Pcm => pcm::encode_idr_pcm_au(&y, &cb, &cr, self.width, self.height)
-                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
-            EncodeMode::Intra(qp) => {
-                intra::encode_idr_intra_au(&y, &cb, &cr, self.width, self.height, qp)
+        let (au, keyframe) = match &mut self.mode {
+            EncodeMode::Pcm => (
+                pcm::encode_idr_pcm_au(&y, &cb, &cr, self.width, self.height)
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
+                true,
+            ),
+            EncodeMode::Intra(qp) => (
+                intra::encode_idr_intra_au(&y, &cb, &cr, self.width, self.height, *qp)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                    .au
+                    .au,
+                true,
+            ),
+            EncodeMode::Inter(enc) => {
+                let f = enc
+                    .encode_frame(&inter::YuvFrame {
+                        y: &y,
+                        cb: &cb,
+                        cr: &cr,
+                    })
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+                (f.au, f.keyframe)
             }
         };
         let mut pkt = Packet::new(0, TimeBase::new(1, 25), au);
         pkt.pts = v.pts.or(Some(self.frame_index));
         pkt.dts = pkt.pts;
-        pkt.flags.keyframe = true;
+        pkt.flags.keyframe = keyframe;
         self.frame_index += 1;
         self.ready.push_back(pkt);
         Ok(())
