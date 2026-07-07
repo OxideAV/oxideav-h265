@@ -26,6 +26,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoded byte-exact against a black-box reference decoder at QPs
   4/17/27/38/45 out of band. New `encode_low_delay_p` example.
 
+- **Two active reference pictures** (POC − 1 and POC − 2, always on
+  from the GOP's third frame): the slice header codes a two-entry
+  §7.4.8 short-term RPS with the `num_ref_idx` override, the AMVP
+  search runs per reference and signals `ref_idx_l0` (the
+  single-bin TR at two actives), merge candidates carry the
+  neighbours' reference identity through the motion field, and the
+  SPS `sps_max_dec_pic_buffering_minus1` grows to 2 for GOP streams
+  (standalone intra AUs keep 1 — their golden pin is unchanged).
+  `FrameStats::ref1` counts CUs referencing POC − 2. Pins: flicker
+  content elects the second reference (P and B) and decodes
+  bit-exactly; the full 9-configuration cross-decode sweep stays
+  byte-exact against the black-box reference decoder out of band;
+  golden GOP pin regenerated (1011 bytes) and re-validated.
+
 - **Rectangular inter partitions** (`PART_2NxN` / `PART_Nx2N`): every
   CTU decision now also competes two-PU splits — per-PU merge/AMVP
   election with the second PU resolved against the first PU's motion

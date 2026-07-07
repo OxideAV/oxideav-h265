@@ -132,7 +132,12 @@ pub struct IntraEncodedAu {
 /// short-term RPS inline, `sps_temporal_mvp_enabled_flag` is 0, and
 /// `sps_max_dec_pic_buffering_minus1[0] == 1` covers the one-reference
 /// low-delay GOP).
-pub(crate) fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
+pub(crate) fn write_sps(
+    width: usize,
+    height: usize,
+    level_idc: u8,
+    max_dec_pic_buffering_minus1: u32,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -147,7 +152,7 @@ pub(crate) fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     w.put_bit(1); // sps_sub_layer_ordering_info_present_flag
-    w.ue(1); // sps_max_dec_pic_buffering_minus1[0]
+    w.ue(max_dec_pic_buffering_minus1); // sps_max_dec_pic_buffering_minus1[0]
     w.ue(0); // sps_max_num_reorder_pics[0]
     w.ue(0); // sps_max_latency_increase_plus1[0]
     w.ue(CTB_LOG2 - 3); // log2_min_luma_coding_block_size_minus3 (16)
@@ -429,6 +434,25 @@ pub fn encode_idr_intra_au(
     width: usize,
     height: usize,
     qp: i32,
+) -> Result<IntraEncodedAu, IntraEncodeError> {
+    // A standalone intra AU needs one reference slot beyond the
+    // current picture (`sps_max_dec_pic_buffering_minus1 == 1`).
+    encode_idr_intra_au_cfg(y, cb, cr, width, height, qp, 1)
+}
+
+/// [`encode_idr_intra_au`] with an explicit
+/// `sps_max_dec_pic_buffering_minus1` — the low-delay GOP encoder
+/// passes 2 so a conforming decoder keeps BOTH short-term references
+/// alive alongside the current picture.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn encode_idr_intra_au_cfg(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    max_dec_pic_buffering_minus1: u32,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(IntraEncodeError::BadDimensions { width, height });
@@ -875,7 +899,12 @@ pub fn encode_idr_intra_au(
     let level_idc = level_idc_for(width * height);
     let units = vec![
         nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
-        nal_unit(33, 0, 0, &write_sps(width, height, level_idc)), // SPS_NUT
+        nal_unit(
+            33,
+            0,
+            0,
+            &write_sps(width, height, level_idc, max_dec_pic_buffering_minus1),
+        ), // SPS_NUT
         nal_unit(34, 0, 0, &write_pps(false, false, None)), // PPS_NUT
         nal_unit(20, 0, 0, &slice_rbsp),           // IDR_N_LP
     ];
