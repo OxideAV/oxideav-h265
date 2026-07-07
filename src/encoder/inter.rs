@@ -36,20 +36,25 @@
 
 use crate::availability::{PictureTiling, TilingParams, MODE_INTRA};
 use crate::binarization::{
-    cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cu_skip_flag_ctx_inc, InterPredIdc,
-    MvdComponent,
+    cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cu_skip_flag_ctx_inc,
+    intra_luma_cand_mode_list, CuPredMode, InterPredIdc, MvdComponent,
 };
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
-use crate::encoder::intra::{chroma_qp_420, code_tb, encode_idr_intra_au, ssd, IntraEncodeError};
+use crate::encoder::intra::{
+    chroma_qp_420, code_tb, encode_idr_intra_au, gather_refs, pred_params, search_best_mode, ssd,
+    zscan_avail, IntraEncodeError,
+};
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::residual::encode_residual_coding;
 use crate::inter_pred::{
     predict_inter_pu, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
 };
-use crate::motion::{derive_chroma_mv, MotionField, Mv};
+use crate::intra_mode_field::{IntraModeField, Neighbour};
+use crate::intra_pred::{intra_predict_with_substitution, Component as PredComponent};
+use crate::motion::{derive_chroma_mv, MotionCell, MotionField, Mv};
 use crate::pu_mv::{resolve_pu_motion, PartMode, PuGeometry, PuMotion, PuMvContext};
 use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
 use crate::slice_data::PredictionUnit;
@@ -97,6 +102,22 @@ pub struct LowDelayPEncoded {
     pub stream: Vec<u8>,
     /// Per-frame reconstruction, `frames.len()` entries.
     pub recon: Vec<FrameRecon>,
+    /// Per-frame CU mode decisions, `frames.len()` entries (frame 0 —
+    /// the IDR — counts every CTB as intra).
+    pub stats: Vec<FrameStats>,
+}
+
+/// Per-frame CU mode-decision counters (one CU per CTB).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    /// `cu_skip_flag == 1` CUs.
+    pub skip: usize,
+    /// Merge-with-residual CUs.
+    pub merge: usize,
+    /// AMVP (explicit-MV) CUs.
+    pub amvp: usize,
+    /// Intra CUs (`pred_mode_flag == 1`, or every CU of the IDR).
+    pub intra: usize,
 }
 
 /// A resolved-and-coded CU candidate (one of skip / merge / AMVP).
@@ -123,6 +144,9 @@ enum CuKind {
     Merge { merge_idx: usize },
     /// AMVP: `mvd_coding` + `mvp_l0_flag`; `rqt_root_cbf` signalled.
     Amvp { mvd: Mv, mvp_flag: u8 },
+    /// Intra fallback (`pred_mode_flag == 1`, `PART_2Nx2N`): §8.4
+    /// prediction with luma mode `mode`, chroma derived-from-luma.
+    Intra { mode: u8 },
 }
 
 /// Encode a low-delay `IDR, P, P, …` sequence at a constant
@@ -164,6 +188,7 @@ pub fn encode_low_delay_p(
         return Ok(LowDelayPEncoded {
             stream: Vec::new(),
             recon: Vec::new(),
+            stats: Vec::new(),
         });
     };
 
@@ -175,15 +200,24 @@ pub fn encode_low_delay_p(
         cb: idr.recon_cb,
         cr: idr.recon_cr,
     }];
+    let mut stats = vec![FrameStats {
+        intra: (width / CTB) * (height / CTB),
+        ..FrameStats::default()
+    }];
 
     for (i, frame) in rest.iter().enumerate() {
         let poc = i as i32 + 1;
         let prev = recon.last().expect("frame 0 present");
-        let (rbsp, rec) = encode_p_slice(frame, prev, poc, width, height, qp);
+        let (rbsp, rec, st) = encode_p_slice(frame, prev, poc, width, height, qp);
         stream.extend_from_slice(&annexb(&[nal_unit(1, 0, 0, &rbsp)])); // TRAIL_R
         recon.push(rec);
+        stats.push(st);
     }
-    Ok(LowDelayPEncoded { stream, recon })
+    Ok(LowDelayPEncoded {
+        stream,
+        recon,
+        stats,
+    })
 }
 
 /// §7.3.6.1 — the P slice-segment header for POC `poc` (one inline
@@ -564,8 +598,8 @@ fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut Slice
 }
 
 /// Encode one P frame as a single TRAIL_R slice against the previous
-/// frame's reconstruction. Returns the slice RBSP and the frame's
-/// reconstruction.
+/// frame's reconstruction. Returns the slice RBSP, the frame's
+/// reconstruction, and its CU mode-decision counters.
 #[allow(clippy::too_many_lines)]
 fn encode_p_slice(
     frame: &YuvFrame<'_>,
@@ -574,7 +608,7 @@ fn encode_p_slice(
     width: usize,
     height: usize,
     qp: i32,
-) -> (Vec<u8>, FrameRecon) {
+) -> (Vec<u8>, FrameRecon, FrameStats) {
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
@@ -600,8 +634,12 @@ fn encode_p_slice(
         cr: vec![0u8; cw * ch],
     };
     let mut field = MotionField::new(width, height);
+    // §8.4.2 luma-mode records for the intra-fallback MPM lists (an
+    // inter / skip CU records as "not intra" ⇒ candidate INTRA_DC).
+    let mut modes = IntraModeField::new(width, height, CTB_LOG2);
     // Per-CTB cu_skip_flag values (CU == CTB) for the §9.3.4.2.2 ctxInc.
     let mut skip_grid = vec![false; ctbs_x * ctbs_y];
+    let mut stats = FrameStats::default();
 
     // §6.4.2 availability plumbing (single slice, single tile).
     let tiling = PictureTiling::new(
@@ -815,6 +853,47 @@ fn encode_p_slice(
                 });
             }
 
+            // ---- intra 2Nx2N fallback (§8.4 against our own recon) ----
+            {
+                let read_y = |x: usize, yy: usize| i32::from(recon.y[yy * width + x]);
+                let avail_y =
+                    |nx: i64, ny: i64| zscan_avail(nx, ny, width, height, CTB, ctbs_x, ctb, 0);
+                let marked = gather_refs(&read_y, &avail_y, x0, y0, CTB);
+                let (mode, pred_y) = search_best_mode(&marked, &src[0]);
+                let (ly, ry) = code_tb(
+                    &src[0],
+                    &pred_y,
+                    CTB,
+                    qp_y,
+                    Component::Luma,
+                    PredMode::Intra,
+                );
+                let code_c = |plane: &[u8], comp: Component, pc: PredComponent| {
+                    let read = |x: usize, yy: usize| i32::from(plane[yy * cw + x]);
+                    let avail =
+                        |nx: i64, ny: i64| zscan_avail(nx, ny, cw, ch, CTB / 2, ctbs_x, ctb, 0);
+                    let marked_c = gather_refs(&read, &avail, cx0, cy0, 8);
+                    let pred = intra_predict_with_substitution(&marked_c, &pred_params(mode, pc))
+                        .expect("legal prediction params");
+                    let src_c = match comp {
+                        Component::Cb => &src[1],
+                        _ => &src[2],
+                    };
+                    code_tb(src_c, &pred, 8, qp_c, comp, PredMode::Intra)
+                };
+                let (lcb, rcb) = code_c(&recon.cb, Component::Cb, PredComponent::Cb);
+                let (lcr, rcr) = code_c(&recon.cr, Component::Cr, PredComponent::Cr);
+                let dist = ssd(&ry, &src[0]) + ssd(&rcb, &src[1]) + ssd(&rcr, &src[2]);
+                let rate = levels_rate(&ly) + levels_rate(&lcb) + levels_rate(&lcr) + 8;
+                cands.push(CuCandidate {
+                    kind: CuKind::Intra { mode },
+                    motion: PuMotion::default(),
+                    levels: Some([ly, lcb, lcr]),
+                    recon: [ry, rcb, rcr],
+                    cost: dist + lambda * rate,
+                });
+            }
+
             cands
                 .into_iter()
                 .min_by_key(|c| c.cost)
@@ -873,12 +952,60 @@ fn encode_p_slice(
                     u8::from(chosen.levels.is_some()),
                 );
             }
+            CuKind::Intra { mode } => {
+                // pred_mode_flag = 1 (MODE_INTRA), part_mode "1"
+                // (2Nx2N at MinCb), PCM disabled in the SPS.
+                cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 1);
+                cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
+                // §7.3.8.5 luma-mode group (single PB): the §8.4.2
+                // candidate list against the recorded neighbour modes
+                // (inter / skip neighbours contribute INTRA_DC), with
+                // the §6.4.1 z-scan availability.
+                let avail_l =
+                    zscan_avail(x0 as i64 - 1, y0 as i64, width, height, CTB, ctbs_x, ctb, 0);
+                let avail_a =
+                    zscan_avail(x0 as i64, y0 as i64 - 1, width, height, CTB, ctbs_x, ctb, 0);
+                let cand_a = modes.cand_intra_pred_mode(x0, y0, Neighbour::Left, avail_l);
+                let cand_b = modes.cand_intra_pred_mode(x0, y0, Neighbour::Above, avail_a);
+                let list = intra_luma_cand_mode_list(cand_a, cand_b);
+                match list.iter().position(|&m| m == *mode) {
+                    Some(k) => {
+                        cabac.encode_decision(&mut w, &mut ctxs.prev_intra_luma_pred_flag[0], 1);
+                        // mpm_idx: TR cMax 2, all bypass.
+                        match k {
+                            0 => cabac.encode_bypass(&mut w, 0),
+                            1 => {
+                                cabac.encode_bypass(&mut w, 1);
+                                cabac.encode_bypass(&mut w, 0);
+                            }
+                            _ => {
+                                cabac.encode_bypass(&mut w, 1);
+                                cabac.encode_bypass(&mut w, 1);
+                            }
+                        }
+                    }
+                    None => {
+                        cabac.encode_decision(&mut w, &mut ctxs.prev_intra_luma_pred_flag[0], 0);
+                        // §8.4.2: rem = mode minus each smaller candidate.
+                        let mut rem = u32::from(*mode);
+                        for &c in &list {
+                            if u32::from(*mode) > u32::from(c) {
+                                rem -= 1;
+                            }
+                        }
+                        cabac.encode_bypass_bits(&mut w, rem, 5); // FL cMax 31
+                    }
+                }
+                // intra_chroma_pred_mode = 4 (derived from luma).
+                cabac.encode_decision(&mut w, &mut ctxs.intra_chroma_pred_mode[0], 0);
+            }
         }
 
         // ---- §7.3.8.8 transform_tree + §7.3.8.10 transform_unit ----
+        let cu_is_intra = matches!(chosen.kind, CuKind::Intra { .. });
         if let Some(levels) = &chosen.levels {
             // Depth-0 16x16 TU (split_transform_flag not present,
-            // inferred 0: 2Nx2N inter at MaxTrafoDepth 0).
+            // inferred 0: 2Nx2N at MaxTrafoDepth 0).
             let cbf_cb = levels[1].iter().any(|&v| v != 0);
             let cbf_cr = levels[2].iter().any(|&v| v != 0);
             let cbf_luma = levels[0].iter().any(|&v| v != 0);
@@ -892,9 +1019,10 @@ fn encode_p_slice(
                 &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
                 u8::from(cbf_cr),
             );
-            // §7.3.8.8: an inter depth-0 TU signals cbf_luma only when
-            // a chroma cbf is set; otherwise it is inferred 1.
-            if cbf_cb || cbf_cr {
+            // §7.3.8.8: an intra CU always signals cbf_luma; an inter
+            // depth-0 TU signals it only when a chroma cbf is set
+            // (otherwise it is inferred 1).
+            if cu_is_intra || cbf_cb || cbf_cr {
                 cabac.encode_decision(
                     &mut w,
                     &mut ctxs.cbf_luma[cbf_luma_ctx_inc(0) as usize],
@@ -903,11 +1031,18 @@ fn encode_p_slice(
             } else {
                 debug_assert!(cbf_luma, "all-zero transform tree must not be coded");
             }
-            // §7.4.9.11: inter TBs use the up-right diagonal scan.
+            // §7.4.9.11: inter TBs use the up-right diagonal scan; the
+            // 16x16 luma / 8x8 chroma intra TBs are not
+            // mode-dependent-scan eligible so they come back diagonal
+            // through the same derivation.
+            let intra_mode = match &chosen.kind {
+                CuKind::Intra { mode } => u32::from(*mode),
+                _ => 0,
+            };
             let rc_params = |log2: u32, c_idx: u8| ResidualCodingParams {
                 log2_trafo_size: log2,
                 is_chroma: c_idx != 0,
-                scan_idx: residual_coding_scan_idx(false, log2, c_idx, 1, 0),
+                scan_idx: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, intra_mode),
                 sign_data_hiding_enabled_flag: false,
                 sign_hidden_suppressed: false,
                 transform_skip_sig_ctx: false,
@@ -944,8 +1079,39 @@ fn encode_p_slice(
             }
         }
 
-        // ---- state update (eqs 8-80..8-85 + recon buffers) ----
-        field.fill_rect(x0, y0, CTB, CTB, chosen.motion.to_cell(poc - 1, i32::MIN));
+        // ---- state update (eqs 8-80..8-85 + mode fields + recon) ----
+        match &chosen.kind {
+            CuKind::Intra { mode } => {
+                stats.intra += 1;
+                // The decoder stamps intra CUs into the motion field so
+                // a later CU's §6.4.2 availability denies them.
+                field.fill_rect(
+                    x0,
+                    y0,
+                    CTB,
+                    CTB,
+                    MotionCell {
+                        is_intra: true,
+                        ..MotionCell::default()
+                    },
+                );
+                modes.record_intra_pb(x0, y0, CTB, *mode, false);
+            }
+            kind => {
+                match kind {
+                    CuKind::Skip { .. } => stats.skip += 1,
+                    CuKind::Merge { .. } => stats.merge += 1,
+                    _ => stats.amvp += 1,
+                }
+                field.fill_rect(x0, y0, CTB, CTB, chosen.motion.to_cell(poc - 1, i32::MIN));
+                let cu_mode = if is_skip {
+                    CuPredMode::Skip
+                } else {
+                    CuPredMode::Inter
+                };
+                modes.record_non_intra_cu(x0, y0, CTB, cu_mode);
+            }
+        }
         if let Some(levels) = &chosen.levels {
             if levels[0].iter().any(|&v| v != 0) {
                 field.mark_nonzero_coeff(x0, y0, CTB, CTB);
@@ -959,7 +1125,7 @@ fn encode_p_slice(
         cabac.encode_terminate(&mut w, u8::from(ctb == ctbs_x * ctbs_y - 1));
     }
     w.align_zero();
-    (w.finish(), recon)
+    (w.finish(), recon, stats)
 }
 
 #[cfg(test)]
@@ -1129,6 +1295,75 @@ mod tests {
         ));
         let empty = encode_low_delay_p(&[], 16, 16, 26).expect("empty ok");
         assert!(empty.stream.is_empty() && empty.recon.is_empty());
+    }
+
+    /// A hard scene change (unrelated content mid-GOP) drives the
+    /// per-CTU decision to the intra fallback — and the stream still
+    /// decodes bit-exactly to the encoder reconstruction.
+    #[test]
+    fn scene_change_selects_intra_cus_in_p_slice() {
+        let (w, h) = (64usize, 64usize);
+        // Frames 0..2: the moving-square scene. Frame 2: a completely
+        // different high-detail pattern (uncorrelated with frame 1).
+        let mut planes = scene(w, h, 2);
+        let y2: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, yy) = (i % w, i / w);
+                (((x * 13) ^ (yy * 7)) % 251) as u8
+            })
+            .collect();
+        let cb2 = vec![60u8; w * h / 4];
+        let cr2 = vec![200u8; w * h / 4];
+        planes.push((y2, cb2, cr2));
+        let frames = as_frames(&planes);
+        let enc = encode_low_delay_p(&frames, w, h, 27).expect("encode");
+
+        // The scene-change P frame elects intra for most CTBs.
+        let st = enc.stats[2];
+        assert!(
+            st.intra > (w / 16) * (h / 16) / 2,
+            "scene change should be intra-dominated, got {st:?}"
+        );
+        // The steady frame before it stays inter-dominated (the CTBs
+        // around the moving square may still legitimately elect intra
+        // on the covered / uncovered texture).
+        let st1 = enc.stats[1];
+        assert!(
+            st1.intra < (w / 16) * (h / 16) / 2,
+            "steady frame should be inter-dominated, got {st1:?}"
+        );
+
+        // And the whole stream still decodes to the encoder recon.
+        let decoded = decode_annexb_sequence(&enc.stream).expect("decode");
+        assert_eq!(decoded.len(), 3);
+        for (i, (dec, rec)) in decoded.iter().zip(enc.recon.iter()).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "frame {i}"
+            );
+        }
+    }
+
+    /// The mode-decision stats add up to the CTB count on every frame.
+    #[test]
+    fn stats_cover_every_ctb() {
+        let planes = scene(48, 32, 3);
+        let frames = as_frames(&planes);
+        let enc = encode_low_delay_p(&frames, 48, 32, 30).expect("encode");
+        assert_eq!(enc.stats.len(), 3);
+        let ctbs = (48 / 16) * (32 / 16);
+        for (i, st) in enc.stats.iter().enumerate() {
+            assert_eq!(
+                st.skip + st.merge + st.amvp + st.intra,
+                ctbs,
+                "frame {i}: {st:?}"
+            );
+        }
+        assert_eq!(enc.stats[0].intra, ctbs, "IDR counts as all-intra");
     }
 
     /// The §7.3.8.9 `mvd_coding( )` encoder is the exact bin-level

@@ -26,6 +26,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoded byte-exact against a black-box reference decoder at QPs
   4/17/27/38/45 out of band. New `encode_low_delay_p` example.
 
+- P-slice **intra-CU fallback**: every CTU decision now also competes
+  a `pred_mode_flag == 1` 2Nx2N intra candidate (all 35 §8.4 modes
+  against the in-progress reconstruction, MPM signalling from the
+  §8.4.2 candidate list with inter/skip neighbours contributing
+  `INTRA_DC`, intra-stamped motion field exactly as the decoder
+  does). `LowDelayPEncoded::stats` exposes per-frame
+  skip/merge/AMVP/intra counters. Pins: a hard mid-GOP scene change
+  elects intra for most CTBs while steady frames stay
+  inter-dominated, bit-exact through our decoder and byte-exact
+  through the black-box reference decoder at QPs 12/27/40.
+
 ### Added — clean-room rebuild round 391 (2026-07-06)
 
 - **Real CABAC intra encoder** (`encoder::intra`), replacing the

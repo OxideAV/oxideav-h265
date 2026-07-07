@@ -246,7 +246,7 @@ fn quantize(coef: &[i32], n: usize, qp: u32) -> Vec<i32> {
 /// z-order quadrant index (`cur_z`; pass 0 when the current TB is the
 /// whole CTB, making every same-CTB neighbour unavailable).
 #[allow(clippy::too_many_arguments)]
-fn zscan_avail(
+pub(crate) fn zscan_avail(
     nx: i64,
     ny: i64,
     plane_w: usize,
@@ -274,7 +274,7 @@ fn zscan_avail(
 
 /// Gather the §8.4.4.2.1 marked reference array for an `n`-sample TB
 /// at `(x0, y0)`: values through `read`, availability through `avail`.
-fn gather_refs(
+pub(crate) fn gather_refs(
     read: &dyn Fn(usize, usize) -> i32,
     avail: &dyn Fn(i64, i64) -> bool,
     x0: usize,
@@ -298,7 +298,7 @@ fn gather_refs(
     MarkedReferenceSamples::new(n, corner, left, top).expect("legal TB geometry")
 }
 
-fn pred_params(mode: u8, cidx: PredComponent) -> IntraPredParams {
+pub(crate) fn pred_params(mode: u8, cidx: PredComponent) -> IntraPredParams {
     IntraPredParams {
         pred_mode_intra: mode,
         cidx,
@@ -312,7 +312,7 @@ fn pred_params(mode: u8, cidx: PredComponent) -> IntraPredParams {
 }
 
 /// SAD-search all 35 §8.4.2 modes; returns `(mode, prediction)`.
-fn search_best_mode(marked: &MarkedReferenceSamples, src: &[i32]) -> (u8, Vec<i32>) {
+pub(crate) fn search_best_mode(marked: &MarkedReferenceSamples, src: &[i32]) -> (u8, Vec<i32>) {
     let mut best = (0u8, Vec::new());
     let mut best_cost = u64::MAX;
     for mode in 0..=34u8 {
