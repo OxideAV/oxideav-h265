@@ -127,8 +127,12 @@ pub struct IntraEncodedAu {
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM off,
-/// SAO off).
-fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
+/// SAO off). Shared by the intra and low-delay-P encoders (nothing in
+/// it is slice-type specific: the P slices code their §7.4.8
+/// short-term RPS inline, `sps_temporal_mvp_enabled_flag` is 0, and
+/// `sps_max_dec_pic_buffering_minus1[0] == 1` covers the one-reference
+/// low-delay GOP).
+pub(crate) fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -168,7 +172,7 @@ fn write_sps(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
 
 /// Table 8-10 — the `ChromaArrayType == 1` chroma QP mapping
 /// `qPC = f(qPi)` (§8.6.1; `QpBdOffsetC == 0` at 8-bit).
-fn chroma_qp_420(qp_y: i32) -> u32 {
+pub(crate) fn chroma_qp_420(qp_y: i32) -> u32 {
     let qpi = qp_y.clamp(0, 57);
     (match qpi {
         x if x < 30 => x,
@@ -330,12 +334,17 @@ fn search_best_mode(marked: &MarkedReferenceSamples, src: &[i32]) -> (u8, Vec<i3
 /// Transform + quantize one component TB and reconstruct it through
 /// the DECODE-side §8.6.2 path. Returns `(levels, recon_samples)`;
 /// `levels` all-zero ⇔ cbf 0 (recon = clipped prediction).
-fn code_tb(
+///
+/// `pred_mode` selects the §8.6.4 transform family exactly as the
+/// decoder does (the intra-luma 4x4 DST case; every TB the intra and
+/// low-delay-P encoders emit at other geometries is DCT either way).
+pub(crate) fn code_tb(
     src: &[i32],
     pred: &[i32],
     n: usize,
     qp: u32,
     component: Component,
+    pred_mode: PredMode,
 ) -> (Vec<i32>, Vec<u8>) {
     let res: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
     let coef = forward_transform(&res, n);
@@ -350,7 +359,7 @@ fn code_tb(
                 n_tbs: n,
                 q_p: qp,
                 component,
-                pred_mode: PredMode::Intra,
+                pred_mode,
                 bit_depth: BIT_DEPTH as u8,
                 extended_precision: false,
                 transquant_bypass: false,
@@ -367,7 +376,7 @@ fn code_tb(
     (levels, recon)
 }
 
-fn ssd(a: &[u8], b: &[i32]) -> u64 {
+pub(crate) fn ssd(a: &[u8], b: &[i32]) -> u64 {
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| {
@@ -498,7 +507,8 @@ pub fn encode_idr_intra_au(
             let avail = |nx: i64, ny: i64| zscan_avail(nx, ny, width, height, CTB, ctbs_x, ctb, 0);
             let marked = gather_refs(&read, &avail, x0, y0, CTB);
             let (mode, pred) = search_best_mode(&marked, &src16);
-            let (levels, recon) = code_tb(&src16, &pred, CTB, qp_y, Component::Luma);
+            let (levels, recon) =
+                code_tb(&src16, &pred, CTB, qp_y, Component::Luma, PredMode::Intra);
             LumaPlan {
                 nxn: false,
                 modes: [mode; 4],
@@ -527,7 +537,8 @@ pub fn encode_idr_intra_au(
                 let marked = gather_refs(&read, &avail, px, py, 8);
                 let src8 = extract(y, width, px, py, 8);
                 let (mode, pred) = search_best_mode(&marked, &src8);
-                let (levels, recon8) = code_tb(&src8, &pred, 8, qp_y, Component::Luma);
+                let (levels, recon8) =
+                    code_tb(&src8, &pred, 8, qp_y, Component::Luma, PredMode::Intra);
                 for j in 0..8 {
                     scratch[(zy * 8 + j) * CTB + zx * 8..(zy * 8 + j) * CTB + zx * 8 + 8]
                         .copy_from_slice(&recon8[j * 8..(j + 1) * 8]);
@@ -574,7 +585,7 @@ pub fn encode_idr_intra_au(
                 let pred = intra_predict_with_substitution(&marked, &pred_params(mode_c, pc))
                     .expect("legal prediction params");
                 let src = extract(plane, cw, cx0, cy0, 8);
-                let (levels, rec) = code_tb(&src, &pred, 8, qp_c, comp);
+                let (levels, rec) = code_tb(&src, &pred, 8, qp_c, comp, PredMode::Intra);
                 store(recon, cw, cx0, cy0, 8, &rec);
                 vec![levels]
             } else {
@@ -596,7 +607,7 @@ pub fn encode_idr_intra_au(
                     let pred = intra_predict_with_substitution(&marked, &pred_params(mode_c, pc))
                         .expect("legal prediction params");
                     let src = extract(plane, cw, px, py, 4);
-                    let (levels, rec) = code_tb(&src, &pred, 4, qp_c, comp);
+                    let (levels, rec) = code_tb(&src, &pred, 4, qp_c, comp, PredMode::Intra);
                     for j in 0..4 {
                         scratch[(zy * 4 + j) * 8 + zx * 4..(zy * 4 + j) * 8 + zx * 4 + 4]
                             .copy_from_slice(&rec[j * 4..(j + 1) * 4]);

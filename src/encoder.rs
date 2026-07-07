@@ -17,6 +17,7 @@
 
 pub mod bitwriter;
 pub mod cabac;
+pub mod inter;
 pub mod intra;
 pub mod nal;
 pub mod pcm;

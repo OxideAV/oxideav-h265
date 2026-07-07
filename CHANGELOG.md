@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — clean-room rebuild round 396 (2026-07-07)
+
+- **P-slice inter encoder** (`encoder::inter::encode_low_delay_p`):
+  low-delay `IDR, P, P, …` GOPs. Every P frame is one TRAIL_R slice
+  referencing the previous frame's reconstruction (inline §7.4.8
+  short-term RPS, `delta_poc == −1`); per CTU skip / merge / AMVP
+  compete under an SSD + λ·rate decision. Motion candidates are
+  resolved through the DECODE-side §8.5.3.2 merge/AMVP derivation
+  against the picture's in-progress motion field (with the §6.4.2
+  availability process), motion estimation is a seeded greedy
+  integer diamond plus half-/quarter-pel refinement against the
+  crate's own §8.5.3.3.3 interpolation, and residuals go through the
+  bin-exact §7.3.8.11 dual (§7.3.8.9 `mvd_coding` EG1 +
+  `merge_idx` TR + `cu_skip_flag`/`pred_mode_flag`/`merge_flag`/
+  `mvp_l0_flag`/`rqt_root_cbf` context coding). Pins: every frame of
+  every GOP decodes bit-exactly to the encoder reconstruction
+  across sizes/QPs; a static scene collapses to all-skip; cross-
+  decoded byte-exact against a black-box reference decoder at QPs
+  4/17/27/38/45 out of band. New `encode_low_delay_p` example.
+
 ### Added — clean-room rebuild round 391 (2026-07-06)
 
 - **Real CABAC intra encoder** (`encoder::intra`), replacing the
