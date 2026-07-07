@@ -42,20 +42,39 @@ conformance pins for the features the corpus lacks. Coverage:
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.
 
-**Encoder: real CABAC intra coding, registered.** `make_encoder` /
-`H265Encoder` (option `mode = "intra"`, `qp` 0..=51) emit Main-profile
-Annex B IDR access units with actual compression: per-CTU §8.4 intra
-prediction over the encoder's own reconstruction (all 35 modes,
-per-CTB `PART_2Nx2N` vs `PART_NxN` rate-distortion decision with
-per-PB modes, §8.4.2 MPM signalling, mode-dependent scans), forward
-DCT-II + reciprocal quantization, and full §7.3.8 syntax through the
-bin-exact §7.3.8.11 residual encoder (`encoder::residual`) — the
-crate's decoder AND a black-box reference decoder reproduce the
-encoder's reconstruction bit-exactly (golden interop stream CI-pinned).
-The default `mode = "pcm"` keeps the lossless PCM-IDR bootstrap
-(every CTB a 16×16 PCM CU; options for dependent segments,
-multi-slice plans, deblocking, band / edge SAO syntax, and true
-multi-tile single-slice pictures with §7.4.7.1 entry points).
+**Encoder: intra + low-delay inter GOPs, registered.**
+`make_encoder` / `H265Encoder` with three modes:
+
+* `mode = "inter"` (`qp` 0..=51, `gop` IDR period, `bslices`) —
+  low-delay `IDR, P, P, …` or `IDR, B, B, …` GOPs
+  (`encoder::inter::LowDelayPEncoder`, one frame in / one AU out):
+  per-CTU **skip / merge / AMVP / rectangular-partition / intra**
+  decisions under an SSD + λ·rate heuristic, with **two active
+  reference pictures** (POC − 1 / POC − 2, `ref_idx_l0` signalled).
+  Motion candidates are resolved through the crate's own DECODE-side
+  §8.5.3.2 merge/AMVP derivation against the in-progress motion
+  field (§6.4.2 availability included), motion estimation is a
+  seeded greedy integer diamond plus half-/quarter-pel refinement
+  against the crate's §8.5.3.3.3 interpolation, `PART_2NxN` /
+  `PART_Nx2N` CUs carry two PUs through the §7.4.9.8 forced depth-1
+  RQT, low-delay B slices exercise the bi-predictive §8.5.3.2.2
+  candidates and `inter_pred_idc`, and a `pred_mode_flag == 1` intra
+  fallback rescues scene changes. Every stream decodes **bit-exact**
+  to the encoder reconstruction through this crate's decoder AND a
+  black-box reference decoder (multi-QP, multi-shape sweeps; golden
+  GOP stream CI-pinned). Per-frame `FrameStats` expose the
+  skip/merge/AMVP/intra/bi/rect/ref1 decisions.
+* `mode = "intra"` — per-CTU §8.4 intra prediction over the
+  encoder's own reconstruction (all 35 modes, per-CTB `PART_2Nx2N`
+  vs `PART_NxN` rate-distortion decision with per-PB modes, §8.4.2
+  MPM signalling, mode-dependent scans), forward DCT-II + reciprocal
+  quantization, full §7.3.8 syntax through the bin-exact §7.3.8.11
+  residual encoder (golden interop stream CI-pinned).
+* `mode = "pcm"` (default) — the lossless PCM-IDR bootstrap
+  (every CTB a 16×16 PCM CU; options for dependent segments,
+  multi-slice plans, deblocking, band / edge SAO syntax, and true
+  multi-tile single-slice pictures with §7.4.7.1 entry points).
+
 4:2:0 8-bit, dimensions multiples of 16.
 
 ## What's implemented
@@ -104,17 +123,20 @@ multi-tile single-slice pictures with §7.4.7.1 entry points).
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Twenty-three embedded-fixture regression pins (the 17-stream staged
+Twenty-four embedded-fixture regression pins (the 17-stream staged
 corpus incl. true tiles + self-built weighted-prediction,
-per-slice-loop-filter, hvcC and golden-intra-interop pins), lossless
-PCM and exact-reconstruction intra encoder↔decoder roundtrips at
-multiple geometries / QPs / partitions, and ~870 unit tests.
+per-slice-loop-filter, hvcC, golden-intra-interop and golden-P-GOP
+interop pins), lossless PCM / exact-reconstruction intra / bit-exact
+low-delay-GOP encoder↔decoder roundtrips at multiple geometries /
+QPs / partitions / slice types, and ~890 unit tests.
 
 ## Not yet implemented
 
-* Encoder inter coding (P/B pictures) and encoder-side SAO /
-  deblocking-aware reconstruction (the intra encoder disables the
-  in-loop filters); larger encoder CTB sizes and 4x4-luma DST TUs.
+* Encoder-side SAO / deblocking-aware reconstruction (the encoder
+  disables the in-loop filters); larger encoder CTB sizes, deeper
+  encoder RQTs, 4x4-luma DST TUs, AMP partitions, encoder temporal
+  MVP, reordered (non-low-delay) B pyramids, and bi-predictive AMVP
+  signalling (bi arises via merge candidates only).
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
