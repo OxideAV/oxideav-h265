@@ -26,6 +26,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoded byte-exact against a black-box reference decoder at QPs
   4/17/27/38/45 out of band. New `encode_low_delay_p` example.
 
+- **Low-delay B slices** (`LowDelayPEncoder::with_b_slices` /
+  registry `bslices` option): non-IDR frames coded as B slices with
+  both reference lists resolving to the previous picture (decode
+  order == display order, SPS unchanged). Adds the B-side header
+  (`slice_type == 0`, `mvd_l1_zero_flag`), initType-2 contexts, the
+  §9.3.3.9 `inter_pred_idc` binarization on AMVP PUs, and the
+  bi-predictive §8.5.3.2.2 merge candidates (zero-merge / combined
+  candidates are bi on B slices — counted in `FrameStats::bi`).
+  Pins: B GOPs decode bit-exactly at QPs 14/27/39 with bi-predicted
+  CUs present; IDR-refreshing B GOPs roundtrip; registry B mode >
+  34 dB; cross-decoded byte-exact against the black-box reference
+  decoder (including a scene-change B GOP) out of band.
+
 - **Streaming GOP encoder + registry `mode = "inter"`**:
   `encoder::inter::LowDelayPEncoder` encodes one frame per call
   (IDR at GOP starts — `gop == 0` for a single leading IDR — P

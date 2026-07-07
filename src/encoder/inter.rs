@@ -1,11 +1,17 @@
-//! Low-delay P-GOP encoder — §8.5 inter prediction on the encode side.
+//! Low-delay GOP encoder — §8.5 inter prediction on the encode side.
 //!
-//! The sequence shape is `IDR, P, P, …`: the first frame goes through
+//! The sequence shape is `IDR, P, P, …` (or `IDR, B, B, …` with
+//! [`LowDelayPEncoder::with_b_slices`]): the first frame goes through
 //! the real CABAC intra encoder ([`crate::encoder::intra`]), every
-//! following frame is one P slice (TRAIL_R) whose single active
-//! reference (`RefPicList0[0]`) is the previous frame's
-//! reconstruction, signalled with an inline §7.4.8 short-term RPS
-//! (`num_negative_pics == 1`, `delta_poc == −1`).
+//! following frame is one P / low-delay-B slice (TRAIL_R) whose
+//! active reference(s) — `RefPicList0[0]`, and `RefPicList1[0]` on B
+//! slices — resolve to the previous frame's reconstruction, signalled
+//! with an inline §7.4.8 short-term RPS (`num_negative_pics == 1`,
+//! `delta_poc == −1`). Low-delay B keeps decode order == display
+//! order while enabling the bi-predictive §8.5.3.2.2 merge candidates
+//! (zero-merge and combined candidates are bi on B slices) and the
+//! B-side syntax (`inter_pred_idc`, `mvd_l1_zero_flag`, initType 2
+//! contexts).
 //!
 //! Geometry mirrors the intra bootstrap: `CtbSizeY == MinCbSizeY ==
 //! 16`, so every CTB is one unsplit CU; inter CUs are `PART_2Nx2N`
@@ -118,6 +124,9 @@ pub struct FrameStats {
     pub amvp: usize,
     /// Intra CUs (`pred_mode_flag == 1`, or every CU of the IDR).
     pub intra: usize,
+    /// Bi-predicted CUs (both `predFlagLX` set — B slices only; a
+    /// subset of `skip + merge`).
+    pub bi: usize,
 }
 
 /// A resolved-and-coded CU candidate (one of skip / merge / AMVP).
@@ -174,6 +183,10 @@ pub struct LowDelayPEncoder {
     qp: i32,
     /// GOP length in frames (`0` = a single leading IDR, endless P).
     gop: usize,
+    /// Code the non-IDR frames as (low-delay) B slices: both
+    /// reference lists resolve to the previous picture, enabling
+    /// bi-predictive merge candidates and the B-slice syntax.
+    b_slices: bool,
     /// POC of the NEXT frame within the current GOP (0 ⇒ IDR next).
     poc: i32,
     prev: Option<FrameRecon>,
@@ -199,9 +212,18 @@ impl LowDelayPEncoder {
             height,
             qp,
             gop,
+            b_slices: false,
             poc: 0,
             prev: None,
         })
+    }
+
+    /// Code non-IDR frames as low-delay B slices (both reference
+    /// lists resolving to the previous picture) instead of P slices.
+    #[must_use]
+    pub fn with_b_slices(mut self, on: bool) -> Self {
+        self.b_slices = on;
+        self
     }
 
     /// Encode the next frame in display order.
@@ -255,8 +277,15 @@ impl LowDelayPEncoder {
             }
         } else {
             let prev = self.prev.as_ref().expect("IDR precedes every P frame");
-            let (rbsp, recon, stats) =
-                encode_p_slice(frame, prev, self.poc, self.width, self.height, self.qp);
+            let (rbsp, recon, stats) = encode_inter_slice(
+                frame,
+                prev,
+                self.poc,
+                self.width,
+                self.height,
+                self.qp,
+                self.b_slices,
+            );
             let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
             self.prev = Some(recon.clone());
             self.poc += 1;
@@ -303,13 +332,15 @@ pub fn encode_low_delay_p(
     Ok(out)
 }
 
-/// §7.3.6.1 — the P slice-segment header for POC `poc` (one inline
-/// negative-delta-1 short-term RPS, no overrides, `MaxNumMergeCand ==
-/// 5`, `slice_qp_delta` against `init_qp == 26`).
-fn write_p_slice_header(w: &mut BitWriter, poc: i32, qp: i32) {
+/// §7.3.6.1 — the P / B slice-segment header for POC `poc` (one
+/// inline negative-delta-1 short-term RPS, no overrides,
+/// `MaxNumMergeCand == 5`, `slice_qp_delta` against `init_qp == 26`).
+/// For the low-delay B shape both reference lists resolve to the same
+/// previous picture (`RefPicList0[0] == RefPicList1[0]`).
+fn write_inter_slice_header(w: &mut BitWriter, poc: i32, qp: i32, b_slice: bool) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
-    w.ue(1); // slice_type = P
+    w.ue(u32::from(!b_slice)); // slice_type (0 = B, 1 = P)
     w.put_bits((poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb
     w.put_bit(0); // short_term_ref_pic_set_sps_flag
                   // st_ref_pic_set( 0 ) — idx 0 has no
@@ -320,8 +351,11 @@ fn write_p_slice_header(w: &mut BitWriter, poc: i32, qp: i32) {
     w.put_bit(1); // used_by_curr_pic_s0_flag[0]
                   // sps_temporal_mvp_enabled_flag == 0, SAO off: nothing.
     w.put_bit(0); // num_ref_idx_active_override_flag (PPS default: 1 active)
-                  // lists_modification_present_flag == 0;
-                  // cabac_init_present_flag == 0; TMVP off; WP off.
+                  // lists_modification_present_flag == 0.
+    if b_slice {
+        w.put_bit(0); // mvd_l1_zero_flag
+    }
+    // cabac_init_present_flag == 0; TMVP off; WP off.
     w.ue((5 - MAX_MERGE) as u32); // five_minus_max_num_merge_cand
     w.se(qp - 26); // slice_qp_delta
                    // Deblocking disabled in the PPS + SAO off: no
@@ -386,10 +420,17 @@ fn amvp_pu(mvd: Mv, mvp_flag: u8) -> PredictionUnit {
 }
 
 /// §8.5.3.3 — the final clipped prediction for a whole 16x16 CTB PU
-/// with uni-L0 motion `mv` (luma quarter-pel). `chroma` selects
-/// whether the Cb / Cr planes are predicted too (the SAD search runs
-/// luma-only).
-fn predict_ctb(refp: &RefPlanes, x0: usize, y0: usize, mv: Mv, chroma: bool) -> InterPrediction {
+/// with the resolved motion (uni-L0, uni-L1 or bi; the low-delay GOP
+/// has a single physical reference, so both lists read the same
+/// planes). `chroma` selects whether the Cb / Cr planes are predicted
+/// too (the SAD search runs luma-only).
+fn predict_ctb(
+    refp: &RefPlanes,
+    x0: usize,
+    y0: usize,
+    motion: &PuMotion,
+    chroma: bool,
+) -> InterPrediction {
     let luma = RefPlane::new(&refp.y, refp.width, refp.height).expect("legal ref plane");
     let (cb, cr) = if chroma {
         (
@@ -399,8 +440,8 @@ fn predict_ctb(refp: &RefPlanes, x0: usize, y0: usize, mv: Mv, chroma: bool) -> 
     } else {
         (None, None)
     };
-    let l0 = ListPrediction {
-        pred_flag: true,
+    let list = |pred_flag: bool, mv: Mv| ListPrediction {
+        pred_flag,
         luma,
         cb,
         cr,
@@ -408,11 +449,8 @@ fn predict_ctb(refp: &RefPlanes, x0: usize, y0: usize, mv: Mv, chroma: bool) -> 
         // §8.5.3.2.10: 4:2:0 chroma MV = luma MV (eighth-pel units).
         mv_c: derive_chroma_mv(mv, 2, 2),
     };
-    // L1 unused (uni-predictive P): pred_flag false, planes ignored.
-    let l1 = ListPrediction {
-        pred_flag: false,
-        ..l0
-    };
+    let l0 = list(motion.pred_flag_l0, motion.mv_l0);
+    let l1 = list(motion.pred_flag_l1, motion.mv_l1);
     let geom = InterPredGeometry {
         x_pb: x0 as i32,
         y_pb: y0 as i32,
@@ -423,6 +461,18 @@ fn predict_ctb(refp: &RefPlanes, x0: usize, y0: usize, mv: Mv, chroma: bool) -> 
         bit_depth_chroma: BIT_DEPTH,
     };
     predict_inter_pu(&l0, &l1, &geom).expect("legal prediction geometry")
+}
+
+/// A uni-L0 [`PuMotion`] for motion-search probes.
+fn uni_l0(mv: Mv) -> PuMotion {
+    PuMotion {
+        pred_flag_l0: true,
+        pred_flag_l1: false,
+        ref_idx_l0: 0,
+        ref_idx_l1: -1,
+        mv_l0: mv,
+        mv_l1: [0, 0],
+    }
 }
 
 /// The previous frame's reconstruction as `i32` planes (the
@@ -577,7 +627,7 @@ fn fractional_me(
     mvp_q: &[Mv],
 ) -> Mv {
     let cost_at = |mv: Mv| -> u64 {
-        let pred = predict_ctb(refp, x0, y0, mv, false);
+        let pred = predict_ctb(refp, x0, y0, &uni_l0(mv), false);
         let mv_rate = mvp_q
             .iter()
             .map(|p| mvd_bits([mv[0] - p[0], mv[1] - p[1]]))
@@ -680,17 +730,18 @@ fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut Slice
     }
 }
 
-/// Encode one P frame as a single TRAIL_R slice against the previous
-/// frame's reconstruction. Returns the slice RBSP, the frame's
-/// reconstruction, and its CU mode-decision counters.
-#[allow(clippy::too_many_lines)]
-fn encode_p_slice(
+/// Encode one P / low-delay-B frame as a single TRAIL_R slice against
+/// the previous frame's reconstruction. Returns the slice RBSP, the
+/// frame's reconstruction, and its CU mode-decision counters.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn encode_inter_slice(
     frame: &YuvFrame<'_>,
     prev: &FrameRecon,
     poc: i32,
     width: usize,
     height: usize,
     qp: i32,
+    b_slice: bool,
 ) -> (Vec<u8>, FrameRecon, FrameStats) {
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
@@ -743,13 +794,13 @@ fn encode_p_slice(
     let col_ref_long_term = |_poc: i32| false;
     let mv_ctx = PuMvContext {
         curr_poc: poc,
-        slice_is_b: false,
+        slice_is_b: b_slice,
         ctb_log2_size_y: CTB_LOG2,
         pic_width_luma: width as u32,
         pic_height_luma: height as u32,
         max_num_merge_cand: MAX_MERGE,
         num_ref_idx_l0_active: 1,
-        num_ref_idx_l1_active: 0,
+        num_ref_idx_l1_active: if b_slice { 1 } else { 0 },
         log2_par_mrg_level: 2,
         temporal_mvp_enabled: false,
         collocated_from_l0_flag: true,
@@ -764,12 +815,13 @@ fn encode_p_slice(
 
     // ---- slice_segment_header( ) ----
     let mut w = BitWriter::new();
-    write_p_slice_header(&mut w, poc, qp);
+    write_inter_slice_header(&mut w, poc, qp, b_slice);
 
     // ---- slice_segment_data( ) ----
     let mut cabac = CabacEncoder::new();
-    // Table 9-4: P slice, cabac_init_flag 0 ⇒ initType 1.
-    let mut ctxs = SliceContexts::init(init_type(1, false), qp);
+    // Table 9-4: cabac_init_flag 0 ⇒ initType 1 (P) / 2 (B).
+    let raw_slice_type = if b_slice { 0 } else { 1 };
+    let mut ctxs = SliceContexts::init(init_type(raw_slice_type, false), qp);
 
     for ctb in 0..ctbs_x * ctbs_y {
         let x0 = (ctb % ctbs_x) * CTB;
@@ -833,7 +885,7 @@ fn encode_p_slice(
             let (best_merge_idx, best_merge_motion) = merge_cands
                 .iter()
                 .map(|&(idx, m)| {
-                    let pred = predict_ctb(&refp, x0, y0, m.mv_l0, false);
+                    let pred = predict_ctb(&refp, x0, y0, &m, false);
                     (
                         sad(&pred.luma, &src[0]) + lambda_me * (idx as u64 + 1),
                         idx,
@@ -883,7 +935,7 @@ fn encode_p_slice(
             let mut cands: Vec<CuCandidate> = Vec::with_capacity(3);
 
             // Skip: best merge candidate, prediction only.
-            let merge_pred = predict_ctb(&refp, x0, y0, best_merge_motion.mv_l0, true);
+            let merge_pred = predict_ctb(&refp, x0, y0, &best_merge_motion, true);
             let (skip_recon, skip_dist) = pred_recon(&merge_pred, &src);
             cands.push(CuCandidate {
                 kind: CuKind::Skip {
@@ -912,7 +964,7 @@ fn encode_p_slice(
             }
 
             // AMVP (with or without residual).
-            let amvp_pred = predict_ctb(&refp, x0, y0, amvp_motion.mv_l0, true);
+            let amvp_pred = predict_ctb(&refp, x0, y0, &amvp_motion, true);
             let (a_levels, a_recon, a_dist, a_rate) =
                 code_ctb_residual(&amvp_pred, &src, qp_y, qp_c);
             let motion_rate = mvd_bits(mvd) + 4; // mvd + mvp/merge/skip/rqt flags
@@ -1025,7 +1077,15 @@ fn encode_p_slice(
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
                 cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 0);
-                // P slice ⇒ PRED_L0 inferred; one active ref ⇒ no
+                if b_slice {
+                    // §9.3.3.9 inter_pred_idc = PRED_L0 ("00"):
+                    // nPbW + nPbH == 32, bin 0 ctxInc = CtDepth (0),
+                    // bin 1 ctxInc = 4.
+                    let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
+                    cabac.encode_decision(&mut w, &mut head[0], 0);
+                    cabac.encode_decision(&mut w, &mut tail[0], 0);
+                }
+                // PRED_L0 (inferred on P); one active ref ⇒ no
                 // ref_idx_l0. mvd_coding + mvp_l0_flag.
                 encode_mvd_pair(&mut w, &mut cabac, &mut ctxs, *mvd);
                 cabac.encode_decision(&mut w, &mut ctxs.mvp_flag[0], *mvp_flag);
@@ -1185,6 +1245,9 @@ fn encode_p_slice(
                     CuKind::Skip { .. } => stats.skip += 1,
                     CuKind::Merge { .. } => stats.merge += 1,
                     _ => stats.amvp += 1,
+                }
+                if chosen.motion.pred_flag_l0 && chosen.motion.pred_flag_l1 {
+                    stats.bi += 1;
                 }
                 field.fill_rect(x0, y0, CTB, CTB, chosen.motion.to_cell(poc - 1, i32::MIN));
                 let cu_mode = if is_skip {
@@ -1447,6 +1510,77 @@ mod tests {
             );
         }
         assert_eq!(enc.stats[0].intra, ctbs, "IDR counts as all-intra");
+    }
+
+    /// Low-delay B slices: both reference lists resolve to the
+    /// previous picture; the whole GOP decodes bit-exactly and the
+    /// zero-merge / combined candidates actually exercise
+    /// bi-prediction.
+    #[test]
+    fn b_gop_decodes_to_encoder_recon_exactly() {
+        let planes = scene(64, 64, 4);
+        let frames = as_frames(&planes);
+        for qp in [14i32, 27, 39] {
+            let mut enc = LowDelayPEncoder::new(64, 64, qp, 0)
+                .expect("encoder")
+                .with_b_slices(true);
+            let mut stream = Vec::new();
+            let mut recons = Vec::new();
+            let mut bi_total = 0usize;
+            for f in &frames {
+                let out = enc.encode_frame(f).expect("encode");
+                stream.extend_from_slice(&out.au);
+                recons.push(out.recon);
+                bi_total += out.stats.bi;
+            }
+            let decoded = decode_annexb_sequence(&stream).expect("decode");
+            assert_eq!(decoded.len(), 4, "qp{qp}");
+            for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+                let mut expect = rec.y.clone();
+                expect.extend_from_slice(&rec.cb);
+                expect.extend_from_slice(&rec.cr);
+                assert_eq!(
+                    dec.picture.to_planar_u8().expect("8-bit"),
+                    expect,
+                    "qp{qp} frame {i}: decoder output == encoder recon"
+                );
+            }
+            assert!(
+                bi_total > 0,
+                "qp{qp}: expected some bi-predicted CUs in the B GOP"
+            );
+        }
+    }
+
+    /// B slices with an IDR-refreshing GOP also roundtrip (initType 2
+    /// contexts + POC reset + both-list handling across the wrap).
+    #[test]
+    fn b_gop_with_idr_refresh_roundtrips() {
+        let planes = scene(48, 48, 5);
+        let frames = as_frames(&planes);
+        let mut enc = LowDelayPEncoder::new(48, 48, 24, 3)
+            .expect("encoder")
+            .with_b_slices(true);
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let out = enc.encode_frame(f).expect("encode");
+            assert_eq!(out.keyframe, i % 3 == 0, "frame {i} keyframe");
+            stream.extend_from_slice(&out.au);
+            recons.push(out.recon);
+        }
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), 5);
+        for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "frame {i}"
+            );
+        }
     }
 
     /// The §7.3.8.9 `mvd_coding( )` encoder is the exact bin-level

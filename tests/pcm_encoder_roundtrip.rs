@@ -207,3 +207,56 @@ fn inter_mode_rejects_bad_gop_option() {
     params.options.insert("gop", "sometimes");
     assert!(oxideav_h265::make_encoder(&params).is_err());
 }
+
+#[test]
+fn inter_mode_b_slices_registry_roundtrip() {
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(48);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "inter");
+    params.options.insert("qp", "12");
+    params.options.insert("bslices", "1");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let frames: Vec<VideoFrame> = (0..4).map(|i| planes(48, 32, i)).collect();
+    let mut aus = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        let pkt = enc.receive_packet().expect("packet per frame");
+        assert_eq!(pkt.flags.keyframe, i == 0, "frame {i} keyframe flag");
+        aus.push(pkt);
+    }
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    for pkt in &aus {
+        dec.send_packet(pkt).expect("decode send");
+    }
+    dec.flush().expect("decode flush");
+    for (i, f) in frames.iter().enumerate() {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for (pi, (p, q)) in v.planes.iter().zip(f.planes.iter()).enumerate() {
+                    let mse: f64 = p
+                        .data
+                        .iter()
+                        .zip(q.data.iter())
+                        .map(|(&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / p.data.len() as f64;
+                    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                    assert!(
+                        psnr > 34.0,
+                        "frame {i} plane {pi}: PSNR {psnr:.1} dB at qp 12 (B slices)"
+                    );
+                }
+            }
+            other => panic!("frame {i}: unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}

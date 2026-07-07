@@ -61,7 +61,9 @@ use oxideav_core::{
 /// * `"inter"` — low-delay `IDR, P, P, …` coding (§8.5 inter
 ///   prediction with per-CTU skip / merge / AMVP / intra decisions)
 ///   at the `qp` option's `SliceQpY`; the `gop` option sets the IDR
-///   period in frames (default 0 = a single leading IDR).
+///   period in frames (default 0 = a single leading IDR); the
+///   `bslices` option (`"1"` / `"true"`) codes the non-IDR frames as
+///   low-delay B slices.
 ///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
@@ -146,8 +148,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     ))
                 })?,
             };
+            let b_slices = match params.options.get("bslices") {
+                None | Some("0") | Some("false") => false,
+                Some("1") | Some("true") => true,
+                Some(v) => {
+                    return Err(Error::InvalidData(format!(
+                        "h265 encode: bslices must be 0/1/true/false, got {v:?}"
+                    )))
+                }
+            };
             let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
-                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                .with_b_slices(b_slices);
             EncodeMode::Inter(enc)
         }
         Some(other) => {
