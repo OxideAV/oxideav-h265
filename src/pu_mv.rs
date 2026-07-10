@@ -473,6 +473,7 @@ fn temporal_mv_for_list(
         curr_ref_long_term: !curr_ref_short,
         no_backward_pred: ctx.no_backward_pred,
         collocated_from_l0_flag: ctx.collocated_from_l0_flag,
+        list_x: x,
         col_ref_long_term: ctx.col_ref_long_term,
     };
     derive_temporal_mv(
@@ -750,6 +751,7 @@ fn temporal_mvp(geom: &PuGeometry, ctx: &PuMvContext, x: usize, ref_idx: i32) ->
         curr_ref_long_term: !curr_ref_short,
         no_backward_pred: ctx.no_backward_pred,
         collocated_from_l0_flag: ctx.collocated_from_l0_flag,
+        list_x: x,
         col_ref_long_term: ctx.col_ref_long_term,
     };
     derive_temporal_mv(

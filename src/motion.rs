@@ -990,6 +990,10 @@ pub struct TemporalMvContext<'a> {
     /// `collocated_from_l0_flag` — the §8.5.3.2.9 `N` used in the
     /// bi-predicted-`!NoBackwardPred` branch (`N` is its value).
     pub collocated_from_l0_flag: bool,
+    /// The list `X` of the `mvLXCol` being derived (0 or 1) — selects
+    /// `listCol = LX` in the bi-predicted `NoBackwardPredFlag == 1`
+    /// branch of §8.5.3.2.9.
+    pub list_x: usize,
     /// Resolve a collocated-picture reference POC to whether that
     /// reference is a long-term picture in the col picture's lists
     /// (`LongTermRefPic( ColPic, colPb, refIdxCol, listCol )`).
@@ -1032,15 +1036,18 @@ fn collocated_mv(col: MotionCell, ctx: &TemporalMvContext) -> Option<Mv> {
     } else {
         // Bi-predicted colPb.
         if ctx.no_backward_pred {
-            // listCol = LX, i.e. the list being predicted (caller passes
-            // the per-X cell already orientated — here X selects via the
-            // collocated_from_l0_flag-independent LX rule; for the present
-            // single-reference fixtures L0 == LX). Use L0 as LX.
-            (col.mv_l0, col.ref_poc_l0)
+            // listCol = LX — the list whose mvLXCol is being derived.
+            if ctx.list_x == 0 {
+                (col.mv_l0, col.ref_poc_l0)
+            } else {
+                (col.mv_l1, col.ref_poc_l1)
+            }
         } else if ctx.collocated_from_l0_flag {
-            (col.mv_l0, col.ref_poc_l0)
-        } else {
+            // listCol = LN with N = collocated_from_l0_flag: N == 1 ⇒ L1.
             (col.mv_l1, col.ref_poc_l1)
+        } else {
+            // N == 0 ⇒ L0.
+            (col.mv_l0, col.ref_poc_l0)
         }
     };
 
@@ -1666,6 +1673,7 @@ mod tests {
             curr_ref_long_term: false,
             no_backward_pred: true,
             collocated_from_l0_flag: true,
+            list_x: 0,
             col_ref_long_term: short_term,
         }
     }
@@ -1736,5 +1744,83 @@ mod tests {
         let lt = |_: i32| false;
         let ctx = temporal_ctx(&lt);
         assert_eq!(derive_temporal_mv(&mf, 0, 0, 8, 8, &ctx), Some([12, 4]));
+    }
+
+    /// A bi-predicted collocated cell with distinct L0 / L1 motion, both
+    /// references at POC distance 4 from the col picture so no scaling
+    /// perturbs the listCol selection under test.
+    fn bi_cell() -> MotionCell {
+        MotionCell {
+            is_intra: false,
+            has_nonzero_coeff: false,
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            ref_poc_l0: -4,
+            ref_poc_l1: 4,
+            mv_l0: [10, 2],
+            mv_l1: [-30, -6],
+        }
+    }
+
+    #[test]
+    fn temporal_bi_col_no_backward_pred_selects_list_x() {
+        // §8.5.3.2.9 bi-predicted colPb, NoBackwardPredFlag == 1:
+        // listCol = LX — the list whose mvLXCol is being derived.
+        let mf = col_field_with(bi_cell(), 64, 64);
+        let lt = |_: i32| false;
+        let l0 = TemporalMvContext {
+            list_x: 0,
+            ..temporal_ctx(&lt)
+        };
+        // colPocDiff (0 − −4 = 4) == currPocDiff (4 − 0 = 4) ⇒ copy.
+        assert_eq!(derive_temporal_mv(&mf, 0, 0, 16, 16, &l0), Some([10, 2]));
+        let l1 = TemporalMvContext {
+            list_x: 1,
+            curr_ref_poc: -4, // keep currPocDiff == colPocDiff (both 8).
+            curr_poc: 4,
+            ..temporal_ctx(&lt)
+        };
+        // listCol = L1: colPocDiff = 0 − 4 = −4, currPocDiff = 4 − −4 = 8
+        // ⇒ scaled (eqs 8-205..8-207): td = −4, tx = (16384+2)/−4 = −4096
+        // (truncating division), tb = 8, distScaleFactor =
+        // (8·−4096 + 32) >> 6 = −32736 >> 6 = −512.
+        let got = derive_temporal_mv(&mf, 0, 0, 16, 16, &l1).unwrap();
+        // comp(−512, −30): v = 15360 ⇒ (15360+127)>>8 = 60;
+        // comp(−512, −6): v = 3072 ⇒ (3072+127)>>8 = 12.
+        assert_eq!(got, [60, 12], "L1 motion selected and scaled");
+    }
+
+    #[test]
+    fn temporal_bi_col_backward_pred_selects_list_n() {
+        // §8.5.3.2.9 bi-predicted colPb, NoBackwardPredFlag == 0:
+        // listCol = LN with N being the VALUE of collocated_from_l0_flag
+        // (flag == 1 ⇒ L1, flag == 0 ⇒ L0).
+        let mf = col_field_with(bi_cell(), 64, 64);
+        let lt = |_: i32| false;
+        let base = temporal_ctx(&lt);
+        let from_l0 = TemporalMvContext {
+            no_backward_pred: false,
+            collocated_from_l0_flag: true,
+            curr_poc: 4,
+            curr_ref_poc: 8, // currPocDiff = −4 == colPocDiff (L1) ⇒ copy.
+            ..base
+        };
+        assert_eq!(
+            derive_temporal_mv(&mf, 0, 0, 16, 16, &from_l0),
+            Some([-30, -6]),
+            "collocated_from_l0_flag == 1 ⇒ N = 1 ⇒ the col L1 motion"
+        );
+        let from_l1 = TemporalMvContext {
+            no_backward_pred: false,
+            collocated_from_l0_flag: false,
+            curr_poc: 4,
+            curr_ref_poc: 0, // currPocDiff = 4 == colPocDiff (L0) ⇒ copy.
+            ..base
+        };
+        assert_eq!(
+            derive_temporal_mv(&mf, 0, 0, 16, 16, &from_l1),
+            Some([10, 2]),
+            "collocated_from_l0_flag == 0 ⇒ N = 0 ⇒ the col L0 motion"
+        );
     }
 }
