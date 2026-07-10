@@ -784,6 +784,17 @@ impl SpsSccExtension {
             }
             if sps_palette_predictor_initializers_present_flag {
                 sps_num_palette_predictor_initializers_minus1 = br.ue()?;
+                // §7.4.3.2.3: bounded by PaletteMaxPredictorSize − 1,
+                // itself capped by the profile limits (§A.3.7:
+                // PaletteMaxPredictorSize <= 128); reject anything past
+                // the largest representable predictor so a malformed
+                // count cannot drive the initializer allocation.
+                if sps_num_palette_predictor_initializers_minus1 >= 128 {
+                    return Err(SpsError::ValueOutOfRange {
+                        field: "sps_num_palette_predictor_initializers_minus1",
+                        got: sps_num_palette_predictor_initializers_minus1,
+                    });
+                }
                 let num_comps = if chroma_format_idc == 0 { 1 } else { 3 };
                 let num_entries = sps_num_palette_predictor_initializers_minus1 as usize + 1;
                 sps_palette_predictor_initializer.reserve(num_comps);
@@ -2918,6 +2929,44 @@ mod tests {
         );
         assert_eq!(scc.motion_vector_resolution_control_idc, 2);
         assert!(!scc.intra_boundary_filtering_disabled_flag);
+    }
+
+    /// §7.4.3.2.3 / §A.3.7: `sps_num_palette_predictor_initializers_minus1`
+    /// past the largest representable predictor (PaletteMaxPredictorSize
+    /// <= 128) is rejected BEFORE any initializer allocation — a fuzzed
+    /// count once drove a multi-GiB `Vec::with_capacity`.
+    #[test]
+    fn rejects_oversized_palette_predictor_initializer_count() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0001"; // range/multilayer/3d = 0, scc = 1
+        s += "0000"; // sps_extension_4bits = 0
+                     // sps_scc_extension():
+        s += "0"; // sps_curr_pic_ref_enabled_flag = 0
+        s += "1"; // palette_mode_enabled_flag = 1
+        s += "00100"; // palette_max_size = 3
+        s += "010"; // delta_palette_max_predictor_size = 1
+        s += "1"; // sps_palette_predictor_initializers_present_flag = 1
+                  // sps_num_palette_predictor_initializers_minus1 = ue(128):
+                  // 129 in 8 bits = 10000001, prefix of 7 zeros.
+        s += "0000000";
+        s += "10000001";
+        s += "1"; // (whatever follows is unreached)
+        let bytes = bits_to_bytes(&s);
+        let err = SeqParameterSet::parse(&bytes).expect_err("oversized initializer count");
+        assert!(matches!(
+            err,
+            SpsError::ValueOutOfRange {
+                field: "sps_num_palette_predictor_initializers_minus1",
+                got: 128
+            }
+        ));
     }
 
     /// §7.4.3.2.3: `motion_vector_resolution_control_idc == 3` is
