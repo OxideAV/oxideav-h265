@@ -998,6 +998,7 @@ fn build_inter_slice_context(
     };
     InterSliceContext {
         curr_poc,
+        constrained_intra_pred: pps.constrained_intra_pred_flag,
         slice_is_b: slice_type == SliceType::B,
         ctb_log2_size_y: geom.ctb_log2,
         pic_width_luma: geom.width,

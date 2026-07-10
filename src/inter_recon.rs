@@ -425,6 +425,9 @@ pub struct InterSliceContext {
     pub log2_sao_offset_scale_luma: u8,
     /// `log2_sao_offset_scale_chroma`.
     pub log2_sao_offset_scale_chroma: u8,
+    /// `constrained_intra_pred_flag` (§8.4.4.2.1) — intra prediction
+    /// inside this picture may not reference non-intra coding units.
+    pub constrained_intra_pred: bool,
     /// The slice's §8.5.3.3.4.3 explicit weighted-prediction tables —
     /// `Some` exactly when `weightedPredFlag` (§8.5.3.3.4.1) is 1.
     pub wp: Option<SliceWpTables>,
@@ -501,6 +504,7 @@ pub fn reconstruct_inter_picture(
         slice.log2_min_cu_qp_delta_size,
         6 * (i32::from(params.bit_depth_luma) - 8),
     );
+    ctx.set_constrained_intra(slice.constrained_intra_pred);
     let mut field = MotionField::new(pic_width_luma, pic_height_luma);
 
     let ctb_size = 1usize << slice.ctb_log2_size_y;
@@ -1283,6 +1287,7 @@ mod tests {
             filter_across_slices: true,
             filter_across_tiles: true,
             curr_poc: 4,
+            constrained_intra_pred: false,
             slice_is_b: false,
             ctb_log2_size_y: 5,
             pic_width_luma: 32,

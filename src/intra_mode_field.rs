@@ -146,6 +146,16 @@ impl IntraModeField {
         );
     }
 
+    /// §8.4.4.2.1 constrained-intra gate — whether the recorded
+    /// `CuPredMode[ x ][ y ]` at the luma location is `MODE_INTRA`.
+    /// Unwritten (not-yet-decoded) cells report `false`; the §6.4.1
+    /// z-scan availability independently denies those.
+    #[must_use]
+    pub fn is_intra_at(&self, x_luma: usize, y_luma: usize) -> bool {
+        let c = &self.cells[self.cell_index(x_luma, y_luma)];
+        c.written && matches!(c.pred_mode, CuPredMode::Intra)
+    }
+
     /// Record a non-intra coding unit (`MODE_INTER` / `MODE_SKIP`) across
     /// its `n_cb` × `n_cb` luma samples. The §8.4.2 candidate derivation
     /// maps such a neighbour to `INTRA_DC`, but the cell must be marked

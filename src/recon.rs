@@ -887,6 +887,10 @@ pub struct ReconCtx {
     /// standalone per-CTU helpers, which fall back to the
     /// `qPY_PRED == SliceQpY` single-QG shortcut).
     qp: Option<QpState>,
+    /// `constrained_intra_pred_flag` (§8.4.4.2.1) — when set, reference
+    /// samples from non-`MODE_INTRA` coding units are "not available
+    /// for intra prediction".
+    constrained_intra: bool,
 }
 
 /// §8.6.1 quantization-parameter derivation state: the per-4×4 `QpY`
@@ -966,7 +970,16 @@ impl ReconCtx {
             tiling,
             slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
             qp: None,
+            constrained_intra: false,
         })
+    }
+
+    /// Enable the §8.4.4.2.1 `constrained_intra_pred_flag` gate:
+    /// reference samples whose covering coding unit is not
+    /// `MODE_INTRA` are treated as "not available for intra
+    /// prediction" (they substitute per §8.4.4.2.2).
+    pub fn set_constrained_intra(&mut self, on: bool) {
+        self.constrained_intra = on;
     }
 
     /// Initialize the §8.6.1 per-picture QP-derivation state.
@@ -1209,7 +1222,15 @@ impl ReconCtx {
         let y_curr_luma = y_tb * sub_h;
         let x_nb_luma = (x_ref as usize * sub_w) as i64;
         let y_nb_luma = (y_ref as usize * sub_h) as i64;
-        self.available(x_curr_luma, y_curr_luma, x_nb_luma, y_nb_luma)
+        if !self.available(x_curr_luma, y_curr_luma, x_nb_luma, y_nb_luma) {
+            return false;
+        }
+        // §8.4.4.2.1: CuPredMode[ xNbY ][ yNbY ] != MODE_INTRA with
+        // constrained_intra_pred_flag == 1 ⇒ not available.
+        !self.constrained_intra
+            || self
+                .field
+                .is_intra_at(x_nb_luma as usize, y_nb_luma as usize)
     }
 
     /// Borrow the §6.4.1 / §6.5 picture tiling (the inter driver's §6.4.2
