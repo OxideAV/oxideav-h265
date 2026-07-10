@@ -467,12 +467,14 @@ pub fn filter_reference_samples(
         let p_left_63 = p.left(63);
         let p_top_63 = p.top(63);
         let p_corner = p.corner();
-        for y in 0..62 {
+        for y in 0..=62 {
             // pF[ −1 ][ y ] = ((63−y)*p[−1][−1] + (y+1)*p[−1][63] + 32) >> 6
+            // (eq 8-37, y = 0..62 INCLUSIVE — 63 interpolated samples).
             left[y as usize] = ((63 - y) * p_corner + (y + 1) * p_left_63 + 32) >> 6;
         }
         left[63] = p_left_63;
-        for x in 0..62 {
+        for x in 0..=62 {
+            // eq 8-39, x = 0..62 inclusive.
             top[x as usize] = ((63 - x) * p_corner + (x + 1) * p_top_63 + 32) >> 6;
         }
         top[63] = p_top_63;
@@ -984,6 +986,29 @@ mod tests {
             assert_eq!(f.top(x), 100);
         }
         assert_eq!(f.corner(), 100);
+    }
+
+    #[test]
+    fn strong_smoothing_bilinear_covers_every_index() {
+        // §8.4.4.2.3 eqs 8-36..8-40: a perfectly linear 32-block ramp
+        // trips biIntFlag (second differences are 0), and the bi-linear
+        // interpolation of a linear ramp reproduces the ramp EXACTLY at
+        // every index 0..=63 — including index 62, which eq 8-37/8-39
+        // covers (the spec's "y = 0..62" is inclusive).
+        let n = 32usize;
+        // corner 64; left[y] = 65 + y; top[x] = 65 + x (slope 1).
+        let left: Vec<i32> = (0..2 * n as i32).map(|y| 65 + y).collect();
+        let top: Vec<i32> = (0..2 * n as i32).map(|x| 65 + x).collect();
+        let p = ReferenceSamples::new(n, 64, left, top).unwrap();
+        // Mode 2 (angular, far from H/V) ⇒ filterFlag = 1 at nTbS 32.
+        let f = filter_reference_samples(&p, 2, true, Component::Luma, 8);
+        assert_eq!(f.corner(), 64);
+        for i in 0..64i32 {
+            // ((63−i)*64 + (i+1)*128 + 32) >> 6 == 65 + i for a slope-1
+            // ramp (and index 63 copies p[63] = 128 directly).
+            assert_eq!(f.left(i), 65 + i, "pF[-1][{i}]");
+            assert_eq!(f.top(i), 65 + i, "pF[{i}][-1]");
+        }
     }
 
     // ---- §8.4.4.2.4 planar ----
