@@ -221,6 +221,28 @@ pub struct ScalingListData {
 }
 
 impl ScalingListData {
+    /// The all-default `scaling_list_data()`: every slot carries its
+    /// §7.4.5 Table 7-5 / Table 7-6 default list with a DC scaling
+    /// factor of 16 (`scaling_list_dc_coef_minus8` inferred to 8).
+    ///
+    /// This is the active scaling-list data when
+    /// `scaling_list_enabled_flag == 1` but neither the SPS nor the PPS
+    /// carries an explicit `scaling_list_data()` body.
+    #[must_use]
+    pub fn all_default() -> Self {
+        let lists: [[ScalingListMatrix; NUM_MATRIX_IDS]; NUM_SIZE_IDS] =
+            core::array::from_fn(|size_id| {
+                core::array::from_fn(|matrix_id| ScalingListMatrix {
+                    coef: default_scaling_list(size_id, matrix_id).to_vec(),
+                    // §7.4.5: the inferred scaling_list_dc_coef_minus8
+                    // is 8 ⇒ ScalingFactor[sizeId][matrixId][0][0] = 16
+                    // (matching the default lists' first coefficient).
+                    dc_coef: 16,
+                })
+            });
+        Self { lists }
+    }
+
     /// Parse `scaling_list_data()` (§7.3.4) and derive the per-slot
     /// `ScalingList` coefficient arrays (§7.4.5), applying the
     /// default-list and prediction-inference rules.
@@ -228,13 +250,7 @@ impl ScalingListData {
         // Seed every slot with its default; signalled slots overwrite.
         // sizeId == 3 only visits matrixId 0 and 3 (the `+= 3` step),
         // so the other four slots stay at their (unused) default.
-        let mut lists: [[ScalingListMatrix; NUM_MATRIX_IDS]; NUM_SIZE_IDS] =
-            core::array::from_fn(|size_id| {
-                core::array::from_fn(|matrix_id| ScalingListMatrix {
-                    coef: default_scaling_list(size_id, matrix_id).to_vec(),
-                    dc_coef: 8,
-                })
-            });
+        let mut lists = Self::all_default().lists;
 
         for (size_id, size_lists) in lists.iter_mut().enumerate() {
             // matrixId += (sizeId == 3) ? 3 : 1  (§7.3.4)
@@ -262,8 +278,10 @@ impl ScalingListData {
                         let def = default_scaling_list(size_id, matrix_id);
                         size_lists[matrix_id] = ScalingListMatrix {
                             coef: def.to_vec(),
-                            // DC default for sizeId > 1 is also 8.
-                            dc_coef: 8,
+                            // §7.4.5: scaling_list_dc_coef_minus8 is
+                            // inferred to be 8 for the default list,
+                            // i.e. a DC scaling factor of 16.
+                            dc_coef: 16,
                         };
                     } else {
                         // refMatrixId = matrixId − delta * step  (7-42),
@@ -579,14 +597,15 @@ mod tests {
         for m in 3..6 {
             assert_eq!(data.lists[1][m].coef, DEFAULT_8X8_INTER.to_vec());
         }
-        // 16x16 reuses the 8x8 defaults; DC default 8.
+        // 16x16 reuses the 8x8 defaults; the default DC is 16 (§7.4.5:
+        // scaling_list_dc_coef_minus8 inferred to 8 ⇒ 8 + 8).
         assert_eq!(data.lists[2][0].coef, DEFAULT_8X8_INTRA.to_vec());
-        assert_eq!(data.lists[2][0].dc_coef, 8);
+        assert_eq!(data.lists[2][0].dc_coef, 16);
         assert_eq!(data.lists[2][3].coef, DEFAULT_8X8_INTER.to_vec());
         // 32x32 visits only matrixId 0 (intra) and 3 (inter).
         assert_eq!(data.lists[3][0].coef, DEFAULT_8X8_INTRA.to_vec());
         assert_eq!(data.lists[3][3].coef, DEFAULT_8X8_INTER.to_vec());
-        assert_eq!(data.lists[3][0].dc_coef, 8);
+        assert_eq!(data.lists[3][0].dc_coef, 16);
     }
 
     /// Coefficient-numbering: sizeId 0 carries 16, sizeId 1..3 carry 64.
@@ -949,9 +968,9 @@ mod tests {
         let intra = &f.factors[3][0];
         assert_eq!(intra.dim, 32);
         assert_eq!(intra.coef.len(), 1024);
-        // Default DC is 8; the i=0 list coef is 16, so the (1..4, 0)
-        // cells in the top-left 4x4 block are 16 while [0][0] is 8.
-        assert_eq!(intra.at(0, 0), 8);
+        // The default DC is 16 (scaling_list_dc_coef_minus8 inferred
+        // to 8), matching the i=0 list coefficient.
+        assert_eq!(intra.at(0, 0), 16);
         assert_eq!(intra.at(1, 0), 16);
         assert_eq!(intra.at(3, 3), 16);
         // Inter Y (matrixId 3) is also derived.
@@ -974,9 +993,9 @@ mod tests {
             let mat = &f.factors[3][m];
             assert_eq!(mat.dim, 32);
             // Derived from the default 16x16 list (intra for m<3, inter
-            // otherwise) ⇒ not all-zero; DC default 8 at [0][0].
+            // otherwise) ⇒ not all-zero; the default DC 16 at [0][0].
             assert!(mat.coef.iter().any(|&c| c != 0));
-            assert_eq!(mat.at(0, 0), 8);
+            assert_eq!(mat.at(0, 0), 16);
         }
         // The chroma 32x32 matrix matches the 16x16 luma-scan placement
         // of the same matrixId's 8x8 default table, replicated 4x4.

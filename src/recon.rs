@@ -35,6 +35,7 @@ use crate::intra_pred::{
     MarkedReferenceSamples, INTRA_DC,
 };
 use crate::picture::{clip1, sub_wh_c, Picture, Plane};
+use crate::scaling_list::ScalingFactors;
 use crate::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
 use crate::transform::{
     residual_block, BlockParams, Component as TfComponent, PredMode, TransformError,
@@ -90,7 +91,7 @@ impl From<TransformError> for ReconError {
 /// SPS / PPS / slice-derived state constant across one picture's intra
 /// reconstruction. Every field is a §8 input the per-block prediction /
 /// dequantization reads.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReconParams {
     /// `ChromaArrayType` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2,
     /// 3 = 4:4:4).
@@ -115,6 +116,46 @@ pub struct ReconParams {
     pub transform_skip_rotation_enabled: bool,
     /// `extended_precision_processing_flag`.
     pub extended_precision: bool,
+    /// The active §7.4.5 `ScalingFactor` matrices when
+    /// `scaling_list_enabled_flag == 1` (the PPS `scaling_list_data()`
+    /// if present, else the SPS body, else the default lists); `None`
+    /// when the flag is 0 (the §8.6.3 flat-16 path).
+    pub scaling: Option<ScalingFactors>,
+}
+
+/// §8.6.3 `m[ x ][ y ]` source selection: the `ScalingFactor[ sizeId ]
+/// [ matrixId ]` matrix for a transform block, or `None` for the flat
+/// 16 (scaling lists disabled, or the `transform_skip_flag == 1 &&
+/// nTbS > 4` exception).
+///
+/// `sizeId` is Table 7-3 (`log2(nTbS) − 2`); `matrixId` is Table 7-4
+/// (`(CuPredMode == MODE_INTRA ? 0 : 3) + cIdx`).
+fn scaling_matrix(
+    params: &ReconParams,
+    n_tbs: usize,
+    pred_mode: PredMode,
+    cidx: TfComponent,
+    transform_skip: bool,
+) -> Option<&crate::scaling_list::ScalingFactorMatrix> {
+    let sf = params.scaling.as_ref()?;
+    if transform_skip && n_tbs > 4 {
+        return None;
+    }
+    let size_id = match n_tbs {
+        4 => 0usize,
+        8 => 1,
+        16 => 2,
+        _ => 3,
+    };
+    let matrix_id = match pred_mode {
+        PredMode::Intra => 0usize,
+        _ => 3,
+    } + match cidx {
+        TfComponent::Luma => 0usize,
+        TfComponent::Cb => 1,
+        TfComponent::Cr => 2,
+    };
+    Some(&sf.factors[size_id][matrix_id])
 }
 
 /// `QpBdOffsetY = 6 * bit_depth_luma_minus8` (§7.4.3.2.1, eq. 7-4).
@@ -296,7 +337,8 @@ fn reconstruct_intra_block(
                 transform_skip,
                 transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
             };
-            Some(residual_block(levels, None, bp)?)
+            let m = scaling_matrix(params, n_tbs, PredMode::Intra, cidx, transform_skip);
+            Some(residual_block(levels, m, bp)?)
         }
         None => None,
     };
@@ -808,7 +850,8 @@ fn inter_residual_block(
         transform_skip: false,
         transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
     };
-    Ok(residual_block(&rb.levels, None, bp)?)
+    let m = scaling_matrix(params, n_tbs, PredMode::Inter, cidx, false);
+    Ok(residual_block(&rb.levels, m, bp)?)
 }
 
 /// Per-picture intra-reconstruction neighbour state — the §8.4.2
@@ -1989,6 +2032,7 @@ mod tests {
             cr_qp_offset: 0,
             transform_skip_rotation_enabled: false,
             extended_precision: false,
+            scaling: None,
         }
     }
 

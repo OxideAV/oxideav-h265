@@ -1053,6 +1053,7 @@ mod tests {
             cr_qp_offset: 0,
             transform_skip_rotation_enabled: false,
             extended_precision: false,
+            scaling: None,
         }
     }
 

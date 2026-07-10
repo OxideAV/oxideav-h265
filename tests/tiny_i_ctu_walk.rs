@@ -224,6 +224,7 @@ fn tiny_i_reconstructs_expected_yuv_end_to_end() {
         cr_qp_offset: 0,
         transform_skip_rotation_enabled: false,
         extended_precision: false,
+        scaling: None,
     };
     let mut pic = Picture::new(16, 16, 1, 8, 8);
     reconstruct_intra_ctu(&mut pic, &recon_params, &ctu).unwrap();
@@ -288,6 +289,7 @@ fn tiny_i_picture_driver_reconstructs_expected_yuv_with_sao() {
         cr_qp_offset: 0,
         transform_skip_rotation_enabled: false,
         extended_precision: false,
+        scaling: None,
     };
     let pic_params = IntraPictureParams {
         ctb_log2_size_y: 4,

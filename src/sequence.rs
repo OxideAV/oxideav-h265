@@ -937,6 +937,20 @@ fn build_recon_params(
         .slice_qp_y(pps)
         .ok_or(SequenceError::Malformed("slice header without slice_qp"))?;
     let range = sps.sps_range_extension.as_ref();
+    // §7.4.5: when scaling_list_enabled_flag == 1 the active
+    // scaling-list data is the PPS body if present, else the SPS body
+    // if present, else the default lists.
+    let scaling = if sps.scaling_list_enabled_flag {
+        let factors = match (&pps.scaling_list_data, &sps.scaling_list_data) {
+            (Some(d), _) => d.scaling_factors(geom.chroma_array_type),
+            (None, Some(d)) => d.scaling_factors(geom.chroma_array_type),
+            (None, None) => crate::scaling_list::ScalingListData::all_default()
+                .scaling_factors(geom.chroma_array_type),
+        };
+        Some(factors)
+    } else {
+        None
+    };
     Ok(ReconParams {
         chroma_array_type: geom.chroma_array_type,
         bit_depth_luma: sps.bit_depth_luma_minus8 + 8,
@@ -949,6 +963,7 @@ fn build_recon_params(
         transform_skip_rotation_enabled: range
             .is_some_and(|r| r.transform_skip_rotation_enabled_flag),
         extended_precision: range.is_some_and(|r| r.extended_precision_processing_flag),
+        scaling,
     })
 }
 
