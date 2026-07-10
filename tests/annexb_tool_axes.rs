@@ -90,3 +90,19 @@ fn wpp_with_slices_decodes_byte_exact() {
 fn open_gop_cra_decodes_byte_exact() {
     assert_decodes_byte_exact(OPENGOP_HEVC, OPENGOP_YUV, 8, "r410-open-gop");
 }
+
+/// 4:2:2 10-bit I/P/B GOP on textured content: the §7.3.8.8
+/// lower-half chroma cbf inheritance into 4x4 leaves and the
+/// §7.3.8.10 per-half pairing of the stacked chroma residual blocks
+/// (upper/lower coded independently).
+#[test]
+fn chroma_422_halves_decode_byte_exact() {
+    let frames = decode_annexb_sequence(M422_HEVC).expect("4:2:2 decode");
+    assert_eq!(frames.len(), 4, "4:2:2: frame count");
+    let mut out = Vec::new();
+    for f in &frames {
+        assert!(f.output, "4:2:2: every frame is an output frame");
+        out.extend(f.picture.to_planar_le16());
+    }
+    assert_eq!(out, M422_YUV, "4:2:2: byte-exact decode");
+}

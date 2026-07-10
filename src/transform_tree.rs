@@ -172,6 +172,13 @@ pub fn decode_transform_tree(
     blk_idx: u32,
     parent_cbf_cb: bool,
     parent_cbf_cr: bool,
+    // The `ChromaArrayType == 2` lower-half companions of the parent's
+    // cbf flags — a `log2TrafoSize == 3` split parent reads both halves
+    // and its 4x4 leaves code the parent chroma at `blkIdx == 3` gated
+    // per half (§7.3.8.10 `cbf_cb[ xBase ][ yBase + ( tIdx <<
+    // log2TrafoSizeC ) ][ trafoDepth ]`).
+    parent_cbf_cb_lower: bool,
+    parent_cbf_cr_lower: bool,
 ) -> Result<TransformTree, ResidualCodingError> {
     // §7.3.8.8: split_transform_flag is read only inside the gate
     //   log2TrafoSize <= MaxTbLog2SizeY && log2TrafoSize > MinTbLog2SizeY
@@ -238,9 +245,12 @@ pub fn decode_transform_tree(
         // deeper depths (the §7.3.8.10 transform_unit reads
         // cbf_cb[xC][yC][cbfDepthC] with cbfDepthC = trafoDepth − 1 for
         // the log2TrafoSize == 2 leaf), so a 4×4 luma leaf carries the
-        // parent's chroma cbf forward.
+        // parent's chroma cbf forward — BOTH halves for
+        // ChromaArrayType == 2.
         cbf_cb = parent_cbf_cb;
         cbf_cr = parent_cbf_cr;
+        cbf_cb_lower = parent_cbf_cb_lower;
+        cbf_cr_lower = parent_cbf_cr_lower;
     }
 
     if split {
@@ -267,6 +277,8 @@ pub fn decode_transform_tree(
                 idx,
                 cbf_cb,
                 cbf_cr,
+                cbf_cb_lower,
+                cbf_cr_lower,
             )
         };
         let tl = decode_child(x0, y0, 0)?;

@@ -78,6 +78,8 @@ fn decode_root(
         0,
         false,
         false,
+        false,
+        false,
     )
 }
 

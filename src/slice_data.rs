@@ -1152,6 +1152,8 @@ fn decode_intra_cu(
         0,
         false,
         false,
+        false,
+        false,
     )?;
     cu.transform_tree = Some(tree);
     Ok(())
@@ -1247,6 +1249,8 @@ fn decode_inter_cu(
             log2_cb_size,
             0,
             0,
+            false,
+            false,
             false,
             false,
         )?;

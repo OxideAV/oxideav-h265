@@ -179,6 +179,13 @@ pub struct TransformUnit {
     pub residual_cb: Vec<ResidualBlock>,
     /// The Cr `residual_coding()` blocks.
     pub residual_cr: Vec<ResidualBlock>,
+    /// Which chroma halves carried a coded Cb block: `[upper, lower]`
+    /// (`ChromaArrayType == 2`; the lower slot is always `false`
+    /// otherwise). Pairs [`Self::residual_cb`] entries — in coding
+    /// order — to their vertical positions.
+    pub cbf_cb_halves: [bool; 2],
+    /// Which chroma halves carried a coded Cr block: `[upper, lower]`.
+    pub cbf_cr_halves: [bool; 2],
 }
 
 /// The once-per-quantization-group decode state the §7.3.8.10 driver
@@ -226,6 +233,9 @@ pub fn decode_transform_unit(
     qg: &mut QuantGroupState,
 ) -> Result<TransformUnit, ResidualCodingError> {
     let mut tu = TransformUnit::default();
+    let lower = params.chroma_array_type == 2;
+    tu.cbf_cb_halves = [params.cbf_cb, lower && params.cbf_cb_lower];
+    tu.cbf_cr_halves = [params.cbf_cr, lower && params.cbf_cr_lower];
 
     // §7.3.8.10: cbfChroma = cbf_cb[..] || cbf_cr[..] ||
     // ( ChromaArrayType == 2 && ( cbf_cb[lower] || cbf_cr[lower] ) )

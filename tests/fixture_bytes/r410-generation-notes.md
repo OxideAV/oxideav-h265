@@ -1,10 +1,10 @@
 # Round-410 tool-axis conformance pins — generation notes
 
-Eight whole-bitstream decode pins (`r410.rs`), each an HEVC Annex B
+Nine whole-bitstream decode pins (`r410.rs`), each an HEVC Annex B
 stream produced by a black-box encoder binary plus the expected YUV
 captured from a black-box reference decode. Every stream targets a
 coding-tool axis that exposed a decoder bug during the round-410
-conformance sweep; all eight decode byte-exact.
+conformance sweep; all nine decode byte-exact.
 
 ## Tooling (black-box binary invocations only)
 
@@ -43,6 +43,7 @@ ffmpeg -threads 1 -i <name>.hevc -f rawvideo -pix_fmt yuv420p <name>.exp.yuv
 | `TSKIP` (grad96x64, 4 frames) | `--no-wpp --tskip --bframes 2 --b-adapt 0 --frames 4` | §7.3.8.11 transform_skip_flag + §8.6.2 transform-skip path |
 | `WPPSLICES` (src192 192x192, 1 frame) | `--wpp --slices 2 --keyint 1 --frames 1` | WPP + multiple slices: per-slice init, in-slice §9.3.2.5 row sync, entry point in slice 2 |
 | `OPENGOP` (src96x64, 8 frames) | `--no-wpp --open-gop --keyint 4 --min-keyint 4 --bframes 2 --b-adapt 0 --frames 8` | CRA + leading pictures mid-stream (2 I / 2 P / 4 B) |
+| `M422` (src422 = testsrc2 96x64 yuv422p, 4 frames) | `--no-wpp --profile main422-10 -D 10 --bframes 2 --b-adapt 0 --frames 4` (expected via `-pix_fmt yuv422p10le`) | 4:2:2 lower-half cbf inheritance + stacked chroma-half residual pairing |
 
 ## SHA-256
 
@@ -56,6 +57,7 @@ ffmpeg -threads 1 -i <name>.hevc -f rawvideo -pix_fmt yuv420p <name>.exp.yuv
 | `TSKIP` | `7ca4a85f01b598d389268f6e07b1c8a61087c103ec06fd6f42fadba874d1665d` (2570) | `07e2744ee7af212342b3bf4db49a9a42fb35284ba9f2d33304b3dad0aedd0006` (36864) |
 | `WPPSLICES` | `4f57be9f0744ab5e015218f07935e84d516b61b35673e3f5df87fadc9f5579a4` (5885) | `b2046d338f763ea70a776406c06091d5ae541dca13c99e5b7405a1efe5dcafc4` (55296) |
 | `OPENGOP` | `42d7968f0231949d0d5aca3cfcccedd54a35f33c4ffcae593c39fd0d38073b36` (5377) | `bb3c63bf79ce0c45016c25827962a52bf44b80be65e5a1b5c1d0b0938f723e1c` (73728) |
+| `M422` | `b64bafb8030f56225752774d86b4ef938f499c003e0e94f0f69dbcbb3aeb8e78` (3927) | `7e772138ba07c664cc6965e9eab496ced646ae7f4cca77a091953d8a91904f7a` (98304) |
 
 ## Round-410 sweep record (beyond the pinned streams)
 
@@ -68,6 +70,12 @@ at 10-bit (`-D 10`), `--aq-mode 2 --qg-size 16` (cu_qp_delta),
 `--hrd --aud --repeat-headers` under VBV, `--temporal-layers`,
 `--radl 2`, `--weightp --weightb`, `--tu-intra-depth 4`,
 plain `--wpp`, and `--wpp --slices 2/3` at 320x256.
+
+Additional 4:2:2 / 4:4:4 byte-exact sweep records: `main422-10` at
+8- and 10-bit (all-intra keyint 1, P-only, B GOPs, `--rect
+--tu-inter-depth 3`, `--tskip`, `--scaling-list default`) plus
+`main444-8` GOPs (`4:2:2` source: `testsrc2` yuv422p; `4:4:4`:
+`gradients` yuv444p).
 
 Note: `--wpp --slices 2` at 128x96 makes x265 disable WPP internally
 ("Too few rows/columns") and emit a truncated second-slice NAL that

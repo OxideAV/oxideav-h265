@@ -785,6 +785,7 @@ fn extract_residual_tree(
                     write_chroma_residual_blocks(
                         params,
                         &unit.residual_cb,
+                        unit.cbf_cb_halves,
                         TfComponent::Cb,
                         qp,
                         transquant_bypass,
@@ -799,6 +800,7 @@ fn extract_residual_tree(
                     write_chroma_residual_blocks(
                         params,
                         &unit.residual_cr,
+                        unit.cbf_cr_halves,
                         TfComponent::Cr,
                         qp,
                         transquant_bypass,
@@ -821,6 +823,7 @@ fn extract_residual_tree(
 fn write_chroma_residual_blocks(
     params: &ReconParams,
     blocks: &[crate::residual::ResidualBlock],
+    coded_halves: [bool; 2],
     cidx: TfComponent,
     qp: u32,
     transquant_bypass: bool,
@@ -829,11 +832,21 @@ fn write_chroma_residual_blocks(
     sub_h: usize,
     plane: &mut CuResidualPlane,
 ) -> Result<(), ReconError> {
-    for (i, rb) in blocks.iter().enumerate() {
+    // §7.3.8.10 codes the halves upper-then-lower, each gated on its
+    // own cbf (`sub_h == 1` ⇔ ChromaArrayType == 2 stacked pair) — pair
+    // the residual list entries to the coded halves.
+    let mut next_block = 0usize;
+    let halves = if sub_h == 1 { 2 } else { 1 };
+    for (v, &coded) in coded_halves.iter().enumerate().take(halves) {
+        if !coded {
+            continue;
+        }
+        let Some(rb) = blocks.get(next_block) else {
+            break;
+        };
+        next_block += 1;
         let n = rb.size();
-        // The §7.3.8.10 4:2:2 stacked-sub-block pair places the second
-        // block one chroma transform-block height below.
-        let by = if i == 1 && sub_h == 1 { yc + n } else { yc };
+        let by = if v == 1 { yc + n } else { yc };
         let res = inter_residual_block(params, rb, cidx, qp, transquant_bypass)?;
         plane.write_block(xc, by, n, &res);
     }
@@ -1814,6 +1827,7 @@ fn reconstruct_deferred_chroma(
         Plane::Cb,
         TfComponent::Cb,
         &unit.residual_cb,
+        unit.cbf_cb_halves,
         xc,
         yc,
         n_tbs_c,
@@ -1828,6 +1842,7 @@ fn reconstruct_deferred_chroma(
         Plane::Cr,
         TfComponent::Cr,
         &unit.residual_cr,
+        unit.cbf_cr_halves,
         xc,
         yc,
         n_tbs_c,
@@ -1987,6 +2002,7 @@ fn reconstruct_transform_unit(
             Plane::Cb,
             TfComponent::Cb,
             &unit.residual_cb,
+            unit.cbf_cb_halves,
             xc,
             yc,
             n_tbs_c,
@@ -2001,6 +2017,7 @@ fn reconstruct_transform_unit(
             Plane::Cr,
             TfComponent::Cr,
             &unit.residual_cr,
+            unit.cbf_cr_halves,
             xc,
             yc,
             n_tbs_c,
@@ -2020,6 +2037,7 @@ fn reconstruct_chroma_blocks(
     plane: Plane,
     cidx: TfComponent,
     residual_blocks: &[crate::residual::ResidualBlock],
+    coded_halves: [bool; 2],
     xc: usize,
     yc: usize,
     n_tbs_c: usize,
@@ -2033,17 +2051,21 @@ fn reconstruct_chroma_blocks(
     // with no coded residual (cbf clear) is still intra-PREDICTED — only
     // the residual add is skipped.
     let vertical_blocks = if params.chroma_array_type == 2 { 2 } else { 1 };
-    for v in 0..vertical_blocks {
-        // §7.3.8.10 residual order is upper-then-lower; a single coded
-        // block with `ChromaArrayType == 2` is ambiguous without the cbf
-        // pair, so pair positionally (exact for 0- and 2-entry lists —
-        // the 4:2:2 single-cbf case is a tracked follow-up).
-        let levels = residual_blocks.get(v).map(|rb| rb.levels.as_slice());
-        let ts = residual_blocks.get(v).is_some_and(|rb| rb.transform_skip);
-        if residual_blocks
-            .get(v)
-            .is_some_and(|rb| rb.explicit_rdpcm_flag)
-        {
+    let mut next_block = 0usize;
+    for (v, &half_coded) in coded_halves.iter().enumerate().take(vertical_blocks) {
+        // §7.3.8.10 codes the halves upper-then-lower, each gated on
+        // its own cbf — pair the residual list entries to the coded
+        // halves.
+        let block = if half_coded {
+            let b = residual_blocks.get(next_block);
+            next_block += 1;
+            b
+        } else {
+            None
+        };
+        let levels = block.map(|rb| rb.levels.as_slice());
+        let ts = block.is_some_and(|rb| rb.transform_skip);
+        if block.is_some_and(|rb| rb.explicit_rdpcm_flag) {
             return Err(ReconError::RdpcmNotSupported);
         }
         reconstruct_intra_block(
@@ -2119,9 +2141,11 @@ mod tests {
         };
         if let Some(d) = cb_dc {
             unit.residual_cb = vec![dc_block(3, d)];
+            unit.cbf_cb_halves = [true, false];
         }
         if let Some(d) = cr_dc {
             unit.residual_cr = vec![dc_block(3, d)];
+            unit.cbf_cr_halves = [true, false];
         }
         let tree = TransformTree::Leaf {
             cbf_luma: true,
