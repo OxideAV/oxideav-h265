@@ -6,6 +6,62 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — decode-conformance round 410 (2026-07-11)
+
+Black-box whole-stream conformance sweep across encoder tool axes
+(37 streams, all now byte-exact; nine new embedded pins in
+`tests/annexb_tool_axes.rs`). Decoder fixes, all against the spec
+text:
+
+- **§8.5.3.2.9 collocated listCol selection**: for a bi-predicted
+  collocated block, `NoBackwardPredFlag == 1` selects the collocated
+  LX motion of the list being derived (the code always read L0), and
+  otherwise listCol is LN with N being the VALUE of
+  `collocated_from_l0_flag` (the selection was inverted). Broke
+  temporal merge/AMVP candidates whenever a reference B picture
+  served as the collocated picture (B pyramids, temporal layers,
+  open-GOP, RADL streams).
+- **§8.6.3 scaling lists were never applied**: the §7.3.4 parse
+  existed but reconstruction always dequantized with the flat 16.
+  ReconParams now carries the active ScalingFactor matrices (PPS
+  body, else SPS body, else default lists) selected per Tables
+  7-3/7-4 in both intra and inter paths, with the transform-skip
+  `nTbS > 4` exception. Also fixes the inferred DC scaling factor of
+  default / delta-0 lists (16, not 8 — §7.4.5).
+- **§8.4.4.2.3 strong intra smoothing**: the eq 8-37/8-39 bilinear
+  loops left reference index 62 unfilled (the spec range `0..62` is
+  inclusive), corrupting smooth-gradient 32x32 intra blocks.
+- **§7.3.8.10 deferred chroma in the inter path**: transform trees
+  splitting to 4x4 luma leaves carry the parent's chroma on the
+  `blkIdx == 3` child; the inter residual extraction wrote those
+  blocks at the child's coordinates instead of the parent's
+  (chroma shifted by two samples on rect/AMP + deep-RQT streams).
+- **§8.4.4.2.1 constrained_intra_pred_flag** is now enforced:
+  reference samples from non-intra coding units are unavailable for
+  intra prediction in P/B pictures (previously parsed but ignored).
+- **§7.3.8.11 transform_skip_flag** is now decoded (the leading
+  residual_coding element desynchronized the CABAC walk on
+  `transform_skip_enabled_flag` streams) and honoured end to end:
+  Table 9-25 contexts, the explicit-RDPCM syntax pair (parsed;
+  §8.6.8 reconstruction rejected explicitly as unimplemented), the
+  signHidden suppression, the §9.3.4.2.5 sig-ctx gate, the §8.6.2
+  tsShift path and the §8.6.3 flat-16 exception.
+- **4:2:2 chroma halves**: a `log2TrafoSize == 3` split node's
+  lower-half cbf flags now reach its 4x4 leaves (the recursion only
+  passed the upper flags — CABAC desync), and the stacked
+  upper/lower chroma residual blocks are paired to their coded
+  halves instead of positionally (a lower-half-only residual was
+  written into the upper half).
+
+### Added — decode-conformance round 410
+
+- Nine embedded tool-axis pins (B-pyramid TMVP, default scaling
+  lists, strong intra smoothing, rect/AMP deferred chroma,
+  constrained intra, transform skip, WPP+2-slices, open-GOP CRA with
+  leading pictures, 4:2:2 10-bit I/P/B) with generation commands and
+  SHA-256 sums in `tests/fixture_bytes/r410-generation-notes.md`.
+
+
 ### Added — clean-room rebuild round 396 (2026-07-07)
 
 - **P-slice inter encoder** (`encoder::inter::encode_low_delay_p`):

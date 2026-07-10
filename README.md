@@ -14,7 +14,9 @@ through the whole-bitstream driver (`decode_annexb_sequence` /
 `SequenceDecoder`) and the `oxideav_core::Decoder` registry entry
 (`make_decoder`, ids `"h265"` / `"hevc"`, `hvc1` / `hev1` / `HEVC`
 FourCCs, MP4 ObjectTypeIndication, Matroska tag) — plus self-built
-conformance pins for the features the corpus lacks. Coverage:
+conformance pins for the features the corpus lacks, and a 37-stream
+black-box tool-axis sweep (round 410) held byte-exact by nine
+embedded pins. Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -35,6 +37,14 @@ conformance pins for the features the corpus lacks. Coverage:
   WPP row conditions, §8.6.1 per-tile `qPY_PREV` resets;
 * §8.5.3.3.4.3 explicit weighted prediction (P uni and B uni/bi, with
   non-default per-slice weights / offsets / denominators);
+* B pyramids / temporal layers / open-GOP CRA + leading pictures /
+  RADL streams (a bi-predicted reference B as the §8.5.3.2.9
+  collocated picture), §7.4.5 scaling lists (default + explicit, all
+  TB sizes, intra + inter), §8.4.4.2.3 strong intra smoothing,
+  §8.4.4.2.1 constrained intra prediction, §7.3.8.11 transform skip,
+  rectangular/AMP partitions with deep inter RQTs (§7.3.8.10 deferred
+  chroma), WPP combined with multiple slices per picture, and
+  4:2:2 stacked chroma halves (per-half cbf gating and placement);
 * §7.3.8.7 PCM coding units, incl. the §8.7.2.5.4 / §8.7.3.1
   loop-filter suppression (`pcm_loop_filter_disabled_flag`, and
   transquant-bypass CUs);
@@ -123,12 +133,13 @@ conformance pins for the features the corpus lacks. Coverage:
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Twenty-four embedded-fixture regression pins (the 17-stream staged
+Thirty-three embedded-fixture regression pins (the 17-stream staged
 corpus incl. true tiles + self-built weighted-prediction,
-per-slice-loop-filter, hvcC, golden-intra-interop and golden-P-GOP
-interop pins), lossless PCM / exact-reconstruction intra / bit-exact
-low-delay-GOP encoder↔decoder roundtrips at multiple geometries /
-QPs / partitions / slice types, and ~890 unit tests.
+per-slice-loop-filter, hvcC, golden-intra-interop, golden-P-GOP
+interop, and the nine round-410 tool-axis conformance pins), lossless
+PCM / exact-reconstruction intra / bit-exact low-delay-GOP
+encoder↔decoder roundtrips at multiple geometries / QPs / partitions /
+slice types, and ~900 unit tests.
 
 ## Not yet implemented
 
@@ -139,6 +150,9 @@ QPs / partitions / slice types, and ~890 unit tests.
   signalling (bi arises via merge candidates only).
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
+* §8.6.8 explicit-RDPCM *reconstruction* (a range-extensions coding
+  tool): the §7.3.8.11 `explicit_rdpcm_flag` syntax is parsed
+  bit-exactly and such blocks are rejected with a clear error.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both
