@@ -77,6 +77,11 @@ fn tiny_i_params() -> SliceDataParams {
         sign_data_hiding_enabled_flag: true,
         cross_component_prediction_enabled_flag: false,
         residual_adaptive_colour_transform_enabled_flag: false,
+        transform_skip_enabled_flag: false,
+        log2_max_transform_skip_size: 2,
+        implicit_rdpcm_enabled_flag: false,
+        explicit_rdpcm_enabled_flag: false,
+        transform_skip_context_enabled_flag: false,
     }
 }
 

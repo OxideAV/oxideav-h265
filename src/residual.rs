@@ -388,6 +388,16 @@ pub struct ResidualBlock {
     /// `(1 << log2_trafo_size)²`. Positions past the last
     /// significant coefficient and in uncoded sub-blocks are 0.
     pub levels: Vec<i32>,
+    /// `transform_skip_flag[ x0 ][ y0 ][ cIdx ]` (§7.3.8.11) — decoded
+    /// by the transform-unit driver before this block's coefficients;
+    /// `false` when the §7.3.8.11 presence gate did not fire.
+    pub transform_skip: bool,
+    /// `explicit_rdpcm_flag[ x0 ][ y0 ][ cIdx ]` (§7.3.8.11, range
+    /// extensions) — parsed for bit-exactness; the §8.6.8 RDPCM
+    /// reconstruction is a follow-up (reconstruction rejects it).
+    pub explicit_rdpcm_flag: bool,
+    /// `explicit_rdpcm_dir_flag[ x0 ][ y0 ][ cIdx ]` (§7.3.8.11).
+    pub explicit_rdpcm_dir_flag: bool,
 }
 
 impl ResidualBlock {
@@ -816,6 +826,9 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         last_sig_coeff_x: last_x,
         last_sig_coeff_y: last_y,
         levels,
+        transform_skip: false,
+        explicit_rdpcm_flag: false,
+        explicit_rdpcm_dir_flag: false,
     })
 }
 

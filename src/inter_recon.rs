@@ -1117,6 +1117,9 @@ mod tests {
                         last_sig_coeff_x: 0,
                         last_sig_coeff_y: 0,
                         levels,
+                        transform_skip: false,
+                        explicit_rdpcm_flag: false,
+                        explicit_rdpcm_dir_flag: false,
                     }),
                     ..Default::default()
                 },

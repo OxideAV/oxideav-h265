@@ -139,6 +139,22 @@ pub struct SliceDataParams {
     /// SCC `residual_adaptive_colour_transform_enabled_flag`
     /// (§7.4.3.3.1).
     pub residual_adaptive_colour_transform_enabled_flag: bool,
+    /// PPS `transform_skip_enabled_flag` (§7.4.3.3.1) — the §7.3.8.11
+    /// `transform_skip_flag` presence gate.
+    pub transform_skip_enabled_flag: bool,
+    /// `Log2MaxTransformSkipSize` (§7.4.3.3.2) —
+    /// `log2_max_transform_skip_block_size_minus2 + 2` (2 when the PPS
+    /// range extension is absent).
+    pub log2_max_transform_skip_size: u32,
+    /// SPS range extension `implicit_rdpcm_enabled_flag` (§7.4.3.2.2)
+    /// — part of the §7.3.8.11 `signHidden` condition.
+    pub implicit_rdpcm_enabled_flag: bool,
+    /// SPS range extension `explicit_rdpcm_enabled_flag` (§7.4.3.2.2)
+    /// — the §7.3.8.11 `explicit_rdpcm_flag` presence gate.
+    pub explicit_rdpcm_enabled_flag: bool,
+    /// SPS range extension `transform_skip_context_enabled_flag`
+    /// (§7.4.3.2.2) — the §9.3.4.2.5 transform-skip sig-ctx gate.
+    pub transform_skip_context_enabled_flag: bool,
 }
 
 /// §7.4.9.3 decoded SAO parameters for one colour component of one CTB.
@@ -589,6 +605,11 @@ fn tu_template(
         cross_component_prediction_enabled_flag: params.cross_component_prediction_enabled_flag,
         residual_adaptive_colour_transform_enabled_flag: params
             .residual_adaptive_colour_transform_enabled_flag,
+        transform_skip_enabled_flag: params.transform_skip_enabled_flag,
+        log2_max_transform_skip_size: params.log2_max_transform_skip_size,
+        implicit_rdpcm_enabled_flag: params.implicit_rdpcm_enabled_flag,
+        explicit_rdpcm_enabled_flag: params.explicit_rdpcm_enabled_flag,
+        transform_skip_context_enabled_flag: params.transform_skip_context_enabled_flag,
         part_mode_2nx2n,
         intra_chroma_pred_mode_corners: [0; 4],
     }

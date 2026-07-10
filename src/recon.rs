@@ -55,6 +55,9 @@ pub enum ReconError {
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
+    /// The residual block signalled §7.3.8.11 `explicit_rdpcm_flag`;
+    /// the §8.6.8 RDPCM reconstruction is not implemented yet.
+    RdpcmNotSupported,
     /// The §6.4.1 picture-tiling geometry needed for neighbour
     /// availability could not be built.
     Tiling(crate::availability::AvailabilityError),
@@ -66,6 +69,9 @@ impl core::fmt::Display for ReconError {
             Self::IntraPred(e) => write!(f, "intra prediction failed: {e}"),
             Self::Transform(e) => write!(f, "inverse transform failed: {e}"),
             Self::InterPred(e) => write!(f, "inter prediction failed: {e}"),
+            Self::RdpcmNotSupported => {
+                f.write_str("explicit RDPCM residual (§8.6.8) is not implemented")
+            }
             Self::InterNotSupported => {
                 f.write_str("inter prediction is not reconstructed by the intra path")
             }
@@ -849,6 +855,9 @@ fn inter_residual_block(
         TfComponent::Luma => params.bit_depth_luma,
         TfComponent::Cb | TfComponent::Cr => params.bit_depth_chroma,
     };
+    if rb.explicit_rdpcm_flag {
+        return Err(ReconError::RdpcmNotSupported);
+    }
     let bp = BlockParams {
         n_tbs,
         q_p: qp,
@@ -857,10 +866,10 @@ fn inter_residual_block(
         bit_depth,
         extended_precision: params.extended_precision,
         transquant_bypass,
-        transform_skip: false,
+        transform_skip: rb.transform_skip,
         transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
     };
-    let m = scaling_matrix(params, n_tbs, PredMode::Inter, cidx, false);
+    let m = scaling_matrix(params, n_tbs, PredMode::Inter, cidx, rb.transform_skip);
     Ok(residual_block(&rb.levels, m, bp)?)
 }
 
@@ -1926,6 +1935,17 @@ fn reconstruct_transform_unit(
     // Luma block: `qp_y` is the CU's §8.6.1-derived QpY.
     let luma_qp = luma_qp(params, qp_y);
     let luma_levels = unit.residual_luma.as_ref().map(|rb| rb.levels.as_slice());
+    let luma_ts = unit
+        .residual_luma
+        .as_ref()
+        .is_some_and(|rb| rb.transform_skip);
+    if unit
+        .residual_luma
+        .as_ref()
+        .is_some_and(|rb| rb.explicit_rdpcm_flag)
+    {
+        return Err(ReconError::RdpcmNotSupported);
+    }
     reconstruct_intra_block(
         pic,
         params,
@@ -1940,7 +1960,7 @@ fn reconstruct_transform_unit(
         luma_levels,
         luma_qp,
         transquant_bypass,
-        false,
+        luma_ts,
     )?;
 
     // Chroma blocks. For 4:2:0 / 4:2:2 the chroma transform block sits at
@@ -2019,6 +2039,13 @@ fn reconstruct_chroma_blocks(
         // pair, so pair positionally (exact for 0- and 2-entry lists —
         // the 4:2:2 single-cbf case is a tracked follow-up).
         let levels = residual_blocks.get(v).map(|rb| rb.levels.as_slice());
+        let ts = residual_blocks.get(v).is_some_and(|rb| rb.transform_skip);
+        if residual_blocks
+            .get(v)
+            .is_some_and(|rb| rb.explicit_rdpcm_flag)
+        {
+            return Err(ReconError::RdpcmNotSupported);
+        }
         reconstruct_intra_block(
             pic,
             params,
@@ -2033,7 +2060,7 @@ fn reconstruct_chroma_blocks(
             levels,
             qp,
             transquant_bypass,
-            false,
+            ts,
         )?;
     }
     Ok(())
@@ -2077,6 +2104,9 @@ mod tests {
             last_sig_coeff_x: 0,
             last_sig_coeff_y: 0,
             levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: false,
+            explicit_rdpcm_dir_flag: false,
         }
     }
 

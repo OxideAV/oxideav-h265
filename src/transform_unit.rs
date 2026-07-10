@@ -129,6 +129,18 @@ pub struct TransformUnitParams {
     /// SCC `residual_adaptive_colour_transform_enabled_flag`
     /// (§7.4.3.3.1) — the §7.3.8.10 `tu_residual_act_flag` outer gate.
     pub residual_adaptive_colour_transform_enabled_flag: bool,
+    /// PPS `transform_skip_enabled_flag` (§7.4.3.3.1) — the §7.3.8.11
+    /// `transform_skip_flag` presence gate.
+    pub transform_skip_enabled_flag: bool,
+    /// `Log2MaxTransformSkipSize` (§7.4.3.3.2).
+    pub log2_max_transform_skip_size: u32,
+    /// SPS range extension `implicit_rdpcm_enabled_flag` (§7.4.3.2.2).
+    pub implicit_rdpcm_enabled_flag: bool,
+    /// SPS range extension `explicit_rdpcm_enabled_flag` (§7.4.3.2.2).
+    pub explicit_rdpcm_enabled_flag: bool,
+    /// SPS range extension `transform_skip_context_enabled_flag`
+    /// (§7.4.3.2.2).
+    pub transform_skip_context_enabled_flag: bool,
     /// `PartMode == PART_2Nx2N` — part of the §7.3.8.10
     /// adaptive-colour-transform predicate.
     pub part_mode_2nx2n: bool,
@@ -423,21 +435,61 @@ fn decode_one_residual(
         params.chroma_array_type,
         pred_mode_intra,
     );
+
+    // §7.3.8.11 leading elements: transform_skip_flag when the PPS
+    // enables transform skip, the CU is not transquant-bypassed, and
+    // the block is within Log2MaxTransformSkipSize.
+    let mut transform_skip = false;
+    if params.transform_skip_enabled_flag
+        && !params.cu_transquant_bypass_flag
+        && log2_trafo_size <= params.log2_max_transform_skip_size
+    {
+        // Table 9-25 contexts: slot 0 luma (cIdx == 0), slot 1 chroma.
+        let slot = usize::from(c_idx > 0);
+        transform_skip = engine.decode_decision(&mut ctx.transform_skip_flag[slot])? != 0;
+    }
+    // §7.3.8.11: explicit_rdpcm_flag / explicit_rdpcm_dir_flag (range
+    // extensions) for inter blocks under transform skip / bypass.
+    let mut explicit_rdpcm_flag = false;
+    let mut explicit_rdpcm_dir_flag = false;
+    if params.cu_pred_mode == CuPredMode::Inter
+        && params.explicit_rdpcm_enabled_flag
+        && (transform_skip || params.cu_transquant_bypass_flag)
+    {
+        let slot = usize::from(c_idx > 0);
+        explicit_rdpcm_flag = engine.decode_decision(&mut ctx.explicit_rdpcm_flag[slot])? != 0;
+        if explicit_rdpcm_flag {
+            explicit_rdpcm_dir_flag =
+                engine.decode_decision(&mut ctx.explicit_rdpcm_dir_flag[slot])? != 0;
+        }
+    }
+
+    // §7.3.8.11 signHidden: forced to 0 for transquant bypass, for the
+    // implicit-RDPCM intra horizontal/vertical transform-skip case
+    // (predModeIntra 10 / 26), and for explicit RDPCM.
+    let implicit_rdpcm = params.cu_pred_mode.is_intra()
+        && params.implicit_rdpcm_enabled_flag
+        && transform_skip
+        && (pred_mode_intra == 10 || pred_mode_intra == 26);
     let rc_params = ResidualCodingParams {
         log2_trafo_size,
         is_chroma: c_idx > 0,
         scan_idx,
         sign_data_hiding_enabled_flag: params.sign_data_hiding_enabled_flag,
-        // The §7.3.8.11 signHidden-force condition and the §9.3.4.2.5
-        // transform-skip sig-ctx gate are forwarded as the caller's
-        // transform-tree context. The driver leaves them at their
-        // conservative defaults (no force, no transform-skip sig ctx);
-        // a transform-tree integration that wires transform_skip_flag /
-        // explicit_rdpcm_flag / cu_transquant_bypass_flag sets them.
-        sign_hidden_suppressed: params.cu_transquant_bypass_flag,
-        transform_skip_sig_ctx: false,
+        sign_hidden_suppressed: params.cu_transquant_bypass_flag
+            || implicit_rdpcm
+            || explicit_rdpcm_flag,
+        // §9.3.4.2.5 — the transform-skip sig-ctx selection applies
+        // when transform_skip_context_enabled_flag is set and the block
+        // is transform-skipped or transquant-bypassed.
+        transform_skip_sig_ctx: params.transform_skip_context_enabled_flag
+            && (transform_skip || params.cu_transquant_bypass_flag),
     };
-    decode_residual_coding(engine, &mut ctx.residual, &rc_params)
+    let mut rb = decode_residual_coding(engine, &mut ctx.residual, &rc_params)?;
+    rb.transform_skip = transform_skip;
+    rb.explicit_rdpcm_flag = explicit_rdpcm_flag;
+    rb.explicit_rdpcm_dir_flag = explicit_rdpcm_dir_flag;
+    Ok(rb)
 }
 
 #[cfg(test)]
@@ -467,6 +519,11 @@ mod tests {
             sign_data_hiding_enabled_flag: false,
             cross_component_prediction_enabled_flag: false,
             residual_adaptive_colour_transform_enabled_flag: false,
+            transform_skip_enabled_flag: false,
+            log2_max_transform_skip_size: 2,
+            implicit_rdpcm_enabled_flag: false,
+            explicit_rdpcm_enabled_flag: false,
+            transform_skip_context_enabled_flag: false,
             part_mode_2nx2n: true,
             intra_chroma_pred_mode_corners: [0; 4],
         }

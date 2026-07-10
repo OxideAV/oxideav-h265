@@ -1178,6 +1178,21 @@ fn build_slice_data_params(
         cross_component_prediction_enabled_flag: pps_range
             .is_some_and(|r| r.cross_component_prediction_enabled_flag),
         residual_adaptive_colour_transform_enabled_flag: false,
+        transform_skip_enabled_flag: pps.transform_skip_enabled_flag,
+        log2_max_transform_skip_size: pps_range
+            .map_or(2, |r| r.log2_max_transform_skip_block_size_minus2 + 2),
+        implicit_rdpcm_enabled_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.implicit_rdpcm_enabled_flag),
+        explicit_rdpcm_enabled_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.explicit_rdpcm_enabled_flag),
+        transform_skip_context_enabled_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.transform_skip_context_enabled_flag),
     }
 }
 
