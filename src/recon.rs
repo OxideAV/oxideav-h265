@@ -760,10 +760,20 @@ fn extract_residual_tree(
                 luma.write_block(x0, y0, n_tbs, &res);
             }
             // Chroma residuals, positioned at the chroma-subsampled
-            // coordinates of this luma node.
+            // coordinates of this luma node. §7.3.8.10 deferred chroma:
+            // a 4×4 luma leaf (ChromaArrayType != 3) carries no chroma
+            // of its own — the blkIdx == 3 child holds the PARENT
+            // node's chroma blocks, positioned at ( xBase, yBase ), the
+            // 8×8 parent's top-left (x0 / y0 with the low 3 bits
+            // cleared).
             if params.chroma_array_type != 0 {
+                let (x_base, y_base) = if log2_trafo_size == 2 && params.chroma_array_type != 3 {
+                    (x0 & !7, y0 & !7)
+                } else {
+                    (x0, y0)
+                };
                 let (sw, sh) = sub_wh_c(params.chroma_array_type);
-                let (xc, yc) = (x0 / sw, y0 / sh);
+                let (xc, yc) = (x_base / sw, y_base / sh);
                 if let Some(plane) = cb {
                     let qp = chroma_qp(params, qp_y, TfComponent::Cb);
                     write_chroma_residual_blocks(
