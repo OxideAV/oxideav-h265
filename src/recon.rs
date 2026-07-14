@@ -38,7 +38,8 @@ use crate::picture::{clip1, sub_wh_c, Picture, Plane};
 use crate::scaling_list::ScalingFactors;
 use crate::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
 use crate::transform::{
-    residual_block, BlockParams, Component as TfComponent, PredMode, TransformError,
+    rdpcm_accumulate, residual_block, BlockParams, Component as TfComponent, PredMode,
+    TransformError,
 };
 use crate::transform_tree::TransformTree;
 use crate::transform_unit::TransformUnit;
@@ -55,9 +56,6 @@ pub enum ReconError {
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
-    /// The residual block signalled §7.3.8.11 `explicit_rdpcm_flag`;
-    /// the §8.6.8 RDPCM reconstruction is not implemented yet.
-    RdpcmNotSupported,
     /// The §6.4.1 picture-tiling geometry needed for neighbour
     /// availability could not be built.
     Tiling(crate::availability::AvailabilityError),
@@ -69,9 +67,6 @@ impl core::fmt::Display for ReconError {
             Self::IntraPred(e) => write!(f, "intra prediction failed: {e}"),
             Self::Transform(e) => write!(f, "inverse transform failed: {e}"),
             Self::InterPred(e) => write!(f, "inter prediction failed: {e}"),
-            Self::RdpcmNotSupported => {
-                f.write_str("explicit RDPCM residual (§8.6.8) is not implemented")
-            }
             Self::InterNotSupported => {
                 f.write_str("inter prediction is not reconstructed by the intra path")
             }
@@ -120,6 +115,15 @@ pub struct ReconParams {
     pub cr_qp_offset: i32,
     /// `transform_skip_rotation_enabled_flag`.
     pub transform_skip_rotation_enabled: bool,
+    /// `implicit_rdpcm_enabled_flag` (§7.4.3.2.2) — gates the §8.4.4.1
+    /// intra `residualDpcm` condition (transform skip or transquant
+    /// bypass, predModeIntra 10 / 26) that invokes the §8.6.5
+    /// directional residual modification, and (with transquant bypass)
+    /// the §8.4.4.2.6 `disableIntraBoundaryFilter` derivation.
+    pub implicit_rdpcm_enabled: bool,
+    /// `intra_boundary_filtering_disabled_flag` (§7.4.3.2.3) — the
+    /// first §8.4.4.2.6 `disableIntraBoundaryFilter` condition.
+    pub intra_boundary_filtering_disabled: bool,
     /// `extended_precision_processing_flag`.
     pub extended_precision: bool,
     /// The active §7.4.5 `ScalingFactor` matrices when
@@ -317,6 +321,12 @@ fn reconstruct_intra_block(
 ) -> Result<(), ReconError> {
     let bit_depth = pic.bit_depth(plane);
     let marked = gather_reference_samples(pic, ctx, plane, xb, yb, n_tbs);
+    // §8.4.4.2.6: disableIntraBoundaryFilter is 1 when
+    // intra_boundary_filtering_disabled_flag is 1, or when
+    // implicit_rdpcm_enabled_flag and cu_transquant_bypass_flag are
+    // both 1.
+    let disable_boundary_filter = params.intra_boundary_filtering_disabled
+        || (params.implicit_rdpcm_enabled && transquant_bypass);
     let ip_params = IntraPredParams {
         pred_mode_intra,
         cidx: ip_component,
@@ -325,7 +335,7 @@ fn reconstruct_intra_block(
         intra_smoothing_disabled: params.intra_smoothing_disabled,
         strong_intra_smoothing_enabled: params.strong_intra_smoothing_enabled,
         chroma_array_type_3: params.chroma_array_type == 3,
-        disable_boundary_filter: false,
+        disable_boundary_filter,
     };
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
@@ -344,7 +354,19 @@ fn reconstruct_intra_block(
                 transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
             };
             let m = scaling_matrix(params, n_tbs, PredMode::Intra, cidx, transform_skip);
-            Some(residual_block(levels, m, bp)?)
+            let mut r = residual_block(levels, m, bp)?;
+            // §8.4.4.1: residualDpcm — implicit RDPCM applies the
+            // §8.6.5 directional residual modification to intra blocks
+            // in transform-skip / transquant-bypass form whose
+            // prediction mode is exactly horizontal (10) or vertical
+            // (26), with mDir = predModeIntra / 26.
+            if params.implicit_rdpcm_enabled
+                && (transform_skip || transquant_bypass)
+                && (pred_mode_intra == 10 || pred_mode_intra == 26)
+            {
+                rdpcm_accumulate(&mut r, n_tbs, pred_mode_intra == 26);
+            }
+            Some(r)
         }
         None => None,
     };
@@ -868,9 +890,6 @@ fn inter_residual_block(
         TfComponent::Luma => params.bit_depth_luma,
         TfComponent::Cb | TfComponent::Cr => params.bit_depth_chroma,
     };
-    if rb.explicit_rdpcm_flag {
-        return Err(ReconError::RdpcmNotSupported);
-    }
     let bp = BlockParams {
         n_tbs,
         q_p: qp,
@@ -883,7 +902,14 @@ fn inter_residual_block(
         transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
     };
     let m = scaling_matrix(params, n_tbs, PredMode::Inter, cidx, rb.transform_skip);
-    Ok(residual_block(&rb.levels, m, bp)?)
+    let mut r = residual_block(&rb.levels, m, bp)?;
+    // §8.5.4.2 step 3 / §8.5.4.3 step 4: when explicit_rdpcm_flag is 1,
+    // the §8.6.5 directional residual modification is invoked with
+    // mDir = explicit_rdpcm_dir_flag (0 horizontal, 1 vertical).
+    if rb.explicit_rdpcm_flag {
+        rdpcm_accumulate(&mut r, n_tbs, rb.explicit_rdpcm_dir_flag);
+    }
+    Ok(r)
 }
 
 /// Per-picture intra-reconstruction neighbour state — the §8.4.2
@@ -1965,13 +1991,8 @@ fn reconstruct_transform_unit(
         .residual_luma
         .as_ref()
         .is_some_and(|rb| rb.transform_skip);
-    if unit
-        .residual_luma
-        .as_ref()
-        .is_some_and(|rb| rb.explicit_rdpcm_flag)
-    {
-        return Err(ReconError::RdpcmNotSupported);
-    }
+    // (§7.3.8.11: explicit_rdpcm_flag is only signalled for MODE_INTER
+    // blocks — an intra unit's residual never carries it.)
     reconstruct_intra_block(
         pic,
         params,
@@ -2076,9 +2097,6 @@ fn reconstruct_chroma_blocks(
         };
         let levels = block.map(|rb| rb.levels.as_slice());
         let ts = block.is_some_and(|rb| rb.transform_skip);
-        if block.is_some_and(|rb| rb.explicit_rdpcm_flag) {
-            return Err(ReconError::RdpcmNotSupported);
-        }
         reconstruct_intra_block(
             pic,
             params,
@@ -2122,6 +2140,8 @@ mod tests {
             cb_qp_offset: 0,
             cr_qp_offset: 0,
             transform_skip_rotation_enabled: false,
+            implicit_rdpcm_enabled: false,
+            intra_boundary_filtering_disabled: false,
             extended_precision: false,
             scaling: None,
         }
@@ -2188,6 +2208,161 @@ mod tests {
             sao: None,
             quadtree: CodingQuadtree::Leaf(Box::new(cu)),
         }
+    }
+
+    /// Build a 16x16 transquant-bypass intra CTU whose single luma TB
+    /// carries `levels` (row-major raw bypass residual) and whose luma
+    /// mode comes from `luma_mode` (an MPM/rem selector against the
+    /// no-neighbour candModeList {PLANAR, DC, 26}).
+    fn bypass_intra_ctu(levels: Vec<i32>, luma_mode: IntraLumaMode) -> CodingTreeUnit {
+        let unit = TransformUnit {
+            residual_luma: Some(ResidualBlock {
+                log2_trafo_size: 4,
+                last_sig_coeff_x: 15,
+                last_sig_coeff_y: 15,
+                levels,
+                transform_skip: false,
+                explicit_rdpcm_flag: false,
+                explicit_rdpcm_dir_flag: false,
+            }),
+            ..Default::default()
+        };
+        let cu = CodingUnit {
+            x0: 0,
+            y0: 0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: true,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            pcm: None,
+            prediction_units: vec![],
+            intra_luma: vec![luma_mode],
+            intra_chroma_pred_mode: vec![4],
+            rqt_root_cbf: true,
+            transform_tree: Some(TransformTree::Leaf {
+                cbf_luma: true,
+                unit,
+            }),
+        };
+        CodingTreeUnit {
+            sao: None,
+            quadtree: CodingQuadtree::Leaf(Box::new(cu)),
+        }
+    }
+
+    /// §8.4.4.1 implicit RDPCM, vertical: a transquant-bypass TB in
+    /// mode 26 (candModeList[2] with no neighbours) whose residual has
+    /// row 0 = 5 accumulates down every column (eq. 8-323), so the
+    /// whole block reconstructs to 128 + 5.
+    #[test]
+    fn implicit_rdpcm_vertical_accumulates_bypass_residual() {
+        let mut params = tiny_params();
+        params.implicit_rdpcm_enabled = true;
+        let mut levels = vec![0i32; 256];
+        levels[..16].fill(5); // row 0 only
+        let ctu = bypass_intra_ctu(
+            levels,
+            IntraLumaMode {
+                prev_intra_luma_pred_flag: true,
+                mpm_idx: Some(2), // candModeList[2] = 26 (vertical)
+                rem_intra_luma_pred_mode: None,
+            },
+        );
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        reconstruct_intra_ctu(&mut pic, &params, &ctu).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 133, "luma at ({x},{y})");
+            }
+        }
+    }
+
+    /// §8.4.4.1 implicit RDPCM, horizontal: mode 10
+    /// (rem_intra_luma_pred_mode 8 against candModeList {0, 1, 26})
+    /// with column 0 = 5 accumulates across every row (eq. 8-322).
+    #[test]
+    fn implicit_rdpcm_horizontal_accumulates_bypass_residual() {
+        let mut params = tiny_params();
+        params.implicit_rdpcm_enabled = true;
+        let mut levels = vec![0i32; 256];
+        for y in 0..16 {
+            levels[y * 16] = 5; // column 0 only
+        }
+        let ctu = bypass_intra_ctu(
+            levels,
+            IntraLumaMode {
+                prev_intra_luma_pred_flag: false,
+                mpm_idx: None,
+                // 8 → +1 for cand 0, +1 for cand 1 ⇒ IntraPredModeY 10.
+                rem_intra_luma_pred_mode: Some(8),
+            },
+        );
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        reconstruct_intra_ctu(&mut pic, &params, &ctu).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 133, "luma at ({x},{y})");
+            }
+        }
+    }
+
+    /// The implicit-RDPCM condition is exact: a bypass block whose mode
+    /// is NOT 10 / 26 (here DC via mpm_idx 1) keeps its raw residual —
+    /// row 0 is 128 + 5, every other row stays at the DC prediction.
+    #[test]
+    fn implicit_rdpcm_skips_non_directional_modes() {
+        let mut params = tiny_params();
+        params.implicit_rdpcm_enabled = true;
+        let mut levels = vec![0i32; 256];
+        levels[..16].fill(5);
+        let ctu = bypass_intra_ctu(
+            levels,
+            IntraLumaMode {
+                prev_intra_luma_pred_flag: true,
+                mpm_idx: Some(1), // candModeList[1] = DC
+                rem_intra_luma_pred_mode: None,
+            },
+        );
+        let mut pic = Picture::new(16, 16, 1, 8, 8);
+        reconstruct_intra_ctu(&mut pic, &params, &ctu).unwrap();
+        for x in 0..16 {
+            assert_eq!(pic.sample(Plane::Luma, x, 0), 133, "row 0 at x={x}");
+            assert_eq!(pic.sample(Plane::Luma, x, 5), 128, "row 5 at x={x}");
+        }
+    }
+
+    /// §8.5.4.2 step 3: an inter residual block with
+    /// `explicit_rdpcm_flag == 1` runs the §8.6.5 modification with
+    /// mDir = `explicit_rdpcm_dir_flag` before placement.
+    #[test]
+    fn explicit_rdpcm_inter_residual_accumulates() {
+        let params = tiny_params();
+        let mut levels = vec![0i32; 16];
+        levels[..4].fill(3); // row 0
+        let rb = ResidualBlock {
+            log2_trafo_size: 2,
+            last_sig_coeff_x: 3,
+            last_sig_coeff_y: 3,
+            levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: true,
+            explicit_rdpcm_dir_flag: true, // vertical
+        };
+        let r = inter_residual_block(&params, &rb, TfComponent::Luma, 25, true).unwrap();
+        assert!(r.iter().all(|&v| v == 3), "vertical accumulation: {r:?}");
+
+        let mut levels_h = vec![0i32; 16];
+        for y in 0..4 {
+            levels_h[y * 4] = 2; // column 0
+        }
+        let rb_h = ResidualBlock {
+            explicit_rdpcm_dir_flag: false, // horizontal
+            levels: levels_h,
+            ..rb
+        };
+        let r = inter_residual_block(&params, &rb_h, TfComponent::Luma, 25, true).unwrap();
+        assert!(r.iter().all(|&v| v == 2), "horizontal accumulation: {r:?}");
     }
 
     #[test]

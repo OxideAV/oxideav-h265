@@ -1056,6 +1056,8 @@ mod tests {
             cb_qp_offset: 0,
             cr_qp_offset: 0,
             transform_skip_rotation_enabled: false,
+            implicit_rdpcm_enabled: false,
+            intra_boundary_filtering_disabled: false,
             extended_precision: false,
             scaling: None,
         }

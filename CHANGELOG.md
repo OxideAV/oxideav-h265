@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — decode-conformance round 413 (2026-07-14)
+
+- **§8.6.5 RDPCM reconstruction** (range-extensions residual
+  modification for transform-bypass blocks), closing the round-410
+  followup: inter blocks with `explicit_rdpcm_flag == 1` apply the
+  directional accumulation with mDir = `explicit_rdpcm_dir_flag`
+  (§8.5.4.2 / §8.5.4.3), and intra transform-skip / transquant-bypass
+  blocks in mode 10 / 26 apply the implicit-RDPCM accumulation with
+  mDir = predModeIntra / 26 (§8.4.4.1) when
+  `implicit_rdpcm_enabled_flag` is set. Explicit-RDPCM blocks were
+  previously rejected (`ReconError::RdpcmNotSupported`, now removed);
+  implicit RDPCM silently decoded wrong. Also wires the §8.4.4.2.6
+  `disableIntraBoundaryFilter` derivation
+  (`intra_boundary_filtering_disabled_flag`, or implicit RDPCM with
+  transquant bypass).
+
 ### Fixed — decode-conformance round 413 (2026-07-14)
 
 - **§8.4.3 per-chroma-PB `IntraPredModeC` for `ChromaArrayType == 3`

@@ -150,9 +150,6 @@ slice types, and ~900 unit tests.
   signalling (bi arises via merge candidates only).
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
-* §8.6.8 explicit-RDPCM *reconstruction* (a range-extensions coding
-  tool): the §7.3.8.11 `explicit_rdpcm_flag` syntax is parsed
-  bit-exactly and such blocks are rejected with a clear error.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

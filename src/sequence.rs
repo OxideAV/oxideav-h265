@@ -962,6 +962,11 @@ fn build_recon_params(
         cr_qp_offset: i32::from(pps.pps_cr_qp_offset) + i32::from(header.slice_cr_qp_offset),
         transform_skip_rotation_enabled: range
             .is_some_and(|r| r.transform_skip_rotation_enabled_flag),
+        implicit_rdpcm_enabled: range.is_some_and(|r| r.implicit_rdpcm_enabled_flag),
+        intra_boundary_filtering_disabled: sps
+            .sps_scc_extension
+            .as_ref()
+            .is_some_and(|s| s.intra_boundary_filtering_disabled_flag),
         extended_precision: range.is_some_and(|r| r.extended_precision_processing_flag),
         scaling,
     })

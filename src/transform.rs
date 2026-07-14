@@ -620,6 +620,42 @@ pub fn residual_block(
     Ok(r)
 }
 
+/// §8.6.5 — residual modification process for blocks using a transform
+/// bypass (RDPCM): the directional cumulative sum over the
+/// `(nTbS)x(nTbS)` residual array `r`.
+///
+/// `vertical` is the process input `mDir`: `false` (mDir 0) applies the
+/// horizontal accumulation of eq. 8-322 (`r[x][y] += r[x-1][y]`, x
+/// proceeding 1..nTbS-1), `true` (mDir 1) the vertical accumulation of
+/// eq. 8-323 (`r[x][y] += r[x][y-1]`, y proceeding 1..nTbS-1).
+///
+/// Invoked for inter blocks with `explicit_rdpcm_flag == 1` (mDir =
+/// `explicit_rdpcm_dir_flag`, §8.5.4.2 / §8.5.4.3) and for intra blocks
+/// under the implicit-RDPCM condition (`implicit_rdpcm_enabled_flag`,
+/// transform skip or transquant bypass, predModeIntra 10 / 26, with
+/// mDir = predModeIntra / 26 — §8.4.4.1).
+///
+/// `r` is row-major by `y` (as [`residual_block`] returns it); its
+/// length must be `n_tbs * n_tbs`.
+pub fn rdpcm_accumulate(r: &mut [i32], n_tbs: usize, vertical: bool) {
+    debug_assert_eq!(r.len(), n_tbs * n_tbs);
+    if vertical {
+        // eq. 8-323: r[ x ][ y ] += r[ x ][ y − 1 ].
+        for y in 1..n_tbs {
+            for x in 0..n_tbs {
+                r[y * n_tbs + x] = r[y * n_tbs + x].wrapping_add(r[(y - 1) * n_tbs + x]);
+            }
+        }
+    } else {
+        // eq. 8-322: r[ x ][ y ] += r[ x − 1 ][ y ].
+        for y in 0..n_tbs {
+            for x in 1..n_tbs {
+                r[y * n_tbs + x] = r[y * n_tbs + x].wrapping_add(r[y * n_tbs + x - 1]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,5 +936,60 @@ mod tests {
         let y2 = transform_1d(&x2, 8, false);
         assert_eq!(y2[0], DCT32[4][0] as i64); // 89
         assert_eq!(y2[1], DCT32[4][1] as i64); // 75
+    }
+
+    /// §8.6.5 eq. 8-322 — horizontal RDPCM is a running sum along each
+    /// row (x proceeding over 1..nTbS − 1).
+    #[test]
+    fn rdpcm_horizontal_accumulates_rows() {
+        // Row-major 4x4: row y holds [y+1, 1, -2, 3].
+        let mut r: Vec<i32> = (0..4).flat_map(|y| vec![y + 1, 1, -2, 3]).collect();
+        rdpcm_accumulate(&mut r, 4, false);
+        for y in 0..4usize {
+            let base = y as i32 + 1;
+            assert_eq!(
+                &r[y * 4..y * 4 + 4],
+                &[base, base + 1, base - 1, base + 2],
+                "row {y}"
+            );
+        }
+    }
+
+    /// §8.6.5 eq. 8-323 — vertical RDPCM is a running sum down each
+    /// column (y proceeding over 1..nTbS − 1).
+    #[test]
+    fn rdpcm_vertical_accumulates_columns() {
+        // Column x holds [x, 5, -3, 1] top to bottom.
+        let mut r = vec![0i32; 16];
+        for x in 0..4usize {
+            r[x] = x as i32;
+            r[4 + x] = 5;
+            r[8 + x] = -3;
+            r[12 + x] = 1;
+        }
+        rdpcm_accumulate(&mut r, 4, true);
+        for x in 0..4usize {
+            let x0 = x as i32;
+            assert_eq!(
+                [r[x], r[4 + x], r[8 + x], r[12 + x]],
+                [x0, x0 + 5, x0 + 2, x0 + 3],
+                "column {x}"
+            );
+        }
+    }
+
+    /// The first row (vertical) / first column (horizontal) is left
+    /// unmodified — the accumulation index proceeds from 1.
+    #[test]
+    fn rdpcm_leaves_first_line_unmodified() {
+        let src: Vec<i32> = (0..64).map(|i| (i * 7 % 23) - 11).collect();
+        let mut h = src.clone();
+        rdpcm_accumulate(&mut h, 8, false);
+        for y in 0..8 {
+            assert_eq!(h[y * 8], src[y * 8], "column 0, row {y}");
+        }
+        let mut v = src.clone();
+        rdpcm_accumulate(&mut v, 8, true);
+        assert_eq!(&v[..8], &src[..8], "row 0");
     }
 }
