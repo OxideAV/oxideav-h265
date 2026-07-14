@@ -155,6 +155,16 @@ slice types, and ~900 unit tests.
   consults the current sample's slice flag where the spec text (both
   08/2021 and 01/2026 editions) names the later (decode-order)
   slice's flag; this implementation follows the spec text.
+* Known corners (RDPCM, spec text followed): (a) §8.4.4.2.6 sets
+  `disableIntraBoundaryFilter` when implicit RDPCM combines with
+  transquant bypass, suppressing the mode-10/26 edge filters — a
+  black-box reference decoder applies those filters regardless;
+  (b) on explicit-RDPCM inter blocks a black-box reference decoder
+  diverges from the literal §8.5.4.2-step-3 / §8.6.5 vertical
+  (`explicit_rdpcm_dir_flag == 1`) reconstruction, while both §8.6.5
+  accumulation directions are black-box-confirmed byte-exact through
+  the implicit path (see
+  `tests/fixture_bytes/r413-generation-notes.md`).
 
 ## License
 

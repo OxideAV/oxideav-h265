@@ -324,9 +324,12 @@ fn reconstruct_intra_block(
     // §8.4.4.2.6: disableIntraBoundaryFilter is 1 when
     // intra_boundary_filtering_disabled_flag is 1, or when
     // implicit_rdpcm_enabled_flag and cu_transquant_bypass_flag are
-    // both 1.
+    // both 1. That derivation gates only the ANGULAR mode-10 / mode-26
+    // edge filters; the §8.4.4.2.5 INTRA_DC smoothing (eq. 8-48..8-51)
+    // is gated on intra_boundary_filtering_disabled_flag alone, so the
+    // implicit-RDPCM term is withheld for the DC mode.
     let disable_boundary_filter = params.intra_boundary_filtering_disabled
-        || (params.implicit_rdpcm_enabled && transquant_bypass);
+        || (pred_mode_intra != INTRA_DC && params.implicit_rdpcm_enabled && transquant_bypass);
     let ip_params = IntraPredParams {
         pred_mode_intra,
         cidx: ip_component,

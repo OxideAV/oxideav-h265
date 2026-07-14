@@ -38,6 +38,47 @@ ffmpeg -threads 1 -i <name>.hevc -f rawvideo -pix_fmt yuv444p <name>.exp.yuv
 | --- | --- | --- |
 | `LL444` | `77f2b66aa36df14a02a1960a00da3db43a0bd697a321b5c678bb498d6a10776d` (25643) | `8c9bdf4f43f96986743eb5d84872a3e0cafcc417396c2862e2a99ba02ac607fd` (110592) |
 
+## Self-built RDPCM pins (`r413-rdpcm-implicit.hevc` / `r413-rdpcm-explicit.hevc`)
+
+No black-box encoder binary exposes the range-extension RDPCM tools
+(the CLI encoder used above has no RDPCM switch and never emits an
+`sps_range_extension()`), so these two streams are SELF-BUILT by the
+deterministic generator in `src/encoder/rdpcm_streams.rs` (this
+crate's own header writers + CABAC encoder; 64x48, transquant-bypass
+lossless, procedural source). The unit tests in that module pin the
+builder output to these exact bytes and the decode to the procedural
+source planes.
+
+Black-box reference validation (`ffmpeg -threads 1 -i <s>.hevc -f
+rawvideo -pix_fmt yuv420p`):
+
+* `r413-rdpcm-implicit.hevc` (1 IDR frame, implicit RDPCM: luma mode
+  26 down the left CTB column / mode 10 along the top row, chroma
+  mode 26/10 everywhere via `intra_chroma_pred_mode` 1/2, DC/PLANAR
+  luma controls): reference decode is **byte-exact** against the
+  procedural source — both §8.6.5 accumulation directions are
+  black-box-confirmed, luma and chroma.
+* `r413-rdpcm-explicit.hevc` (IDR + P, per-component
+  `explicit_rdpcm_flag` with both directions, flag-0 controls, one
+  skip CU): the reference decoder parses the stream cleanly, matches
+  frame 0 byte-exact and every flag-0 / horizontal-direction P block,
+  but diverges on the vertical-direction (`explicit_rdpcm_dir_flag
+  == 1`) blocks (and neighbouring chroma blocks decoded after them).
+  T-REC-H.265 is literal here — §8.5.4.2 step 3 / §8.5.4.3 step 4 set
+  mDir equal to `explicit_rdpcm_dir_flag`, §8.6.5 maps mDir 0/1 to
+  horizontal/vertical, and the §9.3.4.2 ctxIdx table gives the dir
+  flag its own per-component context pair — and the implicit-RDPCM
+  stream already black-box-confirms both accumulation directions, so
+  this crate follows the spec text (documented as a known reference
+  deviation in the README).
+
+| Pin | bytes | SHA-256 |
+| --- | --- | --- |
+| `r413-rdpcm-implicit.hevc` | 4073 | `e1259b18ee4fe063f7a1be770920d5a834aad9e718c01fe1ecad84e741b2da03` |
+| implicit expected YUV (= procedural source, 4608 B) | | `9ccc624f9c8ec4edabfaabd1f4386ec5b269e5fb680465ec6ea30a36ace4ccfe` |
+| `r413-rdpcm-explicit.hevc` | 6882 | `22c20ae71bea20437c69c5ed50c497316f3ce700bf566ce7a5f0a121f51fcca5` |
+| explicit expected YUV (= procedural source, 9216 B) | | `f526bdbe6aaab35a0c7941922190ae96ab0162152e4c0b4a9175ae721b50a44c` |
+
 ## Round-413 sweep record (beyond the pinned streams)
 
 After the per-PB chroma-mode fix, the following also byte-exact-decode

@@ -21,6 +21,8 @@ pub mod inter;
 pub mod intra;
 pub mod nal;
 pub mod pcm;
+#[cfg(test)]
+mod rdpcm_streams;
 pub mod residual;
 
 /// Registry-encoder coding mode, selected by the `mode` codec option.

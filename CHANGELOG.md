@@ -20,7 +20,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   implicit RDPCM silently decoded wrong. Also wires the §8.4.4.2.6
   `disableIntraBoundaryFilter` derivation
   (`intra_boundary_filtering_disabled_flag`, or implicit RDPCM with
-  transquant bypass).
+  transquant bypass — angular 10/26 filters only; the §8.4.4.2.5 DC
+  gate is the SCC flag alone). Validated by two self-built lossless
+  conformance streams (`src/encoder/rdpcm_streams.rs`, pinned under
+  `tests/fixture_bytes/`): the implicit-RDPCM stream is byte-exact
+  against a black-box reference decode in both accumulation
+  directions; the explicit-RDPCM stream decodes losslessly per the
+  literal spec text (a documented reference deviation on
+  vertical-direction blocks).
 
 ### Fixed — decode-conformance round 413 (2026-07-14)
 
