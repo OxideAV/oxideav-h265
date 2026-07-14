@@ -1704,12 +1704,23 @@ fn reconstruct_cu(
         pb_modes[i] = derive_and_record_luma_mode(ctx, x_pb, y_pb, n_pb, &luma_mode, false);
     }
 
-    // §8.4.3 — IntraPredModeC from the first PB's luma mode.
-    let intra_pred_mode_c = derive_intra_pred_mode_c(
-        cu.intra_chroma_pred_mode[0],
-        pb_modes[0],
-        params.chroma_array_type == 2,
-    );
+    // §8.4.3 — IntraPredModeC. For ChromaArrayType != 3 the CU has one
+    // chroma PB whose mode derives from the corner (blkIdx 0) luma PB;
+    // for ChromaArrayType == 3 with PART_NxN, §7.3.8.5 signals four
+    // intra_chroma_pred_mode elements and each chroma PB derives from
+    // its OWN co-located luma PB's IntraPredModeY.
+    let per_pb_chroma =
+        params.chroma_array_type == 3 && is_nxn && cu.intra_chroma_pred_mode.len() == 4;
+    let mut modes_c = [INTRA_DC; 4];
+    for (i, mode_c) in modes_c.iter_mut().enumerate() {
+        let (raw, luma_for_c) = if per_pb_chroma {
+            (cu.intra_chroma_pred_mode[i], pb_modes[i])
+        } else {
+            (cu.intra_chroma_pred_mode[0], pb_modes[0])
+        };
+        *mode_c = derive_intra_pred_mode_c(raw, luma_for_c, params.chroma_array_type == 2);
+    }
+    let intra_pred_mode_c = modes_c[0];
 
     // §8.6.1 — derive the CU's QpY (threading qPY_PREV across
     // quantization groups when the picture-level QP state is
@@ -1744,7 +1755,7 @@ fn reconstruct_cu(
                         y_cb + dy,
                         child_log2,
                         pb_modes[i],
-                        intra_pred_mode_c,
+                        modes_c[i],
                         qp_y,
                         cu.cu_transquant_bypass_flag,
                         defer_chroma,

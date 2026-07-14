@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — decode-conformance round 413 (2026-07-14)
+
+- **§8.4.3 per-chroma-PB `IntraPredModeC` for `ChromaArrayType == 3`
+  PART_NxN**: 4:4:4 intra NxN coding units signal four
+  `intra_chroma_pred_mode` elements (§7.3.8.5) and each chroma
+  prediction block derives its mode from its OWN co-located luma PB's
+  `IntraPredModeY`; reconstruction applied the corner (blkIdx 0)
+  derivation to all four chroma PBs. Exposed by a lossless 4:4:4
+  black-box stream (new embedded pin in `tests/annexb_r413_axes.rs`);
+  a ten-stream 4:4:4 / lossless / high-bit-depth sweep is byte-exact
+  after the fix.
+
 ### Fixed — decode-conformance round 410 (2026-07-11)
 
 Black-box whole-stream conformance sweep across encoder tool axes
