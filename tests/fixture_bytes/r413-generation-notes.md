@@ -79,6 +79,32 @@ rawvideo -pix_fmt yuv420p`):
 | `r413-rdpcm-explicit.hevc` | 6882 | `22c20ae71bea20437c69c5ed50c497316f3ce700bf566ce7a5f0a121f51fcca5` |
 | explicit expected YUV (= procedural source, 9216 B) | | `f526bdbe6aaab35a0c7941922190ae96ab0162152e4c0b4a9175ae721b50a44c` |
 
+## Self-built SCC palette pin (`r413-palette.hevc`)
+
+No black-box encoder OR decoder binary available to this workspace
+supports the Screen Content Coding palette mode (the CLI encoder has
+no SCC profile; the reference decoder binary, asked to decode this
+stream, emits a mid-grey concealment frame rather than palette
+reconstruction). The stream is SELF-BUILT by the deterministic
+generator in `src/encoder/palette_streams.rs` (this crate's own
+header writers + CABAC encoder): a 64x48 all-palette IDR picture
+whose twelve 16x16 palette CUs exercise new-entry signalling,
+`palette_predictor_run` reuse, explicit-index and copy-above runs,
+run-to-end inference, a `MaxPaletteIndex == 0` block,
+`palette_transpose_flag`, and escape samples in both forms —
+transquant-bypass (FL) and quantized (EG3 at `SliceQpY == 4`, where
+eq. 8-77 dequantizes exactly, keeping the stream lossless).
+
+Validation therefore rests on (a) the spec-transcribed §7.3.8.13 /
+§8.4.4.2.7 / §9.3.3.6 / §9.3.3.14 unit tests with hand-computed
+vectors, and (b) the lossless whole-stream roundtrip through the real
+CABAC engine and slice machinery, pinned byte-for-byte:
+
+| Pin | bytes | SHA-256 |
+| --- | --- | --- |
+| `r413-palette.hevc` | 402 | `faf242663abfb8f9ce8d6e874be1ec1339f3369ac609f60def8d702510603214` |
+| expected YUV (= planned palette content, 4608 B) | | `d54199726077c032f78546c5fe2ee7653a6a60f072006c33a0ec66e3013f3afd` |
+
 ## Round-413 sweep record (beyond the pinned streams)
 
 After the per-PB chroma-mode fix, the following also byte-exact-decode

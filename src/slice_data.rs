@@ -155,6 +155,13 @@ pub struct SliceDataParams {
     /// SPS range extension `transform_skip_context_enabled_flag`
     /// (§7.4.3.2.2) — the §9.3.4.2.5 transform-skip sig-ctx gate.
     pub transform_skip_context_enabled_flag: bool,
+    /// SCC `palette_mode_enabled_flag` (§7.4.3.2.3) — the §7.3.8.5
+    /// `palette_mode_flag` presence gate.
+    pub palette_mode_enabled_flag: bool,
+    /// SCC `palette_max_size` (§7.4.3.2.3).
+    pub palette_max_size: u32,
+    /// `PaletteMaxPredictorSize` (eq. 7-35).
+    pub palette_max_predictor_size: u32,
 }
 
 /// §7.4.9.3 decoded SAO parameters for one colour component of one CTB.
@@ -207,6 +214,10 @@ pub struct CodingUnit {
     /// already scaled to the picture bit depth per §8.4.1
     /// equation 8-12 (`pcm_sample << (BitDepth − PcmBitDepth)`).
     pub pcm: Option<PcmSamples>,
+    /// §7.3.8.13 palette coding unit payload (`Some` iff
+    /// `palette_mode_flag == 1`; such a CU has no prediction units and
+    /// no transform tree).
+    pub palette: Option<Box<crate::palette::PaletteCu>>,
     /// Decoded prediction units (intra: empty — the luma/chroma intra
     /// modes carry the prediction; inter: 1..=4 entries).
     pub prediction_units: Vec<PredictionUnit>,
@@ -827,6 +838,7 @@ fn decode_coding_unit(
         part_mode: PartMode::Part2Nx2N,
         pcm_flag: false,
         pcm: None,
+        palette: None,
         prediction_units: Vec::new(),
         intra_luma: Vec::new(),
         intra_chroma_pred_mode: Vec::new(),
@@ -851,6 +863,36 @@ fn decode_coding_unit(
         cu_pred_mode_from_flag(flag)
     };
     cu.cu_pred_mode = cu_pred_mode;
+
+    // §7.3.8.5: palette_mode_flag, gated on the SCC enable, an intra
+    // CU and log2CbSize <= MaxTbLog2SizeY; a palette CU replaces the
+    // whole prediction + transform-coding tail of coding_unit( ).
+    if params.palette_mode_enabled_flag
+        && cu_pred_mode == CuPredMode::Intra
+        && log2_cb_size <= params.max_tb_log2_size_y
+        // palette_mode_flag: one Table 9-38 context-coded bin.
+        && engine.decode_decision(&mut ctx.palette_mode_flag[0])? != 0
+    {
+        let pp = crate::palette::PaletteParams {
+            palette_max_size: params.palette_max_size,
+            palette_max_predictor_size: params.palette_max_predictor_size,
+            chroma_array_type: params.chroma_array_type,
+            bit_depth_luma: params.bit_depth_luma,
+            bit_depth_chroma: params.bit_depth_chroma,
+            cu_transquant_bypass_flag: cu.cu_transquant_bypass_flag,
+            cu_qp_delta_enabled_flag: params.cu_qp_delta_enabled_flag,
+            cu_chroma_qp_offset_enabled_flag: params.cu_chroma_qp_offset_enabled_flag,
+            chroma_qp_offset_list_len_minus1: params.chroma_qp_offset_list_len_minus1,
+        };
+        let pal =
+            crate::palette::decode_palette_coding(engine, ctx, &pp, qg, 1usize << log2_cb_size)?;
+        // A palette CU carries no IntraPredModeY; record INTRA_DC for
+        // the §8.4.2 neighbour derivation (the PCM convention — the
+        // spec never derives a mode for palette blocks).
+        state.record_pcm_cu(x0, y0, n_cb_s);
+        cu.palette = Some(Box::new(pal));
+        return Ok(cu);
+    }
 
     // part_mode: present when MODE_INTER or log2CbSize == MinCbLog2SizeY.
     let part_present =

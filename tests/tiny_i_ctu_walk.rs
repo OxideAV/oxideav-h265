@@ -82,6 +82,9 @@ fn tiny_i_params() -> SliceDataParams {
         implicit_rdpcm_enabled_flag: false,
         explicit_rdpcm_enabled_flag: false,
         transform_skip_context_enabled_flag: false,
+        palette_mode_enabled_flag: false,
+        palette_max_size: 0,
+        palette_max_predictor_size: 0,
     }
 }
 

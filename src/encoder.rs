@@ -20,6 +20,8 @@ pub mod cabac;
 pub mod inter;
 pub mod intra;
 pub mod nal;
+#[cfg(test)]
+mod palette_streams;
 pub mod pcm;
 #[cfg(test)]
 mod rdpcm_streams;

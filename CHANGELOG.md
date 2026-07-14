@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added — decode-conformance round 413 (2026-07-14)
 
+- **SCC palette-mode decode, end to end** (`palette` module): the
+  §7.3.8.5 `palette_mode_flag` gate, the full §7.3.8.13
+  `palette_coding( )` parse (predictor reuse runs, new entries, the
+  §9.3.3.14 index-count and §9.3.3.6 truncated-binary index
+  binarizations, copy-above / explicit index runs with the §9.3.4.2.8
+  run-prefix contexts, per-run eq. 7-83/7-84 index adjustment, both
+  escape binarizations, and the in-palette `delta_qp( )` /
+  `chroma_qp_offset( )`), the §8.4.4.2.7 reconstruction (transpose,
+  eq. 8-77 escape dequantization clamped per component QP), and the
+  palette predictor machinery — §9.3.2.3 initialization from PPS /
+  SPS initializers, eq. 8-79 per-CU update, and §9.3.2.4/.5 WPP /
+  dependent-slice storage & synchronization (the predictor travels
+  inside `SliceContexts`, re-initialized at slice / tile / WPP-row
+  context re-init points). Palette CUs record `INTRA_DC` for §8.4.2
+  neighbour derivation and honour the transquant-bypass loop-filter
+  suppression. Pinned by a self-built twelve-CU lossless conformance
+  stream (`tests/fixture_bytes/r413-palette.hevc`) — no black-box
+  encoder or decoder in this workspace supports SCC palette, see the
+  generation notes.
+
 - **§8.6.5 RDPCM reconstruction** (range-extensions residual
   modification for transform-bypass blocks), closing the round-410
   followup: inter blocks with `explicit_rdpcm_flag == 1` apply the

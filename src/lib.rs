@@ -262,6 +262,7 @@ pub mod intra_mode_field;
 pub mod intra_pred;
 pub mod motion;
 pub mod nal;
+pub mod palette;
 pub mod picture;
 pub mod poc;
 pub mod pps;

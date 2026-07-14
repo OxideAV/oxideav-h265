@@ -95,7 +95,7 @@ fn source_planes(w: usize, h: usize, frame: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>
 
 /// §7.3.3 — profile tier level for Format Range Extensions
 /// (`general_profile_idc == 4`) at the given level.
-fn write_ptl_rext(w: &mut BitWriter, level_idc: u8) {
+pub(crate) fn write_ptl_rext(w: &mut BitWriter, level_idc: u8) {
     w.put_bits(0, 2); // general_profile_space
     w.put_bit(0); // general_tier_flag
     w.put_bits(4, 5); // general_profile_idc = 4 (Range Extensions)
@@ -206,7 +206,7 @@ fn write_sps_rext(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
 
 /// §7.3.2.3 — PPS with `transquant_bypass_enabled_flag == 1`,
 /// deblocking disabled, sign hiding off.
-fn write_pps_bypass() -> Vec<u8> {
+pub(crate) fn write_pps_bypass() -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id

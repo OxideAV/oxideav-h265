@@ -434,6 +434,14 @@ pub enum ResidualCodingError {
     /// A scan order §7.4.9.11 never selects for `residual_coding( )`
     /// (only diagonal / horizontal / vertical are reachable).
     UnsupportedScanIdx(ScanIdx),
+    /// A §7.3.8.13 `palette_coding( )` element violated a parse bound.
+    Palette(crate::palette::PaletteError),
+}
+
+impl From<crate::palette::PaletteError> for ResidualCodingError {
+    fn from(e: crate::palette::PaletteError) -> Self {
+        Self::Palette(e)
+    }
 }
 
 impl core::fmt::Display for ResidualCodingError {
@@ -444,6 +452,7 @@ impl core::fmt::Display for ResidualCodingError {
             Self::UnsupportedLog2TrafoSize(v) => {
                 write!(f, "residual_coding: log2TrafoSize {v} outside 2..=5")
             }
+            Self::Palette(e) => write!(f, "{e}"),
             Self::UnsupportedScanIdx(s) => {
                 write!(
                     f,

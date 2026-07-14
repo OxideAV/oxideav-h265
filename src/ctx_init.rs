@@ -446,6 +446,14 @@ pub struct SliceContexts {
     pub cu_chroma_qp_offset_flag: [ContextModel; 1],
     /// `cu_chroma_qp_offset_idx` (Table 9-35).
     pub cu_chroma_qp_offset_idx: [ContextModel; 1],
+    /// §9.3.2.1 palette predictor variables (`PredictorPaletteSize` /
+    /// `PredictorPaletteEntries`) — parse state that initializes,
+    /// stores and synchronizes ALONGSIDE the context variables
+    /// (§9.3.2.3 / §9.3.2.4 / §9.3.2.5), so it travels inside this
+    /// struct. [`Self::init`] leaves it empty; the slice driver
+    /// assigns the PPS / SPS initializer-derived predictor at every
+    /// §9.3.2.2 re-initialization point.
+    pub palette_predictor: crate::palette::PalettePredictor,
 }
 
 impl SliceContexts {
@@ -591,6 +599,7 @@ impl SliceContexts {
                 init_type,
                 slice_qp_y,
             ),
+            palette_predictor: crate::palette::PalettePredictor::default(),
         }
     }
 

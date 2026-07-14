@@ -1132,6 +1132,8 @@ fn build_slice_data_params(
     let cu_chroma_qp_offset_enabled = header.cu_chroma_qp_offset_enabled_flag;
     let log2_min_cu_chroma_qp_offset_size =
         geom.ctb_log2 - pps_range.map_or(0, |r| r.diff_cu_chroma_qp_offset_depth);
+    let scc = sps.sps_scc_extension.as_ref();
+    let palette_max_size = scc.map_or(0, |e| e.palette_max_size);
     SliceDataParams {
         ctb_log2_size_y: geom.ctb_log2,
         min_cb_log2_size_y: geom.min_cb_log2,
@@ -1198,6 +1200,10 @@ fn build_slice_data_params(
             .sps_range_extension
             .as_ref()
             .is_some_and(|r| r.transform_skip_context_enabled_flag),
+        palette_mode_enabled_flag: scc.is_some_and(|e| e.palette_mode_enabled_flag),
+        palette_max_size,
+        palette_max_predictor_size: palette_max_size
+            + scc.map_or(0, |e| e.delta_palette_max_predictor_size),
     }
 }
 
@@ -1289,12 +1295,45 @@ fn decode_slice_segment_data(
     // §9.3.2.2 — a dependent slice segment synchronizes its context
     // variables from TableStateIdxDs (§9.3.2.5) instead of
     // re-initializing.
+    // §9.3.2.3 — the palette predictor re-initialization value (the
+    // PPS initializers if present, else the SPS initializers, else
+    // empty), applied wherever §9.3.2.1 re-initializes the context
+    // variables. A dependent segment SYNCHRONIZES the predictor from
+    // the stored state instead (it travels inside SliceContexts).
+    let num_comps = if geom.chroma_array_type == 0 { 1 } else { 3 };
+    let base_palette_predictor = pps
+        .pps_scc_extension
+        .as_ref()
+        .filter(|e| e.pps_palette_predictor_initializers_present_flag)
+        .map(|e| {
+            crate::palette::PalettePredictor::from_initializers(
+                &e.pps_palette_predictor_initializer,
+                num_comps,
+            )
+        })
+        .or_else(|| {
+            sps.sps_scc_extension
+                .as_ref()
+                .filter(|e| e.sps_palette_predictor_initializers_present_flag)
+                .map(|e| {
+                    crate::palette::PalettePredictor::from_initializers(
+                        &e.sps_palette_predictor_initializer,
+                        num_comps,
+                    )
+                })
+        })
+        .unwrap_or_default();
+    let fresh_contexts = || {
+        let mut c = SliceContexts::init(it, slice_qp_y);
+        c.palette_predictor = base_palette_predictor.clone();
+        c
+    };
     let mut ctx = if seg.header.dependent_slice_segment_flag {
         ds_stored.clone().ok_or(SequenceError::Malformed(
             "dependent segment without Ds state",
         ))?
     } else {
-        SliceContexts::init(it, slice_qp_y)
+        fresh_contexts()
     };
     // §9.3.2.4 / §9.3.2.5 — the WPP context storage (stored after the
     // second CTB of a row; synchronized at the next row's start when
@@ -1346,8 +1385,10 @@ fn decode_slice_segment_data(
                 engine = CabacEngine::new(BitReader::new(sub_range(sub_idx)?))
                     .map_err(|_| SequenceError::Malformed("substream too short for CABAC init"))?;
                 if tile_start {
-                    // §9.3.2.2 — fresh contexts at the tile start.
-                    ctx = SliceContexts::init(it, slice_qp_y);
+                    // §9.3.2.2 / §9.3.2.3 — fresh contexts (and
+                    // re-initialized palette predictor) at the tile
+                    // start.
+                    ctx = fresh_contexts();
                 } else {
                     // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
                     // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
@@ -1359,7 +1400,7 @@ fn decode_slice_segment_data(
                     };
                     ctx = match (&wpp_stored, t_avail) {
                         (Some(stored), true) => stored.clone(),
-                        _ => SliceContexts::init(it, slice_qp_y),
+                        _ => fresh_contexts(),
                     };
                 }
             }

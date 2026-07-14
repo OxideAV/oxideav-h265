@@ -48,6 +48,14 @@ embedded pins. Coverage:
 * §7.3.8.7 PCM coding units, incl. the §8.7.2.5.4 / §8.7.3.1
   loop-filter suppression (`pcm_loop_filter_disabled_flag`, and
   transquant-bypass CUs);
+* range-extension RDPCM (§8.6.5 implicit intra + explicit inter
+  directional residual modification) and SCC **palette mode**
+  (§7.3.8.13 parse incl. the predictor-palette machinery with WPP /
+  dependent-slice synchronization, §8.4.4.2.7 reconstruction with
+  transpose and bypass / quantized escapes) — pinned by self-built
+  conformance streams (`tests/fixture_bytes/r413-*.hevc`), the
+  implicit-RDPCM stream byte-exact against a black-box reference
+  decode;
 * both transport forms: Annex B extradata/packets AND `hvcC`
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.

@@ -1637,6 +1637,52 @@ fn derive_and_record_luma_mode(
 /// the picture: `SL[xCb+i][yCb+j] = pcm_sample_luma[nCbS*j + i] <<
 /// (BitDepthY − PcmBitDepthY)` (equation 8-12; the shift was applied
 /// at parse time) and the chroma analogues.
+/// §8.4.4.2.7 — write a palette CU's reconstructed components into
+/// the picture. `qp_y` is the §8.6.1-derived QpY of the CU; per-
+/// component `Qp′` values (eq. 8-73..8-75) feed the escape
+/// dequantization.
+fn write_palette_cu(
+    pic: &mut Picture,
+    params: &ReconParams,
+    pal: &crate::palette::PaletteCu,
+    x_cb: usize,
+    y_cb: usize,
+    qp_y: i32,
+    transquant_bypass: bool,
+) {
+    let qp_luma = luma_qp(params, qp_y) as i32;
+    crate::palette::reconstruct_palette_component(
+        pal,
+        0,
+        1,
+        1,
+        qp_luma,
+        u32::from(params.bit_depth_luma),
+        transquant_bypass,
+        |x, y, v| pic.set_sample(Plane::Luma, x_cb + x, y_cb + y, v),
+    );
+    if params.chroma_array_type != 0 {
+        let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
+        let (cx, cy) = (x_cb / sub_w, y_cb / sub_h);
+        for (c_idx, plane, comp) in [
+            (1usize, Plane::Cb, TfComponent::Cb),
+            (2, Plane::Cr, TfComponent::Cr),
+        ] {
+            let qp_c = chroma_qp(params, qp_y, comp) as i32;
+            crate::palette::reconstruct_palette_component(
+                pal,
+                c_idx,
+                sub_w,
+                sub_h,
+                qp_c,
+                u32::from(params.bit_depth_chroma),
+                transquant_bypass,
+                |x, y, v| pic.set_sample(plane, cx + x, cy + y, v),
+            );
+        }
+    }
+}
+
 fn write_pcm_cu(
     pic: &mut Picture,
     chroma_array_type: u8,
@@ -1701,6 +1747,27 @@ fn reconstruct_cu(
         if let Some(pcm) = cu.pcm.as_ref() {
             write_pcm_cu(pic, params.chroma_array_type, x_cb, y_cb, n_cb, pcm);
         }
+        return Ok(());
+    }
+
+    if let Some(pal) = cu.palette.as_deref() {
+        // §8.4.4.2.7 — palette-mode reconstruction. A palette CU has
+        // no IntraPredModeY; neighbours derive INTRA_DC (the PCM
+        // convention).
+        ctx.field.record_intra_pb(x_cb, y_cb, n_cb, INTRA_DC, true);
+        // §8.6.1 QP derivation feeds the escape dequantization; the
+        // delta_qp( ) arrives inside palette_coding( ).
+        let cu_delta = pal.cu_qp_delta.as_ref().map(|d| d.value);
+        let qp_y = ctx.derive_cu_qp(params, x_cb, y_cb, cu.log2_cb_size, cu_delta);
+        write_palette_cu(
+            pic,
+            params,
+            pal,
+            x_cb,
+            y_cb,
+            qp_y,
+            cu.cu_transquant_bypass_flag,
+        );
         return Ok(());
     }
 
@@ -2194,6 +2261,7 @@ mod tests {
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
             pcm: None,
+            palette: None,
             prediction_units: vec![],
             // prev_intra_luma_pred_flag + mpm_idx 0 ⇒ candModeList[0] =
             // PLANAR for the all-DC neighbour fallback.
@@ -2239,6 +2307,7 @@ mod tests {
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
             pcm: None,
+            palette: None,
             prediction_units: vec![],
             intra_luma: vec![luma_mode],
             intra_chroma_pred_mode: vec![4],
@@ -2449,6 +2518,7 @@ mod tests {
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
             pcm: None,
+            palette: None,
             prediction_units: vec![],
             intra_luma: vec![luma],
             intra_chroma_pred_mode: vec![chroma_pred_mode],
@@ -2899,6 +2969,7 @@ mod tests {
             part_mode: PartMode::Part2Nx2N,
             pcm_flag: false,
             pcm: None,
+            palette: None,
             prediction_units: vec![],
             intra_luma: vec![luma],
             intra_chroma_pred_mode: vec![4],

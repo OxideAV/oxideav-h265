@@ -523,7 +523,7 @@ where
 /// against runaway encodings; the cap is comfortably above any legal
 /// HEVC bypass-coded suffix value (§7.4.9.11 puts the practical
 /// ceiling well below `2^31`).
-fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
+pub(crate) fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
     read_eg_k_with(k, || engine.decode_bypass())
 }
 
