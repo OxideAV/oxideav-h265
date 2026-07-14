@@ -43,7 +43,7 @@ const DELTA_MAX_PREDICTOR: u32 = 9;
 
 /// §7.3.2.2 — 4:2:0 8-bit SPS (CTB 16, no PCM, SAO off) with an
 /// `sps_scc_extension()` enabling palette mode.
-fn write_sps_scc(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
+fn write_sps_scc(width: usize, height: usize, level_idc: u8, initializers: &[[u16; 3]]) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -87,7 +87,18 @@ fn write_sps_scc(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
     w.put_bit(1); // palette_mode_enabled_flag
     w.ue(PALETTE_MAX_SIZE); // palette_max_size
     w.ue(DELTA_MAX_PREDICTOR); // delta_palette_max_predictor_size
-    w.put_bit(0); // sps_palette_predictor_initializers_present_flag
+    if initializers.is_empty() {
+        w.put_bit(0); // sps_palette_predictor_initializers_present_flag
+    } else {
+        w.put_bit(1); // sps_palette_predictor_initializers_present_flag
+        w.ue(initializers.len() as u32 - 1); // sps_num_..._minus1
+                                             // §7.3.2.2.3: component-major, u(BitDepth) each (8 bits here).
+        for c in 0..3 {
+            for e in initializers {
+                w.put_bits(u32::from(e[c]), 8);
+            }
+        }
+    }
     w.put_bits(0, 2); // motion_vector_resolution_control_idc
     w.put_bit(0); // intra_boundary_filtering_disabled_flag
     w.rbsp_trailing_bits();
@@ -842,10 +853,216 @@ pub(crate) fn build_palette_stream() -> (Vec<u8>, Planes) {
             vw.rbsp_trailing_bits();
             vw.finish()
         }),
-        nal_unit(33, 0, 0, &write_sps_scc(width, height, 30)),
+        nal_unit(33, 0, 0, &write_sps_scc(width, height, 30, &[])),
         nal_unit(34, 0, 0, &write_pps_bypass()),
         nal_unit(20, 0, 0, &slice), // IDR_N_LP
     ];
+    (annexb(&units), (y_plane, cb_plane, cr_plane))
+}
+
+/// Second pin: §9.3.2.3 SPS palette predictor INITIALIZERS + per-
+/// independent-slice predictor re-initialization. A 32x32 picture
+/// (2x2 CTBs) in TWO independent slices; the SPS carries four
+/// predictor initializer entries, so every slice starts with a
+/// four-entry predictor. CU plans: reuse-only palettes from the
+/// initializers, a MaxPaletteIndex-0 block at the second slice's
+/// start (proving the re-init), and a 256-run diagonal block whose
+/// index count exercises the §9.3.3.14 all-ones escape suffix.
+pub(crate) fn build_palette_init_stream() -> (Vec<u8>, Planes) {
+    const INIT: [[u16; 3]; 4] = [[25, 60, 190], [80, 90, 100], [140, 120, 70], [200, 180, 40]];
+    let (width, height) = (32usize, 32usize);
+    let (cw, ch) = (width / 2, height / 2);
+    let ctbs_x = width / CTB;
+    let n = CTB;
+
+    let base_predictor = PalettePredictor {
+        entries: [
+            INIT.iter().map(|e| e[0]).collect(),
+            INIT.iter().map(|e| e[1]).collect(),
+            INIT.iter().map(|e| e[2]).collect(),
+        ],
+    };
+
+    let plans: Vec<CuPlan> = vec![
+        // CTB 0 (slice 1): reuse initializer entries 0 and 2; stripes.
+        CuPlan {
+            reuse: vec![true, false, true, false],
+            new_entries: Default::default(),
+            escape_present: false,
+            transpose: false,
+            bypass: true,
+            index_map: {
+                let mut m = vec![0u8; n * n];
+                for y in 0..n {
+                    for x in 0..n {
+                        m[y * n + x] = u8::from((x / 4) % 2 == 1);
+                    }
+                }
+                m
+            },
+            escape_vals: Default::default(),
+        },
+        // CTB 1 (slice 1): predictor evolved to [i0, i2, i1, i3];
+        // reuse the outer two; horizontal bands.
+        CuPlan {
+            reuse: vec![true, false, false, true],
+            new_entries: Default::default(),
+            escape_present: false,
+            transpose: false,
+            bypass: true,
+            index_map: {
+                let mut m = vec![0u8; n * n];
+                for y in 0..n {
+                    for x in 0..n {
+                        m[y * n + x] = u8::from(y >= 8);
+                    }
+                }
+                m
+            },
+            escape_vals: Default::default(),
+        },
+        // CTB 2 (slice 2, FIRST CU): the predictor must be the
+        // re-initialized four initializer entries again — reuse entry
+        // 1 only (MaxPaletteIndex == 0 degenerate block).
+        CuPlan {
+            reuse: vec![false, true, false, false],
+            new_entries: Default::default(),
+            escape_present: false,
+            transpose: false,
+            bypass: true,
+            index_map: vec![0u8; n * n],
+            escape_vals: Default::default(),
+        },
+        // CTB 3 (slice 2): reuse all four evolved entries; diagonal
+        // (x + y) % 4 texture — 256 single-sample explicit runs, so
+        // num_palette_indices_minus1 = 255 takes the §9.3.3.14
+        // all-ones prefix + EGk escape.
+        CuPlan {
+            reuse: vec![true, true, true, true],
+            new_entries: Default::default(),
+            escape_present: false,
+            transpose: false,
+            bypass: true,
+            index_map: {
+                let mut m = vec![0u8; n * n];
+                for y in 0..n {
+                    for x in 0..n {
+                        m[y * n + x] = ((x + y) % 4) as u8;
+                    }
+                }
+                m
+            },
+            escape_vals: Default::default(),
+        },
+    ];
+
+    let mut y_plane = vec![0u8; width * height];
+    let mut cb_plane = vec![0u8; cw * ch];
+    let mut cr_plane = vec![0u8; cw * ch];
+
+    // Two independent slices: CTBs [0, 1] and [2, 3].
+    let mut slice_rbsps: Vec<Vec<u8>> = Vec::new();
+    for (slice_idx, ctbs) in [[0usize, 1], [2, 3]].iter().enumerate() {
+        let mut w = BitWriter::new();
+        let first = slice_idx == 0;
+        w.put_bit(u8::from(first)); // first_slice_segment_in_pic_flag
+        w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
+        w.ue(0); // slice_pic_parameter_set_id
+        if !first {
+            // slice_segment_address: Ceil(Log2(4)) = 2 bits.
+            w.put_bits(ctbs[0] as u32, 2);
+        }
+        w.ue(2); // slice_type = I
+        w.se(SLICE_QP - 26); // slice_qp_delta
+        w.rbsp_trailing_bits();
+
+        let mut cabac = CabacEncoder::new();
+        let mut ctx = SliceContexts::init(init_type(2, false), SLICE_QP);
+        // §9.3.2.3 — every independent slice re-initializes the
+        // predictor from the SPS initializers.
+        let mut predictor = base_predictor.clone();
+
+        for &ctb in ctbs {
+            let x0 = (ctb % ctbs_x) * CTB;
+            let y0 = (ctb / ctbs_x) * CTB;
+            let plan = &plans[ctb];
+            cabac.encode_decision(
+                &mut w,
+                &mut ctx.cu_transquant_bypass_flag[0],
+                u8::from(plan.bypass),
+            );
+            cabac.encode_decision(&mut w, &mut ctx.palette_mode_flag[0], 1);
+            let cu = encode_palette_cu(&mut cabac, &mut w, &mut ctx, &mut predictor, plan);
+            crate::palette::reconstruct_palette_component(
+                &cu,
+                0,
+                1,
+                1,
+                SLICE_QP,
+                8,
+                plan.bypass,
+                |x, y, v| {
+                    y_plane[(y0 + y) * width + x0 + x] = v as u8;
+                },
+            );
+            crate::palette::reconstruct_palette_component(
+                &cu,
+                1,
+                2,
+                2,
+                SLICE_QP,
+                8,
+                plan.bypass,
+                |x, y, v| {
+                    cb_plane[(y0 / 2 + y) * cw + x0 / 2 + x] = v as u8;
+                },
+            );
+            crate::palette::reconstruct_palette_component(
+                &cu,
+                2,
+                2,
+                2,
+                SLICE_QP,
+                8,
+                plan.bypass,
+                |x, y, v| {
+                    cr_plane[(y0 / 2 + y) * cw + x0 / 2 + x] = v as u8;
+                },
+            );
+            cabac.encode_terminate(&mut w, u8::from(ctb == ctbs[1]));
+        }
+        w.align_zero();
+        slice_rbsps.push(w.finish());
+    }
+
+    let mut units = vec![
+        nal_unit(32, 0, 0, &{
+            let mut vw = BitWriter::new();
+            vw.put_bits(0, 4);
+            vw.put_bit(1);
+            vw.put_bit(1);
+            vw.put_bits(0, 6);
+            vw.put_bits(0, 3);
+            vw.put_bit(1);
+            vw.put_bits(0xFFFF, 16);
+            write_ptl_rext(&mut vw, 30);
+            vw.put_bit(1);
+            vw.ue(1);
+            vw.ue(0);
+            vw.ue(0);
+            vw.put_bits(0, 6);
+            vw.ue(0);
+            vw.put_bit(0);
+            vw.put_bit(0);
+            vw.rbsp_trailing_bits();
+            vw.finish()
+        }),
+        nal_unit(33, 0, 0, &write_sps_scc(width, height, 30, &INIT)),
+        nal_unit(34, 0, 0, &write_pps_bypass()),
+    ];
+    for rbsp in &slice_rbsps {
+        units.push(nal_unit(20, 0, 0, rbsp)); // IDR_N_LP
+    }
     (annexb(&units), (y_plane, cb_plane, cr_plane))
 }
 
@@ -853,6 +1070,30 @@ pub(crate) fn build_palette_stream() -> (Vec<u8>, Planes) {
 mod tests {
     use super::*;
     use crate::sequence::decode_annexb_sequence;
+
+    /// SPS predictor initializers + two independent slices: the
+    /// second slice's first CU must see the re-initialized
+    /// four-entry predictor (§9.3.2.3), not the first slice's
+    /// evolved one.
+    #[test]
+    fn palette_initializer_stream_decodes_lossless() {
+        let (stream, (y, cb, cr)) = build_palette_init_stream();
+        let pinned: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixture_bytes/r413-palette-init.hevc"
+        ));
+        assert_eq!(stream, pinned, "builder must reproduce the validated bytes");
+        let frames = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(frames.len(), 1);
+        let mut expected = y;
+        expected.extend(cb);
+        expected.extend(cr);
+        assert_eq!(
+            frames[0].picture.to_planar_u8().expect("8-bit planes"),
+            expected,
+            "lossless palette decode with SPS initializers"
+        );
+    }
 
     /// The checked-in stream bytes are exactly what the builder
     /// produces, and this crate's decoder reconstructs the planned

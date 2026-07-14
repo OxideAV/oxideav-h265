@@ -105,6 +105,23 @@ CABAC engine and slice machinery, pinned byte-for-byte:
 | `r413-palette.hevc` | 402 | `faf242663abfb8f9ce8d6e874be1ec1339f3369ac609f60def8d702510603214` |
 | expected YUV (= planned palette content, 4608 B) | | `d54199726077c032f78546c5fe2ee7653a6a60f072006c33a0ec66e3013f3afd` |
 
+### `r413-palette-init.hevc`
+
+A second self-built palette pin covering §9.3.2.3 SPS palette
+predictor INITIALIZERS with TWO independent slices (32x32, 2x2 CTBs):
+the second slice's first CU proves the per-slice predictor
+re-initialization (its reuse run selects an initializer entry, not
+the first slice's evolved predictor), plus a `MaxPaletteIndex == 0`
+degenerate block and a 256-explicit-run diagonal block whose
+`num_palette_indices_minus1 == 255` takes the §9.3.3.14 all-ones
+prefix + EGk escape suffix. Same validation posture as
+`r413-palette.hevc`.
+
+| Pin | bytes | SHA-256 |
+| --- | --- | --- |
+| `r413-palette-init.hevc` | 171 | `324345a3afb4203b02f47aba62558f8ec4c4f23119739dfc36d896aba152e74e` |
+| expected YUV (1536 B) | | `bdd5b00d4592586c46c9245f13f2c7cdd1daf78494342e0a88650523c6bb2af6` |
+
 ## Round-413 sweep record (beyond the pinned streams)
 
 After the per-PB chroma-mode fix, the following also byte-exact-decode

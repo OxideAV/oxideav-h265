@@ -26,7 +26,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   suppression. Pinned by a self-built twelve-CU lossless conformance
   stream (`tests/fixture_bytes/r413-palette.hevc`) — no black-box
   encoder or decoder in this workspace supports SCC palette, see the
-  generation notes.
+  generation notes. A second pin (`r413-palette-init.hevc`) covers
+  the §9.3.2.3 SPS predictor initializers, per-independent-slice
+  predictor re-initialization, and the §9.3.3.14 all-ones-prefix
+  index-count escape.
 
 - **§8.6.5 RDPCM reconstruction** (range-extensions residual
   modification for transform-bypass blocks), closing the round-410
