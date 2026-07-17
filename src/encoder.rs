@@ -15,16 +15,24 @@
 //! re-walked through [`crate::nal`], and CABAC bin streams re-decoded
 //! through [`crate::cabac::CabacEngine`].
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bitwriter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cabac;
 pub mod inter;
 pub mod intra;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod nal;
 #[cfg(test)]
 mod palette_streams;
 pub mod pcm;
 #[cfg(test)]
 mod rdpcm_streams;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residual;
 
 /// Registry-encoder coding mode, selected by the `mode` codec option.

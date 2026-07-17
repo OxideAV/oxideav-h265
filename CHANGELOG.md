@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — public-surface hygiene (2026-07-17)
+
+- Internal plumbing modules (CABAC / binarization / reconstruction /
+  parameter-set parsers / write-side encoder building blocks) and
+  their crate-root re-exports are now `#[doc(hidden)]`: they stay
+  `pub` for tests / fuzz targets but are no longer part of the stable
+  API. The stable surface is the registry pair (`register`,
+  `make_decoder` / `make_encoder`), the `decoder` / `encoder`
+  (incl. `encoder::{pcm,intra,inter}`) / `sequence` / `picture` /
+  `nal` / `hvcc` modules, the crate-root `Error`, and the error types
+  those surfaces carry. No semantic or signature changes.
+
 ### Added — decode-conformance round 413 (2026-07-14)
 
 - **SCC palette-mode decode, end to end** (`palette` module): the
