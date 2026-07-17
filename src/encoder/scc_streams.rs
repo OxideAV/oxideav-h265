@@ -168,7 +168,7 @@ fn write_sps_scc(
 
 /// §7.3.2.3 — bypass PPS carrying a `pps_scc_extension()` with the
 /// given `pps_curr_pic_ref_enabled_flag` / ACT flags.
-fn write_pps_scc(curr_pic_ref: bool, act: bool) -> Vec<u8> {
+fn write_pps_scc(curr_pic_ref: bool, act: bool, ccp: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -200,12 +200,19 @@ fn write_pps_scc(curr_pic_ref: bool, act: bool) -> Vec<u8> {
     w.ue(0); // log2_parallel_merge_level_minus2
     w.put_bit(0); // slice_segment_header_extension_present_flag
     w.put_bit(1); // pps_extension_present_flag
-    w.put_bit(0); // pps_range_extension_flag
+    w.put_bit(u8::from(ccp)); // pps_range_extension_flag
     w.put_bit(0); // pps_multilayer_extension_flag
     w.put_bit(0); // pps_3d_extension_flag
     w.put_bit(1); // pps_scc_extension_flag
     w.put_bits(0, 4); // pps_extension_4bits
-                      // pps_scc_extension() — §7.3.2.3.3.
+    if ccp {
+        // pps_range_extension() — §7.3.2.3.2 (transform_skip off).
+        w.put_bit(1); // cross_component_prediction_enabled_flag
+        w.put_bit(0); // chroma_qp_offset_list_enabled_flag
+        w.ue(0); // log2_sao_offset_scale_luma
+        w.ue(0); // log2_sao_offset_scale_chroma
+    }
+    // pps_scc_extension() — §7.3.2.3.3.
     w.put_bit(u8::from(curr_pic_ref)); // pps_curr_pic_ref_enabled_flag
     w.put_bit(u8::from(act)); // residual_adaptive_colour_transform_enabled_flag
     if act {
@@ -280,12 +287,20 @@ fn encode_intra_luma_mode(
 // ACT stream (4:4:4 all-intra)
 // ---------------------------------------------------------------------------
 
-/// Per-CTB ACT plan: `(luma_mode, tu_residual_act_flag)` — DM chroma
-/// throughout; the flag alternates so plain CUs interleave as
-/// controls.
-fn act_plan(ctb: usize) -> (u8, bool) {
+/// Per-CTB ACT plan: `(luma_mode, tu_residual_act_flag, cb_scale,
+/// cr_scale)` — DM chroma throughout; the act flag alternates so
+/// plain CUs interleave as controls, and the cross-component
+/// prediction scales cycle so CCP applies BOTH under and without the
+/// colour transform (the §8.4.4.1 step-8 before §8.6.8 ordering).
+fn act_plan(ctb: usize) -> (u8, bool, i32, i32) {
     const MODES: [u8; 6] = [0, 1, 26, 10, 18, 34];
-    (MODES[ctb % MODES.len()], ctb % 2 == 0)
+    const SCALES: [i32; 5] = [0, 1, -2, 4, -8];
+    (
+        MODES[ctb % MODES.len()],
+        ctb % 2 == 0,
+        SCALES[ctb % SCALES.len()],
+        SCALES[(ctb + 2) % SCALES.len()],
+    )
 }
 
 /// Encode the all-intra 4:4:4 bypass ACT slice: one 16x16 PART_2Nx2N
@@ -309,7 +324,7 @@ fn encode_act_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: us
     for ctb in 0..ctbs_x * ctbs_y {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
-        let (mode, act) = act_plan(ctb);
+        let (mode, act, cb_scale, cr_scale) = act_plan(ctb);
 
         // Component residuals (lossless recon == source).
         let residual = |plane: &[u8], pc: PredComponent| -> Vec<i32> {
@@ -325,7 +340,9 @@ fn encode_act_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: us
         let r_cb = residual(cb, PredComponent::Cb);
         let r_cr = residual(cr, PredComponent::Cr);
 
-        // act == 1: code the forward-lifted triples.
+        // act == 1: code the forward-lifted triples; the decoder
+        // applies §8.4.4.1 step-8 CCP BEFORE the §8.6.8 inverse, so
+        // the CCP term is subtracted from the post-lifting chroma.
         let (res_l, res_cb, res_cr) = if act {
             let mut cl = Vec::with_capacity(r_y.len());
             let mut ccb = Vec::with_capacity(r_y.len());
@@ -340,6 +357,21 @@ fn encode_act_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: us
         } else {
             (r_y, r_cb, r_cr)
         };
+        let cbf_luma_pre = res_l.iter().any(|&v| v != 0);
+        // §7.3.8.10: cross_comp_pred needs cbf_luma.
+        let (cb_scale, cr_scale) = if cbf_luma_pre {
+            (cb_scale, cr_scale)
+        } else {
+            (0, 0)
+        };
+        let ccp_sub = |res: &[i32], scale: i32| -> Vec<i32> {
+            res.iter()
+                .zip(&res_l)
+                .map(|(&v, &ry)| v - ((scale * ry) >> 3))
+                .collect()
+        };
+        let res_cb = ccp_sub(&res_cb, cb_scale);
+        let res_cr = ccp_sub(&res_cr, cr_scale);
 
         // ---- coding_unit( ) ----
         cabac.encode_decision(&mut w, &mut ctxs.cu_transquant_bypass_flag[0], 1);
@@ -388,9 +420,21 @@ fn encode_act_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: us
             encode_residual_coding(&mut w, &mut cabac, &mut ctxs.residual, &rc(false), &res_l)
                 .expect("valid luma levels");
         }
+        // §7.3.8.10 in-place chroma: cross_comp_pred precedes each
+        // chroma residual_coding (gate: enabled && cbf_luma && DM).
+        if cbf_luma {
+            crate::encoder::ccp_streams::encode_cross_comp_pred(
+                &mut w, &mut cabac, &mut ctxs, 0, cb_scale,
+            );
+        }
         if cbf_cb_f {
             encode_residual_coding(&mut w, &mut cabac, &mut ctxs.residual, &rc(true), &res_cb)
                 .expect("valid cb levels");
+        }
+        if cbf_luma {
+            crate::encoder::ccp_streams::encode_cross_comp_pred(
+                &mut w, &mut cabac, &mut ctxs, 1, cr_scale,
+            );
         }
         if cbf_cr_f {
             encode_residual_coding(&mut w, &mut cabac, &mut ctxs.residual, &rc(true), &res_cr)
@@ -412,7 +456,7 @@ pub(crate) fn build_act_stream() -> (Vec<u8>, Planes) {
     let units = vec![
         nal_unit(32, 0, 0, &write_vps_scc(30, true)),
         nal_unit(33, 0, 0, &write_sps_scc(w, h, 30, true, false)),
-        nal_unit(34, 0, 0, &write_pps_scc(false, true)),
+        nal_unit(34, 0, 0, &write_pps_scc(false, true, true)),
         nal_unit(20, 0, 0, &slice), // IDR_N_LP
     ];
     (annexb(&units), (y, cb, cr))
@@ -629,18 +673,51 @@ fn encode_ibc_p_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usiz
             || res_cb.iter().any(|&v| v != 0)
             || res_cr.iter().any(|&v| v != 0);
 
+        // Interior CUs whose left neighbour already carries the
+        // (−CTB, 0) IBC vector use MERGE (candidate A1, the
+        // eqs 8-124/8-125 rounding on the current-picture reference);
+        // the rest are AMVP CUs on the eq. 8-98 integer path.
+        let use_merge = col >= 2;
         cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0); // MODE_INTER
         cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1); // PART_2Nx2N
-        cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 0); // AMVP
-                                                                   // ref_idx_l0 absent (one active reference).
-        encode_mvd_pair(&mut w, &mut cabac, &mut ctxs, mvd);
-        cabac.encode_decision(&mut w, &mut ctxs.mvp_flag[0], 0); // mvp_l0_flag
-                                                                 // rqt_root_cbf (non-merge inter CU).
-        cabac.encode_decision(&mut w, &mut ctxs.rqt_root_cbf[0], u8::from(any_res));
-        if any_res {
+        if use_merge {
+            let merge_probe = resolve_pu_motion(
+                &field,
+                &geom,
+                &PredictionUnit {
+                    merge_flag: true,
+                    merge_idx: Some(0),
+                    inter_pred_idc: None,
+                    ref_idx_l0: None,
+                    mvd_l0: None,
+                    mvp_l0_flag: None,
+                    ref_idx_l1: None,
+                    mvd_l1: None,
+                    mvp_l1_flag: None,
+                },
+                &mv_ctx,
+                &available,
+            );
+            assert_eq!(merge_probe.mv_l0, target, "A1 merge must copy the IBC MV");
+            assert!(any_res, "merge (non-skip) TU needs a coded residual");
+            cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 1); // merge
+                                                                       // merge_idx absent (MaxNumMergeCand == 1); rqt_root_cbf
+                                                                       // inferred 1 for a 2Nx2N merge CU.
             emit_tu_420(
                 &mut w, &mut cabac, &mut ctxs, &res_l, &res_cb, &res_cr, false, 0,
             );
+        } else {
+            cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 0); // AMVP
+                                                                       // ref_idx_l0 absent (one active reference).
+            encode_mvd_pair(&mut w, &mut cabac, &mut ctxs, mvd);
+            cabac.encode_decision(&mut w, &mut ctxs.mvp_flag[0], 0); // mvp_l0_flag
+                                                                     // rqt_root_cbf (non-merge inter CU).
+            cabac.encode_decision(&mut w, &mut ctxs.rqt_root_cbf[0], u8::from(any_res));
+            if any_res {
+                emit_tu_420(
+                    &mut w, &mut cabac, &mut ctxs, &res_l, &res_cb, &res_cr, false, 0,
+                );
+            }
         }
 
         // Mirror the decoder's motion-field store for later MVPs.
@@ -791,7 +868,7 @@ pub(crate) fn build_ibc_stream() -> (Vec<u8>, Planes) {
     let units = vec![
         nal_unit(32, 0, 0, &write_vps_scc(30, false)),
         nal_unit(33, 0, 0, &write_sps_scc(w, h, 30, false, true)),
-        nal_unit(34, 0, 0, &write_pps_scc(true, false)),
+        nal_unit(34, 0, 0, &write_pps_scc(true, false, false)),
         nal_unit(20, 0, 0, &slice), // IDR_N_LP
     ];
     (annexb(&units), (y, cb, cr))

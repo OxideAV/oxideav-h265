@@ -264,7 +264,7 @@ const ZERO_RESIDUAL_CTB: usize = 5;
 
 /// Encode the §9.3.3.8 TR(cMax = 4) `log2_res_scale_abs_plus1[ c ]`
 /// prefix plus the `res_scale_sign_flag[ c ]` for one component.
-fn encode_cross_comp_pred(
+pub(super) fn encode_cross_comp_pred(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
