@@ -24,6 +24,8 @@ pub mod cabac;
 pub mod inter;
 pub mod intra;
 // internal — exposed for tests/fuzz; not part of the stable API
+#[cfg(test)]
+mod ccp_streams;
 #[doc(hidden)]
 pub mod nal;
 #[cfg(test)]
