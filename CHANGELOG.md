@@ -46,6 +46,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reconstruction via a per-CU snapshot (exact, since the §8.5.3.1
   availability constraints bound every referenced sample to precede
   the coding block in z-scan order).
+- **Three self-built conformance pins** (`tests/fixture_bytes/
+  r416-*.hevc` + whole-bitstream axis tests): a 4:4:4 lossless CCP
+  stream sweeping every ResScaleVal magnitude/sign (byte-exact
+  through a black-box reference decode), a 4:4:4 lossless ACT stream
+  alternating `tu_residual_act_flag`, and a 4:2:0 lossless IBC
+  stream (an IDR whose P slice lists only the current picture). The
+  surveyed black-box reference decoder rejects SCC streams outright,
+  so the ACT / IBC pins are decoder-pins (r413 palette precedent).
+
+### Fixed — round 416
+
+- The sequence driver hardcoded
+  `residual_adaptive_colour_transform_enabled_flag` to `false` in
+  the slice-data parse params, so `tu_residual_act_flag` was never
+  read from the wire (CABAC desync on any real ACT stream). It now
+  propagates from the PPS SCC extension.
 
 ### Changed — public-surface hygiene (2026-07-17)
 

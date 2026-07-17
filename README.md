@@ -14,9 +14,10 @@ through the whole-bitstream driver (`decode_annexb_sequence` /
 `SequenceDecoder`) and the `oxideav_core::Decoder` registry entry
 (`make_decoder`, ids `"h265"` / `"hevc"`, `hvc1` / `hev1` / `HEVC`
 FourCCs, MP4 ObjectTypeIndication, Matroska tag) — plus self-built
-conformance pins for the features the corpus lacks, and a 37-stream
-black-box tool-axis sweep (round 410) held byte-exact by nine
-embedded pins. Coverage:
+conformance pins for the features the corpus lacks (rounds 413 / 416:
+RDPCM, palette, cross-component prediction, adaptive colour
+transform, intra block copy), and a 37-stream black-box tool-axis
+sweep (round 410) held byte-exact by nine embedded pins. Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -56,6 +57,19 @@ embedded pins. Coverage:
   conformance streams (`tests/fixture_bytes/r413-*.hevc`), the
   implicit-RDPCM stream byte-exact against a black-box reference
   decode;
+* the Rext/SCC application tail: §8.6.6 **cross-component
+  prediction** (eq. 8-324 applied on the intra and inter residual
+  paths, cbf-clear chroma blocks included), §8.6.8 **adaptive colour
+  transform** (the §8.6.8.2 lifting inverse with ACT-adjusted
+  quantization, eqs 8-287/8-288/8-291), and **intra block copy**
+  (current-picture referencing: the §8.3.4 currPic list append,
+  `use_integer_mv_flag`, the eqs 8-98..8-101 / 8-124..8-125 integer
+  MV paths, the eqs 8-102/8-103 reduction, prediction from the
+  pre-filter reconstruction) — pinned by self-built conformance
+  streams (`tests/fixture_bytes/r416-*.hevc`), the CCP stream
+  byte-exact against a black-box reference decode (the surveyed
+  reference decoder rejects SCC streams outright, so the ACT / IBC
+  pins are decoder-pins);
 * both transport forms: Annex B extradata/packets AND `hvcC`
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.
