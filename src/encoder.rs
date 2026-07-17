@@ -33,6 +33,8 @@ mod palette_streams;
 pub mod pcm;
 #[cfg(test)]
 mod rdpcm_streams;
+#[cfg(test)]
+mod scc_streams;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod residual;

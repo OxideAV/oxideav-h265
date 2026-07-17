@@ -1220,7 +1220,10 @@ fn build_slice_data_params(
         sign_data_hiding_enabled_flag: pps.sign_data_hiding_enabled_flag,
         cross_component_prediction_enabled_flag: pps_range
             .is_some_and(|r| r.cross_component_prediction_enabled_flag),
-        residual_adaptive_colour_transform_enabled_flag: false,
+        residual_adaptive_colour_transform_enabled_flag: pps
+            .pps_scc_extension
+            .as_ref()
+            .is_some_and(|s| s.residual_adaptive_colour_transform_enabled_flag),
         transform_skip_enabled_flag: pps.transform_skip_enabled_flag,
         log2_max_transform_skip_size: pps_range
             .map_or(2, |r| r.log2_max_transform_skip_block_size_minus2 + 2),

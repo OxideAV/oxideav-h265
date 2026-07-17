@@ -38,7 +38,7 @@ use crate::intra_pred::{
 use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
 
 /// One picture's `(Y, Cb, Cr)` planes (all full-resolution — 4:4:4).
-type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
+pub(super) type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// CTB / coding-block log2 size (16x16, `MinCbSizeY == CtbSizeY`).
 const CTB_LOG2: u32 = 4;
@@ -48,7 +48,7 @@ const SLICE_QP: i32 = 26;
 
 /// Deterministic 4:4:4 source planes: smooth gradients plus a coarse
 /// checker texture (full-resolution chroma).
-fn source_planes_444(w: usize, h: usize) -> Planes {
+pub(super) fn source_planes_444(w: usize, h: usize) -> Planes {
     let lum = |x: i32, y: i32| -> u8 {
         let g = (x * 3 + y * 5) % 197;
         let t = ((x / 4 + y / 4) % 3) * 23;
@@ -217,7 +217,7 @@ fn write_pps_ccp() -> Vec<u8> {
     w.finish()
 }
 
-fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> {
+pub(super) fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> {
     let mut out = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
@@ -230,7 +230,7 @@ fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> 
 /// The intra prediction params mirroring the stream's SPS: 4:4:4,
 /// default smoothing, no strong smoothing, boundary filters active
 /// (no implicit RDPCM in this stream).
-fn ip_params_444(mode: u8, cidx: PredComponent) -> IntraPredParams {
+pub(super) fn ip_params_444(mode: u8, cidx: PredComponent) -> IntraPredParams {
     IntraPredParams {
         pred_mode_intra: mode,
         cidx,
