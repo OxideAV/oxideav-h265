@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — Rext/SCC application tail, round 416 (2026-07-17)
+
+- **Cross-component prediction is now APPLIED, not just parsed**
+  (§8.6.6, 4:4:4 only): the §7.3.8.12 `cross_comp_pred( )` results
+  (`ResScaleVal` per chroma component) modify the chroma residuals of
+  each transform unit from its co-located luma residual per
+  eq. 8-324, on both the intra path (§8.4.4.1 step 8, after the
+  step-7 §8.6.5 modification) and the inter residual-extraction path
+  (§8.5.4.3 step 5). A chroma transform block whose cbf is clear
+  still receives the scaled luma residual. The eq. 8-324
+  `( rY << BitDepthC ) >> BitDepthY` bit-depth alignment runs in
+  64-bit intermediates so extended-precision coefficient ranges
+  cannot overflow.
+
 ### Changed — public-surface hygiene (2026-07-17)
 
 - Internal plumbing modules (CABAC / binarization / reconstruction /
