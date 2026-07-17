@@ -1122,6 +1122,9 @@ fn encode_inter_slice(
         ref_short_term: &ref_short_term,
         col_field: None,
         col_ref_long_term: &col_ref_long_term,
+        use_integer_mv: false,
+        two_versions_curr_pic: false,
+        is_curr_pic: &|_, _| false,
     };
 
     // ---- slice_segment_header( ) ----

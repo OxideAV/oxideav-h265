@@ -1385,6 +1385,14 @@ pub struct SliceSegmentHeader {
     /// `pps.weighted_pred_flag && slice_type == P` or
     /// `pps.weighted_bipred_flag && slice_type == B` is true).
     pub five_minus_max_num_merge_cand: Option<u32>,
+    /// `use_integer_mv_flag` (§7.3.6.1) — present for P/B slices when
+    /// the SPS SCC `motion_vector_resolution_control_idc == 2`;
+    /// otherwise inferred equal to
+    /// `motion_vector_resolution_control_idc` (§7.4.7.1). When 1,
+    /// motion vectors of this slice referring to pictures other than
+    /// the current picture use integer resolution (eqs 8-98..8-101 /
+    /// 8-124..8-125).
+    pub use_integer_mv_flag: bool,
     /// Decoded `pred_weight_table()` (§7.3.6.3) when the §7.3.6.1 outer
     /// gate is statically present
     /// (`(pps.weighted_pred_flag && slice_type == P) ||
@@ -1667,6 +1675,7 @@ impl SliceSegmentHeader {
                 collocated_from_l0_flag: None,
                 collocated_ref_idx: None,
                 five_minus_max_num_merge_cand: None,
+                use_integer_mv_flag: false,
                 pred_weight_table: None,
                 slice_qp_delta: None,
                 slice_cb_qp_offset: 0,
@@ -1860,6 +1869,7 @@ impl SliceSegmentHeader {
                         collocated_from_l0_flag: None,
                         collocated_ref_idx: None,
                         five_minus_max_num_merge_cand: None,
+                        use_integer_mv_flag: false,
                         pred_weight_table: None,
                         slice_qp_delta: None,
                         slice_cb_qp_offset: 0,
@@ -2033,6 +2043,19 @@ impl SliceSegmentHeader {
             None
         };
 
+        // §7.3.6.1: use_integer_mv_flag is present for inter slices
+        // when motion_vector_resolution_control_idc == 2; otherwise
+        // §7.4.7.1 infers it equal to the idc value.
+        let mv_res_idc = sps
+            .sps_scc_extension
+            .as_ref()
+            .map_or(0, |s| s.motion_vector_resolution_control_idc);
+        let use_integer_mv_flag = if st.is_inter() && mv_res_idc == 2 {
+            br.u1()? != 0
+        } else {
+            mv_res_idc == 1
+        };
+
         // Slice QP / chroma QP / deblocking / loop-filter / entry-points
         // tail (§7.3.6.1) — shared by I, P and B independent slice
         // segments.
@@ -2160,6 +2183,7 @@ impl SliceSegmentHeader {
             collocated_from_l0_flag,
             collocated_ref_idx,
             five_minus_max_num_merge_cand,
+            use_integer_mv_flag,
             pred_weight_table,
             slice_qp_delta: Some(slice_qp_delta),
             slice_cb_qp_offset,

@@ -332,7 +332,13 @@ impl Dpb {
     /// `RefPicList1`) as index vectors into [`Dpb::entries`].
     ///
     /// `rps` is the [`apply_rps`](Dpb::apply_rps) output; `params` carries
-    /// the §8.3.4 sizing + modification inputs.
+    /// the §8.3.4 sizing + modification inputs. With
+    /// `curr_pic_ref_enabled` (`pps_curr_pic_ref_enabled_flag`) the
+    /// equation 8-8 / 8-10 wrap appends the current picture — the
+    /// [`CURR_PIC`] sentinel — after `RefPicSetLtCurr` on every pass,
+    /// and the equation 8-9 closing clause overrides the last active
+    /// `RefPicList0` slot when the temp list was longer than the
+    /// active count and no explicit modification was signalled.
     #[must_use]
     pub fn build_ref_pic_lists(
         &self,
@@ -340,14 +346,22 @@ impl Dpb {
         params: &RefPicListParams<'_>,
     ) -> RefPicLists {
         // RefPicListTemp0 (equation 8-8): StCurrBefore, StCurrAfter, LtCurr,
-        // repeated until NumRpsCurrTempList0 entries are produced.
+        // (+ currPic with pps_curr_pic_ref_enabled_flag), repeated until
+        // NumRpsCurrTempList0 entries are produced.
         let active0 = (params.num_ref_idx_l0_active_minus1 + 1) as usize;
         let num_temp0 = active0.max(params.num_pic_total_curr as usize);
         let temp0 = build_temp_list(
             num_temp0,
             &[&rps.st_curr_before, &rps.st_curr_after, &rps.lt_curr],
+            params.curr_pic_ref_enabled,
         );
-        let list0 = apply_list_modification(&temp0, active0, params.list_entry_l0);
+        let mut list0 = apply_list_modification(&temp0, active0, params.list_entry_l0);
+        // Equation 8-9 closing clause.
+        if params.curr_pic_ref_enabled && params.list_entry_l0.is_none() && num_temp0 > active0 {
+            if let Some(last) = list0.last_mut() {
+                *last = Some(CURR_PIC);
+            }
+        }
 
         let list1 = if params.is_b {
             // RefPicListTemp1 (equation 8-10): StCurrAfter, StCurrBefore,
@@ -357,6 +371,7 @@ impl Dpb {
             let temp1 = build_temp_list(
                 num_temp1,
                 &[&rps.st_curr_after, &rps.st_curr_before, &rps.lt_curr],
+                params.curr_pic_ref_enabled,
             );
             Some(apply_list_modification(
                 &temp1,
@@ -370,6 +385,13 @@ impl Dpb {
         RefPicLists { list0, list1 }
     }
 }
+
+/// The [`RefPicLists`] sentinel index standing for the CURRENT decoded
+/// picture (before in-loop filtering) — the §8.3.4 `currPic` appended
+/// when `pps_curr_pic_ref_enabled_flag` is 1. It is deliberately out of
+/// range for every real DPB entry vector; consumers must test for it
+/// before indexing.
+pub const CURR_PIC: usize = usize::MAX;
 
 /// §8.3.4 sizing + modification inputs for
 /// [`Dpb::build_ref_pic_lists`].
@@ -387,6 +409,9 @@ pub struct RefPicListParams<'a> {
     pub list_entry_l0: Option<&'a [u32]>,
     /// `list_entry_l1[]` (§7.3.6.2) — `Some` reorders `RefPicListTemp1`.
     pub list_entry_l1: Option<&'a [u32]>,
+    /// `pps_curr_pic_ref_enabled_flag` — appends the [`CURR_PIC`]
+    /// sentinel per equations 8-8 / 8-9 / 8-10.
+    pub curr_pic_ref_enabled: bool,
 }
 
 /// The §8.3.2 RPS resolved to DPB entry indices. A `None` is the spec's
@@ -429,11 +454,14 @@ pub fn select_col_pic(
     collocated_ref_idx: u32,
 ) -> Option<usize> {
     let idx = collocated_ref_idx as usize;
-    if slice_type_is_b && !collocated_from_l0_flag {
+    let picked = if slice_type_is_b && !collocated_from_l0_flag {
         lists.list1.as_ref()?.get(idx).copied().flatten()
     } else {
         lists.list0.get(idx).copied().flatten()
-    }
+    };
+    // §7.4.7.1: collocated_ref_idx shall not refer to the current
+    // picture — treat a malformed selection as "no collocated picture".
+    picked.filter(|&i| i != CURR_PIC)
 }
 
 /// §8.3.5 — `NoBackwardPredFlag`: true iff every reference picture in
@@ -445,7 +473,8 @@ pub fn no_backward_pred_flag(dpb: &Dpb, lists: &RefPicLists, curr_poc: i32) -> b
     let mut all_le = true;
     let check = |idx: &Option<usize>, all_le: &mut bool| {
         if let Some(i) = idx {
-            if diff_pic_order_cnt(dpb.entries[*i].poc, curr_poc) > 0 {
+            // The current picture (CURR_PIC) has DiffPicOrderCnt == 0.
+            if *i != CURR_PIC && diff_pic_order_cnt(dpb.entries[*i].poc, curr_poc) > 0 {
                 *all_le = false;
             }
         }
@@ -462,12 +491,17 @@ pub fn no_backward_pred_flag(dpb: &Dpb, lists: &RefPicLists, curr_poc: i32) -> b
 }
 
 /// Build a §8.3.4 `RefPicListTempX` by concatenating the given RPS sets
-/// in order and wrapping around until `len` entries are produced
-/// (equations 8-8 / 8-10; `pps_curr_pic_ref_enabled_flag` SCC append is
-/// not modelled here — it is gated off for the present decoder state).
-fn build_temp_list(len: usize, sets: &[&[Option<usize>]]) -> Vec<Option<usize>> {
+/// in order — appending the [`CURR_PIC`] sentinel after each pass when
+/// `curr_pic_ref_enabled` (`pps_curr_pic_ref_enabled_flag`) — and
+/// wrapping around until `len` entries are produced (equations
+/// 8-8 / 8-10).
+fn build_temp_list(
+    len: usize,
+    sets: &[&[Option<usize>]],
+    curr_pic_ref_enabled: bool,
+) -> Vec<Option<usize>> {
     let mut temp = Vec::with_capacity(len);
-    if sets.iter().all(|s| s.is_empty()) {
+    if sets.iter().all(|s| s.is_empty()) && !curr_pic_ref_enabled {
         return temp;
     }
     while temp.len() < len {
@@ -478,6 +512,13 @@ fn build_temp_list(len: usize, sets: &[&[Option<usize>]]) -> Vec<Option<usize>> 
                 }
                 temp.push(e);
             }
+        }
+        if curr_pic_ref_enabled {
+            // The equation 8-8 / 8-10 currPic append carries no
+            // `rIdx < NumRpsCurrTempListX` guard — the temp list may
+            // end one entry longer than `len` (reachable through
+            // `list_entry_lX`).
+            temp.push(Some(CURR_PIC));
         }
     }
     temp
@@ -598,6 +639,103 @@ mod tests {
         );
         assert_eq!(rpl.list0, vec![Some(0)]);
         assert!(rpl.list1.is_none());
+    }
+
+    /// §8.3.4 with `pps_curr_pic_ref_enabled_flag`: the current picture
+    /// (CURR_PIC) is appended after the RPS sets (eq. 8-8) — a P slice
+    /// with one short-term reference and two active entries lists
+    /// [ref, currPic].
+    #[test]
+    fn curr_pic_ref_appends_current_picture() {
+        let st = MaterializedShortTermRefPicSet {
+            delta_poc_s0: vec![-1],
+            used_by_curr_pic_s0: vec![true],
+            delta_poc_s1: vec![],
+            used_by_curr_pic_s1: vec![],
+        };
+        let lists = build_rps_poc_lists(false, 1, 256, &st, &[]);
+        let mut dpb = Dpb::new();
+        dpb.insert(entry(0, Marking::ShortTerm));
+        let rps = dpb.apply_rps(false, 0, &lists, 256);
+        let rpl = dpb.build_ref_pic_lists(
+            &rps,
+            &RefPicListParams {
+                num_ref_idx_l0_active_minus1: 1,
+                num_pic_total_curr: 2,
+                curr_pic_ref_enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(rpl.list0, vec![Some(0), Some(CURR_PIC)]);
+    }
+
+    /// An IRAP-only stream (empty RPS) with current-picture referencing
+    /// still builds a list: [currPic] (the intra-block-copy-only case).
+    #[test]
+    fn curr_pic_ref_fills_empty_rps_list() {
+        let dpb = Dpb::new();
+        let rps = ResolvedRps::default();
+        let rpl = dpb.build_ref_pic_lists(
+            &rps,
+            &RefPicListParams {
+                num_ref_idx_l0_active_minus1: 0,
+                num_pic_total_curr: 1,
+                curr_pic_ref_enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(rpl.list0, vec![Some(CURR_PIC)]);
+    }
+
+    /// The eq. 8-9 closing clause: with the temp list longer than the
+    /// active count and no explicit modification, the LAST active slot
+    /// is overridden to currPic — one short-term ref, one active entry,
+    /// NumPicTotalCurr 2 ⇒ list0 = [currPic].
+    #[test]
+    fn curr_pic_ref_overrides_last_active_slot() {
+        let st = MaterializedShortTermRefPicSet {
+            delta_poc_s0: vec![-1],
+            used_by_curr_pic_s0: vec![true],
+            delta_poc_s1: vec![],
+            used_by_curr_pic_s1: vec![],
+        };
+        let lists = build_rps_poc_lists(false, 1, 256, &st, &[]);
+        let mut dpb = Dpb::new();
+        dpb.insert(entry(0, Marking::ShortTerm));
+        let rps = dpb.apply_rps(false, 0, &lists, 256);
+        let rpl = dpb.build_ref_pic_lists(
+            &rps,
+            &RefPicListParams {
+                num_ref_idx_l0_active_minus1: 0,
+                num_pic_total_curr: 2,
+                curr_pic_ref_enabled: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(rpl.list0, vec![Some(CURR_PIC)]);
+    }
+
+    /// select_col_pic never yields the CURR_PIC sentinel (§7.4.7.1
+    /// forbids collocated_ref_idx referring to the current picture).
+    #[test]
+    fn col_pic_selection_rejects_curr_pic() {
+        let lists = RefPicLists {
+            list0: vec![Some(CURR_PIC)],
+            list1: None,
+        };
+        assert_eq!(select_col_pic(&lists, false, true, 0), None);
+    }
+
+    /// no_backward_pred_flag treats currPic as DiffPicOrderCnt == 0
+    /// (not a future reference).
+    #[test]
+    fn no_backward_pred_ignores_curr_pic() {
+        let dpb = Dpb::new();
+        let lists = RefPicLists {
+            list0: vec![Some(CURR_PIC)],
+            list1: None,
+        };
+        assert!(no_backward_pred_flag(&dpb, &lists, 5));
     }
 
     #[test]

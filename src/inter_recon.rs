@@ -122,9 +122,27 @@ impl<'a> RefListAccess<'a> {
     }
 
     /// Borrow `RefPicListX[ ref_idx ]`'s DPB entry, or `None` when the
-    /// list slot is "no reference picture" / out of range.
+    /// list slot is "no reference picture", out of range, or the
+    /// current picture ([`crate::dpb::CURR_PIC`] — resolved by the
+    /// reconstruction driver, not the DPB).
     #[must_use]
     pub fn entry(&self, list: usize, ref_idx: i32) -> Option<&'a DpbEntry> {
+        let idx = self.slot(list, ref_idx)?;
+        if idx == crate::dpb::CURR_PIC {
+            return None;
+        }
+        self.entries.get(idx)
+    }
+
+    /// `true` when `RefPicListX[ ref_idx ]` is the CURRENT picture (the
+    /// §8.3.4 currPic append — intra block copy).
+    #[must_use]
+    pub fn is_curr_pic(&self, list: usize, ref_idx: i32) -> bool {
+        self.slot(list, ref_idx) == Some(crate::dpb::CURR_PIC)
+    }
+
+    /// The raw `RefPicListX[ ref_idx ]` slot value.
+    fn slot(&self, list: usize, ref_idx: i32) -> Option<usize> {
         if ref_idx < 0 {
             return None;
         }
@@ -133,8 +151,7 @@ impl<'a> RefListAccess<'a> {
         } else {
             self.lists.list1.as_ref()?.get(ref_idx as usize)
         };
-        let idx = (*slot?)?;
-        self.entries.get(idx)
+        *slot?
     }
 }
 
@@ -167,10 +184,29 @@ pub fn reconstruct_inter_cu(
     let cat = params.chroma_array_type;
     let (sub_w, sub_h) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
 
+    // §8.5.3.1: a prediction from the current picture (intra block
+    // copy) reads the current decoded samples before in-loop
+    // filtering. The §8.5.3.1 availability constraints guarantee every
+    // referenced sample precedes this coding block in z-scan order, so
+    // one snapshot at CU entry is exact.
+    let needs_curr = refs.lists.list0.contains(&Some(crate::dpb::CURR_PIC))
+        || refs
+            .lists
+            .list1
+            .as_ref()
+            .is_some_and(|l| l.contains(&Some(crate::dpb::CURR_PIC)));
+    let needs_curr = needs_curr
+        && motions.iter().any(|m| {
+            (m.pred_flag_l0 && refs.is_curr_pic(0, m.ref_idx_l0))
+                || (m.pred_flag_l1 && refs.is_curr_pic(1, m.ref_idx_l1))
+        });
+    let snapshot: Option<Picture> = needs_curr.then(|| pic.clone());
+
     for (rect, motion) in rects.iter().zip(motions.iter()) {
         let l0 = resolve_list(
             params,
             refs,
+            snapshot.as_ref(),
             0,
             motion.pred_flag_l0,
             motion.ref_idx_l0,
@@ -179,6 +215,7 @@ pub fn reconstruct_inter_cu(
         let l1 = resolve_list(
             params,
             refs,
+            snapshot.as_ref(),
             1,
             motion.pred_flag_l1,
             motion.ref_idx_l1,
@@ -226,21 +263,34 @@ pub fn reconstruct_inter_cu(
 /// chroma MV and fetching `RefPicListX[ refIdx ]`. An unused list (or a
 /// list whose reference resolves to "no reference picture") becomes a
 /// `pred_flag == false` entry pointing at a fallback picture (never read).
-fn resolve_list<'a>(
+///
+/// `curr_snapshot` is the pre-in-loop-filter copy of the current
+/// picture (`Some` exactly when the CU references the §8.3.4 currPic —
+/// intra block copy).
+fn resolve_list<'a, 'b>(
     params: &ReconParams,
-    refs: &RefListAccess<'a>,
+    refs: &'b RefListAccess<'a>,
+    curr_snapshot: Option<&'b Picture>,
     list: usize,
     pred_flag: bool,
     ref_idx: i32,
     mv_l: [i32; 2],
-) -> Result<ResolvedList<'a>, ReconError> {
+) -> Result<ResolvedList<'b>, ReconError>
+where
+    'a: 'b,
+{
+    let (sw, sh) = if params.chroma_array_type != 0 {
+        sub_wh_c(params.chroma_array_type)
+    } else {
+        (1, 1)
+    };
     if pred_flag {
-        if let Some(ref_pic) = refs.ref_pic(list, ref_idx) {
-            let (sw, sh) = if params.chroma_array_type != 0 {
-                sub_wh_c(params.chroma_array_type)
-            } else {
-                (1, 1)
-            };
+        let ref_pic: Option<&'b Picture> = if refs.is_curr_pic(list, ref_idx) {
+            curr_snapshot
+        } else {
+            refs.ref_pic(list, ref_idx)
+        };
+        if let Some(ref_pic) = ref_pic {
             let mv_c = derive_chroma_mv(mv_l, sw as i32, sh as i32);
             return Ok(ResolvedList {
                 pred_flag: true,
@@ -257,6 +307,7 @@ fn resolve_list<'a>(
     let fallback = refs
         .ref_pic(0, 0)
         .or_else(|| refs.ref_pic(1, 0))
+        .or(curr_snapshot)
         .ok_or(ReconError::InterNotSupported)?;
     Ok(ResolvedList {
         pred_flag: false,
@@ -435,6 +486,12 @@ pub struct InterSliceContext {
     /// §8.7 loop filters must not modify the reconstructed samples of
     /// `pcm_flag == 1` coding units.
     pub pcm_loop_filter_disabled: bool,
+    /// `use_integer_mv_flag` (§7.4.7.1) — the eqs 8-98..8-101 /
+    /// 8-124..8-125 integer motion-vector resolution.
+    pub use_integer_mv: bool,
+    /// `TwoVersionsOfCurrDecPicFlag` (§7.4.3.3.3 eq. 7-40) — gates the
+    /// §8.5.3.2.1 eqs 8-102/8-103 8×8 bi→uni reduction.
+    pub two_versions_curr_pic: bool,
 }
 
 /// One placed coding tree unit for the §8.5 picture-level inter driver.
@@ -524,16 +581,28 @@ pub fn reconstruct_inter_picture(
     ctx.set_slice_addr_rs(slice_addr_map.clone());
 
     // §8.5.3.2 reference-picture resolvers, bound to the §8.3.4 ref lists.
-    let ref_poc = |list: usize, ref_idx: i32| refs.ref_poc(list, ref_idx);
+    // The CURR_PIC sentinel resolves to the current POC and — per the
+    // §8.3.1 "the current decoded picture is marked as used for
+    // long-term reference" clause — reads as a long-term reference.
+    let ref_poc = |list: usize, ref_idx: i32| {
+        if refs.is_curr_pic(list, ref_idx) {
+            slice.curr_poc
+        } else {
+            refs.ref_poc(list, ref_idx)
+        }
+    };
     let ref_long_term = |list: usize, ref_idx: i32| {
-        refs.entry(list, ref_idx)
-            .is_some_and(|e| e.marking == crate::dpb::Marking::LongTerm)
+        refs.is_curr_pic(list, ref_idx)
+            || refs
+                .entry(list, ref_idx)
+                .is_some_and(|e| e.marking == crate::dpb::Marking::LongTerm)
     };
     let ref_short_term = |list: usize, ref_idx: i32| {
         refs.entry(list, ref_idx)
             .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
     };
     let col_ref_long_term = |_poc: i32| false;
+    let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
 
     let mv_ctx = PuMvContext {
         curr_poc: slice.curr_poc,
@@ -554,6 +623,9 @@ pub fn reconstruct_inter_picture(
         ref_short_term: &ref_short_term,
         col_field,
         col_ref_long_term: &col_ref_long_term,
+        use_integer_mv: slice.use_integer_mv,
+        two_versions_curr_pic: slice.two_versions_curr_pic,
+        is_curr_pic: &is_curr_pic,
     };
 
     let mut deblock_cus: Vec<crate::deblock::DeblockCuDesc> = Vec::new();
@@ -1175,6 +1247,112 @@ mod tests {
             ref_short_term: short,
             col_field: None,
             col_ref_long_term: col_long,
+            use_integer_mv: false,
+            two_versions_curr_pic: false,
+            is_curr_pic: &|_, _| false,
+        }
+    }
+
+    /// §8.5.3.1 intra block copy: a CU whose L0 reference is the
+    /// CURRENT picture (CURR_PIC) copies already-reconstructed samples
+    /// of the same picture. The 16×16 CU at (16, 0) signals an AMVP MV
+    /// of −16 luma samples (mvd −16 on the eq. 8-98 integer path), so
+    /// it reconstructs to a copy of the (0, 0) block — luma and both
+    /// chroma planes.
+    #[test]
+    fn ibc_cu_copies_current_picture_block() {
+        let params = p_params();
+        let entries: Vec<DpbEntry> = Vec::new();
+        let lists = RefPicLists {
+            list0: vec![Some(crate::dpb::CURR_PIC)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+
+        let ref_poc = |_l: usize, _r: i32| 4i32;
+        let long = |_l: usize, _r: i32| true;
+        let short = |_l: usize, _r: i32| false;
+        let col_long = |_p: i32| false;
+        let is_curr = |l: usize, r: i32| l == 0 && r == 0;
+        let mut ctx = p_ctx(&ref_poc, &long, &short, &col_long);
+        ctx.is_curr_pic = &is_curr;
+
+        let mvd = |v: i32| crate::binarization::MvdComponent {
+            greater0_flag: u8::from(v != 0),
+            greater1_flag: None,
+            minus2: None,
+            sign_flag: None,
+            value: v,
+        };
+        let pu = PredictionUnit {
+            merge_flag: false,
+            merge_idx: None,
+            inter_pred_idc: Some(crate::binarization::InterPredIdc::PredL0),
+            ref_idx_l0: Some(0),
+            mvd_l0: Some([mvd(-16), mvd(0)]),
+            mvp_l0_flag: Some(0),
+            ref_idx_l1: None,
+            mvd_l1: None,
+            mvp_l1_flag: None,
+        };
+        let mut cu = inter_cu_16(pu, None);
+        cu.x0 = 16;
+
+        let mut field = MotionField::new(32, 32);
+        // Seed the current picture with a distinct pattern; the CU
+        // region starts at the 8-bit mid-level.
+        let mut pic = Picture::new(32, 32, 1, 8, 8);
+        for y in 0..32usize {
+            for x in 0..32usize {
+                pic.set_sample(Plane::Luma, x, y, ((x * 7 + y * 3) % 200) as i32);
+            }
+        }
+        for y in 0..16usize {
+            for x in 0..16usize {
+                pic.set_sample(Plane::Cb, x, y, ((x * 5 + y * 11) % 180) as i32);
+                pic.set_sample(Plane::Cr, x, y, ((x * 13 + y * 2) % 160) as i32);
+            }
+        }
+        let available = |_x: i32, _y: i32| false;
+        resolve_and_reconstruct_inter_cu(
+            &mut pic,
+            &mut field,
+            &params,
+            &cu,
+            &cu.prediction_units,
+            &ctx,
+            &available,
+            &refs,
+            25,
+            None,
+        )
+        .unwrap();
+
+        for y in 0..16usize {
+            for x in 0..16usize {
+                assert_eq!(
+                    pic.sample(Plane::Luma, 16 + x, y),
+                    pic.sample(Plane::Luma, x, y),
+                    "luma ({x},{y})"
+                );
+            }
+        }
+        for y in 0..8usize {
+            for x in 0..8usize {
+                assert_eq!(
+                    pic.sample(Plane::Cb, 8 + x, y),
+                    pic.sample(Plane::Cb, x, y),
+                    "cb ({x},{y})"
+                );
+                assert_eq!(
+                    pic.sample(Plane::Cr, 8 + x, y),
+                    pic.sample(Plane::Cr, x, y),
+                    "cr ({x},{y})"
+                );
+            }
         }
     }
 
@@ -1322,6 +1500,8 @@ mod tests {
             log2_sao_offset_scale_chroma: 0,
             wp: None,
             pcm_loop_filter_disabled: false,
+            use_integer_mv: false,
+            two_versions_curr_pic: false,
         }
     }
 
@@ -1663,6 +1843,7 @@ mod tests {
             temporal_mvp_enabled: false,
             collocated_from_l0_flag: true,
             collocated_ref_idx: 0,
+            curr_pic_ref_enabled: false,
         };
         let idr = seq.begin_picture(&idr_header, &i_slice);
         seq.store_picture(idr.poc, 0, flat_ref(110, 128), MotionField::new(32, 32));

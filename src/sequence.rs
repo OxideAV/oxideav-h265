@@ -882,8 +882,9 @@ fn materialize_slice_rps(
 }
 
 /// `NumPicTotalCurr` (§7.4.7.2) from the already-resolved picture
-/// header info (single-layer, `pps_curr_pic_ref_enabled_flag == 0`).
-fn num_pic_total_curr(info: &PictureHeaderInfo) -> u32 {
+/// header info (single-layer; `pps_curr_pic_ref_enabled_flag`
+/// contributes the closing `NumPicTotalCurr++`).
+fn num_pic_total_curr(info: &PictureHeaderInfo, curr_pic_ref_enabled: bool) -> u32 {
     let st = info
         .short_term_rps
         .used_by_curr_pic_s0
@@ -896,7 +897,7 @@ fn num_pic_total_curr(info: &PictureHeaderInfo) -> u32 {
         .iter()
         .filter(|e| e.used_by_curr_pic_lt)
         .count();
-    (st + lt) as u32
+    (st + lt) as u32 + u32::from(curr_pic_ref_enabled)
 }
 
 fn build_slice_ref_params(
@@ -907,6 +908,10 @@ fn build_slice_ref_params(
 ) -> SliceRefParams {
     let is_b = slice_type == SliceType::B;
     let is_inter = slice_type != SliceType::I;
+    let curr_pic_ref_enabled = pps
+        .pps_scc_extension
+        .as_ref()
+        .is_some_and(|s| s.pps_curr_pic_ref_enabled_flag);
     SliceRefParams {
         is_inter,
         is_b,
@@ -920,10 +925,11 @@ fn build_slice_ref_params(
                 .num_ref_idx_l1_active_minus1
                 .unwrap_or(pps.num_ref_idx_l1_default_active_minus1),
         ),
-        num_pic_total_curr: num_pic_total_curr(info),
+        num_pic_total_curr: num_pic_total_curr(info, curr_pic_ref_enabled),
         temporal_mvp_enabled: header.slice_temporal_mvp_enabled_flag,
         collocated_from_l0_flag: header.collocated_from_l0_flag.unwrap_or(true),
         collocated_ref_idx: header.collocated_ref_idx.unwrap_or(0),
+        curr_pic_ref_enabled,
     }
 }
 
@@ -1064,6 +1070,18 @@ fn build_inter_slice_context(
             .pcm
             .as_ref()
             .is_some_and(|p| p.loop_filter_disabled_flag),
+        use_integer_mv: header.use_integer_mv_flag,
+        // §7.4.3.3.3 eq. 7-40: TwoVersionsOfCurrDecPicFlag =
+        // pps_curr_pic_ref_enabled_flag && ( sao enabled ||
+        // !pps_deblocking_filter_disabled_flag ||
+        // deblocking_filter_override_enabled_flag ).
+        two_versions_curr_pic: pps
+            .pps_scc_extension
+            .as_ref()
+            .is_some_and(|s| s.pps_curr_pic_ref_enabled_flag)
+            && (sps.sample_adaptive_offset_enabled_flag
+                || !pps.deblocking.disabled_flag
+                || pps.deblocking.override_enabled_flag),
     }
 }
 

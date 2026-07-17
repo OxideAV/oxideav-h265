@@ -246,6 +246,18 @@ pub struct PuMvContext<'a> {
     /// Resolve the collocated picture's stored `refIdxCol` reference POC to
     /// whether that reference is long-term (the §8.5.3.2.9 scaling gate).
     pub col_ref_long_term: &'a dyn Fn(i32) -> bool,
+    /// `use_integer_mv_flag` (§7.4.7.1) — selects the eqs 8-98..8-101 /
+    /// 8-124..8-125 integer-resolution motion-vector path for every
+    /// reference.
+    pub use_integer_mv: bool,
+    /// `TwoVersionsOfCurrDecPicFlag` (§7.4.3.3.3, eq. 7-40) — gates the
+    /// §8.5.3.2.1 eqs 8-102/8-103 8×8 bi→uni reduction.
+    pub two_versions_curr_pic: bool,
+    /// Resolve `(list, ref_idx)` to whether `RefPicListX[ ref_idx ]` is
+    /// the CURRENT picture (§8.3.4 currPic — intra block copy). Its
+    /// motion vectors take the integer-resolution path regardless of
+    /// `use_integer_mv`.
+    pub is_curr_pic: &'a dyn Fn(usize, i32) -> bool,
 }
 
 impl std::fmt::Debug for PuMvContext<'_> {
@@ -650,14 +662,33 @@ fn resolve_merge(
     let ref_poc = ctx.ref_poc;
     let chosen = build_merge_candidate(&spatial, col, params, merge_idx, pb_w_plus_h, ref_poc);
 
-    PuMotion {
+    // §8.5.3.2.1 step 9 (eqs 8-124/8-125): the merged motion vector is
+    // rounded to integer resolution when use_integer_mv_flag is 1 or
+    // the reference picture is the current picture.
+    let round = |mv: Mv| [(mv[0] >> 2) << 2, (mv[1] >> 2) << 2];
+    let mv_l0 =
+        if chosen.pred_flag_l0 && (ctx.use_integer_mv || (ctx.is_curr_pic)(0, chosen.ref_idx_l0)) {
+            round(chosen.mv_l0)
+        } else {
+            chosen.mv_l0
+        };
+    let mv_l1 =
+        if chosen.pred_flag_l1 && (ctx.use_integer_mv || (ctx.is_curr_pic)(1, chosen.ref_idx_l1)) {
+            round(chosen.mv_l1)
+        } else {
+            chosen.mv_l1
+        };
+
+    let mut out = PuMotion {
         pred_flag_l0: chosen.pred_flag_l0,
         pred_flag_l1: chosen.pred_flag_l1,
         ref_idx_l0: chosen.ref_idx_l0,
         ref_idx_l1: chosen.ref_idx_l1,
-        mv_l0: chosen.mv_l0,
-        mv_l1: chosen.mv_l1,
-    }
+        mv_l0,
+        mv_l1,
+    };
+    apply_bi_to_uni_reduction(&mut out, geom, ctx);
+    out
 }
 
 /// §8.5.3.2.1 steps 1–5 — the AMVP (non-merge) branch.
@@ -710,10 +741,11 @@ fn resolve_amvp(
         let mvd = mvd_field
             .map(|c| [c[0].value, c[1].value])
             .unwrap_or([0, 0]);
-        // The integer-MV path (eqs 8-98..8-101) applies for SCC current-
-        // picture-referencing or use_integer_mv_flag; the present
-        // decoder state uses the fractional path (integer_mv == false).
-        let mv = reconstruct_mv(mvp, mvd, false);
+        // The integer-MV path (eqs 8-98..8-101) applies when the
+        // reference picture is the current picture (intra block copy)
+        // or use_integer_mv_flag is 1.
+        let integer_mv = ctx.use_integer_mv || (ctx.is_curr_pic)(x, ref_idx);
+        let mv = reconstruct_mv(mvp, mvd, integer_mv);
         match x {
             0 => {
                 out.pred_flag_l0 = true;
@@ -765,11 +797,20 @@ fn temporal_mvp(geom: &PuGeometry, ctx: &PuMvContext, x: usize, ref_idx: i32) ->
 }
 
 /// §8.5.3.2.1 eqs 8-102/8-103 — the `nPbSw == 8 && nPbSh == 8` bi→uni-L0
-/// reduction (the SCC `TwoVersionsOfCurrDecPicFlag` clause). For the
-/// non-SCC main path this clause never fires (`TwoVersionsOfCurrDecPicFlag
-/// == 0`), so the reduction is a no-op; the function is structured so the
-/// SCC path can be enabled when current-picture referencing lands.
-fn apply_bi_to_uni_reduction(out: &mut PuMotion, geom: &PuGeometry, _ctx: &PuMvContext) {
+/// reduction (the SCC `TwoVersionsOfCurrDecPicFlag` clause):
+///
+/// * `noIntegerMvFlag = !( ( mvL0 & 0x3 == 0 ) || ( mvL1 & 0x3 == 0 ) )`
+///   (eq 8-102 — either vector being fully integer clears it);
+/// * `identicalMvs = ( mvL0 == mvL1 ) && DiffPicOrderCnt(
+///   RefPicList0[ refIdxL0 ], RefPicList1[ refIdxL1 ] ) == 0`
+///   (eq 8-103);
+/// * with both prediction flags set, an 8×8 prediction block,
+///   `TwoVersionsOfCurrDecPicFlag == 1`, `noIntegerMvFlag == 1` and
+///   `identicalMvs == 0`, list 1 is dropped.
+fn apply_bi_to_uni_reduction(out: &mut PuMotion, geom: &PuGeometry, ctx: &PuMvContext) {
+    if !ctx.two_versions_curr_pic {
+        return;
+    }
     // nPbSw / nPbSh (eqs 8-86/8-87).
     let n_pb_sw = geom.n_cb_s
         / if matches!(geom.part_mode, PartMode::Part2Nx2N | PartMode::Part2NxN) {
@@ -783,15 +824,16 @@ fn apply_bi_to_uni_reduction(out: &mut PuMotion, geom: &PuGeometry, _ctx: &PuMvC
         } else {
             2
         };
-    // The full eq 8-102/8-103 clause additionally requires
-    // TwoVersionsOfCurrDecPicFlag == 1 (SCC). The non-SCC main path keeps
-    // bi-prediction intact, so we gate the reduction off for now.
-    let two_versions_of_curr_dec_pic = false;
+    let integer_mv = |mv: Mv| (mv[0] & 0x3) == 0 && (mv[1] & 0x3) == 0;
+    let no_integer_mv = !(integer_mv(out.mv_l0) || integer_mv(out.mv_l1));
+    let identical_mvs = out.mv_l0 == out.mv_l1
+        && (ctx.ref_poc)(0, out.ref_idx_l0) == (ctx.ref_poc)(1, out.ref_idx_l1);
     if out.pred_flag_l0
         && out.pred_flag_l1
         && n_pb_sw == 8
         && n_pb_sh == 8
-        && two_versions_of_curr_dec_pic
+        && no_integer_mv
+        && !identical_mvs
     {
         out.pred_flag_l1 = false;
         out.ref_idx_l1 = -1;
@@ -845,6 +887,9 @@ mod tests {
             ref_short_term: short,
             col_field: None,
             col_ref_long_term: col_long,
+            use_integer_mv: false,
+            two_versions_curr_pic: false,
+            is_curr_pic: &|_, _| false,
         }
     }
 
@@ -956,6 +1001,69 @@ mod tests {
         // predictor [8,0] + mvd [3,2] = [11, 2].
         assert_eq!(out.mv_l0, [11, 2]);
         assert_eq!(out.ref_idx_l0, 0);
+    }
+
+    /// Eqs 8-124/8-125: a merge candidate whose reference is the
+    /// current picture rounds its motion vector to integer resolution.
+    #[test]
+    fn merge_rounds_mv_for_curr_pic_reference() {
+        let mut field = intra_field(32, 32);
+        // Fractional neighbour MV [13, -6] referencing POC 4 (= curr).
+        field.fill_rect(0, 0, 16, 32, inter_cell_l0(4, [13, -6]));
+        let ref_poc = |_l: usize, r: i32| if r == 0 { 4 } else { -999 };
+        let long = |_l: usize, r: i32| r == 0;
+        let short = |_l: usize, _r: i32| false;
+        let col_long = |_p: i32| false;
+        let mut ctx = base_ctx(&ref_poc, &long, &short, &col_long);
+        let is_curr = |l: usize, r: i32| l == 0 && r == 0;
+        ctx.is_curr_pic = &is_curr;
+        let geom = geom_2nx2n(16, 0, 16);
+        let avail = |x: i32, y: i32| x < 16 && y < 32 && x >= 0 && y >= 0;
+        let out = resolve_pu_motion(&field, &geom, &merge_pu(0), &ctx, &avail);
+        assert!(out.pred_flag_l0);
+        // ( 13 >> 2 ) << 2 = 12; ( −6 >> 2 ) << 2 = −8 (arithmetic).
+        assert_eq!(out.mv_l0, [12, -8]);
+    }
+
+    /// Eqs 8-98..8-101: the AMVP integer path applies the mvd at
+    /// integer scale on the truncated predictor when the reference is
+    /// the current picture.
+    #[test]
+    fn amvp_integer_path_for_curr_pic_reference() {
+        let mut field = intra_field(32, 32);
+        // Neighbour predictor [9, 5] (fractional) referencing curr POC 4.
+        field.fill_rect(0, 0, 16, 32, inter_cell_l0(4, [9, 5]));
+        let ref_poc = |_l: usize, r: i32| if r == 0 { 4 } else { -999 };
+        let long = |_l: usize, r: i32| r == 0;
+        let short = |_l: usize, _r: i32| false;
+        let col_long = |_p: i32| false;
+        let mut ctx = base_ctx(&ref_poc, &long, &short, &col_long);
+        let is_curr = |l: usize, r: i32| l == 0 && r == 0;
+        ctx.is_curr_pic = &is_curr;
+        let geom = geom_2nx2n(16, 0, 16);
+        let mvd = |v: i32| MvdComponent {
+            greater0_flag: u8::from(v != 0),
+            greater1_flag: None,
+            minus2: None,
+            sign_flag: None,
+            value: v,
+        };
+        let pu = PredictionUnit {
+            merge_flag: false,
+            merge_idx: None,
+            inter_pred_idc: Some(InterPredIdc::PredL0),
+            ref_idx_l0: Some(0),
+            mvd_l0: Some([mvd(-3), mvd(1)]),
+            mvp_l0_flag: Some(0),
+            ref_idx_l1: None,
+            mvd_l1: None,
+            mvp_l1_flag: None,
+        };
+        let avail = |x: i32, y: i32| x < 16 && y < 32 && x >= 0 && y >= 0;
+        let out = resolve_pu_motion(&field, &geom, &pu, &ctx, &avail);
+        assert!(out.pred_flag_l0);
+        // ( ( 9 >> 2 ) + (−3) ) << 2 = −4; ( ( 5 >> 2 ) + 1 ) << 2 = 8.
+        assert_eq!(out.mv_l0, [-4, 8]);
     }
 
     #[test]

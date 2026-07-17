@@ -87,6 +87,9 @@ pub struct SliceRefParams {
     pub collocated_from_l0_flag: bool,
     /// `collocated_ref_idx` (inferred 0 when absent).
     pub collocated_ref_idx: u32,
+    /// `pps_curr_pic_ref_enabled_flag` — the §8.3.4 currPic append
+    /// (intra block copy).
+    pub curr_pic_ref_enabled: bool,
 }
 
 /// The cross-picture decode state for one coded video sequence.
@@ -155,6 +158,7 @@ impl PictureSequenceState {
                     is_b: slice.is_b,
                     list_entry_l0: None,
                     list_entry_l1: None,
+                    curr_pic_ref_enabled: slice.curr_pic_ref_enabled,
                 },
             ))
         } else {
@@ -243,6 +247,7 @@ mod tests {
             temporal_mvp_enabled: false,
             collocated_from_l0_flag: true,
             collocated_ref_idx: 0,
+            curr_pic_ref_enabled: false,
         }
     }
 
@@ -318,6 +323,7 @@ mod tests {
             temporal_mvp_enabled: true,
             collocated_from_l0_flag: true,
             collocated_ref_idx: 0,
+            curr_pic_ref_enabled: false,
             ..i_slice()
         };
         let p = st.begin_picture(&p_header, &p_slice);

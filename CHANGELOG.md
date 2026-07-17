@@ -31,6 +31,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   intra reconstruction and inter residual-extraction paths. cbf-clear
   components are materialized so the transform's cross-component
   mixing reaches them.
+- **Intra block copy decode, end to end** (SCC
+  `pps_curr_pic_ref_enabled_flag`): the §8.3.4 reference lists append
+  the current picture per eqs 8-8/8-9/8-10 (with the eq. 8-9 closing
+  override and the unguarded temp-list append), `NumPicTotalCurr`
+  counts it (§7.4.7.2), the slice header parses
+  `use_integer_mv_flag`, motion vectors referencing the current
+  picture (or any, with `use_integer_mv_flag`) take the integer-
+  resolution paths (AMVP eqs 8-98..8-101, merge eqs 8-124/8-125), the
+  current picture reads as a long-term reference for the candidate
+  derivations, the §8.5.3.2.1 eqs 8-102/8-103 8×8 bi→uni reduction is
+  active under `TwoVersionsOfCurrDecPicFlag` (eq. 7-40), and
+  prediction from the current picture copies the pre-in-loop-filter
+  reconstruction via a per-CU snapshot (exact, since the §8.5.3.1
+  availability constraints bound every referenced sample to precede
+  the coding block in z-scan order).
 
 ### Changed — public-surface hygiene (2026-07-17)
 
