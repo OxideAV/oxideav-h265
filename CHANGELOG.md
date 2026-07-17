@@ -19,6 +19,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `( rY << BitDepthC ) >> BitDepthY` bit-depth alignment runs in
   64-bit intermediates so extended-precision coefficient ranges
   cannot overflow.
+- **Adaptive colour transform decode, end to end** (§8.6.8, 4:4:4
+  SCC): a `tu_residual_act_flag == 1` transform unit now derives its
+  three co-located residual arrays with the ACT-adjusted quantization
+  parameters (eq. 8-291 luma clip-and-offset, eq. 8-287/8-288 chroma
+  offset-base swap to `PpsActQpOffset* + slice_act_*_qp_offset`),
+  applies cross-component prediction first, then the §8.6.8.2 inverse
+  colour transformation (input coefficient-range clips, lossy
+  bit-depth alignment with the eq. 8-334/8-335 chroma pre-scale, the
+  eq. 8-336..8-339 lifting, and the rounded down-shift), on both the
+  intra reconstruction and inter residual-extraction paths. cbf-clear
+  components are materialized so the transform's cross-component
+  mixing reaches them.
 
 ### Changed — public-surface hygiene (2026-07-17)
 

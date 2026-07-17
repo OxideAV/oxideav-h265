@@ -113,6 +113,15 @@ pub struct ReconParams {
     pub cb_qp_offset: i32,
     /// `pps_cr_qp_offset + slice_cr_qp_offset` (§8.6.1 `qPiCr` offset).
     pub cr_qp_offset: i32,
+    /// `PpsActQpOffsetY + slice_act_y_qp_offset` — the §8.6.2 eq. 8-291
+    /// luma qP offset applied when `tu_residual_act_flag == 1`.
+    pub act_y_qp_offset: i32,
+    /// `PpsActQpOffsetCb + slice_act_cb_qp_offset` — the §8.6.1
+    /// eq. 8-287 `qPiCb` offset base for `tu_residual_act_flag == 1`
+    /// transform units (replacing the pps + slice Cb offsets).
+    pub act_cb_qp_offset: i32,
+    /// `PpsActQpOffsetCr + slice_act_cr_qp_offset` (eq. 8-288).
+    pub act_cr_qp_offset: i32,
     /// `transform_skip_rotation_enabled_flag`.
     pub transform_skip_rotation_enabled: bool,
     /// `implicit_rdpcm_enabled_flag` (§7.4.3.2.2) — gates the §8.4.4.1
@@ -190,6 +199,15 @@ fn luma_qp(params: &ReconParams, qp_y: i32) -> u32 {
     (qp_y + qp_bd) as u32
 }
 
+/// §8.6.2 eq. 8-291 — the luma qP of a `tu_residual_act_flag == 1`
+/// transform block: `Clip3( 0, 51 + QpBdOffsetY, Qp′Y +
+/// PpsActQpOffsetY + slice_act_y_qp_offset )`.
+#[inline]
+fn luma_qp_act(params: &ReconParams, qp_y: i32) -> u32 {
+    let qp_bd = qp_bd_offset(params.bit_depth_luma);
+    (qp_y + qp_bd + params.act_y_qp_offset).clamp(0, 51 + qp_bd) as u32
+}
+
 /// §8.6.1 eq. 8-283 with `qPY_PRED == SliceQpY` — the single-QG
 /// fallback used when no picture-level QP state is initialized (the
 /// standalone per-CTU helpers).
@@ -231,14 +249,25 @@ fn qpc_420(qpi: i32) -> i32 {
 /// `Qp′Cx = qPCx + QpBdOffsetC` (eq. 8-260).
 #[inline]
 fn chroma_qp(params: &ReconParams, qp_y: i32, cidx: TfComponent) -> u32 {
+    chroma_qp_act(params, qp_y, cidx, false)
+}
+
+/// §8.6.1 with the eq. 8-285..8-288 offset selection: for a
+/// `tu_residual_act_flag == 1` transform unit the `qPiCx` offset base
+/// is `PpsActQpOffsetCx + slice_act_cx_qp_offset` instead of the
+/// pps + slice component offsets.
+#[inline]
+fn chroma_qp_act(params: &ReconParams, qp_y: i32, cidx: TfComponent, act: bool) -> u32 {
     let qp_bd_c = qp_bd_offset(params.bit_depth_chroma);
     // `qp_y` is the already-derived (eq. 8-283) QpY — the §8.6.1
     // chroma input.
     let qpy = qp_y;
-    let offset = match cidx {
-        TfComponent::Cb => params.cb_qp_offset,
-        TfComponent::Cr => params.cr_qp_offset,
-        TfComponent::Luma => 0,
+    let offset = match (cidx, act) {
+        (TfComponent::Cb, false) => params.cb_qp_offset,
+        (TfComponent::Cr, false) => params.cr_qp_offset,
+        (TfComponent::Cb, true) => params.act_cb_qp_offset,
+        (TfComponent::Cr, true) => params.act_cr_qp_offset,
+        (TfComponent::Luma, _) => 0,
     };
     let qpi = (qpy + offset).clamp(-qp_bd_c, 57);
     let qpc = if params.chroma_array_type == 1 {
@@ -383,6 +412,118 @@ fn reconstruct_intra_block(
     transform_skip: bool,
     ccp: Option<CcpInput<'_>>,
 ) -> Result<Option<Vec<i32>>, ReconError> {
+    // §8.6.2 residual array (zero when the block has no coded coeffs).
+    let res: Option<Vec<i32>> = match residual {
+        Some(levels) => Some(intra_residual_array(
+            params,
+            cidx,
+            n_tbs,
+            pred_mode_intra,
+            levels,
+            qp,
+            transquant_bypass,
+            transform_skip,
+        )?),
+        None => None,
+    };
+
+    // §8.4.4.1 step 8: cross-component prediction modifies the chroma
+    // residual from the co-located luma residual (after the step-7
+    // §8.6.5 modification, before the §8.6.7 add). A block with no
+    // coded chroma residual still receives the scaled luma residual.
+    let res = match ccp {
+        Some(c) => {
+            let mut r = res.unwrap_or_else(|| vec![0i32; n_tbs * n_tbs]);
+            apply_cross_comp_pred(
+                &mut r,
+                c.luma_residual,
+                c.res_scale_val,
+                params.bit_depth_luma,
+                params.bit_depth_chroma,
+            );
+            Some(r)
+        }
+        None => res,
+    };
+
+    predict_add_store(
+        pic,
+        params,
+        ctx,
+        plane,
+        ip_component,
+        xb,
+        yb,
+        n_tbs,
+        pred_mode_intra,
+        transquant_bypass,
+        res.as_deref(),
+    )?;
+    Ok(res)
+}
+
+/// §8.6.2 + §8.6.5 — dequantize / inverse-transform one intra block's
+/// coded levels and apply the §8.4.4.1 implicit-RDPCM residual
+/// modification when its condition holds.
+#[allow(clippy::too_many_arguments)]
+fn intra_residual_array(
+    params: &ReconParams,
+    cidx: TfComponent,
+    n_tbs: usize,
+    pred_mode_intra: u8,
+    levels: &[i32],
+    qp: u32,
+    transquant_bypass: bool,
+    transform_skip: bool,
+) -> Result<Vec<i32>, ReconError> {
+    let bit_depth = match cidx {
+        TfComponent::Luma => params.bit_depth_luma,
+        TfComponent::Cb | TfComponent::Cr => params.bit_depth_chroma,
+    };
+    let bp = BlockParams {
+        n_tbs,
+        q_p: qp,
+        component: cidx,
+        pred_mode: PredMode::Intra,
+        bit_depth,
+        extended_precision: params.extended_precision,
+        transquant_bypass,
+        transform_skip,
+        transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
+    };
+    let m = scaling_matrix(params, n_tbs, PredMode::Intra, cidx, transform_skip);
+    let mut r = residual_block(levels, m, bp)?;
+    // §8.4.4.1: residualDpcm — implicit RDPCM applies the §8.6.5
+    // directional residual modification to intra blocks in
+    // transform-skip / transquant-bypass form whose prediction mode is
+    // exactly horizontal (10) or vertical (26), with
+    // mDir = predModeIntra / 26.
+    if params.implicit_rdpcm_enabled
+        && (transform_skip || transquant_bypass)
+        && (pred_mode_intra == 10 || pred_mode_intra == 26)
+    {
+        rdpcm_accumulate(&mut r, n_tbs, pred_mode_intra == 26);
+    }
+    Ok(r)
+}
+
+/// §8.4.4.2.1 prediction + §8.6.7 picture construction for one intra
+/// transform block: gather references, predict, add `res` (when
+/// present), clip, store.
+#[allow(clippy::too_many_arguments)]
+fn predict_add_store(
+    pic: &mut Picture,
+    params: &ReconParams,
+    ctx: &ReconCtx,
+    plane: Plane,
+    ip_component: IpComponent,
+    xb: usize,
+    yb: usize,
+    n_tbs: usize,
+    pred_mode_intra: u8,
+    transquant_bypass: bool,
+    res: Option<&[i32]>,
+) -> Result<(), ReconError> {
     let bit_depth = pic.bit_depth(plane);
     let marked = gather_reference_samples(pic, ctx, plane, xb, yb, n_tbs);
     // §8.4.4.2.6: disableIntraBoundaryFilter is 1 when
@@ -406,67 +547,16 @@ fn reconstruct_intra_block(
     };
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
-    // §8.6.2 residual array (zero when the block has no coded coeffs).
-    let res: Option<Vec<i32>> = match residual {
-        Some(levels) => {
-            let bp = BlockParams {
-                n_tbs,
-                q_p: qp,
-                component: cidx,
-                pred_mode: PredMode::Intra,
-                bit_depth,
-                extended_precision: params.extended_precision,
-                transquant_bypass,
-                transform_skip,
-                transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
-            };
-            let m = scaling_matrix(params, n_tbs, PredMode::Intra, cidx, transform_skip);
-            let mut r = residual_block(levels, m, bp)?;
-            // §8.4.4.1: residualDpcm — implicit RDPCM applies the
-            // §8.6.5 directional residual modification to intra blocks
-            // in transform-skip / transquant-bypass form whose
-            // prediction mode is exactly horizontal (10) or vertical
-            // (26), with mDir = predModeIntra / 26.
-            if params.implicit_rdpcm_enabled
-                && (transform_skip || transquant_bypass)
-                && (pred_mode_intra == 10 || pred_mode_intra == 26)
-            {
-                rdpcm_accumulate(&mut r, n_tbs, pred_mode_intra == 26);
-            }
-            Some(r)
-        }
-        None => None,
-    };
-
-    // §8.4.4.1 step 8: cross-component prediction modifies the chroma
-    // residual from the co-located luma residual (after the step-7
-    // §8.6.5 modification, before the §8.6.7 add). A block with no
-    // coded chroma residual still receives the scaled luma residual.
-    let res = match ccp {
-        Some(c) => {
-            let mut r = res.unwrap_or_else(|| vec![0i32; n_tbs * n_tbs]);
-            apply_cross_comp_pred(
-                &mut r,
-                c.luma_residual,
-                c.res_scale_val,
-                params.bit_depth_luma,
-                params.bit_depth_chroma,
-            );
-            Some(r)
-        }
-        None => res,
-    };
-
-    // §8.4.4.1 / §8.6.5: recSamples = Clip1( predSamples + resSamples ).
+    // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
     for y in 0..n_tbs {
         for x in 0..n_tbs {
             let p = pred[y * n_tbs + x];
-            let r = res.as_ref().map_or(0, |r| r[y * n_tbs + x]);
+            let r = res.map_or(0, |r| r[y * n_tbs + x]);
             let v = clip1(p + r, bit_depth);
             pic.set_sample(plane, xb + x, yb + y, v);
         }
     }
-    Ok(res)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +956,73 @@ fn extract_residual_tree(
         }
         TransformTree::Leaf { unit, .. } => {
             let n_tbs = 1usize << log2_trafo_size;
+            // §8.5.4.1 step 4 — a tu_residual_act_flag == 1 unit
+            // (4:4:4) derives all three co-located residual arrays
+            // (ACT-adjusted qP), applies cross-component prediction,
+            // then the §8.6.8.2 inverse colour transform, before the
+            // arrays land in the CU planes.
+            if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 {
+                let mut r_y = match &unit.residual_luma {
+                    Some(rb) => inter_residual_block(
+                        params,
+                        rb,
+                        TfComponent::Luma,
+                        luma_qp_act(params, qp_y),
+                        transquant_bypass,
+                    )?,
+                    None => vec![0i32; n_tbs * n_tbs],
+                };
+                let chroma_res = |blocks: &[crate::residual::ResidualBlock],
+                                  coded: bool,
+                                  cidx: TfComponent|
+                 -> Result<Vec<i32>, ReconError> {
+                    match blocks.first() {
+                        Some(rb) if coded => inter_residual_block(
+                            params,
+                            rb,
+                            cidx,
+                            chroma_qp_act(params, qp_y, cidx, true),
+                            transquant_bypass,
+                        ),
+                        _ => Ok(vec![0i32; n_tbs * n_tbs]),
+                    }
+                };
+                let mut r_cb =
+                    chroma_res(&unit.residual_cb, unit.cbf_cb_halves[0], TfComponent::Cb)?;
+                let mut r_cr =
+                    chroma_res(&unit.residual_cr, unit.cbf_cr_halves[0], TfComponent::Cr)?;
+                for (r, ccp) in [
+                    (&mut r_cb, unit.cross_comp_pred_cb.as_ref()),
+                    (&mut r_cr, unit.cross_comp_pred_cr.as_ref()),
+                ] {
+                    if let Some(c) = CcpInput::resolve(params.chroma_array_type, ccp, Some(&r_y)) {
+                        apply_cross_comp_pred(
+                            r,
+                            c.luma_residual,
+                            c.res_scale_val,
+                            params.bit_depth_luma,
+                            params.bit_depth_chroma,
+                        );
+                    }
+                }
+                crate::transform::act_inverse(
+                    &mut r_y,
+                    &mut r_cb,
+                    &mut r_cr,
+                    params.bit_depth_luma,
+                    params.bit_depth_chroma,
+                    params.extended_precision,
+                    transquant_bypass,
+                );
+                luma.write_block(x0, y0, n_tbs, &r_y);
+                if let Some(plane) = cb {
+                    plane.write_block(x0, y0, n_tbs, &r_cb);
+                }
+                if let Some(plane) = cr {
+                    plane.write_block(x0, y0, n_tbs, &r_cr);
+                }
+                return Ok(());
+            }
             // Luma residual (§8.6.2 with the MODE_INTER path). The
             // array is kept for the §8.5.4.3 step-5 cross-component
             // prediction of this unit's chroma blocks (4:4:4).
@@ -2184,6 +2341,25 @@ fn reconstruct_transform_unit(
     let n_tbs = 1usize << log2_trafo_size;
     let _ = unit.cu_qp_delta.as_ref();
 
+    // §8.6.8 adaptive colour transform (4:4:4 only): the three
+    // co-located residual arrays of this unit are jointly modified
+    // before the per-component prediction + add.
+    if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 && !skip_chroma {
+        return reconstruct_act_transform_unit(
+            pic,
+            params,
+            ctx,
+            unit,
+            x0,
+            y0,
+            n_tbs,
+            intra_pred_mode_y,
+            intra_pred_mode_c,
+            qp_y,
+            transquant_bypass,
+        );
+    }
+
     // Luma block: `qp_y` is the CU's §8.6.1-derived QpY.
     let luma_qp = luma_qp(params, qp_y);
     let luma_levels = unit.residual_luma.as_ref().map(|rb| rb.levels.as_slice());
@@ -2278,6 +2454,161 @@ fn reconstruct_transform_unit(
     Ok(())
 }
 
+/// §8.4.4.1 with `residual_adaptive_colour_transform_enabled_flag` and
+/// `tu_residual_act_flag == 1` (4:4:4): the transform unit's three
+/// co-located residual arrays are derived (ACT-adjusted qP per
+/// eq. 8-291 / 8-287 / 8-288), cross-component prediction applies
+/// first (§8.4.4.1 step 8), then the §8.6.8.2 inverse colour
+/// transform, then each component is predicted and stored.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_act_transform_unit(
+    pic: &mut Picture,
+    params: &ReconParams,
+    ctx: &ReconCtx,
+    unit: &TransformUnit,
+    x0: usize,
+    y0: usize,
+    n_tbs: usize,
+    intra_pred_mode_y: u8,
+    intra_pred_mode_c: u8,
+    qp_y: i32,
+    transquant_bypass: bool,
+) -> Result<(), ReconError> {
+    let qp_l = luma_qp_act(params, qp_y);
+    let qp_cb = chroma_qp_act(params, qp_y, TfComponent::Cb, true);
+    let qp_cr = chroma_qp_act(params, qp_y, TfComponent::Cr, true);
+
+    // The §8.6.8.2 transform mixes the components, so a cbf-clear
+    // component still needs a materialized (zero) residual array.
+    let mut r_y = match &unit.residual_luma {
+        Some(rb) => intra_residual_array(
+            params,
+            TfComponent::Luma,
+            n_tbs,
+            intra_pred_mode_y,
+            &rb.levels,
+            qp_l,
+            transquant_bypass,
+            rb.transform_skip,
+        )?,
+        None => vec![0i32; n_tbs * n_tbs],
+    };
+    let chroma_res = |blocks: &[crate::residual::ResidualBlock],
+                      coded: bool,
+                      cidx: TfComponent,
+                      qp: u32|
+     -> Result<Vec<i32>, ReconError> {
+        match blocks.first() {
+            Some(rb) if coded => intra_residual_array(
+                params,
+                cidx,
+                n_tbs,
+                intra_pred_mode_c,
+                &rb.levels,
+                qp,
+                transquant_bypass,
+                rb.transform_skip,
+            ),
+            _ => Ok(vec![0i32; n_tbs * n_tbs]),
+        }
+    };
+    let mut r_cb = chroma_res(
+        &unit.residual_cb,
+        unit.cbf_cb_halves[0],
+        TfComponent::Cb,
+        qp_cb,
+    )?;
+    let mut r_cr = chroma_res(
+        &unit.residual_cr,
+        unit.cbf_cr_halves[0],
+        TfComponent::Cr,
+        qp_cr,
+    )?;
+
+    // §8.4.4.1 step 8 — cross-component prediction precedes the
+    // colour transform (the §8.4.1 step-2 ordering).
+    if let Some(c) = CcpInput::resolve(
+        params.chroma_array_type,
+        unit.cross_comp_pred_cb.as_ref(),
+        Some(&r_y),
+    ) {
+        apply_cross_comp_pred(
+            &mut r_cb,
+            c.luma_residual,
+            c.res_scale_val,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        );
+    }
+    if let Some(c) = CcpInput::resolve(
+        params.chroma_array_type,
+        unit.cross_comp_pred_cr.as_ref(),
+        Some(&r_y),
+    ) {
+        apply_cross_comp_pred(
+            &mut r_cr,
+            c.luma_residual,
+            c.res_scale_val,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        );
+    }
+
+    // §8.6.8.2 — the inverse adaptive colour transformation.
+    crate::transform::act_inverse(
+        &mut r_y,
+        &mut r_cb,
+        &mut r_cr,
+        params.bit_depth_luma,
+        params.bit_depth_chroma,
+        params.extended_precision,
+        transquant_bypass,
+    );
+
+    // Per-component §8.4.4.2.1 prediction + §8.6.7 construction
+    // (4:4:4 — the chroma blocks are co-located and equal-sized).
+    predict_add_store(
+        pic,
+        params,
+        ctx,
+        Plane::Luma,
+        IpComponent::Luma,
+        x0,
+        y0,
+        n_tbs,
+        intra_pred_mode_y,
+        transquant_bypass,
+        Some(&r_y),
+    )?;
+    predict_add_store(
+        pic,
+        params,
+        ctx,
+        Plane::Cb,
+        ip_component_of(TfComponent::Cb),
+        x0,
+        y0,
+        n_tbs,
+        intra_pred_mode_c,
+        transquant_bypass,
+        Some(&r_cb),
+    )?;
+    predict_add_store(
+        pic,
+        params,
+        ctx,
+        Plane::Cr,
+        ip_component_of(TfComponent::Cr),
+        x0,
+        y0,
+        n_tbs,
+        intra_pred_mode_c,
+        transquant_bypass,
+        Some(&r_cr),
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_blocks(
     pic: &mut Picture,
@@ -2358,6 +2689,9 @@ mod tests {
             slice_qp_y: 25,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
+            act_y_qp_offset: 0,
+            act_cb_qp_offset: 0,
+            act_cr_qp_offset: 0,
             transform_skip_rotation_enabled: false,
             implicit_rdpcm_enabled: false,
             intra_boundary_filtering_disabled: false,
@@ -3327,5 +3661,185 @@ mod tests {
                 assert_eq!(pic.sample(Plane::Cr, x, y), 128, "cr at ({x},{y})");
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §8.6.8 adaptive colour transform (4:4:4)
+    // -----------------------------------------------------------------
+
+    /// A 16×16 transquant-bypass 4:4:4 intra CTU whose single TU has
+    /// `tu_residual_act_flag == 1` and carries the given raw bypass
+    /// residuals per component (all-cbf-set unless a level vec is
+    /// `None`).
+    fn act_intra_ctu(
+        luma_levels: Option<Vec<i32>>,
+        cb_levels: Option<Vec<i32>>,
+        cr_levels: Option<Vec<i32>>,
+    ) -> CodingTreeUnit {
+        let raw = |levels: Vec<i32>| ResidualBlock {
+            log2_trafo_size: 4,
+            last_sig_coeff_x: 15,
+            last_sig_coeff_y: 15,
+            levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: false,
+            explicit_rdpcm_dir_flag: false,
+        };
+        let mut unit = TransformUnit {
+            tu_residual_act_flag: 1,
+            ..Default::default()
+        };
+        let cbf_luma = luma_levels.is_some();
+        if let Some(l) = luma_levels {
+            unit.residual_luma = Some(raw(l));
+        }
+        if let Some(l) = cb_levels {
+            unit.residual_cb = vec![raw(l)];
+            unit.cbf_cb_halves = [true, false];
+        }
+        if let Some(l) = cr_levels {
+            unit.residual_cr = vec![raw(l)];
+            unit.cbf_cr_halves = [true, false];
+        }
+        let cu = CodingUnit {
+            x0: 0,
+            y0: 0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: true,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            pcm: None,
+            palette: None,
+            prediction_units: vec![],
+            intra_luma: vec![IntraLumaMode {
+                prev_intra_luma_pred_flag: true,
+                mpm_idx: Some(0),
+                rem_intra_luma_pred_mode: None,
+            }],
+            intra_chroma_pred_mode: vec![4],
+            rqt_root_cbf: true,
+            transform_tree: Some(TransformTree::Leaf { cbf_luma, unit }),
+        };
+        CodingTreeUnit {
+            sao: None,
+            quadtree: CodingQuadtree::Leaf(Box::new(cu)),
+        }
+    }
+
+    /// §8.6.8.2 lossless inverse in the intra path: coded
+    /// (Y, Cg, Co) = (4, 3, 14) lifts back to component residuals
+    /// (6, −4, 10) — tmp = 4 − 1 = 3, rY = 6, rCb = 3 − 7 = −4,
+    /// rCr = 14 − 4 = 10 — on top of the flat 128 prediction.
+    #[test]
+    fn act_intra_bypass_lifts_residual_triple() {
+        let params = params_444();
+        let ctu = act_intra_ctu(Some(vec![4; 256]), Some(vec![3; 256]), Some(vec![14; 256]));
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        reconstruct_intra_ctu(&mut pic, &params, &ctu).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 134, "luma at ({x},{y})");
+                assert_eq!(pic.sample(Plane::Cb, x, y), 124, "cb at ({x},{y})");
+                assert_eq!(pic.sample(Plane::Cr, x, y), 138, "cr at ({x},{y})");
+            }
+        }
+    }
+
+    /// A cbf-clear component still participates in the §8.6.8.2
+    /// mixing: chroma-only (Cg = 2) produces tmp = −1 ⇒
+    /// (rY, rCb, rCr) = (1, −1, −1).
+    #[test]
+    fn act_intra_mixes_into_uncoded_components() {
+        let params = params_444();
+        let ctu = act_intra_ctu(None, Some(vec![2; 256]), None);
+        let mut pic = Picture::new(16, 16, 3, 8, 8);
+        reconstruct_intra_ctu(&mut pic, &params, &ctu).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 129, "luma at ({x},{y})");
+                assert_eq!(pic.sample(Plane::Cb, x, y), 127, "cb at ({x},{y})");
+                assert_eq!(pic.sample(Plane::Cr, x, y), 127, "cr at ({x},{y})");
+            }
+        }
+    }
+
+    /// §8.5.4.1 step 4 in the inter residual-extraction path: the same
+    /// (4, 3, 14) → (6, −4, 10) lifting lands in the CU residual
+    /// planes.
+    #[test]
+    fn act_inter_extract_lifts_residual_triple() {
+        let params = params_444();
+        let raw = |levels: Vec<i32>| ResidualBlock {
+            log2_trafo_size: 3,
+            last_sig_coeff_x: 7,
+            last_sig_coeff_y: 7,
+            levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: false,
+            explicit_rdpcm_dir_flag: false,
+        };
+        let unit = TransformUnit {
+            tu_residual_act_flag: 1,
+            residual_luma: Some(raw(vec![4; 64])),
+            residual_cb: vec![raw(vec![3; 64])],
+            residual_cr: vec![raw(vec![14; 64])],
+            cbf_cb_halves: [true, false],
+            cbf_cr_halves: [true, false],
+            ..Default::default()
+        };
+        let tree = TransformTree::Leaf {
+            cbf_luma: true,
+            unit,
+        };
+        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 8, 25, true).unwrap();
+        assert!(res.luma.samples.iter().all(|&v| v == 6), "luma");
+        assert!(
+            res.cb.as_ref().unwrap().samples.iter().all(|&v| v == -4),
+            "cb"
+        );
+        assert!(
+            res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 10),
+            "cr"
+        );
+    }
+
+    /// §8.4.4.1 step-8 ordering: cross-component prediction applies
+    /// BEFORE the §8.6.8.2 colour transform. Luma coded 8 with
+    /// ResScaleVal +8 on Cb: rCb becomes 8 before the lifting ⇒
+    /// tmp = 8 − 4 = 4, rY = 12, rCb = 4, rCr = 4 (Cr CCP absent,
+    /// rCr = 0 + rCb after eq. 8-339... rCr = 0 → rCb' = 4 ⇒ rCr = 4).
+    #[test]
+    fn act_applies_after_ccp() {
+        let params = params_444();
+        let raw = |levels: Vec<i32>| ResidualBlock {
+            log2_trafo_size: 3,
+            last_sig_coeff_x: 7,
+            last_sig_coeff_y: 7,
+            levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: false,
+            explicit_rdpcm_dir_flag: false,
+        };
+        let unit = TransformUnit {
+            tu_residual_act_flag: 1,
+            residual_luma: Some(raw(vec![8; 64])),
+            cross_comp_pred_cb: Some(ccp(8)),
+            ..Default::default()
+        };
+        let tree = TransformTree::Leaf {
+            cbf_luma: true,
+            unit,
+        };
+        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 8, 25, true).unwrap();
+        assert!(res.luma.samples.iter().all(|&v| v == 12), "luma");
+        assert!(
+            res.cb.as_ref().unwrap().samples.iter().all(|&v| v == 4),
+            "cb"
+        );
+        assert!(
+            res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 4),
+            "cr"
+        );
     }
 }

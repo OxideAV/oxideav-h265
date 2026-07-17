@@ -960,6 +960,24 @@ fn build_recon_params(
         slice_qp_y,
         cb_qp_offset: i32::from(pps.pps_cb_qp_offset) + i32::from(header.slice_cb_qp_offset),
         cr_qp_offset: i32::from(pps.pps_cr_qp_offset) + i32::from(header.slice_cr_qp_offset),
+        // §7.4.3.3.3: PpsActQpOffset{Y,Cb,Cr} = pps_act_{y,cb}_qp_offset_plus5 − 5
+        // / pps_act_cr_qp_offset_plus3 − 3; the slice offsets add on top
+        // (§7.4.7.1), each 0 when absent.
+        act_y_qp_offset: pps
+            .pps_scc_extension
+            .as_ref()
+            .map_or(-5, |s| s.pps_act_y_qp_offset_plus5 - 5)
+            + header.slice_act_y_qp_offset,
+        act_cb_qp_offset: pps
+            .pps_scc_extension
+            .as_ref()
+            .map_or(-5, |s| s.pps_act_cb_qp_offset_plus5 - 5)
+            + header.slice_act_cb_qp_offset,
+        act_cr_qp_offset: pps
+            .pps_scc_extension
+            .as_ref()
+            .map_or(-3, |s| s.pps_act_cr_qp_offset_plus3 - 3)
+            + header.slice_act_cr_qp_offset,
         transform_skip_rotation_enabled: range
             .is_some_and(|r| r.transform_skip_rotation_enabled_flag),
         implicit_rdpcm_enabled: range.is_some_and(|r| r.implicit_rdpcm_enabled_flag),

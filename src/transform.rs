@@ -656,6 +656,78 @@ pub fn rdpcm_accumulate(r: &mut [i32], n_tbs: usize, vertical: bool) {
     }
 }
 
+/// §8.6.8.2 — adaptive colour transformation process (inverse), applied
+/// to the three co-located residual arrays of one 4:4:4 transform block
+/// whose `tu_residual_act_flag` is 1.
+///
+/// Ordered per the clause:
+/// 1. eq. 8-326..8-328 — clip each array to its `CoeffMin/Max` range
+///    (luma range for `rY`, chroma range for `rCb` / `rCr`);
+/// 2. when `cu_transquant_bypass_flag == 0`, eq. 8-329..8-335 —
+///    bit-depth alignment to `Max( BitDepthY, BitDepthC )` with the
+///    extra `<< 1` on both chroma arrays;
+/// 3. eq. 8-336..8-339 — the lifting inverse:
+///    `tmp = rY − ( rCb >> 1 ); rY = tmp + rCb;
+///    rCb = tmp − ( rCr >> 1 ); rCr += rCb`;
+/// 4. when `cu_transquant_bypass_flag == 0`, eq. 8-340..8-342 — the
+///    rounded down-shift back to the component bit depths.
+///
+/// All three slices must have the same length (`nTbS * nTbS`).
+pub fn act_inverse(
+    r_y: &mut [i32],
+    r_cb: &mut [i32],
+    r_cr: &mut [i32],
+    bit_depth_luma: u8,
+    bit_depth_chroma: u8,
+    extended_precision: bool,
+    transquant_bypass: bool,
+) {
+    debug_assert_eq!(r_y.len(), r_cb.len());
+    debug_assert_eq!(r_y.len(), r_cr.len());
+    let (min_y, max_y) = coeff_range(bit_depth_luma, extended_precision);
+    let (min_c, max_c) = coeff_range(bit_depth_chroma, extended_precision);
+    // eq. 8-329..8-332.
+    let max_bd = bit_depth_luma.max(bit_depth_chroma);
+    let delta_bd_y = u32::from(max_bd - bit_depth_luma);
+    let delta_bd_c = u32::from(max_bd - bit_depth_chroma);
+    let offset_bd_y = if delta_bd_y != 0 {
+        1i32 << (delta_bd_y - 1)
+    } else {
+        0
+    };
+    let offset_bd_c = if delta_bd_c != 0 {
+        1i32 << (delta_bd_c - 1)
+    } else {
+        0
+    };
+    for i in 0..r_y.len() {
+        // eq. 8-326..8-328.
+        let mut y = r_y[i].clamp(min_y, max_y);
+        let mut cb = r_cb[i].clamp(min_c, max_c);
+        let mut cr = r_cr[i].clamp(min_c, max_c);
+        // eq. 8-333..8-335 (lossy only).
+        if !transquant_bypass {
+            y <<= delta_bd_y;
+            cb <<= delta_bd_c + 1;
+            cr <<= delta_bd_c + 1;
+        }
+        // eq. 8-336..8-339.
+        let tmp = y - (cb >> 1);
+        y = tmp + cb;
+        cb = tmp - (cr >> 1);
+        cr += cb;
+        // eq. 8-340..8-342 (lossy only).
+        if !transquant_bypass {
+            y = (y + offset_bd_y) >> delta_bd_y;
+            cb = (cb + offset_bd_c) >> delta_bd_c;
+            cr = (cr + offset_bd_c) >> delta_bd_c;
+        }
+        r_y[i] = y;
+        r_cb[i] = cb;
+        r_cr[i] = cr;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,6 +1048,91 @@ mod tests {
                 "column {x}"
             );
         }
+    }
+
+    /// §8.6.8.2 lossless (transquant-bypass) inverse undoes the
+    /// matching forward lifting exactly: forward
+    /// `Co = c2 − c1; t = c1 + ( Co >> 1 ); Cg = c0 − t;
+    /// Y = t + ( Cg >> 1 )` (component order c0/c1/c2 mapped onto the
+    /// reconstructed rY/rCb/rCr outputs), inverse eq. 8-336..8-339.
+    #[test]
+    fn act_inverse_bypass_roundtrips_forward_lifting() {
+        let triples: Vec<(i32, i32, i32)> = (0..64)
+            .map(|i| {
+                let a = ((i * 37) % 51) - 25;
+                let b = ((i * 53) % 61) - 30;
+                let c = ((i * 71) % 41) - 20;
+                (a, b, c)
+            })
+            .collect();
+        let mut r_y = Vec::new();
+        let mut r_cb = Vec::new();
+        let mut r_cr = Vec::new();
+        for &(c0, c1, c2) in &triples {
+            let co = c2 - c1;
+            let t = c1 + (co >> 1);
+            let cg = c0 - t;
+            let y = t + (cg >> 1);
+            r_y.push(y);
+            r_cb.push(cg);
+            r_cr.push(co);
+        }
+        act_inverse(&mut r_y, &mut r_cb, &mut r_cr, 8, 8, false, true);
+        for (i, &(c0, c1, c2)) in triples.iter().enumerate() {
+            assert_eq!((r_y[i], r_cb[i], r_cr[i]), (c0, c1, c2), "triple {i}");
+        }
+    }
+
+    /// The lossy path pre-scales both chroma arrays by `<< 1`
+    /// (eq. 8-334 / 8-335) even at equal bit depths (deltaBD = 0):
+    /// rY = 0, rCb = 4, rCr = 0 ⇒ cb = 8, tmp = −4, y = 4, cb = −4,
+    /// cr = −4.
+    #[test]
+    fn act_inverse_lossy_prescales_chroma() {
+        let mut r_y = vec![0i32];
+        let mut r_cb = vec![4i32];
+        let mut r_cr = vec![0i32];
+        act_inverse(&mut r_y, &mut r_cb, &mut r_cr, 8, 8, false, false);
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (4, -4, -4));
+    }
+
+    /// Bit-depth alignment (eq. 8-329..8-335 / 8-340..8-342): with
+    /// BitDepthY = 10, BitDepthC = 8 a luma-only residual survives the
+    /// up/down shift exactly (deltaBDY = 0, deltaBDC = 2), and a
+    /// chroma-only rCb = 1 aligns to 1 << 3 = 8 before the lifting.
+    #[test]
+    fn act_inverse_lossy_aligns_bit_depths() {
+        // Luma-only: chroma zero ⇒ y unchanged, cb/cr mirror −(y>>1)
+        // pattern scaled back down.
+        let mut r_y = vec![100i32];
+        let mut r_cb = vec![0i32];
+        let mut r_cr = vec![0i32];
+        act_inverse(&mut r_y, &mut r_cb, &mut r_cr, 10, 8, false, false);
+        // deltaBDY = 0: y = 100 − 0 + 0 = 100.
+        // cb = tmp = 100 (aligned) → back: (100 + 2) >> 2 = 25.
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (100, 25, 25));
+        // Chroma-only rCb = 1 at deltaBDC = 2: cb = 1 << 3 = 8;
+        // tmp = −4; y = 4; cb = −4 → (−4 + 2) >> 2 = −1 (arithmetic);
+        // cr = −4 → −1; y stays 10-bit (deltaBDY = 0).
+        let mut r_y = vec![0i32];
+        let mut r_cb = vec![1i32];
+        let mut r_cr = vec![0i32];
+        act_inverse(&mut r_y, &mut r_cb, &mut r_cr, 10, 8, false, false);
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (4, -1, -1));
+    }
+
+    /// Eq. 8-326..8-328 clip the INPUT arrays to the coefficient
+    /// ranges before any lifting.
+    #[test]
+    fn act_inverse_clips_inputs_to_coeff_range() {
+        let mut r_y = vec![40000i32];
+        let mut r_cb = vec![-40000i32];
+        let mut r_cr = vec![0i32];
+        act_inverse(&mut r_y, &mut r_cb, &mut r_cr, 8, 8, false, true);
+        // Clipped to (32767, −32768, 0): tmp = 32767 − (−16384) =
+        // 49151; y = 49151 − 32768 = 16383; cb = 49151 − 0 = 49151;
+        // cr = 0 + 49151 = 49151.
+        assert_eq!((r_y[0], r_cb[0], r_cr[0]), (16383, 49151, 49151));
     }
 
     /// The first row (vertical) / first column (horizontal) is left
