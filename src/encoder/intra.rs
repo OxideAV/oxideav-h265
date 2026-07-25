@@ -706,6 +706,8 @@ pub(crate) fn encode_idr_intra_au_full(
 
     // ---- §8.7 in-loop filters (deblocking + SAO) on the recon ----
     let mut deblock_on = false;
+    let mut beta_offset_div2 = 0i32;
+    let mut tc_offset_div2 = 0i32;
     let mut slice_sao_luma = false;
     let mut slice_sao_chroma = false;
     let mut sao_ctbs: Vec<SaoCtbParams> = Vec::new();
@@ -739,6 +741,8 @@ pub(crate) fn encode_idr_intra_au_full(
             lf,
         );
         deblock_on = out.deblock_on;
+        beta_offset_div2 = out.beta_offset_div2;
+        tc_offset_div2 = out.tc_offset_div2;
         slice_sao_luma = out.slice_sao_luma;
         slice_sao_chroma = out.slice_sao_chroma;
         sao_ctbs = out.sao_ctbs;
@@ -766,8 +770,8 @@ pub(crate) fn encode_idr_intra_au_full(
         w.put_bit(u8::from(deblock_on)); // deblocking_filter_override_flag
         if deblock_on {
             w.put_bit(0); // slice_deblocking_filter_disabled_flag
-            w.se(0); // slice_beta_offset_div2
-            w.se(0); // slice_tc_offset_div2
+            w.se(beta_offset_div2); // slice_beta_offset_div2
+            w.se(tc_offset_div2); // slice_tc_offset_div2
         }
     }
     if slice_sao_luma || slice_sao_chroma || deblock_on {

@@ -110,8 +110,8 @@ registered.** `make_encoder` / `H265Encoder` with three modes:
 Both coding modes accept the §8.7 **in-loop filters** (`deblock` /
 `sao` codec options, `LoopFilterCfg` on the direct APIs): the encoder
 reconstructs through its own decode-side §8.7.2 deblocking (per-slice
-on/off elected against distortion, signalled via the §7.3.6.1
-override group) and §8.7.3 SAO (per-CTB statistics-driven band / edge
+election over off + a {−2, 0, 2}² β/tC-offset sweep, signalled via
+the §7.3.6.1 override group) and §8.7.3 SAO (per-CTB statistics-driven band / edge
 offset estimation with merge-left/up pricing, every candidate
 measured with the decoder's own apply, `encode_sao_ctb` the bin-exact
 §7.3.8.3 dual of the parse) — so the filtered pictures its references
@@ -179,11 +179,10 @@ slice types, and ~900 unit tests.
 
 ## Not yet implemented
 
-* Encoder-side non-zero β/tC deblocking offsets (the election is
-  on/off with zero offsets); larger encoder CTB sizes, deeper
-  encoder RQTs, 4x4-luma DST TUs, AMP partitions, encoder temporal
-  MVP, reordered (non-low-delay) B pyramids, and bi-predictive AMVP
-  signalling (bi arises via merge candidates only).
+* Larger encoder CTB sizes, deeper encoder RQTs, 4x4-luma DST TUs,
+  AMP partitions, encoder temporal MVP, reordered (non-low-delay)
+  B pyramids, and bi-predictive AMVP signalling (bi arises via
+  merge candidates only).
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with

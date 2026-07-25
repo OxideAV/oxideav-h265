@@ -411,6 +411,10 @@ struct SliceLfSignalling<'a> {
     /// This slice's deblocking election
     /// (`slice_deblocking_filter_disabled_flag == !deblock_on`).
     deblock_on: bool,
+    /// Elected `slice_beta_offset_div2`.
+    beta_offset_div2: i32,
+    /// Elected `slice_tc_offset_div2`.
+    tc_offset_div2: i32,
     /// Elected `slice_sao_luma_flag`.
     sao_luma: bool,
     /// Elected `slice_sao_chroma_flag`.
@@ -476,8 +480,8 @@ fn write_inter_slice_header(
         w.put_bit(u8::from(lf.deblock_on)); // deblocking_filter_override_flag
         if lf.deblock_on {
             w.put_bit(0); // slice_deblocking_filter_disabled_flag
-            w.se(0); // slice_beta_offset_div2
-            w.se(0); // slice_tc_offset_div2
+            w.se(lf.beta_offset_div2); // slice_beta_offset_div2
+            w.se(lf.tc_offset_div2); // slice_tc_offset_div2
         }
     }
     if lf.sao_luma || lf.sao_chroma || lf.deblock_on {
@@ -1662,6 +1666,8 @@ fn encode_inter_slice(
     let mut lf_sig = SliceLfSignalling {
         cfg: lf,
         deblock_on: false,
+        beta_offset_div2: 0,
+        tc_offset_div2: 0,
         sao_luma: false,
         sao_chroma: false,
     };
@@ -1692,6 +1698,8 @@ fn encode_inter_slice(
             lf,
         );
         lf_sig.deblock_on = out.deblock_on;
+        lf_sig.beta_offset_div2 = out.beta_offset_div2;
+        lf_sig.tc_offset_div2 = out.tc_offset_div2;
         lf_sig.sao_luma = out.slice_sao_luma;
         lf_sig.sao_chroma = out.slice_sao_chroma;
         sao_ctbs = out.sao_ctbs;

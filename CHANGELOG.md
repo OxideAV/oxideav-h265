@@ -14,9 +14,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   from the coding decisions (partition mode, transform-split
   topology, the per-transform-block nonzero-coefficient marks the
   §8.7.2.4 bS derivation reads), so the encoder's reference pictures
-  match a conforming decoder's bit for bit. The per-slice on/off
-  election is distortion-driven and signalled through the §7.3.6.1
-  deblocking override group (PPS
+  match a conforming decoder's bit for bit. The per-slice election is
+  distortion-driven over off plus a {−2, 0, 2}²
+  `slice_beta_offset_div2` / `slice_tc_offset_div2` sweep, signalled
+  through the §7.3.6.1 deblocking override group (PPS
   `deblocking_filter_override_enabled_flag == 1`, default disabled).
 - **§8.7.3 SAO estimation + emission on the encoder side**:
   statistics-driven per-CTB offset derivation (band position by

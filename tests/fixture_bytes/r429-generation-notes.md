@@ -26,12 +26,16 @@ reconstruction byte for byte.
 | `r429-lf-bgop-qp33.hevc` | same clip generator, 48x48, 5 frames | low-delay B, GOP 3 (mid-stream IDR refresh), QP 33, deblock + SAO |
 | `r429-lf-intra-qp32.hevc` | the `intra_encoder_interop` gradient frame, 64x64 | one intra IDR AU, QP 32, deblock + SAO |
 
+The deblocking election sweeps `slice_beta_offset_div2` /
+`slice_tc_offset_div2` over {−2, 0, 2}² (plus off), so pinned streams
+may carry non-zero slice offsets.
+
 SHA-256:
 
 ```
-835597f0abc2b79c616050f698d1eb8f7f1fb23c0d6023029d0bf5a6375d400a  r429-lf-pgop-qp27.hevc
+3e3231a97204b3ba4accf9fb186ddc23f04a54d7ccc8dda30a23a0917f3e261b  r429-lf-pgop-qp27.hevc
 4aa2284a9dee54e9dd2f448197f5095e3238f656fe1539b3affbaa3f1059cf71  r429-lf-bgop-qp33.hevc
-4ec3649c8456ca549538879a764a9370fb7785963196b81910f6b426ebff5561  r429-lf-intra-qp32.hevc
+519f84b77cd6fe7f7a93fe367a639c2f8033934bb85776833ad12fd0c78c367d  r429-lf-intra-qp32.hevc
 ```
 
 ## Out-of-band sweep
@@ -41,5 +45,7 @@ Beyond the three pinned streams, a 72-configuration filtered sweep
 {deblock-only, SAO-luma+chroma, SAO-luma-only, deblock+SAO}, 4 frames
 each) was generated the same way and every stream's black-box
 reference decode matched the encoder reconstruction byte-exactly
-(72/72). The in-tree unit tests hold the same streams bit-exact
-through this crate's own decoder, closing the three-way contract.
+(72/72; re-run after the β/tC-offset election landed — 75/75 with
+the three pins included). The in-tree unit tests hold the same
+streams bit-exact through this crate's own decoder, closing the
+three-way contract.

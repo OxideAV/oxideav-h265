@@ -14,10 +14,12 @@
 //!   [`DeblockCuDesc`]s built from the encoder's coding decisions
 //!   (partition mode + transform-split topology) and the same
 //!   [`MotionField`] the mode decisions maintained. The per-frame
-//!   on/off election is distortion-driven: the slice signals
+//!   election is distortion-driven over off + a 3x3
+//!   `slice_beta_offset_div2` / `slice_tc_offset_div2` sweep
+//!   ({−2, 0, 2}²): the slice signals
 //!   `deblocking_filter_override_flag == 1` /
-//!   `slice_deblocking_filter_disabled_flag == 0` only when the
-//!   filtered picture is closer to the source (β/tC offsets are 0).
+//!   `slice_deblocking_filter_disabled_flag == 0` with the winning
+//!   offsets only when some filtered picture is closer to the source.
 //! * **SAO** (§8.7.3) — per-CTB statistics-driven offset estimation
 //!   (the derivation of the offsets is encoder freedom; the *applied*
 //!   modification is the decoder's own
@@ -117,21 +119,23 @@ pub struct CtbShape {
 
 /// Build the per-CTB [`DeblockCuDesc`] list for a fixed-geometry
 /// encoder picture (CTB == CU == 16, raster order, single slice /
-/// tile, constant QP, β/tC offsets 0).
+/// tile, constant QP) at the given slice β/tC offsets.
 #[must_use]
 pub(crate) fn ctb_deblock_descs(
     shapes: &[CtbShape],
     width: usize,
     height: usize,
     qp: i32,
+    beta_offset_div2: i32,
+    tc_offset_div2: i32,
 ) -> Vec<DeblockCuDesc> {
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     debug_assert_eq!(shapes.len(), ctbs_x * ctbs_y);
     let params = DeblockCuParams {
         qp_y: qp,
-        beta_offset_div2: 0,
-        tc_offset_div2: 0,
+        beta_offset_div2,
+        tc_offset_div2,
         cb_qp_offset: 0,
         cr_qp_offset: 0,
         bit_depth_luma: 8,
@@ -194,6 +198,11 @@ pub(crate) struct FilteredFrame {
     /// The slice's deblocking election
     /// (`slice_deblocking_filter_disabled_flag == !deblock_on`).
     pub deblock_on: bool,
+    /// Elected `slice_beta_offset_div2` (meaningful iff
+    /// [`Self::deblock_on`]).
+    pub beta_offset_div2: i32,
+    /// Elected `slice_tc_offset_div2`.
+    pub tc_offset_div2: i32,
     /// Elected `slice_sao_luma_flag`.
     pub slice_sao_luma: bool,
     /// Elected `slice_sao_chroma_flag`.
@@ -637,23 +646,43 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         height,
     );
 
-    // ---- §8.7.2 deblocking + per-slice on/off election ----
+    // ---- §8.7.2 deblocking: per-slice on/off + β/tC election ----
     let mut deblock_on = false;
+    let mut beta_offset_div2 = 0i32;
+    let mut tc_offset_div2 = 0i32;
     let base = if cfg.deblocking {
-        let mut filtered = pre.clone();
-        let descs = ctb_deblock_descs(input.shapes, width, height, input.qp);
-        deblock_picture_full(&mut filtered, input.field, &descs, None, None);
         let ssd = |p: &Picture| {
             plane_ssd(p, Plane::Luma, input.src[0])
                 + plane_ssd(p, Plane::Cb, input.src[1])
                 + plane_ssd(p, Plane::Cr, input.src[2])
         };
-        if ssd(&filtered) < ssd(&pre) {
-            deblock_on = true;
-            filtered
-        } else {
-            pre
+        // se(v) bin-length proxy of one slice offset field.
+        let se_bits = |v: i32| -> u64 {
+            match v.unsigned_abs() {
+                0 => 1,
+                n => 2 * u64::from(32 - n.leading_zeros()) + 1,
+            }
+        };
+        // Off (override_flag 0: one bit) vs each (β, tC) offset pair
+        // (override group: ~3 bits + the two se(v) fields).
+        let mut best_pic = pre.clone();
+        let mut best_cost = ssd(&pre) + input.lambda;
+        for beta in [-2i32, 0, 2] {
+            for tc in [-2i32, 0, 2] {
+                let mut filtered = pre.clone();
+                let descs = ctb_deblock_descs(input.shapes, width, height, input.qp, beta, tc);
+                deblock_picture_full(&mut filtered, input.field, &descs, None, None);
+                let cost = ssd(&filtered) + input.lambda * (3 + se_bits(beta) + se_bits(tc));
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_pic = filtered;
+                    deblock_on = true;
+                    beta_offset_div2 = beta;
+                    tc_offset_div2 = tc;
+                }
+            }
         }
+        best_pic
     } else {
         pre
     };
@@ -805,6 +834,8 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
     let cr = planar[width * height + cw * ch..].to_vec();
     FilteredFrame {
         deblock_on,
+        beta_offset_div2,
+        tc_offset_div2,
         slice_sao_luma,
         slice_sao_chroma,
         sao_ctbs,
@@ -1225,6 +1256,41 @@ mod tests {
         let out = filter_frame(&input, &cfg);
         assert!(out.deblock_on, "blocky recon elects deblocking");
         assert_ne!(out.y, recon_y, "deblocking modified the luma plane");
+        assert!(
+            (-2..=2).contains(&out.beta_offset_div2) && (-2..=2).contains(&out.tc_offset_div2),
+            "elected offsets stay in the swept range"
+        );
+
+        // The election is optimal over its candidate set: brute-force
+        // every (β, tC) pair through the decode-side driver and check
+        // the elected pair's distortion is the minimum.
+        let ssd = |a: &[u8], b: &[u8]| -> u64 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let d = i64::from(x) - i64::from(y);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let dist_at = |beta: i32, tc: i32| -> u64 {
+            let mut pic = planes_to_picture(&recon_y, &cpl, &cpl, w, h);
+            let descs = ctb_deblock_descs(&shapes, w, h, 37, beta, tc);
+            deblock_picture_full(&mut pic, &field, &descs, None, None);
+            let planar = pic.to_planar_u8().expect("8-bit");
+            ssd(&planar[..w * h], &src_y)
+        };
+        let elected = dist_at(out.beta_offset_div2, out.tc_offset_div2);
+        for beta in [-2i32, 0, 2] {
+            for tc in [-2i32, 0, 2] {
+                // λ == 1 makes the rate term negligible against the
+                // luma SSD scale of this content.
+                assert!(
+                    elected <= dist_at(beta, tc) + 16,
+                    "({beta},{tc}) beats the elected pair"
+                );
+            }
+        }
 
         // Perfect reconstruction: filtering can only hurt ⇒ declined.
         let input2 = FilterInput {
