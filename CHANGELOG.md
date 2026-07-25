@@ -6,6 +6,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — encoder in-loop filters, round 429 (2026-07-25)
+
+- **§8.7.2 deblocking on the encoder's reconstruction path**
+  (`encoder::loopfilter`): every filtered frame runs the crate's own
+  DECODE-side `deblock_picture_full` over per-CTB descriptors built
+  from the coding decisions (partition mode, transform-split
+  topology, the per-transform-block nonzero-coefficient marks the
+  §8.7.2.4 bS derivation reads), so the encoder's reference pictures
+  match a conforming decoder's bit for bit. The per-slice on/off
+  election is distortion-driven and signalled through the §7.3.6.1
+  deblocking override group (PPS
+  `deblocking_filter_override_enabled_flag == 1`, default disabled).
+- **§8.7.3 SAO estimation + emission on the encoder side**:
+  statistics-driven per-CTB offset derivation (band position by
+  per-band gain, the four edge classes with the §7.4.9.3
+  inferred-sign clamps, chroma under the shared-type rule, whole-CTB
+  merge-left/up candidates priced as well), every candidate's
+  distortion measured with the decoder's own `apply_sao_ctb_full`
+  and the elected grid applied through `apply_sao_picture_full`.
+  `encode_sao_ctb` is the bin-exact §7.3.8.3 `sao( rx, ry )` dual of
+  `decode_sao`, differential-tested against it. Slice-level
+  `slice_sao_luma_flag` / `slice_sao_chroma_flag` election drops the
+  per-CTB syntax entirely when no CTB benefits.
+- **Wiring**: `encode_idr_intra_au_lf` and
+  `LowDelayPEncoder::with_loop_filters` (public `LoopFilterCfg`);
+  registry options `deblock` / `sao` on the `intra` and `inter`
+  modes; both encoders restructured into decide → filter → emit
+  passes so the filter elections are known before the slice header
+  is written. `LoopFilterCfg::off()` is byte-identical with the
+  legacy unfiltered output (golden pins unchanged).
+- **Validation**: filtered P and B GOPs (deblock-only / SAO-only /
+  both, QP 17..40, mid-stream IDR refreshes, square + non-square
+  geometries) decode bit-exactly to the encoder's filtered
+  reconstruction through the crate's own decoder AND a black-box
+  reference decoder (72/72-configuration out-of-band sweep); three
+  golden filtered streams pinned
+  (`tests/loopfilter_encoder_interop.rs`). On the interop clip the
+  filters buy up to +1.5 dB luma PSNR at equal rate (QP 22).
+
 ### Added — Rext/SCC application tail, round 416 (2026-07-17)
 
 - **Cross-component prediction is now APPLIED, not just parsed**
