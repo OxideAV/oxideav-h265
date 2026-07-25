@@ -260,3 +260,104 @@ fn inter_mode_b_slices_registry_roundtrip() {
     }
     assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
 }
+
+#[test]
+fn inter_mode_loop_filters_registry_roundtrip() {
+    // The `deblock` / `sao` options turn the §8.7 in-loop filters on:
+    // the emitted stream signals them and still decodes cleanly (the
+    // bit-exact encoder-recon contract is pinned by the unit tests;
+    // here the registry wiring and fidelity are exercised).
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(48);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "inter");
+    params.options.insert("qp", "18");
+    params.options.insert("deblock", "1");
+    params.options.insert("sao", "true");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let frames: Vec<VideoFrame> = (0..4).map(|i| planes(48, 32, i)).collect();
+    let mut aus = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        let pkt = enc.receive_packet().expect("packet per frame");
+        assert_eq!(pkt.flags.keyframe, i == 0, "frame {i} keyframe flag");
+        aus.push(pkt);
+    }
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    for pkt in &aus {
+        dec.send_packet(pkt).expect("decode send");
+    }
+    dec.flush().expect("decode flush");
+    for (i, f) in frames.iter().enumerate() {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for (pi, (p, q)) in v.planes.iter().zip(f.planes.iter()).enumerate() {
+                    let mse: f64 = p
+                        .data
+                        .iter()
+                        .zip(q.data.iter())
+                        .map(|(&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / p.data.len() as f64;
+                    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                    assert!(
+                        psnr > 32.0,
+                        "frame {i} plane {pi}: PSNR {psnr:.1} dB at qp 18 with loop filters"
+                    );
+                }
+            }
+            other => panic!("frame {i}: unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}
+
+#[test]
+fn intra_mode_loop_filters_registry_roundtrip() {
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(32);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "intra");
+    params.options.insert("qp", "30");
+    params.options.insert("deblock", "true");
+    params.options.insert("sao", "1");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let f = planes(32, 32, 0x21);
+    enc.send_frame(&Frame::Video(f.clone())).expect("send");
+    let pkt = enc.receive_packet().expect("packet");
+    assert!(pkt.flags.keyframe);
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    dec.send_packet(&pkt).expect("decode send");
+    dec.flush().expect("decode flush");
+    assert!(matches!(dec.receive_frame(), Ok(Frame::Video(_))));
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}
+
+#[test]
+fn loop_filter_options_are_validated() {
+    // pcm mode has no transform path: the filter options are refused.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(16);
+    params.height = Some(16);
+    params.options.insert("deblock", "1");
+    assert!(oxideav_h265::make_encoder(&params).is_err());
+
+    // Malformed values are refused in the filtered modes.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(16);
+    params.height = Some(16);
+    params.options.insert("mode", "inter");
+    params.options.insert("sao", "banana");
+    assert!(oxideav_h265::make_encoder(&params).is_err());
+}

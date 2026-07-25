@@ -48,8 +48,9 @@ enum EncodeMode {
     Pcm,
     /// Real CABAC intra coding ([`intra::encode_idr_intra_au`]) at
     /// the carried `SliceQpY` (`mode = "intra"`, `qp` option, default
-    /// 26).
-    Intra(i32),
+    /// 26) with the carried §8.7 in-loop filters (`deblock` / `sao`
+    /// options).
+    Intra(i32, loopfilter::LoopFilterCfg),
     /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
     /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
     /// 26; `gop` option = GOP length in frames, default 0 = a single
@@ -82,6 +83,12 @@ use oxideav_core::{
 ///   `bslices` option (`"1"` / `"true"`) codes the non-IDR frames as
 ///   low-delay B slices.
 ///
+/// The `"intra"` and `"inter"` modes accept the §8.7 in-loop filter
+/// options `deblock` and `sao` (`"1"` / `"true"` to enable): the
+/// encoder then signals the filters, elects them per slice / CTB
+/// against distortion, and reconstructs through them (the reference
+/// path a conforming decoder holds).
+///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
     codec_id: CodecId,
@@ -111,9 +118,10 @@ impl std::fmt::Debug for H265Encoder {
 /// Direct factory endpoint: construct the software H.265 encoder.
 /// Codec options: `mode` (`"pcm"` lossless bootstrap, the default,
 /// `"intra"` real CABAC intra coding, or `"inter"` low-delay P GOPs),
-/// `qp` (`SliceQpY` 0..=51 for the intra / inter modes, default 26)
-/// and `gop` (inter mode IDR period, default 0 = single leading
-/// IDR).
+/// `qp` (`SliceQpY` 0..=51 for the intra / inter modes, default 26),
+/// `gop` (inter mode IDR period, default 0 = single leading IDR),
+/// and the in-loop filter switches `deblock` / `sao` (intra / inter
+/// modes; default off).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
@@ -152,9 +160,33 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 }),
         }
     };
+    let parse_flag = |params: &CodecParameters, key: &str| -> Result<bool> {
+        match params.options.get(key) {
+            None | Some("0") | Some("false") => Ok(false),
+            Some("1") | Some("true") => Ok(true),
+            Some(v) => Err(Error::InvalidData(format!(
+                "h265 encode: {key} must be 0/1/true/false, got {v:?}"
+            ))),
+        }
+    };
+    let parse_lf = |params: &CodecParameters| -> Result<loopfilter::LoopFilterCfg> {
+        let sao = parse_flag(params, "sao")?;
+        Ok(loopfilter::LoopFilterCfg {
+            deblocking: parse_flag(params, "deblock")?,
+            sao_luma: sao,
+            sao_chroma: sao,
+        })
+    };
     let mode = match params.options.get("mode") {
-        None | Some("pcm") => EncodeMode::Pcm,
-        Some("intra") => EncodeMode::Intra(parse_qp(params)?),
+        None | Some("pcm") => {
+            if parse_lf(params)?.any() {
+                return Err(Error::InvalidData(
+                    "h265 encode: deblock/sao options require mode \"intra\" or \"inter\"".into(),
+                ));
+            }
+            EncodeMode::Pcm
+        }
+        Some("intra") => EncodeMode::Intra(parse_qp(params)?, parse_lf(params)?),
         Some("inter") => {
             let qp = parse_qp(params)?;
             let gop = match params.options.get("gop") {
@@ -165,18 +197,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     ))
                 })?,
             };
-            let b_slices = match params.options.get("bslices") {
-                None | Some("0") | Some("false") => false,
-                Some("1") | Some("true") => true,
-                Some(v) => {
-                    return Err(Error::InvalidData(format!(
-                        "h265 encode: bslices must be 0/1/true/false, got {v:?}"
-                    )))
-                }
-            };
+            let b_slices = parse_flag(params, "bslices")?;
             let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
                 .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                .with_b_slices(b_slices);
+                .with_b_slices(b_slices)
+                .with_loop_filters(parse_lf(params)?);
             EncodeMode::Inter(enc)
         }
         Some(other) => {
@@ -247,8 +272,8 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
-            EncodeMode::Intra(qp) => (
-                intra::encode_idr_intra_au(&y, &cb, &cr, self.width, self.height, *qp)
+            EncodeMode::Intra(qp, lf) => (
+                intra::encode_idr_intra_au_lf(&y, &cb, &cr, self.width, self.height, *qp, lf)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .au,
                 true,
