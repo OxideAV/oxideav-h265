@@ -50,8 +50,10 @@ fn sign(x: i32) -> i32 {
 
 /// Table 8-13 — `(hPos[0], vPos[0], hPos[1], vPos[1])` for a SAO edge
 /// offset class (0 = 0-deg, 1 = 90-deg, 2 = 135-deg, 3 = 45-deg).
+/// `pub(crate)` so the encoder's SAO estimation classifies with the
+/// same table.
 #[inline]
-fn eo_pos(eo_class: u8) -> (i32, i32, i32, i32) {
+pub(crate) fn eo_pos(eo_class: u8) -> (i32, i32, i32, i32) {
     match eo_class {
         // horizontal: left + right.
         0 => (-1, 0, 1, 0),

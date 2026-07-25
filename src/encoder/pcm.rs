@@ -286,6 +286,25 @@ pub(crate) fn write_pps(
     deblocking_enabled: bool,
     tiles: Option<(u32, u32)>,
 ) -> Vec<u8> {
+    write_pps_lf(
+        dependent_slice_segments_enabled,
+        deblocking_enabled,
+        false,
+        tiles,
+    )
+}
+
+/// [`write_pps`] with `deblocking_filter_override_enabled_flag`
+/// control: the loop-filter encoders write the PPS with
+/// `pps_deblocking_filter_disabled_flag == 1` +
+/// `deblocking_filter_override_enabled_flag == 1` so every slice
+/// elects deblocking on/off itself (§7.3.6.1 override group).
+pub(crate) fn write_pps_lf(
+    dependent_slice_segments_enabled: bool,
+    deblocking_enabled: bool,
+    deblocking_override_enabled: bool,
+    tiles: Option<(u32, u32)>,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -316,7 +335,7 @@ pub(crate) fn write_pps(
     }
     w.put_bit(1); // pps_loop_filter_across_slices_enabled_flag
     w.put_bit(1); // deblocking_filter_control_present_flag
-    w.put_bit(0); // deblocking_filter_override_enabled_flag
+    w.put_bit(u8::from(deblocking_override_enabled)); // deblocking_filter_override_enabled_flag
     w.put_bit(u8::from(!deblocking_enabled)); // pps_deblocking_filter_disabled_flag
     if deblocking_enabled {
         w.se(0); // pps_beta_offset_div2

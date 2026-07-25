@@ -23,6 +23,7 @@ pub mod bitwriter;
 pub mod cabac;
 pub mod inter;
 pub mod intra;
+pub mod loopfilter;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[cfg(test)]
 mod ccp_streams;

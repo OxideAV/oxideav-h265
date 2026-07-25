@@ -44,20 +44,26 @@
 //! reconstruction exactly — pinned by the roundtrip tests.
 
 use crate::binarization::intra_luma_cand_mode_list;
+use crate::binarization::PartMode;
 use crate::binarization::{cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc};
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
+use crate::encoder::loopfilter::{
+    encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
+};
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for, write_pps, write_ptl, write_vps};
+use crate::encoder::pcm::{level_idc_for, write_pps_lf, write_ptl, write_vps};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
     intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
     MarkedReferenceSamples,
 };
+use crate::motion::MotionField;
 use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::slice_data::SaoCtbParams;
 use crate::transform::{forward_dct_1d, residual_block, BlockParams, Component, PredMode};
 
 /// The fixed CTB / coding-block log2 size (16x16).
@@ -127,16 +133,17 @@ pub struct IntraEncodedAu {
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM off,
-/// SAO off). Shared by the intra and low-delay-P encoders (nothing in
-/// it is slice-type specific: the P slices code their §7.4.8
-/// short-term RPS inline, `sps_temporal_mvp_enabled_flag` is 0, and
-/// `sps_max_dec_pic_buffering_minus1[0] == 1` covers the one-reference
-/// low-delay GOP).
-pub(crate) fn write_sps(
+/// SAO per `sao_enabled`). Shared by the intra and low-delay-P
+/// encoders (nothing in it is slice-type specific: the P slices code
+/// their §7.4.8 short-term RPS inline, `sps_temporal_mvp_enabled_flag`
+/// is 0, and `sps_max_dec_pic_buffering_minus1[0] == 1` covers the
+/// one-reference low-delay GOP).
+pub(crate) fn write_sps_lf(
     width: usize,
     height: usize,
     level_idc: u8,
     max_dec_pic_buffering_minus1: u32,
+    sao_enabled: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
@@ -163,7 +170,7 @@ pub(crate) fn write_sps(
     w.ue(0); // max_transform_hierarchy_depth_intra
     w.put_bit(0); // scaling_list_enabled_flag
     w.put_bit(0); // amp_enabled_flag
-    w.put_bit(0); // sample_adaptive_offset_enabled_flag
+    w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
     w.put_bit(0); // pcm_enabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
     w.put_bit(0); // long_term_ref_pics_present_flag
@@ -420,6 +427,17 @@ struct LumaPlan {
     recon: Vec<u8>,
 }
 
+/// One CTB's pass-1 coding decisions (pass 2 emits the syntax after
+/// the in-loop filter elections are known).
+struct CtbPlan {
+    /// The elected luma partition + levels.
+    plan: LumaPlan,
+    /// Chroma Cb TB levels (1 x 8x8 or 4 x 4x4, z-order).
+    cb_levels: Vec<Vec<i32>>,
+    /// Chroma Cr TB levels.
+    cr_levels: Vec<Vec<i32>>,
+}
+
 /// Encode one 4:2:0 8-bit frame as a self-contained intra IDR access
 /// unit at `SliceQpY == qp` and return it with the reconstruction a
 /// conforming decoder produces.
@@ -440,11 +458,31 @@ pub fn encode_idr_intra_au(
     encode_idr_intra_au_cfg(y, cb, cr, width, height, qp, 1)
 }
 
+/// [`encode_idr_intra_au`] with the §8.7 in-loop filters enabled per
+/// `lf`: the reconstruction runs through the crate's decode-side
+/// deblocking (per-slice on/off elected against distortion) and SAO
+/// (per-CTB §7.3.8.3 parameters from statistics-driven offset
+/// estimation), and the returned `recon_*` planes are the *filtered*
+/// picture — still exactly what a conforming decoder outputs.
+///
+/// # Errors
+/// [`IntraEncodeError`] on bad dimensions / plane sizes / QP.
+pub fn encode_idr_intra_au_lf(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    lf: &LoopFilterCfg,
+) -> Result<IntraEncodedAu, IntraEncodeError> {
+    encode_idr_intra_au_full(y, cb, cr, width, height, qp, 1, lf)
+}
+
 /// [`encode_idr_intra_au`] with an explicit
 /// `sps_max_dec_pic_buffering_minus1` — the low-delay GOP encoder
 /// passes 2 so a conforming decoder keeps BOTH short-term references
 /// alive alongside the current picture.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn encode_idr_intra_au_cfg(
     y: &[u8],
     cb: &[u8],
@@ -453,6 +491,34 @@ pub(crate) fn encode_idr_intra_au_cfg(
     height: usize,
     qp: i32,
     max_dec_pic_buffering_minus1: u32,
+) -> Result<IntraEncodedAu, IntraEncodeError> {
+    encode_idr_intra_au_full(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        qp,
+        max_dec_pic_buffering_minus1,
+        &LoopFilterCfg::off(),
+    )
+}
+
+/// The full-configuration intra encode: two passes (per-CTB mode
+/// decision + reconstruction, then syntax emission) around the §8.7
+/// in-loop filter stage, so the per-CTB §7.3.8.3 SAO parameters and
+/// the slice-header filter elections are known before the slice is
+/// written.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn encode_idr_intra_au_full(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    max_dec_pic_buffering_minus1: u32,
+    lf: &LoopFilterCfg,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(IntraEncodeError::BadDimensions { width, height });
@@ -488,21 +554,7 @@ pub(crate) fn encode_idr_intra_au_cfg(
     let mut recon_cb = vec![0u8; cw * ch];
     let mut recon_cr = vec![0u8; cw * ch];
     let mut modes = IntraModeField::new(width, height, CTB_LOG2);
-
-    // ---- slice_segment_header( ) ----
-    let mut w = BitWriter::new();
-    w.put_bit(1); // first_slice_segment_in_pic_flag
-    w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
-    w.ue(0); // slice_pic_parameter_set_id
-    w.ue(2); // slice_type = I
-    w.se(qp - 26); // slice_qp_delta (init_qp_minus26 == 0)
-                   // SAO off + deblocking disabled: no more slice-level fields.
-    w.rbsp_trailing_bits(); // byte_alignment()
-
-    // ---- slice_segment_data( ) ----
-    let mut cabac = CabacEncoder::new();
-    // Table 9-4: I slice => initType 0 (raw slice_type 2).
-    let mut ctxs = SliceContexts::init(init_type(2, false), qp);
+    let mut plans: Vec<CtbPlan> = Vec::with_capacity(ctbs_x * ctbs_y);
 
     let extract = |plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize| -> Vec<i32> {
         let mut out = Vec::with_capacity(n * n);
@@ -644,6 +696,112 @@ pub(crate) fn encode_idr_intra_au_cfg(
         };
         let cb_levels = code_chroma(cb, &mut recon_cb, Component::Cb, PredComponent::Cb);
         let cr_levels = code_chroma(cr, &mut recon_cr, Component::Cr, PredComponent::Cr);
+
+        plans.push(CtbPlan {
+            plan,
+            cb_levels,
+            cr_levels,
+        });
+    }
+
+    // ---- §8.7 in-loop filters (deblocking + SAO) on the recon ----
+    let mut deblock_on = false;
+    let mut slice_sao_luma = false;
+    let mut slice_sao_chroma = false;
+    let mut sao_ctbs: Vec<SaoCtbParams> = Vec::new();
+    if lf.any() {
+        let shapes: Vec<CtbShape> = plans
+            .iter()
+            .map(|p| CtbShape {
+                part_mode: if p.plan.nxn {
+                    PartMode::PartNxN
+                } else {
+                    PartMode::Part2Nx2N
+                },
+                split_depth1: p.plan.nxn,
+            })
+            .collect();
+        // Every CU is intra: the fresh motion field's all-intra
+        // background is exactly the decoder's state (bS == 2 at every
+        // filtered edge).
+        let field = MotionField::new(width, height);
+        let out = filter_frame(
+            &FilterInput {
+                width,
+                height,
+                qp,
+                lambda,
+                recon: [&recon_y, &recon_cb, &recon_cr],
+                src: [y, cb, cr],
+                field: &field,
+                shapes: &shapes,
+            },
+            lf,
+        );
+        deblock_on = out.deblock_on;
+        slice_sao_luma = out.slice_sao_luma;
+        slice_sao_chroma = out.slice_sao_chroma;
+        sao_ctbs = out.sao_ctbs;
+        recon_y = out.y;
+        recon_cb = out.cb;
+        recon_cr = out.cr;
+    }
+
+    // ---- slice_segment_header( ) ----
+    let mut w = BitWriter::new();
+    w.put_bit(1); // first_slice_segment_in_pic_flag
+    w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
+    w.ue(0); // slice_pic_parameter_set_id
+    w.ue(2); // slice_type = I
+    if lf.sao() {
+        // SPS SAO enabled: the per-slice component gates are present.
+        w.put_bit(u8::from(slice_sao_luma)); // slice_sao_luma_flag
+        w.put_bit(u8::from(slice_sao_chroma)); // slice_sao_chroma_flag
+    }
+    w.se(qp - 26); // slice_qp_delta (init_qp_minus26 == 0)
+    if lf.deblocking {
+        // §7.3.6.1 deblocking override group (the PPS signals
+        // override-enabled + deblocking disabled; an electing slice
+        // overrides to enabled with zero β/tC offsets).
+        w.put_bit(u8::from(deblock_on)); // deblocking_filter_override_flag
+        if deblock_on {
+            w.put_bit(0); // slice_deblocking_filter_disabled_flag
+            w.se(0); // slice_beta_offset_div2
+            w.se(0); // slice_tc_offset_div2
+        }
+    }
+    if slice_sao_luma || slice_sao_chroma || deblock_on {
+        // §7.3.6.1: present iff pps_loop_filter_across_slices (1) and
+        // some in-loop filter is active for this slice.
+        w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    w.rbsp_trailing_bits(); // byte_alignment()
+
+    // ---- slice_segment_data( ) — pass 2: syntax emission ----
+    let mut cabac = CabacEncoder::new();
+    // Table 9-4: I slice => initType 0 (raw slice_type 2).
+    let mut ctxs = SliceContexts::init(init_type(2, false), qp);
+    for (ctb, ctb_plan) in plans.iter().enumerate() {
+        let x0 = (ctb % ctbs_x) * CTB;
+        let y0 = (ctb / ctbs_x) * CTB;
+        if slice_sao_luma || slice_sao_chroma {
+            // §7.3.8.3 sao( rx, ry ) ahead of the coding quadtree.
+            encode_sao_ctb(
+                &mut w,
+                &mut cabac,
+                &mut ctxs,
+                &sao_ctbs[ctb],
+                ctb % ctbs_x,
+                ctb / ctbs_x,
+                slice_sao_luma,
+                slice_sao_chroma,
+            );
+        }
+        let plan = &ctb_plan.plan;
+        let cb_levels = &ctb_plan.cb_levels;
+        let cr_levels = &ctb_plan.cr_levels;
+        // §8.4.3: IntraPredModeC derives from the CU's first PB.
+        let mode_c = plan.modes[0];
 
         // ---- §7.3.8.5 coding_unit( ) syntax ----
         // part_mode: §9.3.3.7 intra at MinCb — "1" = PART_2Nx2N,
@@ -903,9 +1061,15 @@ pub(crate) fn encode_idr_intra_au_cfg(
             33,
             0,
             0,
-            &write_sps(width, height, level_idc, max_dec_pic_buffering_minus1),
+            &write_sps_lf(
+                width,
+                height,
+                level_idc,
+                max_dec_pic_buffering_minus1,
+                lf.sao(),
+            ),
         ), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps(false, false, None)), // PPS_NUT
+        nal_unit(34, 0, 0, &write_pps_lf(false, false, lf.deblocking, None)), // PPS_NUT
         nal_unit(20, 0, 0, &slice_rbsp),           // IDR_N_LP
     ];
     Ok(IntraEncodedAu {
@@ -1085,6 +1249,129 @@ mod tests {
             encode_idr_intra_au(&y, &cb, &cr, 32, 16, 26),
             Err(IntraEncodeError::PlaneSize { .. })
         ));
+    }
+
+    /// Filtered intra AUs (§8.7.2 deblocking / §8.7.3 SAO, alone and
+    /// combined) decode bit-exactly to the encoder's filtered
+    /// reconstruction through the crate's own decoder, across
+    /// geometries and QPs.
+    #[test]
+    fn filtered_intra_au_decodes_to_encoder_recon_exactly() {
+        let cfgs = [
+            LoopFilterCfg {
+                deblocking: true,
+                sao_luma: false,
+                sao_chroma: false,
+            },
+            LoopFilterCfg {
+                deblocking: false,
+                sao_luma: true,
+                sao_chroma: true,
+            },
+            LoopFilterCfg {
+                deblocking: false,
+                sao_luma: true,
+                sao_chroma: false,
+            },
+            LoopFilterCfg::all(),
+        ];
+        for (w, h) in [(32usize, 32usize), (64, 48)] {
+            for planes_fn in [planes, blocky_planes] {
+                let (y, cb, cr) = planes_fn(w, h);
+                for qp in [27i32, 38] {
+                    for cfg in &cfgs {
+                        let enc =
+                            encode_idr_intra_au_lf(&y, &cb, &cr, w, h, qp, cfg).expect("encode");
+                        let frames = decode_annexb_sequence(&enc.au).expect("decode");
+                        assert_eq!(frames.len(), 1, "{w}x{h} qp{qp} {cfg:?}");
+                        let mut recon = enc.recon_y.clone();
+                        recon.extend_from_slice(&enc.recon_cb);
+                        recon.extend_from_slice(&enc.recon_cr);
+                        assert_eq!(
+                            frames[0].picture.to_planar_u8().expect("8-bit"),
+                            recon,
+                            "{w}x{h} qp{qp} {cfg:?}: decoder output == filtered recon"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The filter elections are distortion-driven, so a filtered
+    /// encode is never further from the source than the unfiltered
+    /// one — and on smooth content at high QP (where quantization
+    /// manufactures block edges the source never had) the filters
+    /// actually engage (the reconstruction changes and the slice
+    /// header signals them).
+    #[test]
+    fn filters_never_hurt_and_engage_on_smooth_content() {
+        let (w, h) = (64usize, 64usize);
+        let (y, cb, cr) = planes(w, h);
+        let qp = 40;
+        let plain = encode_idr_intra_au(&y, &cb, &cr, w, h, qp).expect("plain");
+        let filtered =
+            encode_idr_intra_au_lf(&y, &cb, &cr, w, h, qp, &LoopFilterCfg::all()).expect("lf");
+        let ssd = |a: &[u8], b: &[u8]| -> u64 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(&p, &q)| {
+                    let d = i64::from(p) - i64::from(q);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let d_plain =
+            ssd(&plain.recon_y, &y) + ssd(&plain.recon_cb, &cb) + ssd(&plain.recon_cr, &cr);
+        let d_filt = ssd(&filtered.recon_y, &y)
+            + ssd(&filtered.recon_cb, &cb)
+            + ssd(&filtered.recon_cr, &cr);
+        assert!(
+            d_filt <= d_plain,
+            "filters must not hurt: filtered {d_filt} vs plain {d_plain}"
+        );
+        assert_ne!(
+            filtered.recon_y, plain.recon_y,
+            "high-QP blocky content should engage the loop filters"
+        );
+
+        // The written headers carry the filter signalling: SAO enabled
+        // in the SPS, the deblocking override chain in the PPS, and
+        // the elected per-slice flags in the slice header.
+        let units = crate::nal::collect_nal_units(&filtered.au).expect("walk");
+        let sps = crate::sps::SeqParameterSet::parse(&units[1].rbsp).expect("sps");
+        assert!(sps.sample_adaptive_offset_enabled_flag);
+        let pps = crate::pps::PicParameterSet::parse(&units[2].rbsp).expect("pps");
+        assert!(pps.deblocking_filter_control_present_flag);
+        assert!(pps.deblocking.override_enabled_flag);
+        assert!(pps.deblocking.disabled_flag, "PPS default stays disabled");
+        let header = crate::slice::SliceSegmentHeader::parse(
+            &units[3].rbsp,
+            units[3].header.nal_unit_type,
+            &sps,
+            &pps,
+        )
+        .expect("slice header");
+        assert!(
+            header.slice_sao_luma_flag
+                || header.slice_sao_chroma_flag
+                || header.deblocking.is_some_and(|d| !d.disabled_flag),
+            "some in-loop filter is elected in the slice header"
+        );
+    }
+
+    /// `LoopFilterCfg::off()` reproduces the legacy unfiltered stream
+    /// byte for byte (headers included) — the golden interop pins stay
+    /// valid.
+    #[test]
+    fn lf_off_is_byte_identical_to_legacy_encode() {
+        let (w, h) = (48usize, 32usize);
+        let (y, cb, cr) = planes(w, h);
+        let plain = encode_idr_intra_au(&y, &cb, &cr, w, h, 24).expect("plain");
+        let off =
+            encode_idr_intra_au_lf(&y, &cb, &cr, w, h, 24, &LoopFilterCfg::off()).expect("off");
+        assert_eq!(plain.au, off.au);
+        assert_eq!(plain.recon_y, off.recon_y);
     }
 
     /// Table 8-10 spot pins.
