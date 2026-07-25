@@ -50,8 +50,11 @@ use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::intra::{
-    chroma_qp_420, code_tb, encode_idr_intra_au_cfg, gather_refs, pred_params, search_best_mode,
+    chroma_qp_420, code_tb, encode_idr_intra_au_full, gather_refs, pred_params, search_best_mode,
     ssd, zscan_avail, IntraEncodeError,
+};
+use crate::encoder::loopfilter::{
+    encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::residual::encode_residual_coding;
@@ -172,16 +175,6 @@ struct Depth1Levels {
     cr: [Vec<i32>; 4],
 }
 
-impl CuLevels {
-    /// `true` iff the luma tree carries a non-zero coefficient.
-    fn luma_nonzero(&self) -> bool {
-        match self {
-            Self::Depth0(l) => l[0].iter().any(|&v| v != 0),
-            Self::Depth1(d) => d.luma.iter().any(|l| l.iter().any(|&v| v != 0)),
-        }
-    }
-}
-
 /// One prediction unit's §7.3.8.6 signalling (merge or AMVP).
 #[derive(Clone, Copy)]
 enum PuSyntax {
@@ -241,6 +234,9 @@ pub struct LowDelayPEncoder {
     /// reference lists resolve to the previous picture, enabling
     /// bi-predictive merge candidates and the B-slice syntax.
     b_slices: bool,
+    /// The §8.7 in-loop filters this stream signals and applies on
+    /// its reconstruction path.
+    filters: LoopFilterCfg,
     /// POC of the NEXT frame within the current GOP (0 ⇒ IDR next).
     poc: i32,
     /// The most recent reconstructions, newest first (up to two — the
@@ -269,6 +265,7 @@ impl LowDelayPEncoder {
             qp,
             gop,
             b_slices: false,
+            filters: LoopFilterCfg::off(),
             poc: 0,
             prevs: Vec::new(),
         })
@@ -279,6 +276,17 @@ impl LowDelayPEncoder {
     #[must_use]
     pub fn with_b_slices(mut self, on: bool) -> Self {
         self.b_slices = on;
+        self
+    }
+
+    /// Enable the §8.7 in-loop filters (deblocking / SAO) on the
+    /// encoder's reconstruction path: every frame's reference — and
+    /// the [`EncodedPFrame::recon`] a conforming decoder reproduces —
+    /// becomes the FILTERED picture, with the filter elections
+    /// signalled in the parameter sets and slice headers.
+    #[must_use]
+    pub fn with_loop_filters(mut self, filters: LoopFilterCfg) -> Self {
+        self.filters = filters;
         self
     }
 
@@ -309,7 +317,7 @@ impl LowDelayPEncoder {
         let out = if idr_now {
             // sps_max_dec_pic_buffering_minus1 = 2: the current picture
             // plus the two short-term references the P/B slices keep.
-            let idr = encode_idr_intra_au_cfg(
+            let idr = encode_idr_intra_au_full(
                 frame.y,
                 frame.cb,
                 frame.cr,
@@ -317,6 +325,7 @@ impl LowDelayPEncoder {
                 self.height,
                 self.qp,
                 2,
+                &self.filters,
             )?;
             let recon = FrameRecon {
                 y: idr.recon_y,
@@ -343,6 +352,7 @@ impl LowDelayPEncoder {
                 self.height,
                 self.qp,
                 self.b_slices,
+                &self.filters,
             );
             let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
             self.prevs.insert(0, recon.clone());
@@ -391,12 +401,38 @@ pub fn encode_low_delay_p(
     Ok(out)
 }
 
+/// The slice header's in-loop-filter fields (§7.3.6.1): the enabled
+/// filter set plus this slice's elections.
+struct SliceLfSignalling<'a> {
+    /// The stream's filter configuration (drives field presence: the
+    /// SAO gates exist iff the SPS enables SAO, the deblocking
+    /// override group iff the PPS enables the override).
+    cfg: &'a LoopFilterCfg,
+    /// This slice's deblocking election
+    /// (`slice_deblocking_filter_disabled_flag == !deblock_on`).
+    deblock_on: bool,
+    /// Elected `slice_sao_luma_flag`.
+    sao_luma: bool,
+    /// Elected `slice_sao_chroma_flag`.
+    sao_chroma: bool,
+}
+
 /// §7.3.6.1 — the P / B slice-segment header for POC `poc`: an inline
 /// short-term RPS with `n_refs` (1 or 2) negative delta-1 pictures,
 /// the `num_ref_idx` override when two references are active,
-/// `MaxNumMergeCand == 5`, `slice_qp_delta` against `init_qp == 26`.
+/// `MaxNumMergeCand == 5`, `slice_qp_delta` against `init_qp == 26`,
+/// then the in-loop-filter block (`slice_sao_*` gates when the SPS
+/// enables SAO, the deblocking override group when the PPS enables
+/// the override, the across-slices flag when any filter is active).
 /// On a B slice both reference lists hold the same (past) pictures.
-fn write_inter_slice_header(w: &mut BitWriter, poc: i32, qp: i32, b_slice: bool, n_refs: u32) {
+fn write_inter_slice_header(
+    w: &mut BitWriter,
+    poc: i32,
+    qp: i32,
+    b_slice: bool,
+    n_refs: u32,
+    lf: &SliceLfSignalling<'_>,
+) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(u32::from(!b_slice)); // slice_type (0 = B, 1 = P)
@@ -411,7 +447,12 @@ fn write_inter_slice_header(w: &mut BitWriter, poc: i32, qp: i32, b_slice: bool,
         w.ue(0); // delta_poc_s0_minus1[i]
         w.put_bit(1); // used_by_curr_pic_s0_flag[i]
     }
-    // sps_temporal_mvp_enabled_flag == 0, SAO off: nothing.
+    // sps_temporal_mvp_enabled_flag == 0: nothing.
+    if lf.cfg.sao() {
+        // SPS SAO enabled: the per-slice component gates are present.
+        w.put_bit(u8::from(lf.sao_luma)); // slice_sao_luma_flag
+        w.put_bit(u8::from(lf.sao_chroma)); // slice_sao_chroma_flag
+    }
     if n_refs > 1 {
         w.put_bit(1); // num_ref_idx_active_override_flag
         w.ue(n_refs - 1); // num_ref_idx_l0_active_minus1
@@ -428,8 +469,23 @@ fn write_inter_slice_header(w: &mut BitWriter, poc: i32, qp: i32, b_slice: bool,
     // cabac_init_present_flag == 0; TMVP off; WP off.
     w.ue((5 - MAX_MERGE) as u32); // five_minus_max_num_merge_cand
     w.se(qp - 26); // slice_qp_delta
-                   // Deblocking disabled in the PPS + SAO off: no
-                   // loop-filter fields; no tiles / WPP: no entry points.
+    if lf.cfg.deblocking {
+        // §7.3.6.1 deblocking override group (the PPS signals
+        // override-enabled + deblocking disabled; an electing slice
+        // overrides to enabled with zero β/tC offsets).
+        w.put_bit(u8::from(lf.deblock_on)); // deblocking_filter_override_flag
+        if lf.deblock_on {
+            w.put_bit(0); // slice_deblocking_filter_disabled_flag
+            w.se(0); // slice_beta_offset_div2
+            w.se(0); // slice_tc_offset_div2
+        }
+    }
+    if lf.sao_luma || lf.sao_chroma || lf.deblock_on {
+        // §7.3.6.1: present iff pps_loop_filter_across_slices (1) and
+        // some in-loop filter is active for this slice.
+        w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    // No tiles / WPP: no entry points.
     w.rbsp_trailing_bits(); // byte_alignment()
 }
 
@@ -1028,8 +1084,11 @@ fn encode_pu_syntax(
 }
 
 /// Encode one P / low-delay-B frame as a single TRAIL_R slice against
-/// the previous frame's reconstruction. Returns the slice RBSP, the
-/// frame's reconstruction, and its CU mode-decision counters.
+/// the previous frame's reconstruction: pass 1 makes the per-CTB mode
+/// decisions and builds the pre-filter reconstruction, the §8.7 filter
+/// stage elects and applies deblocking + SAO, pass 2 emits the slice
+/// header and syntax. Returns the slice RBSP, the frame's (filtered)
+/// reconstruction, and its CU mode-decision counters.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn encode_inter_slice(
     frame: &YuvFrame<'_>,
@@ -1039,6 +1098,7 @@ fn encode_inter_slice(
     height: usize,
     qp: i32,
     b_slice: bool,
+    lf: &LoopFilterCfg,
 ) -> (Vec<u8>, FrameRecon, FrameStats) {
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
@@ -1127,16 +1187,10 @@ fn encode_inter_slice(
         is_curr_pic: &|_, _| false,
     };
 
-    // ---- slice_segment_header( ) ----
-    let mut w = BitWriter::new();
-    write_inter_slice_header(&mut w, poc, qp, b_slice, n_refs as u32);
-
-    // ---- slice_segment_data( ) ----
-    let mut cabac = CabacEncoder::new();
-    // Table 9-4: cabac_init_flag 0 ⇒ initType 1 (P) / 2 (B).
-    let raw_slice_type = if b_slice { 0 } else { 1 };
-    let mut ctxs = SliceContexts::init(init_type(raw_slice_type, false), qp);
-
+    // ---- pass 1: per-CTB mode decisions + reconstruction ----
+    let mut plans: Vec<CuCandidate> = Vec::with_capacity(ctbs_x * ctbs_y);
+    // `ctb` also drives the x0/y0 arithmetic, not just the grid index.
+    #[allow(clippy::needless_range_loop)]
     for ctb in 0..ctbs_x * ctbs_y {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
@@ -1510,6 +1564,168 @@ fn encode_inter_slice(
                 .expect("at least the skip candidate")
         };
 
+        // ---- state update (eqs 8-80..8-85 + mode fields + recon) ----
+        let is_skip = matches!(chosen.kind, CuKind::Skip { .. });
+        skip_grid[ctb] = is_skip;
+        match &chosen.kind {
+            CuKind::Intra { mode } => {
+                stats.intra += 1;
+                // The decoder stamps intra CUs into the motion field so
+                // a later CU's §6.4.2 availability denies them.
+                field.fill_rect(
+                    x0,
+                    y0,
+                    CTB,
+                    CTB,
+                    MotionCell {
+                        is_intra: true,
+                        ..MotionCell::default()
+                    },
+                );
+                modes.record_intra_pb(x0, y0, CTB, *mode, false);
+            }
+            kind => {
+                match kind {
+                    CuKind::Skip { .. } => stats.skip += 1,
+                    CuKind::Merge { .. } => stats.merge += 1,
+                    CuKind::Rect { pus, .. } => {
+                        if pus.iter().any(|p| matches!(p, PuSyntax::Amvp { .. })) {
+                            stats.amvp += 1;
+                        } else {
+                            stats.merge += 1;
+                        }
+                        stats.rect += 1;
+                    }
+                    _ => stats.amvp += 1,
+                }
+                if chosen
+                    .motions
+                    .iter()
+                    .any(|m| m.pred_flag_l0 && m.pred_flag_l1)
+                {
+                    stats.bi += 1;
+                }
+                if chosen.motions.iter().any(|m| {
+                    (m.pred_flag_l0 && m.ref_idx_l0 > 0) || (m.pred_flag_l1 && m.ref_idx_l1 > 0)
+                }) {
+                    stats.ref1 += 1;
+                }
+                // eqs 8-80..8-85: one motion cell per PU rectangle, the
+                // stored identity being the referenced picture's POC.
+                let part = match kind {
+                    CuKind::Rect { vertical: true, .. } => PartMode::PartNx2N,
+                    CuKind::Rect { .. } => PartMode::Part2NxN,
+                    _ => PartMode::Part2Nx2N,
+                };
+                let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
+                for (r, m) in rects.iter().zip(chosen.motions.iter()) {
+                    field.fill_rect(
+                        r.x_pb,
+                        r.y_pb,
+                        r.n_pb_w,
+                        r.n_pb_h,
+                        m.to_cell(poc - 1 - m.ref_idx_l0.max(0), poc - 1 - m.ref_idx_l1.max(0)),
+                    );
+                }
+                let cu_mode = if is_skip {
+                    CuPredMode::Skip
+                } else {
+                    CuPredMode::Inter
+                };
+                modes.record_non_intra_cu(x0, y0, CTB, cu_mode);
+                // §8.7.2.4 — mark each luma TRANSFORM BLOCK carrying a
+                // coded coefficient (the decoder marks per tree leaf,
+                // not per CU; intra CUs are never marked — their edges
+                // are bS 2 regardless).
+                match &chosen.levels {
+                    Some(CuLevels::Depth0(l)) if l[0].iter().any(|&v| v != 0) => {
+                        field.mark_nonzero_coeff(x0, y0, CTB, CTB);
+                    }
+                    Some(CuLevels::Depth1(d)) => {
+                        for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
+                            if d.luma[k].iter().any(|&v| v != 0) {
+                                field.mark_nonzero_coeff(x0 + zx * 8, y0 + zy * 8, 8, 8);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        store(&mut recon.y, width, x0, y0, CTB, &chosen.recon[0]);
+        store(&mut recon.cb, cw, cx0, cy0, 8, &chosen.recon[1]);
+        store(&mut recon.cr, cw, cx0, cy0, 8, &chosen.recon[2]);
+        plans.push(chosen);
+    }
+
+    // ---- §8.7 in-loop filters (deblocking + SAO) on the recon ----
+    let mut lf_sig = SliceLfSignalling {
+        cfg: lf,
+        deblock_on: false,
+        sao_luma: false,
+        sao_chroma: false,
+    };
+    let mut sao_ctbs: Vec<crate::slice_data::SaoCtbParams> = Vec::new();
+    if lf.any() {
+        let shapes: Vec<CtbShape> = plans
+            .iter()
+            .map(|c| CtbShape {
+                part_mode: match &c.kind {
+                    CuKind::Rect { vertical: true, .. } => crate::binarization::PartMode::PartNx2N,
+                    CuKind::Rect { .. } => crate::binarization::PartMode::Part2NxN,
+                    _ => crate::binarization::PartMode::Part2Nx2N,
+                },
+                split_depth1: matches!(c.levels, Some(CuLevels::Depth1(_))),
+            })
+            .collect();
+        let out = filter_frame(
+            &FilterInput {
+                width,
+                height,
+                qp,
+                lambda,
+                recon: [&recon.y, &recon.cb, &recon.cr],
+                src: [frame.y, frame.cb, frame.cr],
+                field: &field,
+                shapes: &shapes,
+            },
+            lf,
+        );
+        lf_sig.deblock_on = out.deblock_on;
+        lf_sig.sao_luma = out.slice_sao_luma;
+        lf_sig.sao_chroma = out.slice_sao_chroma;
+        sao_ctbs = out.sao_ctbs;
+        recon.y = out.y;
+        recon.cb = out.cb;
+        recon.cr = out.cr;
+    }
+
+    // ---- slice_segment_header( ) ----
+    let mut w = BitWriter::new();
+    write_inter_slice_header(&mut w, poc, qp, b_slice, n_refs as u32, &lf_sig);
+
+    // ---- slice_segment_data( ) — pass 2: syntax emission ----
+    let mut cabac = CabacEncoder::new();
+    // Table 9-4: cabac_init_flag 0 ⇒ initType 1 (P) / 2 (B).
+    let raw_slice_type = if b_slice { 0 } else { 1 };
+    let mut ctxs = SliceContexts::init(init_type(raw_slice_type, false), qp);
+    for (ctb, chosen) in plans.iter().enumerate() {
+        let x0 = (ctb % ctbs_x) * CTB;
+        let y0 = (ctb / ctbs_x) * CTB;
+        if lf_sig.sao_luma || lf_sig.sao_chroma {
+            // §7.3.8.3 sao( rx, ry ) ahead of the coding quadtree.
+            encode_sao_ctb(
+                &mut w,
+                &mut cabac,
+                &mut ctxs,
+                &sao_ctbs[ctb],
+                ctb % ctbs_x,
+                ctb / ctbs_x,
+                lf_sig.sao_luma,
+                lf_sig.sao_chroma,
+            );
+        }
+
         // ---- emit the §7.3.8.5 coding_unit( ) syntax ----
         let is_skip = matches!(chosen.kind, CuKind::Skip { .. });
         {
@@ -1533,7 +1749,6 @@ fn encode_inter_slice(
                 u8::from(is_skip),
             );
         }
-        skip_grid[ctb] = is_skip;
 
         match &chosen.kind {
             CuKind::Skip { merge_idx } => {
@@ -1792,84 +2007,6 @@ fn encode_inter_slice(
             None => {}
         }
 
-        // ---- state update (eqs 8-80..8-85 + mode fields + recon) ----
-        match &chosen.kind {
-            CuKind::Intra { mode } => {
-                stats.intra += 1;
-                // The decoder stamps intra CUs into the motion field so
-                // a later CU's §6.4.2 availability denies them.
-                field.fill_rect(
-                    x0,
-                    y0,
-                    CTB,
-                    CTB,
-                    MotionCell {
-                        is_intra: true,
-                        ..MotionCell::default()
-                    },
-                );
-                modes.record_intra_pb(x0, y0, CTB, *mode, false);
-            }
-            kind => {
-                match kind {
-                    CuKind::Skip { .. } => stats.skip += 1,
-                    CuKind::Merge { .. } => stats.merge += 1,
-                    CuKind::Rect { pus, .. } => {
-                        if pus.iter().any(|p| matches!(p, PuSyntax::Amvp { .. })) {
-                            stats.amvp += 1;
-                        } else {
-                            stats.merge += 1;
-                        }
-                        stats.rect += 1;
-                    }
-                    _ => stats.amvp += 1,
-                }
-                if chosen
-                    .motions
-                    .iter()
-                    .any(|m| m.pred_flag_l0 && m.pred_flag_l1)
-                {
-                    stats.bi += 1;
-                }
-                if chosen.motions.iter().any(|m| {
-                    (m.pred_flag_l0 && m.ref_idx_l0 > 0) || (m.pred_flag_l1 && m.ref_idx_l1 > 0)
-                }) {
-                    stats.ref1 += 1;
-                }
-                // eqs 8-80..8-85: one motion cell per PU rectangle, the
-                // stored identity being the referenced picture's POC.
-                let part = match kind {
-                    CuKind::Rect { vertical: true, .. } => PartMode::PartNx2N,
-                    CuKind::Rect { .. } => PartMode::Part2NxN,
-                    _ => PartMode::Part2Nx2N,
-                };
-                let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
-                for (r, m) in rects.iter().zip(chosen.motions.iter()) {
-                    field.fill_rect(
-                        r.x_pb,
-                        r.y_pb,
-                        r.n_pb_w,
-                        r.n_pb_h,
-                        m.to_cell(poc - 1 - m.ref_idx_l0.max(0), poc - 1 - m.ref_idx_l1.max(0)),
-                    );
-                }
-                let cu_mode = if is_skip {
-                    CuPredMode::Skip
-                } else {
-                    CuPredMode::Inter
-                };
-                modes.record_non_intra_cu(x0, y0, CTB, cu_mode);
-            }
-        }
-        if let Some(levels) = &chosen.levels {
-            if levels.luma_nonzero() {
-                field.mark_nonzero_coeff(x0, y0, CTB, CTB);
-            }
-        }
-        store(&mut recon.y, width, x0, y0, CTB, &chosen.recon[0]);
-        store(&mut recon.cb, cw, cx0, cy0, 8, &chosen.recon[1]);
-        store(&mut recon.cr, cw, cx0, cy0, 8, &chosen.recon[2]);
-
         // end_of_slice_segment_flag.
         cabac.encode_terminate(&mut w, u8::from(ctb == ctbs_x * ctbs_y - 1));
     }
@@ -1880,6 +2017,7 @@ fn encode_inter_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::intra::encode_idr_intra_au_cfg;
     use crate::sequence::decode_annexb_sequence;
 
     /// A deterministic scene: a textured background with a moving
@@ -2318,6 +2456,134 @@ mod tests {
                 "frame {i}"
             );
         }
+    }
+
+    /// Encode a whole GOP with a given filter cfg and assert every
+    /// frame decodes bit-exactly to the encoder's (filtered) recon
+    /// through the crate's own decoder. Returns the per-frame recons.
+    fn assert_filtered_gop_roundtrip(
+        planes: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        w: usize,
+        h: usize,
+        qp: i32,
+        b: bool,
+        gop: usize,
+        cfg: LoopFilterCfg,
+    ) -> Vec<FrameRecon> {
+        let frames = as_frames(planes);
+        let mut enc = LowDelayPEncoder::new(w, h, qp, gop)
+            .expect("encoder")
+            .with_b_slices(b)
+            .with_loop_filters(cfg);
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        for f in &frames {
+            let out = enc.encode_frame(f).expect("encode");
+            stream.extend_from_slice(&out.au);
+            recons.push(out.recon);
+        }
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), planes.len(), "qp{qp} b={b} {cfg:?}");
+        for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "qp{qp} b={b} {cfg:?} frame {i}: decoder output == filtered recon"
+            );
+        }
+        recons
+    }
+
+    /// Filtered low-delay GOPs (deblocking, SAO, and both — P and B
+    /// slices, multiple QPs) stay bit-exact through the crate's own
+    /// decoder, with the filtered pictures serving as the references
+    /// of every following frame.
+    #[test]
+    fn filtered_gops_decode_to_encoder_recon_exactly() {
+        let planes = scene(64, 64, 4);
+        let cfgs = [
+            LoopFilterCfg {
+                deblocking: true,
+                sao_luma: false,
+                sao_chroma: false,
+            },
+            LoopFilterCfg {
+                deblocking: false,
+                sao_luma: true,
+                sao_chroma: true,
+            },
+            LoopFilterCfg::all(),
+        ];
+        for cfg in cfgs {
+            for (qp, b) in [(22i32, false), (32, false), (32, true), (40, true)] {
+                assert_filtered_gop_roundtrip(&planes, 64, 64, qp, b, 0, cfg);
+            }
+        }
+        // Non-square geometry.
+        let planes = scene(48, 32, 3);
+        assert_filtered_gop_roundtrip(&planes, 48, 32, 30, false, 0, LoopFilterCfg::all());
+    }
+
+    /// Mid-stream IDR refreshes inside a filtered GOP: the filtered
+    /// IDR reconstruction is the reference of the following P frames,
+    /// and the whole stream stays bit-exact.
+    #[test]
+    fn filtered_gop_with_idr_refresh_roundtrips() {
+        let planes = scene(48, 48, 5);
+        assert_filtered_gop_roundtrip(&planes, 48, 48, 33, true, 3, LoopFilterCfg::all());
+    }
+
+    /// The filters actually engage on a real GOP at high QP: the
+    /// filtered reconstruction differs from the unfiltered encode and
+    /// is never further from the source (the elections are
+    /// distortion-driven per frame).
+    #[test]
+    fn filtered_gop_engages_and_never_hurts() {
+        let (w, h, n) = (64usize, 64usize, 4usize);
+        let planes = scene(w, h, n);
+        let frames = as_frames(&planes);
+        let qp = 38;
+        let run = |cfg: LoopFilterCfg| -> Vec<FrameRecon> {
+            let mut enc = LowDelayPEncoder::new(w, h, qp, 0)
+                .expect("encoder")
+                .with_loop_filters(cfg);
+            frames
+                .iter()
+                .map(|f| enc.encode_frame(f).expect("encode").recon)
+                .collect()
+        };
+        let plain = run(LoopFilterCfg::off());
+        let filtered = run(LoopFilterCfg::all());
+        assert!(
+            plain
+                .iter()
+                .zip(filtered.iter())
+                .any(|(p, f)| p.y != f.y || p.cb != f.cb || p.cr != f.cr),
+            "qp{qp}: the loop filters should engage on some frame"
+        );
+        // Frame 0 (the IDR) shares its pre-filter reconstruction with
+        // the unfiltered run, so the distortion-driven elections can
+        // only improve it. (Later frames predict from different
+        // references, so only the IDR comparison is deterministic.)
+        let ssd = |a: &[u8], b: &[u8]| -> u64 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let d = i64::from(x) - i64::from(y);
+                    (d * d) as u64
+                })
+                .sum()
+        };
+        let d = |r: &FrameRecon, t: usize| {
+            ssd(&r.y, &planes[t].0) + ssd(&r.cb, &planes[t].1) + ssd(&r.cr, &planes[t].2)
+        };
+        assert!(
+            d(&filtered[0], 0) <= d(&plain[0], 0),
+            "IDR: filtered distortion must not exceed unfiltered"
+        );
     }
 
     /// The §7.3.8.9 `mvd_coding( )` encoder is the exact bin-level
