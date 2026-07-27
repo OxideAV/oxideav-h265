@@ -51,7 +51,7 @@ use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::intra::{
     chroma_qp_420, code_tb, encode_idr_intra_au_full, gather_refs, pred_params, search_best_mode,
-    ssd, zscan_avail, IntraEncodeError,
+    ssd, zscan_avail, IntraEncodeError, SpsCfg,
 };
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
@@ -175,15 +175,28 @@ struct Depth1Levels {
     cr: [Vec<i32>; 4],
 }
 
+/// One list's non-merge (AMVP) signalling group: `ref_idx_lX` (when
+/// that list has more than one active reference), the §7.3.8.9
+/// `mvd_coding( )` pair, and `mvp_lX_flag`.
+#[derive(Clone, Copy)]
+struct AmvpGroup {
+    ref_idx: u8,
+    mvd: Mv,
+    mvp_flag: u8,
+}
+
 /// One prediction unit's §7.3.8.6 signalling (merge or AMVP).
 #[derive(Clone, Copy)]
 enum PuSyntax {
     /// `merge_flag == 1`, `merge_idx`.
     Merge { merge_idx: usize },
-    /// `merge_flag == 0`: (`inter_pred_idc` on B) + `ref_idx_l0`
-    /// (when two references are active) + `mvd_coding` +
-    /// `mvp_l0_flag`.
-    Amvp { ref_idx: u8, mvd: Mv, mvp_flag: u8 },
+    /// `merge_flag == 0`: `inter_pred_idc` (on B slices) selects the
+    /// used list(s) — `PRED_L0`, `PRED_L1` or `PRED_BI` — and each
+    /// used list carries its [`AmvpGroup`].
+    Amvp {
+        l0: Option<AmvpGroup>,
+        l1: Option<AmvpGroup>,
+    },
 }
 
 /// The signalling class of a chosen CU.
@@ -324,7 +337,7 @@ impl LowDelayPEncoder {
                 self.width,
                 self.height,
                 self.qp,
-                2,
+                &SpsCfg::legacy(2),
                 &self.filters,
             )?;
             let recon = FrameRecon {
@@ -344,16 +357,31 @@ impl LowDelayPEncoder {
                 },
             }
         } else {
-            let (rbsp, recon, stats) = encode_inter_slice(
-                frame,
-                &self.prevs,
-                self.poc,
-                self.width,
-                self.height,
-                self.qp,
-                self.b_slices,
-                &self.filters,
-            );
+            // The active references: RefPicListX[i] = the
+            // reconstruction of POC − 1 − i (newest first, up to two),
+            // and a low-delay B slice holds the same set on both lists.
+            let l0: Vec<(i32, &FrameRecon)> = self
+                .prevs
+                .iter()
+                .take(2)
+                .enumerate()
+                .map(|(i, rec)| (self.poc - 1 - i as i32, rec))
+                .collect();
+            let spec = SliceSpec {
+                poc: self.poc,
+                qp: self.qp,
+                b_slice: self.b_slices,
+                rps_neg: (1..=l0.len() as u32).map(|d| (d, true)).collect(),
+                rps_pos: Vec::new(),
+                l1: if self.b_slices {
+                    l0.clone()
+                } else {
+                    Vec::new()
+                },
+                l0,
+                lf: &self.filters,
+            };
+            let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
             self.prevs.insert(0, recon.clone());
             self.prevs.truncate(2);
@@ -421,35 +449,63 @@ struct SliceLfSignalling<'a> {
     sao_chroma: bool,
 }
 
-/// §7.3.6.1 — the P / B slice-segment header for POC `poc`: an inline
-/// short-term RPS with `n_refs` (1 or 2) negative delta-1 pictures,
-/// the `num_ref_idx` override when two references are active,
-/// `MaxNumMergeCand == 5`, `slice_qp_delta` against `init_qp == 26`,
-/// then the in-loop-filter block (`slice_sao_*` gates when the SPS
-/// enables SAO, the deblocking override group when the PPS enables
-/// the override, the across-slices flag when any filter is active).
-/// On a B slice both reference lists hold the same (past) pictures.
-fn write_inter_slice_header(
-    w: &mut BitWriter,
-    poc: i32,
-    qp: i32,
-    b_slice: bool,
-    n_refs: u32,
-    lf: &SliceLfSignalling<'_>,
-) {
+/// Everything one P / B slice's coding depends on beyond the frame
+/// samples: POC, QP, slice type, the inline §7.4.8 short-term RPS
+/// content, and the two active reference lists (POC + reconstruction
+/// each, in `RefPicListX` order). The low-delay GOP passes past
+/// pictures on both lists; the hierarchical-B GOP passes past
+/// pictures on L0 and future pictures on L1.
+pub(crate) struct SliceSpec<'a> {
+    /// `PicOrderCntVal` (== `slice_pic_order_cnt_lsb`, 8 bits).
+    pub poc: i32,
+    /// `SliceQpY`.
+    pub qp: i32,
+    /// B slice (`slice_type == 0`)?
+    pub b_slice: bool,
+    /// Negative RPS entries closest-first: `(PocDelta, used_by_curr)`
+    /// with `PocDelta = poc − entry POC > 0`, strictly increasing.
+    pub rps_neg: Vec<(u32, bool)>,
+    /// Positive RPS entries closest-first: `(entry POC − poc, used)`.
+    pub rps_pos: Vec<(u32, bool)>,
+    /// `RefPicList0`: active references, `(POC, reconstruction)`.
+    pub l0: Vec<(i32, &'a FrameRecon)>,
+    /// `RefPicList1` (B slices; empty on P slices).
+    pub l1: Vec<(i32, &'a FrameRecon)>,
+    /// The stream's §8.7 in-loop filter configuration.
+    pub lf: &'a LoopFilterCfg,
+}
+
+/// §7.3.6.1 — the P / B slice-segment header: an inline §7.4.8
+/// short-term RPS (negative + positive pictures with per-entry used
+/// flags), the `num_ref_idx` override when a list keeps more than one
+/// active reference, `MaxNumMergeCand == 5`, `slice_qp_delta` against
+/// `init_qp == 26`, then the in-loop-filter block (`slice_sao_*`
+/// gates when the SPS enables SAO, the deblocking override group when
+/// the PPS enables the override, the across-slices flag when any
+/// filter is active).
+fn write_inter_slice_header(w: &mut BitWriter, spec: &SliceSpec<'_>, lf: &SliceLfSignalling<'_>) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
-    w.ue(u32::from(!b_slice)); // slice_type (0 = B, 1 = P)
-    w.put_bits((poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb
+    w.ue(u32::from(!spec.b_slice)); // slice_type (0 = B, 1 = P)
+    w.put_bits((spec.poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb
     w.put_bit(0); // short_term_ref_pic_set_sps_flag
                   // st_ref_pic_set( 0 ) — idx 0 has no
                   // inter_ref_pic_set_prediction_flag (§7.3.7).
-    w.ue(n_refs); // num_negative_pics
-    w.ue(0); // num_positive_pics
-    for _ in 0..n_refs {
-        // §7.4.8: DeltaPocS0[i] = DeltaPocS0[i−1] − 1 ⇒ −1, −2.
-        w.ue(0); // delta_poc_s0_minus1[i]
-        w.put_bit(1); // used_by_curr_pic_s0_flag[i]
+    w.ue(spec.rps_neg.len() as u32); // num_negative_pics
+    w.ue(spec.rps_pos.len() as u32); // num_positive_pics
+    let mut prev = 0u32;
+    for &(delta, used) in &spec.rps_neg {
+        // §7.4.8: DeltaPocS0[i] = DeltaPocS0[i−1] − (minus1 + 1).
+        w.ue(delta - prev - 1); // delta_poc_s0_minus1[i]
+        w.put_bit(u8::from(used)); // used_by_curr_pic_s0_flag[i]
+        prev = delta;
+    }
+    let mut prev = 0u32;
+    for &(delta, used) in &spec.rps_pos {
+        // §7.4.8: DeltaPocS1[i] = DeltaPocS1[i−1] + (minus1 + 1).
+        w.ue(delta - prev - 1); // delta_poc_s1_minus1[i]
+        w.put_bit(u8::from(used)); // used_by_curr_pic_s1_flag[i]
+        prev = delta;
     }
     // sps_temporal_mvp_enabled_flag == 0: nothing.
     if lf.cfg.sao() {
@@ -457,22 +513,25 @@ fn write_inter_slice_header(
         w.put_bit(u8::from(lf.sao_luma)); // slice_sao_luma_flag
         w.put_bit(u8::from(lf.sao_chroma)); // slice_sao_chroma_flag
     }
-    if n_refs > 1 {
+    let n_l0 = spec.l0.len() as u32;
+    let n_l1 = spec.l1.len() as u32;
+    if n_l0 != 1 || (spec.b_slice && n_l1 != 1) {
+        // PPS defaults are one active reference per list.
         w.put_bit(1); // num_ref_idx_active_override_flag
-        w.ue(n_refs - 1); // num_ref_idx_l0_active_minus1
-        if b_slice {
-            w.ue(n_refs - 1); // num_ref_idx_l1_active_minus1
+        w.ue(n_l0 - 1); // num_ref_idx_l0_active_minus1
+        if spec.b_slice {
+            w.ue(n_l1 - 1); // num_ref_idx_l1_active_minus1
         }
     } else {
         w.put_bit(0); // num_ref_idx_active_override_flag (default: 1)
     }
     // lists_modification_present_flag == 0.
-    if b_slice {
+    if spec.b_slice {
         w.put_bit(0); // mvd_l1_zero_flag
     }
     // cabac_init_present_flag == 0; TMVP off; WP off.
     w.ue((5 - MAX_MERGE) as u32); // five_minus_max_num_merge_cand
-    w.se(qp - 26); // slice_qp_delta
+    w.se(spec.qp - 26); // slice_qp_delta
     if lf.cfg.deblocking {
         // §7.3.6.1 deblocking override group (the PPS signals
         // override-enabled + deblocking disabled; an electing slice
@@ -527,9 +586,10 @@ fn merge_pu(merge_idx: usize) -> PredictionUnit {
     }
 }
 
-/// An AMVP L0 PU with the given reference index, mvd pair and
-/// `mvp_l0_flag`.
-fn amvp_pu(ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUnit {
+/// An AMVP PU carrying the given per-list signalling groups (the
+/// §7.3.8.6 fields the §8.5.3.2 derivation reads). At least one list
+/// must be used; `inter_pred_idc` follows from which are.
+fn amvp_pu(l0: Option<AmvpGroup>, l1: Option<AmvpGroup>) -> PredictionUnit {
     let comp = |v: i32| MvdComponent {
         greater0_flag: u8::from(v != 0),
         greater1_flag: None,
@@ -537,28 +597,67 @@ fn amvp_pu(ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUnit {
         sign_flag: None,
         value: v,
     };
+    let idc = match (l0.is_some(), l1.is_some()) {
+        (true, true) => InterPredIdc::PredBi,
+        (false, true) => InterPredIdc::PredL1,
+        // An AMVP PU uses at least one list; default to L0.
+        _ => InterPredIdc::PredL0,
+    };
     PredictionUnit {
         merge_flag: false,
         merge_idx: None,
-        inter_pred_idc: Some(InterPredIdc::PredL0),
-        ref_idx_l0: Some(ref_idx),
-        mvd_l0: Some([comp(mvd[0]), comp(mvd[1])]),
-        mvp_l0_flag: Some(mvp_flag),
-        ref_idx_l1: None,
-        mvd_l1: None,
-        mvp_l1_flag: None,
+        inter_pred_idc: Some(idc),
+        ref_idx_l0: l0.map(|g| g.ref_idx),
+        mvd_l0: l0.map(|g| [comp(g.mvd[0]), comp(g.mvd[1])]),
+        mvp_l0_flag: l0.map(|g| g.mvp_flag),
+        ref_idx_l1: l1.map(|g| g.ref_idx),
+        mvd_l1: l1.map(|g| [comp(g.mvd[0]), comp(g.mvd[1])]),
+        mvp_l1_flag: l1.map(|g| g.mvp_flag),
+    }
+}
+
+/// A single-list [`amvp_pu`] probe (zero or explicit mvd) for the
+/// §8.5.3.2.6 predictor derivation and the ME resolution step.
+fn amvp_pu_list(list: usize, ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUnit {
+    let g = Some(AmvpGroup {
+        ref_idx,
+        mvd,
+        mvp_flag,
+    });
+    if list == 0 {
+        amvp_pu(g, None)
+    } else {
+        amvp_pu(None, g)
+    }
+}
+
+/// Select the plane set a list prediction reads: the used list's
+/// `refs[refIdxLX]`, or (for an unused list, whose planes are never
+/// read) any legal plane set from either list.
+fn pick_ref<'r>(
+    refs: &'r [RefPlanes],
+    other: &'r [RefPlanes],
+    pred_flag: bool,
+    ref_idx: i32,
+) -> &'r RefPlanes {
+    if pred_flag {
+        &refs[ref_idx.max(0) as usize]
+    } else {
+        refs.first().unwrap_or_else(|| &other[0])
     }
 }
 
 /// §8.5.3.3 — the final clipped prediction for a `w`x`h` PU at
 /// `(x0, y0)` with the resolved motion (uni-L0, uni-L1 or bi). Each
-/// used list reads `refs[ refIdxLX ]` — the low-delay GOP keeps up to
-/// two past reconstructions (POC − 1, POC − 2), and on B slices both
-/// lists index the same set. `chroma` selects whether the Cb / Cr
-/// planes are predicted too (the SAD search runs luma-only).
+/// used list reads `refs_lX[ refIdxLX ]`; the low-delay GOP passes the
+/// same past reconstructions on both lists, the hierarchical-B GOP
+/// passes past pictures on L0 and future pictures on L1. `chroma`
+/// selects whether the Cb / Cr planes are predicted too (the SAD
+/// search runs luma-only).
 #[allow(clippy::too_many_arguments)]
 fn predict_block(
-    refs: &[RefPlanes],
+    refs_l0: &[RefPlanes],
+    refs_l1: &[RefPlanes],
     x0: usize,
     y0: usize,
     w: usize,
@@ -566,13 +665,7 @@ fn predict_block(
     motion: &PuMotion,
     chroma: bool,
 ) -> InterPrediction {
-    let list = |pred_flag: bool, ref_idx: i32, mv: Mv| {
-        // An unused list still needs legal planes (never read).
-        let refp = &refs[if pred_flag {
-            ref_idx.max(0) as usize
-        } else {
-            0
-        }];
+    fn list(refp: &RefPlanes, pred_flag: bool, mv: Mv, chroma: bool) -> ListPrediction<'_> {
         let luma = RefPlane::new(&refp.y, refp.width, refp.height).expect("legal ref plane");
         let (cb, cr) = if chroma {
             (
@@ -595,9 +688,19 @@ fn predict_block(
             // §8.5.3.2.10: 4:2:0 chroma MV = luma MV (eighth-pel units).
             mv_c: derive_chroma_mv(mv, 2, 2),
         }
-    };
-    let l0 = list(motion.pred_flag_l0, motion.ref_idx_l0, motion.mv_l0);
-    let l1 = list(motion.pred_flag_l1, motion.ref_idx_l1, motion.mv_l1);
+    }
+    let l0 = list(
+        pick_ref(refs_l0, refs_l1, motion.pred_flag_l0, motion.ref_idx_l0),
+        motion.pred_flag_l0,
+        motion.mv_l0,
+        chroma,
+    );
+    let l1 = list(
+        pick_ref(refs_l1, refs_l0, motion.pred_flag_l1, motion.ref_idx_l1),
+        motion.pred_flag_l1,
+        motion.mv_l1,
+        chroma,
+    );
     let geom = InterPredGeometry {
         x_pb: x0 as i32,
         y_pb: y0 as i32,
@@ -798,7 +901,8 @@ fn fractional_me(
     mvp_q: &[Mv],
 ) -> Mv {
     let cost_at = |mv: Mv| -> u64 {
-        let pred = predict_block(std::slice::from_ref(refp), x0, y0, w, h, &uni_l0(mv), false);
+        let one = std::slice::from_ref(refp);
+        let pred = predict_block(one, one, x0, y0, w, h, &uni_l0(mv), false);
         let mv_rate = mvp_q
             .iter()
             .map(|p| mvd_bits([mv[0] - p[0], mv[1] - p[1]]))
@@ -837,10 +941,16 @@ fn fractional_me(
 
 /// Inputs shared by every per-PU decision of one slice.
 struct PuChooseCtx<'a> {
-    refs: &'a [RefPlanes],
+    refs_l0: &'a [RefPlanes],
+    refs_l1: &'a [RefPlanes],
     mv_ctx: &'a PuMvContext<'a>,
     lambda_me: u64,
     b_slice: bool,
+    /// B slice whose two reference lists differ (hierarchical B): the
+    /// AMVP election searches L1 and the bi combination too. A
+    /// low-delay B (both lists the same pictures) keeps the L0-only
+    /// search — L1 would duplicate it bin for bin at a higher rate.
+    two_sided: bool,
 }
 
 /// Choose merge-vs-AMVP for one prediction unit against `field` (the
@@ -867,7 +977,7 @@ fn choose_pu(
     let (merge_cost, merge_idx, merge_motion) = merge_cands
         .iter()
         .map(|&(idx, m)| {
-            let pred = predict_block(ctx.refs, x, y, w, h, &m, false);
+            let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &m, false);
             (
                 sad(&pred.luma, src_y) + ctx.lambda_me * (idx as u64 + 2),
                 idx,
@@ -891,44 +1001,48 @@ fn choose_pu(
     }
 }
 
-/// §8.5.3.2.6 + motion estimation over every active reference: the
-/// SAD + λ·bins-best AMVP signalling for one PU. Returns the syntax,
-/// the resolved motion, the rate proxy and the search cost.
-fn amvp_search(
+/// §8.5.3.2.6 + motion estimation over every active reference of ONE
+/// list: the SAD + λ·bins-best single-list AMVP signalling for one
+/// PU. Returns the group, the resolved motion, the rate proxy and the
+/// search cost; `None` when the list has no active reference.
+#[allow(clippy::too_many_arguments)]
+fn amvp_search_list(
     field: &MotionField,
     geom: &PuGeometry,
     available: &dyn Fn(i32, i32) -> bool,
     src_y: &[i32],
     ctx: &PuChooseCtx<'_>,
     merge_cands: &[(usize, PuMotion)],
-) -> (PuSyntax, PuMotion, u64, u64) {
+    list: usize,
+) -> Option<(AmvpGroup, PuMotion, u64, u64)> {
     let (x, y, w, h) = (geom.x_pb, geom.y_pb, geom.n_pb_w, geom.n_pb_h);
-    let (mut best_amvp, mut best_amvp_cost, mut best_amvp_rate) = (None, u64::MAX, 0u64);
-    for (r, refp) in ctx.refs.iter().enumerate() {
+    let refs = if list == 0 { ctx.refs_l0 } else { ctx.refs_l1 };
+    let mv_of = |m: &PuMotion| if list == 0 { m.mv_l0 } else { m.mv_l1 };
+    let mut best: Option<(AmvpGroup, PuMotion, u64, u64)> = None;
+    for (r, refp) in refs.iter().enumerate() {
         let mvp = [
-            resolve_pu_motion(
+            mv_of(&resolve_pu_motion(
                 field,
                 geom,
-                &amvp_pu(r as u8, [0, 0], 0),
+                &amvp_pu_list(list, r as u8, [0, 0], 0),
                 ctx.mv_ctx,
                 available,
-            )
-            .mv_l0,
-            resolve_pu_motion(
+            )),
+            mv_of(&resolve_pu_motion(
                 field,
                 geom,
-                &amvp_pu(r as u8, [0, 0], 1),
+                &amvp_pu_list(list, r as u8, [0, 0], 1),
                 ctx.mv_ctx,
                 available,
-            )
-            .mv_l0,
+            )),
         ];
         let mut seeds: Vec<[i32; 2]> = vec![[0, 0]];
         for p in &mvp {
             seeds.push([p[0] >> 2, p[1] >> 2]);
         }
         for (_, m) in merge_cands {
-            seeds.push([m.mv_l0[0] >> 2, m.mv_l0[1] >> 2]);
+            let mv = mv_of(m);
+            seeds.push([mv[0] >> 2, mv[1] >> 2]);
         }
         seeds.dedup();
         let int_mv = integer_me(refp, src_y, x, y, w, h, &seeds, ctx.lambda_me, &mvp);
@@ -955,29 +1069,111 @@ fn amvp_search(
         let motion = resolve_pu_motion(
             field,
             geom,
-            &amvp_pu(r as u8, mvd, mvp_flag),
+            &amvp_pu_list(list, r as u8, mvd, mvp_flag),
             ctx.mv_ctx,
             available,
         );
         // merge_flag + mvp_flag + ref_idx bin (2 refs) + idc (B) + mvd.
-        let rate = 2 + mvd_bits(mvd) + u64::from(ctx.refs.len() > 1) + u64::from(ctx.b_slice) * 2;
-        let pred = predict_block(ctx.refs, x, y, w, h, &motion, false);
+        let rate = 2 + mvd_bits(mvd) + u64::from(refs.len() > 1) + u64::from(ctx.b_slice) * 2;
+        let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false);
         let cost = sad(&pred.luma, src_y) + ctx.lambda_me * rate;
-        if cost < best_amvp_cost {
-            best_amvp_cost = cost;
-            best_amvp_rate = rate;
-            best_amvp = Some((
-                PuSyntax::Amvp {
-                    ref_idx: r as u8,
-                    mvd,
-                    mvp_flag,
-                },
-                motion,
-            ));
+        let improved = match &best {
+            None => true,
+            Some((_, _, _, c)) => cost < *c,
+        };
+        if improved {
+            let group = AmvpGroup {
+                ref_idx: r as u8,
+                mvd,
+                mvp_flag,
+            };
+            best = Some((group, motion, rate, cost));
         }
     }
-    let (amvp_syntax, amvp_motion) = best_amvp.expect("at least one reference");
-    (amvp_syntax, amvp_motion, best_amvp_rate, best_amvp_cost)
+    best
+}
+
+/// The full AMVP election for one PU: the best single-list search on
+/// L0 — and, on a two-sided B slice, on L1 plus the bi-predictive
+/// combination of the two winners. Returns the syntax, the resolved
+/// motion, the rate proxy and the search cost.
+fn amvp_search(
+    field: &MotionField,
+    geom: &PuGeometry,
+    available: &dyn Fn(i32, i32) -> bool,
+    src_y: &[i32],
+    ctx: &PuChooseCtx<'_>,
+    merge_cands: &[(usize, PuMotion)],
+) -> (PuSyntax, PuMotion, u64, u64) {
+    let (x, y, w, h) = (geom.x_pb, geom.y_pb, geom.n_pb_w, geom.n_pb_h);
+    let l0 = amvp_search_list(field, geom, available, src_y, ctx, merge_cands, 0);
+    if !ctx.two_sided {
+        let (g, motion, rate, cost) = l0.expect("at least one L0 reference");
+        return (
+            PuSyntax::Amvp {
+                l0: Some(g),
+                l1: None,
+            },
+            motion,
+            rate,
+            cost,
+        );
+    }
+    let l1 = amvp_search_list(field, geom, available, src_y, ctx, merge_cands, 1);
+    let mut cands: Vec<(PuSyntax, PuMotion, u64, u64)> = Vec::with_capacity(3);
+    if let Some((g, motion, rate, cost)) = l0 {
+        cands.push((
+            PuSyntax::Amvp {
+                l0: Some(g),
+                l1: None,
+            },
+            motion,
+            rate,
+            cost,
+        ));
+    }
+    if let Some((g, motion, rate, cost)) = l1 {
+        cands.push((
+            PuSyntax::Amvp {
+                l0: None,
+                l1: Some(g),
+            },
+            motion,
+            rate,
+            cost,
+        ));
+    }
+    if let (Some((g0, _, _, _)), Some((g1, _, _, _))) = (&l0, &l1) {
+        // Bi combination of the two single-list winners: the AMVP
+        // predictor derivation of each list is independent of the
+        // other, so the resolved per-list MVs match the uni winners.
+        let motion = resolve_pu_motion(
+            field,
+            geom,
+            &amvp_pu(Some(*g0), Some(*g1)),
+            ctx.mv_ctx,
+            available,
+        );
+        // merge_flag + inter_pred_idc ("1") + per-list mvd/mvp/ref bins.
+        let rate = 2
+            + (mvd_bits(g0.mvd) + 1 + u64::from(ctx.refs_l0.len() > 1))
+            + (mvd_bits(g1.mvd) + 1 + u64::from(ctx.refs_l1.len() > 1));
+        let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false);
+        let cost = sad(&pred.luma, src_y) + ctx.lambda_me * rate;
+        cands.push((
+            PuSyntax::Amvp {
+                l0: Some(*g0),
+                l1: Some(*g1),
+            },
+            motion,
+            rate,
+            cost,
+        ));
+    }
+    cands
+        .into_iter()
+        .min_by_key(|&(_, _, _, cost)| cost)
+        .expect("at least one active reference across the lists")
 }
 
 /// Encode `merge_idx` (§9.3.3.10 TR with `cMax = MaxNumMergeCand − 1`:
@@ -1047,63 +1243,67 @@ fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut Slice
 }
 
 /// §7.3.8.6 — emit one prediction unit's syntax (merge_flag +
-/// merge_idx, or the AMVP group). `ref_idx_lX` is never present (one
-/// active reference per list) and a non-merge PU is `PRED_L0`
-/// (signalled as "00" `inter_pred_idc` on B slices — bin 0 ctxInc =
-/// CtDepth = 0, bin 1 ctxInc = 4; `nPbW + nPbH != 12` for every PU
-/// shape this encoder emits).
+/// merge_idx, or the AMVP groups). On B slices `inter_pred_idc` is
+/// coded per Table 9-47 (`PRED_BI` = "1", `PRED_L0` = "00", `PRED_L1`
+/// = "01"; bin 0 ctxInc = CtDepth = 0, bin 1 ctxInc = 4 — `nPbW +
+/// nPbH != 12` for every PU shape this encoder emits). Each used
+/// list codes `ref_idx_lX` (a single context bin — at most two active
+/// references per list), `mvd_coding` (`mvd_l1_zero_flag == 0`) and
+/// `mvp_lX_flag`.
 fn encode_pu_syntax(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
     pu: &PuSyntax,
     b_slice: bool,
-    n_refs: usize,
+    n_l0: usize,
+    n_l1: usize,
 ) {
     match pu {
         PuSyntax::Merge { merge_idx } => {
             cabac.encode_decision(w, &mut ctxs.merge_flag[0], 1);
             encode_merge_idx(w, cabac, ctxs, *merge_idx);
         }
-        PuSyntax::Amvp {
-            ref_idx,
-            mvd,
-            mvp_flag,
-        } => {
+        PuSyntax::Amvp { l0, l1 } => {
             cabac.encode_decision(w, &mut ctxs.merge_flag[0], 0);
             if b_slice {
                 let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
-                cabac.encode_decision(w, &mut head[0], 0);
-                cabac.encode_decision(w, &mut tail[0], 0);
+                if l0.is_some() && l1.is_some() {
+                    cabac.encode_decision(w, &mut head[0], 1); // PRED_BI
+                } else {
+                    cabac.encode_decision(w, &mut head[0], 0);
+                    cabac.encode_decision(w, &mut tail[0], u8::from(l1.is_some()));
+                }
             }
-            if n_refs > 1 {
-                // §9.3.3 TR cMax = num_ref_idx_l0_active_minus1 == 1:
-                // a single context-coded bin (ctxInc 0).
-                cabac.encode_decision(w, &mut ctxs.ref_idx[0], *ref_idx);
+            for (group, n_active) in [(l0, n_l0), (l1, n_l1)] {
+                let Some(g) = group else { continue };
+                if n_active > 1 {
+                    // §9.3.3 TR cMax = num_ref_idx_lX_active_minus1 ==
+                    // 1: a single context-coded bin (ctxInc 0).
+                    debug_assert!(n_active == 2, "at most two active references per list");
+                    cabac.encode_decision(w, &mut ctxs.ref_idx[0], g.ref_idx);
+                }
+                encode_mvd_pair(w, cabac, ctxs, g.mvd);
+                cabac.encode_decision(w, &mut ctxs.mvp_flag[0], g.mvp_flag);
             }
-            encode_mvd_pair(w, cabac, ctxs, *mvd);
-            cabac.encode_decision(w, &mut ctxs.mvp_flag[0], *mvp_flag);
         }
     }
 }
 
-/// Encode one P / low-delay-B frame as a single TRAIL_R slice against
-/// the previous frame's reconstruction: pass 1 makes the per-CTB mode
-/// decisions and builds the pre-filter reconstruction, the §8.7 filter
-/// stage elects and applies deblocking + SAO, pass 2 emits the slice
-/// header and syntax. Returns the slice RBSP, the frame's (filtered)
+/// Encode one P / B frame as a single TRAIL_R slice against the
+/// reference lists of `spec`: pass 1 makes the per-CTB mode decisions
+/// and builds the pre-filter reconstruction, the §8.7 filter stage
+/// elects and applies deblocking + SAO, pass 2 emits the slice header
+/// and syntax. Returns the slice RBSP, the frame's (filtered)
 /// reconstruction, and its CU mode-decision counters.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn encode_inter_slice(
+#[allow(clippy::too_many_lines)]
+pub(crate) fn encode_inter_slice(
     frame: &YuvFrame<'_>,
-    prevs: &[FrameRecon],
-    poc: i32,
+    spec: &SliceSpec<'_>,
     width: usize,
     height: usize,
-    qp: i32,
-    b_slice: bool,
-    lf: &LoopFilterCfg,
 ) -> (Vec<u8>, FrameRecon, FrameStats) {
+    let (poc, qp, b_slice, lf) = (spec.poc, spec.qp, spec.b_slice, spec.lf);
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
@@ -1115,20 +1315,27 @@ fn encode_inter_slice(
     let lambda_me: u64 = lambda;
 
     let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
-    // The active references: RefPicListX[i] = the reconstruction of
-    // POC − 1 − i (newest first, up to two).
-    let refs: Vec<RefPlanes> = prevs
-        .iter()
-        .take(2)
-        .map(|prev| RefPlanes {
-            y: to_i32(&prev.y),
-            cb: to_i32(&prev.cb),
-            cr: to_i32(&prev.cr),
-            width,
-            height,
-        })
-        .collect();
-    let n_refs = refs.len() as i32;
+    let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
+        list.iter()
+            .map(|&(_, rec)| RefPlanes {
+                y: to_i32(&rec.y),
+                cb: to_i32(&rec.cb),
+                cr: to_i32(&rec.cr),
+                width,
+                height,
+            })
+            .collect()
+    };
+    let refs_l0: Vec<RefPlanes> = to_planes(&spec.l0);
+    let refs_l1: Vec<RefPlanes> = to_planes(&spec.l1);
+    let l0_pocs: Vec<i32> = spec.l0.iter().map(|&(p, _)| p).collect();
+    let l1_pocs: Vec<i32> = spec.l1.iter().map(|&(p, _)| p).collect();
+    let n_l0 = l0_pocs.len() as i32;
+    let n_l1 = l1_pocs.len() as i32;
+    // Hierarchical B: the two lists differ, so the AMVP election
+    // searches L1 / bi as well; a low-delay B keeps the L0-only
+    // search (L1 duplicates it at a higher signalling rate).
+    let two_sided = b_slice && l0_pocs != l1_pocs;
 
     let mut recon = FrameRecon {
         y: vec![0u8; width * height],
@@ -1155,18 +1362,28 @@ fn encode_inter_slice(
     )
     .expect("legal single-tile geometry");
 
-    // §8.5.3.2 reference resolvers: short-term references at POC − 1
-    // (and POC − 2 with two active entries).
-    let ref_poc = |_list: usize, ref_idx: i32| {
-        if (0..n_refs).contains(&ref_idx) {
-            poc - 1 - ref_idx
+    // §8.5.3.2 reference resolvers over the spec's explicit lists.
+    let list_pocs = |list: usize| -> &Vec<i32> {
+        if list == 0 {
+            &l0_pocs
         } else {
-            i32::MIN
+            &l1_pocs
         }
     };
+    let ref_poc = |list: usize, ref_idx: i32| -> i32 {
+        usize::try_from(ref_idx)
+            .ok()
+            .and_then(|i| list_pocs(list).get(i).copied())
+            .unwrap_or(i32::MIN)
+    };
     let ref_long_term = |_list: usize, _ref_idx: i32| false;
-    let ref_short_term = |_list: usize, ref_idx: i32| (0..n_refs).contains(&ref_idx);
+    let ref_short_term = |list: usize, ref_idx: i32| {
+        usize::try_from(ref_idx).is_ok_and(|i| i < list_pocs(list).len())
+    };
     let col_ref_long_term = |_poc: i32| false;
+    // §8.5.3.2.2 NoBackwardPredFlag: 1 iff every active reference of
+    // both lists precedes the current picture in output order.
+    let no_backward_pred = !l0_pocs.iter().chain(l1_pocs.iter()).any(|&p| p > poc);
     let mv_ctx = PuMvContext {
         curr_poc: poc,
         slice_is_b: b_slice,
@@ -1174,13 +1391,13 @@ fn encode_inter_slice(
         pic_width_luma: width as u32,
         pic_height_luma: height as u32,
         max_num_merge_cand: MAX_MERGE,
-        num_ref_idx_l0_active: n_refs,
-        num_ref_idx_l1_active: if b_slice { n_refs } else { 0 },
+        num_ref_idx_l0_active: n_l0,
+        num_ref_idx_l1_active: if b_slice { n_l1 } else { 0 },
         log2_par_mrg_level: 2,
         temporal_mvp_enabled: false,
         collocated_from_l0_flag: true,
         col_poc: 0,
-        no_backward_pred: true,
+        no_backward_pred,
         ref_poc: &ref_poc,
         ref_long_term: &ref_long_term,
         ref_short_term: &ref_short_term,
@@ -1257,7 +1474,7 @@ fn encode_inter_slice(
             let (best_merge_idx, best_merge_motion) = merge_cands
                 .iter()
                 .map(|&(idx, m)| {
-                    let pred = predict_block(&refs, x0, y0, CTB, CTB, &m, false);
+                    let pred = predict_block(&refs_l0, &refs_l1, x0, y0, CTB, CTB, &m, false);
                     (
                         sad(&pred.luma, &src[0]) + lambda_me * (idx as u64 + 1),
                         idx,
@@ -1270,10 +1487,12 @@ fn encode_inter_slice(
 
             // ---- AMVP: §8.5.3.2.6 predictors + per-reference ME ----
             let choose_ctx = PuChooseCtx {
-                refs: &refs,
+                refs_l0: &refs_l0,
+                refs_l1: &refs_l1,
                 mv_ctx: &mv_ctx,
                 lambda_me,
                 b_slice,
+                two_sided,
             };
             let (amvp_syntax, amvp_motion, amvp_rate, _) = amvp_search(
                 &field,
@@ -1288,7 +1507,16 @@ fn encode_inter_slice(
             let mut cands: Vec<CuCandidate> = Vec::with_capacity(6);
 
             // Skip: best merge candidate, prediction only.
-            let merge_pred = predict_block(&refs, x0, y0, CTB, CTB, &best_merge_motion, true);
+            let merge_pred = predict_block(
+                &refs_l0,
+                &refs_l1,
+                x0,
+                y0,
+                CTB,
+                CTB,
+                &best_merge_motion,
+                true,
+            );
             let (skip_recon, skip_dist) = pred_recon(&merge_pred, &src);
             cands.push(CuCandidate {
                 kind: CuKind::Skip {
@@ -1317,7 +1545,7 @@ fn encode_inter_slice(
             }
 
             // AMVP (with or without residual).
-            let amvp_pred = predict_block(&refs, x0, y0, CTB, CTB, &amvp_motion, true);
+            let amvp_pred = predict_block(&refs_l0, &refs_l1, x0, y0, CTB, CTB, &amvp_motion, true);
             let (a_levels, a_recon, a_dist, a_rate) =
                 code_ctb_residual(&amvp_pred, &src, qp_y, qp_c);
             let motion_rate = amvp_rate + 2; // + skip / rqt flags
@@ -1414,7 +1642,9 @@ fn encode_inter_slice(
                             poc - 1 - motion.ref_idx_l1.max(0),
                         ),
                     );
-                    let p = predict_block(&refs, r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, &motion, true);
+                    let p = predict_block(
+                        &refs_l0, &refs_l1, r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, &motion, true,
+                    );
                     blit(
                         &mut pred_y,
                         CTB,
@@ -1710,7 +1940,7 @@ fn encode_inter_slice(
 
     // ---- slice_segment_header( ) ----
     let mut w = BitWriter::new();
-    write_inter_slice_header(&mut w, poc, qp, b_slice, n_refs as u32, &lf_sig);
+    write_inter_slice_header(&mut w, spec, &lf_sig);
 
     // ---- slice_segment_data( ) — pass 2: syntax emission ----
     let mut cabac = CabacEncoder::new();
@@ -1774,14 +2004,23 @@ fn encode_inter_slice(
                         merge_idx: *merge_idx,
                     },
                     b_slice,
-                    n_refs as usize,
+                    n_l0 as usize,
+                    n_l1 as usize,
                 );
                 // rqt_root_cbf not present (2Nx2N merge ⇒ inferred 1).
             }
             CuKind::Amvp { pu } => {
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
-                encode_pu_syntax(&mut w, &mut cabac, &mut ctxs, pu, b_slice, n_refs as usize);
+                encode_pu_syntax(
+                    &mut w,
+                    &mut cabac,
+                    &mut ctxs,
+                    pu,
+                    b_slice,
+                    n_l0 as usize,
+                    n_l1 as usize,
+                );
                 cabac.encode_decision(
                     &mut w,
                     &mut ctxs.rqt_root_cbf[0],
@@ -1801,7 +2040,15 @@ fn encode_inter_slice(
                     cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], 1);
                 }
                 for pu in pus {
-                    encode_pu_syntax(&mut w, &mut cabac, &mut ctxs, pu, b_slice, n_refs as usize);
+                    encode_pu_syntax(
+                        &mut w,
+                        &mut cabac,
+                        &mut ctxs,
+                        pu,
+                        b_slice,
+                        n_l0 as usize,
+                        n_l1 as usize,
+                    );
                 }
                 // rqt_root_cbf: present (PartMode != PART_2Nx2N).
                 cabac.encode_decision(

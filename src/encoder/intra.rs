@@ -54,7 +54,7 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for, write_pps_lf, write_ptl, write_vps};
+use crate::encoder::pcm::{level_idc_for, write_pps_lf, write_ptl, write_vps, write_vps_cfg};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -132,19 +132,56 @@ pub struct IntraEncodedAu {
     pub recon_cr: Vec<u8>,
 }
 
+/// The stream-level geometry / buffering knobs of the shared SPS
+/// (everything the intra, low-delay and hierarchical-B encoders vary
+/// between them; the rest of the SPS is fixed 4:2:0 8-bit CTB-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpsCfg {
+    /// `sps_max_dec_pic_buffering_minus1[0]`.
+    pub max_dec_pic_buffering_minus1: u32,
+    /// `sps_max_num_reorder_pics[0]` (nonzero for the out-of-order
+    /// hierarchical-B GOPs).
+    pub max_num_reorder_pics: u32,
+    /// `MinCbLog2SizeY` (4 for the legacy CTB == CU geometry; 3 for
+    /// the AMP-enabled geometry, where every CTB is an UNSPLIT 16x16
+    /// CU with `log2CbSize > MinCbLog2SizeY`).
+    pub min_cb_log2: u32,
+    /// `amp_enabled_flag` (requires `min_cb_log2 == 3` — Table 9-45
+    /// only reaches the AMP bin strings when `log2CbSize >
+    /// MinCbLog2SizeY`).
+    pub amp: bool,
+}
+
+impl SpsCfg {
+    /// The legacy fixed geometry: `MinCbSizeY == CtbSizeY == 16`, no
+    /// AMP, no output reordering.
+    pub(crate) fn legacy(max_dec_pic_buffering_minus1: u32) -> Self {
+        Self {
+            max_dec_pic_buffering_minus1,
+            max_num_reorder_pics: 0,
+            min_cb_log2: CTB_LOG2,
+            amp: false,
+        }
+    }
+}
+
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM off,
-/// SAO per `sao_enabled`). Shared by the intra and low-delay-P
-/// encoders (nothing in it is slice-type specific: the P slices code
-/// their §7.4.8 short-term RPS inline, `sps_temporal_mvp_enabled_flag`
-/// is 0, and `sps_max_dec_pic_buffering_minus1[0] == 1` covers the
-/// one-reference low-delay GOP).
-pub(crate) fn write_sps_lf(
+/// SAO per `sao_enabled`) with the [`SpsCfg`] knob set (coding-block
+/// geometry, `amp_enabled_flag`, DPB / reorder bounds). Shared by the
+/// intra, low-delay and hierarchical-B encoders (nothing in it is
+/// slice-type specific: the P / B slices code their §7.4.8 short-term
+/// RPS inline and `sps_temporal_mvp_enabled_flag` is 0).
+pub(crate) fn write_sps_cfg(
     width: usize,
     height: usize,
     level_idc: u8,
-    max_dec_pic_buffering_minus1: u32,
+    cfg: &SpsCfg,
     sao_enabled: bool,
 ) -> Vec<u8> {
+    debug_assert!(
+        !cfg.amp || cfg.min_cb_log2 < CTB_LOG2,
+        "AMP requires log2CbSize > MinCbLog2SizeY (Table 9-45)"
+    );
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
@@ -159,17 +196,17 @@ pub(crate) fn write_sps_lf(
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     w.put_bit(1); // sps_sub_layer_ordering_info_present_flag
-    w.ue(max_dec_pic_buffering_minus1); // sps_max_dec_pic_buffering_minus1[0]
-    w.ue(0); // sps_max_num_reorder_pics[0]
+    w.ue(cfg.max_dec_pic_buffering_minus1); // sps_max_dec_pic_buffering_minus1[0]
+    w.ue(cfg.max_num_reorder_pics); // sps_max_num_reorder_pics[0]
     w.ue(0); // sps_max_latency_increase_plus1[0]
-    w.ue(CTB_LOG2 - 3); // log2_min_luma_coding_block_size_minus3 (16)
-    w.ue(0); // log2_diff_max_min_luma_coding_block_size (CTB 16)
+    w.ue(cfg.min_cb_log2 - 3); // log2_min_luma_coding_block_size_minus3
+    w.ue(CTB_LOG2 - cfg.min_cb_log2); // log2_diff_max_min_luma_coding_block_size (CTB 16)
     w.ue(0); // log2_min_luma_transform_block_size_minus2 (4)
     w.ue(2); // log2_diff_max_min_luma_transform_block_size (16)
     w.ue(0); // max_transform_hierarchy_depth_inter
     w.ue(0); // max_transform_hierarchy_depth_intra
     w.put_bit(0); // scaling_list_enabled_flag
-    w.put_bit(0); // amp_enabled_flag
+    w.put_bit(u8::from(cfg.amp)); // amp_enabled_flag
     w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
     w.put_bit(0); // pcm_enabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
@@ -476,7 +513,7 @@ pub fn encode_idr_intra_au_lf(
     qp: i32,
     lf: &LoopFilterCfg,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
-    encode_idr_intra_au_full(y, cb, cr, width, height, qp, 1, lf)
+    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &SpsCfg::legacy(1), lf)
 }
 
 /// [`encode_idr_intra_au`] with an explicit
@@ -499,7 +536,7 @@ pub(crate) fn encode_idr_intra_au_cfg(
         width,
         height,
         qp,
-        max_dec_pic_buffering_minus1,
+        &SpsCfg::legacy(max_dec_pic_buffering_minus1),
         &LoopFilterCfg::off(),
     )
 }
@@ -517,7 +554,7 @@ pub(crate) fn encode_idr_intra_au_full(
     width: usize,
     height: usize,
     qp: i32,
-    max_dec_pic_buffering_minus1: u32,
+    cfg: &SpsCfg,
     lf: &LoopFilterCfg,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
@@ -1059,22 +1096,28 @@ pub(crate) fn encode_idr_intra_au_full(
     let slice_rbsp = w.finish();
 
     let level_idc = level_idc_for(width * height);
+    // The reorder-free streams keep the historical VPS bounds (1, 0)
+    // so every golden pin stays byte-stable; a reordering
+    // (hierarchical-B) stream signals its honest DPB bounds.
+    let vps = if cfg.max_num_reorder_pics == 0 {
+        write_vps(level_idc)
+    } else {
+        write_vps_cfg(
+            level_idc,
+            cfg.max_dec_pic_buffering_minus1,
+            cfg.max_num_reorder_pics,
+        )
+    };
     let units = vec![
-        nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
+        nal_unit(32, 0, 0, &vps), // VPS_NUT
         nal_unit(
             33,
             0,
             0,
-            &write_sps_lf(
-                width,
-                height,
-                level_idc,
-                max_dec_pic_buffering_minus1,
-                lf.sao(),
-            ),
+            &write_sps_cfg(width, height, level_idc, cfg, lf.sao()),
         ), // SPS_NUT
         nal_unit(34, 0, 0, &write_pps_lf(false, false, lf.deblocking, None)), // PPS_NUT
-        nal_unit(20, 0, 0, &slice_rbsp),           // IDR_N_LP
+        nal_unit(20, 0, 0, &slice_rbsp), // IDR_N_LP
     ];
     Ok(IntraEncodedAu {
         au: annexb(&units),

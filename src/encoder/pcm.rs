@@ -206,6 +206,17 @@ pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
 
 /// §7.3.2.1 — the minimal single-layer VPS.
 pub(crate) fn write_vps(level_idc: u8) -> Vec<u8> {
+    write_vps_cfg(level_idc, 1, 0)
+}
+
+/// [`write_vps`] with explicit `vps_max_dec_pic_buffering_minus1[0]` /
+/// `vps_max_num_reorder_pics[0]` (the hierarchical-B encoder holds
+/// more references and reorders output).
+pub(crate) fn write_vps_cfg(
+    level_idc: u8,
+    max_dec_pic_buffering_minus1: u32,
+    max_num_reorder_pics: u32,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // vps_video_parameter_set_id
     w.put_bit(1); // vps_base_layer_internal_flag
@@ -216,8 +227,8 @@ pub(crate) fn write_vps(level_idc: u8) -> Vec<u8> {
     w.put_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
     write_ptl(&mut w, level_idc);
     w.put_bit(1); // vps_sub_layer_ordering_info_present_flag
-    w.ue(1); // vps_max_dec_pic_buffering_minus1[0]
-    w.ue(0); // vps_max_num_reorder_pics[0]
+    w.ue(max_dec_pic_buffering_minus1); // vps_max_dec_pic_buffering_minus1[0]
+    w.ue(max_num_reorder_pics); // vps_max_num_reorder_pics[0]
     w.ue(0); // vps_max_latency_increase_plus1[0]
     w.put_bits(0, 6); // vps_max_layer_id
     w.ue(0); // vps_num_layer_sets_minus1
