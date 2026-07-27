@@ -631,7 +631,12 @@ pub(crate) fn encode_idr_intra_au_full(
         };
 
         // ---- candidate PART_NxN: four 8x8 PBs/TBs, z-order ----
-        let plan_nxn = {
+        // Only at the legacy MinCb geometry: at `log2CbSize >
+        // MinCbLog2SizeY` an intra CU's `part_mode` is not present
+        // (§7.3.8.5), so PART_NxN cannot be signalled.
+        let plan_nxn = if cfg.min_cb_log2 < CTB_LOG2 {
+            None
+        } else {
             let mut scratch = vec![0u8; CTB * CTB]; // in-progress CTB recon
             let mut pb_modes = [0u8; 4];
             let mut pb_levels: Vec<Vec<i32>> = Vec::with_capacity(4);
@@ -659,12 +664,12 @@ pub(crate) fn encode_idr_intra_au_full(
                 pb_modes[k] = mode;
                 pb_levels.push(levels);
             }
-            LumaPlan {
+            Some(LumaPlan {
                 nxn: true,
                 modes: pb_modes,
                 levels: pb_levels,
                 recon: scratch,
-            }
+            })
         };
 
         // Luma-only rate-distortion comparison: SSD of the coded
@@ -675,10 +680,9 @@ pub(crate) fn encode_idr_intra_au_full(
                 + plan.levels.len() as u64 * 6;
             ssd(&plan.recon, &src16) + lambda * rate
         };
-        let plan = if cost(&plan_nxn) < cost(&plan_2n) {
-            plan_nxn
-        } else {
-            plan_2n
+        let plan = match plan_nxn {
+            Some(nxn) if cost(&nxn) < cost(&plan_2n) => nxn,
+            _ => plan_2n,
         };
         store(&mut recon_y, width, x0, y0, CTB, &plan.recon);
         // §8.4.3: IntraPredModeC derives from the CU's first PB.
@@ -845,9 +849,20 @@ pub(crate) fn encode_idr_intra_au_full(
         let mode_c = plan.modes[0];
 
         // ---- §7.3.8.5 coding_unit( ) syntax ----
-        // part_mode: §9.3.3.7 intra at MinCb — "1" = PART_2Nx2N,
-        // "0" = PART_NxN.
-        cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], u8::from(!plan.nxn));
+        if cfg.min_cb_log2 < CTB_LOG2 {
+            // §7.3.8.4: log2CbSize (4) > MinCbLog2SizeY — split_cu_flag
+            // is coded, and every CTB stays one UNSPLIT 16x16 CU. All
+            // CtDepth values are 0, so both §9.3.4.2.2 conds are 0 and
+            // the ctxInc is 0. part_mode is then NOT present for an
+            // intra CU at log2CbSize > MinCbLog2SizeY (§7.3.8.5;
+            // inferred PART_2Nx2N).
+            cabac.encode_decision(&mut w, &mut ctxs.split_cu_flag[0], 0);
+            debug_assert!(!plan.nxn, "PART_NxN cannot be signalled above MinCb");
+        } else {
+            // part_mode: §9.3.3.7 intra at MinCb — "1" = PART_2Nx2N,
+            // "0" = PART_NxN.
+            cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], u8::from(!plan.nxn));
+        }
         // §7.3.8.5 two-loop luma mode group: all
         // prev_intra_luma_pred_flag bins first, then the mpm_idx /
         // rem_intra_luma_pred_mode group. The §8.4.2 candidate list of

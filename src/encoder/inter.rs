@@ -250,6 +250,11 @@ pub struct LowDelayPEncoder {
     /// The §8.7 in-loop filters this stream signals and applies on
     /// its reconstruction path.
     filters: LoopFilterCfg,
+    /// AMP stream configuration: `MinCbSizeY == 8` with every CTB an
+    /// unsplit 16x16 CU, `amp_enabled_flag == 1`, and the asymmetric
+    /// PART_2NxnU/2NxnD/nLx2N/nRx2N shapes competing in the inter CU
+    /// ladder.
+    amp: bool,
     /// POC of the NEXT frame within the current GOP (0 ⇒ IDR next).
     poc: i32,
     /// The most recent reconstructions, newest first (up to two — the
@@ -279,6 +284,7 @@ impl LowDelayPEncoder {
             gop,
             b_slices: false,
             filters: LoopFilterCfg::off(),
+            amp: false,
             poc: 0,
             prevs: Vec::new(),
         })
@@ -289,6 +295,18 @@ impl LowDelayPEncoder {
     #[must_use]
     pub fn with_b_slices(mut self, on: bool) -> Self {
         self.b_slices = on;
+        self
+    }
+
+    /// Switch the stream to the AMP configuration: the SPS signals
+    /// `MinCbSizeY == 8` + `amp_enabled_flag == 1` (every CTB still
+    /// one unsplit 16x16 CU, now with an explicit `split_cu_flag`),
+    /// and the inter CU ladder elects the asymmetric
+    /// `PART_2NxnU / PART_2NxnD / PART_nLx2N / PART_nRx2N` motion
+    /// partitions alongside the symmetric shapes.
+    #[must_use]
+    pub fn with_amp(mut self, on: bool) -> Self {
+        self.amp = on;
         self
     }
 
@@ -337,7 +355,12 @@ impl LowDelayPEncoder {
                 self.width,
                 self.height,
                 self.qp,
-                &SpsCfg::legacy(2),
+                &SpsCfg {
+                    max_dec_pic_buffering_minus1: 2,
+                    max_num_reorder_pics: 0,
+                    min_cb_log2: if self.amp { 3 } else { 4 },
+                    amp: self.amp,
+                },
                 &self.filters,
             )?;
             let recon = FrameRecon {
@@ -380,6 +403,7 @@ impl LowDelayPEncoder {
                 },
                 l0,
                 lf: &self.filters,
+                big_cu: self.amp,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
@@ -473,6 +497,11 @@ pub(crate) struct SliceSpec<'a> {
     pub l1: Vec<(i32, &'a FrameRecon)>,
     /// The stream's §8.7 in-loop filter configuration.
     pub lf: &'a LoopFilterCfg,
+    /// Stream geometry: `log2CbSize > MinCbLog2SizeY` (MinCb 8, one
+    /// explicit `split_cu_flag == 0` per CTB, the Table 9-45 big-CU
+    /// `part_mode` column, no intra `part_mode`). Implied by the AMP
+    /// stream configuration.
+    pub big_cu: bool,
 }
 
 /// §7.3.6.1 — the P / B slice-segment header: an inline §7.4.8
@@ -1964,6 +1993,13 @@ pub(crate) fn encode_inter_slice(
             );
         }
 
+        if spec.big_cu {
+            // §7.3.8.4: log2CbSize (4) > MinCbLog2SizeY (3) —
+            // split_cu_flag is coded and 0 (one unsplit 16x16 CU per
+            // CTB; all CtDepth 0 ⇒ both §9.3.4.2.2 conds 0 ⇒ ctxInc 0).
+            cabac.encode_decision(&mut w, &mut ctxs.split_cu_flag[0], 0);
+        }
+
         // ---- emit the §7.3.8.5 coding_unit( ) syntax ----
         let is_skip = matches!(chosen.kind, CuKind::Skip { .. });
         {
@@ -2029,15 +2065,19 @@ pub(crate) fn encode_inter_slice(
             }
             CuKind::Rect { vertical, pus } => {
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
-                // §9.3.3.7 inter part_mode at MinCb (log2CbSize 4 > 3):
-                // "01" = PART_2NxN, "001" = PART_Nx2N (bin 0 ctx 0,
-                // bin 1 ctx 1, bin 2 the MinCb slot 2).
+                // §9.3.3.7 inter part_mode:
+                // * at MinCb (log2CbSize == MinCbLog2SizeY > 3):
+                //   "01" = PART_2NxN, "001" = PART_Nx2N (bin 0 ctx 0,
+                //   bin 1 ctx 1, bin 2 the MinCb slot 2);
+                // * above MinCb with amp_enabled_flag: "011" =
+                //   PART_2NxN, "001" = PART_Nx2N (bin 2 = 1 selects
+                //   the symmetric form, ctx slot 3).
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 0);
-                if *vertical {
-                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], 0);
+                cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], u8::from(!*vertical));
+                if spec.big_cu {
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[3], 1);
+                } else if *vertical {
                     cabac.encode_decision(&mut w, &mut ctxs.part_mode[2], 1);
-                } else {
-                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], 1);
                 }
                 for pu in pus {
                     encode_pu_syntax(
@@ -2059,9 +2099,13 @@ pub(crate) fn encode_inter_slice(
             }
             CuKind::Intra { mode } => {
                 // pred_mode_flag = 1 (MODE_INTRA), part_mode "1"
-                // (2Nx2N at MinCb), PCM disabled in the SPS.
+                // (2Nx2N) at MinCb — NOT present above MinCb
+                // (§7.3.8.5, inferred PART_2Nx2N); PCM disabled in
+                // the SPS.
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 1);
-                cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
+                if !spec.big_cu {
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1);
+                }
                 // §7.3.8.5 luma-mode group (single PB): the §8.4.2
                 // candidate list against the recorded neighbour modes
                 // (inter / skip neighbours contribute INTRA_DC), with
@@ -2839,6 +2883,100 @@ mod tests {
             d(&filtered[0], 0) <= d(&plain[0], 0),
             "IDR: filtered distortion must not exceed unfiltered"
         );
+    }
+
+    /// The AMP stream configuration (`MinCbSizeY == 8`, an explicit
+    /// `split_cu_flag == 0` per CTB, the Table 9-45 big-CU part_mode
+    /// column) roundtrips bit-exactly through the crate's own decoder
+    /// on P and B GOPs, with and without the in-loop filters — and the
+    /// SPS actually signals the geometry.
+    #[test]
+    fn amp_geometry_gops_decode_to_encoder_recon_exactly() {
+        let planes = scene(64, 64, 4);
+        let frames = as_frames(&planes);
+        for (qp, b, lf) in [
+            (22i32, false, LoopFilterCfg::off()),
+            (32, true, LoopFilterCfg::off()),
+            (35, true, LoopFilterCfg::all()),
+        ] {
+            let mut enc = LowDelayPEncoder::new(64, 64, qp, 0)
+                .expect("encoder")
+                .with_b_slices(b)
+                .with_amp(true)
+                .with_loop_filters(lf);
+            let mut stream = Vec::new();
+            let mut recons = Vec::new();
+            for f in &frames {
+                let out = enc.encode_frame(f).expect("encode");
+                stream.extend_from_slice(&out.au);
+                recons.push(out.recon);
+            }
+            // The SPS carries the AMP geometry.
+            let units = crate::nal::collect_nal_units(&stream).expect("walk");
+            let sps = crate::sps::SeqParameterSet::parse(&units[1].rbsp).expect("sps");
+            assert!(sps.amp_enabled_flag, "qp{qp} b={b}");
+            assert_eq!(sps.log2_min_luma_coding_block_size_minus3, 0);
+            assert_eq!(sps.log2_diff_max_min_luma_coding_block_size, 1);
+            let decoded = decode_annexb_sequence(&stream).expect("decode");
+            assert_eq!(decoded.len(), 4, "qp{qp} b={b}");
+            for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+                let mut expect = rec.y.clone();
+                expect.extend_from_slice(&rec.cb);
+                expect.extend_from_slice(&rec.cr);
+                assert_eq!(
+                    dec.picture.to_planar_u8().expect("8-bit"),
+                    expect,
+                    "qp{qp} b={b} frame {i}: decoder output == encoder recon"
+                );
+            }
+        }
+    }
+
+    /// A scene change inside an AMP-geometry GOP drives the intra
+    /// fallback — whose CU syntax above MinCb carries NO part_mode
+    /// (§7.3.8.5) — and the stream still decodes bit-exactly.
+    #[test]
+    fn amp_geometry_intra_fallback_roundtrips() {
+        let (w, h) = (64usize, 64usize);
+        let mut planes = scene(w, h, 2);
+        let y2: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, yy) = (i % w, i / w);
+                (((x * 13) ^ (yy * 7)) % 251) as u8
+            })
+            .collect();
+        planes.push((y2, vec![60u8; w * h / 4], vec![200u8; w * h / 4]));
+        let frames = as_frames(&planes);
+        let mut enc = LowDelayPEncoder::new(w, h, 27, 0)
+            .expect("encoder")
+            .with_amp(true);
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        let mut intra_total = 0usize;
+        for f in &frames {
+            let out = enc.encode_frame(f).expect("encode");
+            stream.extend_from_slice(&out.au);
+            recons.push(out.recon);
+            if !out.keyframe {
+                intra_total += out.stats.intra;
+            }
+        }
+        assert!(
+            intra_total > 0,
+            "the scene change should elect intra CUs in the AMP-geometry P slice"
+        );
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), 3);
+        for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "frame {i}"
+            );
+        }
     }
 
     /// The §7.3.8.9 `mvd_coding( )` encoder is the exact bin-level

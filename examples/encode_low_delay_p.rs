@@ -1,11 +1,14 @@
 //! Encode raw 4:2:0 frames as a low-delay `IDR, P, P, …` stream.
 //!
 //! ```text
-//! cargo run --example encode_low_delay_p -- in.yuv WxH QP out.hevc [recon.yuv] [b]
+//! cargo run --example encode_low_delay_p -- in.yuv WxH QP out.hevc [recon.yuv] [b] [amp] [deblock] [sao]
 //! ```
 //!
-//! A trailing `b` argument codes the non-IDR frames as low-delay B
-//! slices (both reference lists resolving to the previous picture).
+//! Trailing flags: `b` codes the non-IDR frames as low-delay B
+//! slices (both reference lists resolving to the previous picture),
+//! `amp` switches to the AMP stream configuration (MinCb 8 +
+//! asymmetric motion partitions), `deblock` / `sao` enable the §8.7
+//! in-loop filters.
 //!
 //! `in.yuv` is a concatenation of planar 8-bit 4:2:0 frames;
 //! dimensions must be multiples of 16. The optional `recon.yuv`
@@ -13,6 +16,7 @@
 //! conforming decoder must output).
 
 use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
+use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,10 +44,16 @@ fn main() {
             YuvFrame { y, cb, cr }
         })
         .collect();
-    let b_slices = args.iter().skip(4).any(|a| a == "b");
+    let flag = |name: &str| args.iter().skip(4).any(|a| a == name);
     let mut enc = LowDelayPEncoder::new(w, h, qp, 0)
         .expect("encoder")
-        .with_b_slices(b_slices);
+        .with_b_slices(flag("b"))
+        .with_amp(flag("amp"))
+        .with_loop_filters(LoopFilterCfg {
+            deblocking: flag("deblock"),
+            sao_luma: flag("sao"),
+            sao_chroma: flag("sao"),
+        });
     let mut stream = Vec::new();
     let mut recon = Vec::new();
     for f in &frames {
@@ -54,12 +64,14 @@ fn main() {
         recon.extend_from_slice(&out.recon.cr);
     }
     std::fs::write(&args[3], &stream).expect("write output");
-    if let Some(recon_path) = args.get(4).filter(|a| a.as_str() != "b") {
+    let is_flag = |a: &str| matches!(a, "b" | "amp" | "deblock" | "sao");
+    if let Some(recon_path) = args.get(4).filter(|a| !is_flag(a)) {
         std::fs::write(recon_path, &recon).expect("write recon");
     }
     eprintln!(
-        "{w}x{h} qp{qp}{}: {} frames -> {} bytes",
-        if b_slices { " (B slices)" } else { "" },
+        "{w}x{h} qp{qp}{}{}: {} frames -> {} bytes",
+        if flag("b") { " (B slices)" } else { "" },
+        if flag("amp") { " (AMP)" } else { "" },
         frames.len(),
         stream.len()
     );
