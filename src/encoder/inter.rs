@@ -136,6 +136,10 @@ pub struct FrameStats {
     /// Rectangular-partition CUs (`PART_2NxN` / `PART_Nx2N` — an
     /// overlay counted in `merge` / `amvp` too).
     pub rect: usize,
+    /// Asymmetric-partition CUs (`PART_2NxnU` / `PART_2NxnD` /
+    /// `PART_nLx2N` / `PART_nRx2N` — an overlay counted in `merge` /
+    /// `amvp` too; AMP streams only).
+    pub amp: usize,
     /// CUs referencing the second reference picture (POC − 2) on some
     /// PU / list (an overlay of the mode classes above).
     pub ref1: usize,
@@ -209,10 +213,10 @@ enum CuKind {
     /// AMVP (one 2Nx2N PU): the carried [`PuSyntax::Amvp`] group;
     /// `rqt_root_cbf` signalled.
     Amvp { pu: PuSyntax },
-    /// Rectangular inter partition (`PART_2NxN` when `vertical` is
-    /// `false`, `PART_Nx2N` when `true`): two prediction units, the
-    /// forced depth-1 RQT, `rqt_root_cbf` signalled.
-    Rect { vertical: bool, pus: [PuSyntax; 2] },
+    /// Two-PU inter partition (`PART_2NxN` / `PART_Nx2N`, or one of
+    /// the four AMP shapes on an AMP stream): two prediction units,
+    /// the forced depth-1 RQT, `rqt_root_cbf` signalled.
+    TwoPu { part: PartMode, pus: [PuSyntax; 2] },
     /// Intra fallback (`pred_mode_flag == 1`, `PART_2Nx2N`): §8.4
     /// prediction with luma mode `mode`, chroma derived-from-luma.
     Intra { mode: u8 },
@@ -597,6 +601,39 @@ fn store(plane: &mut [u8], pw: usize, x0: usize, y0: usize, n: usize, s: &[u8]) 
     for j in 0..n {
         plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + n].copy_from_slice(&s[j * n..(j + 1) * n]);
     }
+}
+
+/// The [`crate::binarization::PartMode`] twin of a [`PartMode`] (the
+/// loop-filter descriptors speak the binarization enum).
+fn bin_part_mode(p: PartMode) -> crate::binarization::PartMode {
+    use crate::binarization::PartMode as B;
+    match p {
+        PartMode::Part2Nx2N => B::Part2Nx2N,
+        PartMode::Part2NxN => B::Part2NxN,
+        PartMode::PartNx2N => B::PartNx2N,
+        PartMode::PartNxN => B::PartNxN,
+        PartMode::Part2NxnU => B::Part2NxnU,
+        PartMode::Part2NxnD => B::Part2NxnD,
+        PartMode::PartNLx2N => B::PartNLx2N,
+        PartMode::PartNRx2N => B::PartNRx2N,
+    }
+}
+
+/// `true` for the horizontal-split two-PU shapes (`PART_2NxN` /
+/// `PART_2NxnU` / `PART_2NxnD`) — Table 9-45 bin 1.
+fn part_is_horizontal(p: PartMode) -> bool {
+    matches!(
+        p,
+        PartMode::Part2NxN | PartMode::Part2NxnU | PartMode::Part2NxnD
+    )
+}
+
+/// `true` for the four asymmetric shapes.
+fn part_is_amp(p: PartMode) -> bool {
+    matches!(
+        p,
+        PartMode::Part2NxnU | PartMode::Part2NxnD | PartMode::PartNLx2N | PartMode::PartNRx2N
+    )
 }
 
 /// The merge / skip PU syntax for candidate `merge_idx` (the §7.3.8.6
@@ -1598,9 +1635,18 @@ pub(crate) fn encode_inter_slice(
                 });
             }
 
-            // ---- rectangular partitions (PART_2NxN / PART_Nx2N) ----
-            for part in [PartMode::Part2NxN, PartMode::PartNx2N] {
-                let vertical = part == PartMode::PartNx2N;
+            // ---- two-PU partitions: the symmetric rectangles, plus
+            // the four asymmetric shapes on an AMP stream ----
+            let mut two_pu_parts = vec![PartMode::Part2NxN, PartMode::PartNx2N];
+            if spec.big_cu {
+                two_pu_parts.extend([
+                    PartMode::Part2NxnU,
+                    PartMode::Part2NxnD,
+                    PartMode::PartNLx2N,
+                    PartMode::PartNRx2N,
+                ]);
+            }
+            for part in two_pu_parts {
                 let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
                 // The decoder resolves PU1 with PU0's motion already in
                 // the field (§8.5.3.2 order): stage the writes on a copy.
@@ -1610,7 +1656,9 @@ pub(crate) fn encode_inter_slice(
                 let mut pred_y = vec![0i32; CTB * CTB];
                 let mut pred_cb = vec![0i32; 64];
                 let mut pred_cr = vec![0i32; 64];
-                let mut motion_rate_r = 3u64; // pred_mode + part_mode bins
+                // pred_mode + part_mode bins (the AMP forms carry two
+                // extra part_mode bins).
+                let mut motion_rate_r = if part_is_amp(part) { 5u64 } else { 3u64 };
                 for (k, r) in rects.iter().enumerate() {
                     let g = PuGeometry {
                         x_cb: x0,
@@ -1772,7 +1820,7 @@ pub(crate) fn encode_inter_slice(
                     (None, rec, d)
                 };
                 cands.push(CuCandidate {
-                    kind: CuKind::Rect { vertical, pus },
+                    kind: CuKind::TwoPu { part, pus },
                     motions: motions_r,
                     levels: levels_r,
                     recon: recon_final,
@@ -1851,13 +1899,17 @@ pub(crate) fn encode_inter_slice(
                 match kind {
                     CuKind::Skip { .. } => stats.skip += 1,
                     CuKind::Merge { .. } => stats.merge += 1,
-                    CuKind::Rect { pus, .. } => {
+                    CuKind::TwoPu { part, pus } => {
                         if pus.iter().any(|p| matches!(p, PuSyntax::Amvp { .. })) {
                             stats.amvp += 1;
                         } else {
                             stats.merge += 1;
                         }
-                        stats.rect += 1;
+                        if part_is_amp(*part) {
+                            stats.amp += 1;
+                        } else {
+                            stats.rect += 1;
+                        }
                     }
                     _ => stats.amvp += 1,
                 }
@@ -1876,8 +1928,7 @@ pub(crate) fn encode_inter_slice(
                 // eqs 8-80..8-85: one motion cell per PU rectangle, the
                 // stored identity being the referenced picture's POC.
                 let part = match kind {
-                    CuKind::Rect { vertical: true, .. } => PartMode::PartNx2N,
-                    CuKind::Rect { .. } => PartMode::Part2NxN,
+                    CuKind::TwoPu { part, .. } => *part,
                     _ => PartMode::Part2Nx2N,
                 };
                 let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
@@ -1936,8 +1987,7 @@ pub(crate) fn encode_inter_slice(
             .iter()
             .map(|c| CtbShape {
                 part_mode: match &c.kind {
-                    CuKind::Rect { vertical: true, .. } => crate::binarization::PartMode::PartNx2N,
-                    CuKind::Rect { .. } => crate::binarization::PartMode::Part2NxN,
+                    CuKind::TwoPu { part, .. } => bin_part_mode(*part),
                     _ => crate::binarization::PartMode::Part2Nx2N,
                 },
                 split_depth1: matches!(c.levels, Some(CuLevels::Depth1(_))),
@@ -2063,20 +2113,29 @@ pub(crate) fn encode_inter_slice(
                     u8::from(chosen.levels.is_some()),
                 );
             }
-            CuKind::Rect { vertical, pus } => {
+            CuKind::TwoPu { part, pus } => {
                 cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0);
-                // §9.3.3.7 inter part_mode:
+                // §9.3.3.7 inter part_mode (bin 0 ctx 0, bin 1 ctx 1):
                 // * at MinCb (log2CbSize == MinCbLog2SizeY > 3):
-                //   "01" = PART_2NxN, "001" = PART_Nx2N (bin 0 ctx 0,
-                //   bin 1 ctx 1, bin 2 the MinCb slot 2);
+                //   "01" = PART_2NxN, "001" = PART_Nx2N (bin 2 the
+                //   MinCb ctx slot 2);
                 // * above MinCb with amp_enabled_flag: "011" =
                 //   PART_2NxN, "001" = PART_Nx2N (bin 2 = 1 selects
-                //   the symmetric form, ctx slot 3).
+                //   the symmetric form, ctx slot 3), and the AMP
+                //   forms "0100" = PART_2NxnU, "0101" = PART_2NxnD,
+                //   "0000" = PART_nLx2N, "0001" = PART_nRx2N (bin 2 =
+                //   0, bin 3 bypass picking the second-quarter side).
+                let horizontal = part_is_horizontal(*part);
+                let amp_shape = part_is_amp(*part);
                 cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 0);
-                cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], u8::from(!*vertical));
+                cabac.encode_decision(&mut w, &mut ctxs.part_mode[1], u8::from(horizontal));
                 if spec.big_cu {
-                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[3], 1);
-                } else if *vertical {
+                    cabac.encode_decision(&mut w, &mut ctxs.part_mode[3], u8::from(!amp_shape));
+                    if amp_shape {
+                        let second = matches!(part, PartMode::Part2NxnD | PartMode::PartNRx2N);
+                        cabac.encode_bypass(&mut w, u8::from(second));
+                    }
+                } else if !horizontal {
                     cabac.encode_decision(&mut w, &mut ctxs.part_mode[2], 1);
                 }
                 for pu in pus {
@@ -2976,6 +3035,83 @@ mod tests {
                 expect,
                 "frame {i}"
             );
+        }
+    }
+
+    /// Banded scenes whose motion boundaries sit at QUARTER offsets
+    /// inside the CTB rows / columns (where no symmetric split
+    /// aligns): the AMP shapes are actually elected, signalled on the
+    /// wire, and the streams decode bit-exactly — P and B, plain and
+    /// filtered.
+    #[test]
+    fn amp_shapes_are_elected_and_roundtrip() {
+        let (w, h) = (64usize, 64usize);
+        // Horizontal bands split at y = 20 (CTB row 1, local offset 4
+        // ⇒ PART_2NxnU) and y = 44 (row 2, local offset 12 ⇒
+        // PART_2NxnD); `transpose` yields the vertical analogues.
+        let banded = |transpose: bool| -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            (0..4usize)
+                .map(|t| {
+                    let y: Vec<u8> = (0..w * h)
+                        .map(|i| {
+                            let (mut x, mut yy) = (i % w, i / w);
+                            if transpose {
+                                core::mem::swap(&mut x, &mut yy);
+                            }
+                            let (shift, phase) = if yy < 20 {
+                                (2 * t, 0usize)
+                            } else if yy < 44 {
+                                (w - 2 * t, 60)
+                            } else {
+                                (2 * t + 1, 120)
+                            };
+                            (((x + shift) * 7 + yy * 3 + phase) % 240) as u8
+                        })
+                        .collect();
+                    (y, vec![110u8; w * h / 4], vec![140u8; w * h / 4])
+                })
+                .collect()
+        };
+        for (transpose, b, lf) in [
+            (false, false, LoopFilterCfg::off()),
+            (true, false, LoopFilterCfg::off()),
+            (false, true, LoopFilterCfg::all()),
+        ] {
+            let planes = banded(transpose);
+            let frames = as_frames(&planes);
+            let mut enc = LowDelayPEncoder::new(w, h, 30, 0)
+                .expect("encoder")
+                .with_b_slices(b)
+                .with_amp(true)
+                .with_loop_filters(lf);
+            let mut stream = Vec::new();
+            let mut recons = Vec::new();
+            let mut amp_total = 0usize;
+            for f in &frames {
+                let out = enc.encode_frame(f).expect("encode");
+                stream.extend_from_slice(&out.au);
+                recons.push(out.recon);
+                amp_total += out.stats.amp;
+            }
+            assert!(
+                amp_total > 0,
+                "transpose={transpose} b={b}: quarter-offset motion boundaries \
+                 should elect AMP shapes"
+            );
+            // (The bit-exact roundtrip below IS the wire-level truth:
+            // a part_mode mismatch would desynchronize CABAC.)
+            let decoded = decode_annexb_sequence(&stream).expect("decode");
+            assert_eq!(decoded.len(), 4, "transpose={transpose} b={b}");
+            for (i, (dec, rec)) in decoded.iter().zip(recons.iter()).enumerate() {
+                let mut expect = rec.y.clone();
+                expect.extend_from_slice(&rec.cb);
+                expect.extend_from_slice(&rec.cr);
+                assert_eq!(
+                    dec.picture.to_planar_u8().expect("8-bit"),
+                    expect,
+                    "transpose={transpose} b={b} frame {i}"
+                );
+            }
         }
     }
 
