@@ -24,6 +24,7 @@ pub mod cabac;
 pub mod inter;
 pub mod intra;
 pub mod loopfilter;
+pub mod pyramid;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[cfg(test)]
 mod ccp_streams;

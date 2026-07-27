@@ -95,7 +95,7 @@ pub struct YuvFrame<'a> {
 }
 
 /// One frame's reconstruction (what a conforming decoder outputs).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FrameRecon {
     /// Reconstructed luma plane.
     pub y: Vec<u8>,
@@ -1442,6 +1442,11 @@ pub(crate) fn encode_inter_slice(
             .and_then(|i| list_pocs(list).get(i).copied())
             .unwrap_or(i32::MIN)
     };
+    // The decoder's motion-field cells store the REFERENCED
+    // picture's POC per used list (pu_mv fill: `ref_poc(list, idx)`);
+    // an unused list's value is ignored by `to_cell`.
+    let cell_pocs =
+        |m: &PuMotion| -> (i32, i32) { (ref_poc(0, m.ref_idx_l0), ref_poc(1, m.ref_idx_l1)) };
     let ref_long_term = |_list: usize, _ref_idx: i32| false;
     let ref_short_term = |list: usize, ref_idx: i32| {
         usize::try_from(ref_idx).is_ok_and(|i| i < list_pocs(list).len())
@@ -1709,16 +1714,10 @@ pub(crate) fn encode_inter_slice(
                     let (pu_syntax, motion, rate_k) =
                         choose_pu(&tmp, &g, &avail_k, &src_pu, &choose_ctx);
                     // eqs 8-80..8-85: PU1's derivation sees PU0's motion.
-                    tmp.fill_rect(
-                        r.x_pb,
-                        r.y_pb,
-                        r.n_pb_w,
-                        r.n_pb_h,
-                        motion.to_cell(
-                            poc - 1 - motion.ref_idx_l0.max(0),
-                            poc - 1 - motion.ref_idx_l1.max(0),
-                        ),
-                    );
+                    tmp.fill_rect(r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, {
+                        let (p0, p1) = cell_pocs(&motion);
+                        motion.to_cell(p0, p1)
+                    });
                     let p = predict_block(
                         &refs_l0, &refs_l1, r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, &motion, true,
                     );
@@ -1933,13 +1932,10 @@ pub(crate) fn encode_inter_slice(
                 };
                 let rects = crate::pu_mv::pu_partitions(x0, y0, CTB, part);
                 for (r, m) in rects.iter().zip(chosen.motions.iter()) {
-                    field.fill_rect(
-                        r.x_pb,
-                        r.y_pb,
-                        r.n_pb_w,
-                        r.n_pb_h,
-                        m.to_cell(poc - 1 - m.ref_idx_l0.max(0), poc - 1 - m.ref_idx_l1.max(0)),
-                    );
+                    field.fill_rect(r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, {
+                        let (p0, p1) = cell_pocs(m);
+                        m.to_cell(p0, p1)
+                    });
                 }
                 let cu_mode = if is_skip {
                     CuPredMode::Skip
