@@ -81,7 +81,10 @@ use oxideav_core::{
 ///   at the `qp` option's `SliceQpY`; the `gop` option sets the IDR
 ///   period in frames (default 0 = a single leading IDR); the
 ///   `bslices` option (`"1"` / `"true"`) codes the non-IDR frames as
-///   low-delay B slices.
+///   low-delay B slices; the `amp` option switches to the AMP stream
+///   configuration (`MinCbSizeY == 8`, `amp_enabled_flag == 1`, the
+///   four asymmetric PART_2NxnU/2NxnD/nLx2N/nRx2N shapes competing in
+///   the inter CU ladder).
 ///
 /// The `"intra"` and `"inter"` modes accept the §8.7 in-loop filter
 /// options `deblock` and `sao` (`"1"` / `"true"` to enable): the
@@ -120,8 +123,9 @@ impl std::fmt::Debug for H265Encoder {
 /// `"intra"` real CABAC intra coding, or `"inter"` low-delay P GOPs),
 /// `qp` (`SliceQpY` 0..=51 for the intra / inter modes, default 26),
 /// `gop` (inter mode IDR period, default 0 = single leading IDR),
-/// and the in-loop filter switches `deblock` / `sao` (intra / inter
-/// modes; default off).
+/// `amp` (inter mode: asymmetric motion partitions), and the in-loop
+/// filter switches `deblock` / `sao` (intra / inter modes; default
+/// off).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
@@ -184,9 +188,21 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     "h265 encode: deblock/sao options require mode \"intra\" or \"inter\"".into(),
                 ));
             }
+            if parse_flag(params, "amp")? {
+                return Err(Error::InvalidData(
+                    "h265 encode: the amp option requires mode \"inter\"".into(),
+                ));
+            }
             EncodeMode::Pcm
         }
-        Some("intra") => EncodeMode::Intra(parse_qp(params)?, parse_lf(params)?),
+        Some("intra") => {
+            if parse_flag(params, "amp")? {
+                return Err(Error::InvalidData(
+                    "h265 encode: the amp option requires mode \"inter\"".into(),
+                ));
+            }
+            EncodeMode::Intra(parse_qp(params)?, parse_lf(params)?)
+        }
         Some("inter") => {
             let qp = parse_qp(params)?;
             let gop = match params.options.get("gop") {
@@ -201,6 +217,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
                 .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                 .with_b_slices(b_slices)
+                .with_amp(parse_flag(params, "amp")?)
                 .with_loop_filters(parse_lf(params)?);
             EncodeMode::Inter(enc)
         }

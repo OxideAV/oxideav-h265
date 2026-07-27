@@ -199,6 +199,90 @@ fn inter_mode_registry_gop_roundtrip() {
 }
 
 #[test]
+fn inter_mode_amp_registry_roundtrip() {
+    // The `amp` option switches the stream to the AMP configuration
+    // (MinCb 8 + amp_enabled_flag + the asymmetric shapes in the CU
+    // ladder); the registry wiring and fidelity are exercised here —
+    // the bit-exact encoder-recon contract is pinned by the unit
+    // tests.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(48);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "inter");
+    params.options.insert("qp", "12");
+    params.options.insert("amp", "1");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let frames: Vec<VideoFrame> = (0..4).map(|i| planes(48, 32, i)).collect();
+    let mut aus = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        let pkt = enc.receive_packet().expect("packet per frame");
+        assert_eq!(pkt.flags.keyframe, i == 0, "frame {i} keyframe flag");
+        aus.push(pkt);
+    }
+    // The SPS signals the AMP geometry.
+    let units = oxideav_h265::collect_nal_units(&aus[0].data).expect("walk");
+    let sps = units
+        .iter()
+        .find(|u| u.header.nal_unit_type == 33)
+        .expect("SPS in the IDR AU");
+    let sps = oxideav_h265::SeqParameterSet::parse(&sps.rbsp).expect("sps parse");
+    assert!(sps.amp_enabled_flag);
+    assert_eq!(sps.log2_min_luma_coding_block_size_minus3, 0);
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    for pkt in &aus {
+        dec.send_packet(pkt).expect("decode send");
+    }
+    dec.flush().expect("decode flush");
+    for (i, f) in frames.iter().enumerate() {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for (pi, (p, q)) in v.planes.iter().zip(f.planes.iter()).enumerate() {
+                    let mse: f64 = p
+                        .data
+                        .iter()
+                        .zip(q.data.iter())
+                        .map(|(&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / p.data.len() as f64;
+                    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                    assert!(
+                        psnr > 34.0,
+                        "frame {i} plane {pi}: PSNR {psnr:.1} dB at qp 12 (AMP)"
+                    );
+                }
+            }
+            other => panic!("frame {i}: unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}
+
+#[test]
+fn amp_option_requires_inter_mode() {
+    for mode in [None, Some("pcm"), Some("intra")] {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(16);
+        params.height = Some(16);
+        if let Some(m) = mode {
+            params.options.insert("mode", m);
+        }
+        params.options.insert("amp", "1");
+        assert!(
+            oxideav_h265::make_encoder(&params).is_err(),
+            "mode {mode:?} must reject the amp option"
+        );
+    }
+}
+
+#[test]
 fn inter_mode_rejects_bad_gop_option() {
     let mut params = CodecParameters::video("h265".into());
     params.width = Some(16);
