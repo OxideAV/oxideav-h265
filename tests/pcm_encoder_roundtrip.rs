@@ -283,6 +283,113 @@ fn amp_option_requires_inter_mode() {
 }
 
 #[test]
+fn pyramid_registry_roundtrip() {
+    // mode=inter + pyramid=4: hierarchical-B coding. Packets arrive
+    // in bursts per mini-GOP (decode order), dts trails pts by
+    // log2(gop) frames, and flush() emits the low-delay tail. The
+    // registry decoder's reorder queue restores display order.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(48);
+    params.height = Some(32);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.options.insert("mode", "inter");
+    params.options.insert("qp", "12");
+    params.options.insert("pyramid", "4");
+
+    let mut enc = oxideav_h265::make_encoder(&params).expect("encoder factory");
+    let frames: Vec<VideoFrame> = (0..6).map(|i| planes(48, 32, i)).collect();
+    let mut aus = Vec::new();
+    for f in &frames {
+        enc.send_frame(&Frame::Video(f.clone())).expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            aus.push(pkt);
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(pkt) = enc.receive_packet() {
+        aus.push(pkt);
+    }
+    assert_eq!(aus.len(), 6, "one packet per pushed frame after flush");
+    // Decode order: IDR 0, then mini-GOP {4, 2, 1, 3}, then tail 5.
+    let ptss: Vec<i64> = aus.iter().map(|p| p.pts.expect("pts")).collect();
+    assert_eq!(ptss, vec![0, 4, 2, 1, 3, 5], "decode-order pts");
+    for (k, pkt) in aus.iter().enumerate() {
+        assert_eq!(pkt.flags.keyframe, k == 0, "packet {k} keyframe flag");
+        let dts = pkt.dts.expect("dts");
+        assert_eq!(dts, k as i64 - 2, "packet {k} dts (delay log2(4) = 2)");
+        assert!(dts <= pkt.pts.unwrap(), "packet {k}: dts <= pts");
+    }
+
+    let dec_params = CodecParameters::video("h265".into());
+    let mut dec = oxideav_h265::make_decoder(&dec_params).expect("decoder factory");
+    for pkt in &aus {
+        dec.send_packet(pkt).expect("decode send");
+    }
+    dec.flush().expect("decode flush");
+    for (i, f) in frames.iter().enumerate() {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                for (pi, (p, q)) in v.planes.iter().zip(f.planes.iter()).enumerate() {
+                    let mse: f64 = p
+                        .data
+                        .iter()
+                        .zip(q.data.iter())
+                        .map(|(&a, &b)| {
+                            let d = f64::from(a) - f64::from(b);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / p.data.len() as f64;
+                    let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                    assert!(
+                        psnr > 33.0,
+                        "frame {i} plane {pi}: PSNR {psnr:.1} dB at qp 12 (pyramid)"
+                    );
+                }
+            }
+            other => panic!("frame {i}: unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
+}
+
+#[test]
+fn pyramid_option_validation() {
+    let base = || {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("mode", "inter");
+        params
+    };
+    for bad in ["3", "32", "0", "x"] {
+        let mut params = base();
+        params.options.insert("pyramid", bad);
+        assert!(
+            oxideav_h265::make_encoder(&params).is_err(),
+            "pyramid={bad} must be rejected"
+        );
+    }
+    let mut params = base();
+    params.options.insert("pyramid", "4");
+    params.options.insert("gop", "3");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "pyramid + gop must be rejected"
+    );
+    let mut params = base();
+    params.options.insert("pyramid", "4");
+    params.options.insert("bslices", "1");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "pyramid + bslices must be rejected"
+    );
+    let mut params = base();
+    params.options.insert("pyramid", "8");
+    assert!(oxideav_h265::make_encoder(&params).is_ok());
+}
+
+#[test]
 fn inter_mode_rejects_bad_gop_option() {
     let mut params = CodecParameters::video("h265".into());
     params.width = Some(16);

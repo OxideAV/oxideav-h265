@@ -57,6 +57,21 @@ enum EncodeMode {
     /// 26; `gop` option = GOP length in frames, default 0 = a single
     /// leading IDR).
     Inter(inter::LowDelayPEncoder),
+    /// Hierarchical-B coding (`mode = "inter"` + `pyramid = <gop>`):
+    /// dyadic B pyramids through [`pyramid::PyramidEncoder`] —
+    /// out-of-order coding, so packets arrive in bursts per mini-GOP
+    /// and [`Encoder::flush`] emits the low-delay tail.
+    Pyramid {
+        /// The buffering pyramid encoder.
+        enc: pyramid::PyramidEncoder,
+        /// `log2(gop)` — the dts-behind-pts reorder delay in frames.
+        delay: i64,
+        /// The caller-supplied pts of each pushed frame, by display
+        /// index (`None` ⇒ the display index itself).
+        pts_by_display: Vec<Option<i64>>,
+        /// Decode-order packet counter (drives dts).
+        decode_count: i64,
+    },
 }
 
 use std::collections::VecDeque;
@@ -85,7 +100,12 @@ use oxideav_core::{
 ///   low-delay B slices; the `amp` option switches to the AMP stream
 ///   configuration (`MinCbSizeY == 8`, `amp_enabled_flag == 1`, the
 ///   four asymmetric PART_2NxnU/2NxnD/nLx2N/nRx2N shapes competing in
-///   the inter CU ladder).
+///   the inter CU ladder); the `pyramid` option (a power of two in
+///   2..=16) switches to hierarchical-B coding — dyadic mini-GOPs
+///   coded out of display order with per-layer QP offsets; packets
+///   then arrive in bursts per mini-GOP (dts trails pts by
+///   `log2(pyramid)` frames) and `flush()` emits the tail. `pyramid`
+///   excludes the `gop` / `bslices` options.
 ///
 /// The `"intra"` and `"inter"` modes accept the §8.7 in-loop filter
 /// options `deblock` and `sao` (`"1"` / `"true"` to enable): the
@@ -206,21 +226,48 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
         Some("inter") => {
             let qp = parse_qp(params)?;
-            let gop = match params.options.get("gop") {
-                None => 0usize,
-                Some(v) => v.parse::<usize>().map_err(|_| {
-                    Error::InvalidData(format!(
-                        "h265 encode: gop must be a non-negative integer, got {v:?}"
-                    ))
-                })?,
-            };
-            let b_slices = parse_flag(params, "bslices")?;
-            let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
-                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                .with_b_slices(b_slices)
-                .with_amp(parse_flag(params, "amp")?)
-                .with_loop_filters(parse_lf(params)?);
-            EncodeMode::Inter(enc)
+            if let Some(v) = params.options.get("pyramid") {
+                if params.options.get("gop").is_some() || params.options.get("bslices").is_some() {
+                    return Err(Error::InvalidData(
+                        "h265 encode: pyramid excludes the gop / bslices options".into(),
+                    ));
+                }
+                let g = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|g| g.is_power_of_two() && (2..=16).contains(g))
+                    .ok_or_else(|| {
+                        Error::InvalidData(format!(
+                            "h265 encode: pyramid must be a power of two in 2..=16, got {v:?}"
+                        ))
+                    })?;
+                let enc = pyramid::PyramidEncoder::new(width, height, qp, g)
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                    .with_amp(parse_flag(params, "amp")?)
+                    .with_loop_filters(parse_lf(params)?);
+                EncodeMode::Pyramid {
+                    enc,
+                    delay: i64::from(g.trailing_zeros()),
+                    pts_by_display: Vec::new(),
+                    decode_count: 0,
+                }
+            } else {
+                let gop = match params.options.get("gop") {
+                    None => 0usize,
+                    Some(v) => v.parse::<usize>().map_err(|_| {
+                        Error::InvalidData(format!(
+                            "h265 encode: gop must be a non-negative integer, got {v:?}"
+                        ))
+                    })?,
+                };
+                let b_slices = parse_flag(params, "bslices")?;
+                let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                    .with_b_slices(b_slices)
+                    .with_amp(parse_flag(params, "amp")?)
+                    .with_loop_filters(parse_lf(params)?);
+                EncodeMode::Inter(enc)
+            }
         }
         Some(other) => {
             return Err(Error::InvalidData(format!(
@@ -306,6 +353,28 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
                 (f.au, f.keyframe)
             }
+            EncodeMode::Pyramid {
+                enc,
+                delay,
+                pts_by_display,
+                decode_count,
+            } => {
+                pts_by_display.push(v.pts);
+                let aus = enc
+                    .encode_frame(&inter::YuvFrame {
+                        y: &y,
+                        cb: &cb,
+                        cr: &cr,
+                    })
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+                self.frame_index += 1;
+                let (delay, decode_count) = (*delay, decode_count);
+                let mut packets = Self::pyramid_packets(aus, pts_by_display, delay, decode_count);
+                for pkt in packets.drain(..) {
+                    self.ready.push_back(pkt);
+                }
+                return Ok(());
+            }
         };
         let mut pkt = Packet::new(0, TimeBase::new(1, 25), au);
         pkt.pts = v.pts.or(Some(self.frame_index));
@@ -321,7 +390,51 @@ impl Encoder for H265Encoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Every frame is emitted eagerly; nothing is buffered.
+        // Only the pyramid mode buffers: emit its low-delay tail.
+        if let EncodeMode::Pyramid {
+            enc,
+            delay,
+            pts_by_display,
+            decode_count,
+        } = &mut self.mode
+        {
+            let aus = enc.flush();
+            let (delay, decode_count) = (*delay, decode_count);
+            let mut packets = Self::pyramid_packets(aus, pts_by_display, delay, decode_count);
+            for pkt in packets.drain(..) {
+                self.ready.push_back(pkt);
+            }
+        }
         Ok(())
+    }
+}
+
+impl H265Encoder {
+    /// Turn a burst of decode-ordered pyramid access units into
+    /// packets: pts = the pushed frame's pts (default: its display
+    /// index), dts = the decode counter minus the reorder delay (a
+    /// dts never after its pts on the dyadic schedule).
+    fn pyramid_packets(
+        aus: Vec<pyramid::PyramidAu>,
+        pts_by_display: &[Option<i64>],
+        delay: i64,
+        decode_count: &mut i64,
+    ) -> Vec<Packet> {
+        aus.into_iter()
+            .map(|au| {
+                let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.au);
+                pkt.pts = Some(
+                    pts_by_display
+                        .get(au.display_order)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(au.display_order as i64),
+                );
+                pkt.dts = Some(*decode_count - delay);
+                *decode_count += 1;
+                pkt.flags.keyframe = au.keyframe;
+                pkt
+            })
+            .collect()
     }
 }
