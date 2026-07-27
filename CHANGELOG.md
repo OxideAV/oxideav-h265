@@ -6,6 +6,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — encoder AMP + hierarchical-B pyramids, round 431 (2026-07-27)
+
+- **Asymmetric motion partitions** (`LowDelayPEncoder::with_amp`,
+  registry option `amp`): the AMP stream configuration signals
+  `MinCbSizeY == 8` + `amp_enabled_flag == 1` — every CTB stays one
+  UNSPLIT 16x16 CU behind an explicit §7.3.8.4 `split_cu_flag == 0`,
+  inter `part_mode` moves to the Table 9-45 big-CU column (including
+  the four AMP bin strings), and intra CUs above MinCb carry no
+  `part_mode` (§7.3.8.5). The inter CU ladder elects
+  `PART_2NxnU / PART_2NxnD / PART_nLx2N / PART_nRx2N` alongside the
+  symmetric shapes through the same staged-motion-field per-PU
+  merge/AMVP election and forced depth-1 RQT; the loop-filter CU
+  descriptors carry the real AMP part modes. Measured at fixed
+  geometry on quarter-offset motion-boundary content: −20.5 % /
+  −28.9 % bytes at equal PSNR (qp 24 / 30).
+- **Hierarchical-B GOPs** (`encoder::pyramid`, registry option
+  `pyramid = 2/4/8/16`): one leading IDR, then dyadic mini-GOPs coded
+  out of display order — next anchor first as a layer-0 P slice, then
+  each interval's midpoint as a B slice with the past boundary on
+  `RefPicList0` and the FUTURE boundary on `RefPicList1`, one layer
+  deeper per halving, with per-layer QP offsets
+  (`with_layer_qp_step`). Slices carry inline §7.4.8 short-term RPS
+  with negative AND positive pictures (used flags on the active
+  pair); the SPS/VPS signal `sps_max_num_reorder_pics = log2(gop)`
+  and a DPB bound of `log2(gop) + 2`. Streaming `PyramidEncoder`
+  (display-order in, decode-order AU bursts out, low-delay tail on
+  `flush`) plus sequence-level `encode_pyramid[_with]`; registry
+  packets follow the dts = decode-counter − log2(gop) law. On a
+  noisy-pan clip at qp 27 the GOP-8 pyramid takes −11.5 % bytes vs
+  the low-delay chain.
+- **Two-sided AMVP** in the shared inter machinery: `SliceSpec` with
+  explicit per-list reference sets and RPS content, dual-list
+  prediction plumbing, per-list + bi AMVP search on two-sided B
+  slices, and full Table 9-47 `inter_pred_idc` emission
+  (`PRED_L0` / `PRED_L1` / `PRED_BI`) with the L1
+  `ref_idx/mvd/mvp` syntax group. Motion-field cells now stamp the
+  true referenced POCs (`ref_poc(list, idx)`, as the decoder does).
+- **Validation**: AMP and pyramid roundtrips across QP x slice-type x
+  filter sweeps decode bit-exactly through the crate's own decoder
+  (display order for the pyramids, via the §C.5.2.2 output ordering);
+  ten configurations cross-checked byte-exact out of band against a
+  black-box reference HEVC decoder; three new golden interop pins
+  (AMP P-GOP, GOP-4 pyramid, GOP-8 pyramid x AMP x deblock/SAO).
+  Legacy streams are byte-identical (existing golden pins
+  untouched); `FrameStats` gains the `amp` counter.
+
 ### Added — encoder in-loop filters, round 429 (2026-07-25)
 
 - **§8.7.2 deblocking on the encoder's reconstruction path**

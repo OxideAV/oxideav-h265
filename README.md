@@ -74,28 +74,45 @@ sweep (round 410) held byte-exact by nine embedded pins. Coverage:
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.
 
-**Encoder: intra + low-delay inter GOPs with in-loop filters,
-registered.** `make_encoder` / `H265Encoder` with three modes:
+**Encoder: intra + low-delay inter + hierarchical-B GOPs with AMP
+and in-loop filters, registered.** `make_encoder` / `H265Encoder`
+with three modes:
 
-* `mode = "inter"` (`qp` 0..=51, `gop` IDR period, `bslices`) —
-  low-delay `IDR, P, P, …` or `IDR, B, B, …` GOPs
-  (`encoder::inter::LowDelayPEncoder`, one frame in / one AU out):
-  per-CTU **skip / merge / AMVP / rectangular-partition / intra**
+* `mode = "inter"` (`qp` 0..=51, `gop` IDR period, `bslices`, `amp`,
+  `pyramid`) — low-delay `IDR, P, P, …` / `IDR, B, B, …` GOPs
+  (`encoder::inter::LowDelayPEncoder`, one frame in / one AU out) or
+  dyadic **hierarchical-B pyramids**
+  (`encoder::pyramid::PyramidEncoder`, `pyramid = 2/4/8/16`):
+  per-CTU **skip / merge / AMVP / two-PU-partition / intra**
   decisions under an SSD + λ·rate heuristic, with **two active
-  reference pictures** (POC − 1 / POC − 2, `ref_idx_l0` signalled).
-  Motion candidates are resolved through the crate's own DECODE-side
-  §8.5.3.2 merge/AMVP derivation against the in-progress motion
-  field (§6.4.2 availability included), motion estimation is a
-  seeded greedy integer diamond plus half-/quarter-pel refinement
-  against the crate's §8.5.3.3.3 interpolation, `PART_2NxN` /
-  `PART_Nx2N` CUs carry two PUs through the §7.4.9.8 forced depth-1
-  RQT, low-delay B slices exercise the bi-predictive §8.5.3.2.2
-  candidates and `inter_pred_idc`, and a `pred_mode_flag == 1` intra
-  fallback rescues scene changes. Every stream decodes **bit-exact**
-  to the encoder reconstruction through this crate's decoder AND a
+  reference pictures** on the low-delay path (POC − 1 / POC − 2,
+  `ref_idx_l0` signalled). Motion candidates are resolved through
+  the crate's own DECODE-side §8.5.3.2 merge/AMVP derivation against
+  the in-progress motion field (§6.4.2 availability included),
+  motion estimation is a seeded greedy integer diamond plus
+  half-/quarter-pel refinement against the crate's §8.5.3.3.3
+  interpolation, two-PU CUs carry the §7.4.9.8 forced depth-1 RQT,
+  and a `pred_mode_flag == 1` intra fallback rescues scene changes.
+  The **AMP configuration** (`amp` option / `with_amp`) moves the
+  stream to `MinCbSizeY == 8` + `amp_enabled_flag == 1` (explicit
+  `split_cu_flag`, the Table 9-45 big-CU `part_mode` column) and
+  elects `PART_2NxnU / PART_2NxnD / PART_nLx2N / PART_nRx2N`
+  alongside the symmetric shapes — on quarter-offset motion-boundary
+  content the shapes buy **−20 to −29 % bytes at equal PSNR**. The
+  **pyramid** codes each mini-GOP out of display order (next anchor
+  as P first, then the midpoint B recursion with the past boundary
+  on `RefPicList0` and the FUTURE boundary on `RefPicList1`),
+  signals per-slice negative + positive short-term RPS with
+  `sps_max_num_reorder_pics = log2(gop)`, allocates rate by
+  per-layer QP offsets, and searches uni-L0 / uni-L1 / **bi AMVP**
+  per PU (`inter_pred_idc` `PRED_L0/L1/BI` all emitted); on a
+  noisy-pan clip the GOP-8 pyramid takes **−11.5 % bytes** vs the
+  low-delay chain at qp 27. Every stream decodes **bit-exact** to
+  the encoder reconstruction through this crate's decoder AND a
   black-box reference decoder (multi-QP, multi-shape sweeps; golden
-  GOP stream CI-pinned). Per-frame `FrameStats` expose the
-  skip/merge/AMVP/intra/bi/rect/ref1 decisions.
+  GOP / AMP / pyramid / composition streams CI-pinned). Per-frame
+  `FrameStats` expose the skip/merge/AMVP/intra/bi/rect/amp/ref1
+  decisions.
 * `mode = "intra"` — per-CTU §8.4 intra prediction over the
   encoder's own reconstruction (all 35 modes, per-CTB `PART_2Nx2N`
   vs `PART_NxN` rate-distortion decision with per-PB modes, §8.4.2
@@ -169,20 +186,22 @@ PSNR at equal rate.
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Thirty-three embedded-fixture regression pins (the 17-stream staged
+Thirty-six embedded-fixture regression pins (the 17-stream staged
 corpus incl. true tiles + self-built weighted-prediction,
 per-slice-loop-filter, hvcC, golden-intra-interop, golden-P-GOP
-interop, and the nine round-410 tool-axis conformance pins), lossless
-PCM / exact-reconstruction intra / bit-exact low-delay-GOP
-encoder↔decoder roundtrips at multiple geometries / QPs / partitions /
-slice types, and ~900 unit tests.
+interop, the round-431 AMP / pyramid / composition interop pins, and
+the nine round-410 tool-axis conformance pins), lossless PCM /
+exact-reconstruction intra / bit-exact low-delay- and
+hierarchical-B-GOP encoder↔decoder roundtrips at multiple
+geometries / QPs / partitions / slice types, and ~930 unit tests.
 
 ## Not yet implemented
 
-* Larger encoder CTB sizes, deeper encoder RQTs, 4x4-luma DST TUs,
-  AMP partitions, encoder temporal MVP, reordered (non-low-delay)
-  B pyramids, and bi-predictive AMVP signalling (bi arises via
-  merge candidates only).
+* Larger encoder CTB sizes, deeper encoder RQTs / coding quadtrees
+  (the AMP configuration codes 16x16 CUs above an 8x8 MinCb, but
+  never splits), 4x4-luma DST TUs, encoder temporal MVP, more than
+  one active reference per list on the pyramid path, and adaptive
+  (non-dyadic) GOP structures.
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
