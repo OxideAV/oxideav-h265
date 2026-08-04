@@ -108,7 +108,8 @@
 
 use crate::binarization::{
     coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
-    coeff_abs_level_remaining_c_rice_param_eq_9_24, decode_coeff_abs_level_remaining_with,
+    coeff_abs_level_remaining_c_rice_param_eq_9_24, coeff_abs_level_remaining_c_rice_param_eq_9_25,
+    decode_coeff_abs_level_remaining_ext_with, decode_coeff_abs_level_remaining_with,
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
     read_truncated_rice_prefix, sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc,
@@ -198,6 +199,16 @@ pub struct ResidualContexts {
     pub coeff_abs_level_greater1_flag: [ContextModel; COEFF_ABS_LEVEL_GREATER1_FLAG_CTX_COUNT],
     /// `coeff_abs_level_greater2_flag` bank (Table 9-31).
     pub coeff_abs_level_greater2_flag: [ContextModel; COEFF_ABS_LEVEL_GREATER2_FLAG_CTX_COUNT],
+    /// §9.3.2.2 Rice-parameter initialization states `StatCoeff[ k ]`,
+    /// `k` = eq. 9-20/9-21 `sbType` (0/1 chroma transform / bypass,
+    /// 2/3 luma transform / bypass). Zeroed at context
+    /// initialization, updated once per sub-block by the §9.3.3.11
+    /// eq. 9-23 rule, and carried inside the context bank so the
+    /// §9.3.2.4 / §9.3.2.5 WPP and dependent-segment storage
+    /// (`TableStatCoeffWpp` / `TableStatCoeffDs`) travels with the
+    /// context-variable snapshot. Only consulted when
+    /// `persistent_rice_adaptation_enabled_flag == 1`.
+    pub stat_coeff: [u8; 4],
 }
 
 impl ResidualContexts {
@@ -246,6 +257,7 @@ impl ResidualContexts {
                 &TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG, init_type
             )
             .map(init),
+            stat_coeff: [0; 4],
         }
     }
 
@@ -266,6 +278,7 @@ impl ResidualContexts {
             sig_coeff_flag: [c; SIG_COEFF_FLAG_CTX_COUNT],
             coeff_abs_level_greater1_flag: [c; COEFF_ABS_LEVEL_GREATER1_FLAG_CTX_COUNT],
             coeff_abs_level_greater2_flag: [c; COEFF_ABS_LEVEL_GREATER2_FLAG_CTX_COUNT],
+            stat_coeff: [0; 4],
         }
     }
 }
@@ -294,6 +307,24 @@ pub trait ResidualBinSource {
         }
         Ok(value)
     }
+
+    /// §9.3.4.3.6 — alignment prior to aligned bypass decoding
+    /// (`ivlCurrRange = 256`). Invoked by the driver before the
+    /// `coeff_sign_flag` / `coeff_abs_level_remaining` bypass run of
+    /// a sub-block when `cabac_bypass_alignment_enabled_flag == 1`
+    /// and `escapeDataPresent == 1`. Scripted sources may treat it as
+    /// a recording no-op — the aligned engine still serves one bin
+    /// per call.
+    fn align_bypass(&mut self) {}
+
+    /// Mutable access to the §9.3.2.2 `StatCoeff[ k ]` Rice
+    /// initialization states, consulted and updated (eqs. 9-22 /
+    /// 9-23) only when `persistent_rice_adaptation_enabled_flag ==
+    /// 1`. The production source exposes
+    /// [`ResidualContexts::stat_coeff`] so the state persists across
+    /// TUs and travels with the WPP / dependent-segment context
+    /// storage.
+    fn stat_coeff(&mut self) -> &mut [u8; 4];
 }
 
 /// The production [`ResidualBinSource`]: context-coded bins go
@@ -336,6 +367,14 @@ impl ResidualBinSource for EngineResidualBinSource<'_, '_, '_> {
     fn bypass_bits(&mut self, n: u8) -> Result<u32, CabacError> {
         self.engine.decode_bypass_bits(n)
     }
+
+    fn align_bypass(&mut self) {
+        self.engine.align_bypass();
+    }
+
+    fn stat_coeff(&mut self) -> &mut [u8; 4] {
+        &mut self.contexts.stat_coeff
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -369,6 +408,28 @@ pub struct ResidualCodingParams {
     /// `true`, every `sig_coeff_flag` bin uses the dedicated
     /// transform-skip context (42 luma / 16-chroma `sigCtx`).
     pub transform_skip_sig_ctx: bool,
+    /// SPS range extension `persistent_rice_adaptation_enabled_flag`
+    /// — switches the `coeff_abs_level_remaining` Rice derivation to
+    /// the §9.3.3.11 eqs. 9-20..9-23 / 9-25 persistent path
+    /// (`StatCoeff[ sbType ]`-seeded, uncapped).
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    /// SPS range extension `cabac_bypass_alignment_enabled_flag` —
+    /// the §9.3.4.3.6 alignment runs before the sub-block's
+    /// `coeff_sign_flag` / `coeff_abs_level_remaining` bypass bins
+    /// when `escapeDataPresent == 1`.
+    pub cabac_bypass_alignment_enabled_flag: bool,
+    /// SPS range extension `extended_precision_processing_flag` —
+    /// the `coeff_abs_level_remaining` escape suffix uses the
+    /// §9.3.3.4 limited EGk binarization with the eq. 9-14
+    /// `log2TransformRange`.
+    pub extended_precision_processing_flag: bool,
+    /// `BitDepth` of the block's colour component (eq. 9-14 input;
+    /// only consulted when `extended_precision_processing_flag`).
+    pub bit_depth: u8,
+    /// The eq. 9-20/9-21 `sbType` discriminator:
+    /// `transform_skip_flag || cu_transquant_bypass_flag` (only
+    /// consulted when `persistent_rice_adaptation_enabled_flag`).
+    pub rice_stat_transform_skip: bool,
 }
 
 /// The reconstructed coefficient array of one transform block —
@@ -719,6 +780,13 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         let mut last_greater1_scan_pos: i32 = -1;
         let mut g1 = [0u8; 16];
         let mut entered_subblock = false;
+        // §7.3.8.11 escapeDataPresent: set when any coefficient of
+        // this sub-block will (or may) carry a
+        // coeff_abs_level_remaining — a second-or-later greater1
+        // flag, a significant position past the 8-flag cap, or a
+        // greater2 flag equal to 1. Gates the §9.3.4.3.6 aligned
+        // bypass decoding.
+        let mut escape_data_present = false;
         for n in (0..16).rev() {
             if sig[n] == 1 {
                 if num_greater1 < 8 {
@@ -734,7 +802,11 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
                     num_greater1 += 1;
                     if bin == 1 && last_greater1_scan_pos == -1 {
                         last_greater1_scan_pos = n as i32;
+                    } else if bin == 1 {
+                        escape_data_present = true;
                     }
+                } else {
+                    escape_data_present = true;
                 }
                 if last_sig_scan_pos == -1 {
                     last_sig_scan_pos = n as i32;
@@ -756,6 +828,19 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             let ctx_inc = coeff_abs_level_greater2_flag_ctx_inc(g1_state.ctx_set(), is_chroma);
             let bin = bins.decision(ResidualElement::CoeffAbsLevelGreater2Flag, ctx_inc)?;
             g2[last_greater1_scan_pos as usize] = bin;
+            if bin == 1 {
+                escape_data_present = true;
+            }
+        }
+
+        // §9.3.4.3.6 — with cabac_bypass_alignment_enabled_flag, the
+        // bypass decoding of this sub-block's coeff_sign_flag and
+        // coeff_abs_level_remaining bins runs aligned
+        // (ivlCurrRange = 256) when escapeDataPresent == 1. All the
+        // remaining bins of the sub-block are bypass-coded, so one
+        // alignment here covers both passes.
+        if params.cabac_bypass_alignment_enabled_flag && escape_data_present {
+            bins.align_bypass();
         }
 
         // coeff_sign_flag pass (bypass): present for every significant
@@ -773,11 +858,16 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
 
         // Level pass: coeff_abs_level_remaining + TransCoeffLevel
         // composition, with the §9.3.3.11 per-sub-block Rice
-        // adaptation (eq. 9-24, persistent_rice_adaptation off).
+        // adaptation — eq. 9-24 when
+        // persistent_rice_adaptation_enabled_flag == 0, the
+        // StatCoeff-seeded eqs. 9-20..9-23 / 9-25 path when it is 1.
         let mut num_sig_coeff: u32 = 0;
         let mut sum_abs_level: u64 = 0;
         let mut c_last_abs_level: u32 = 0;
         let mut c_last_rice_param: u32 = 0;
+        // eq. 9-20 / 9-21 sbType (persistent path only).
+        let sb_type = 2 * usize::from(!is_chroma) + usize::from(params.rice_stat_transform_skip);
+        let mut first_remaining_in_sb = true;
         for n in (0..16).rev() {
             if sig[n] != 1 {
                 continue;
@@ -794,11 +884,51 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             };
             let mut remaining: u32 = 0;
             if base_level == threshold {
-                let c_rice_param = coeff_abs_level_remaining_c_rice_param_eq_9_24(
-                    c_last_abs_level,
-                    c_last_rice_param,
-                );
-                remaining = decode_coeff_abs_level_remaining_with(c_rice_param, || bins.bypass())?;
+                let c_rice_param = if params.persistent_rice_adaptation_enabled_flag {
+                    if first_remaining_in_sb {
+                        // eq. 9-22: cLastRiceParam starts at
+                        // initRiceValue = StatCoeff[ sbType ] / 4
+                        // (cLastAbsLevel stays 0).
+                        c_last_rice_param = u32::from(bins.stat_coeff()[sb_type] / 4);
+                    }
+                    coeff_abs_level_remaining_c_rice_param_eq_9_25(
+                        c_last_abs_level,
+                        c_last_rice_param,
+                    )
+                } else {
+                    coeff_abs_level_remaining_c_rice_param_eq_9_24(
+                        c_last_abs_level,
+                        c_last_rice_param,
+                    )
+                };
+                remaining = if params.extended_precision_processing_flag {
+                    // eq. 9-14: log2TransformRange =
+                    // Max( 15, BitDepth + 6 ) for the component.
+                    let log2_transform_range =
+                        u32::from(params.bit_depth).saturating_add(6).max(15);
+                    decode_coeff_abs_level_remaining_ext_with(
+                        c_rice_param,
+                        log2_transform_range,
+                        || bins.bypass(),
+                    )?
+                } else {
+                    decode_coeff_abs_level_remaining_with(c_rice_param, || bins.bypass())?
+                };
+                // eq. 9-23: the sub-block's FIRST
+                // coeff_abs_level_remaining updates
+                // StatCoeff[ sbType ] once (the shift distance is
+                // capped defensively; conforming states never near
+                // it).
+                if params.persistent_rice_adaptation_enabled_flag && first_remaining_in_sb {
+                    let stat = &mut bins.stat_coeff()[sb_type];
+                    let shift = u32::from(*stat / 4).min(24);
+                    if remaining >= (3u32 << shift) {
+                        *stat = stat.saturating_add(1);
+                    } else if u64::from(remaining) * 2 < (1u64 << shift) && *stat > 0 {
+                        *stat -= 1;
+                    }
+                }
+                first_remaining_in_sb = false;
                 // §9.3.3.11: cAbsLevel = baseLevel +
                 // coeff_abs_level_remaining[ n ]; carried with the
                 // cRiceParam to the next invocation in this sub-block.
@@ -868,6 +998,7 @@ mod tests {
         bypasses: VecDeque<u8>,
         log: Vec<(ResidualElement, u32)>,
         bypass_reads: usize,
+        stat_coeff: [u8; 4],
     }
 
     impl Scripted {
@@ -877,6 +1008,7 @@ mod tests {
                 bypasses: bypasses.iter().copied().collect(),
                 log: Vec::new(),
                 bypass_reads: 0,
+                stat_coeff: [0; 4],
             }
         }
     }
@@ -894,6 +1026,10 @@ mod tests {
             self.bypass_reads += 1;
             Ok(self.bypasses.pop_front().expect("bypass script exhausted"))
         }
+
+        fn stat_coeff(&mut self) -> &mut [u8; 4] {
+            &mut self.stat_coeff
+        }
     }
 
     fn luma_params(log2: u32, scan_idx: ScanIdx) -> ResidualCodingParams {
@@ -904,6 +1040,11 @@ mod tests {
             sign_data_hiding_enabled_flag: false,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth: 8,
+            rice_stat_transform_skip: false,
         }
     }
 

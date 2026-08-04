@@ -3871,6 +3871,82 @@ pub fn coeff_abs_level_remaining_c_rice_param_eq_9_24(
     (c_last_rice_param + bump).min(4)
 }
 
+/// §9.3.3.11 — `cRiceParam` adaptation, persistent path
+/// (`persistent_rice_adaptation_enabled_flag == 1`), eq. 9-25:
+///
+/// ```text
+/// cRiceParam = cLastRiceParam +
+///              ( cLastAbsLevel > ( 3 * ( 1 << cLastRiceParam ) ) ? 1 : 0 )
+/// ```
+///
+/// Unlike the eq. 9-24 path there is **no** Min(…, 4) ceiling — the
+/// parameter keeps growing while consecutive levels exceed the
+/// threshold, and the per-sub-block start value is `initRiceValue =
+/// StatCoeff[ sbType ] / 4` (eq. 9-22) rather than 0. A defensive cap
+/// of 24 keeps the downstream `4 << cRiceParam` / TR-suffix shifts
+/// sound; reaching it would need `cLastAbsLevel > 3 << 23`, beyond
+/// the §7.4.9.11 `CoeffMax` bound (eqs. 7-27 .. 7-30, at most
+/// `2^22 − 1` even with `extended_precision_processing_flag == 1` at
+/// `BitDepth` 16), so no conforming stream is affected.
+#[must_use]
+pub fn coeff_abs_level_remaining_c_rice_param_eq_9_25(
+    c_last_abs_level: u32,
+    c_last_rice_param: u32,
+) -> u32 {
+    let r = c_last_rice_param.min(24);
+    let threshold = 3u32 << r;
+    let bump = u32::from(c_last_abs_level > threshold);
+    (r + bump).min(24)
+}
+
+/// §9.3.3.4 — decode the **limited EGk** suffix of
+/// `coeff_abs_level_remaining[ n ]`, invoked only when
+/// `extended_precision_processing_flag == 1` and the §9.3.3.2 TR
+/// prefix was the all-ones escape. `rice_param` is the §9.3.3.11
+/// "riceParam = cRiceParam + 1" input; `log2_transform_range` is
+/// eq. 9-14 (`Max( 15, BitDepth + 6 )` for the block's component).
+///
+/// The eq. 9-16 bin string is a unary prefix-extension run of `1`
+/// bins capped at `maxPrefixExtensionLength = 28 −
+/// log2TransformRange` (eq. 9-15), then — only when the run stopped
+/// short of the cap — a `0` terminator, then a fixed-length escape of
+/// `PrefixExtensionLength + riceParam` bits (or `log2TransformRange`
+/// bits when the run hit the cap, with no terminator). The decoded
+/// `symbolVal` is the escape value plus
+/// `( ( 1 << PrefixExtensionLength ) − 1 ) << riceParam`.
+pub fn decode_limited_egk_suffix_with<F>(
+    rice_param: u32,
+    log2_transform_range: u32,
+    mut read_bin: F,
+) -> Result<u32, CabacError>
+where
+    F: FnMut() -> Result<u8, CabacError>,
+{
+    let max_prefix_extension_length = 28u32.saturating_sub(log2_transform_range);
+    let mut prefix_extension_length: u32 = 0;
+    let mut hit_cap = true;
+    while prefix_extension_length < max_prefix_extension_length {
+        if read_bin()? == 0 {
+            hit_cap = false;
+            break;
+        }
+        prefix_extension_length += 1;
+    }
+    let escape_length = if hit_cap {
+        log2_transform_range
+    } else {
+        prefix_extension_length + rice_param
+    };
+    let mut escape: u64 = 0;
+    for _ in 0..escape_length.min(32) {
+        escape = (escape << 1) | u64::from(read_bin()?);
+    }
+    // Compose in u64 and saturate: the §7.4.9.11 conformance bound
+    // keeps every conforming value far below u32 saturation.
+    let base = ((1u64 << prefix_extension_length.min(32)) - 1) << rice_param.min(31);
+    Ok(u32::try_from(base + escape).unwrap_or(u32::MAX))
+}
+
 /// §9.3.3.11 eq. 9-26 — `cMax = 4 << cRiceParam`.
 ///
 /// Drives the §9.3.3.2 TR-prefix `cMax` input. For `cRiceParam ∈
@@ -3965,6 +4041,37 @@ where
     let c_max = u64::from(coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param));
     let value = c_max + base + u64::from(suffix);
     Ok(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// §9.3.3.11, `extended_precision_processing_flag == 1` variant of
+/// [`decode_coeff_abs_level_remaining_with`]: the §9.3.3.2 TR prefix
+/// and `cRiceParam`-bit TR suffix are unchanged, but the all-ones
+/// escape switches to the §9.3.3.4 **limited EGk** suffix
+/// ([`decode_limited_egk_suffix_with`]) with `riceParam = cRiceParam
+/// + 1` and the component's `log2TransformRange` (eq. 9-14).
+pub fn decode_coeff_abs_level_remaining_ext_with<F>(
+    c_rice_param: u32,
+    log2_transform_range: u32,
+    mut read_bin: F,
+) -> Result<u32, CabacError>
+where
+    F: FnMut() -> Result<u8, CabacError>,
+{
+    let mut prefix_len: u32 = 0;
+    while prefix_len < COEFF_ABS_LEVEL_REMAINING_TR_PREFIX_ESCAPE_LEN {
+        let bin = read_bin()?;
+        if bin == 0 {
+            let mut tr_suffix: u32 = 0;
+            for _ in 0..c_rice_param {
+                tr_suffix = (tr_suffix << 1) | u32::from(read_bin()?);
+            }
+            return Ok((prefix_len << c_rice_param) + tr_suffix);
+        }
+        prefix_len += 1;
+    }
+    let suffix = decode_limited_egk_suffix_with(c_rice_param + 1, log2_transform_range, read_bin)?;
+    let c_max = coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param);
+    Ok(c_max.saturating_add(suffix))
 }
 
 /// §9.3.3.11 — full bypass-coded decode of `coeff_abs_level_remaining[

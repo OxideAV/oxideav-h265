@@ -32,6 +32,11 @@ fn template() -> TransformUnitParams {
         explicit_rdpcm_enabled_flag: false,
         transform_skip_context_enabled_flag: false,
 
+        persistent_rice_adaptation_enabled_flag: false,
+        cabac_bypass_alignment_enabled_flag: false,
+        extended_precision_processing_flag: false,
+        bit_depth_luma: 8,
+        bit_depth_chroma: 8,
         part_mode_2nx2n: true,
         intra_chroma_pred_mode_corners: [0; 4],
     }

@@ -155,6 +155,15 @@ pub struct SliceDataParams {
     /// SPS range extension `transform_skip_context_enabled_flag`
     /// (§7.4.3.2.2) — the §9.3.4.2.5 transform-skip sig-ctx gate.
     pub transform_skip_context_enabled_flag: bool,
+    /// SPS range extension `persistent_rice_adaptation_enabled_flag`
+    /// (§7.4.3.2.2) — the §9.3.3.11 StatCoeff Rice path.
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    /// SPS range extension `cabac_bypass_alignment_enabled_flag`
+    /// (§7.4.3.2.2) — the §9.3.4.3.6 aligned bypass decoding gate.
+    pub cabac_bypass_alignment_enabled_flag: bool,
+    /// SPS range extension `extended_precision_processing_flag`
+    /// (§7.4.3.2.2) — the §9.3.3.4 limited-EGk escape suffix gate.
+    pub extended_precision_processing_flag: bool,
     /// SCC `palette_mode_enabled_flag` (§7.4.3.2.3) — the §7.3.8.5
     /// `palette_mode_flag` presence gate.
     pub palette_mode_enabled_flag: bool,
@@ -621,6 +630,11 @@ fn tu_template(
         implicit_rdpcm_enabled_flag: params.implicit_rdpcm_enabled_flag,
         explicit_rdpcm_enabled_flag: params.explicit_rdpcm_enabled_flag,
         transform_skip_context_enabled_flag: params.transform_skip_context_enabled_flag,
+        persistent_rice_adaptation_enabled_flag: params.persistent_rice_adaptation_enabled_flag,
+        cabac_bypass_alignment_enabled_flag: params.cabac_bypass_alignment_enabled_flag,
+        extended_precision_processing_flag: params.extended_precision_processing_flag,
+        bit_depth_luma: params.bit_depth_luma as u8,
+        bit_depth_chroma: params.bit_depth_chroma as u8,
         part_mode_2nx2n,
         intra_chroma_pred_mode_corners: [0; 4],
     }

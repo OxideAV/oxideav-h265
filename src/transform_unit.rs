@@ -141,6 +141,19 @@ pub struct TransformUnitParams {
     /// SPS range extension `transform_skip_context_enabled_flag`
     /// (§7.4.3.2.2).
     pub transform_skip_context_enabled_flag: bool,
+    /// SPS range extension `persistent_rice_adaptation_enabled_flag`
+    /// (§7.4.3.2.2) — the §9.3.3.11 StatCoeff Rice path.
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    /// SPS range extension `cabac_bypass_alignment_enabled_flag`
+    /// (§7.4.3.2.2) — the §9.3.4.3.6 aligned bypass decoding gate.
+    pub cabac_bypass_alignment_enabled_flag: bool,
+    /// SPS range extension `extended_precision_processing_flag`
+    /// (§7.4.3.2.2) — the §9.3.3.4 limited-EGk escape suffix gate.
+    pub extended_precision_processing_flag: bool,
+    /// `BitDepthY` (eq. 9-14 input for luma blocks).
+    pub bit_depth_luma: u8,
+    /// `BitDepthC` (eq. 9-14 input for chroma blocks).
+    pub bit_depth_chroma: u8,
     /// `PartMode == PART_2Nx2N` — part of the §7.3.8.10
     /// adaptive-colour-transform predicate.
     pub part_mode_2nx2n: bool,
@@ -494,6 +507,15 @@ fn decode_one_residual(
         // is transform-skipped or transquant-bypassed.
         transform_skip_sig_ctx: params.transform_skip_context_enabled_flag
             && (transform_skip || params.cu_transquant_bypass_flag),
+        persistent_rice_adaptation_enabled_flag: params.persistent_rice_adaptation_enabled_flag,
+        cabac_bypass_alignment_enabled_flag: params.cabac_bypass_alignment_enabled_flag,
+        extended_precision_processing_flag: params.extended_precision_processing_flag,
+        bit_depth: if c_idx > 0 {
+            params.bit_depth_chroma
+        } else {
+            params.bit_depth_luma
+        },
+        rice_stat_transform_skip: transform_skip || params.cu_transquant_bypass_flag,
     };
     let mut rb = decode_residual_coding(engine, &mut ctx.residual, &rc_params)?;
     rb.transform_skip = transform_skip;
@@ -534,6 +556,11 @@ mod tests {
             implicit_rdpcm_enabled_flag: false,
             explicit_rdpcm_enabled_flag: false,
             transform_skip_context_enabled_flag: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
             part_mode_2nx2n: true,
             intra_chroma_pred_mode_corners: [0; 4],
         }

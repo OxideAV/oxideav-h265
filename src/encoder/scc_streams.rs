@@ -415,6 +415,11 @@ fn encode_act_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: us
             sign_data_hiding_enabled_flag: false,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth: 8,
+            rice_stat_transform_skip: false,
         };
         if cbf_luma {
             encode_residual_coding(&mut w, &mut cabac, &mut ctxs.residual, &rc(false), &res_l)
@@ -843,6 +848,11 @@ fn emit_tu_420(
         sign_data_hiding_enabled_flag: false,
         sign_hidden_suppressed: false,
         transform_skip_sig_ctx: false,
+        persistent_rice_adaptation_enabled_flag: false,
+        cabac_bypass_alignment_enabled_flag: false,
+        extended_precision_processing_flag: false,
+        bit_depth: 8,
+        rice_stat_transform_skip: false,
     };
     if cbf_luma {
         encode_residual_coding(w, cabac, &mut ctxs.residual, &rc(4, false), res_l)

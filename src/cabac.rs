@@ -294,6 +294,19 @@ impl<'a> CabacEngine<'a> {
         self.ivl_curr_range
     }
 
+    /// §9.3.4.3.6 — alignment process prior to aligned bypass
+    /// decoding: `ivlCurrRange` is set equal to 256. Invoked when
+    /// `cabac_bypass_alignment_enabled_flag == 1` before the bypass
+    /// decoding of `coeff_sign_flag[ ]` / `coeff_abs_level_remaining[
+    /// ]` (and the §7.3.8.13 palette escape group) when
+    /// `escapeDataPresent == 1`. After alignment every bypass bin
+    /// consumes exactly one stream bit (the NOTE's shift-register
+    /// view); bypass decoding itself never changes `ivlCurrRange`, so
+    /// repeated invocations inside one aligned run are no-ops.
+    pub fn align_bypass(&mut self) {
+        self.ivl_curr_range = 256;
+    }
+
     /// Current `ivlOffset` register value (for tests / inspection).
     #[must_use]
     pub fn ivl_offset(&self) -> u16 {

@@ -1239,6 +1239,18 @@ fn build_slice_data_params(
             .sps_range_extension
             .as_ref()
             .is_some_and(|r| r.transform_skip_context_enabled_flag),
+        persistent_rice_adaptation_enabled_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.persistent_rice_adaptation_enabled_flag),
+        cabac_bypass_alignment_enabled_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.cabac_bypass_alignment_enabled_flag),
+        extended_precision_processing_flag: sps
+            .sps_range_extension
+            .as_ref()
+            .is_some_and(|r| r.extended_precision_processing_flag),
         palette_mode_enabled_flag: scc.is_some_and(|e| e.palette_mode_enabled_flag),
         palette_max_size,
         palette_max_predictor_size: palette_max_size

@@ -2222,6 +2222,11 @@ pub(crate) fn encode_inter_slice(
             sign_data_hiding_enabled_flag: false,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth: 8,
+            rice_stat_transform_skip: false,
         };
         match &chosen.levels {
             Some(CuLevels::Depth0(levels)) => {

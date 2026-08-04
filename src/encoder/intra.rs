@@ -977,6 +977,11 @@ pub(crate) fn encode_idr_intra_au_full(
             sign_data_hiding_enabled_flag: false,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth: 8,
+            rice_stat_transform_skip: false,
         };
         if !plan.nxn {
             // Single 16x16 TU at depth 0.

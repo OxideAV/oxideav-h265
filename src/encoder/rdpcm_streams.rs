@@ -474,6 +474,11 @@ fn encode_bypass_idr_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height:
             sign_data_hiding_enabled_flag: false,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
+            persistent_rice_adaptation_enabled_flag: false,
+            cabac_bypass_alignment_enabled_flag: false,
+            extended_precision_processing_flag: false,
+            bit_depth: 8,
+            rice_stat_transform_skip: false,
         };
         if cbf_luma {
             encode_residual_coding(
@@ -656,6 +661,11 @@ fn encode_bypass_p_slice(
                 sign_data_hiding_enabled_flag: false,
                 sign_hidden_suppressed: false,
                 transform_skip_sig_ctx: false,
+                persistent_rice_adaptation_enabled_flag: false,
+                cabac_bypass_alignment_enabled_flag: false,
+                extended_precision_processing_flag: false,
+                bit_depth: 8,
+                rice_stat_transform_skip: false,
             };
             encode_residual_coding(wtr, cabac, &mut ctxs.residual, &rc, &levels)
                 .expect("valid inter levels");
