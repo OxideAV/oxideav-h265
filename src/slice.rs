@@ -2135,13 +2135,11 @@ impl SliceSegmentHeader {
 
         // Entry-point-offset block (§7.3.6.1). §7.4.7.1 bounds
         // `num_entry_point_offsets` by the active partitioning: the
-        // tile count when `tiles_enabled_flag == 1`, else
-        // `PicHeightInCtbsY` when `entropy_coding_sync_enabled_flag ==
-        // 1`. The two flags being simultaneously 1 is forbidden by
-        // §7.4.3.3.1 (rejected upstream by the PPS parser); the
-        // defensive cap here takes the wider of the two bounds in
-        // that pathological case rather than gate on a flag
-        // combination that already cannot occur. Each
+        // tile count when only `tiles_enabled_flag == 1`,
+        // `PicHeightInCtbsY` when only
+        // `entropy_coding_sync_enabled_flag == 1`, and
+        // `NumTileColumns * PicHeightInCtbsY` when both are 1
+        // (wavefronts inside every tile). Each
         // `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1`
         // bits wide and is read into [`EntryPointOffsets::
         // entry_point_offset_minus1`] (a per-index `Vec<u32>`); the
@@ -2317,29 +2315,27 @@ fn parse_header_extension(
 /// caller has already gated on `tiles_enabled_flag ||
 /// entropy_coding_sync_enabled_flag`.
 fn num_entry_point_offsets_upper_bound(sps: &SeqParameterSet, pps: &PicParameterSet) -> u32 {
-    let tiles_bound = if pps.tiles_enabled_flag {
+    // §7.4.7.1, three-way constraint:
+    //   * tiles == 0, sync == 1  ⇒ 0 .. PicHeightInCtbsY − 1
+    //   * tiles == 1, sync == 0  ⇒ 0 .. cols * rows − 1
+    //   * tiles == 1, sync == 1  ⇒ 0 .. cols * PicHeightInCtbsY − 1
+    // (wavefront rows counted per tile COLUMN — every tile row of a
+    // column contributes its CTB rows, summing to PicHeightInCtbsY).
+    // Arithmetic in u64 keeps the parser defensive against a
+    // pathological PPS even though no conforming level overflows u32.
+    let bound = if pps.tiles_enabled_flag {
         let cols = u64::from(pps.tiles.num_tile_columns_minus1) + 1;
-        let rows = u64::from(pps.tiles.num_tile_rows_minus1) + 1;
-        // (cols * rows) - 1 cannot overflow u32 for any conforming
-        // HEVC level (max tile count is 22 * 20 per Annex A), but
-        // arithmetic in u64 keeps the parser defensive against a
-        // pathological PPS.
-        let prod = cols.saturating_mul(rows).saturating_sub(1);
-        u32::try_from(prod).unwrap_or(u32::MAX)
+        if pps.entropy_coding_sync_enabled_flag {
+            cols.saturating_mul(u64::from(pic_height_in_ctbs_y(sps)))
+                .saturating_sub(1)
+        } else {
+            let rows = u64::from(pps.tiles.num_tile_rows_minus1) + 1;
+            cols.saturating_mul(rows).saturating_sub(1)
+        }
     } else {
-        0
+        u64::from(pic_height_in_ctbs_y(sps)).saturating_sub(1)
     };
-    let wpp_bound = if pps.entropy_coding_sync_enabled_flag {
-        pic_height_in_ctbs_y(sps).saturating_sub(1)
-    } else {
-        0
-    };
-    // Take the wider of the two: when only one flag is set the other
-    // bound is 0 and the active one wins; when both are set (a
-    // §7.4.3.3.1 forbidden combination already rejected by the PPS
-    // parser) this picks the wider so a stray header here is not
-    // rejected on top of a PPS error.
-    tiles_bound.max(wpp_bound)
+    u32::try_from(bound).unwrap_or(u32::MAX)
 }
 
 /// `Ceil( Log2( n ) )` — the §7.4.7.1 width formula for
