@@ -241,6 +241,8 @@ fn tiny_i_reconstructs_expected_yuv_end_to_end() {
         intra_boundary_filtering_disabled: false,
         extended_precision: false,
         scaling: None,
+        chroma_qp_offset_list: Vec::new(),
+        cu_qp_offset_c: core::cell::Cell::new((0, 0)),
     };
     let mut pic = Picture::new(16, 16, 1, 8, 8);
     reconstruct_intra_ctu(&mut pic, &recon_params, &ctu).unwrap();
@@ -311,6 +313,8 @@ fn tiny_i_picture_driver_reconstructs_expected_yuv_with_sao() {
         intra_boundary_filtering_disabled: false,
         extended_precision: false,
         scaling: None,
+        chroma_qp_offset_list: Vec::new(),
+        cu_qp_offset_c: core::cell::Cell::new((0, 0)),
     };
     let pic_params = IntraPictureParams {
         ctb_log2_size_y: 4,

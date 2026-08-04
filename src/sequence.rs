@@ -993,6 +993,17 @@ fn build_recon_params(
             .is_some_and(|s| s.intra_boundary_filtering_disabled_flag),
         extended_precision: range.is_some_and(|r| r.extended_precision_processing_flag),
         scaling,
+        chroma_qp_offset_list: pps
+            .pps_range_extension
+            .as_ref()
+            .map(|r| {
+                r.chroma_qp_offset_list
+                    .iter()
+                    .map(|e| (i32::from(e.cb_qp_offset), i32::from(e.cr_qp_offset)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cu_qp_offset_c: core::cell::Cell::new((0, 0)),
     })
 }
 

@@ -651,6 +651,12 @@ pub fn reconstruct_inter_picture(
         {
             ctx.reset_qp_prev();
         }
+        // §7.4.7.1 — CuQpOffsetCb / CuQpOffsetCr reset to 0 at each
+        // slice start (unlike qPY_PREV they do NOT reset at tile /
+        // WPP-row boundaries).
+        if prev_slice_addr != Some(placed.slice_addr_rs) {
+            params.cu_qp_offset_c.set((0, 0));
+        }
         prev_slice_addr = Some(placed.slice_addr_rs);
         prev_tile = Some(tile);
         reconstruct_inter_quadtree(
@@ -1135,6 +1141,8 @@ mod tests {
             intra_boundary_filtering_disabled: false,
             extended_precision: false,
             scaling: None,
+            chroma_qp_offset_list: Vec::new(),
+            cu_qp_offset_c: core::cell::Cell::new((0, 0)),
         }
     }
 

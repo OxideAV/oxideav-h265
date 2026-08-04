@@ -140,6 +140,35 @@ pub struct ReconParams {
     /// if present, else the SPS body, else the default lists); `None`
     /// when the flag is 0 (the §8.6.3 flat-16 path).
     pub scaling: Option<ScalingFactors>,
+    /// `(cb_qp_offset_list[i], cr_qp_offset_list[i])` (§7.4.3.3.2) —
+    /// the PPS range extension chroma QP offset lists dereferenced by
+    /// `cu_chroma_qp_offset_idx`. Empty when
+    /// `chroma_qp_offset_list_enabled_flag == 0`.
+    pub chroma_qp_offset_list: Vec<(i32, i32)>,
+    /// The live `( CuQpOffsetCb, CuQpOffsetCr )` state (§7.4.9.10):
+    /// reset to `(0, 0)` at each slice start (§7.4.7.1), overwritten
+    /// whenever a reconstructed transform unit / palette CU carries a
+    /// parsed `cu_chroma_qp_offset_flag`, and consumed by the §8.6.1
+    /// eqs. 8-285..8-288 chroma QP derivation. Interior-mutable so the
+    /// decode-order state threads through the shared `&ReconParams`
+    /// without touching every recursion signature (picture
+    /// reconstruction is single-threaded).
+    pub cu_qp_offset_c: core::cell::Cell<(i32, i32)>,
+}
+
+/// §7.4.9.10 — resolve a parsed `cu_chroma_qp_offset` element to the
+/// `( CuQpOffsetCb, CuQpOffsetCr )` pair it selects (eqs. 7-87 / 7-88;
+/// `(0, 0)` when the flag is 0) and store it in the live state.
+fn apply_cu_chroma_qp_offset(params: &ReconParams, off: &crate::binarization::CuChromaQpOffset) {
+    let pair = match off.offset_indices() {
+        Some(idx) => params
+            .chroma_qp_offset_list
+            .get(idx as usize)
+            .copied()
+            .unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    params.cu_qp_offset_c.set(pair);
 }
 
 /// §8.6.3 `m[ x ][ y ]` source selection: the `ScalingFactor[ sizeId ]
@@ -262,11 +291,12 @@ fn chroma_qp_act(params: &ReconParams, qp_y: i32, cidx: TfComponent, act: bool) 
     // `qp_y` is the already-derived (eq. 8-283) QpY — the §8.6.1
     // chroma input.
     let qpy = qp_y;
+    let (cu_off_cb, cu_off_cr) = params.cu_qp_offset_c.get();
     let offset = match (cidx, act) {
-        (TfComponent::Cb, false) => params.cb_qp_offset,
-        (TfComponent::Cr, false) => params.cr_qp_offset,
-        (TfComponent::Cb, true) => params.act_cb_qp_offset,
-        (TfComponent::Cr, true) => params.act_cr_qp_offset,
+        (TfComponent::Cb, false) => params.cb_qp_offset + cu_off_cb,
+        (TfComponent::Cr, false) => params.cr_qp_offset + cu_off_cr,
+        (TfComponent::Cb, true) => params.act_cb_qp_offset + cu_off_cb,
+        (TfComponent::Cr, true) => params.act_cr_qp_offset + cu_off_cr,
         (TfComponent::Luma, _) => 0,
     };
     let qpi = (qpy + offset).clamp(-qp_bd_c, 57);
@@ -956,6 +986,11 @@ fn extract_residual_tree(
         }
         TransformTree::Leaf { unit, .. } => {
             let n_tbs = 1usize << log2_trafo_size;
+            // §7.4.9.10 — thread the CuQpOffsetCb / CuQpOffsetCr state
+            // in decode order on the inter residual path too.
+            if let Some(off) = &unit.cu_chroma_qp_offset {
+                apply_cu_chroma_qp_offset(params, off);
+            }
             // §8.5.4.1 step 4 — a tu_residual_act_flag == 1 unit
             // (4:4:4) derives all three co-located residual arrays
             // (ACT-adjusted qP), applies cross-component prediction,
@@ -1935,6 +1970,12 @@ fn write_palette_cu(
     qp_y: i32,
     transquant_bypass: bool,
 ) {
+    // §7.4.9.10 — a chroma_qp_offset( ) parsed inside
+    // palette_coding( ) updates the slice-wide state exactly like a
+    // transform unit's.
+    if let Some(off) = &pal.cu_chroma_qp_offset {
+        apply_cu_chroma_qp_offset(params, off);
+    }
     let qp_luma = luma_qp(params, qp_y) as i32;
     crate::palette::reconstruct_palette_component(
         pal,
@@ -2346,6 +2387,11 @@ fn reconstruct_transform_unit(
 ) -> Result<(), ReconError> {
     let n_tbs = 1usize << log2_trafo_size;
     let _ = unit.cu_qp_delta.as_ref();
+    // §7.4.9.10 — a parsed chroma_qp_offset( ) element updates the
+    // slice-wide CuQpOffsetCb / CuQpOffsetCr state in decode order.
+    if let Some(off) = &unit.cu_chroma_qp_offset {
+        apply_cu_chroma_qp_offset(params, off);
+    }
 
     // §8.6.8 adaptive colour transform (4:4:4 only): the three
     // co-located residual arrays of this unit are jointly modified
@@ -2703,6 +2749,8 @@ mod tests {
             intra_boundary_filtering_disabled: false,
             extended_precision: false,
             scaling: None,
+            chroma_qp_offset_list: Vec::new(),
+            cu_qp_offset_c: core::cell::Cell::new((0, 0)),
         }
     }
 
