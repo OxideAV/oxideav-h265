@@ -468,6 +468,12 @@ pub struct InterSliceContext {
     pub cb_qp_offset: i32,
     /// `pps_cr_qp_offset + slice_cr_qp_offset`.
     pub cr_qp_offset: i32,
+    /// `pps_cb_qp_offset` alone — the §8.7.2.5.1/.2 `cQpPicOffset`
+    /// input to chroma deblocking, which per the invocation text
+    /// excludes the slice-level and CU-level chroma QP adjustments.
+    pub pps_cb_qp_offset: i32,
+    /// `pps_cr_qp_offset` alone (chroma deblocking `cQpPicOffset`).
+    pub pps_cr_qp_offset: i32,
     /// `slice_sao_luma_flag` (§8.7.3.1 luma gate).
     pub slice_sao_luma_flag: bool,
     /// `slice_sao_chroma_flag` (§8.7.3.1 chroma gate).
@@ -841,8 +847,8 @@ fn collect_deblock_cu(
         qp_y,
         beta_offset_div2: slice.beta_offset_div2,
         tc_offset_div2: slice.tc_offset_div2,
-        cb_qp_offset: slice.cb_qp_offset,
-        cr_qp_offset: slice.cr_qp_offset,
+        cb_qp_offset: slice.pps_cb_qp_offset,
+        cr_qp_offset: slice.pps_cr_qp_offset,
         bit_depth_luma,
         bit_depth_chroma,
         chroma_array_type,
@@ -1510,6 +1516,8 @@ mod tests {
             pcm_loop_filter_disabled: false,
             use_integer_mv: false,
             two_versions_curr_pic: false,
+            pps_cb_qp_offset: 0,
+            pps_cr_qp_offset: 0,
         }
     }
 

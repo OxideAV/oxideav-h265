@@ -1035,9 +1035,11 @@ pub struct DeblockCuParams {
     pub beta_offset_div2: i32,
     /// `slice_tc_offset_div2`.
     pub tc_offset_div2: i32,
-    /// `pps_cb_qp_offset + slice_cb_qp_offset` for the Cb component.
+    /// `pps_cb_qp_offset` for the Cb component — the §8.7.2.5.1/.2
+    /// `cQpPicOffset` (slice-level and CU-level chroma QP adjustments
+    /// are excluded from chroma deblocking by the invocation text).
     pub cb_qp_offset: i32,
-    /// `pps_cr_qp_offset + slice_cr_qp_offset` for the Cr component.
+    /// `pps_cr_qp_offset` for the Cr component.
     pub cr_qp_offset: i32,
     /// `BitDepthY`.
     pub bit_depth_luma: u8,

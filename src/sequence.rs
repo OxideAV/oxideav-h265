@@ -1072,6 +1072,8 @@ fn build_inter_slice_context(
         slice_qp_y: recon.slice_qp_y,
         cb_qp_offset: recon.cb_qp_offset,
         cr_qp_offset: recon.cr_qp_offset,
+        pps_cb_qp_offset: i32::from(pps.pps_cb_qp_offset),
+        pps_cr_qp_offset: i32::from(pps.pps_cr_qp_offset),
         slice_sao_luma_flag: header.slice_sao_luma_flag,
         slice_sao_chroma_flag: header.slice_sao_chroma_flag,
         log2_sao_offset_scale_luma: pps_range.map_or(0, |r| r.log2_sao_offset_scale_luma as u8),
