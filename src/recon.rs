@@ -2093,13 +2093,19 @@ fn reconstruct_cu(
     let per_pb_chroma =
         params.chroma_array_type == 3 && is_nxn && cu.intra_chroma_pred_mode.len() == 4;
     let mut modes_c = [INTRA_DC; 4];
-    for (i, mode_c) in modes_c.iter_mut().enumerate() {
-        let (raw, luma_for_c) = if per_pb_chroma {
-            (cu.intra_chroma_pred_mode[i], pb_modes[i])
-        } else {
-            (cu.intra_chroma_pred_mode[0], pb_modes[0])
-        };
-        *mode_c = derive_intra_pred_mode_c(raw, luma_for_c, params.chroma_array_type == 2);
+    // ChromaArrayType == 0 (monochrome): §7.3.8.5 signals no
+    // intra_chroma_pred_mode and no chroma PB exists — keep the DC
+    // placeholders (nothing downstream consumes them without a
+    // chroma plane).
+    if params.chroma_array_type != 0 {
+        for (i, mode_c) in modes_c.iter_mut().enumerate() {
+            let (raw, luma_for_c) = if per_pb_chroma {
+                (cu.intra_chroma_pred_mode[i], pb_modes[i])
+            } else {
+                (cu.intra_chroma_pred_mode[0], pb_modes[0])
+            };
+            *mode_c = derive_intra_pred_mode_c(raw, luma_for_c, params.chroma_array_type == 2);
+        }
     }
     let intra_pred_mode_c = modes_c[0];
 
