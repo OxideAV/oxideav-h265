@@ -17,7 +17,15 @@ FourCCs, MP4 ObjectTypeIndication, Matroska tag) — plus self-built
 conformance pins for the features the corpus lacks (rounds 413 / 416:
 RDPCM, palette, cross-component prediction, adaptive colour
 transform, intra block copy), and a 37-stream black-box tool-axis
-sweep (round 410) held byte-exact by nine embedded pins. Coverage:
+sweep (round 410) held byte-exact by nine embedded pins. Against the
+staged **official JCT-VC RExt / SCC conformance corpus** (61
+decodable bitstreams with published output digests,
+`docs/video/h265/conformance/`), 26 streams decode byte-exact
+(round 437; docs-gated pins in `tests/conformance_official.rs`) —
+including the transform-skip-context, wavefronts-inside-tiles /
+aligned-bypass / high-throughput, persistent-Rice-seeded,
+Monochrome 8/12-bit, Main 4:2:2 10 and 8-bit
+extended-precision-intra families. Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -209,16 +217,26 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   consults the current sample's slice flag where the spec text (both
   08/2021 and 01/2026 editions) names the later (decode-order)
   slice's flag; this implementation follows the spec text.
-* Known corners (RDPCM, spec text followed): (a) §8.4.4.2.6 sets
+* Known corner (RDPCM, spec text followed): §8.4.4.2.6 sets
   `disableIntraBoundaryFilter` when implicit RDPCM combines with
   transquant bypass, suppressing the mode-10/26 edge filters — a
-  black-box reference decoder applies those filters regardless;
-  (b) on explicit-RDPCM inter blocks a black-box reference decoder
-  diverges from the literal §8.5.4.2-step-3 / §8.6.5 vertical
-  (`explicit_rdpcm_dir_flag == 1`) reconstruction, while both §8.6.5
-  accumulation directions are black-box-confirmed byte-exact through
-  the implicit path (see
-  `tests/fixture_bytes/r413-generation-notes.md`).
+  black-box reference decoder applies those filters regardless.
+  (The r413 note claiming a reference deviation on explicit-RDPCM
+  *vertical* blocks is retired: the official `ExplicitRdpcm_A`
+  conformance stream matches the black-box decode exactly, this
+  crate's luma decode agrees byte-for-byte, and the remaining
+  divergence is an unrelated ±1 chroma artifact on isolated rows,
+  still under investigation.)
+* Official-corpus families not yet byte-exact: the 4:4:4
+  multi-tool `GENERAL_*_444` / `WAVETILES` / `QMATRIX` parse
+  desync (mid-picture, first reproduces in a busy 4:4:4 intra CTB),
+  16-bit extended-precision reconstruction (the 8-bit
+  extended-precision streams pass; 10/12/16-bit diverge on their
+  first picture), unequal luma/chroma bit depths (first divergence
+  at frame 4), the official CCP / SAO-offset-scale / persistent-Rice
+  single-stream anchors, and most SCC streams (palette-heavy parse
+  still desyncs mid-slice; two streams decode all 33 frames with
+  subtle reconstruction deltas).
 
 ## License
 

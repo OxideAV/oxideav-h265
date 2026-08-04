@@ -6,6 +6,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added / Fixed — official RExt + SCC conformance, round 437 (2026-08-04)
+
+Round 437 triaged the staged official JCT-VC conformance corpus
+(`docs/video/h265/conformance/`, 61 decodable RExt + SCC bitstreams
+with published output digests) through the whole-bitstream decoder,
+moving the byte-exact count from 12/61 to **26/61**:
+
+- **§7.4.7.1 entry-point bound for tiles + wavefronts combined**: the
+  slice-header range check treated the two partitioning flags as
+  mutually exclusive; the combined case allows
+  `NumTileColumns * PicHeightInCtbsY − 1` subsets. The six staged
+  WPP-and-tile high-throughput streams now decode byte-exact.
+- **§9.3.3.11 persistent Rice adaptation**
+  (`persistent_rice_adaptation_enabled_flag`): `StatCoeff[ sbType ]`
+  seeding (eqs. 9-20..9-23) and the uncapped eq. 9-25 adaptation,
+  with the state carried in `ResidualContexts` so the §9.3.2.4/.5
+  WPP / dependent-segment storage snapshots it.
+- **§9.3.4.3.6 aligned bypass decoding**
+  (`cabac_bypass_alignment_enabled_flag`): §7.3.8.11
+  `escapeDataPresent` tracking and the `ivlCurrRange = 256` alignment
+  before each sub-block's sign + remaining bypass run.
+- **§9.3.3.4 limited EGk escape suffixes**
+  (`extended_precision_processing_flag`): the eqs. 9-14..9-16
+  binarization replacing the plain EGk escape.
+- **Monochrome (4:0:0) reconstruction**: intra CUs no longer read the
+  absent `intra_chroma_pred_mode`; the 8-bit / 12-bit
+  Monochrome-profile streams decode byte-exact.
+- **§9.3.4.2.8 palette run-prefix ctxInc** consumes the RAW signalled
+  `palette_idx_idc` (inferred 0 when absent), not the eq. 7-84
+  adjusted `CurrPaletteIndex`. The self-built r413 palette pins
+  shared the bug symmetrically on the write side and were
+  regenerated; the official palette-heavy SCC streams now parse
+  substantially further (two to complete 33-frame decodes).
+- **§8.6.1 `CuQpOffsetCb` / `CuQpOffsetCr` applied**: the parsed
+  §7.3.8.15 `chroma_qp_offset( )` elements now feed
+  eqs. 8-285..8-288 (per-slice state, decode-order updates from
+  transform units and palette CUs, ACT bases included). Closes the
+  `GENERAL_*_422` pair and both `Main_422_10` streams.
+- **§8.7.2.5.5 chroma deblocking `cQpPicOffset`** is the PPS chroma
+  offset alone — the slice/CU-level adjustments no longer leak into
+  the tC derivation.
+- `tests/conformance_official.rs` pins the 26 byte-exact streams
+  (docs-gated: a no-op where the corpus is not staged), and the
+  `conformance_scan` example triages the corpus with per-frame
+  §D.2 decoded-picture-hash SEI scoring.
+- The round also **disproves** the r413 "reference deviates on
+  explicit-RDPCM vertical blocks" note: a black-box decode of the
+  official `ExplicitRdpcm_A` stream reproduces the published digest
+  exactly, and this crate's luma decode agrees byte-for-byte — the
+  remaining divergence is a ±1 chroma artifact on isolated rows
+  (under investigation), not the §8.6.5 direction.
+
 ### Added — encoder AMP + hierarchical-B pyramids, round 431 (2026-07-27)
 
 - **Asymmetric motion partitions** (`LowDelayPEncoder::with_amp`,
