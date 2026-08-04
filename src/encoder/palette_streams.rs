@@ -360,6 +360,11 @@ fn encode_palette_cu(
     let explicit: Vec<&Run> = runs.iter().filter(|r| !r.copy).collect();
     let num_indices = explicit.len();
     let final_copy = runs.last().map(|r| r.copy).unwrap_or(false);
+    // Per-run RAW `palette_idx_idc` values (0 for copy-above runs):
+    // §9.3.4.2.8 derives the `palette_run_prefix` ctxInc from the
+    // signalled syntax element, so the run loop below needs the
+    // pre-eq.-7-84 value, not the plan's final index.
+    let mut idc_by_run: Vec<u32> = vec![0; runs.len()];
 
     if max_index > 0 {
         encode_num_palette_indices_minus1(cabac, w, num_indices as u32 - 1, max_index);
@@ -370,7 +375,7 @@ fn encode_palette_cu(
         let mut adjust = 0u32;
         let mut pos = 0usize;
         let mut prev_copy = false;
-        for r in &runs {
+        for (run_i, r) in runs.iter().enumerate() {
             if !r.copy {
                 let adjusted_ref = if pos > 0 {
                     let p = &scan[pos - 1];
@@ -393,6 +398,7 @@ fn encode_palette_cu(
                 } else {
                     target
                 };
+                idc_by_run[run_i] = idc;
                 let c_max = max_index - adjust;
                 if c_max > 0 {
                     encode_tb(cabac, w, idc, c_max);
@@ -423,7 +429,7 @@ fn encode_palette_cu(
     let mut remaining = num_indices;
     let mut pos = 0usize;
     let mut prev_copy = false;
-    for r in &runs {
+    for (run_i, r) in runs.iter().enumerate() {
         // Mirror the parse-side flag presence gates.
         if max_index > 0 && pos >= n && !prev_copy {
             if remaining > 0 && pos < area - 1 {
@@ -435,7 +441,9 @@ fn encode_palette_cu(
         } else {
             assert!(!r.copy, "copy-above not expressible at pos {pos}");
         }
-        let idc_for_ctx = if r.copy { 0 } else { u32::from(r.index) };
+        // §9.3.4.2.8: the run-prefix ctxInc consumes the RAW
+        // signalled `palette_idx_idc`, not the final palette index.
+        let idc_for_ctx = if r.copy { 0 } else { idc_by_run[run_i] };
         if max_index > 0 {
             if !r.copy {
                 remaining -= 1;

@@ -98,11 +98,16 @@ eq. 8-77 dequantizes exactly, keeping the stream lossless).
 Validation therefore rests on (a) the spec-transcribed §7.3.8.13 /
 §8.4.4.2.7 / §9.3.3.6 / §9.3.3.14 unit tests with hand-computed
 vectors, and (b) the lossless whole-stream roundtrip through the real
-CABAC engine and slice machinery, pinned byte-for-byte:
+CABAC engine and slice machinery, pinned byte-for-byte. (Round 437:
+both pins regenerated after the §9.3.4.2.8 correction — the
+`palette_run_prefix` ctxInc now consumes the RAW signalled
+`palette_idx_idc` rather than the eq. 7-84-adjusted `CurrPaletteIndex`
+on both the write and parse sides, a divergence exposed by the staged
+official SCC conformance streams.)
 
 | Pin | bytes | SHA-256 |
 | --- | --- | --- |
-| `r413-palette.hevc` | 402 | `faf242663abfb8f9ce8d6e874be1ec1339f3369ac609f60def8d702510603214` |
+| `r413-palette.hevc` | 411 | `4f80f73039b2073ca2e88d7eb59e34dc170ff922f0c645a1c575938bf80e527d` |
 | expected YUV (= planned palette content, 4608 B) | | `d54199726077c032f78546c5fe2ee7653a6a60f072006c33a0ec66e3013f3afd` |
 
 ### `r413-palette-init.hevc`
@@ -119,7 +124,7 @@ prefix + EGk escape suffix. Same validation posture as
 
 | Pin | bytes | SHA-256 |
 | --- | --- | --- |
-| `r413-palette-init.hevc` | 171 | `324345a3afb4203b02f47aba62558f8ec4c4f23119739dfc36d896aba152e74e` |
+| `r413-palette-init.hevc` | 171 | `8076f4bf7dc7607a668b785190ed5e87dce010d80b44dd2742852b6f892408e7` |
 | expected YUV (1536 B) | | `bdd5b00d4592586c46c9245f13f2c7cdd1daf78494342e0a88650523c6bb2af6` |
 
 ## Round-413 sweep record (beyond the pinned streams)

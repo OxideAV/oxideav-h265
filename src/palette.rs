@@ -384,6 +384,11 @@ pub fn decode_palette_coding(
     let mut remaining = num_palette_indices;
     let mut scan_pos = 0usize;
     let mut curr_palette_index = 0u32;
+    // The RAW `palette_idx_idc` (`PaletteIndexIdc[ currNumIndices ]`,
+    // §7.4.9.6 inferred 0 when absent) BEFORE the eq. 7-84
+    // adjustment: §9.3.4.2.8 derives the `palette_run_prefix` ctxInc
+    // from the syntax element value, not from `CurrPaletteIndex`.
+    let mut raw_palette_idx_idc = 0u32;
     while scan_pos < area {
         let pos = &scan[scan_pos];
         let (x_c, y_c) = (pos.x as usize, pos.y as usize);
@@ -410,6 +415,7 @@ pub fn decode_palette_coding(
                 .get(curr_num_indices)
                 .copied()
                 .unwrap_or(0);
+            raw_palette_idx_idc = curr_palette_index;
             let adjusted_ref = if scan_pos > 0 {
                 let p = &scan[scan_pos - 1];
                 if !copy_above[p.y as usize * n_cbs + p.x as usize] {
@@ -451,7 +457,7 @@ pub fn decode_palette_coding(
                 if max_run_minus1 > 0 {
                     // palette_run_prefix: TR with per-bin §9.3.4.2.8
                     // ctxInc for bins 0..=4, bypass beyond.
-                    let idc_for_ctx = if copy_flag { 0 } else { curr_palette_index };
+                    let idc_for_ctx = if copy_flag { 0 } else { raw_palette_idx_idc };
                     let c_max = palette_run_prefix_tr_cmax(max_run_minus1 as u32);
                     let (prefix, _escape) =
                         read_truncated_rice_prefix(
