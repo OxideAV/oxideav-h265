@@ -19,6 +19,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use oxideav_h265::decode_annexb_sequence;
+use oxideav_h265::nal::NalIter;
+use oxideav_h265::picture::Plane;
+use oxideav_h265::sei::{parse_sei_rbsp, PictureHash, SeiNalType, SeiPayload};
 
 /// RFC 1321 MD5 (self-contained; used only to check decoded output
 /// against the published conformance digests).
@@ -102,7 +105,11 @@ fn sidecar_digests(dir: &Path, stem: &str) -> Vec<String> {
             || name.ends_with("_md5sum.txt");
         // Sidecars whose name starts with the stream stem (upstream
         // also uses `<stem>_yuv.md5` and, for IPCM, a shortened stem).
+        let stem_unver = stem
+            .trim_end_matches(char::is_numeric)
+            .trim_end_matches('_');
         let matches_stem = name.starts_with(stem)
+            || name.starts_with(stem_unver)
             || stem.starts_with(name.trim_end_matches(".md5").trim_end_matches("_yuv"));
         if !is_sidecar || !matches_stem {
             continue;
@@ -119,6 +126,105 @@ fn sidecar_digests(dir: &Path, stem: &str) -> Vec<String> {
     digests.sort();
     digests.dedup();
     digests
+}
+
+/// All §D.2 decoded-picture-hash suffix-SEI messages in the stream,
+/// one `Vec<PictureHash>` (per component) per message, in decode order.
+fn picture_hashes(data: &[u8]) -> Vec<Vec<PictureHash>> {
+    let mut out = Vec::new();
+    for unit in NalIter::new(data).flatten() {
+        if unit.header.nal_unit_type != 40 {
+            continue;
+        }
+        let Ok(msgs) = parse_sei_rbsp(&unit.rbsp, SeiNalType::Suffix) else {
+            continue;
+        };
+        for m in msgs {
+            if let SeiPayload::DecodedPictureHash(h) = m.payload {
+                out.push(h.component_hashes);
+            }
+        }
+    }
+    out
+}
+
+/// §D.3 `pictureData` serialization of one plane (8-bit samples as
+/// single bytes, deeper as 16-bit little-endian).
+fn plane_bytes(pic: &oxideav_h265::picture::Picture, plane: Plane) -> Vec<u8> {
+    let (w, h) = pic.plane_dims(plane);
+    let bd = pic.bit_depth(plane);
+    let mut out = Vec::with_capacity(w * h * 2);
+    for y in 0..h {
+        for x in 0..w {
+            let v = pic.sample(plane, x, y);
+            if bd <= 8 {
+                out.push(v as u8);
+            } else {
+                out.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// The per-plane §D.3.19 hash triplet of one decoded picture,
+/// computed once per frame (MD5, CRC-16 and checksum per component).
+fn frame_hashes(pic: &oxideav_h265::picture::Picture) -> Vec<([u8; 16], u16, u32)> {
+    let planes = [Plane::Luma, Plane::Cb, Plane::Cr];
+    let n_comps = if pic.chroma_array_type() == 0 { 1 } else { 3 };
+    let mut out = Vec::with_capacity(n_comps);
+    for &plane in planes.iter().take(n_comps) {
+        let bytes = plane_bytes(pic, plane);
+        let hexs = md5::hex(&bytes);
+        let mut digest = [0u8; 16];
+        for i in 0..16 {
+            digest[i] = u8::from_str_radix(&hexs[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        // §D.3.19 CRC-16 (poly 0x1021, init 0xFFFF, two zero bytes
+        // appended, bits msb-first).
+        let mut crc: u32 = 0xFFFF;
+        for &b in bytes.iter().chain([0u8, 0u8].iter()) {
+            for bit in (0..8).rev() {
+                let msb = (crc >> 15) & 1;
+                let d = u32::from((b >> bit) & 1);
+                crc = ((crc << 1) & 0xFFFF) ^ (0x1021 * (msb ^ d));
+            }
+        }
+        // §D.3.19 checksum: byte-wise sum with the coordinate xor mask.
+        let (pw, ph) = pic.plane_dims(plane);
+        let bd = pic.bit_depth(plane);
+        let mut sum: u32 = 0;
+        for y in 0..ph {
+            for x in 0..pw {
+                let v = pic.sample(plane, x, y) as u32;
+                let xor_mask = ((x & 0xFF) ^ (y & 0xFF) ^ (x >> 8) ^ (y >> 8)) as u32;
+                sum = sum
+                    .wrapping_add((v & 0xFF) ^ xor_mask)
+                    .wrapping_add(if bd > 8 {
+                        ((v >> 8) & 0xFF) ^ xor_mask
+                    } else {
+                        0
+                    });
+            }
+        }
+        out.push((digest, crc as u16, sum));
+    }
+    out
+}
+
+/// Match one frame's precomputed hash triplets against one SEI set.
+fn frame_matches(frame: &[([u8; 16], u16, u32)], hashes: &[PictureHash]) -> bool {
+    if hashes.len() != frame.len() {
+        return false;
+    }
+    frame
+        .iter()
+        .zip(hashes)
+        .all(|((md5d, crc, sum), h)| match h {
+            PictureHash::Md5(e) => md5d == e,
+            PictureHash::Crc(e) => crc == e,
+            PictureHash::Checksum(e) => sum == e,
+        })
 }
 
 fn scan_branch(branch_dir: &Path, filter: &str, summary: &mut String) -> (usize, usize) {
@@ -184,8 +290,25 @@ fn scan_branch(branch_dir: &Path, filter: &str, summary: &mut String) -> (usize,
                     pass += 1;
                     format!("PASS16 {stem}: {n} frames")
                 } else {
+                    // Frame-level triage against the stream's own
+                    // decoded-picture-hash SEI messages (order-free
+                    // membership: a frame is OK if ANY SEI hash-set
+                    // matches it).
+                    let sei = picture_hashes(&data);
+                    let (mut ok_frames, mut first_bad) = (0usize, None::<usize>);
+                    if !sei.is_empty() {
+                        for (i, f) in frames.iter().enumerate() {
+                            let fh = frame_hashes(&f.picture);
+                            if sei.iter().any(|h| frame_matches(&fh, h)) {
+                                ok_frames += 1;
+                            } else if first_bad.is_none() {
+                                first_bad = Some(i);
+                            }
+                        }
+                    }
                     format!(
-                        "MISMATCH {stem}: {n} frames, ours8={} ours16={d16}, published yuv {:?}",
+                        "MISMATCH {stem}: {n} frames, sei_ok={ok_frames}/{} first_bad={first_bad:?}, ours8={} ours16={d16}, published yuv {:?}",
+                        sei.len(),
                         d8.unwrap_or_else(|| "-".into()),
                         yuv_digests
                     )
