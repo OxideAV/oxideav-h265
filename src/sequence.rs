@@ -391,6 +391,11 @@ impl SequenceDecoder {
         // (TableStateIdxDs, §9.3.2.4).
         let mut cur_indep: &SegmentData = indep;
         let mut ds_stored: Option<SliceContexts> = None;
+        // §9.3.2.4 WPP snapshot — ONE picture-wide storage: a CTU row
+        // started by a later slice segment of the same slice
+        // synchronizes from the state stored while an earlier segment
+        // decoded the row above (§9.3.2.5, T-availability gated).
+        let mut wpp_stored: Option<SliceContexts> = None;
         for seg in segs {
             if seg.header.dependent_slice_segment_flag {
                 if ds_stored.is_none() {
@@ -411,6 +416,7 @@ impl SequenceDecoder {
                 &mut decoded,
                 &mut slice_addr_of,
                 &mut ds_stored,
+                &mut wpp_stored,
                 self.tolerant,
             )?;
         }
@@ -623,6 +629,7 @@ pub fn decode_annexb_sequence_debug(
     let mut parse_state =
         PictureParseState::new(&build_slice_data_params(&seg.header, sps, pps, &geom, st));
     let mut ds_stored = None;
+    let mut wpp_stored = None;
     let res = decode_slice_segment_data(
         seg,
         &seg.header,
@@ -633,6 +640,7 @@ pub fn decode_annexb_sequence_debug(
         &mut decoded,
         &mut slice_addr_of,
         &mut ds_stored,
+        &mut wpp_stored,
         false,
     );
     if let Err(e) = res {
@@ -691,6 +699,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
         st0,
     ));
     let mut ds_stored = None;
+    let mut wpp_stored = None;
     if let Err(e) = decode_slice_segment_data(
         seg,
         &seg.header,
@@ -701,6 +710,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
         &mut decoded,
         &mut slice_addr_of,
         &mut ds_stored,
+        &mut wpp_stored,
         true,
     ) {
         eprintln!("(walk error: {e})");
@@ -1310,6 +1320,7 @@ fn decode_slice_segment_data(
     decoded: &mut Vec<(u32, u32, CodingTreeUnit)>,
     slice_addr_of: &mut [Option<u32>],
     ds_stored: &mut Option<SliceContexts>,
+    wpp_stored: &mut Option<SliceContexts>,
     tolerant: bool,
 ) -> Result<(), SequenceError> {
     let header = effective_header;
@@ -1408,17 +1419,53 @@ fn decode_slice_segment_data(
         c.palette_predictor = base_palette_predictor.clone();
         c
     };
+    // §6.4.1-gated availability of the spatial neighbour T (eq. 9-3,
+    // the above-right CTB) for the §9.3.2.5 WPP synchronization: T
+    // must exist, lie in the SAME slice (the stored snapshot may come
+    // from an earlier slice segment of that slice) and the same tile.
+    let t_available = |ctb_addr_ts: u32, slice_addr_of: &[Option<u32>]| {
+        let rs = tiling.ctb_addr_ts_to_rs(ctb_addr_ts);
+        let (rx, ry) = (rs % geom.pic_w_ctbs, rs / geom.pic_w_ctbs);
+        ry > 0 && rx + 1 < geom.pic_w_ctbs && {
+            let t_rs = (ry - 1) * geom.pic_w_ctbs + rx + 1;
+            slice_addr_of[t_rs as usize] == Some(slice_addr_rs)
+                && tiling.tile_id(tiling.ctb_addr_rs_to_ts(t_rs)) == tiling.tile_id(ctb_addr_ts)
+        }
+    };
+    // §9.3.2.1 — the initial context state of this slice segment. For
+    // a DEPENDENT segment the branch order matters: a segment whose
+    // first CTU is the first CTU of a tile RE-INITIALIZES (§9.3.2.2 /
+    // §9.3.2.3), one whose first CTU starts a CTU row of a tile under
+    // entropy_coding_sync SYNCHRONIZES from the WPP snapshot
+    // (§9.3.2.5, T-availability gated), and only otherwise does the
+    // §9.3.2.5 dependent-segment synchronization from TableStateIdxDs
+    // apply. An independent segment re-initializes.
     let mut ctx = if seg.header.dependent_slice_segment_flag {
-        ds_stored.clone().ok_or(SequenceError::Malformed(
-            "dependent segment without Ds state",
-        ))?
+        let first_rs = seg.header.slice_segment_address;
+        let (rx, _ry) = (first_rs % geom.pic_w_ctbs, first_rs / geom.pic_w_ctbs);
+        let tile_start = tiles_on
+            && ctb_addr_ts > 0
+            && tiling.tile_id(ctb_addr_ts) != tiling.tile_id(ctb_addr_ts - 1);
+        let wpp_row_start = wpp
+            && !tile_start
+            && (rx == 0
+                || tiling.tile_id(tiling.ctb_addr_rs_to_ts(first_rs - 1))
+                    != tiling.tile_id(ctb_addr_ts));
+        if tile_start {
+            fresh_contexts()
+        } else if wpp_row_start {
+            match (&*wpp_stored, t_available(ctb_addr_ts, slice_addr_of)) {
+                (Some(stored), true) => stored.clone(),
+                _ => fresh_contexts(),
+            }
+        } else {
+            ds_stored.clone().ok_or(SequenceError::Malformed(
+                "dependent segment without Ds state",
+            ))?
+        }
     } else {
         fresh_contexts()
     };
-    // §9.3.2.4 / §9.3.2.5 — the WPP context storage (stored after the
-    // second CTB of a row; synchronized at the next row's start when
-    // the above-right CTB is available).
-    let mut wpp_stored: Option<SliceContexts> = None;
     let mut first_ctu = true;
     // Set after the row-final CTU's end_of_subset_one_bit: the next CTU
     // starts a new substream.
@@ -1472,13 +1519,7 @@ fn decode_slice_segment_data(
                 } else {
                     // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
                     // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
-                    let t_avail = ry > 0 && rx + 1 < geom.pic_w_ctbs && {
-                        let t_rs = (ry - 1) * geom.pic_w_ctbs + rx + 1;
-                        slice_addr_of[t_rs as usize] == Some(slice_addr_rs)
-                            && tiling.tile_id(tiling.ctb_addr_rs_to_ts(t_rs))
-                                == tiling.tile_id(ctb_addr_ts)
-                    };
-                    ctx = match (&wpp_stored, t_avail) {
+                    ctx = match (&*wpp_stored, t_available(ctb_addr_ts, slice_addr_of)) {
                         (Some(stored), true) => stored.clone(),
                         _ => fresh_contexts(),
                     };
@@ -1528,7 +1569,7 @@ fn decode_slice_segment_data(
                     && tiling.tile_id(ctb_addr_ts)
                         != tiling.tile_id(tiling.ctb_addr_rs_to_ts(ctb_addr_rs - 2))))
         {
-            wpp_stored = Some(ctx.clone());
+            *wpp_stored = Some(ctx.clone());
         }
 
         let eos = end_of_slice_segment_flag(&mut engine)

@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — §9.3.2.1 initialization priority at dependent-segment starts, round 441 (2026-08-12)
+
+A dependent slice segment whose first CTU is the first CTU of a tile
+RE-INITIALIZES the CABAC contexts / StatCoeff / palette predictor
+(§9.3.2.2 / §9.3.2.3), and one whose first CTU starts a CTU row of a
+tile under `entropy_coding_sync_enabled_flag` SYNCHRONIZES from the
+§9.3.2.4 WPP snapshot — the §9.3.2.5 `TableStateIdxDs` restore is
+only the LAST branch of §9.3.2.1, not the unconditional dependent-
+segment behaviour this decoder applied. The WPP snapshot storage is
+also picture-wide now: a CTU row started by a later slice segment of
+the same slice synchronizes from the state stored while an earlier
+segment decoded the row above (spatial-neighbour-T availability
+gated, §6.4.1). Closes the `WAVETILES` official stream (its fourth
+CVS packs wavefronts + tiles + 6-CTU dependent slice segments):
+37/61 → **38/61** byte-exact.
+
 ### Fixed — §7.4.2.4.4 access-unit boundary on parameter-set NAL units, round 441 (2026-08-12)
 
 A VPS / SPS / PPS NAL unit (`nuh_layer_id == 0`) succeeding a VCL NAL
