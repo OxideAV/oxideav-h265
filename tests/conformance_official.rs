@@ -79,22 +79,33 @@ mod md5 {
     }
 }
 
-/// The streams pinned byte-exact (round 437). `branch/stem` form.
+/// The streams pinned byte-exact (rounds 437 + 441). `branch/stem` form.
 const EXPECTED_PASS: &[&str] = &[
     "RExt/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2",
+    "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_10BIT_RExt_Sony_1",
+    "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_12BIT_RExt_Sony_1",
+    "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_16BIT_RExt_Sony_1",
     "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_8BIT_RExt_Sony_1",
+    "RExt/EXTPREC_MAIN_444_16_INTRA_10BIT_RExt_Sony_1",
+    "RExt/EXTPREC_MAIN_444_16_INTRA_12BIT_RExt_Sony_1",
+    "RExt/EXTPREC_MAIN_444_16_INTRA_16BIT_RExt_Sony_1",
     "RExt/EXTPREC_MAIN_444_16_INTRA_8BIT_RExt_Sony_1",
     "RExt/GENERAL_10b_420_RExt_Sony_1",
     "RExt/GENERAL_10b_422_RExt_Sony_1",
+    "RExt/GENERAL_10b_444_RExt_Sony_2",
     "RExt/GENERAL_12b_400_RExt_Sony_1",
     "RExt/GENERAL_12b_420_RExt_Sony_1",
     "RExt/GENERAL_12b_422_RExt_Sony_1",
+    "RExt/GENERAL_12b_444_RExt_Sony_2",
+    "RExt/GENERAL_16b_400_RExt_Sony_1",
     "RExt/GENERAL_8b_400_RExt_Sony_1",
     "RExt/GENERAL_8b_420_RExt_Sony_1",
+    "RExt/GENERAL_8b_444_RExt_Sony_2",
     "RExt/IPCM_A_RExt_NEC_2",
     "RExt/IPCM_B_RExt_NEC",
     "RExt/Main_422_10_A_RExt_Sony_2",
     "RExt/Main_422_10_B_RExt_Sony_2",
+    "RExt/PERSIST_RPARAM_A_RExt_Sony_3",
     "RExt/TSCTX_10bit_I_RExt_SHARP_1",
     "RExt/TSCTX_10bit_RExt_SHARP_1",
     "RExt/TSCTX_12bit_I_RExt_SHARP_1",

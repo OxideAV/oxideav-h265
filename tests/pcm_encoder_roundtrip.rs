@@ -552,3 +552,71 @@ fn loop_filter_options_are_validated() {
     params.options.insert("sao", "banana");
     assert!(oxideav_h265::make_encoder(&params).is_err());
 }
+
+/// §7.4.2.4.4 — a parameter-set NAL unit following a VCL NAL unit
+/// starts a NEW access unit, so the pending picture must be decoded
+/// against the parameter sets it was coded with BEFORE the arriving
+/// set (legally re-sent with the same id and different content for
+/// the next CVS) overwrites them.
+#[test]
+fn resent_parameter_sets_do_not_retroactively_apply_to_the_pending_picture() {
+    let a = planes(16, 16, 0x5a);
+    let b = planes(48, 32, 0xa5);
+    let mut stream = oxideav_h265::encoder::pcm::encode_idr_pcm_au(
+        &a.planes[0].data,
+        &a.planes[1].data,
+        &a.planes[2].data,
+        16,
+        16,
+    )
+    .expect("encode CVS 1");
+    // Second CVS with a DIFFERENT geometry under the SAME sps/pps ids.
+    stream.extend(
+        oxideav_h265::encoder::pcm::encode_idr_pcm_au(
+            &b.planes[0].data,
+            &b.planes[1].data,
+            &b.planes[2].data,
+            48,
+            32,
+        )
+        .expect("encode CVS 2"),
+    );
+
+    let frames = oxideav_h265::decode_annexb_sequence(&stream).expect("decode both CVSs");
+    assert_eq!(frames.len(), 2);
+    let dims: Vec<(usize, usize)> = frames
+        .iter()
+        .map(|f| (f.picture.width_luma(), f.picture.height_luma()))
+        .collect();
+    assert_eq!(dims, vec![(16, 16), (48, 32)]);
+    // PCM is lossless: both pictures reproduce their sources exactly.
+    for (frame, (src, w, h)) in frames.iter().zip([(&a, 16usize, 16usize), (&b, 48, 32)]) {
+        for (plane, (pw, ph), data) in [
+            (
+                oxideav_h265::picture::Plane::Luma,
+                (w, h),
+                &src.planes[0].data,
+            ),
+            (
+                oxideav_h265::picture::Plane::Cb,
+                (w / 2, h / 2),
+                &src.planes[1].data,
+            ),
+            (
+                oxideav_h265::picture::Plane::Cr,
+                (w / 2, h / 2),
+                &src.planes[2].data,
+            ),
+        ] {
+            for y in 0..ph {
+                for x in 0..pw {
+                    assert_eq!(
+                        frame.picture.sample(plane, x, y),
+                        i32::from(data[y * pw + x]),
+                        "plane {plane:?} sample ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+}

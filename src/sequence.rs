@@ -250,14 +250,30 @@ impl SequenceDecoder {
         }
         match header.nal_unit_type {
             NAL_VPS => {
+                // §7.4.2.4.4: a VPS / SPS / PPS NAL unit (nuh_layer_id
+                // 0) succeeding a VCL NAL unit starts a NEW access
+                // unit — the pending picture is complete. Decode it
+                // BEFORE the arriving parameter set can overwrite the
+                // sets it was coded against (streams legally re-send
+                // a parameter set with the same id and new content for
+                // the next CVS / picture).
+                if header.nuh_layer_id == 0 {
+                    self.finish_picture()?;
+                }
                 // The VPS carries no fields the single-layer decode
-                // needs; activation is a no-op.
+                // needs; activation is otherwise a no-op.
             }
             NAL_SPS => {
+                if header.nuh_layer_id == 0 {
+                    self.finish_picture()?;
+                }
                 let sps = SeqParameterSet::parse(&rbsp)?;
                 self.sps.insert(sps.sps_id, sps);
             }
             NAL_PPS => {
+                if header.nuh_layer_id == 0 {
+                    self.finish_picture()?;
+                }
                 let pps = PicParameterSet::parse(&rbsp)?;
                 self.pps.insert(pps.pps_id, pps);
             }

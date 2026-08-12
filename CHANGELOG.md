@@ -6,6 +6,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — §7.4.2.4.4 access-unit boundary on parameter-set NAL units, round 441 (2026-08-12)
+
+A VPS / SPS / PPS NAL unit (`nuh_layer_id == 0`) succeeding a VCL NAL
+unit **starts a new access unit**, so the pending picture is complete
+and must be decoded before the arriving parameter set is activated.
+The whole-bitstream driver deferred that decode to the next picture's
+first slice — by which time a re-sent parameter set with the same id
+and different content (the normal shape of multi-CVS conformance
+streams and per-picture-PPS streams) had already overwritten the maps
+the picture decode reads. Slice *headers* were parsed against the
+right sets; the slice-data decode was not.
+
+One fix, eleven official conformance streams (26/61 → **37/61**
+byte-exact): both `EXTPREC_*_444_16_INTRA` families at 10/12/16 bit
+(the 4:4:4 extended-precision matrix is now complete at every staged
+depth), `GENERAL_{8,10,12}b_444`, `GENERAL_16b_400`, and
+`PERSIST_RPARAM_A`; `QMATRIX_A` (twenty per-picture PPSs) improves
+from 1/20 to 4/20 hash-correct frames. Regression-pinned by a two-CVS
+same-ids different-geometry lossless roundtrip and the expanded
+`tests/conformance_official.rs` list.
+
 ### Added / Fixed — official RExt + SCC conformance, round 437 (2026-08-04)
 
 Round 437 triaged the staged official JCT-VC conformance corpus
