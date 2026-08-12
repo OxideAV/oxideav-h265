@@ -20,12 +20,15 @@ transform, intra block copy), and a 37-stream black-box tool-axis
 sweep (round 410) held byte-exact by nine embedded pins. Against the
 staged **official JCT-VC RExt / SCC conformance corpus** (61
 decodable bitstreams with published output digests,
-`docs/video/h265/conformance/`), 26 streams decode byte-exact
-(round 437; docs-gated pins in `tests/conformance_official.rs`) —
+`docs/video/h265/conformance/`), 38 streams decode byte-exact
+(round 441; docs-gated pins in `tests/conformance_official.rs`) —
 including the transform-skip-context, wavefronts-inside-tiles /
-aligned-bypass / high-throughput, persistent-Rice-seeded,
-Monochrome 8/12-bit, Main 4:2:2 10 and 8-bit
-extended-precision-intra families. Coverage:
+aligned-bypass / high-throughput, persistent-Rice(-seeded and
+single-stream-anchor), Monochrome 8/12/16-bit, Main 4:2:2 10, the
+COMPLETE 4:4:4 extended-precision-intra matrix (both profiles at
+8/10/12/16-bit), the 4:4:4 `GENERAL_*` multi-tool family, and
+`WAVETILES` (wavefronts + tiles + dependent slice segments in one
+picture). Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -227,16 +230,21 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   crate's luma decode agrees byte-for-byte, and the remaining
   divergence is an unrelated ±1 chroma artifact on isolated rows,
   still under investigation.)
-* Official-corpus families not yet byte-exact: the 4:4:4
-  multi-tool `GENERAL_*_444` / `WAVETILES` / `QMATRIX` parse
-  desync (mid-picture, first reproduces in a busy 4:4:4 intra CTB),
-  16-bit extended-precision reconstruction (the 8-bit
-  extended-precision streams pass; 10/12/16-bit diverge on their
-  first picture), unequal luma/chroma bit depths (first divergence
-  at frame 4), the official CCP / SAO-offset-scale / persistent-Rice
-  single-stream anchors, and most SCC streams (palette-heavy parse
-  still desyncs mid-slice; two streams decode all 33 frames with
-  subtle reconstruction deltas).
+* Official-corpus families not yet byte-exact (23 streams):
+  * the CCP anchors (`CCP_{8,10,12}bit`) and `QMATRIX_A` — first
+    intra pictures byte-exact, chroma-only ±small divergence from
+    the first B pictures on (localized to a missing `+1`-offset
+    population inside single band/edge classes of chroma SAO CTBs;
+    the CCP application itself reproduces eq. 8-324 exactly and the
+    affected samples are mostly OUTSIDE cross-component-predicted
+    TUs);
+  * `Bitdepth_A/B` (unequal luma/chroma depths) — 4 intra frames
+    byte-exact, Cr diverges from the first inter frame;
+  * `SAO_A_RExt` (SAO offset scale) and `ExplicitRdpcm_A` (±1 chroma
+    rows, luma byte-exact);
+  * all 15 SCC streams: the palette-heavy 4:4:4 parse still desyncs
+    inside the first picture (predictor-run bound trips), while the
+    4:2:0 SCC streams decode fully with reconstruction deltas.
 
 ## License
 
