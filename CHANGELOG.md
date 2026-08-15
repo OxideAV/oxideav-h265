@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — §7.3.8.10 `tu_residual_act_flag` presence gate is a three-way disjunction, round 444 (2026-08-15)
+
+The adaptive-colour-transform flag is present for a `MODE_INTER`
+coding unit, OR a `PART_2Nx2N` intra CU whose
+`intra_chroma_pred_mode[ x0 ][ y0 ]` is 4 (derived mode), OR an intra
+CU whose four MinCb-quadrant `intra_chroma_pred_mode` values are all
+4 — the `PART_NxN` derived-mode case. This decoder conjoined the last
+two arms, so on ACT-enabled 4:4:4 SCC streams every `PART_NxN`
+all-derived-mode intra CU skipped a context-coded bin and the CABAC
+parse silently desynchronized — surfacing hundreds of coding units
+later as palette-bound violations (`palette_predictor_run` /
+`PaletteMaxRunMinus1` errors), which the r441 triage had recorded as
+a palette-upstream desync. All 12 previously-erroring official SCC
+bitstreams now parse end to end (the corpus 4:2:0/4:4:4 split was the
+giveaway: ACT is 4:4:4-only). Byte-exactness of the SCC branch is
+still open (reconstruction deltas from the first picture, all 15
+streams); pinned by the `act_flag_gate_is_a_three_way_disjunction`
+unit test.
+
 ### Fixed — §8.5.4.3 codes ONE chroma block per 4:4:4 transform unit, round 444 (2026-08-15)
 
 The stacked upper/lower chroma-block pair of a transform unit exists

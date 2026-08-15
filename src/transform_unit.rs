@@ -257,15 +257,19 @@ pub fn decode_transform_unit(
         || (params.chroma_array_type == 2 && (params.cbf_cb_lower || params.cbf_cr_lower));
 
     if params.cbf_luma || cbf_chroma {
-        // §7.3.8.10 adaptive-colour-transform predicate.
+        // §7.3.8.10 adaptive-colour-transform predicate — a THREE-way
+        // disjunction: MODE_INTER, or a PART_2Nx2N intra CU whose
+        // intra_chroma_pred_mode[ x0 ][ y0 ] is 4 (derived-mode), or
+        // an intra CU whose four MinCb-quadrant
+        // intra_chroma_pred_mode[ xP.. ][ yP.. ] values are ALL 4 (the
+        // PART_NxN derived-mode case).
         let act_gate = params.residual_adaptive_colour_transform_enabled_flag
             && (params.cu_pred_mode == CuPredMode::Inter
-                || (params.part_mode_2nx2n
-                    && params.intra_chroma_pred_mode == 4
-                    && params
-                        .intra_chroma_pred_mode_corners
-                        .iter()
-                        .all(|&m| m == 4)));
+                || (params.part_mode_2nx2n && params.intra_chroma_pred_mode == 4)
+                || params
+                    .intra_chroma_pred_mode_corners
+                    .iter()
+                    .all(|&m| m == 4));
         tu.tu_residual_act_flag = if act_gate {
             decode_tu_residual_act_flag(engine, &mut ctx.tu_residual_act_flag[0])?
         } else {
@@ -587,6 +591,43 @@ mod tests {
         // No context adaptation ⇒ no bins consumed from the engine.
         assert_eq!(ctx, ctx_before);
         assert_eq!(qg, QuantGroupState::default());
+    }
+
+    /// §7.3.8.10 — the `tu_residual_act_flag` presence gate is a
+    /// THREE-way disjunction. A `PART_NxN` intra coding unit whose
+    /// four MinCb-quadrant `intra_chroma_pred_mode` values are all 4
+    /// reads the flag even though the `PART_2Nx2N &&
+    /// intra_chroma_pred_mode == 4` arm is false, and a `PART_2Nx2N`
+    /// derived-mode CU reads it regardless of the corner values.
+    #[test]
+    fn act_flag_gate_is_a_three_way_disjunction() {
+        let decode_consumes_act_bin = |part_2nx2n: bool, icpm: u8, corners: [u8; 4]| -> bool {
+            let data = [0x5Au8; 96];
+            let mut engine = CabacEngine::new(BitReader::new(&data)).unwrap();
+            let mut ctx = SliceContexts::init(0, 26);
+            let ctx_before = ctx.clone();
+            let mut qg = QuantGroupState::default();
+            let mut params = base_params();
+            params.chroma_array_type = 3;
+            params.residual_adaptive_colour_transform_enabled_flag = true;
+            params.cbf_luma = true;
+            params.log2_trafo_size = 2;
+            params.part_mode_2nx2n = part_2nx2n;
+            params.intra_chroma_pred_mode = icpm;
+            params.intra_chroma_pred_mode_corners = corners;
+            decode_transform_unit(&mut engine, &mut ctx, &params, &mut qg).unwrap();
+            // The act flag is the only context-coded element consulting
+            // this slot; adaptation proves the bin was read.
+            ctx.tu_residual_act_flag != ctx_before.tu_residual_act_flag
+        };
+        // PART_NxN (not 2Nx2N), all four corners derived-mode: read.
+        assert!(decode_consumes_act_bin(false, 4, [4, 4, 4, 4]));
+        // PART_2Nx2N derived-mode: read (second arm).
+        assert!(decode_consumes_act_bin(true, 4, [4, 4, 4, 4]));
+        // PART_NxN with a non-derived corner: inferred 0, no bin.
+        assert!(!decode_consumes_act_bin(false, 4, [4, 4, 0, 4]));
+        // PART_2Nx2N non-derived mode: inferred 0, no bin.
+        assert!(!decode_consumes_act_bin(true, 0, [0, 0, 0, 0]));
     }
 
     /// `cbfLuma` set but no chroma ⇒ a single luma residual_coding is
