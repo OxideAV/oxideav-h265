@@ -20,15 +20,20 @@ transform, intra block copy), and a 37-stream black-box tool-axis
 sweep (round 410) held byte-exact by nine embedded pins. Against the
 staged **official JCT-VC RExt / SCC conformance corpus** (61
 decodable bitstreams with published output digests,
-`docs/video/h265/conformance/`), 38 streams decode byte-exact
-(round 441; docs-gated pins in `tests/conformance_official.rs`) —
-including the transform-skip-context, wavefronts-inside-tiles /
-aligned-bypass / high-throughput, persistent-Rice(-seeded and
-single-stream-anchor), Monochrome 8/12/16-bit, Main 4:2:2 10, the
-COMPLETE 4:4:4 extended-precision-intra matrix (both profiles at
-8/10/12/16-bit), the 4:4:4 `GENERAL_*` multi-tool family, and
-`WAVETILES` (wavefronts + tiles + dependent slice segments in one
-picture). Coverage:
+`docs/video/h265/conformance/`), 46 streams decode byte-exact
+(round 444; docs-gated pins in `tests/conformance_official.rs`) —
+**the complete 46-stream RExt branch**: transform-skip-context,
+wavefronts-inside-tiles / aligned-bypass / high-throughput,
+persistent-Rice(-seeded and single-stream-anchor), Monochrome
+8/12/16-bit, Main 4:2:2 10, the COMPLETE 4:4:4
+extended-precision-intra matrix (both profiles at 8/10/12/16-bit),
+the 4:4:4 `GENERAL_*` multi-tool family, `WAVETILES` (wavefronts +
+tiles + dependent slice segments in one picture), the
+cross-component-prediction anchors (`CCP_{8,10,12}bit`), `QMATRIX_A`,
+unequal luma/chroma depths (`Bitdepth_A/B`), `SAO_A_RExt`, and
+`ExplicitRdpcm_A`. All 15 official SCC bitstreams parse end to end
+(round 444 §7.3.8.10 ACT-gate fix); their reconstruction is not yet
+byte-exact. Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -224,27 +229,21 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   `disableIntraBoundaryFilter` when implicit RDPCM combines with
   transquant bypass, suppressing the mode-10/26 edge filters — a
   black-box reference decoder applies those filters regardless.
-  (The r413 note claiming a reference deviation on explicit-RDPCM
-  *vertical* blocks is retired: the official `ExplicitRdpcm_A`
-  conformance stream matches the black-box decode exactly, this
-  crate's luma decode agrees byte-for-byte, and the remaining
-  divergence is an unrelated ±1 chroma artifact on isolated rows,
-  still under investigation.)
-* Official-corpus families not yet byte-exact (23 streams):
-  * the CCP anchors (`CCP_{8,10,12}bit`) and `QMATRIX_A` — first
-    intra pictures byte-exact, chroma-only ±small divergence from
-    the first B pictures on (localized to a missing `+1`-offset
-    population inside single band/edge classes of chroma SAO CTBs;
-    the CCP application itself reproduces eq. 8-324 exactly and the
-    affected samples are mostly OUTSIDE cross-component-predicted
-    TUs);
-  * `Bitdepth_A/B` (unequal luma/chroma depths) — 4 intra frames
-    byte-exact, Cr diverges from the first inter frame;
-  * `SAO_A_RExt` (SAO offset scale) and `ExplicitRdpcm_A` (±1 chroma
-    rows, luma byte-exact);
-  * all 15 SCC streams: the palette-heavy 4:4:4 parse still desyncs
-    inside the first picture (predictor-run bound trips), while the
-    4:2:0 SCC streams decode fully with reconstruction deltas.
+  (The r413/r437 "±1 chroma artifact under investigation" notes are
+  retired: the divergence was the round-444 §8.5.4.3 phantom
+  stacked-half bug, and `ExplicitRdpcm_A` is now byte-exact.)
+* Official-corpus families not yet byte-exact (the 15 SCC streams):
+  every SCC bitstream parses end to end (round 444 closed the
+  §7.3.8.10 ACT-gate CABAC desync), and the decoded pictures are
+  visually clean, but reconstruction diverges from the published
+  per-frame hashes starting at the first picture — before the loop
+  filters, in pictures whose only non-validated tools are intra
+  block copy and the SCC glue. Round-444 elimination notes: the
+  §8.5.3.3.3 MC math, eq. 8-124/8-125 merge rounding, chroma-QP /
+  scaling-list / WP paths and the loop-filter stages all self-check
+  clean against the Recommendation text; localizing further needs
+  per-region ground truth that the corpus sidecars (whole-plane
+  MD5s) do not provide.
 
 ## License
 
