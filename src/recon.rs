@@ -1108,7 +1108,6 @@ fn extract_residual_tree(
                         transquant_bypass,
                         xc,
                         yc,
-                        sh,
                         n_tbs,
                         ccp_cb,
                         plane,
@@ -1125,7 +1124,6 @@ fn extract_residual_tree(
                         transquant_bypass,
                         xc,
                         yc,
-                        sh,
                         n_tbs,
                         ccp_cr,
                         plane,
@@ -1155,16 +1153,20 @@ fn write_chroma_residual_blocks(
     transquant_bypass: bool,
     xc: usize,
     yc: usize,
-    sub_h: usize,
     n_tbs_c: usize,
     ccp: Option<CcpInput<'_>>,
     plane: &mut CuResidualPlane,
 ) -> Result<(), ReconError> {
     // §7.3.8.10 codes the halves upper-then-lower, each gated on its
-    // own cbf (`sub_h == 1` ⇔ ChromaArrayType == 2 stacked pair) — pair
-    // the residual list entries to the coded halves.
+    // own cbf. The stacked pair exists ONLY for ChromaArrayType == 2
+    // (§8.5.4.3: blkIdx proceeds over 0..( ChromaArrayType == 2 ? 1 :
+    // 0 )) — 4:4:4 also has SubHeightC == 1 but codes a single chroma
+    // block per transform unit, so keying on `sub_h` alone would
+    // synthesize a phantom second block one TU-height below (visible
+    // as a spurious §8.6.6 cross-component application on 4:4:4
+    // cbf-clear blocks).
     let mut next_block = 0usize;
-    let halves = if sub_h == 1 { 2 } else { 1 };
+    let halves = if params.chroma_array_type == 2 { 2 } else { 1 };
     for (v, &coded) in coded_halves.iter().enumerate().take(halves) {
         let (mut res, n) = if coded {
             let Some(rb) = blocks.get(next_block) else {
@@ -3693,6 +3695,58 @@ mod tests {
             "cr: {:?}",
             &res.cr.as_ref().unwrap().samples[..8]
         );
+    }
+
+    /// §8.5.4.3: the stacked upper/lower chroma-block pair exists only
+    /// for `ChromaArrayType == 2` (`blkIdx` proceeds over
+    /// `0..( ChromaArrayType == 2 ? 1 : 0 )`). A 4:4:4 transform unit
+    /// codes ONE chroma block — a cbf-clear Cb with cross-component
+    /// prediction must modify exactly its own `nTbS` square and never
+    /// synthesize a second block one TU-height below (the phantom
+    /// write previously corrupted the sibling leaf's region in every
+    /// split transform tree).
+    #[test]
+    fn ccp_444_uncoded_chroma_writes_single_block_not_stacked_halves() {
+        let params = params_444();
+        let raw = |levels: Vec<i32>| ResidualBlock {
+            log2_trafo_size: 3,
+            last_sig_coeff_x: 7,
+            last_sig_coeff_y: 7,
+            levels,
+            transform_skip: false,
+            explicit_rdpcm_flag: false,
+            explicit_rdpcm_dir_flag: false,
+        };
+        // Top-left 8×8 leaf: luma residual 16, CCP on a cbf-clear Cb
+        // (contribution (2·16) >> 3 = 4). The other three leaves are
+        // empty (no luma, no chroma, no CCP).
+        let ccp_leaf = TransformTree::Leaf {
+            cbf_luma: true,
+            unit: TransformUnit {
+                residual_luma: Some(raw(vec![16; 64])),
+                cross_comp_pred_cb: Some(ccp(2)),
+                ..Default::default()
+            },
+        };
+        let empty_leaf = || TransformTree::Leaf {
+            cbf_luma: false,
+            unit: TransformUnit::default(),
+        };
+        let tree = TransformTree::Split {
+            cbf_cb: true,
+            cbf_cb_lower: false,
+            cbf_cr: false,
+            cbf_cr_lower: false,
+            children: Box::new([ccp_leaf, empty_leaf(), empty_leaf(), empty_leaf()]),
+        };
+        let res = extract_cu_residual(&params, Some(&tree), 0, 0, 16, 25, true).unwrap();
+        let cb = res.cb.as_ref().unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = if x < 8 && y < 8 { 4 } else { 0 };
+                assert_eq!(cb.samples[y * 16 + x], expected, "cb residual at ({x},{y})");
+            }
+        }
     }
 
     /// A zero ResScaleVal (`log2_res_scale_abs_plus1 == 0`) is the

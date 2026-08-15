@@ -79,9 +79,14 @@ mod md5 {
     }
 }
 
-/// The streams pinned byte-exact (rounds 437 + 441). `branch/stem` form.
+/// The streams pinned byte-exact (rounds 437 + 441 + 444). `branch/stem` form.
 const EXPECTED_PASS: &[&str] = &[
     "RExt/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2",
+    "RExt/Bitdepth_A_RExt_Sony_1",
+    "RExt/Bitdepth_B_RExt_Sony_1",
+    "RExt/CCP_10bit_RExt_QCOM",
+    "RExt/CCP_12bit_RExt_QCOM",
+    "RExt/CCP_8bit_RExt_QCOM",
     "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_10BIT_RExt_Sony_1",
     "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_12BIT_RExt_Sony_1",
     "RExt/EXTPREC_HIGHTHROUGHPUT_444_16_INTRA_16BIT_RExt_Sony_1",
@@ -90,6 +95,7 @@ const EXPECTED_PASS: &[&str] = &[
     "RExt/EXTPREC_MAIN_444_16_INTRA_12BIT_RExt_Sony_1",
     "RExt/EXTPREC_MAIN_444_16_INTRA_16BIT_RExt_Sony_1",
     "RExt/EXTPREC_MAIN_444_16_INTRA_8BIT_RExt_Sony_1",
+    "RExt/ExplicitRdpcm_A_BBC_1",
     "RExt/GENERAL_10b_420_RExt_Sony_1",
     "RExt/GENERAL_10b_422_RExt_Sony_1",
     "RExt/GENERAL_10b_444_RExt_Sony_2",
@@ -106,6 +112,8 @@ const EXPECTED_PASS: &[&str] = &[
     "RExt/Main_422_10_A_RExt_Sony_2",
     "RExt/Main_422_10_B_RExt_Sony_2",
     "RExt/PERSIST_RPARAM_A_RExt_Sony_3",
+    "RExt/QMATRIX_A_RExt_Sony_1",
+    "RExt/SAO_A_RExt_MediaTek_1",
     "RExt/TSCTX_10bit_I_RExt_SHARP_1",
     "RExt/TSCTX_10bit_RExt_SHARP_1",
     "RExt/TSCTX_12bit_I_RExt_SHARP_1",
@@ -134,7 +142,9 @@ fn sidecar_digests(dir: &Path, stem: &str) -> Vec<String> {
     };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_sidecar = name.ends_with(".md5") || name.ends_with(".md5sum.txt");
+        let is_sidecar = name.ends_with(".md5")
+            || name.ends_with(".md5sum.txt")
+            || name.ends_with("_md5sum.txt");
         let stem_unver = stem
             .trim_end_matches(char::is_numeric)
             .trim_end_matches('_');

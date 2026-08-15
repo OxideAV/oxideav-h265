@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — §8.5.4.3 codes ONE chroma block per 4:4:4 transform unit, round 444 (2026-08-15)
+
+The stacked upper/lower chroma-block pair of a transform unit exists
+only for `ChromaArrayType == 2` (§8.5.4.3: `blkIdx` proceeds over
+`0..( ChromaArrayType == 2 ? 1 : 0 )`). The inter residual-extraction
+path keyed the pair on `SubHeightC == 1` — true for 4:2:2 AND 4:4:4 —
+so on 4:4:4 every transform unit carrying a §7.3.8.12
+`cross_comp_pred( )` with a cbf-clear chroma half synthesized a
+phantom second §8.6.6 cross-component application one TU-height BELOW
+the real block, corrupting the sibling region of the coding unit with
+`( ResScaleVal * rY ) >> 3` offsets (chroma-only, inter pictures
+only — the intra path already keyed on `ChromaArrayType == 2`, which
+is why every intra frame stayed byte-exact and the r441 triage
+mislocalized the divergence into chroma SAO).
+
+One line, EIGHT official conformance streams (38/61 → **46/61**
+byte-exact, the complete RExt branch): `CCP_{8,10,12}bit`,
+`QMATRIX_A`, `Bitdepth_A/B` (the "Cr-only" divergence was this
+phantom landing on Cr-active regions), `SAO_A_RExt`, and
+`ExplicitRdpcm_A` (retiring the r437 "±1 chroma artifact under
+investigation" note — the §8.6.5 direction was never at fault).
+Regression-pinned by a split-tree unit test
+(`ccp_444_uncoded_chroma_writes_single_block_not_stacked_halves`) and
+the expanded `tests/conformance_official.rs` list (the sidecar
+matcher now also reads the `<stem>_md5sum.txt` form those streams
+publish).
+
 ### Fixed — §9.3.2.1 initialization priority at dependent-segment starts, round 441 (2026-08-12)
 
 A dependent slice segment whose first CTU is the first CTU of a tile
