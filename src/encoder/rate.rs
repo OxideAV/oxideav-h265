@@ -55,6 +55,13 @@ pub struct RateControlCfg {
     pub min_qp: i32,
     /// Highest `SliceQpY` the controller may pick (default 49).
     pub max_qp: i32,
+    /// VBV buffer size in bits (`None` = unconstrained ABR). When
+    /// set, the encoder models a decoder buffer of this size filled
+    /// at [`Self::bits_per_second`] and drained whole-frame at each
+    /// decode instant: the controller aims each frame under the
+    /// current fullness, and the low-delay encoder re-encodes at a
+    /// higher QP when a frame would still underflow it.
+    pub vbv_buffer_bits: Option<u64>,
 }
 
 impl RateControlCfg {
@@ -70,7 +77,16 @@ impl RateControlCfg {
             initial_qp: None,
             min_qp: 4,
             max_qp: 49,
+            vbv_buffer_bits: None,
         }
+    }
+
+    /// Add a VBV buffer constraint of `bits` (see
+    /// [`Self::vbv_buffer_bits`]).
+    #[must_use]
+    pub fn with_vbv(mut self, bits: u64) -> Self {
+        self.vbv_buffer_bits = Some(bits);
+        self
     }
 }
 
@@ -123,6 +139,10 @@ pub(crate) struct RateController {
     /// ±one second of the target rate.
     buffer: i64,
     buffer_cap: i64,
+    /// VBV decoder-buffer model: `(size, fullness)` in bits. Fullness
+    /// starts at `size`, refills by [`Self::target`] per frame and
+    /// drains whole-frame in `update`.
+    vbv: Option<(i64, i64)>,
 }
 
 impl RateController {
@@ -148,7 +168,23 @@ impl RateController {
             coded_at: [None, None],
             buffer: 0,
             buffer_cap: (cfg.bits_per_second.max(64)).min(i64::MAX as u64) as i64,
+            vbv: cfg.vbv_buffer_bits.map(|b| {
+                let size = b.clamp(256, i64::MAX as u64) as i64;
+                (size, size)
+            }),
         }
+    }
+
+    /// The hard VBV budget for the NEXT frame (its coded size must
+    /// stay at or under this many bits, or the modelled decoder
+    /// buffer underflows). `None` without a VBV constraint.
+    pub(crate) fn vbv_frame_cap(&self) -> Option<u64> {
+        self.vbv.map(|(_, fullness)| fullness.max(0) as u64)
+    }
+
+    /// The configured QP ceiling (the re-encode loop's last resort).
+    pub(crate) fn max_qp(&self) -> i32 {
+        self.max_qp
     }
 
     /// Elect the next frame's `SliceQpY` for a frame of `class`.
@@ -156,9 +192,14 @@ impl RateController {
         // The frame budget: the nominal share minus a drain of the
         // accumulated overshoot spread over the next 8 frames, kept
         // within a sane multiple of the nominal share.
-        let desired = (self.target - self.buffer / 8)
+        let mut desired = (self.target - self.buffer / 8)
             .clamp(self.target / 4, self.target.saturating_mul(4))
             .max(64) as u64;
+        if let Some((_, fullness)) = self.vbv {
+            // Aim comfortably under the hard VBV budget so the
+            // re-encode loop stays a rare emergency.
+            desired = desired.min((fullness.max(64) as u64).saturating_mul(3) / 4);
+        }
         let complexity = self.complexity[class.idx()].or_else(|| {
             // Cold class: borrow the other class through the
             // intra/inter cost ratio.
@@ -216,6 +257,10 @@ impl RateController {
         self.frame_count += 1;
         self.buffer = (self.buffer + bits.min(i64::MAX as u64) as i64 - self.target)
             .clamp(-self.buffer_cap, self.buffer_cap);
+        if let Some((size, fullness)) = &mut self.vbv {
+            // Whole-frame drain, then one frame interval of fill.
+            *fullness = (*fullness - bits.min(i64::MAX as u64) as i64 + self.target).min(*size);
+        }
     }
 }
 
@@ -326,6 +371,41 @@ mod tests {
                 "rate {rate} gop {gop}: tail {tail} vs {wanted} ({err_pct}%)"
             );
         }
+    }
+
+    #[test]
+    fn vbv_caps_the_frame_budget_and_tracks_fullness() {
+        let mut rc = RateController::new(
+            &RateControlCfg::new(100_000, 25, 1).with_vbv(20_000),
+            64,
+            64,
+        );
+        // Full buffer to start.
+        assert_eq!(rc.vbv_frame_cap(), Some(20_000));
+        let q0 = rc.pick_qp(FrameClass::Inter);
+        rc.update(FrameClass::Inter, q0, 12_000);
+        // 20000 - 12000 + 4000 (one frame of fill at 100k/25).
+        assert_eq!(rc.vbv_frame_cap(), Some(12_000));
+        // Refill never exceeds the buffer size.
+        rc.update(FrameClass::Inter, q0, 0);
+        assert_eq!(rc.vbv_frame_cap(), Some(16_000));
+        for _ in 0..10 {
+            rc.update(FrameClass::Inter, q0, 0);
+        }
+        assert_eq!(rc.vbv_frame_cap(), Some(20_000));
+        // A low buffer pushes the next pick's QP up against an
+        // unconstrained twin.
+        let mut tight = RateController::new(
+            &RateControlCfg::new(100_000, 25, 1).with_vbv(20_000),
+            64,
+            64,
+        );
+        let mut free = RateController::new(&RateControlCfg::new(100_000, 25, 1), 64, 64);
+        for rcx in [&mut tight, &mut free] {
+            let q = rcx.pick_qp(FrameClass::Inter);
+            rcx.update(FrameClass::Inter, q, 19_000); // nearly drains the VBV
+        }
+        assert!(tight.pick_qp(FrameClass::Inter) >= free.pick_qp(FrameClass::Inter));
     }
 
     #[test]

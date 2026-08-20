@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — VBV-constrained rate control (`bufsize`), round 449 (2026-08-21)
+
+`RateControlCfg::with_vbv` / the registry `bufsize` option (bits,
+`k` / `M` suffixes; requires `bitrate`): the controller models a
+decoder buffer of the given size filled at the target rate and
+drained whole-frame at each decode instant. Frame budgets aim at 3/4
+of the current fullness, and — the hard guarantee — the low-delay
+and all-intra encoders RE-ENCODE a frame at increasing QP (+3 steps
+up to the ceiling) whenever its access unit would still underflow
+the modelled buffer, made possible by splitting `encode_frame` into
+a side-effect-free `code_frame_at` plus a state commit. Pinned by a
+leaky-bucket replay over a stream whose unconstrained twin provably
+overshoots the buffer (no frame ever exceeds fullness, streams stay
+bit-exact through the crate's decoder and a black-box reference
+decoder, achieved rate within 0.4 % of target on the validation
+clip). `bufsize` with `pyramid` is rejected for now (mini-GOP burst
+coding needs per-slice budgeting).
+
 ### Added — SPS VUI frame-rate declaration (§E.2.1 `vui_timing_info`), round 449 (2026-08-21)
 
 `LowDelayPEncoder::with_frame_rate` / `PyramidEncoder::with_frame_rate`

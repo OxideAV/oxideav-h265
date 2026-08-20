@@ -402,7 +402,7 @@ impl LowDelayPEncoder {
             }
         }
         let idr_now = self.prevs.is_empty() || self.poc == 0;
-        let frame_qp = match &mut self.rc {
+        let mut frame_qp = match &mut self.rc {
             Some(rc) => rc.pick_qp(if idr_now {
                 FrameClass::Intra
             } else {
@@ -410,7 +410,61 @@ impl LowDelayPEncoder {
             }),
             None => self.qp,
         };
-        let out = if idr_now {
+        // Code the frame at `frame_qp`; under a VBV constraint,
+        // re-encode at a higher QP until the access unit fits the
+        // modelled decoder buffer (or the QP ceiling is reached).
+        let mut coded = self.code_frame_at(frame, idr_now, frame_qp)?;
+        if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+            let qp_ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
+            while coded.0.len() as u64 * 8 > cap && frame_qp < qp_ceiling {
+                frame_qp = (frame_qp + 3).min(qp_ceiling);
+                coded = self.code_frame_at(frame, idr_now, frame_qp)?;
+            }
+        }
+        let (au, keyframe, recon, stats) = coded;
+        // Commit the reference / POC state and the model feedback.
+        if idr_now {
+            self.prevs = vec![recon.clone()];
+            self.poc = 1;
+        } else {
+            self.prevs.insert(0, recon.clone());
+            self.prevs.truncate(2);
+            self.poc += 1;
+        }
+        if let Some(rc) = &mut self.rc {
+            rc.update(
+                if idr_now {
+                    FrameClass::Intra
+                } else {
+                    FrameClass::Inter
+                },
+                frame_qp,
+                au.len() as u64 * 8,
+            );
+        }
+        // GOP wrap: schedule the next IDR.
+        if self.gop > 0 && self.poc >= self.gop as i32 {
+            self.poc = 0;
+        }
+        Ok(EncodedPFrame {
+            au,
+            keyframe,
+            recon,
+            stats,
+            qp: frame_qp,
+        })
+    }
+
+    /// Code the next frame at `qp` WITHOUT committing any encoder
+    /// state (the VBV re-encode loop may call this repeatedly).
+    #[allow(clippy::type_complexity)]
+    fn code_frame_at(
+        &self,
+        frame: &YuvFrame<'_>,
+        idr_now: bool,
+        qp: i32,
+    ) -> Result<(Vec<u8>, bool, FrameRecon, FrameStats), IntraEncodeError> {
+        if idr_now {
             // sps_max_dec_pic_buffering_minus1 = 2: the current picture
             // plus the two short-term references the P/B slices keep.
             let idr = encode_idr_intra_au_full(
@@ -419,7 +473,7 @@ impl LowDelayPEncoder {
                 frame.cr,
                 self.width,
                 self.height,
-                frame_qp,
+                qp,
                 &SpsCfg {
                     max_dec_pic_buffering_minus1: 2,
                     max_num_reorder_pics: 0,
@@ -431,23 +485,19 @@ impl LowDelayPEncoder {
                 &self.filters,
                 self.aq,
             )?;
-            let recon = FrameRecon {
-                y: idr.recon_y,
-                cb: idr.recon_cb,
-                cr: idr.recon_cr,
-            };
-            self.prevs = vec![recon.clone()];
-            self.poc = 1;
-            EncodedPFrame {
-                au: idr.au,
-                keyframe: true,
-                recon,
-                stats: FrameStats {
+            Ok((
+                idr.au,
+                true,
+                FrameRecon {
+                    y: idr.recon_y,
+                    cb: idr.recon_cb,
+                    cr: idr.recon_cr,
+                },
+                FrameStats {
                     intra: (self.width / CTB) * (self.height / CTB),
                     ..FrameStats::default()
                 },
-                qp: frame_qp,
-            }
+            ))
         } else {
             // The active references: RefPicListX[i] = the
             // reconstruction of POC − 1 − i (newest first, up to two),
@@ -461,7 +511,7 @@ impl LowDelayPEncoder {
                 .collect();
             let spec = SliceSpec {
                 poc: self.poc,
-                qp: frame_qp,
+                qp,
                 b_slice: self.b_slices,
                 rps_neg: (1..=l0.len() as u32).map(|d| (d, true)).collect(),
                 rps_pos: Vec::new(),
@@ -476,34 +526,8 @@ impl LowDelayPEncoder {
                 aq: self.aq,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
-            let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
-            self.prevs.insert(0, recon.clone());
-            self.prevs.truncate(2);
-            self.poc += 1;
-            EncodedPFrame {
-                au,
-                keyframe: false,
-                recon,
-                stats,
-                qp: frame_qp,
-            }
-        };
-        if let Some(rc) = &mut self.rc {
-            rc.update(
-                if idr_now {
-                    FrameClass::Intra
-                } else {
-                    FrameClass::Inter
-                },
-                frame_qp,
-                out.au.len() as u64 * 8,
-            );
+            Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
         }
-        // GOP wrap: schedule the next IDR.
-        if self.gop > 0 && self.poc >= self.gop as i32 {
-            self.poc = 0;
-        }
-        Ok(out)
     }
 }
 

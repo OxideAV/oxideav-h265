@@ -322,6 +322,105 @@ fn registry_abr_intra_mode_adapts_qp() {
     );
 }
 
+/// VBV-constrained ABR: with `RateControlCfg::with_vbv` the encoder
+/// guarantees no frame exceeds the modelled decoder buffer — the
+/// cold-start IDR (which overshoots a plain ABR run) is re-encoded
+/// at a higher QP until it fits, and replaying the leaky bucket over
+/// the whole stream never underflows.
+#[test]
+fn vbv_constrained_stream_never_underflows() {
+    let planes = clip(30);
+    let (rate, bufsize) = (150_000u64, 12_000u64);
+    let per_frame_fill = (rate / u64::from(FPS)) as i64;
+    // Unconstrained twin: prove the constraint has something to do.
+    let mut free = LowDelayPEncoder::new(W, H, 26, 10)
+        .expect("encoder")
+        .with_rate_control(&RateControlCfg::new(rate, FPS, 1));
+    let free_max = frames(&planes)
+        .iter()
+        .map(|f| free.encode_frame(f).expect("encode").au.len() as u64 * 8)
+        .max()
+        .unwrap();
+    assert!(
+        free_max > bufsize,
+        "test premise: the unconstrained run must overshoot the buffer ({free_max} bits)"
+    );
+    // Constrained run: replay the decoder-buffer model.
+    let mut enc = LowDelayPEncoder::new(W, H, 26, 10)
+        .expect("encoder")
+        .with_rate_control(&RateControlCfg::new(rate, FPS, 1).with_vbv(bufsize));
+    let mut stream = Vec::new();
+    let mut recons = Vec::new();
+    let mut fullness = bufsize as i64;
+    for (i, f) in frames(&planes).iter().enumerate() {
+        let out = enc.encode_frame(f).expect("encode");
+        let bits = out.au.len() as i64 * 8;
+        assert!(
+            bits <= fullness,
+            "frame {i}: {bits} bits would underflow the VBV (fullness {fullness})"
+        );
+        fullness = (fullness - bits + per_frame_fill).min(bufsize as i64);
+        stream.extend_from_slice(&out.au);
+        recons.push(out.recon);
+    }
+    // Still a conforming stream, bit-exact through the own decoder.
+    let decoded = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
+    for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+        let mut expect = rec.y.clone();
+        expect.extend_from_slice(&rec.cb);
+        expect.extend_from_slice(&rec.cr);
+        assert_eq!(
+            dec.picture.to_planar_u8().expect("8-bit"),
+            expect,
+            "frame {i}"
+        );
+    }
+}
+
+#[test]
+fn registry_vbv_options_validate_and_roundtrip() {
+    let planes = clip(6);
+    // Happy path: bitrate + bufsize.
+    let mut p = base_params();
+    p.options.insert("mode", "inter");
+    p.options.insert("bitrate", "200k");
+    p.options.insert("bufsize", "40k");
+    let mut enc = make_encoder(&p).expect("encoder");
+    let mut n = 0usize;
+    for (y, cb, cr) in &planes {
+        enc.send_frame(&video_frame(y, cb, cr)).expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            assert!(
+                pkt.data.len() as u64 * 8 <= 40_000,
+                "no frame may exceed the VBV buffer"
+            );
+            n += 1;
+        }
+    }
+    assert_eq!(n, planes.len());
+    // bufsize without bitrate / malformed / with pyramid: rejected.
+    for opts in [
+        vec![("mode", "inter"), ("bufsize", "40k")],
+        vec![("mode", "inter"), ("bitrate", "200k"), ("bufsize", "9")],
+        vec![
+            ("mode", "inter"),
+            ("pyramid", "4"),
+            ("bitrate", "200k"),
+            ("bufsize", "40k"),
+        ],
+    ] {
+        let mut p = base_params();
+        for (k, v) in &opts {
+            p.options.insert(*k, *v);
+        }
+        assert!(
+            matches!(make_encoder(&p), Err(Error::InvalidData(_))),
+            "{opts:?}"
+        );
+    }
+}
+
 /// An explicit `fps` option (or `with_frame_rate` on the direct
 /// APIs) declares the frame rate in the SPS: §E.2.1
 /// `vui_timing_info` with `num_units_in_tick == fps_den`,

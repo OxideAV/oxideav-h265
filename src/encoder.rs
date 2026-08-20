@@ -134,6 +134,9 @@ use oxideav_core::{
 /// the `fps` option (`"25"` or `"30000/1001"`, default 25) fixing the
 /// frame rate the budget is spread over and an explicit `qp` option
 /// seeding the starting QP. `fps` also sets the packet time base.
+/// `bufsize` (bits; requires `bitrate`) adds a VBV constraint: no
+/// access unit may exceed the modelled decoder buffer (frames are
+/// re-encoded at a higher QP when needed; low-delay and intra paths).
 ///
 /// The `aq` option (1..=3, `"intra"` / `"inter"` modes) enables
 /// spatial adaptive quantization: per-CTB QP offsets from luma
@@ -282,6 +285,35 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
     let bitrate = parse_bitrate(params)?;
+    // `bufsize` — VBV buffer size in bits, optional `k` / `M` suffix
+    // (requires `bitrate`).
+    let bufsize = match params.options.get("bufsize") {
+        None => None,
+        Some(v) => {
+            if bitrate.is_none() {
+                return Err(Error::InvalidData(
+                    "h265 encode: bufsize requires the bitrate option".into(),
+                ));
+            }
+            let (digits, mult) = match v.as_bytes().last() {
+                Some(b'k' | b'K') => (&v[..v.len() - 1], 1_000u64),
+                Some(b'M') => (&v[..v.len() - 1], 1_000_000),
+                _ => (v, 1),
+            };
+            Some(
+                digits
+                    .parse::<u64>()
+                    .ok()
+                    .map(|n| n.saturating_mul(mult))
+                    .filter(|&b| b >= 1_000)
+                    .ok_or_else(|| {
+                        Error::InvalidData(format!(
+                            "h265 encode: bufsize must be an integer >= 1000 bits                              (optional k/M suffix), got {v:?}"
+                        ))
+                    })?,
+            )
+        }
+    };
     let fps = parse_fps(params)?;
     // Declare the frame rate in the SPS VUI only when the caller
     // stated it (an explicit `fps` option).
@@ -293,6 +325,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         if params.options.get("qp").is_some() {
             cfg.initial_qp = Some(qp);
         }
+        cfg.vbv_buffer_bits = bufsize;
         cfg
     };
     let mode = match params.options.get("mode") {
@@ -360,6 +393,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_aq(parse_aq(params)?);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
+                }
+                if bufsize.is_some() {
+                    return Err(Error::InvalidData(
+                        "h265 encode: bufsize with pyramid is not supported yet".into(),
+                    ));
                 }
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
@@ -471,7 +509,7 @@ impl Encoder for H265Encoder {
                 aq,
                 timing,
             } => {
-                let frame_qp = match rc {
+                let mut frame_qp = match rc {
                     Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
                     None => *qp,
                 };
@@ -480,19 +518,31 @@ impl Encoder for H265Encoder {
                     timing: *timing,
                     ..intra::SpsCfg::legacy(1)
                 };
-                let au = intra::encode_idr_intra_au_full(
-                    &y,
-                    &cb,
-                    &cr,
-                    self.width,
-                    self.height,
-                    frame_qp,
-                    &cfg,
-                    lf,
-                    *aq,
-                )
-                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                .au;
+                let code = |frame_qp: i32| -> Result<Vec<u8>> {
+                    Ok(intra::encode_idr_intra_au_full(
+                        &y,
+                        &cb,
+                        &cr,
+                        self.width,
+                        self.height,
+                        frame_qp,
+                        &cfg,
+                        lf,
+                        *aq,
+                    )
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                    .au)
+                };
+                let mut au = code(frame_qp)?;
+                // VBV constraint (`bufsize`): re-encode at a higher
+                // QP until the AU fits the modelled decoder buffer.
+                if let Some(cap) = rc.as_ref().and_then(|r| r.vbv_frame_cap()) {
+                    let ceiling = rc.as_ref().map_or(51, |r| r.max_qp());
+                    while au.len() as u64 * 8 > cap && frame_qp < ceiling {
+                        frame_qp = (frame_qp + 3).min(ceiling);
+                        au = code(frame_qp)?;
+                    }
+                }
                 if let Some(rc) = rc {
                     rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);
                 }

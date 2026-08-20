@@ -1,14 +1,16 @@
 //! Encode raw 4:2:0 frames under average-bitrate rate control.
 //!
 //! ```text
-//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [pyramid=N] [aq=N] [b] [deblock] [sao]
+//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [pyramid=N] [aq=N] [vbv=BITS] [b] [deblock] [sao]
 //! ```
 //!
 //! `BITRATE` is bits per second (optional `k` / `M` suffix); `FPS` is
 //! an integer or a `num/den` ratio. `gop=N` re-emits an IDR every `N`
 //! frames; `pyramid=N` switches to hierarchical-B mini-GOPs of `N`
 //! frames (excludes `gop` / `b`); `aq=N` (1..=3) enables spatial
-//! adaptive quantization (per-CTB `cu_qp_delta`); `b` codes the
+//! adaptive quantization (per-CTB `cu_qp_delta`); `vbv=BITS`
+//! constrains every access unit to a decoder buffer of that size
+//! (low-delay path only); `b` codes the
 //! non-IDR frames as low-delay B slices; `deblock` / `sao` enable
 //! the §8.7 in-loop filters.
 //!
@@ -77,7 +79,12 @@ fn main() {
         .skip(5)
         .find_map(|a| a.strip_prefix("aq=")?.parse::<u8>().ok())
         .unwrap_or(0);
-    let cfg = RateControlCfg::new(bitrate, fps_num, fps_den);
+    let vbv = args
+        .iter()
+        .skip(5)
+        .find_map(|a| a.strip_prefix("vbv=")?.parse::<u64>().ok());
+    let mut cfg = RateControlCfg::new(bitrate, fps_num, fps_den);
+    cfg.vbv_buffer_bits = vbv;
     let lf = LoopFilterCfg {
         deblocking: flag("deblock"),
         sao_luma: flag("sao"),
@@ -103,6 +110,7 @@ fn main() {
                 || a.starts_with("gop=")
                 || a.starts_with("pyramid=")
                 || a.starts_with("aq=")
+                || a.starts_with("vbv=")
         };
         if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
             std::fs::write(recon_path, &recon).expect("write recon");
@@ -144,6 +152,7 @@ fn main() {
             || a.starts_with("gop=")
             || a.starts_with("pyramid=")
             || a.starts_with("aq=")
+            || a.starts_with("vbv=")
     };
     if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
         std::fs::write(recon_path, &recon).expect("write recon");

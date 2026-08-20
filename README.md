@@ -165,7 +165,11 @@ base QP per mini-GOP under its per-layer offsets — through
 through this crate's decoder and a black-box reference decoder, and
 land within a few percent of the requested rate (measured 1.4–6.2 %
 across 60k–600k b/s low-delay targets; ≤13 % on 30-frame pyramid
-clips, converging with length).
+clips, converging with length). A **VBV constraint** (`bufsize`
+option / `with_vbv`) additionally hard-caps every access unit to a
+modelled decoder buffer — frames that would underflow it are
+re-encoded at a higher QP (leaky-bucket replay CI-pinned; low-delay
+and all-intra paths).
 
 Every coding mode adds **spatial adaptive quantization** (`aq`
 option 1..=3; `encode_idr_intra_au_aq`, `with_aq` on the low-delay
@@ -248,9 +252,11 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   never splits), 4x4-luma DST TUs, encoder temporal MVP, more than
   one active reference per list on the pyramid path, and adaptive
   (non-dyadic) GOP structures.
-* HRD-constrained (CBR/VBV) rate targeting, and CTU-level rate
+* VBV on the pyramid path (mini-GOP burst budgeting), §E.2.2/§E.2.3
+  HRD-parameter signalling for the VBV model, and CTU-level rate
   feedback inside a frame (`cu_qp_delta` is used for spatial AQ; the
-  rate controller still allocates at frame granularity).
+  rate controller allocates at frame granularity, with whole-frame
+  re-encode as the VBV backstop).
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
