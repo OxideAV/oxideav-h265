@@ -6,6 +6,76 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-h265/compare/v0.0.9...v0.0.10) - 2026-08-20
+
+### Added
+
+- *(encoder)* VBV-constrained rate control (bufsize)
+- *(encoder)* SPS VUI frame-rate declaration (§E.2.1 vui_timing_info)
+- *(encoder)* adaptive quantization on the inter paths
+- *(encoder)* spatial adaptive quantization - first cu_qp_delta writer (intra)
+- *(encoder)* pyramid-path rate control
+- *(encoder)* average-bitrate rate control (bitrate/fps options)
+- *(recon)* apply cu_chroma_qp_offset — §8.6.1 CuQpOffsetCb / CuQpOffsetCr
+- *(residual)* persistent Rice, aligned bypass, limited-EGk escapes
+- *(registry)* pyramid codec option on the H.265 encoder
+- *(encoder)* hierarchical-B GOPs — dyadic pyramids with out-of-order coding
+- *(registry)* amp codec option on the H.265 encoder
+- *(encoder)* asymmetric motion partitions in the inter CU ladder
+- *(encoder)* AMP stream geometry — MinCb 8, split_cu_flag, big-CU part_mode column
+- *(encoder)* β/tC slice-offset election for the deblocking filter
+- *(registry)* deblock / sao codec options on the H.265 encoder
+- *(encoder)* §8.7 in-loop filters on the low-delay P/B GOP reconstruction path
+- *(encoder)* §8.7 in-loop filters on the intra encoder's reconstruction path
+- *(inter)* intra block copy — current-picture referencing decode
+- *(recon)* §8.6.8 adaptive colour transform decode, end to end
+- *(recon)* apply §8.6.6 cross-component prediction to chroma residuals
+- *(palette)* SCC palette-mode decode end to end (§7.3.8.13 / §8.4.4.2.7)
+- *(recon)* §8.6.5 RDPCM reconstruction (explicit inter + implicit intra)
+- *(residual)* decode §7.3.8.11 transform_skip_flag and apply the §8.6.2 transform-skip path
+- *(recon)* enforce §8.4.4.2.1 constrained_intra_pred_flag
+
+### Fixed
+
+- *(fuzz)* decode_residual harness tracks the range-extension ResidualCodingParams fields
+- *(parse)* §7.3.8.10 tu_residual_act_flag gate is a three-way disjunction
+- *(recon)* §8.5.4.3 codes ONE chroma block per 4:4:4 transform unit
+- *(sequence)* §9.3.2.1 initialization priority at dependent-segment starts
+- *(sequence)* parameter-set NAL after a VCL NAL closes the access unit (§7.4.2.4.4)
+- *(deblock)* chroma cQpPicOffset is the PPS offset alone
+- *(palette)* §9.3.4.2.8 run-prefix ctxInc uses the raw palette_idx_idc
+- *(recon)* monochrome (ChromaArrayType 0) intra CU reconstruction
+- *(slice)* §7.4.7.1 entry-point bound for tiles + wavefronts combined
+- *(recon)* derive §8.4.3 IntraPredModeC per chroma PB for 4:4:4 PART_NxN
+- *(sps)* bound sps_num_palette_predictor_initializers_minus1 before allocating
+- *(422)* inherit lower-half chroma cbf into 4x4 leaves; pair stacked chroma residuals per half
+- *(recon)* position §7.3.8.10 deferred chroma at the parent node in the inter path
+- *(intra)* §8.4.4.2.3 strong smoothing covers reference index 62
+- *(recon)* apply §8.6.3 scaling-list quantization matrices; correct default DC to 16
+- *(motion)* correct §8.5.3.2.9 listCol selection for bi-predicted collocated blocks
+
+### Other
+
+- round-444 status — official conformance 38/61 -> 46/61, RExt branch complete, all SCC streams parse
+- round-441 rollup — official RExt/SCC conformance 26/61 -> 38/61
+- *(conformance)* pin the 26 byte-exact official streams; round-437 docs
+- *(conformance)* frame-level scoring via decoded-picture-hash SEI
+- *(conformance)* staged-corpus triage scanner example
+- round-431 rollup — encoder AMP + hierarchical-B pyramids
+- *(interop)* three-way AMP + pyramid golden pins
+- *(encoder)* explicit reference-list slice spec + dual-list prediction
+- round-429 rollup — encoder in-loop filters (deblocking + SAO)
+- *(interop)* three-way loop-filter pins — filtered P/B GOPs + intra AU
+- *(scc)* deepen the ACT + IBC pins — CCP under ACT, merge-mode IBC
+- *(axes)* round-416 whole-bitstream axis pins; README/CHANGELOG rollup
+- *(scc)* self-built ACT + IBC conformance streams; wire the ACT parse gate
+- *(ccp)* self-built §8.6.6 conformance stream, black-box validated
+- *(api)* doc(hidden) the internal public surface
+- *(palette)* SPS predictor-initializer pin with two independent slices
+- *(rdpcm)* self-built §8.6.5 conformance streams, black-box validated
+- round-410 decode-conformance coverage in README + CHANGELOG
+- eight round-410 tool-axis whole-stream conformance pins
+
 ### Added — VBV-constrained rate control (`bufsize`), round 449 (2026-08-21)
 
 `RateControlCfg::with_vbv` / the registry `bufsize` option (bits,
