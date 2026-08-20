@@ -6,6 +6,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — spatial adaptive quantization: the encoder's first `cu_qp_delta` writer (intra), round 449 (2026-08-21)
+
+`encode_idr_intra_au_aq` / the registry `aq` option (1..=3, `mode =
+"intra"`): each CTB's `QpY` moves off the slice QP by `aq` QP per
+octave of luma-activity ratio against the picture average (integer Q3
+log2, clamped ±6, deterministic), spending relatively more bits on
+flat regions where quantization error is most visible. This is the
+encode side's first per-CTB QP signalling:
+
+* the PPS gains `cu_qp_delta_enabled_flag` + `diff_cu_qp_delta_depth
+  == 0` (one §7.4.9.14 quantization group per CTB);
+* `encode_cu_qp_delta` writes the §9.3.3.10 `cu_qp_delta_abs`
+  binarization (TR cMax-5 prefix over the two Table 9-24 contexts,
+  bypass EG0 escape, bypass sign) — the bin-exact dual of the decode
+  side, exercised through ±6 deltas (the escape path included);
+* the encoder threads the §8.6.1 `qPY_PREV` chain (with one QG per
+  CTB the neighbour prediction collapses to the previous CU in decode
+  order), including the inference that a CTB with no coded cbf
+  transmits nothing and inherits the predicted QP — mirrored for
+  quantization, deblocking and the next prediction;
+* the §8.7.2 deblocking descriptors now carry per-CTB effective QPs
+  (both q- and p-side neighbour scalars), so QP-dependent filtering
+  stays exact under AQ.
+
+Validated differentially (every AQ stream decodes byte-exact through
+this crate's own full §8.6.1/§8.7.2 decoder, across strengths, QPs
+17..42 and filter configurations) and black-box (9 QP × strength
+configurations byte-exact through a reference decoder). AQ never
+loses quality in the flat region at equal slice QP (pinned).
+
 ### Added — pyramid-path rate control, round 449 (2026-08-21)
 
 The hierarchical-B pyramid joins the ABR machinery:

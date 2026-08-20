@@ -1,14 +1,17 @@
 //! Encode one raw 4:2:0 frame as a real CABAC intra IDR stream.
 //!
 //! ```text
-//! cargo run --example encode_intra -- in.yuv WxH QP out.hevc [recon.yuv]
+//! cargo run --example encode_intra -- in.yuv WxH QP out.hevc [recon.yuv] [aq=N]
 //! ```
 //!
 //! `in.yuv` is one planar 8-bit 4:2:0 frame; dimensions must be
 //! multiples of 16. The optional `recon.yuv` receives the encoder's
 //! own reconstruction (what a conforming decoder must output).
+//! `aq=N` (1..=3) enables spatial adaptive quantization (per-CTB
+//! `cu_qp_delta`).
 
-use oxideav_h265::encoder::intra::encode_idr_intra_au;
+use oxideav_h265::encoder::intra::encode_idr_intra_au_aq;
+use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,13 +29,19 @@ fn main() {
     assert_eq!(data.len(), w * h * 3 / 2, "one planar 4:2:0 frame");
     let (y, c) = data.split_at(w * h);
     let (cb, cr) = c.split_at(w * h / 4);
-    let enc = encode_idr_intra_au(y, cb, cr, w, h, qp).expect("encode");
+    let aq = args
+        .iter()
+        .skip(4)
+        .find_map(|a| a.strip_prefix("aq=")?.parse::<u8>().ok())
+        .unwrap_or(0);
+    let enc =
+        encode_idr_intra_au_aq(y, cb, cr, w, h, qp, &LoopFilterCfg::off(), aq).expect("encode");
     std::fs::write(&args[3], &enc.au).expect("write output");
-    if let Some(recon_path) = args.get(4) {
+    if let Some(recon_path) = args.get(4).filter(|a| !a.starts_with("aq=")) {
         let mut recon = enc.recon_y.clone();
         recon.extend_from_slice(&enc.recon_cb);
         recon.extend_from_slice(&enc.recon_cr);
         std::fs::write(recon_path, &recon).expect("write recon");
     }
-    eprintln!("{w}x{h} qp{qp} -> {} bytes", enc.au.len());
+    eprintln!("{w}x{h} qp{qp} aq{aq} -> {} bytes", enc.au.len());
 }

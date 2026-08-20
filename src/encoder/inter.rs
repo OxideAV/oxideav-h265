@@ -393,8 +393,10 @@ impl LowDelayPEncoder {
                     max_num_reorder_pics: 0,
                     min_cb_log2: if self.amp { 3 } else { 4 },
                     amp: self.amp,
+                    cu_qp_delta: false,
                 },
                 &self.filters,
+                0,
             )?;
             let recon = FrameRecon {
                 y: idr.recon_y,
@@ -1307,7 +1309,7 @@ fn encode_merge_idx(
 /// §9.3.3.3 — encode an EGk-coded value (the dual of the decoder's
 /// `read_eg_k_with`): a run of `1` prefix bins, a `0`, then
 /// `prefix_ones + k` MSB-first suffix bins.
-fn encode_eg_k(w: &mut BitWriter, cabac: &mut CabacEncoder, value: u32, k: u32) {
+pub(crate) fn encode_eg_k(w: &mut BitWriter, cabac: &mut CabacEncoder, value: u32, k: u32) {
     let mut prefix_ones = 0u32;
     while ((1u64 << (prefix_ones + 1)) - 1) << k <= u64::from(value) {
         prefix_ones += 1;
@@ -2031,11 +2033,12 @@ pub(crate) fn encode_inter_slice(
                 split_depth1: matches!(c.levels, Some(CuLevels::Depth1(_))),
             })
             .collect();
+        let ctb_qps = vec![qp; shapes.len()];
         let out = filter_frame(
             &FilterInput {
                 width,
                 height,
-                qp,
+                ctb_qps: &ctb_qps,
                 lambda,
                 recon: [&recon.y, &recon.cb, &recon.cr],
                 src: [frame.y, frame.cb, frame.cr],

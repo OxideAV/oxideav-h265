@@ -167,6 +167,15 @@ land within a few percent of the requested rate (measured 1.4–6.2 %
 across 60k–600k b/s low-delay targets; ≤13 % on 30-frame pyramid
 clips, converging with length).
 
+The intra mode adds **spatial adaptive quantization** (`aq` option
+1..=3, `encode_idr_intra_au_aq`): per-CTB QP offsets from luma
+activity, signalled through §7.3.8.10 / §7.4.9.14 `cu_qp_delta` (the
+encoder's first per-CTB QP writer — §9.3.3.10 binarization, the
+§8.6.1 `qPY_PREV` prediction mirror incl. the no-cbf inheritance, and
+per-CTB QP-dependent §8.7.2 deblocking), byte-exact through this
+crate's decoder and a black-box reference decoder across strengths ×
+QPs × filter configurations.
+
 4:2:0 8-bit, dimensions multiples of 16.
 
 ## What's implemented
@@ -231,8 +240,9 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   never splits), 4x4-luma DST TUs, encoder temporal MVP, more than
   one active reference per list on the pyramid path, and adaptive
   (non-dyadic) GOP structures.
-* Per-CTU QP adaptation (`cu_qp_delta` emission — the decode side is
-  implemented) and HRD-constrained (CBR/VBV) targeting.
+* Per-CTU QP adaptation on the INTER paths (`cu_qp_delta` emission
+  landed on the intra path; P/B slices still code at constant slice
+  QP) and HRD-constrained (CBR/VBV) targeting.
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with

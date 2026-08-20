@@ -38,8 +38,10 @@
 //!
 //! Geometry contract (shared with the intra / low-delay encoders):
 //! `CtbSizeY == 16`, one coding unit per CTB, 4:2:0 8-bit, a single
-//! slice and tile per picture, constant QP (no `cu_qp_delta`), no PCM
-//! / transquant-bypass CUs (so the §8.7 `NoFilterMap` is empty).
+//! slice and tile per picture, per-CTB QP through
+//! [`FilterInput::ctb_qps`] (constant, or the `cu_qp_delta` effective
+//! values under adaptive quantization), no PCM / transquant-bypass
+//! CUs (so the §8.7 `NoFilterMap` is empty).
 
 use crate::binarization::PartMode;
 use crate::ctx_init::SliceContexts;
@@ -119,44 +121,49 @@ pub struct CtbShape {
 
 /// Build the per-CTB [`DeblockCuDesc`] list for a fixed-geometry
 /// encoder picture (CTB == CU == 16, raster order, single slice /
-/// tile, constant QP) at the given slice β/tC offsets.
+/// tile) at the given slice β/tC offsets. `qps` carries each CTB-CU's
+/// §8.6.1-derived `QpY` (one entry per CTB — a constant-QP caller
+/// passes the slice QP everywhere; an AQ caller passes the effective
+/// per-CTB values, which also feed the p-side neighbour scalars).
 #[must_use]
 pub(crate) fn ctb_deblock_descs(
     shapes: &[CtbShape],
     width: usize,
     height: usize,
-    qp: i32,
+    qps: &[i32],
     beta_offset_div2: i32,
     tc_offset_div2: i32,
 ) -> Vec<DeblockCuDesc> {
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     debug_assert_eq!(shapes.len(), ctbs_x * ctbs_y);
-    let params = DeblockCuParams {
-        qp_y: qp,
-        beta_offset_div2,
-        tc_offset_div2,
-        cb_qp_offset: 0,
-        cr_qp_offset: 0,
-        bit_depth_luma: 8,
-        bit_depth_chroma: 8,
-        chroma_array_type: 1,
-    };
+    debug_assert_eq!(qps.len(), ctbs_x * ctbs_y);
     shapes
         .iter()
         .enumerate()
         .map(|(ctb, shape)| {
             let x0 = (ctb % ctbs_x) * CTB;
             let y0 = (ctb / ctbs_x) * CTB;
+            let qp = qps[ctb];
+            let params = DeblockCuParams {
+                qp_y: qp,
+                beta_offset_div2,
+                tc_offset_div2,
+                cb_qp_offset: 0,
+                cr_qp_offset: 0,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
+                chroma_array_type: 1,
+            };
             DeblockCuDesc {
                 cu: DeblockCu {
                     x_cb: x0,
                     y_cb: y0,
                     log2_cb_size: CTB_LOG2,
                     params,
-                    // Constant QP: the p-side scalars equal the CU QP.
-                    qp_y_p_left: qp,
-                    qp_y_p_top: qp,
+                    // The p-side scalars are the neighbour CU's QpY.
+                    qp_y_p_left: if x0 > 0 { qps[ctb - 1] } else { qp },
+                    qp_y_p_top: if y0 > 0 { qps[ctb - ctbs_x] } else { qp },
                 },
                 transform_split: if shape.split_depth1 {
                     crate::deblock::TransformSplit::split_once()
@@ -179,8 +186,9 @@ pub(crate) struct FilterInput<'a> {
     pub width: usize,
     /// Picture height in luma samples.
     pub height: usize,
-    /// `SliceQpY`.
-    pub qp: i32,
+    /// Per-CTB §8.6.1-derived `QpY` (raster order; the constant-QP
+    /// paths repeat the slice QP).
+    pub ctb_qps: &'a [i32],
     /// The SSD-per-bin λ of the slice's mode decisions.
     pub lambda: u64,
     /// Pre-filter reconstruction planes `[y, cb, cr]`.
@@ -670,7 +678,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         for beta in [-2i32, 0, 2] {
             for tc in [-2i32, 0, 2] {
                 let mut filtered = pre.clone();
-                let descs = ctb_deblock_descs(input.shapes, width, height, input.qp, beta, tc);
+                let descs = ctb_deblock_descs(input.shapes, width, height, input.ctb_qps, beta, tc);
                 deblock_picture_full(&mut filtered, input.field, &descs, None, None);
                 let cost = ssd(&filtered) + input.lambda * (3 + se_bits(beta) + se_bits(tc));
                 if cost < best_cost {
@@ -1163,10 +1171,11 @@ mod tests {
             };
             (w / 16) * (h / 16)
         ];
+        let qps = vec![30i32; (w / 16) * (h / 16)];
         let input = FilterInput {
             width: w,
             height: h,
-            qp: 30,
+            ctb_qps: &qps,
             lambda: 4,
             recon: [&recon_y, &recon_c, &recon_c],
             src: [&src_y, &src_c, &src_c],
@@ -1241,10 +1250,11 @@ mod tests {
             };
             (w / 16) * (h / 16)
         ];
+        let qps = vec![37i32; (w / 16) * (h / 16)];
         let input = FilterInput {
             width: w,
             height: h,
-            qp: 37,
+            ctb_qps: &qps,
             lambda: 1,
             recon: [&recon_y, &cpl, &cpl],
             src: [&src_y, &cpl, &cpl],
@@ -1278,7 +1288,7 @@ mod tests {
         };
         let dist_at = |beta: i32, tc: i32| -> u64 {
             let mut pic = planes_to_picture(&recon_y, &cpl, &cpl, w, h);
-            let descs = ctb_deblock_descs(&shapes, w, h, 37, beta, tc);
+            let descs = ctb_deblock_descs(&shapes, w, h, &qps, beta, tc);
             deblock_picture_full(&mut pic, &field, &descs, None, None);
             let planar = pic.to_planar_u8().expect("8-bit");
             ssd(&planar[..w * h], &src_y)

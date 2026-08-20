@@ -19,6 +19,7 @@
 #[doc(hidden)]
 pub mod bitwriter;
 // internal — exposed for tests/fuzz; not part of the stable API
+mod aq;
 #[doc(hidden)]
 pub mod cabac;
 pub mod inter;
@@ -60,6 +61,9 @@ enum EncodeMode {
         lf: loopfilter::LoopFilterCfg,
         /// ABR controller (the `bitrate` / `fps` options).
         rc: Option<rate::RateController>,
+        /// Spatial adaptive-quantization strength (the `aq` option,
+        /// 0..=3; nonzero signals per-CTB `cu_qp_delta`).
+        aq: u8,
     },
     /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
     /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
@@ -260,6 +264,15 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             ))
         })
     };
+    // `aq` — spatial adaptive-quantization strength 0..=3.
+    let parse_aq = |params: &CodecParameters| -> Result<u8> {
+        match params.options.get("aq") {
+            None => Ok(0),
+            Some(v) => v.parse::<u8>().ok().filter(|&a| a <= 3).ok_or_else(|| {
+                Error::InvalidData(format!("h265 encode: aq must be 0..=3, got {v:?}"))
+            }),
+        }
+    };
     let bitrate = parse_bitrate(params)?;
     let fps = parse_fps(params)?;
     // ABR configuration when `bitrate` is set: an explicit `qp`
@@ -290,6 +303,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                         .into(),
                 ));
             }
+            if parse_aq(params)? != 0 {
+                return Err(Error::InvalidData(
+                    "h265 encode: the aq option requires mode \"intra\"".into(),
+                ));
+            }
             EncodeMode::Pcm
         }
         Some("intra") => {
@@ -303,9 +321,15 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 qp,
                 lf: parse_lf(params)?,
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
+                aq: parse_aq(params)?,
             }
         }
         Some("inter") => {
+            if parse_aq(params)? != 0 {
+                return Err(Error::InvalidData(
+                    "h265 encode: the aq option is not supported with mode \"inter\" yet".into(),
+                ));
+            }
             let qp = parse_qp(params)?;
             if let Some(v) = params.options.get("pyramid") {
                 if params.options.get("gop").is_some() || params.options.get("bslices").is_some() {
@@ -425,12 +449,12 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
-            EncodeMode::Intra { qp, lf, rc } => {
+            EncodeMode::Intra { qp, lf, rc, aq } => {
                 let frame_qp = match rc {
                     Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
                     None => *qp,
                 };
-                let au = intra::encode_idr_intra_au_lf(
+                let au = intra::encode_idr_intra_au_aq(
                     &y,
                     &cb,
                     &cr,
@@ -438,6 +462,7 @@ impl Encoder for H265Encoder {
                     self.height,
                     frame_qp,
                     lf,
+                    *aq,
                 )
                 .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                 .au;

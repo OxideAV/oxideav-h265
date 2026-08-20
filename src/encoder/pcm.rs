@@ -316,6 +316,26 @@ pub(crate) fn write_pps_lf(
     deblocking_override_enabled: bool,
     tiles: Option<(u32, u32)>,
 ) -> Vec<u8> {
+    write_pps_full(
+        dependent_slice_segments_enabled,
+        deblocking_enabled,
+        deblocking_override_enabled,
+        tiles,
+        false,
+    )
+}
+
+/// [`write_pps_lf`] with `cu_qp_delta_enabled_flag` control: the
+/// adaptive-quantization encoders signal per-CTB QP through §7.3.8.10
+/// `cu_qp_delta` (`diff_cu_qp_delta_depth == 0`, one quantization
+/// group per CTB).
+pub(crate) fn write_pps_full(
+    dependent_slice_segments_enabled: bool,
+    deblocking_enabled: bool,
+    deblocking_override_enabled: bool,
+    tiles: Option<(u32, u32)>,
+    cu_qp_delta: bool,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -329,7 +349,10 @@ pub(crate) fn write_pps_lf(
     w.se(SLICE_QP - 26); // init_qp_minus26
     w.put_bit(0); // constrained_intra_pred_flag
     w.put_bit(0); // transform_skip_enabled_flag
-    w.put_bit(0); // cu_qp_delta_enabled_flag
+    w.put_bit(u8::from(cu_qp_delta)); // cu_qp_delta_enabled_flag
+    if cu_qp_delta {
+        w.ue(0); // diff_cu_qp_delta_depth (QG == CTB)
+    }
     w.se(0); // pps_cb_qp_offset
     w.se(0); // pps_cr_qp_offset
     w.put_bit(0); // pps_slice_chroma_qp_offsets_present_flag

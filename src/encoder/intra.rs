@@ -54,7 +54,7 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for, write_pps_lf, write_ptl, write_vps, write_vps_cfg};
+use crate::encoder::pcm::{level_idc_for, write_pps_full, write_ptl, write_vps, write_vps_cfg};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -97,6 +97,8 @@ pub enum IntraEncodeError {
     },
     /// `SliceQpY` outside 0..=51.
     BadQp(i32),
+    /// Adaptive-quantization strength outside 0..=3.
+    BadAq(u8),
 }
 
 impl core::fmt::Display for IntraEncodeError {
@@ -112,6 +114,7 @@ impl core::fmt::Display for IntraEncodeError {
                 got,
             } => write!(f, "{plane} plane has {got} samples, expected {expected}"),
             Self::BadQp(qp) => write!(f, "slice QP {qp} outside 0..=51"),
+            Self::BadAq(aq) => write!(f, "aq strength {aq} outside 0..=3"),
         }
     }
 }
@@ -150,6 +153,10 @@ pub(crate) struct SpsCfg {
     /// only reaches the AMP bin strings when `log2CbSize >
     /// MinCbLog2SizeY`).
     pub amp: bool,
+    /// PPS `cu_qp_delta_enabled_flag` (with `diff_cu_qp_delta_depth
+    /// == 0`: one quantization group per CTB) — set by the
+    /// adaptive-quantization configurations.
+    pub cu_qp_delta: bool,
 }
 
 impl SpsCfg {
@@ -161,6 +168,7 @@ impl SpsCfg {
             max_num_reorder_pics: 0,
             min_cb_log2: CTB_LOG2,
             amp: false,
+            cu_qp_delta: false,
         }
     }
 }
@@ -217,6 +225,35 @@ pub(crate) fn write_sps_cfg(
     w.put_bit(0); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.finish()
+}
+
+/// §7.3.8.14 / §9.3.3.10 — encode one `cu_qp_delta` (`CuQpDeltaVal ==
+/// delta`): `cu_qp_delta_abs` as a TR(cMax 5) prefix over the two
+/// Table 9-24 contexts (bin 0 its own, bins 1..4 shared) with a
+/// bypass EG0 escape suffix, then the bypass `cu_qp_delta_sign_flag`
+/// when nonzero. The write-side dual of
+/// [`crate::binarization::decode_cu_qp_delta`].
+pub(crate) fn encode_cu_qp_delta(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    delta: i32,
+) {
+    const CMAX: u32 = crate::binarization::CU_QP_DELTA_ABS_TR_CMAX;
+    let abs = delta.unsigned_abs();
+    for i in 0..abs.min(CMAX) {
+        let ctx = usize::from(i != 0);
+        cabac.encode_decision(w, &mut ctxs.cu_qp_delta_abs[ctx], 1);
+    }
+    if abs < CMAX {
+        let ctx = usize::from(abs != 0);
+        cabac.encode_decision(w, &mut ctxs.cu_qp_delta_abs[ctx], 0);
+    } else {
+        crate::encoder::inter::encode_eg_k(w, cabac, abs - CMAX, 0);
+    }
+    if abs != 0 {
+        cabac.encode_bypass(w, u8::from(delta < 0));
+    }
 }
 
 /// Table 8-10 — the `ChromaArrayType == 1` chroma QP mapping
@@ -473,6 +510,21 @@ struct CtbPlan {
     cb_levels: Vec<Vec<i32>>,
     /// Chroma Cr TB levels.
     cr_levels: Vec<Vec<i32>>,
+    /// The `QpY` this CTB was quantized at (slice QP + AQ offset).
+    qp: i32,
+}
+
+impl CtbPlan {
+    /// Any nonzero coded level in the CTB (⇔ some TU signals a cbf,
+    /// so a `cu_qp_delta` can be — and is — transmitted).
+    fn any_cbf(&self) -> bool {
+        self.plan
+            .levels
+            .iter()
+            .chain(self.cb_levels.iter())
+            .chain(self.cr_levels.iter())
+            .any(|lv| lv.iter().any(|&v| v != 0))
+    }
 }
 
 /// Encode one 4:2:0 8-bit frame as a self-contained intra IDR access
@@ -513,7 +565,35 @@ pub fn encode_idr_intra_au_lf(
     qp: i32,
     lf: &LoopFilterCfg,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
-    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &SpsCfg::legacy(1), lf)
+    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &SpsCfg::legacy(1), lf, 0)
+}
+
+/// [`encode_idr_intra_au_lf`] with spatial **adaptive quantization**:
+/// at `aq` in 1..=3, each CTB's `QpY` moves off the slice QP by `aq`
+/// QP per octave of luma-activity ratio against the picture average
+/// (clamped ±6), signalled through §7.3.8.10 / §7.4.9.14
+/// `cu_qp_delta` (`diff_cu_qp_delta_depth == 0`). `aq == 0` is
+/// exactly [`encode_idr_intra_au_lf`].
+///
+/// # Errors
+/// [`IntraEncodeError`] on bad dimensions / plane sizes / QP, or
+/// `aq > 3`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_idr_intra_au_aq(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    qp: i32,
+    lf: &LoopFilterCfg,
+    aq: u8,
+) -> Result<IntraEncodedAu, IntraEncodeError> {
+    let cfg = SpsCfg {
+        cu_qp_delta: aq > 0,
+        ..SpsCfg::legacy(1)
+    };
+    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &cfg, lf, aq)
 }
 
 /// [`encode_idr_intra_au`] with an explicit
@@ -538,6 +618,7 @@ pub(crate) fn encode_idr_intra_au_cfg(
         qp,
         &SpsCfg::legacy(max_dec_pic_buffering_minus1),
         &LoopFilterCfg::off(),
+        0,
     )
 }
 
@@ -556,6 +637,7 @@ pub(crate) fn encode_idr_intra_au_full(
     qp: i32,
     cfg: &SpsCfg,
     lf: &LoopFilterCfg,
+    aq: u8,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(IntraEncodeError::BadDimensions { width, height });
@@ -563,6 +645,13 @@ pub(crate) fn encode_idr_intra_au_full(
     if !(0..=51).contains(&qp) {
         return Err(IntraEncodeError::BadQp(qp));
     }
+    if aq > 3 {
+        return Err(IntraEncodeError::BadAq(aq));
+    }
+    debug_assert!(
+        aq == 0 || cfg.cu_qp_delta,
+        "AQ needs the PPS cu_qp_delta_enabled_flag"
+    );
     let check = |plane: &'static str, buf: &[u8], expected: usize| {
         if buf.len() != expected {
             Err(IntraEncodeError::PlaneSize {
@@ -581,11 +670,13 @@ pub(crate) fn encode_idr_intra_au_full(
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
-    let qp_y = qp as u32;
-    let qp_c = chroma_qp_420(qp);
     // Rate-distortion tradeoff for the partition decision: SSD per
     // estimated bit, doubling every 3 QP (integer, deterministic).
-    let lambda: u64 = 1u64 << (qp.unsigned_abs().saturating_sub(9) / 3);
+    let lambda_of = |q: i32| -> u64 { 1u64 << (q.unsigned_abs().saturating_sub(9) / 3) };
+    let lambda = lambda_of(qp);
+    // Spatial AQ: per-CTB QP offsets against the slice QP (all zero
+    // at `aq == 0`).
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq);
 
     let mut recon_y = vec![0u8; width * height];
     let mut recon_cb = vec![0u8; cw * ch];
@@ -609,9 +700,13 @@ pub(crate) fn encode_idr_intra_au_full(
         }
     };
 
-    for ctb in 0..ctbs_x * ctbs_y {
+    for (ctb, &aq_delta) in aq_deltas.iter().enumerate() {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
+        let ctb_qp = (qp + aq_delta).clamp(0, 51);
+        let qp_y = ctb_qp as u32;
+        let qp_c = chroma_qp_420(ctb_qp);
+        let lambda = lambda_of(ctb_qp);
         let src16 = extract(y, width, x0, y0, CTB);
 
         // ---- candidate PART_2Nx2N: one 16x16 PB/TB ----
@@ -742,8 +837,31 @@ pub(crate) fn encode_idr_intra_au_full(
             plan,
             cb_levels,
             cr_levels,
+            qp: ctb_qp,
         });
     }
+
+    // The §8.6.1 effective per-CTB QpY a decoder derives: with one
+    // quantization group per CTB the neighbour prediction collapses
+    // to qPY_PREV (the previous CU in decode order, SliceQpY at the
+    // slice start), so a CTB that transmits no cu_qp_delta (no coded
+    // cbf anywhere, or cu_qp_delta off) inherits the running value.
+    let eff_qps: Vec<i32> = {
+        let mut prev = qp;
+        plans
+            .iter()
+            .map(|p| {
+                if cfg.cu_qp_delta && p.any_cbf() {
+                    prev = p.qp;
+                }
+                if cfg.cu_qp_delta {
+                    prev
+                } else {
+                    qp
+                }
+            })
+            .collect()
+    };
 
     // ---- §8.7 in-loop filters (deblocking + SAO) on the recon ----
     let mut deblock_on = false;
@@ -772,7 +890,7 @@ pub(crate) fn encode_idr_intra_au_full(
             &FilterInput {
                 width,
                 height,
-                qp,
+                ctb_qps: &eff_qps,
                 lambda,
                 recon: [&recon_y, &recon_cb, &recon_cr],
                 src: [y, cb, cr],
@@ -826,6 +944,9 @@ pub(crate) fn encode_idr_intra_au_full(
     let mut cabac = CabacEncoder::new();
     // Table 9-4: I slice => initType 0 (raw slice_type 2).
     let mut ctxs = SliceContexts::init(init_type(2, false), qp);
+    // §8.6.1 qPY_PREV thread for the cu_qp_delta emission (one QG per
+    // CTB ⇒ qPY_PRED == qPY_PREV; SliceQpY at the slice start).
+    let mut qp_prev = qp;
     for (ctb, ctb_plan) in plans.iter().enumerate() {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
@@ -1003,6 +1124,11 @@ pub(crate) fn encode_idr_intra_au_full(
                 &mut ctxs.cbf_luma[cbf_luma_ctx_inc(0) as usize],
                 u8::from(cbf_luma),
             );
+            // §7.3.8.10 delta_qp( ) in the first (only) TU with a cbf.
+            if cfg.cu_qp_delta && (cbf_luma || cbf_cb || cbf_cr) {
+                encode_cu_qp_delta(&mut w, &mut cabac, &mut ctxs, ctb_plan.qp - qp_prev);
+                qp_prev = ctb_plan.qp;
+            }
             if cbf_luma {
                 encode_residual_coding(
                     &mut w,
@@ -1051,6 +1177,7 @@ pub(crate) fn encode_idr_intra_au_full(
                 &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
                 u8::from(root_cr),
             );
+            let mut delta_done = false;
             for k in 0..4 {
                 let cbf_cb_k = leaf_cbf(&cb_levels[k]);
                 let cbf_cr_k = leaf_cbf(&cr_levels[k]);
@@ -1074,6 +1201,13 @@ pub(crate) fn encode_idr_intra_au_full(
                     &mut ctxs.cbf_luma[cbf_luma_ctx_inc(1) as usize],
                     u8::from(cbf_luma_k),
                 );
+                // §7.3.8.10 delta_qp( ) in the first depth-1 TU with a
+                // cbf (`IsCuQpDeltaCoded` then holds for the QG).
+                if cfg.cu_qp_delta && !delta_done && (cbf_luma_k || cbf_cb_k || cbf_cr_k) {
+                    encode_cu_qp_delta(&mut w, &mut cabac, &mut ctxs, ctb_plan.qp - qp_prev);
+                    qp_prev = ctb_plan.qp;
+                    delta_done = true;
+                }
                 if cbf_luma_k {
                     encode_residual_coding(
                         &mut w,
@@ -1136,7 +1270,12 @@ pub(crate) fn encode_idr_intra_au_full(
             0,
             &write_sps_cfg(width, height, level_idc, cfg, lf.sao()),
         ), // SPS_NUT
-        nal_unit(34, 0, 0, &write_pps_lf(false, false, lf.deblocking, None)), // PPS_NUT
+        nal_unit(
+            34,
+            0,
+            0,
+            &write_pps_full(false, false, lf.deblocking, None, cfg.cu_qp_delta),
+        ), // PPS_NUT
         nal_unit(20, 0, 0, &slice_rbsp), // IDR_N_LP
     ];
     Ok(IntraEncodedAu {

@@ -252,6 +252,7 @@ impl PyramidEncoder {
             max_num_reorder_pics: self.depth(),
             min_cb_log2: if self.amp { 3 } else { 4 },
             amp: self.amp,
+            cu_qp_delta: false,
         }
     }
 
@@ -298,6 +299,7 @@ impl PyramidEncoder {
                 idr_qp,
                 &self.sps_cfg(),
                 &self.filters,
+                0,
             )?;
             let recon = FrameRecon {
                 y: idr.recon_y,
