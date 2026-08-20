@@ -179,6 +179,70 @@ fn abr_streams_decode_bit_exact_through_own_decoder() {
 }
 
 #[test]
+fn pyramid_abr_hits_target_and_roundtrips() {
+    use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+    let planes = clip(33); // IDR + four GOP-8 mini-GOPs
+    let frames = frames(&planes);
+    let mut totals = Vec::new();
+    for target in [120_000u64, 360_000] {
+        let enc = PyramidEncoder::new(W, H, 26, 8)
+            .expect("encoder")
+            .with_rate_control(&RateControlCfg::new(target, FPS, 1));
+        let out = encode_pyramid_with(enc, &frames).expect("encode");
+        let total_bits = out.stream.len() as u64 * 8;
+        let wanted = target * planes.len() as u64 / u64::from(FPS);
+        let err_pct = (total_bits as i64 - wanted as i64).unsigned_abs() * 100 / wanted;
+        assert!(
+            err_pct <= 25,
+            "pyramid {target} b/s: {total_bits} bits vs budget {wanted} ({err_pct}%)"
+        );
+        totals.push(total_bits);
+        // Display-order decode == encoder reconstruction, bit-exact.
+        let decoded = decode_annexb_sequence(&out.stream).expect("decode");
+        assert_eq!(decoded.len(), planes.len());
+        for (i, (dec, rec)) in decoded.iter().zip(&out.recon).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "pyramid {target} frame {i}"
+            );
+        }
+    }
+    assert!(totals[1] > totals[0], "3x the budget codes more bits");
+}
+
+#[test]
+fn registry_pyramid_abr_roundtrips() {
+    let planes = clip(9); // IDR + one GOP-4 mini-GOP + 4-frame tail
+    let mut p = base_params();
+    p.options.insert("mode", "inter");
+    p.options.insert("pyramid", "4");
+    p.options.insert("bitrate", "250k");
+    p.options.insert("fps", "30000/1001");
+    let mut enc = make_encoder(&p).expect("encoder");
+    let mut stream = Vec::new();
+    let mut n_packets = 0usize;
+    for (y, cb, cr) in &planes {
+        enc.send_frame(&video_frame(y, cb, cr)).expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            stream.extend_from_slice(&pkt.data);
+            n_packets += 1;
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(pkt) = enc.receive_packet() {
+        stream.extend_from_slice(&pkt.data);
+        n_packets += 1;
+    }
+    assert_eq!(n_packets, planes.len());
+    let decoded = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
+}
+
+#[test]
 fn higher_target_buys_lower_distortion() {
     let planes = clip(24);
     let (bits_lo, _, ssd_lo, _) = encode_abr(&planes, 80_000, 0, false, LoopFilterCfg::off());
@@ -271,10 +335,6 @@ fn registry_rejects_bad_abr_options() {
         (
             vec![("mode", "inter"), ("bitrate", "200k"), ("fps", "30/0")],
             "fps",
-        ),
-        (
-            vec![("mode", "inter"), ("pyramid", "4"), ("bitrate", "200k")],
-            "pyramid",
         ),
     ] {
         let mut p = base_params();

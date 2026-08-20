@@ -322,15 +322,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                             "h265 encode: pyramid must be a power of two in 2..=16, got {v:?}"
                         ))
                     })?;
-                if bitrate.is_some() {
-                    return Err(Error::InvalidData(
-                        "h265 encode: bitrate with pyramid is not supported yet".into(),
-                    ));
-                }
-                let enc = pyramid::PyramidEncoder::new(width, height, qp, g)
+                let mut enc = pyramid::PyramidEncoder::new(width, height, qp, g)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?);
+                if bitrate.is_some() {
+                    enc = enc.with_rate_control(&rc_cfg(params, qp));
+                }
                 EncodeMode::Pyramid {
                     enc,
                     delay: i64::from(g.trailing_zeros()),

@@ -1,13 +1,15 @@
 //! Encode raw 4:2:0 frames under average-bitrate rate control.
 //!
 //! ```text
-//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [b] [deblock] [sao]
+//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [pyramid=N] [b] [deblock] [sao]
 //! ```
 //!
 //! `BITRATE` is bits per second (optional `k` / `M` suffix); `FPS` is
 //! an integer or a `num/den` ratio. `gop=N` re-emits an IDR every `N`
-//! frames; `b` codes the non-IDR frames as low-delay B slices;
-//! `deblock` / `sao` enable the §8.7 in-loop filters.
+//! frames; `pyramid=N` switches to hierarchical-B mini-GOPs of `N`
+//! frames (excludes `gop` / `b`); `b` codes the non-IDR frames as
+//! low-delay B slices; `deblock` / `sao` enable the §8.7 in-loop
+//! filters.
 //!
 //! `in.yuv` is a concatenation of planar 8-bit 4:2:0 frames;
 //! dimensions must be multiples of 16. The optional `recon.yuv`
@@ -17,6 +19,7 @@
 
 use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
 use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
+use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
 use oxideav_h265::encoder::rate::RateControlCfg;
 
 fn main() {
@@ -64,15 +67,51 @@ fn main() {
         .skip(5)
         .find_map(|a| a.strip_prefix("gop=")?.parse::<usize>().ok())
         .unwrap_or(0);
+    let pyramid = args
+        .iter()
+        .skip(5)
+        .find_map(|a| a.strip_prefix("pyramid=")?.parse::<usize>().ok());
+    let cfg = RateControlCfg::new(bitrate, fps_num, fps_den);
+    let lf = LoopFilterCfg {
+        deblocking: flag("deblock"),
+        sao_luma: flag("sao"),
+        sao_chroma: flag("sao"),
+    };
+    if let Some(g) = pyramid {
+        let enc = PyramidEncoder::new(w, h, 26, g)
+            .expect("encoder")
+            .with_loop_filters(lf)
+            .with_rate_control(&cfg);
+        let out = encode_pyramid_with(enc, &frames).expect("encode");
+        std::fs::write(&args[4], &out.stream).expect("write output");
+        let mut recon = Vec::new();
+        for rec in &out.recon {
+            recon.extend_from_slice(&rec.y);
+            recon.extend_from_slice(&rec.cb);
+            recon.extend_from_slice(&rec.cr);
+        }
+        let is_flag = |a: &str| {
+            matches!(a, "b" | "deblock" | "sao")
+                || a.starts_with("gop=")
+                || a.starts_with("pyramid=")
+        };
+        if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
+            std::fs::write(recon_path, &recon).expect("write recon");
+        }
+        let secs = frames.len() as f64 * f64::from(fps_den) / f64::from(fps_num);
+        eprintln!(
+            "{w}x{h} pyramid-{g} target {bitrate} b/s @ {fps_num}/{fps_den} fps: {} frames -> {} bytes ({:.0} b/s achieved)",
+            frames.len(),
+            out.stream.len(),
+            out.stream.len() as f64 * 8.0 / secs
+        );
+        return;
+    }
     let mut enc = LowDelayPEncoder::new(w, h, 26, gop)
         .expect("encoder")
         .with_b_slices(flag("b"))
-        .with_loop_filters(LoopFilterCfg {
-            deblocking: flag("deblock"),
-            sao_luma: flag("sao"),
-            sao_chroma: flag("sao"),
-        })
-        .with_rate_control(&RateControlCfg::new(bitrate, fps_num, fps_den));
+        .with_loop_filters(lf)
+        .with_rate_control(&cfg);
     let mut stream = Vec::new();
     let mut recon = Vec::new();
     for (i, f) in frames.iter().enumerate() {
@@ -89,7 +128,9 @@ fn main() {
         recon.extend_from_slice(&out.recon.cr);
     }
     std::fs::write(&args[4], &stream).expect("write output");
-    let is_flag = |a: &str| matches!(a, "b" | "deblock" | "sao") || a.starts_with("gop=");
+    let is_flag = |a: &str| {
+        matches!(a, "b" | "deblock" | "sao") || a.starts_with("gop=") || a.starts_with("pyramid=")
+    };
     if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
         std::fs::write(recon_path, &recon).expect("write recon");
     }

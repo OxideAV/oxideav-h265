@@ -6,6 +6,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — pyramid-path rate control, round 449 (2026-08-21)
+
+The hierarchical-B pyramid joins the ABR machinery:
+`PyramidEncoder::with_rate_control(&RateControlCfg)` elects the BASE
+QP once per mini-GOP (the per-layer offsets ride on top, keeping the
+pyramid's rate-allocation shape while its level tracks the target),
+and every coded slice feeds back at the base QP so the complexity
+EWMA absorbs the layer-offset discount — the inversion at the next
+election is unbiased. The low-delay flush tail elects per frame. The
+registry `bitrate` / `fps` options now compose with `pyramid`
+(the round-449 "not yet" carve-out is lifted); `PyramidAu::qp`
+exposes each slice's QP. Validated by budget-accuracy + bit-exact
+display-order roundtrip tests (GOP 4 / 8, filtered and not) and an
+out-of-band black-box reference-decoder sweep (pyramid-8 @150k,
+pyramid-4 + deblock/SAO @400k — both byte-exact, achieved rate
+within 13 % on a 30-frame clip, converging with length).
+
 ### Added — average-bitrate rate control (`bitrate` / `fps`), round 449 (2026-08-21)
 
 The encoder gains ABR targeting (`encoder::rate`): a deterministic,

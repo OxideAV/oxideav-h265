@@ -51,6 +51,7 @@ use crate::encoder::inter::{encode_inter_slice, FrameRecon, FrameStats, SliceSpe
 use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
 use crate::encoder::loopfilter::LoopFilterCfg;
 use crate::encoder::nal::{annexb, nal_unit};
+use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
 
 /// The fixed CTB size shared with the intra / low-delay encoders.
 const CTB: usize = 16;
@@ -72,6 +73,10 @@ pub struct PyramidAu {
     pub recon: FrameRecon,
     /// The frame's CU mode-decision counters.
     pub stats: FrameStats,
+    /// The `SliceQpY` this frame was coded at (base + layer offset,
+    /// with the base elected per mini-GOP under
+    /// [`PyramidEncoder::with_rate_control`]).
+    pub qp: i32,
 }
 
 /// An owned 4:2:0 frame buffered until its mini-GOP completes.
@@ -151,6 +156,10 @@ pub struct PyramidEncoder {
     refs: BTreeMap<i32, FrameRecon>,
     /// POC of the last coded anchor (`None` before the IDR).
     anchor: Option<i32>,
+    /// ABR rate controller: when set, it elects the base QP of each
+    /// mini-GOP (the per-layer offsets ride on top) and the
+    /// constructor `qp` is unused.
+    rc: Option<RateController>,
 }
 
 impl PyramidEncoder {
@@ -187,6 +196,7 @@ impl PyramidEncoder {
             pending: Vec::new(),
             refs: BTreeMap::new(),
             anchor: None,
+            rc: None,
         })
     }
 
@@ -215,6 +225,18 @@ impl PyramidEncoder {
         self
     }
 
+    /// Switch to average-bitrate coding: a [`RateController`] elects
+    /// the BASE QP of each mini-GOP against `cfg` (the per-layer
+    /// offsets ride on top, so the pyramid's rate allocation shape is
+    /// kept while its level tracks the target). Every coded slice
+    /// feeds back at its actual layer QP, so the model learns the
+    /// mini-GOP mixture. Replaces the constructor's constant QP.
+    #[must_use]
+    pub fn with_rate_control(mut self, cfg: &RateControlCfg) -> Self {
+        self.rc = Some(RateController::new(cfg, self.width, self.height));
+        self
+    }
+
     /// The number of pyramid layers below the anchors
     /// (`log2(gop)`).
     fn depth(&self) -> u32 {
@@ -233,9 +255,10 @@ impl PyramidEncoder {
         }
     }
 
-    /// The layer-`l` slice QP.
-    fn layer_qp(&self, layer: u8) -> i32 {
-        (self.qp + i32::from(layer) * self.layer_qp_step).clamp(0, 51)
+    /// The layer-`l` slice QP over `base` (the constructor QP, or
+    /// the rate controller's per-mini-GOP election).
+    fn layer_qp(&self, base: i32, layer: u8) -> i32 {
+        (base + i32::from(layer) * self.layer_qp_step).clamp(0, 51)
     }
 
     /// Push the next DISPLAY-order frame; returns every access unit
@@ -262,13 +285,17 @@ impl PyramidEncoder {
 
         if self.anchor.is_none() {
             // The leading IDR (POC 0, layer 0).
+            let idr_qp = match &mut self.rc {
+                Some(rc) => rc.pick_qp(FrameClass::Intra),
+                None => self.qp,
+            };
             let idr = encode_idr_intra_au_full(
                 frame.y,
                 frame.cb,
                 frame.cr,
                 self.width,
                 self.height,
-                self.qp,
+                idr_qp,
                 &self.sps_cfg(),
                 &self.filters,
             )?;
@@ -280,6 +307,9 @@ impl PyramidEncoder {
             self.refs.insert(0, recon.clone());
             self.anchor = Some(0);
             self.next_display = 1;
+            if let Some(rc) = &mut self.rc {
+                rc.update(FrameClass::Intra, idr_qp, idr.au.len() as u64 * 8);
+            }
             return Ok(vec![PyramidAu {
                 au: idr.au,
                 keyframe: true,
@@ -290,6 +320,7 @@ impl PyramidEncoder {
                     intra: (self.width / CTB) * (self.height / CTB),
                     ..FrameStats::default()
                 },
+                qp: idr_qp,
             }]);
         }
 
@@ -312,6 +343,13 @@ impl PyramidEncoder {
         let a = self.anchor.expect("mini-GOP needs an anchor");
         let g = self.gop as i32;
         let sched = build_schedule(a, g);
+        // One base-QP election per mini-GOP; every coded slice feeds
+        // back below, so the model tracks the layer mixture and the
+        // widening excursion window absorbs the once-per-GOP cadence.
+        let base = match &mut self.rc {
+            Some(rc) => rc.pick_qp(FrameClass::Inter),
+            None => self.qp,
+        };
         let mut out = Vec::with_capacity(sched.len());
         for (i, s) in sched.iter().enumerate() {
             // Retained set for THIS slice's RPS: every already-coded
@@ -335,7 +373,14 @@ impl PyramidEncoder {
             self.refs.retain(|p, _| retained.contains(p));
 
             let frame = &self.pending[(s.poc - a - 1) as usize];
-            let au = self.code_slice(frame.as_yuv(), s, &retained);
+            let au = self.code_slice(frame.as_yuv(), s, &retained, base);
+            if let Some(rc) = &mut self.rc {
+                // Feed back at the BASE QP (not the slice's layer
+                // QP): the model then learns the layer-offset
+                // discount as part of the complexity, so inverting it
+                // at the next base election is unbiased.
+                rc.update(FrameClass::Inter, base, au.au.len() as u64 * 8);
+            }
             self.refs.insert(s.poc, au.recon.clone());
             out.push(au);
         }
@@ -348,8 +393,8 @@ impl PyramidEncoder {
     }
 
     /// Encode one scheduled P / B slice against the retained
-    /// reconstructions.
-    fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32]) -> PyramidAu {
+    /// reconstructions, at `base` QP plus the slice's layer offset.
+    fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32], base: i32) -> PyramidAu {
         let b_slice = s.l1.is_some();
         let rec_of = |p: i32| -> &FrameRecon { self.refs.get(&p).expect("retained recon") };
         let l0 = vec![(s.l0, rec_of(s.l0))];
@@ -367,9 +412,10 @@ impl PyramidEncoder {
             .filter(|&&p| p > s.poc)
             .map(|&p| ((p - s.poc) as u32, Some(p) == s.l1))
             .collect();
+        let qp = self.layer_qp(base, s.layer);
         let spec = SliceSpec {
             poc: s.poc,
-            qp: self.layer_qp(s.layer),
+            qp,
             b_slice,
             rps_neg,
             rps_pos,
@@ -386,6 +432,7 @@ impl PyramidEncoder {
             layer: s.layer,
             recon,
             stats,
+            qp,
         }
     }
 
@@ -410,7 +457,14 @@ impl PyramidEncoder {
             };
             let retained = vec![poc - 1];
             self.refs.retain(|&p, _| p == poc - 1);
-            let au = self.code_slice(frame.as_yuv(), &s, &retained);
+            let base = match &mut self.rc {
+                Some(rc) => rc.pick_qp(FrameClass::Inter),
+                None => self.qp,
+            };
+            let au = self.code_slice(frame.as_yuv(), &s, &retained, base);
+            if let Some(rc) = &mut self.rc {
+                rc.update(FrameClass::Inter, base, au.au.len() as u64 * 8);
+            }
             self.refs.insert(poc, au.recon.clone());
             out.push(au);
         }

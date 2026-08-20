@@ -154,15 +154,18 @@ black-box reference decoder (three golden filtered streams
 CI-pinned); on the interop clip the filters buy up to +1.5 dB luma
 PSNR at equal rate.
 
-Both coding modes also accept **average-bitrate rate control**
+Every coding path also accepts **average-bitrate rate control**
 (`bitrate` / `fps` codec options, `with_rate_control` on the
-low-delay API): a deterministic integer-only controller on the
-§8.6.3 quantizer lattice (`bits ≈ C / 2^(QP/6)`, per-class complexity
-EWMA, leaky-bucket budget, bounded per-frame QP excursions) elects
-each frame's `SliceQpY` through `slice_qp_delta` alone — streams stay
-conforming, decode bit-exact through this crate's decoder and a
-black-box reference decoder, and land within a few percent of the
-requested rate (measured 1.4–6.2 % across 60k–600k b/s targets).
+low-delay AND pyramid APIs): a deterministic integer-only controller
+on the §8.6.3 quantizer lattice (`bits ≈ C / 2^(QP/6)`, per-class
+complexity EWMA, leaky-bucket budget, bounded per-frame QP
+excursions) elects each frame's `SliceQpY` — the pyramid elects a
+base QP per mini-GOP under its per-layer offsets — through
+`slice_qp_delta` alone, so streams stay conforming, decode bit-exact
+through this crate's decoder and a black-box reference decoder, and
+land within a few percent of the requested rate (measured 1.4–6.2 %
+across 60k–600k b/s low-delay targets; ≤13 % on 30-frame pyramid
+clips, converging with length).
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -228,10 +231,8 @@ geometries / QPs / partitions / slice types, and ~930 unit tests.
   never splits), 4x4-luma DST TUs, encoder temporal MVP, more than
   one active reference per list on the pyramid path, and adaptive
   (non-dyadic) GOP structures.
-* Rate control on the hierarchical-B pyramid path (the low-delay and
-  all-intra paths have ABR; the pyramid still codes at constant
-  base QP + per-layer offsets), per-CTU QP adaptation
-  (`cu_qp_delta`), and HRD-constrained (CBR/VBV) targeting.
+* Per-CTU QP adaptation (`cu_qp_delta` emission — the decode side is
+  implemented) and HRD-constrained (CBR/VBV) targeting.
 * Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
   (decode side is implemented).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
