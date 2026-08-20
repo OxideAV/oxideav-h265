@@ -179,6 +179,11 @@ rate control — byte-exact through this crate's decoder and a
 black-box reference decoder across modes × strengths × QPs × filter
 configurations.
 
+An explicit `fps` (or `with_frame_rate`) additionally declares the
+frame rate in the SPS as a §E.2.1 VUI `vui_timing_info` block
+(probes report the true rate; omitted otherwise, keeping historical
+streams byte-stable).
+
 4:2:0 8-bit, dimensions multiples of 16.
 
 ## What's implemented

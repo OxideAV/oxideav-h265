@@ -64,6 +64,8 @@ enum EncodeMode {
         /// Spatial adaptive-quantization strength (the `aq` option,
         /// 0..=3; nonzero signals per-CTB `cu_qp_delta`).
         aq: u8,
+        /// §E.2.1 VUI timing declaration (an explicit `fps` option).
+        timing: Option<(u32, u32)>,
     },
     /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
     /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
@@ -281,6 +283,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     let bitrate = parse_bitrate(params)?;
     let fps = parse_fps(params)?;
+    // Declare the frame rate in the SPS VUI only when the caller
+    // stated it (an explicit `fps` option).
+    let fps_declared = params.options.get("fps").is_some();
     // ABR configuration when `bitrate` is set: an explicit `qp`
     // option seeds the controller's starting QP.
     let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
@@ -328,6 +333,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 lf: parse_lf(params)?,
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
                 aq: parse_aq(params)?,
+                timing: fps_declared.then_some((fps.1, fps.0)),
             }
         }
         Some("inter") => {
@@ -352,6 +358,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?)
                     .with_aq(parse_aq(params)?);
+                if fps_declared {
+                    enc = enc.with_frame_rate(fps.0, fps.1);
+                }
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
@@ -377,6 +386,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?)
                     .with_aq(parse_aq(params)?);
+                if fps_declared {
+                    enc = enc.with_frame_rate(fps.0, fps.1);
+                }
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
@@ -452,18 +464,30 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
-            EncodeMode::Intra { qp, lf, rc, aq } => {
+            EncodeMode::Intra {
+                qp,
+                lf,
+                rc,
+                aq,
+                timing,
+            } => {
                 let frame_qp = match rc {
                     Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
                     None => *qp,
                 };
-                let au = intra::encode_idr_intra_au_aq(
+                let cfg = intra::SpsCfg {
+                    cu_qp_delta: *aq > 0,
+                    timing: *timing,
+                    ..intra::SpsCfg::legacy(1)
+                };
+                let au = intra::encode_idr_intra_au_full(
                     &y,
                     &cb,
                     &cr,
                     self.width,
                     self.height,
                     frame_qp,
+                    &cfg,
                     lf,
                     *aq,
                 )

@@ -157,6 +157,11 @@ pub(crate) struct SpsCfg {
     /// == 0`: one quantization group per CTB) — set by the
     /// adaptive-quantization configurations.
     pub cu_qp_delta: bool,
+    /// §E.2.1 VUI timing declaration:
+    /// `(vui_num_units_in_tick, vui_time_scale)` — i.e. `(fps_den,
+    /// fps_num)`. `None` omits the VUI entirely (the historical
+    /// streams).
+    pub timing: Option<(u32, u32)>,
 }
 
 impl SpsCfg {
@@ -169,6 +174,7 @@ impl SpsCfg {
             min_cb_log2: CTB_LOG2,
             amp: false,
             cu_qp_delta: false,
+            timing: None,
         }
     }
 }
@@ -221,7 +227,28 @@ pub(crate) fn write_sps_cfg(
     w.put_bit(0); // long_term_ref_pics_present_flag
     w.put_bit(0); // sps_temporal_mvp_enabled_flag
     w.put_bit(0); // strong_intra_smoothing_enabled_flag
-    w.put_bit(0); // vui_parameters_present_flag
+    match cfg.timing {
+        None => w.put_bit(0), // vui_parameters_present_flag
+        Some((num_units_in_tick, time_scale)) => {
+            // §E.2.1 vui_parameters( ) — everything off except the
+            // timing declaration.
+            w.put_bit(1); // vui_parameters_present_flag
+            w.put_bit(0); // aspect_ratio_info_present_flag
+            w.put_bit(0); // overscan_info_present_flag
+            w.put_bit(0); // video_signal_type_present_flag
+            w.put_bit(0); // chroma_loc_info_present_flag
+            w.put_bit(0); // neutral_chroma_indication_flag
+            w.put_bit(0); // field_seq_flag
+            w.put_bit(0); // frame_field_info_present_flag
+            w.put_bit(0); // default_display_window_flag
+            w.put_bit(1); // vui_timing_info_present_flag
+            w.put_bits(num_units_in_tick, 32); // vui_num_units_in_tick
+            w.put_bits(time_scale, 32); // vui_time_scale
+            w.put_bit(0); // vui_poc_proportional_to_timing_flag
+            w.put_bit(0); // vui_hrd_parameters_present_flag
+            w.put_bit(0); // bitstream_restriction_flag
+        }
+    }
     w.put_bit(0); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.finish()

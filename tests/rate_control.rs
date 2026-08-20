@@ -322,6 +322,69 @@ fn registry_abr_intra_mode_adapts_qp() {
     );
 }
 
+/// An explicit `fps` option (or `with_frame_rate` on the direct
+/// APIs) declares the frame rate in the SPS: §E.2.1
+/// `vui_timing_info` with `num_units_in_tick == fps_den`,
+/// `time_scale == fps_num` — parsed back through the crate's own SPS
+/// decoder. Without it the SPS stays VUI-free (historical streams
+/// byte-stable).
+#[test]
+fn fps_option_declares_vui_timing() {
+    use oxideav_h265::sps::SeqParameterSet;
+    let sps_of = |stream: &[u8]| -> SeqParameterSet {
+        let units = oxideav_h265::collect_nal_units(stream).expect("nals");
+        let sps = units
+            .iter()
+            .find(|u| u.header.nal_unit_type == 33)
+            .expect("SPS NAL");
+        SeqParameterSet::parse(&sps.rbsp).expect("SPS parse")
+    };
+    let planes = clip(2);
+    // Registry inter path with an explicit rational fps.
+    let mut p = base_params();
+    p.options.insert("mode", "inter");
+    p.options.insert("fps", "30000/1001");
+    let mut enc = make_encoder(&p).expect("encoder");
+    let (y, cb, cr) = &planes[0];
+    enc.send_frame(&video_frame(y, cb, cr)).expect("send");
+    let pkt = enc.receive_packet().expect("packet");
+    let sps = sps_of(&pkt.data);
+    let vui = sps.vui_parameters.expect("VUI present");
+    let timing = vui.timing_info.expect("timing info present");
+    assert_eq!((timing.num_units_in_tick, timing.time_scale), (1001, 30000));
+    // No fps option -> no VUI.
+    let mut p2 = base_params();
+    p2.options.insert("mode", "inter");
+    let mut enc2 = make_encoder(&p2).expect("encoder");
+    enc2.send_frame(&video_frame(y, cb, cr)).expect("send");
+    let pkt2 = enc2.receive_packet().expect("packet");
+    assert!(sps_of(&pkt2.data).vui_parameters.is_none());
+    // Direct pyramid API + decode still bit-exact with the VUI SPS.
+    {
+        use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+        let frames = frames(&planes);
+        let enc = PyramidEncoder::new(W, H, 30, 2)
+            .expect("encoder")
+            .with_frame_rate(25, 1);
+        let out = encode_pyramid_with(enc, &frames).expect("encode");
+        let sps = sps_of(&out.stream);
+        let timing = sps
+            .vui_parameters
+            .expect("VUI")
+            .timing_info
+            .expect("timing");
+        assert_eq!((timing.num_units_in_tick, timing.time_scale), (1, 25));
+        let decoded = decode_annexb_sequence(&out.stream).expect("decode");
+        assert_eq!(decoded.len(), planes.len());
+        for (dec, rec) in decoded.iter().zip(&out.recon) {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(dec.picture.to_planar_u8().expect("8-bit"), expect);
+        }
+    }
+}
+
 #[test]
 fn registry_rejects_bad_abr_options() {
     for (opts, needle) in [

@@ -88,6 +88,7 @@ fn main() {
             .expect("encoder")
             .with_loop_filters(lf)
             .with_aq(aq)
+            .with_frame_rate(fps_num, fps_den)
             .with_rate_control(&cfg);
         let out = encode_pyramid_with(enc, &frames).expect("encode");
         std::fs::write(&args[4], &out.stream).expect("write output");
@@ -120,6 +121,7 @@ fn main() {
         .with_b_slices(flag("b"))
         .with_loop_filters(lf)
         .with_aq(aq)
+        .with_frame_rate(fps_num, fps_den)
         .with_rate_control(&cfg);
     let mut stream = Vec::new();
     let mut recon = Vec::new();

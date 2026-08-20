@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — SPS VUI frame-rate declaration (§E.2.1 `vui_timing_info`), round 449 (2026-08-21)
+
+`LowDelayPEncoder::with_frame_rate` / `PyramidEncoder::with_frame_rate`
+(and every registry mode when the `fps` option is explicitly given):
+the SPS now carries `vui_parameters_present_flag == 1` with a minimal
+§E.2.1 VUI body declaring `vui_num_units_in_tick = fps_den`,
+`vui_time_scale = fps_num` — so players and probes see the intended
+frame rate (verified black-box: a 30000/1001 stream probes as
+30000/1001, and still decodes byte-exact). Streams without an
+explicit rate stay VUI-free, keeping every golden pin byte-stable;
+the declaration is parsed back bit-exact through the crate's own
+§E.2.1 VUI decoder in CI.
+
 ### Added — adaptive quantization on the inter paths (P / low-delay B / pyramid), round 449 (2026-08-21)
 
 `LowDelayPEncoder::with_aq` / `PyramidEncoder::with_aq` (and the

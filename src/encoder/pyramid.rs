@@ -163,6 +163,9 @@ pub struct PyramidEncoder {
     /// Spatial adaptive-quantization strength (0 = constant slice
     /// QP; 1..=3 = per-CTB `cu_qp_delta` on every slice).
     aq: u8,
+    /// §E.2.1 VUI timing declaration `(num_units_in_tick,
+    /// time_scale)` for the stream's SPS (`None` = no VUI).
+    timing: Option<(u32, u32)>,
 }
 
 impl PyramidEncoder {
@@ -201,7 +204,16 @@ impl PyramidEncoder {
             anchor: None,
             rc: None,
             aq: 0,
+            timing: None,
         })
+    }
+
+    /// Declare the stream's frame rate in the SPS VUI — see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_frame_rate`].
+    #[must_use]
+    pub fn with_frame_rate(mut self, fps_num: u32, fps_den: u32) -> Self {
+        self.timing = (fps_num > 0 && fps_den > 0).then_some((fps_den, fps_num));
+        self
     }
 
     /// Enable spatial adaptive quantization at `strength` (clamped to
@@ -266,6 +278,7 @@ impl PyramidEncoder {
             min_cb_log2: if self.amp { 3 } else { 4 },
             amp: self.amp,
             cu_qp_delta: self.aq > 0,
+            timing: self.timing,
         }
     }
 
