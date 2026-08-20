@@ -50,8 +50,8 @@ use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::intra::{
-    chroma_qp_420, code_tb, encode_idr_intra_au_full, gather_refs, pred_params, search_best_mode,
-    ssd, zscan_avail, IntraEncodeError, SpsCfg,
+    chroma_qp_420, code_tb, encode_cu_qp_delta, encode_idr_intra_au_full, gather_refs, pred_params,
+    search_best_mode, ssd, zscan_avail, IntraEncodeError, SpsCfg,
 };
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
@@ -273,6 +273,10 @@ pub struct LowDelayPEncoder {
     /// `SliceQpY` and the constructor `qp` is unused (pass it as
     /// [`RateControlCfg::initial_qp`] to seed the starting point).
     rc: Option<RateController>,
+    /// Spatial adaptive-quantization strength (0 = constant slice
+    /// QP; 1..=3 = per-CTB `cu_qp_delta` on every frame, IDRs
+    /// included).
+    aq: u8,
 }
 
 impl LowDelayPEncoder {
@@ -301,7 +305,20 @@ impl LowDelayPEncoder {
             poc: 0,
             prevs: Vec::new(),
             rc: None,
+            aq: 0,
         })
+    }
+
+    /// Enable spatial adaptive quantization at `strength` (clamped to
+    /// 0..=3): every frame's CTBs move off the frame QP by `strength`
+    /// QP per octave of luma-activity ratio, signalled through
+    /// per-CTB `cu_qp_delta` (the PPS gains
+    /// `cu_qp_delta_enabled_flag`). Composes with the constant-QP,
+    /// GOP, B-slice, filter and rate-control configurations.
+    #[must_use]
+    pub fn with_aq(mut self, strength: u8) -> Self {
+        self.aq = strength.min(3);
+        self
     }
 
     /// Code non-IDR frames as low-delay B slices (both reference
@@ -393,10 +410,10 @@ impl LowDelayPEncoder {
                     max_num_reorder_pics: 0,
                     min_cb_log2: if self.amp { 3 } else { 4 },
                     amp: self.amp,
-                    cu_qp_delta: false,
+                    cu_qp_delta: self.aq > 0,
                 },
                 &self.filters,
-                0,
+                self.aq,
             )?;
             let recon = FrameRecon {
                 y: idr.recon_y,
@@ -440,6 +457,7 @@ impl LowDelayPEncoder {
                 l0,
                 lf: &self.filters,
                 big_cu: self.amp,
+                aq: self.aq,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             let au = annexb(&[nal_unit(1, 0, 0, &rbsp)]); // TRAIL_R
@@ -550,6 +568,10 @@ pub(crate) struct SliceSpec<'a> {
     /// `part_mode` column, no intra `part_mode`). Implied by the AMP
     /// stream configuration.
     pub big_cu: bool,
+    /// Spatial adaptive-quantization strength (0 = constant slice QP;
+    /// 1..=3 = per-CTB `cu_qp_delta` signalling — the stream's PPS
+    /// must carry `cu_qp_delta_enabled_flag == 1`).
+    pub aq: u8,
 }
 
 /// §7.3.6.1 — the P / B slice-segment header: an inline §7.4.8
@@ -1417,12 +1439,13 @@ pub(crate) fn encode_inter_slice(
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
-    let qp_y = qp as u32;
-    let qp_c = chroma_qp_420(qp);
     // SSD-per-bit tradeoff, doubling every 3 QP (as the intra path);
     // the SAD-domain motion-search λ uses the same scale.
-    let lambda: u64 = 1u64 << (qp.unsigned_abs().saturating_sub(9) / 3);
-    let lambda_me: u64 = lambda;
+    let lambda_of = |q: i32| -> u64 { 1u64 << (q.unsigned_abs().saturating_sub(9) / 3) };
+    let lambda = lambda_of(qp);
+    // Spatial AQ: per-CTB QP offsets against the slice QP (all zero
+    // at `spec.aq == 0`); signalled through cu_qp_delta.
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq);
 
     let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
     let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
@@ -1525,12 +1548,20 @@ pub(crate) fn encode_inter_slice(
 
     // ---- pass 1: per-CTB mode decisions + reconstruction ----
     let mut plans: Vec<CuCandidate> = Vec::with_capacity(ctbs_x * ctbs_y);
+    // The QP each CTB was quantized at (slice QP + AQ offset).
+    let mut plan_qps: Vec<i32> = Vec::with_capacity(ctbs_x * ctbs_y);
     // `ctb` also drives the x0/y0 arithmetic, not just the grid index.
     #[allow(clippy::needless_range_loop)]
     for ctb in 0..ctbs_x * ctbs_y {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
         let (cx0, cy0) = (x0 / 2, y0 / 2);
+        let ctb_qp = (qp + aq_deltas[ctb]).clamp(0, 51);
+        plan_qps.push(ctb_qp);
+        let qp_y = ctb_qp as u32;
+        let qp_c = chroma_qp_420(ctb_qp);
+        let lambda = lambda_of(ctb_qp);
+        let lambda_me = lambda;
         let src = [
             extract(frame.y, width, x0, y0, CTB),
             extract(frame.cb, cw, cx0, cy0, 8),
@@ -2022,6 +2053,41 @@ pub(crate) fn encode_inter_slice(
         sao_chroma: false,
     };
     let mut sao_ctbs: Vec<crate::slice_data::SaoCtbParams> = Vec::new();
+    // §8.6.1 effective per-CTB QpY a decoder derives: a CU transmits
+    // its cu_qp_delta only when its transform tree codes some cbf
+    // (skip / rqt_root_cbf == 0 / all-zero-TU CUs transmit nothing
+    // and inherit the predicted QP — with one QG per CTB, the running
+    // qPY_PREV). Constant everywhere when AQ is off.
+    let any_cbf = |c: &CuCandidate| -> bool {
+        match &c.levels {
+            Some(CuLevels::Depth0(l)) => l.iter().any(|lv| lv.iter().any(|&v| v != 0)),
+            Some(CuLevels::Depth1(d)) => {
+                let Depth1Levels { luma, cb, cr } = d.as_ref();
+                luma.iter()
+                    .chain(cb.iter())
+                    .chain(cr.iter())
+                    .any(|lv| lv.iter().any(|&v| v != 0))
+            }
+            None => false,
+        }
+    };
+    let eff_qps: Vec<i32> = {
+        let mut prev = qp;
+        plans
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if spec.aq > 0 {
+                    if any_cbf(c) {
+                        prev = plan_qps[i];
+                    }
+                    prev
+                } else {
+                    qp
+                }
+            })
+            .collect()
+    };
     if lf.any() {
         let shapes: Vec<CtbShape> = plans
             .iter()
@@ -2033,12 +2099,11 @@ pub(crate) fn encode_inter_slice(
                 split_depth1: matches!(c.levels, Some(CuLevels::Depth1(_))),
             })
             .collect();
-        let ctb_qps = vec![qp; shapes.len()];
         let out = filter_frame(
             &FilterInput {
                 width,
                 height,
-                ctb_qps: &ctb_qps,
+                ctb_qps: &eff_qps,
                 lambda,
                 recon: [&recon.y, &recon.cb, &recon.cr],
                 src: [frame.y, frame.cb, frame.cr],
@@ -2067,6 +2132,9 @@ pub(crate) fn encode_inter_slice(
     // Table 9-4: cabac_init_flag 0 ⇒ initType 1 (P) / 2 (B).
     let raw_slice_type = if b_slice { 0 } else { 1 };
     let mut ctxs = SliceContexts::init(init_type(raw_slice_type, false), qp);
+    // §8.6.1 qPY_PREV thread for the cu_qp_delta emission (one QG per
+    // CTB ⇒ qPY_PRED == qPY_PREV; SliceQpY at the slice start).
+    let mut qp_prev = qp;
     for (ctb, chosen) in plans.iter().enumerate() {
         let x0 = (ctb % ctbs_x) * CTB;
         let y0 = (ctb / ctbs_x) * CTB;
@@ -2302,6 +2370,12 @@ pub(crate) fn encode_inter_slice(
                 } else {
                     debug_assert!(cbf_luma, "all-zero transform tree must not be coded");
                 }
+                // §7.3.8.10 delta_qp( ) in the (only) TU when it
+                // carries a cbf.
+                if spec.aq > 0 && (cbf_luma || cbf_cb || cbf_cr) {
+                    encode_cu_qp_delta(&mut w, &mut cabac, &mut ctxs, plan_qps[ctb] - qp_prev);
+                    qp_prev = plan_qps[ctb];
+                }
                 if cbf_luma {
                     encode_residual_coding(
                         &mut w,
@@ -2353,6 +2427,7 @@ pub(crate) fn encode_inter_slice(
                     &mut ctxs.cbf_chroma[cbf_cr_ctx_inc(0) as usize],
                     u8::from(root_cr),
                 );
+                let mut delta_done = false;
                 for k in 0..4 {
                     let cbf_cb_k = leaf_nz(&cb[k]);
                     let cbf_cr_k = leaf_nz(&cr[k]);
@@ -2376,6 +2451,13 @@ pub(crate) fn encode_inter_slice(
                         &mut ctxs.cbf_luma[cbf_luma_ctx_inc(1) as usize],
                         u8::from(cbf_luma_k),
                     );
+                    // §7.3.8.10 delta_qp( ) in the first depth-1 TU
+                    // with a cbf.
+                    if spec.aq > 0 && !delta_done && (cbf_luma_k || cbf_cb_k || cbf_cr_k) {
+                        encode_cu_qp_delta(&mut w, &mut cabac, &mut ctxs, plan_qps[ctb] - qp_prev);
+                        qp_prev = plan_qps[ctb];
+                        delta_done = true;
+                    }
                     if cbf_luma_k {
                         encode_residual_coding(
                             &mut w,

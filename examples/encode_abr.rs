@@ -1,15 +1,16 @@
 //! Encode raw 4:2:0 frames under average-bitrate rate control.
 //!
 //! ```text
-//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [pyramid=N] [b] [deblock] [sao]
+//! cargo run --example encode_abr -- in.yuv WxH BITRATE FPS out.hevc [recon.yuv] [gop=N] [pyramid=N] [aq=N] [b] [deblock] [sao]
 //! ```
 //!
 //! `BITRATE` is bits per second (optional `k` / `M` suffix); `FPS` is
 //! an integer or a `num/den` ratio. `gop=N` re-emits an IDR every `N`
 //! frames; `pyramid=N` switches to hierarchical-B mini-GOPs of `N`
-//! frames (excludes `gop` / `b`); `b` codes the non-IDR frames as
-//! low-delay B slices; `deblock` / `sao` enable the §8.7 in-loop
-//! filters.
+//! frames (excludes `gop` / `b`); `aq=N` (1..=3) enables spatial
+//! adaptive quantization (per-CTB `cu_qp_delta`); `b` codes the
+//! non-IDR frames as low-delay B slices; `deblock` / `sao` enable
+//! the §8.7 in-loop filters.
 //!
 //! `in.yuv` is a concatenation of planar 8-bit 4:2:0 frames;
 //! dimensions must be multiples of 16. The optional `recon.yuv`
@@ -71,6 +72,11 @@ fn main() {
         .iter()
         .skip(5)
         .find_map(|a| a.strip_prefix("pyramid=")?.parse::<usize>().ok());
+    let aq = args
+        .iter()
+        .skip(5)
+        .find_map(|a| a.strip_prefix("aq=")?.parse::<u8>().ok())
+        .unwrap_or(0);
     let cfg = RateControlCfg::new(bitrate, fps_num, fps_den);
     let lf = LoopFilterCfg {
         deblocking: flag("deblock"),
@@ -81,6 +87,7 @@ fn main() {
         let enc = PyramidEncoder::new(w, h, 26, g)
             .expect("encoder")
             .with_loop_filters(lf)
+            .with_aq(aq)
             .with_rate_control(&cfg);
         let out = encode_pyramid_with(enc, &frames).expect("encode");
         std::fs::write(&args[4], &out.stream).expect("write output");
@@ -94,6 +101,7 @@ fn main() {
             matches!(a, "b" | "deblock" | "sao")
                 || a.starts_with("gop=")
                 || a.starts_with("pyramid=")
+                || a.starts_with("aq=")
         };
         if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
             std::fs::write(recon_path, &recon).expect("write recon");
@@ -111,6 +119,7 @@ fn main() {
         .expect("encoder")
         .with_b_slices(flag("b"))
         .with_loop_filters(lf)
+        .with_aq(aq)
         .with_rate_control(&cfg);
     let mut stream = Vec::new();
     let mut recon = Vec::new();
@@ -129,7 +138,10 @@ fn main() {
     }
     std::fs::write(&args[4], &stream).expect("write output");
     let is_flag = |a: &str| {
-        matches!(a, "b" | "deblock" | "sao") || a.starts_with("gop=") || a.starts_with("pyramid=")
+        matches!(a, "b" | "deblock" | "sao")
+            || a.starts_with("gop=")
+            || a.starts_with("pyramid=")
+            || a.starts_with("aq=")
     };
     if let Some(recon_path) = args.get(5).filter(|a| !is_flag(a)) {
         std::fs::write(recon_path, &recon).expect("write recon");

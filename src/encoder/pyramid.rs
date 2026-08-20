@@ -160,6 +160,9 @@ pub struct PyramidEncoder {
     /// mini-GOP (the per-layer offsets ride on top) and the
     /// constructor `qp` is unused.
     rc: Option<RateController>,
+    /// Spatial adaptive-quantization strength (0 = constant slice
+    /// QP; 1..=3 = per-CTB `cu_qp_delta` on every slice).
+    aq: u8,
 }
 
 impl PyramidEncoder {
@@ -197,7 +200,17 @@ impl PyramidEncoder {
             refs: BTreeMap::new(),
             anchor: None,
             rc: None,
+            aq: 0,
         })
+    }
+
+    /// Enable spatial adaptive quantization at `strength` (clamped to
+    /// 0..=3) — see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_aq`].
+    #[must_use]
+    pub fn with_aq(mut self, strength: u8) -> Self {
+        self.aq = strength.min(3);
+        self
     }
 
     /// Set the per-layer QP step (default 1): a slice on pyramid
@@ -252,7 +265,7 @@ impl PyramidEncoder {
             max_num_reorder_pics: self.depth(),
             min_cb_log2: if self.amp { 3 } else { 4 },
             amp: self.amp,
-            cu_qp_delta: false,
+            cu_qp_delta: self.aq > 0,
         }
     }
 
@@ -299,7 +312,7 @@ impl PyramidEncoder {
                 idr_qp,
                 &self.sps_cfg(),
                 &self.filters,
-                0,
+                self.aq,
             )?;
             let recon = FrameRecon {
                 y: idr.recon_y,
@@ -425,6 +438,7 @@ impl PyramidEncoder {
             l1,
             lf: &self.filters,
             big_cu: self.amp,
+            aq: self.aq,
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAu {

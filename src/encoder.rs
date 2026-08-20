@@ -133,6 +133,10 @@ use oxideav_core::{
 /// frame rate the budget is spread over and an explicit `qp` option
 /// seeding the starting QP. `fps` also sets the packet time base.
 ///
+/// The `aq` option (1..=3, `"intra"` / `"inter"` modes) enables
+/// spatial adaptive quantization: per-CTB QP offsets from luma
+/// activity, signalled through §7.3.8.10 `cu_qp_delta`.
+///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
     codec_id: CodecId,
@@ -169,8 +173,10 @@ impl std::fmt::Debug for H265Encoder {
 /// `gop` (inter mode IDR period, default 0 = single leading IDR),
 /// `amp` (inter mode: asymmetric motion partitions), the in-loop
 /// filter switches `deblock` / `sao` (intra / inter modes; default
-/// off), and the ABR pair `bitrate` / `fps` (intra / inter modes:
-/// per-frame QP elected against a target average bitrate).
+/// off), the ABR pair `bitrate` / `fps` (intra / inter modes:
+/// per-frame QP elected against a target average bitrate), and `aq`
+/// (intra / inter modes: spatial adaptive quantization via per-CTB
+/// `cu_qp_delta`, strength 1..=3).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
@@ -325,11 +331,6 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             }
         }
         Some("inter") => {
-            if parse_aq(params)? != 0 {
-                return Err(Error::InvalidData(
-                    "h265 encode: the aq option is not supported with mode \"inter\" yet".into(),
-                ));
-            }
             let qp = parse_qp(params)?;
             if let Some(v) = params.options.get("pyramid") {
                 if params.options.get("gop").is_some() || params.options.get("bslices").is_some() {
@@ -349,7 +350,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 let mut enc = pyramid::PyramidEncoder::new(width, height, qp, g)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_amp(parse_flag(params, "amp")?)
-                    .with_loop_filters(parse_lf(params)?);
+                    .with_loop_filters(parse_lf(params)?)
+                    .with_aq(parse_aq(params)?);
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
@@ -373,7 +375,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_b_slices(b_slices)
                     .with_amp(parse_flag(params, "amp")?)
-                    .with_loop_filters(parse_lf(params)?);
+                    .with_loop_filters(parse_lf(params)?)
+                    .with_aq(parse_aq(params)?);
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }

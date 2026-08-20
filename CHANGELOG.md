@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — adaptive quantization on the inter paths (P / low-delay B / pyramid), round 449 (2026-08-21)
+
+`LowDelayPEncoder::with_aq` / `PyramidEncoder::with_aq` (and the
+registry `aq` option now composing with `mode = "inter"`, `gop`,
+`bslices`, `pyramid`, the in-loop filters AND `bitrate`): every
+inter slice codes per-CTB QPs (slice/frame QP + the activity
+offsets), emitting `cu_qp_delta` through the same §7.3.8.10 /
+§9.3.3.10 write path as the intra landing — with the inter-specific
+inference mirrored on the §8.6.1 chain: skip CUs,
+`rqt_root_cbf == 0` AMVP/two-PU CUs and all-zero transform trees
+transmit no delta and inherit the predicted QP (deblocking and the
+running `qPY_PREV` both see the inherited value). Mode decisions
+(merge/AMVP/intra competition, motion-search λ) run at each CTB's
+own QP. Validated by bit-exact GOP roundtrips (P and low-delay B
+with filters, pyramid composed with rate control, registry paths)
+and an out-of-band black-box reference-decoder sweep (low-delay
+gop=10 aq=2, B+filters aq=3, pyramid-8 aq=2+filters — all
+byte-exact; ABR accuracy unchanged: 90-frame pyramid @300 kb/s
+lands within 0.7 %).
+
 ### Added — spatial adaptive quantization: the encoder's first `cu_qp_delta` writer (intra), round 449 (2026-08-21)
 
 `encode_idr_intra_au_aq` / the registry `aq` option (1..=3, `mode =

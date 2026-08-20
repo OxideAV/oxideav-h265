@@ -161,10 +161,125 @@ fn aq_registry_option_roundtrips_and_validates() {
         oxideav_h265::make_encoder(&pcm),
         Err(Error::InvalidData(_))
     ));
-    let mut inter = p.clone();
-    inter.options.insert("mode", "inter");
-    assert!(matches!(
-        oxideav_h265::make_encoder(&inter),
-        Err(Error::InvalidData(_))
-    ));
+}
+
+/// Inter-path AQ: P and low-delay-B GOPs with per-CTB `cu_qp_delta`
+/// — skip and `rqt_root_cbf == 0` CUs transmit no delta and must
+/// inherit the running §8.6.1 prediction on both sides.
+#[test]
+fn inter_aq_gops_decode_bit_exact() {
+    use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
+    let (w, h, n) = (96usize, 64usize, 8usize);
+    let planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..n)
+        .map(|t| {
+            let (mut y, cb, cr) = mixed_planes(w, h, t as u8);
+            // A moving bright square so inter modes engage.
+            let (sx, sy) = (6 + t * 3, 10 + t);
+            for j in 0..10 {
+                for i in 0..10 {
+                    y[(sy + j) * w + sx + i] = y[(sy + j) * w + sx + i].wrapping_add(70);
+                }
+            }
+            (y, cb, cr)
+        })
+        .collect();
+    for (b_slices, lf, aq) in [
+        (false, LoopFilterCfg::off(), 1u8),
+        (false, LoopFilterCfg::all(), 2),
+        (true, LoopFilterCfg::all(), 3),
+    ] {
+        let mut enc = LowDelayPEncoder::new(w, h, 30, 5)
+            .expect("encoder")
+            .with_b_slices(b_slices)
+            .with_loop_filters(lf)
+            .with_aq(aq);
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        for (y, cb, cr) in &planes {
+            let out = enc.encode_frame(&YuvFrame { y, cb, cr }).expect("encode");
+            stream.extend_from_slice(&out.au);
+            recons.push(out.recon);
+        }
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), n, "b={b_slices} aq={aq}");
+        for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                dec.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "b={b_slices} aq={aq} frame {i}: decoder output == encoder recon"
+            );
+        }
+    }
+}
+
+/// Pyramid AQ (out-of-order B slices) composed with rate control:
+/// the mini-GOP base QP comes from the controller, the per-CTB
+/// offsets from AQ, and the whole stream stays bit-exact.
+#[test]
+fn pyramid_aq_with_rate_control_decodes_bit_exact() {
+    use oxideav_h265::encoder::inter::YuvFrame;
+    use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+    use oxideav_h265::encoder::rate::RateControlCfg;
+    let (w, h, n) = (64usize, 64usize, 9usize);
+    let planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n).map(|t| mixed_planes(w, h, t as u8)).collect();
+    let frames: Vec<YuvFrame<'_>> = planes
+        .iter()
+        .map(|(y, cb, cr)| YuvFrame { y, cb, cr })
+        .collect();
+    let enc = PyramidEncoder::new(w, h, 30, 4)
+        .expect("encoder")
+        .with_aq(2)
+        .with_rate_control(&RateControlCfg::new(300_000, 25, 1));
+    let out = encode_pyramid_with(enc, &frames).expect("encode");
+    let decoded = decode_annexb_sequence(&out.stream).expect("decode");
+    assert_eq!(decoded.len(), n);
+    for (i, (dec, rec)) in decoded.iter().zip(&out.recon).enumerate() {
+        let mut expect = rec.y.clone();
+        expect.extend_from_slice(&rec.cb);
+        expect.extend_from_slice(&rec.cr);
+        assert_eq!(
+            dec.picture.to_planar_u8().expect("8-bit"),
+            expect,
+            "pyramid aq frame {i}"
+        );
+    }
+}
+
+/// Registry inter mode accepts `aq` and roundtrips.
+#[test]
+fn registry_inter_aq_roundtrips() {
+    use oxideav_core::{CodecParameters, Frame, PixelFormat, VideoFrame, VideoPlane};
+    let (w, h, n) = (64usize, 64usize, 6usize);
+    let planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+        (0..n).map(|t| mixed_planes(w, h, t as u8)).collect();
+    let mut p = CodecParameters::video("h265".into());
+    p.width = Some(w as u32);
+    p.height = Some(h as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+    p.options.insert("mode", "inter");
+    p.options.insert("gop", "3");
+    p.options.insert("aq", "2");
+    p.options.insert("bitrate", "200k");
+    let mut enc = oxideav_h265::make_encoder(&p).expect("encoder");
+    let plane = |data: &[u8], stride: usize| VideoPlane {
+        stride,
+        data: data.to_vec(),
+    };
+    let mut stream = Vec::new();
+    for (y, cb, cr) in &planes {
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: None,
+            planes: vec![plane(y, w), plane(cb, w / 2), plane(cr, w / 2)],
+        }))
+        .expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            stream.extend_from_slice(&pkt.data);
+        }
+    }
+    let decoded = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(decoded.len(), n);
 }
