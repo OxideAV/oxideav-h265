@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — average-bitrate rate control (`bitrate` / `fps`), round 449 (2026-08-21)
+
+The encoder gains ABR targeting (`encoder::rate`): a deterministic,
+integer-only controller (Q16 fixed point on the §8.6.3 quantizer
+lattice, where the step is `2^(QP/6)`) that models each frame class's
+coded size as `bits ≈ C / 2^(QP/6)`, folds every coded frame back
+into a per-class complexity EWMA (intra and inter tracked
+separately), and elects each frame's `SliceQpY` from the inverted
+model under a leaky-bucket budget with bounded per-frame QP
+excursions (a `min(2 + gap, 15)` window that widens with the frames
+since the class last coded, so rare IDRs re-anchor within one refresh
+while back-to-back frames move at most ±3). Rate control moves ONLY
+the
+per-slice `slice_qp_delta`, so every stream stays conforming and
+bit-exact through the crate's own decoder.
+
+* `LowDelayPEncoder::with_rate_control(&RateControlCfg)` — ABR on the
+  low-delay P/B paths (GOP refresh, AMP and the §8.7 in-loop filters
+  all compose); `EncodedPFrame::qp` exposes the per-frame election.
+* Registry options `bitrate` (bits/s, `k` / `M` suffixes) and `fps`
+  (`"25"` or `"30000/1001"`, default 25) on the `"inter"` and
+  `"intra"` modes; an explicit `qp` option seeds the starting QP,
+  otherwise it derives from the target bits per pixel. `fps` also
+  sets the packet time base (previously hardwired to 1/25).
+  `bitrate` with `"pcm"` or (for now) `pyramid` is rejected.
+* Measured on a 96x64 noisy moving-square clip @25 fps: targets of
+  60k / 100k / 250k / 600k b/s land within 1.4–6.2 % of the request,
+  and every rate-controlled stream (P, low-delay B, filtered,
+  GOP-refresh) decodes byte-exact through a black-box reference
+  decoder and through this crate's decoder.
+* New `encode_abr` example; validation in `tests/rate_control.rs`
+  (accuracy, steady-state convergence, bounded QP tracks, bit-exact
+  roundtrips, registry option errors) plus model unit tests.
+
 ### Fixed — §7.3.8.10 `tu_residual_act_flag` presence gate is a three-way disjunction, round 444 (2026-08-15)
 
 The adaptive-colour-transform flag is present for a `MODE_INTER`

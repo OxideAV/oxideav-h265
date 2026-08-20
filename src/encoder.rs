@@ -33,6 +33,7 @@ pub mod nal;
 #[cfg(test)]
 mod palette_streams;
 pub mod pcm;
+pub mod rate;
 #[cfg(test)]
 mod rdpcm_streams;
 #[cfg(test)]
@@ -50,8 +51,16 @@ enum EncodeMode {
     /// Real CABAC intra coding ([`intra::encode_idr_intra_au`]) at
     /// the carried `SliceQpY` (`mode = "intra"`, `qp` option, default
     /// 26) with the carried §8.7 in-loop filters (`deblock` / `sao`
-    /// options).
-    Intra(i32, loopfilter::LoopFilterCfg),
+    /// options); the `bitrate` option swaps the constant QP for a
+    /// per-frame ABR election.
+    Intra {
+        /// Constant `SliceQpY` when `rc` is off.
+        qp: i32,
+        /// The §8.7 in-loop filter switches.
+        lf: loopfilter::LoopFilterCfg,
+        /// ABR controller (the `bitrate` / `fps` options).
+        rc: Option<rate::RateController>,
+    },
     /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
     /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
     /// 26; `gop` option = GOP length in frames, default 0 = a single
@@ -113,6 +122,13 @@ use oxideav_core::{
 /// against distortion, and reconstructs through them (the reference
 /// path a conforming decoder holds).
 ///
+/// The `bitrate` option (bits per second, optional `k` / `M` suffix)
+/// switches the `"intra"` / `"inter"` modes from constant QP to
+/// average-bitrate coding: [`rate::RateControlCfg`] semantics, with
+/// the `fps` option (`"25"` or `"30000/1001"`, default 25) fixing the
+/// frame rate the budget is spread over and an explicit `qp` option
+/// seeding the starting QP. `fps` also sets the packet time base.
+///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
     codec_id: CodecId,
@@ -122,6 +138,9 @@ pub struct H265Encoder {
     mode: EncodeMode,
     ready: VecDeque<Packet>,
     frame_index: i64,
+    /// Packet time base (`fps_den / fps_num` from the `fps` option;
+    /// default 1/25).
+    time_base: TimeBase,
 }
 
 /// Former name of [`H265Encoder`] (from when the registry encoder was
@@ -144,9 +163,10 @@ impl std::fmt::Debug for H265Encoder {
 /// `"intra"` real CABAC intra coding, or `"inter"` low-delay P GOPs),
 /// `qp` (`SliceQpY` 0..=51 for the intra / inter modes, default 26),
 /// `gop` (inter mode IDR period, default 0 = single leading IDR),
-/// `amp` (inter mode: asymmetric motion partitions), and the in-loop
+/// `amp` (inter mode: asymmetric motion partitions), the in-loop
 /// filter switches `deblock` / `sao` (intra / inter modes; default
-/// off).
+/// off), and the ABR pair `bitrate` / `fps` (intra / inter modes:
+/// per-frame QP elected against a target average bitrate).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or not
@@ -202,6 +222,55 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             sao_chroma: sao,
         })
     };
+    // `bitrate` — bits per second, optional `k` / `M` suffix.
+    let parse_bitrate = |params: &CodecParameters| -> Result<Option<u64>> {
+        let Some(v) = params.options.get("bitrate") else {
+            return Ok(None);
+        };
+        let (digits, mult) = match v.as_bytes().last() {
+            Some(b'k' | b'K') => (&v[..v.len() - 1], 1_000u64),
+            Some(b'M') => (&v[..v.len() - 1], 1_000_000),
+            _ => (v, 1),
+        };
+        digits
+            .parse::<u64>()
+            .ok()
+            .map(|n| n.saturating_mul(mult))
+            .filter(|&b| b >= 1_000)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "h265 encode: bitrate must be an integer >= 1000 bits/s \
+                     (optional k/M suffix), got {v:?}"
+                ))
+            })
+    };
+    // `fps` — `"25"` or `"30000/1001"`, default 25.
+    let parse_fps = |params: &CodecParameters| -> Result<(u32, u32)> {
+        let Some(v) = params.options.get("fps") else {
+            return Ok((25, 1));
+        };
+        let parsed = match v.split_once('/') {
+            None => v.parse::<u32>().ok().map(|n| (n, 1)),
+            Some((n, d)) => n.parse::<u32>().ok().zip(d.parse::<u32>().ok()),
+        };
+        parsed.filter(|&(n, d)| n > 0 && d > 0).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "h265 encode: fps must be a positive integer or num/den ratio, got {v:?}"
+            ))
+        })
+    };
+    let bitrate = parse_bitrate(params)?;
+    let fps = parse_fps(params)?;
+    // ABR configuration when `bitrate` is set: an explicit `qp`
+    // option seeds the controller's starting QP.
+    let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
+        let mut cfg = rate::RateControlCfg::new(bitrate.unwrap_or(0), fps.0, fps.1);
+        if params.options.get("qp").is_some() {
+            cfg.initial_qp = Some(qp);
+        }
+        cfg
+    };
     let mode = match params.options.get("mode") {
         None | Some("pcm") => {
             if parse_lf(params)?.any() {
@@ -214,6 +283,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     "h265 encode: the amp option requires mode \"inter\"".into(),
                 ));
             }
+            if bitrate.is_some() {
+                return Err(Error::InvalidData(
+                    "h265 encode: the bitrate option requires mode \"intra\" or \"inter\" \
+                     (PCM coding is lossless fixed-rate)"
+                        .into(),
+                ));
+            }
             EncodeMode::Pcm
         }
         Some("intra") => {
@@ -222,7 +298,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     "h265 encode: the amp option requires mode \"inter\"".into(),
                 ));
             }
-            EncodeMode::Intra(parse_qp(params)?, parse_lf(params)?)
+            let qp = parse_qp(params)?;
+            EncodeMode::Intra {
+                qp,
+                lf: parse_lf(params)?,
+                rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
+            }
         }
         Some("inter") => {
             let qp = parse_qp(params)?;
@@ -241,6 +322,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                             "h265 encode: pyramid must be a power of two in 2..=16, got {v:?}"
                         ))
                     })?;
+                if bitrate.is_some() {
+                    return Err(Error::InvalidData(
+                        "h265 encode: bitrate with pyramid is not supported yet".into(),
+                    ));
+                }
                 let enc = pyramid::PyramidEncoder::new(width, height, qp, g)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_amp(parse_flag(params, "amp")?)
@@ -261,11 +347,14 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     })?,
                 };
                 let b_slices = parse_flag(params, "bslices")?;
-                let enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
+                let mut enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_b_slices(b_slices)
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?);
+                if bitrate.is_some() {
+                    enc = enc.with_rate_control(&rc_cfg(params, qp));
+                }
                 EncodeMode::Inter(enc)
             }
         }
@@ -288,6 +377,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
+        time_base: TimeBase::new(i64::from(fps.1), i64::from(fps.0)),
     }))
 }
 
@@ -337,12 +427,27 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
-            EncodeMode::Intra(qp, lf) => (
-                intra::encode_idr_intra_au_lf(&y, &cb, &cr, self.width, self.height, *qp, lf)
-                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                    .au,
-                true,
-            ),
+            EncodeMode::Intra { qp, lf, rc } => {
+                let frame_qp = match rc {
+                    Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
+                    None => *qp,
+                };
+                let au = intra::encode_idr_intra_au_lf(
+                    &y,
+                    &cb,
+                    &cr,
+                    self.width,
+                    self.height,
+                    frame_qp,
+                    lf,
+                )
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                .au;
+                if let Some(rc) = rc {
+                    rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);
+                }
+                (au, true)
+            }
             EncodeMode::Inter(enc) => {
                 let f = enc
                     .encode_frame(&inter::YuvFrame {
@@ -369,14 +474,16 @@ impl Encoder for H265Encoder {
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
                 self.frame_index += 1;
                 let (delay, decode_count) = (*delay, decode_count);
-                let mut packets = Self::pyramid_packets(aus, pts_by_display, delay, decode_count);
+                let time_base = self.time_base;
+                let mut packets =
+                    Self::pyramid_packets(aus, pts_by_display, delay, decode_count, time_base);
                 for pkt in packets.drain(..) {
                     self.ready.push_back(pkt);
                 }
                 return Ok(());
             }
         };
-        let mut pkt = Packet::new(0, TimeBase::new(1, 25), au);
+        let mut pkt = Packet::new(0, self.time_base, au);
         pkt.pts = v.pts.or(Some(self.frame_index));
         pkt.dts = pkt.pts;
         pkt.flags.keyframe = keyframe;
@@ -400,7 +507,9 @@ impl Encoder for H265Encoder {
         {
             let aus = enc.flush();
             let (delay, decode_count) = (*delay, decode_count);
-            let mut packets = Self::pyramid_packets(aus, pts_by_display, delay, decode_count);
+            let time_base = self.time_base;
+            let mut packets =
+                Self::pyramid_packets(aus, pts_by_display, delay, decode_count, time_base);
             for pkt in packets.drain(..) {
                 self.ready.push_back(pkt);
             }
@@ -419,10 +528,11 @@ impl H265Encoder {
         pts_by_display: &[Option<i64>],
         delay: i64,
         decode_count: &mut i64,
+        time_base: TimeBase,
     ) -> Vec<Packet> {
         aus.into_iter()
             .map(|au| {
-                let mut pkt = Packet::new(0, TimeBase::new(1, 25), au.au);
+                let mut pkt = Packet::new(0, time_base, au.au);
                 pkt.pts = Some(
                     pts_by_display
                         .get(au.display_order)

@@ -57,6 +57,7 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
+use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
 use crate::encoder::residual::encode_residual_coding;
 use crate::inter_pred::{
     predict_inter_pu, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
@@ -234,6 +235,10 @@ pub struct EncodedPFrame {
     pub recon: FrameRecon,
     /// The frame's CU mode-decision counters.
     pub stats: FrameStats,
+    /// The `SliceQpY` this frame was coded at (the constructor QP, or
+    /// the rate controller's per-frame election under
+    /// [`LowDelayPEncoder::with_rate_control`]).
+    pub qp: i32,
 }
 
 /// The streaming low-delay encoder: one frame in, one access unit
@@ -264,6 +269,10 @@ pub struct LowDelayPEncoder {
     /// The most recent reconstructions, newest first (up to two — the
     /// active references POC − 1 and POC − 2).
     prevs: Vec<FrameRecon>,
+    /// ABR rate controller: when set, it elects each frame's
+    /// `SliceQpY` and the constructor `qp` is unused (pass it as
+    /// [`RateControlCfg::initial_qp`] to seed the starting point).
+    rc: Option<RateController>,
 }
 
 impl LowDelayPEncoder {
@@ -291,6 +300,7 @@ impl LowDelayPEncoder {
             amp: false,
             poc: 0,
             prevs: Vec::new(),
+            rc: None,
         })
     }
 
@@ -325,6 +335,17 @@ impl LowDelayPEncoder {
         self
     }
 
+    /// Switch to average-bitrate coding: a [`RateController`] elects
+    /// each frame's `SliceQpY` against `cfg` (target bitrate + frame
+    /// rate), replacing the constructor's constant QP. Every stream
+    /// stays fully conforming — rate control only moves the per-slice
+    /// `slice_qp_delta`.
+    #[must_use]
+    pub fn with_rate_control(mut self, cfg: &RateControlCfg) -> Self {
+        self.rc = Some(RateController::new(cfg, self.width, self.height));
+        self
+    }
+
     /// Encode the next frame in display order.
     ///
     /// # Errors
@@ -349,6 +370,14 @@ impl LowDelayPEncoder {
             }
         }
         let idr_now = self.prevs.is_empty() || self.poc == 0;
+        let frame_qp = match &mut self.rc {
+            Some(rc) => rc.pick_qp(if idr_now {
+                FrameClass::Intra
+            } else {
+                FrameClass::Inter
+            }),
+            None => self.qp,
+        };
         let out = if idr_now {
             // sps_max_dec_pic_buffering_minus1 = 2: the current picture
             // plus the two short-term references the P/B slices keep.
@@ -358,7 +387,7 @@ impl LowDelayPEncoder {
                 frame.cr,
                 self.width,
                 self.height,
-                self.qp,
+                frame_qp,
                 &SpsCfg {
                     max_dec_pic_buffering_minus1: 2,
                     max_num_reorder_pics: 0,
@@ -382,6 +411,7 @@ impl LowDelayPEncoder {
                     intra: (self.width / CTB) * (self.height / CTB),
                     ..FrameStats::default()
                 },
+                qp: frame_qp,
             }
         } else {
             // The active references: RefPicListX[i] = the
@@ -396,7 +426,7 @@ impl LowDelayPEncoder {
                 .collect();
             let spec = SliceSpec {
                 poc: self.poc,
-                qp: self.qp,
+                qp: frame_qp,
                 b_slice: self.b_slices,
                 rps_neg: (1..=l0.len() as u32).map(|d| (d, true)).collect(),
                 rps_pos: Vec::new(),
@@ -419,8 +449,20 @@ impl LowDelayPEncoder {
                 keyframe: false,
                 recon,
                 stats,
+                qp: frame_qp,
             }
         };
+        if let Some(rc) = &mut self.rc {
+            rc.update(
+                if idr_now {
+                    FrameClass::Intra
+                } else {
+                    FrameClass::Inter
+                },
+                frame_qp,
+                out.au.len() as u64 * 8,
+            );
+        }
         // GOP wrap: schedule the next IDR.
         if self.gop > 0 && self.poc >= self.gop as i32 {
             self.poc = 0;
