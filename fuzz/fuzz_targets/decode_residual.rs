@@ -60,6 +60,14 @@ fuzz_target!(|data: &[u8]| {
         sign_data_hiding_enabled_flag: cfg & 0x10 != 0,
         sign_hidden_suppressed: cfg & 0x20 != 0,
         transform_skip_sig_ctx: data[1] & 0x40 != 0,
+        // Range-extension knobs driven from the same config bytes so
+        // the persistent-Rice / alignment / extended-precision paths
+        // are reachable too.
+        persistent_rice_adaptation_enabled_flag: data[1] & 0x80 != 0,
+        cabac_bypass_alignment_enabled_flag: data[2] & 0x01 != 0,
+        extended_precision_processing_flag: data[2] & 0x02 != 0,
+        bit_depth: if data[2] & 0x04 != 0 { 12 } else { 8 },
+        rice_stat_transform_skip: data[2] & 0x08 != 0,
     };
 
     let slice_qp_y = i32::from(data[1] & 0x3F).min(51);
