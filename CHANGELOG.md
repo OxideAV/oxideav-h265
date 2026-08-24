@@ -33,6 +33,19 @@ streams (the SEI rides between the parameter sets and the slice, so
 the context-dependent parse lands after SPS activation) and decodes
 them byte-exact to the encoder reconstructions.
 
+### Added — hierarchical QP offsets on the wire + registry `pyramidstep`, round 451 (2026-08-24)
+
+The pyramid's per-layer rate allocation is now a registry surface
+(`pyramidstep`, 0..=6, default 1: `SliceQpY = base + layer * step`,
+requires `pyramid`) and wire-verified: new tests parse every slice
+header back (`slice_qp_delta` against the PPS `init_qp`) and assert
+the signalled `SliceQpY` equals the layer allocation for flat /
+default / steep steps, that a steeper step strictly shrinks the
+deep-layer bit share while the layer-0 anchors stay byte-identical,
+and that the offsets compose with spatial AQ + the in-loop filters
+(per-CTB `cu_qp_delta` riding on per-layer slice QPs, bit-exact
+through the crate's own decoder).
+
 ### Changed — pyramid ABR accuracy: per-slice base elections + measurement gates, round 451 (2026-08-24)
 
 The hierarchical-B rate controller now elects a base QP per SLICE (at

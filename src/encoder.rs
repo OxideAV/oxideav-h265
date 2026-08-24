@@ -122,7 +122,10 @@ use oxideav_core::{
 ///   four asymmetric PART_2NxnU/2NxnD/nLx2N/nRx2N shapes competing in
 ///   the inter CU ladder); the `pyramid` option (a power of two in
 ///   2..=16) switches to hierarchical-B coding — dyadic mini-GOPs
-///   coded out of display order with per-layer QP offsets; packets
+///   coded out of display order with per-layer QP offsets — the
+///   `pyramidstep` option (0..=6, default 1) sets the per-layer step
+///   of that hierarchical allocation (`SliceQpY = base + layer *
+///   step`, composing with `aq`'s per-CTB deltas on top); packets
 ///   then arrive in bursts per mini-GOP (dts trails pts by
 ///   `log2(pyramid)` frames) and `flush()` emits the tail. `pyramid`
 ///   excludes the `gop` / `bslices` options.
@@ -343,6 +346,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "h265 encode: hrd requires the bitrate, bufsize and fps options".into(),
         ));
     }
+    if params.options.get("pyramidstep").is_some() && params.options.get("pyramid").is_none() {
+        return Err(Error::InvalidData(
+            "h265 encode: pyramidstep requires the pyramid option".into(),
+        ));
+    }
     // ABR configuration when `bitrate` is set: an explicit `qp`
     // option seeds the controller's starting QP.
     let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
@@ -416,8 +424,24 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                             "h265 encode: pyramid must be a power of two in 2..=16, got {v:?}"
                         ))
                     })?;
+                // `pyramidstep` — the per-layer QP step of the
+                // hierarchical rate allocation (SliceQpY = base +
+                // layer * step; default 1).
+                let step = match params.options.get("pyramidstep") {
+                    None => 1i32,
+                    Some(v) => v
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|s| (0..=6).contains(s))
+                        .ok_or_else(|| {
+                            Error::InvalidData(format!(
+                                "h265 encode: pyramidstep must be 0..=6, got {v:?}"
+                            ))
+                        })?,
+                };
                 let mut enc = pyramid::PyramidEncoder::new(width, height, qp, g)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                    .with_layer_qp_step(step)
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?)
                     .with_aq(parse_aq(params)?);
