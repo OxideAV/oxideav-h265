@@ -312,21 +312,35 @@ impl PyramidEncoder {
 
         if self.anchor.is_none() {
             // The leading IDR (POC 0, layer 0).
-            let idr_qp = match &mut self.rc {
+            let mut idr_qp = match &mut self.rc {
                 Some(rc) => rc.pick_qp(FrameClass::Intra),
                 None => self.qp,
             };
-            let idr = encode_idr_intra_au_full(
-                frame.y,
-                frame.cb,
-                frame.cr,
-                self.width,
-                self.height,
-                idr_qp,
-                &self.sps_cfg(),
-                &self.filters,
-                self.aq,
-            )?;
+            let code = |qp: i32| {
+                encode_idr_intra_au_full(
+                    frame.y,
+                    frame.cb,
+                    frame.cr,
+                    self.width,
+                    self.height,
+                    qp,
+                    &self.sps_cfg(),
+                    &self.filters,
+                    self.aq,
+                )
+            };
+            let mut idr = code(idr_qp)?;
+            // VBV constraint: re-encode at a higher QP until the IDR
+            // access unit fits the modelled decoder buffer (or the QP
+            // ceiling is reached) — the same hard guarantee as the
+            // low-delay arm.
+            if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+                let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
+                while idr.au.len() as u64 * 8 > cap && idr_qp < ceiling {
+                    idr_qp = (idr_qp + 3).min(ceiling);
+                    idr = code(idr_qp)?;
+                }
+            }
             let recon = FrameRecon {
                 y: idr.recon_y,
                 cb: idr.recon_cb,
@@ -375,9 +389,10 @@ impl PyramidEncoder {
         // back below, so the model tracks the layer mixture and the
         // widening excursion window absorbs the once-per-GOP cadence.
         let base = match &mut self.rc {
-            Some(rc) => rc.pick_qp(FrameClass::Inter),
+            Some(rc) => rc.pick_qp_burst(FrameClass::Inter, sched.len()),
             None => self.qp,
         };
+        let pending = std::mem::take(&mut self.pending);
         let mut out = Vec::with_capacity(sched.len());
         for (i, s) in sched.iter().enumerate() {
             // Retained set for THIS slice's RPS: every already-coded
@@ -400,15 +415,8 @@ impl PyramidEncoder {
             // Drop reconstructions nothing references any more.
             self.refs.retain(|p, _| retained.contains(p));
 
-            let frame = &self.pending[(s.poc - a - 1) as usize];
-            let au = self.code_slice(frame.as_yuv(), s, &retained, base);
-            if let Some(rc) = &mut self.rc {
-                // Feed back at the BASE QP (not the slice's layer
-                // QP): the model then learns the layer-offset
-                // discount as part of the complexity, so inverting it
-                // at the next base election is unbiased.
-                rc.update(FrameClass::Inter, base, au.au.len() as u64 * 8);
-            }
+            let frame = &pending[(s.poc - a - 1) as usize];
+            let au = self.code_slice_vbv(frame.as_yuv(), s, &retained, base);
             self.refs.insert(s.poc, au.recon.clone());
             out.push(au);
         }
@@ -416,13 +424,51 @@ impl PyramidEncoder {
         let new_anchor = a + g;
         self.refs.retain(|&p, _| p == new_anchor);
         self.anchor = Some(new_anchor);
-        self.pending.clear();
         out
     }
 
+    /// Encode one scheduled P / B slice at `base` QP plus the slice's
+    /// layer offset, enforce the VBV constraint (re-encode at a
+    /// higher QP while the access unit would underflow the modelled
+    /// buffer), and feed the rate model back — the per-temporal-layer
+    /// buffer accounting: every access unit drains the model at its
+    /// own decode instant, whatever pyramid layer it sits on.
+    fn code_slice_vbv(
+        &mut self,
+        frame: YuvFrame<'_>,
+        s: &Sched,
+        retained: &[i32],
+        base: i32,
+    ) -> PyramidAu {
+        let mut bump = 0i32;
+        let mut au = self.code_slice(frame, s, retained, self.layer_qp(base, s.layer));
+        if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+            let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
+            while au.au.len() as u64 * 8 > cap && au.qp < ceiling {
+                bump += 3;
+                let qp = (self.layer_qp(base, s.layer) + bump).min(ceiling);
+                au = self.code_slice(frame, s, retained, qp);
+            }
+        }
+        if let Some(rc) = &mut self.rc {
+            // Feed back at the BASE QP (not the slice's layer QP) plus
+            // any VBV bump: the model then learns the layer-offset
+            // discount as part of the complexity, so inverting it at
+            // the next base election is unbiased — while a bumped
+            // slice reports the QP its bits were really coded at
+            // relative to the layer shape.
+            rc.update(
+                FrameClass::Inter,
+                (base + bump).clamp(0, 51),
+                au.au.len() as u64 * 8,
+            );
+        }
+        au
+    }
+
     /// Encode one scheduled P / B slice against the retained
-    /// reconstructions, at `base` QP plus the slice's layer offset.
-    fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32], base: i32) -> PyramidAu {
+    /// reconstructions at slice QP `qp`.
+    fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32], qp: i32) -> PyramidAu {
         let b_slice = s.l1.is_some();
         let rec_of = |p: i32| -> &FrameRecon { self.refs.get(&p).expect("retained recon") };
         let l0 = vec![(s.l0, rec_of(s.l0))];
@@ -440,7 +486,6 @@ impl PyramidEncoder {
             .filter(|&&p| p > s.poc)
             .map(|&p| ((p - s.poc) as u32, Some(p) == s.l1))
             .collect();
-        let qp = self.layer_qp(base, s.layer);
         let spec = SliceSpec {
             poc: s.poc,
             qp,
@@ -490,10 +535,7 @@ impl PyramidEncoder {
                 Some(rc) => rc.pick_qp(FrameClass::Inter),
                 None => self.qp,
             };
-            let au = self.code_slice(frame.as_yuv(), &s, &retained, base);
-            if let Some(rc) = &mut self.rc {
-                rc.update(FrameClass::Inter, base, au.au.len() as u64 * 8);
-            }
+            let au = self.code_slice_vbv(frame.as_yuv(), &s, &retained, base);
             self.refs.insert(poc, au.recon.clone());
             out.push(au);
         }

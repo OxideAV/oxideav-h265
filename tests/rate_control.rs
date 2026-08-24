@@ -399,16 +399,10 @@ fn registry_vbv_options_validate_and_roundtrip() {
         }
     }
     assert_eq!(n, planes.len());
-    // bufsize without bitrate / malformed / with pyramid: rejected.
+    // bufsize without bitrate / malformed: rejected.
     for opts in [
         vec![("mode", "inter"), ("bufsize", "40k")],
         vec![("mode", "inter"), ("bitrate", "200k"), ("bufsize", "9")],
-        vec![
-            ("mode", "inter"),
-            ("pyramid", "4"),
-            ("bitrate", "200k"),
-            ("bufsize", "40k"),
-        ],
     ] {
         let mut p = base_params();
         for (k, v) in &opts {
@@ -419,6 +413,118 @@ fn registry_vbv_options_validate_and_roundtrip() {
             "{opts:?}"
         );
     }
+}
+
+/// VBV over the hierarchical-B pyramid: every access unit — anchor P
+/// bursts and every B layer alike — must fit the modelled decoder
+/// buffer at ITS OWN decode instant (per-temporal-layer buffer
+/// accounting), replay-pinned exactly like the flat-GOP arm: the
+/// leaky bucket is replayed over the decode-order access units and
+/// may never underflow, while the unconstrained twin provably
+/// overshoots the buffer.
+#[test]
+fn pyramid_vbv_constrained_stream_never_underflows() {
+    use oxideav_h265::encoder::pyramid::PyramidEncoder;
+    let planes = clip(33); // IDR + four GOP-8 mini-GOPs
+    let frames = frames(&planes);
+    let (rate, bufsize) = (150_000u64, 14_000u64);
+    let per_frame_fill = (rate / u64::from(FPS)) as i64;
+    // Decode-order AU sizes through a pyramid encoder.
+    let collect = |mut enc: PyramidEncoder| -> Vec<oxideav_h265::encoder::pyramid::PyramidAu> {
+        let mut aus = Vec::new();
+        for f in &frames {
+            aus.extend(enc.encode_frame(f).expect("encode"));
+        }
+        aus.extend(enc.flush());
+        aus
+    };
+    // Unconstrained twin: prove the constraint has something to do.
+    let free = collect(
+        PyramidEncoder::new(W, H, 26, 8)
+            .expect("encoder")
+            .with_rate_control(&RateControlCfg::new(rate, FPS, 1)),
+    );
+    let free_max = free.iter().map(|au| au.au.len() as u64 * 8).max().unwrap();
+    assert!(
+        free_max > bufsize,
+        "test premise: the unconstrained pyramid must overshoot the buffer ({free_max} bits)"
+    );
+    // Constrained run: replay the decoder-buffer model in DECODE
+    // order (the order the access units hit the buffer).
+    let aus = collect(
+        PyramidEncoder::new(W, H, 26, 8)
+            .expect("encoder")
+            .with_rate_control(&RateControlCfg::new(rate, FPS, 1).with_vbv(bufsize)),
+    );
+    assert_eq!(aus.len(), planes.len());
+    let mut fullness = bufsize as i64;
+    let mut stream = Vec::new();
+    for (i, au) in aus.iter().enumerate() {
+        let bits = au.au.len() as i64 * 8;
+        assert!(
+            bits <= fullness,
+            "decode-order AU {i} (display {}, layer {}): {bits} bits would underflow \
+             the VBV (fullness {fullness})",
+            au.display_order,
+            au.layer
+        );
+        fullness = (fullness - bits + per_frame_fill).min(bufsize as i64);
+        stream.extend_from_slice(&au.au);
+    }
+    // Still a conforming stream: display-order decode == encoder
+    // reconstruction, bit-exact.
+    let decoded = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
+    let mut recons: Vec<Option<&oxideav_h265::encoder::inter::FrameRecon>> =
+        vec![None; planes.len()];
+    for au in &aus {
+        recons[au.display_order] = Some(&au.recon);
+    }
+    for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+        let rec = rec.expect("every display index coded");
+        let mut expect = rec.y.clone();
+        expect.extend_from_slice(&rec.cb);
+        expect.extend_from_slice(&rec.cr);
+        assert_eq!(
+            dec.picture.to_planar_u8().expect("8-bit"),
+            expect,
+            "frame {i}"
+        );
+    }
+}
+
+/// The registry `bufsize` + `pyramid` combination (rejected before
+/// round 451) now encodes with the per-AU VBV guarantee.
+#[test]
+fn registry_pyramid_vbv_roundtrips() {
+    let planes = clip(9); // IDR + one GOP-4 mini-GOP + 4-frame tail
+    let mut p = base_params();
+    p.options.insert("mode", "inter");
+    p.options.insert("pyramid", "4");
+    p.options.insert("bitrate", "200k");
+    p.options.insert("bufsize", "30k");
+    let mut enc = make_encoder(&p).expect("encoder");
+    let mut stream = Vec::new();
+    let mut n = 0usize;
+    for (y, cb, cr) in &planes {
+        enc.send_frame(&video_frame(y, cb, cr)).expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            assert!(
+                pkt.data.len() as u64 * 8 <= 30_000,
+                "no access unit may exceed the VBV buffer"
+            );
+            stream.extend_from_slice(&pkt.data);
+            n += 1;
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(pkt) = enc.receive_packet() {
+        stream.extend_from_slice(&pkt.data);
+        n += 1;
+    }
+    assert_eq!(n, planes.len());
+    let decoded = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
 }
 
 /// An explicit `fps` option (or `with_frame_rate` on the direct

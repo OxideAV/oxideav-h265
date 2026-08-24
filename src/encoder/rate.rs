@@ -189,6 +189,18 @@ impl RateController {
 
     /// Elect the next frame's `SliceQpY` for a frame of `class`.
     pub(crate) fn pick_qp(&mut self, class: FrameClass) -> i32 {
+        self.pick_qp_burst(class, 1)
+    }
+
+    /// Elect one `SliceQpY` for a BURST of `burst` frames of `class`
+    /// coded back to back before the next election (the pyramid's
+    /// per-mini-GOP base QP). Identical to [`Self::pick_qp`] except
+    /// the VBV aim: the whole burst drains the modelled buffer with
+    /// only `burst - 1` refill intervals in between, so the per-frame
+    /// budget is aimed at the burst's share of that window instead of
+    /// the instantaneous fullness alone.
+    pub(crate) fn pick_qp_burst(&mut self, class: FrameClass, burst: usize) -> i32 {
+        let burst = burst.max(1) as i64;
         // The frame budget: the nominal share minus a drain of the
         // accumulated overshoot spread over the next 8 frames, kept
         // within a sane multiple of the nominal share.
@@ -197,8 +209,14 @@ impl RateController {
             .max(64) as u64;
         if let Some((_, fullness)) = self.vbv {
             // Aim comfortably under the hard VBV budget so the
-            // re-encode loop stays a rare emergency.
-            desired = desired.min((fullness.max(64) as u64).saturating_mul(3) / 4);
+            // re-encode loop stays a rare emergency. Over a burst the
+            // budget is the current fullness plus the refill the
+            // later frames' decode instants add.
+            let burst_budget = fullness
+                .max(64)
+                .saturating_add((burst - 1).saturating_mul(self.target))
+                .max(64) as u64;
+            desired = desired.min(burst_budget.saturating_mul(3) / 4 / burst as u64);
         }
         let complexity = self.complexity[class.idx()].or_else(|| {
             // Cold class: borrow the other class through the

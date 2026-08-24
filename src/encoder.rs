@@ -136,7 +136,9 @@ use oxideav_core::{
 /// seeding the starting QP. `fps` also sets the packet time base.
 /// `bufsize` (bits; requires `bitrate`) adds a VBV constraint: no
 /// access unit may exceed the modelled decoder buffer (frames are
-/// re-encoded at a higher QP when needed; low-delay and intra paths).
+/// re-encoded at a higher QP when needed) — on the low-delay, intra
+/// AND pyramid paths, the last with per-access-unit accounting at
+/// each decode instant across the mini-GOP burst.
 ///
 /// The `aq` option (1..=3, `"intra"` / `"inter"` modes) enables
 /// spatial adaptive quantization: per-CTB QP offsets from luma
@@ -393,11 +395,6 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_aq(parse_aq(params)?);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
-                }
-                if bufsize.is_some() {
-                    return Err(Error::InvalidData(
-                        "h265 encode: bufsize with pyramid is not supported yet".into(),
-                    ));
                 }
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));

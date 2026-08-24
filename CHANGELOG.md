@@ -6,6 +6,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — VBV across B-pyramid GOPs (per-AU decode-instant accounting), round 451 (2026-08-24)
+
+`bufsize` now composes with `pyramid` (the r449 rejection is lifted):
+the hierarchical-B encoder enforces the modelled decoder buffer on
+EVERY access unit at its own decode instant — the leading IDR, each
+mini-GOP's anchor P and every B layer alike drain the model in decode
+order and are re-encoded at a higher QP (+3 steps up to the ceiling)
+whenever they would still underflow it, exactly the flat-GOP arm's
+hard guarantee. The per-mini-GOP base-QP election aims the burst at
+its whole refill window (`pick_qp_burst`: fullness plus the
+`gop − 1` intervening fill intervals, 3/4 headroom), so the
+re-encode loop stays an emergency. Replay-pinned like the r449
+low-delay arm: the leaky bucket replayed over the decode-order
+access units never underflows while the unconstrained twin provably
+overshoots the buffer, and the streams stay bit-exact through the
+crate's own decoder.
+
 ### Added — VBV-constrained rate control (`bufsize`), round 449 (2026-08-21)
 
 `RateControlCfg::with_vbv` / the registry `bufsize` option (bits,
