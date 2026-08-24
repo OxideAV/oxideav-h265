@@ -476,3 +476,140 @@ fn error_display_strings() {
     assert!(format!("{}", SeiError::TruncatedHeader).contains("truncated"));
     assert!(format!("{}", SeiError::TruncatedPayload { payload_type: 6 }).contains('6'));
 }
+
+/// §D.2.2 / §D.2.3 — the context-dependent buffering-period and
+/// pic-timing parsers against a hand-built HRD context (the widths
+/// this crate's encoder emits: 24-bit initial delays, 24-bit AU
+/// removal delays, 16-bit DPB output delays, one CPB, NAL HRD only).
+mod hrd_sei {
+    use super::*;
+    use crate::encoder::bitwriter::BitWriter;
+    use crate::hrd::HrdCommonInfo;
+
+    fn common() -> HrdCommonInfo {
+        HrdCommonInfo {
+            nal_hrd_parameters_present_flag: true,
+            vcl_hrd_parameters_present_flag: false,
+            sub_pic_hrd_params_present_flag: false,
+            tick_divisor_minus2: 0,
+            du_cpb_removal_delay_increment_length_minus1: 0,
+            sub_pic_cpb_params_in_pic_timing_sei_flag: false,
+            dpb_output_delay_du_length_minus1: 0,
+            bit_rate_scale: 0,
+            cpb_size_scale: 0,
+            cpb_size_du_scale: 0,
+            initial_cpb_removal_delay_length_minus1: 23,
+            au_cpb_removal_delay_length_minus1: 23,
+            dpb_output_delay_length_minus1: 15,
+        }
+    }
+
+    #[test]
+    fn buffering_period_roundtrips_through_context_parse() {
+        let mut w = BitWriter::new();
+        w.ue(0); // bp_seq_parameter_set_id
+        w.put_bit(0); // irap_cpb_params_present_flag
+        w.put_bit(0); // concatenation_flag
+        w.put_bits(0, 24); // au_cpb_removal_delay_delta_minus1
+        w.put_bits(123_456, 24); // nal_initial_cpb_removal_delay[0]
+        w.put_bits(7_890, 24); // nal_initial_cpb_removal_offset[0]
+                               // §D.3.1 payload alignment: bit_equal_to_one + zeros.
+        w.put_bit(1);
+        w.align_zero();
+        let body = w.finish();
+        let bp = BufferingPeriodSei::parse(&body, &common(), 1).expect("parse");
+        assert_eq!(bp.bp_seq_parameter_set_id, 0);
+        assert!(!bp.irap_cpb_params_present_flag);
+        assert!(!bp.concatenation_flag);
+        assert_eq!(bp.au_cpb_removal_delay_delta_minus1, 0);
+        assert_eq!(bp.nal_cpb.len(), 1);
+        assert_eq!(bp.nal_cpb[0].delay, 123_456);
+        assert_eq!(bp.nal_cpb[0].offset, 7_890);
+        assert_eq!(bp.nal_cpb[0].alt_delay, None);
+        assert!(bp.vcl_cpb.is_empty());
+        assert_eq!(bp.cpb_delay_offset, 0);
+        assert_eq!(bp.dpb_delay_offset, 0);
+    }
+
+    #[test]
+    fn buffering_period_irap_alt_pairs() {
+        let mut w = BitWriter::new();
+        w.ue(0); // bp_seq_parameter_set_id
+        w.put_bit(1); // irap_cpb_params_present_flag
+        w.put_bits(9, 24); // cpb_delay_offset
+        w.put_bits(4, 16); // dpb_delay_offset
+        w.put_bit(1); // concatenation_flag
+        w.put_bits(2, 24); // au_cpb_removal_delay_delta_minus1
+        for v in [100u32, 200, 300, 400] {
+            w.put_bits(v, 24); // delay, offset, alt_delay, alt_offset
+        }
+        w.put_bit(1);
+        w.align_zero();
+        let bp = BufferingPeriodSei::parse(&w.finish(), &common(), 1).expect("parse");
+        assert!(bp.irap_cpb_params_present_flag);
+        assert_eq!((bp.cpb_delay_offset, bp.dpb_delay_offset), (9, 4));
+        assert!(bp.concatenation_flag);
+        assert_eq!(bp.au_cpb_removal_delay_delta_minus1, 2);
+        assert_eq!(
+            bp.nal_cpb[0],
+            InitialCpbRemoval {
+                delay: 100,
+                offset: 200,
+                alt_delay: Some(300),
+                alt_offset: Some(400),
+            }
+        );
+    }
+
+    #[test]
+    fn pic_timing_roundtrips_through_context_parse() {
+        // No frame-field trio (frame_field_info_present_flag == 0).
+        let mut w = BitWriter::new();
+        w.put_bits(41, 24); // au_cpb_removal_delay_minus1
+        w.put_bits(3, 16); // pic_dpb_output_delay
+        let pt = PicTimingSei::parse(&w.finish(), &common(), false).expect("parse");
+        assert_eq!(pt.pic_struct, None);
+        assert_eq!(pt.au_cpb_removal_delay_minus1, Some(41));
+        assert_eq!(pt.pic_dpb_output_delay, Some(3));
+        assert_eq!(pt.pic_dpb_output_du_delay, None);
+        // With the frame-field trio.
+        let mut w = BitWriter::new();
+        w.put_bits(0, 4); // pic_struct
+        w.put_bits(1, 2); // source_scan_type
+        w.put_bit(0); // duplicate_flag
+        w.put_bits(7, 24);
+        w.put_bits(0, 16);
+        w.put_bit(1);
+        w.align_zero();
+        let pt = PicTimingSei::parse(&w.finish(), &common(), true).expect("parse");
+        assert_eq!(pt.pic_struct, Some(0));
+        assert_eq!(pt.source_scan_type, Some(1));
+        assert_eq!(pt.duplicate_flag, Some(false));
+        assert_eq!(pt.au_cpb_removal_delay_minus1, Some(7));
+    }
+
+    #[test]
+    fn truncated_bodies_error() {
+        let short = [0x00u8, 0x01];
+        assert!(matches!(
+            BufferingPeriodSei::parse(&short, &common(), 1),
+            Err(SeiError::Bit(_))
+        ));
+        assert!(matches!(
+            PicTimingSei::parse(&short, &common(), false),
+            Err(SeiError::Bit(_))
+        ));
+    }
+
+    #[test]
+    fn generic_dispatch_keeps_bp_pt_verbatim() {
+        // payloadType 0 / 1 stay Reserved in the context-free walk.
+        let rbsp = sei_rbsp_one(0, &[0xAA, 0xBB]);
+        let msgs = parse_sei_rbsp(&rbsp, SeiNalType::Prefix).expect("walk");
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            &msgs[0].payload,
+            SeiPayload::Reserved { payload_type: 0, data } if data == &[0xAA, 0xBB]
+        ));
+    }
+}

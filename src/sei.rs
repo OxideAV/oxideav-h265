@@ -260,6 +260,203 @@ pub enum SeiPayload {
     },
 }
 
+/// One per-CPB `(initial delay, initial offset)` pair of a §D.2.2
+/// buffering period SEI message, with the optional alternative pair
+/// (present when `sub_pic_hrd_params_present_flag` or
+/// `irap_cpb_params_present_flag` is set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InitialCpbRemoval {
+    /// `*_initial_cpb_removal_delay[i]` — 90 kHz units,
+    /// `initial_cpb_removal_delay_length_minus1 + 1` bits.
+    pub delay: u32,
+    /// `*_initial_cpb_removal_offset[i]` — 90 kHz units, same width.
+    pub offset: u32,
+    /// `*_initial_alt_cpb_removal_delay[i]` when signalled.
+    pub alt_delay: Option<u32>,
+    /// `*_initial_alt_cpb_removal_offset[i]` when signalled.
+    pub alt_offset: Option<u32>,
+}
+
+/// §D.2.2 — a parsed `buffering_period( payloadSize )` message.
+///
+/// The syntax is context-dependent (field widths and gating flags come
+/// from the active `hrd_parameters( )`), so this payload is not
+/// decoded by the generic [`parse_sei_rbsp`] dispatch — it surfaces
+/// there as [`SeiPayload::Reserved`] and is decoded from those
+/// verbatim bytes by [`BufferingPeriodSei::parse`] once the caller
+/// has activated the SPS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferingPeriodSei {
+    /// `bp_seq_parameter_set_id` (`ue(v)`, 0..=15).
+    pub bp_seq_parameter_set_id: u32,
+    /// `irap_cpb_params_present_flag` (absent — inferred 0 — when
+    /// `sub_pic_hrd_params_present_flag == 1`).
+    pub irap_cpb_params_present_flag: bool,
+    /// `cpb_delay_offset` (`u(v)`,
+    /// `au_cpb_removal_delay_length_minus1 + 1` bits); 0 when not
+    /// present.
+    pub cpb_delay_offset: u32,
+    /// `dpb_delay_offset` (`u(v)`,
+    /// `dpb_output_delay_length_minus1 + 1` bits); 0 when not present.
+    pub dpb_delay_offset: u32,
+    /// `concatenation_flag`.
+    pub concatenation_flag: bool,
+    /// `au_cpb_removal_delay_delta_minus1` (`u(v)`,
+    /// `au_cpb_removal_delay_length_minus1 + 1` bits).
+    pub au_cpb_removal_delay_delta_minus1: u32,
+    /// NAL HRD per-CPB pairs (one per `i in 0..CpbCnt`); empty when
+    /// `NalHrdBpPresentFlag == 0`.
+    pub nal_cpb: Vec<InitialCpbRemoval>,
+    /// VCL HRD per-CPB pairs; empty when `VclHrdBpPresentFlag == 0`.
+    pub vcl_cpb: Vec<InitialCpbRemoval>,
+}
+
+impl BufferingPeriodSei {
+    /// Parse a `buffering_period( )` payload body (the verbatim
+    /// `payloadSize` bytes) against the active HRD context: `hrd` is
+    /// the SPS/VPS `hrd_parameters( )` common info and `cpb_cnt` is
+    /// `cpb_cnt_minus1[ 0 ] + 1` for the operation point.
+    ///
+    /// # Errors
+    /// [`SeiError::Bit`] when the body is shorter than the
+    /// context-implied layout.
+    pub fn parse(
+        body: &[u8],
+        hrd: &crate::hrd::HrdCommonInfo,
+        cpb_cnt: u32,
+    ) -> Result<Self, SeiError> {
+        let mut br = BitReader::new(body);
+        let bp_seq_parameter_set_id = br.ue()?;
+        let irap_cpb_params_present_flag = if hrd.sub_pic_hrd_params_present_flag {
+            false
+        } else {
+            br.u1()? != 0
+        };
+        let (cpb_delay_offset, dpb_delay_offset) = if irap_cpb_params_present_flag {
+            (
+                br.u(hrd.au_cpb_removal_delay_length_minus1 + 1)?,
+                br.u(hrd.dpb_output_delay_length_minus1 + 1)?,
+            )
+        } else {
+            (0, 0)
+        };
+        let concatenation_flag = br.u1()? != 0;
+        let au_cpb_removal_delay_delta_minus1 = br.u(hrd.au_cpb_removal_delay_length_minus1 + 1)?;
+        let alt_present = hrd.sub_pic_hrd_params_present_flag || irap_cpb_params_present_flag;
+        let read_cpb_set = |br: &mut BitReader<'_>| -> Result<Vec<InitialCpbRemoval>, SeiError> {
+            let width = hrd.initial_cpb_removal_delay_length_minus1 + 1;
+            (0..cpb_cnt)
+                .map(|_| {
+                    let delay = br.u(width)?;
+                    let offset = br.u(width)?;
+                    let (alt_delay, alt_offset) = if alt_present {
+                        (Some(br.u(width)?), Some(br.u(width)?))
+                    } else {
+                        (None, None)
+                    };
+                    Ok(InitialCpbRemoval {
+                        delay,
+                        offset,
+                        alt_delay,
+                        alt_offset,
+                    })
+                })
+                .collect()
+        };
+        let nal_cpb = if hrd.nal_hrd_parameters_present_flag {
+            read_cpb_set(&mut br)?
+        } else {
+            Vec::new()
+        };
+        let vcl_cpb = if hrd.vcl_hrd_parameters_present_flag {
+            read_cpb_set(&mut br)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            bp_seq_parameter_set_id,
+            irap_cpb_params_present_flag,
+            cpb_delay_offset,
+            dpb_delay_offset,
+            concatenation_flag,
+            au_cpb_removal_delay_delta_minus1,
+            nal_cpb,
+            vcl_cpb,
+        })
+    }
+}
+
+/// §D.2.3 — a parsed `pic_timing( payloadSize )` message
+/// (the frame-field trio and the AU-level CPB/DPB delays; the
+/// sub-picture decoding-unit branch is parsed structurally but this
+/// crate's HRD is AU-level).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PicTimingSei {
+    /// `pic_struct` (`u(4)`); `None` when
+    /// `frame_field_info_present_flag == 0` in the active VUI.
+    pub pic_struct: Option<u8>,
+    /// `source_scan_type` (`u(2)`), gated as `pic_struct`.
+    pub source_scan_type: Option<u8>,
+    /// `duplicate_flag`, gated as `pic_struct`.
+    pub duplicate_flag: Option<bool>,
+    /// `au_cpb_removal_delay_minus1` (`u(v)`,
+    /// `au_cpb_removal_delay_length_minus1 + 1` bits); `None` when
+    /// `CpbDpbDelaysPresentFlag == 0`.
+    pub au_cpb_removal_delay_minus1: Option<u32>,
+    /// `pic_dpb_output_delay` (`u(v)`,
+    /// `dpb_output_delay_length_minus1 + 1` bits), gated as above.
+    pub pic_dpb_output_delay: Option<u32>,
+    /// `pic_dpb_output_du_delay` (`u(v)`), present only when
+    /// `sub_pic_hrd_params_present_flag == 1`.
+    pub pic_dpb_output_du_delay: Option<u32>,
+}
+
+impl PicTimingSei {
+    /// Parse a `pic_timing( )` payload body (verbatim bytes) against
+    /// the active context: the `hrd_parameters( )` common info (field
+    /// widths, `CpbDpbDelaysPresentFlag =`
+    /// [`crate::hrd::HrdCommonInfo::has_any_hrd`]) and the VUI's
+    /// `frame_field_info_present_flag`.
+    ///
+    /// # Errors
+    /// [`SeiError::Bit`] when the body is shorter than the
+    /// context-implied layout.
+    pub fn parse(
+        body: &[u8],
+        hrd: &crate::hrd::HrdCommonInfo,
+        frame_field_info_present: bool,
+    ) -> Result<Self, SeiError> {
+        let mut br = BitReader::new(body);
+        let mut out = Self {
+            pic_struct: None,
+            source_scan_type: None,
+            duplicate_flag: None,
+            au_cpb_removal_delay_minus1: None,
+            pic_dpb_output_delay: None,
+            pic_dpb_output_du_delay: None,
+        };
+        if frame_field_info_present {
+            out.pic_struct = Some(br.u(4)? as u8);
+            out.source_scan_type = Some(br.u(2)? as u8);
+            out.duplicate_flag = Some(br.u1()? != 0);
+        }
+        if hrd.has_any_hrd() {
+            out.au_cpb_removal_delay_minus1 =
+                Some(br.u(hrd.au_cpb_removal_delay_length_minus1 + 1)?);
+            out.pic_dpb_output_delay = Some(br.u(hrd.dpb_output_delay_length_minus1 + 1)?);
+            if hrd.sub_pic_hrd_params_present_flag {
+                out.pic_dpb_output_du_delay =
+                    Some(br.u(hrd.dpb_output_delay_du_length_minus1 + 1)?);
+                // The optional per-decoding-unit list
+                // (`sub_pic_cpb_params_in_pic_timing_sei_flag`) is not
+                // consumed: this crate's HRD operates at access-unit
+                // level and the payload is length-delimited by §7.3.5.
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// One parsed `sei_message()` (§7.3.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeiMessage {

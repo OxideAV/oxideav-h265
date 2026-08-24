@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — §D.2.2 / §D.2.3 buffering-period + pic-timing SEI parse, round 451 (2026-08-24)
+
+`sei::BufferingPeriodSei::parse` / `sei::PicTimingSei::parse`: the two
+HRD-initializing SEI messages are now decoded. Their syntax is
+context-dependent (field widths and gating flags live in the active
+`hrd_parameters( )`), so they parse from the verbatim payload bytes the
+generic `parse_sei_rbsp` walk already surfaces as `Reserved`, against a
+caller-supplied `HrdCommonInfo` — full coverage of the §D.2.2 body
+(IRAP alternative delay/offset pairs, concatenation,
+`au_cpb_removal_delay_delta_minus1`, NAL and VCL CPB sets) and the
+§D.2.3 AU-level body (frame-field trio, `au_cpb_removal_delay_minus1`,
+`pic_dpb_output_delay`, the sub-pic output-delay field).
+
 ### Added — VBV across B-pyramid GOPs (per-AU decode-instant accounting), round 451 (2026-08-24)
 
 `bufsize` now composes with `pyramid` (the r449 rejection is lifted):
