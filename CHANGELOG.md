@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — CBR delivery schedule (`cbr`) + filler data, round 451 (2026-08-24)
+
+`with_cbr` on both GOP encoders / the registry `cbr` option (requires
+`hrd`): the signalled schedule becomes constant-bit-rate
+(`cbr_flag[0] == 1`) — the Annex C clock switches to back-to-back
+eq. C-3 arrivals, mid-stream buffering periods emit initial delays
+inside the two-sided eq. C-19 bound (`Floor(deltaTime90k) <= delay <=
+Ceil(deltaTime90k)`), and the encoder pads channel underruns with
+§7.3.4 filler-data NAL units after the VCL (the §C.4 condition-2
+overflow floor: cumulative arrival must reach `removal(m+1) −
+CpbSize/BitRate`; a filler-quantum of headroom is reserved under the
+underflow cap, with `bufsize >= 2` frame intervals validated). The
+conformance harness gained the CBR replay (C-3 arrivals, C-19 both
+sides, filler-syntax checks, and a whole-timeline overflow check at
+every pre-removal and post-arrival instant) — in the process the
+two-sided C-19 bound caught and fixed a bytes-vs-bits accounting slip
+in the harness's own AU sizing that the one-sided VBR checks could
+not see. CBR streams decode byte-exact through the crate's decoder
+(FD_NUT skipped) and a black-box reference decoder.
+
 ### Added — HRD signalling + Annex C conformance (`hrd`), round 451 (2026-08-24)
 
 `with_hrd` on the low-delay AND pyramid encoders / the registry `hrd`

@@ -102,6 +102,10 @@ pub enum IntraEncodeError {
     /// HRD signalling enabled without its prerequisites (rate
     /// control with a VBV buffer and an explicit frame rate).
     HrdConfig,
+    /// CBR delivery needs a CPB of at least two elemental ticks of
+    /// the signalled bit rate (the filler quantum must fit between
+    /// the overflow floor and the underflow cap).
+    CbrCpbTooSmall,
 }
 
 impl core::fmt::Display for IntraEncodeError {
@@ -120,6 +124,9 @@ impl core::fmt::Display for IntraEncodeError {
             Self::BadAq(aq) => write!(f, "aq strength {aq} outside 0..=3"),
             Self::HrdConfig => f.write_str(
                 "hrd signalling requires rate control with a VBV buffer and an explicit frame rate",
+            ),
+            Self::CbrCpbTooSmall => f.write_str(
+                "cbr delivery requires a VBV buffer of at least two frame intervals of the bitrate",
             ),
         }
     }

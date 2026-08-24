@@ -49,6 +49,11 @@ pub struct HrdSignalCfg {
     pub bit_rate: u64,
     /// Signalled `CpbSize[0]` in bits (multiple of 16).
     pub cpb_size: u64,
+    /// `cbr_flag[0]`: constant-bit-rate delivery — the HSS feeds the
+    /// CPB back to back at exactly `BitRate` (eq. C-3), so the
+    /// encoder must pad underruns with §7.3.4 filler-data NAL units
+    /// to keep the CPB from overflowing.
+    pub cbr: bool,
 }
 
 impl HrdSignalCfg {
@@ -67,7 +72,19 @@ impl HrdSignalCfg {
             .clamp(16, u64::from(u32::MAX) * 16)
             .div_ceil(16)
             * 16;
-        Self { bit_rate, cpb_size }
+        Self {
+            bit_rate,
+            cpb_size,
+            cbr: false,
+        }
+    }
+
+    /// Switch the schedule to constant-bit-rate delivery
+    /// (`cbr_flag[0] == 1`; see [`Self::cbr`]).
+    #[must_use]
+    pub fn with_cbr(mut self, on: bool) -> Self {
+        self.cbr = on;
+        self
     }
 
     /// `bit_rate_value_minus1[0]` per eq. E-87 at `bit_rate_scale 0`.
@@ -102,7 +119,23 @@ pub(crate) fn write_hrd_parameters(w: &mut BitWriter, cfg: &HrdSignalCfg) {
              // sub_layer_hrd_parameters( 0 ), NAL path.
     w.ue(cfg.bit_rate_value_minus1());
     w.ue(cfg.cpb_size_value_minus1());
-    w.put_bit(0); // cbr_flag[0]
+    w.put_bit(u8::from(cfg.cbr)); // cbr_flag[0]
+}
+
+/// Build one §7.3.4 `filler_data_rbsp( )` NAL unit, framed with its
+/// four-byte start code, whose TOTAL framed size is
+/// `max(7, min_bytes)` bytes (start code 4 + NAL header 2 + `n`
+/// `ff_byte`s + the `rbsp_trailing_bits` `0x80`): the CBR arm's
+/// underrun padding. `FD_NUT` follows the VCL NAL unit within the
+/// access unit (§7.4.2.4.4).
+#[must_use]
+pub(crate) fn filler_data_nal_framed(min_bytes: usize) -> Vec<u8> {
+    let n_ff = min_bytes.saturating_sub(7);
+    let mut rbsp = vec![0xFFu8; n_ff];
+    rbsp.push(0x80);
+    let mut framed = vec![0, 0, 0, 1];
+    framed.extend(nal_unit(38, 0, 0, &rbsp)); // FD_NUT
+    framed
 }
 
 /// Build the §D.2.2 `buffering_period( )` payload bytes:
@@ -296,6 +329,11 @@ impl HrdClock {
     /// buffering-period AU, `removal − (delay + offset) = removal −
     /// delay0` otherwise).
     fn init_arrival_units(&self) -> u128 {
+        if self.cfg.cbr && self.m > 0 {
+            // Eq. C-3: back-to-back delivery, no earliest-arrival
+            // throttle.
+            return self.final_arrival;
+        }
         let throttle = match self.pending_bp {
             Some((delay, _)) => u128::from(delay) * self.units_per_90k(),
             None => u128::from(self.delay0_90k) * self.units_per_90k(),
@@ -316,6 +354,25 @@ impl HrdClock {
         u64::try_from(bits)
             .unwrap_or(u64::MAX)
             .min(self.cfg.cpb_size)
+    }
+
+    /// CBR only: the filler bits the next AU must append (beyond its
+    /// `au_bits` coded bits) so the back-to-back arrival cannot
+    /// overflow the CPB before the FOLLOWING removal: cumulative
+    /// arrival must reach `removal(m + 1) − CpbSize ÷ BitRate` (the
+    /// §C.4 condition-2 bound with continuous delivery). Returns 0
+    /// under VBR or when the AU is already large enough.
+    pub(crate) fn cbr_filler_bits(&self, au_bits: u64) -> u64 {
+        if !self.cfg.cbr {
+            return 0;
+        }
+        let bits_to_units = 90_000u128 * u128::from(self.fps_num);
+        let need_final = self
+            .removal_units(self.m + 1)
+            .saturating_sub(u128::from(self.cfg.cpb_size) * bits_to_units);
+        let have_final = self.init_arrival_units() + u128::from(au_bits) * bits_to_units;
+        let deficit = need_final.saturating_sub(have_final);
+        u64::try_from(deficit.div_ceil(bits_to_units)).unwrap_or(u64::MAX)
     }
 
     /// Commit the next AU at `bits` (all bits of the Type II access
@@ -416,6 +473,7 @@ mod tests {
             HrdSignalCfg {
                 bit_rate: 64_000,
                 cpb_size: 16_000,
+                cbr: false,
             },
             25,
             1,
@@ -431,6 +489,7 @@ mod tests {
             HrdSignalCfg {
                 bit_rate: 64_000,
                 cpb_size: 16_000,
+                cbr: false,
             },
             25,
             1,
@@ -455,6 +514,7 @@ mod tests {
             HrdSignalCfg {
                 bit_rate: 64_000,
                 cpb_size: 16_000,
+                cbr: false,
             },
             25,
             1,
@@ -470,6 +530,7 @@ mod tests {
             HrdSignalCfg {
                 bit_rate: 64_000,
                 cpb_size: 16_000,
+                cbr: false,
             },
             30,
             1,
@@ -498,6 +559,7 @@ mod tests {
             HrdSignalCfg {
                 bit_rate: 64_000,
                 cpb_size: 16_000,
+                cbr: false,
             },
             25,
             1,
@@ -515,6 +577,72 @@ mod tests {
         let (delay, offset) = clock.begin_buffering_period();
         assert_eq!(delay, 3_600);
         assert_eq!(u64::from(delay) + u64::from(offset), 22_500);
+    }
+
+    #[test]
+    fn cbr_clock_pads_underruns_and_never_underflows() {
+        let cfg = HrdSignalCfg {
+            bit_rate: 64_000,
+            cpb_size: 16_000,
+            cbr: true,
+        };
+        let mut clock = HrdClock::new(cfg, 25, 1);
+        clock.begin_buffering_period();
+        // A tiny AU underruns the constant channel: the filler floor
+        // must ask for enough bits that cumulative arrival reaches
+        // removal(m + 1) - CpbSize/BitRate.
+        let au = 200u64;
+        let pad = clock.cbr_filler_bits(au);
+        assert!(pad > 0, "underrun must demand filler");
+        // A whole-CPB AU never needs padding.
+        assert_eq!(clock.cbr_filler_bits(16_000), 0);
+        // Replay: pushing (au + pad)-sized AUs keeps both C.4 sides.
+        for i in 0..20u64 {
+            let coded = 200 + (i % 3) * 400;
+            let cap = clock.frame_cap();
+            let bits = coded.min(cap);
+            let pad = clock.cbr_filler_bits(bits);
+            let total = bits + pad;
+            assert!(total <= cap + 56, "filler stays within the cap slack");
+            let removal = clock.removal_units(clock.next_decode_index());
+            let next_removal = clock.removal_units(clock.next_decode_index() + 1);
+            clock.push_au(total);
+            // No underflow...
+            assert!(clock.final_arrival <= removal, "AU {i}: underflow");
+            // ...and the back-to-back channel never runs a full CPB
+            // ahead of the next removal (the overflow floor).
+            let bits_to_units = 90_000u128 * 25u128;
+            assert!(
+                clock.final_arrival + u128::from(cfg.cpb_size) * bits_to_units >= next_removal,
+                "AU {i}: cumulative arrival fell behind the overflow floor"
+            );
+        }
+    }
+
+    #[test]
+    fn cbr_flag_roundtrips_through_hrd_parameters() {
+        use crate::bitreader::BitReader;
+        use crate::hrd::HrdParameters;
+        let cfg = HrdSignalCfg::for_rate(150_000, 12_000).with_cbr(true);
+        let mut w = BitWriter::new();
+        write_hrd_parameters(&mut w, &cfg);
+        w.rbsp_trailing_bits();
+        let bytes = w.finish();
+        let mut br = BitReader::new(&bytes);
+        let hrd = HrdParameters::parse(&mut br, true, 0, None).expect("parse");
+        assert!(hrd.sub_layers[0].nal_hrd.as_ref().expect("sched").cpb[0].cbr_flag);
+    }
+
+    #[test]
+    fn filler_nal_has_requested_framed_size() {
+        for want in [0usize, 3, 7, 8, 100] {
+            let nal = filler_data_nal_framed(want);
+            assert_eq!(nal.len(), want.max(7));
+            assert_eq!(&nal[..4], &[0, 0, 0, 1]);
+            assert_eq!(nal[4] >> 1, 38, "FD_NUT");
+            assert_eq!(*nal.last().unwrap(), 0x80);
+            assert!(nal[6..nal.len() - 1].iter().all(|&b| b == 0xFF));
+        }
     }
 
     #[test]

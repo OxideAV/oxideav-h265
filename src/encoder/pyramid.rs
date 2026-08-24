@@ -48,8 +48,8 @@
 use std::collections::BTreeMap;
 
 use crate::encoder::hrd::{
-    buffering_period_payload, pic_timing_payload, sei_prefix_nal, HrdClock, HrdSignalCfg,
-    SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+    buffering_period_payload, filler_data_nal_framed, pic_timing_payload, sei_prefix_nal, HrdClock,
+    HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
 };
 use crate::encoder::inter::{encode_inter_slice, FrameRecon, FrameStats, SliceSpec, YuvFrame};
 use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
@@ -175,6 +175,9 @@ pub struct PyramidEncoder {
     rc_cfg: Option<RateControlCfg>,
     /// HRD signalling requested ([`Self::with_hrd`]).
     hrd_on: bool,
+    /// CBR delivery requested ([`Self::with_cbr`]; requires
+    /// `hrd_on`).
+    cbr_on: bool,
     /// The signalled §E.2.2 schedule + Annex C clock, built at the
     /// first frame when `hrd_on`. The clock advances once per access
     /// unit in DECODE order.
@@ -220,6 +223,7 @@ impl PyramidEncoder {
             timing: None,
             rc_cfg: None,
             hrd_on: false,
+            cbr_on: false,
             hrd: None,
         })
     }
@@ -293,10 +297,26 @@ impl PyramidEncoder {
         self
     }
 
+    /// Switch the HRD schedule to constant-bit-rate delivery — see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_cbr`].
+    /// Requires [`Self::with_hrd`].
+    #[must_use]
+    pub fn with_cbr(mut self, on: bool) -> Self {
+        self.cbr_on = on;
+        self
+    }
+
     /// Build the HRD schedule + clock on the first frame (validating
     /// the [`Self::with_hrd`] prerequisites).
     fn ensure_hrd(&mut self) -> Result<(), PyramidError> {
-        if !self.hrd_on || self.hrd.is_some() {
+        if !self.hrd_on {
+            return if self.cbr_on {
+                Err(PyramidError::Encode(IntraEncodeError::HrdConfig))
+            } else {
+                Ok(())
+            };
+        }
+        if self.hrd.is_some() {
             return Ok(());
         }
         let (Some(cfg), Some((num_units, time_scale))) = (&self.rc_cfg, self.timing) else {
@@ -305,7 +325,14 @@ impl PyramidEncoder {
         let Some(vbv) = cfg.vbv_buffer_bits else {
             return Err(PyramidError::Encode(IntraEncodeError::HrdConfig));
         };
-        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv);
+        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv).with_cbr(self.cbr_on);
+        if self.cbr_on {
+            let tick_bits =
+                signal.bit_rate.saturating_mul(u64::from(num_units)) / u64::from(time_scale.max(1));
+            if signal.cpb_size < tick_bits.saturating_mul(2) {
+                return Err(PyramidError::Encode(IntraEncodeError::CbrCpbTooSmall));
+            }
+        }
         self.hrd = Some((signal, HrdClock::new(signal, time_scale, num_units)));
         Ok(())
     }
@@ -341,7 +368,8 @@ impl PyramidEncoder {
         Some(framed)
     }
 
-    /// The joint VBV + Annex C bit budget for the next access unit.
+    /// The joint VBV + Annex C bit budget for the next access unit
+    /// (under CBR, less the reserved filler quantum).
     fn au_cap(&self) -> Option<u64> {
         match (
             self.rc.as_ref().and_then(RateController::vbv_frame_cap),
@@ -349,6 +377,19 @@ impl PyramidEncoder {
         ) {
             (Some(v), Some(h)) => Some(v.min(h)),
             (v, h) => v.or(h),
+        }
+        .map(|c| if self.cbr_on { c.saturating_sub(56) } else { c })
+    }
+
+    /// CBR underrun padding: append a filler-data NAL when the AU
+    /// (SEI included) leaves the back-to-back channel ahead of the
+    /// overflow floor.
+    fn append_cbr_filler(&self, au: &mut Vec<u8>) {
+        if let Some((_, clock)) = &self.hrd {
+            let pad_bits = clock.cbr_filler_bits(au.len() as u64 * 8);
+            if pad_bits > 0 {
+                au.extend(filler_data_nal_framed((pad_bits as usize).div_ceil(8)));
+            }
         }
     }
 
@@ -439,6 +480,7 @@ impl PyramidEncoder {
             if let Some(sei) = &sei {
                 crate::encoder::hrd::splice_sei_before_vcl(&mut idr.au, sei);
             }
+            self.append_cbr_filler(&mut idr.au);
             let recon = FrameRecon {
                 y: idr.recon_y,
                 cb: idr.recon_cb,
@@ -552,6 +594,7 @@ impl PyramidEncoder {
         if let Some(sei) = &sei {
             crate::encoder::hrd::splice_sei_before_vcl(&mut au.au, sei);
         }
+        self.append_cbr_filler(&mut au.au);
         if let Some(rc) = &mut self.rc {
             // Feed back at the BASE QP (not the slice's layer QP) plus
             // any VBV bump: the model then learns the layer-offset

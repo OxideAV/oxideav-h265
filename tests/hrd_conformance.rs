@@ -75,6 +75,8 @@ struct Schedule {
     cpb_size: u64,
     num_units: u64,
     time_scale: u64,
+    /// `cbr_flag[0]` — back-to-back C-3 delivery.
+    cbr: bool,
     common: HrdCommonInfo,
 }
 
@@ -82,6 +84,8 @@ struct Schedule {
 struct Au {
     /// All bits of the Type II access unit (start codes included).
     bits: u64,
+    /// Bits of trailing §7.3.4 filler-data NAL units (CBR padding).
+    filler_bits: u64,
     /// The §D.2.2 message, when the AU carries one.
     bp: Option<BufferingPeriodSei>,
     /// The §D.2.3 message (mandatory under CpbDpbDelaysPresentFlag).
@@ -112,7 +116,6 @@ fn analyze(stream: &[u8]) -> (Schedule, Vec<Au>) {
     assert_eq!(sl.elemental_duration_in_tc_minus1, Some(0));
     assert_eq!(sl.cpb_cnt_minus1, 0, "one delivery schedule");
     let cpb = &sl.nal_hrd.as_ref().expect("NAL schedule").cpb[0];
-    assert!(!cpb.cbr_flag, "VBR schedule");
     // Eqs. E-87 / E-88.
     let bit_rate =
         (u64::from(cpb.bit_rate_value_minus1) + 1) << (6 + u32::from(common.bit_rate_scale));
@@ -123,16 +126,32 @@ fn analyze(stream: &[u8]) -> (Schedule, Vec<Au>) {
         cpb_size,
         num_units: u64::from(timing.num_units_in_tick),
         time_scale: u64::from(timing.time_scale),
+        cbr: cpb.cbr_flag,
         common,
     };
 
-    let mut aus = Vec::new();
+    let mut aus: Vec<Au> = Vec::new();
     let mut cur_bits = 0u64;
     let mut cur_bp = None;
     let mut cur_pt: Option<PicTimingSei> = None;
     for unit in &units {
-        cur_bits += (4 + 2 + unit.escaped.len()) as u64;
+        let nal_bits = (4 + 2 + unit.escaped.len()) as u64 * 8;
+        cur_bits += nal_bits;
         match unit.header.nal_unit_type {
+            38 => {
+                // Filler data trails the VCL: it belongs to the AU
+                // just completed (§7.4.2.4.4 — FD_NUT shall not
+                // precede the first VCL NAL unit of its AU).
+                assert_eq!(cur_bits, nal_bits, "filler directly follows a VCL NAL");
+                let last = aus.last_mut().expect("filler after some AU");
+                last.bits += nal_bits;
+                last.filler_bits += nal_bits;
+                cur_bits = 0;
+                // §7.3.4: ff_bytes then the trailing stop bit.
+                let (body, trailer) = unit.rbsp.split_at(unit.rbsp.len() - 1);
+                assert!(body.iter().all(|&b| b == 0xFF), "filler body is ff_bytes");
+                assert_eq!(trailer, [0x80], "filler rbsp_trailing_bits");
+            }
             39 => {
                 for msg in parse_sei_rbsp(&unit.rbsp, SeiNalType::Prefix).expect("SEI walk") {
                     let body = match &msg.payload {
@@ -157,6 +176,7 @@ fn analyze(stream: &[u8]) -> (Schedule, Vec<Au>) {
                 // VCL: the AU is complete.
                 aus.push(Au {
                     bits: cur_bits,
+                    filler_bits: 0,
                     bp: cur_bp.take(),
                     pt: cur_pt.take().expect("pic timing on every AU"),
                     idr: (19..=20).contains(&t),
@@ -193,6 +213,7 @@ fn replay_annex_c(sch: &Schedule, aus: &[Au]) -> Vec<(u128, u128)> {
     let mut delay_plus_offset: Option<u64> = None;
     let mut final_arrival = 0u128;
     let mut removals: Vec<u128> = Vec::with_capacity(aus.len());
+    let mut init_arrivals: Vec<u128> = Vec::with_capacity(aus.len());
     let mut final_arrivals: Vec<u128> = Vec::with_capacity(aus.len());
 
     for (n, au) in aus.iter().enumerate() {
@@ -235,7 +256,9 @@ fn replay_annex_c(sch: &Schedule, aus: &[Au]) -> Vec<(u128, u128)> {
                 // one closes (AuCpbRemovalDelayVal counts from it).
                 first_curr_bp_removal + tick * u128::from(val)
             };
-            // C-18: delay <= Ceil(deltaTime90k) for n > 0.
+            // C-18 / C-19 for n > 0: the initial delay against
+            // deltaTime90k — an upper bound under VBR, BOTH bounds
+            // under CBR.
             if n > 0 {
                 let delta_units = removal
                     .checked_sub(final_arrival)
@@ -243,10 +266,19 @@ fn replay_annex_c(sch: &Schedule, aus: &[Au]) -> Vec<(u128, u128)> {
                 let ceil_90k = delta_units.div_ceil(ts_br);
                 assert!(
                     u128::from(pair.delay) <= ceil_90k,
-                    "AU {n}: C-18 violated (delay {} > ceil(deltaTime90k) {})",
+                    "AU {n}: C-18/C-19 violated (delay {} > ceil(deltaTime90k) {})",
                     pair.delay,
                     ceil_90k
                 );
+                if sch.cbr {
+                    let floor_90k = delta_units / ts_br;
+                    assert!(
+                        u128::from(pair.delay) >= floor_90k,
+                        "AU {n}: C-19 violated (delay {} < floor(deltaTime90k) {})",
+                        pair.delay,
+                        floor_90k
+                    );
+                }
             }
             // §D.3.2: delay + offset constant over the CVS — this
             // encoder holds it constant over the whole stream.
@@ -263,17 +295,21 @@ fn replay_annex_c(sch: &Schedule, aus: &[Au]) -> Vec<(u128, u128)> {
             first_curr_bp_removal + tick * u128::from(val)
         };
 
-        // §C.2.2 arrival times (VBR: C-4..C-7).
-        let throttle = if au.bp.is_some() {
-            delay_units(cur_delay) // C-7
-        } else {
-            delay_units(cur_delay) + delay_units(cur_offset) // C-6
-        };
+        // §C.2.2 arrival times: back-to-back under CBR (C-3), the
+        // earliest-arrival throttle under VBR (C-4..C-7).
         let init_arrival = if n == 0 {
             0
+        } else if sch.cbr {
+            final_arrival // C-3
         } else {
+            let throttle = if au.bp.is_some() {
+                delay_units(cur_delay) // C-7
+            } else {
+                delay_units(cur_delay) + delay_units(cur_offset) // C-6
+            };
             final_arrival.max(removal.saturating_sub(throttle))
         };
+        init_arrivals.push(init_arrival);
         final_arrival = init_arrival + bits_units(au.bits); // C-8
 
         // §C.4 condition 3: no underflow.
@@ -289,26 +325,48 @@ fn replay_annex_c(sch: &Schedule, aus: &[Au]) -> Vec<(u128, u128)> {
         out.push((removal, removal + tick * out_delay)); // C-15
     }
 
-    // §C.4 condition 2: no overflow — check the CPB content just
-    // after every final-arrival instant (the local maxima of the
-    // piecewise-linear fill: content only grows while an AU is
-    // arriving and drops instantaneously at removals). Arrivals are
-    // sequential, so at AU k's final arrival exactly AUs 0..=k have
-    // fully arrived; removed are the AUs whose (nominal == actual,
-    // `low_delay_hrd_flag == 0`) removal time has passed.
+    // §C.4 condition 2: no overflow. Content is piecewise linear —
+    // rising while an AU arrives, flat while arrival pauses,
+    // dropping instantaneously at removals — so its local maxima lie
+    // just after a final-arrival instant or just before a removal
+    // instant. Both families are checked against the exact arrival
+    // timeline (`arrived(t)` from the per-AU [init, final] spans).
+    let arrived_at = |t: u128| -> u64 {
+        let mut total = 0u64;
+        for ((&init, &fin), au) in init_arrivals.iter().zip(&final_arrivals).zip(aus) {
+            if t >= fin {
+                total += au.bits;
+            } else if t > init {
+                // Partial arrival at BitRate: units -> bits.
+                total += u64::try_from((t - init) / (90_000u128 * u128::from(sch.time_scale)))
+                    .unwrap_or(u64::MAX);
+                break;
+            } else {
+                break;
+            }
+        }
+        total
+    };
+    let removed_before = |t: u128, inclusive: bool| -> u64 {
+        aus.iter()
+            .zip(&removals)
+            .filter(|(_, r)| if inclusive { **r <= t } else { **r < t })
+            .map(|(a, _)| a.bits)
+            .sum()
+    };
     for k in 0..aus.len() {
         let fa = final_arrivals[k];
-        let arrived: u64 = aus[..=k].iter().map(|a| a.bits).sum();
-        let removed: u64 = aus
-            .iter()
-            .zip(&removals)
-            .filter(|(_, r)| **r <= fa)
-            .map(|(a, _)| a.bits)
-            .sum();
+        let content = arrived_at(fa) - removed_before(fa, true);
         assert!(
-            arrived - removed <= sch.cpb_size,
-            "AU {k}: CPB content {} exceeds CpbSize {}",
-            arrived - removed,
+            content <= sch.cpb_size,
+            "AU {k}: CPB content {content} after final arrival exceeds CpbSize {}",
+            sch.cpb_size
+        );
+        let r = removals[k];
+        let content = arrived_at(r) - removed_before(r, false);
+        assert!(
+            content <= sch.cpb_size,
+            "AU {k}: CPB content {content} before removal exceeds CpbSize {}",
             sch.cpb_size
         );
     }
@@ -619,4 +677,143 @@ fn hrd_prerequisites_are_enforced() {
         .with_rate_control(&RateControlCfg::new(200_000, 25, 1).with_vbv(30_000))
         .with_hrd(true);
     assert!(no_fps.encode_frame(&f).is_err(), "missing frame rate");
+}
+
+/// CBR delivery (`cbr_flag == 1`): back-to-back C-3 arrivals, the
+/// two-sided C-19 bound on mid-stream initial delays, and §7.3.4
+/// filler-data padding whenever the coded stream underruns the
+/// constant channel — the whole-timeline overflow check would trip
+/// without it. The 40 kb/s target on trivially compressible content
+/// forces heavy underruns, so filler MUST appear.
+#[test]
+fn cbr_hrd_streams_conform_with_filler() {
+    // A STATIC clip: every P frame is all-skip (a few dozen bits
+    // whatever the QP floor), so the coded stream cannot keep up
+    // with the constant channel and the filler path must engage.
+    let planes: Vec<_> = std::iter::repeat_n(clip(1).remove(0), 25).collect();
+    // Low-delay CBR.
+    let mut enc = LowDelayPEncoder::new(W, H, 26, 8)
+        .expect("encoder")
+        .with_frame_rate(25, 1)
+        .with_rate_control(&RateControlCfg::new(40_000, 25, 1).with_vbv(8_000))
+        .with_hrd(true)
+        .with_cbr(true);
+    let mut stream = Vec::new();
+    let mut recons = Vec::new();
+    for (d, f) in frames(&planes).iter().enumerate() {
+        let out = enc.encode_frame(f).expect("encode");
+        stream.extend_from_slice(&out.au);
+        recons.push((d, out.recon.y, out.recon.cb, out.recon.cr));
+    }
+    let (sch, aus) = analyze(&stream);
+    assert!(sch.cbr, "cbr_flag signalled");
+    let filler: u64 = aus.iter().map(|au| au.filler_bits).sum();
+    assert!(
+        filler > 0,
+        "an underrunning CBR stream must carry filler data"
+    );
+    let display: Vec<usize> = (0..planes.len()).collect();
+    assert_conformant(&stream, &display, "low-delay cbr");
+    // The decoder skips FD_NUT: decode stays byte-exact.
+    assert_decodes_exactly(&stream, &recons, "low-delay cbr");
+    // The channel really is (near-)saturated: total bits within the
+    // filler quantum of the full channel occupancy per tick.
+    let total: u64 = aus.iter().map(|au| au.bits).sum();
+    let per_tick = sch.bit_rate * sch.num_units / sch.time_scale;
+    assert!(
+        total + sch.cpb_size >= per_tick * aus.len() as u64,
+        "cumulative arrival must track the constant channel (total {total})"
+    );
+
+    // Pyramid CBR (reordered removal schedule + filler).
+    let mut enc = PyramidEncoder::new(W, H, 26, 4)
+        .expect("encoder")
+        .with_frame_rate(30, 1)
+        .with_rate_control(&RateControlCfg::new(60_000, 30, 1).with_vbv(12_000))
+        .with_hrd(true)
+        .with_cbr(true);
+    let planes: Vec<_> = std::iter::repeat_n(clip(1).remove(0), 13).collect();
+    let mut stream = Vec::new();
+    let mut display = Vec::new();
+    let mut recons = Vec::new();
+    let mut push = |aus: Vec<oxideav_h265::encoder::pyramid::PyramidAu>| {
+        for au in aus {
+            stream.extend_from_slice(&au.au);
+            display.push(au.display_order);
+            recons.push((au.display_order, au.recon.y, au.recon.cb, au.recon.cr));
+        }
+    };
+    for f in frames(&planes) {
+        push(enc.encode_frame(&f).expect("encode"));
+    }
+    push(enc.flush());
+    let (sch, aus) = analyze(&stream);
+    assert!(sch.cbr);
+    assert!(aus.iter().map(|au| au.filler_bits).sum::<u64>() > 0);
+    assert_conformant(&stream, &display, "pyramid cbr");
+    assert_decodes_exactly(&stream, &recons, "pyramid cbr");
+}
+
+/// Registry `cbr` option: happy path over the all-intra mode (every
+/// AU a buffering period, so C-19 binds on every frame), and the
+/// rejection ladder (`cbr` without `hrd`; a CPB smaller than two
+/// frame intervals of the bitrate).
+#[test]
+fn registry_cbr_option() {
+    let planes = clip(8);
+    let mut p = base_params();
+    p.options.insert("mode", "intra");
+    p.options.insert("bitrate", "200k");
+    p.options.insert("bufsize", "40k");
+    p.options.insert("fps", "25");
+    p.options.insert("hrd", "1");
+    p.options.insert("cbr", "1");
+    let mut enc = make_encoder(&p).expect("encoder");
+    let mut stream = Vec::new();
+    for (y, cb, cr) in &planes {
+        enc.send_frame(&video_frame(y, cb, cr)).expect("send");
+        while let Ok(pkt) = enc.receive_packet() {
+            stream.extend_from_slice(&pkt.data);
+        }
+    }
+    let (sch, aus) = analyze(&stream);
+    assert!(sch.cbr);
+    assert_eq!(aus.len(), planes.len());
+    let display: Vec<usize> = (0..planes.len()).collect();
+    assert_conformant(&stream, &display, "registry intra cbr");
+    assert_eq!(
+        decode_annexb_sequence(&stream).expect("decode").len(),
+        planes.len()
+    );
+    // Rejections.
+    for (extra, needle) in [
+        (vec![("cbr", "1")], "cbr requires"),
+        (
+            vec![("hrd", "1"), ("cbr", "1"), ("bufsize", "1k")],
+            "two frame intervals",
+        ),
+    ] {
+        let mut p = base_params();
+        p.options.insert("mode", "intra");
+        p.options.insert("bitrate", "200k");
+        p.options.insert("bufsize", "40k");
+        p.options.insert("fps", "25");
+        for (k, v) in &extra {
+            p.options.insert(*k, *v);
+        }
+        match make_encoder(&p) {
+            Err(Error::InvalidData(msg)) => {
+                assert!(msg.contains(needle), "{extra:?}: {msg:?}")
+            }
+            Err(other) => panic!("{extra:?}: expected InvalidData, got {other:?}"),
+            Ok(_) => panic!("{extra:?}: expected InvalidData, got an encoder"),
+        }
+    }
+    // Direct API: with_cbr without with_hrd errors at encode time.
+    let (y, cb, cr) = &planes[0];
+    let f = YuvFrame { y, cb, cr };
+    let mut enc = LowDelayPEncoder::new(W, H, 26, 0)
+        .expect("encoder")
+        .with_cbr(true);
+    assert!(enc.encode_frame(&f).is_err(), "cbr without hrd");
 }

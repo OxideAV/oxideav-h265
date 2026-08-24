@@ -161,6 +161,12 @@ use oxideav_core::{
 /// `pic_dpb_output_delay` carries its reorder schedule), and coded
 /// sizes are additionally capped by an exact Annex C CPB replay so
 /// the emitted stream satisfies the §C.4 conformance conditions.
+/// The `cbr` option (requires `hrd`) switches the schedule to
+/// constant-bit-rate delivery (`cbr_flag == 1`): back-to-back
+/// eq. C-3 arrivals, mid-stream initial delays held to the
+/// two-sided eq. C-19 bound, and §7.3.4 filler-data NAL units
+/// padding underruns so the CPB cannot overflow (needs a `bufsize`
+/// of at least two frame intervals of the bitrate).
 ///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
@@ -346,6 +352,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "h265 encode: hrd requires the bitrate, bufsize and fps options".into(),
         ));
     }
+    // `cbr` — constant-bit-rate HRD delivery (requires `hrd`).
+    let cbr_on = parse_flag(params, "cbr")?;
+    if cbr_on && !hrd_on {
+        return Err(Error::InvalidData(
+            "h265 encode: cbr requires the hrd option".into(),
+        ));
+    }
     if params.options.get("pyramidstep").is_some() && params.options.get("pyramid").is_none() {
         return Err(Error::InvalidData(
             "h265 encode: pyramidstep requires the pyramid option".into(),
@@ -400,11 +413,27 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
                 aq: parse_aq(params)?,
                 timing: fps_declared.then_some((fps.1, fps.0)),
-                hrd: hrd_on.then(|| {
-                    let signal =
-                        hrd::HrdSignalCfg::for_rate(bitrate.unwrap_or(64), bufsize.unwrap_or(16));
-                    (signal, hrd::HrdClock::new(signal, fps.0, fps.1))
-                }),
+                hrd: match hrd_on {
+                    false => None,
+                    true => {
+                        let signal = hrd::HrdSignalCfg::for_rate(
+                            bitrate.unwrap_or(64),
+                            bufsize.unwrap_or(16),
+                        )
+                        .with_cbr(cbr_on);
+                        if cbr_on {
+                            let tick_bits = signal.bit_rate.saturating_mul(u64::from(fps.1))
+                                / u64::from(fps.0.max(1));
+                            if signal.cpb_size < tick_bits.saturating_mul(2) {
+                                return Err(Error::InvalidData(format!(
+                                    "h265 encode: {}",
+                                    intra::IntraEncodeError::CbrCpbTooSmall
+                                )));
+                            }
+                        }
+                        Some((signal, hrd::HrdClock::new(signal, fps.0, fps.1)))
+                    }
+                },
             }
         }
         Some("inter") => {
@@ -451,7 +480,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
-                enc = enc.with_hrd(hrd_on);
+                enc = enc.with_hrd(hrd_on).with_cbr(cbr_on);
                 EncodeMode::Pyramid {
                     enc,
                     delay: i64::from(g.trailing_zeros()),
@@ -480,7 +509,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
-                enc = enc.with_hrd(hrd_on);
+                enc = enc.with_hrd(hrd_on).with_cbr(cbr_on);
                 EncodeMode::Inter(enc)
             }
         }
@@ -612,13 +641,16 @@ impl Encoder for H265Encoder {
                 // higher QP until the whole AU (SEI included) fits
                 // the modelled decoder buffer and the Annex C
                 // arrival window.
+                let cbr = hrd.as_ref().is_some_and(|(signal, _)| signal.cbr);
                 let cap = match (
                     rc.as_ref().and_then(|r| r.vbv_frame_cap()),
                     hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
                 ) {
                     (Some(v), Some(h)) => Some(v.min(h)),
                     (v, h) => v.or(h),
-                };
+                }
+                // CBR: reserve the filler quantum under the cap.
+                .map(|c| if cbr { c.saturating_sub(56) } else { c });
                 if let Some(cap) = cap {
                     let ceiling = rc.as_ref().map_or(51, |r| r.max_qp());
                     while au.len() as u64 * 8 + sei_bits > cap && frame_qp < ceiling {
@@ -628,6 +660,13 @@ impl Encoder for H265Encoder {
                 }
                 if let Some(sei) = &sei {
                     hrd::splice_sei_before_vcl(&mut au, sei);
+                }
+                if let Some((_, clock)) = &*hrd {
+                    // CBR underrun padding after the VCL NAL.
+                    let pad_bits = clock.cbr_filler_bits(au.len() as u64 * 8);
+                    if pad_bits > 0 {
+                        au.extend(hrd::filler_data_nal_framed((pad_bits as usize).div_ceil(8)));
+                    }
                 }
                 if let Some(rc) = rc {
                     rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);

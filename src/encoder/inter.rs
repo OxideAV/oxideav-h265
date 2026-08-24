@@ -50,8 +50,8 @@ use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::hrd::{
-    buffering_period_payload, pic_timing_payload, sei_prefix_nal, HrdClock, HrdSignalCfg,
-    SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+    buffering_period_payload, filler_data_nal_framed, pic_timing_payload, sei_prefix_nal, HrdClock,
+    HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
 };
 use crate::encoder::intra::{
     chroma_qp_420, code_tb, encode_cu_qp_delta, encode_idr_intra_au_full, gather_refs, pred_params,
@@ -289,6 +289,9 @@ pub struct LowDelayPEncoder {
     rc_cfg: Option<RateControlCfg>,
     /// HRD signalling requested ([`Self::with_hrd`]).
     hrd_on: bool,
+    /// CBR delivery requested ([`Self::with_cbr`]; requires
+    /// `hrd_on`).
+    cbr_on: bool,
     /// The signalled §E.2.2 schedule + Annex C clock, built at the
     /// first frame when `hrd_on`.
     hrd: Option<(HrdSignalCfg, HrdClock)>,
@@ -324,6 +327,7 @@ impl LowDelayPEncoder {
             timing: None,
             rc_cfg: None,
             hrd_on: false,
+            cbr_on: false,
             hrd: None,
         })
     }
@@ -411,10 +415,30 @@ impl LowDelayPEncoder {
         self
     }
 
+    /// Switch the HRD schedule to constant-bit-rate delivery
+    /// (`cbr_flag[0] == 1`): the modelled channel feeds the CPB back
+    /// to back at exactly the signalled rate (eq. C-3), and the
+    /// encoder pads underruns with §7.3.4 filler-data NAL units so
+    /// the CPB cannot overflow (§C.4 condition 2). Requires
+    /// [`Self::with_hrd`] and a VBV of at least two frame intervals
+    /// of the bitrate; [`Self::encode_frame`] errors otherwise.
+    #[must_use]
+    pub fn with_cbr(mut self, on: bool) -> Self {
+        self.cbr_on = on;
+        self
+    }
+
     /// Build the HRD schedule + clock on the first frame (validating
     /// the [`Self::with_hrd`] prerequisites).
     fn ensure_hrd(&mut self) -> Result<(), IntraEncodeError> {
-        if !self.hrd_on || self.hrd.is_some() {
+        if !self.hrd_on {
+            return if self.cbr_on {
+                Err(IntraEncodeError::HrdConfig)
+            } else {
+                Ok(())
+            };
+        }
+        if self.hrd.is_some() {
             return Ok(());
         }
         let (Some(cfg), Some((num_units, time_scale))) = (&self.rc_cfg, self.timing) else {
@@ -423,7 +447,16 @@ impl LowDelayPEncoder {
         let Some(vbv) = cfg.vbv_buffer_bits else {
             return Err(IntraEncodeError::HrdConfig);
         };
-        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv);
+        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv).with_cbr(self.cbr_on);
+        if self.cbr_on {
+            // The filler quantum must fit between the CBR overflow
+            // floor and the underflow cap (see `cbr_filler_bits`).
+            let tick_bits =
+                signal.bit_rate.saturating_mul(u64::from(num_units)) / u64::from(time_scale.max(1));
+            if signal.cpb_size < tick_bits.saturating_mul(2) {
+                return Err(IntraEncodeError::CbrCpbTooSmall);
+            }
+        }
         self.hrd = Some((signal, HrdClock::new(signal, time_scale, num_units)));
         Ok(())
     }
@@ -493,7 +526,11 @@ impl LowDelayPEncoder {
         ) {
             (Some(v), Some(h)) => Some(v.min(h)),
             (v, h) => v.or(h),
-        };
+        }
+        // CBR: reserve the filler quantum (a minimum filler NAL is
+        // 7 framed bytes) under the cap so the overflow padding can
+        // never push the AU past its removal time.
+        .map(|c| if self.cbr_on { c.saturating_sub(56) } else { c });
         let mut coded = self.code_frame_at(frame, idr_now, frame_qp)?;
         if let Some(cap) = cap {
             let qp_ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
@@ -505,6 +542,13 @@ impl LowDelayPEncoder {
         let (mut au, keyframe, recon, stats) = coded;
         if let Some(sei) = &sei {
             crate::encoder::hrd::splice_sei_before_vcl(&mut au, sei);
+        }
+        if let Some((_, clock)) = &self.hrd {
+            // CBR underrun padding: filler data after the VCL NAL.
+            let pad_bits = clock.cbr_filler_bits(au.len() as u64 * 8);
+            if pad_bits > 0 {
+                au.extend(filler_data_nal_framed((pad_bits as usize).div_ceil(8)));
+            }
         }
         // Commit the reference / POC state and the model feedback.
         if idr_now {
