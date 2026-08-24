@@ -486,13 +486,6 @@ impl PyramidEncoder {
         let a = self.anchor.expect("mini-GOP needs an anchor");
         let g = self.gop as i32;
         let sched = build_schedule(a, g);
-        // One base-QP election per mini-GOP; every coded slice feeds
-        // back below, so the model tracks the layer mixture and the
-        // widening excursion window absorbs the once-per-GOP cadence.
-        let base = match &mut self.rc {
-            Some(rc) => rc.pick_qp_burst(FrameClass::Inter, sched.len()),
-            None => self.qp,
-        };
         let pending = std::mem::take(&mut self.pending);
         let mut out = Vec::with_capacity(sched.len());
         for (i, s) in sched.iter().enumerate() {
@@ -517,7 +510,7 @@ impl PyramidEncoder {
             self.refs.retain(|p, _| retained.contains(p));
 
             let frame = &pending[(s.poc - a - 1) as usize];
-            let au = self.code_slice_vbv(frame.as_yuv(), s, &retained, base);
+            let au = self.code_slice_vbv(frame.as_yuv(), s, &retained);
             self.refs.insert(s.poc, au.recon.clone());
             out.push(au);
         }
@@ -534,13 +527,16 @@ impl PyramidEncoder {
     /// buffer), and feed the rate model back — the per-temporal-layer
     /// buffer accounting: every access unit drains the model at its
     /// own decode instant, whatever pyramid layer it sits on.
-    fn code_slice_vbv(
-        &mut self,
-        frame: YuvFrame<'_>,
-        s: &Sched,
-        retained: &[i32],
-        base: i32,
-    ) -> PyramidAu {
+    fn code_slice_vbv(&mut self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32]) -> PyramidAu {
+        // Per-slice base election: the controller tracks every access
+        // unit at its own decode instant (the once-per-mini-GOP
+        // election under-tracked at low rates — the r451 accuracy
+        // gates measured ~20 % tail drift); the per-layer offsets
+        // ride on top so the pyramid's rate-allocation shape is kept.
+        let base = match &mut self.rc {
+            Some(rc) => rc.pick_qp(FrameClass::Inter),
+            None => self.qp,
+        };
         let sei = self.sei_prefix(false, s.poc as u64);
         let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
         let mut bump = 0i32;
@@ -640,11 +636,7 @@ impl PyramidEncoder {
             };
             let retained = vec![poc - 1];
             self.refs.retain(|&p, _| p == poc - 1);
-            let base = match &mut self.rc {
-                Some(rc) => rc.pick_qp(FrameClass::Inter),
-                None => self.qp,
-            };
-            let au = self.code_slice_vbv(frame.as_yuv(), &s, &retained, base);
+            let au = self.code_slice_vbv(frame.as_yuv(), &s, &retained);
             self.refs.insert(poc, au.recon.clone());
             out.push(au);
         }

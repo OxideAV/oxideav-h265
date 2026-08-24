@@ -33,6 +33,22 @@ streams (the SEI rides between the parameter sets and the slice, so
 the context-dependent parse lands after SPS activation) and decodes
 them byte-exact to the encoder reconstructions.
 
+### Changed — pyramid ABR accuracy: per-slice base elections + measurement gates, round 451 (2026-08-24)
+
+The hierarchical-B rate controller now elects a base QP per SLICE (at
+its own decode instant) instead of once per mini-GOP; the per-layer
+offsets still ride on top. New rate-accuracy measurement gates
+(`tests/rate_accuracy.rs`: target vs achieved over the whole run AND
+the converged tail, across low-delay / pyramid / VBV / VBV+HRD /
+filters / AQ / B-slice configurations, plus a monotone 3-point rate
+ladder and a roomy-VBV no-distortion gate) measured the once-per-GOP
+election at ~20 % tail drift on a 120 kb/s pyramid — the bounded
+excursion window can only move ±3 QP per election, which under-tracks
+at a mini-GOP cadence and rings against the leaky-bucket correction.
+With per-slice elections every matrix configuration lands within
+1.6 % of target (low-delay within 1 %); gates pinned at 5/4 %
+(low-delay) and 6/5 % (pyramid) whole/tail.
+
 ### Added — §D.2.2 / §D.2.3 buffering-period + pic-timing SEI parse, round 451 (2026-08-24)
 
 `sei::BufferingPeriodSei::parse` / `sei::PicTimingSei::parse`: the two
@@ -54,10 +70,11 @@ EVERY access unit at its own decode instant — the leading IDR, each
 mini-GOP's anchor P and every B layer alike drain the model in decode
 order and are re-encoded at a higher QP (+3 steps up to the ceiling)
 whenever they would still underflow it, exactly the flat-GOP arm's
-hard guarantee. The per-mini-GOP base-QP election aims the burst at
-its whole refill window (`pick_qp_burst`: fullness plus the
-`gop − 1` intervening fill intervals, 3/4 headroom), so the
-re-encode loop stays an emergency. Replay-pinned like the r449
+hard guarantee. The controller elects each slice's base QP at its
+own decode instant (the per-layer offsets ride on top, keeping the
+pyramid's rate-allocation shape) and aims it at 3/4 of the modelled
+fullness, so the re-encode loop stays an emergency. Replay-pinned
+like the r449
 low-delay arm: the leaky bucket replayed over the decode-order
 access units never underflows while the unconstrained twin provably
 overshoots the buffer, and the streams stay bit-exact through the
