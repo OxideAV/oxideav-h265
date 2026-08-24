@@ -193,6 +193,12 @@ no-overflow/no-underflow, C-18 and display-order output
 monotonicity asserted across the config matrix) and validated
 black-box: a reference decoder accepts the SEI-bearing streams
 without complaint and decodes them byte-exact (two golden pins).
+The `cbr` option / `with_cbr` switches the schedule to
+constant-bit-rate delivery (`cbr_flag == 1`): back-to-back eq. C-3
+arrivals, mid-stream initial delays held to the two-sided eq. C-19
+bound, and §7.3.4 filler-data NAL units padding channel underruns so
+the CPB cannot overflow — CBR-replayed in the same CI harness with a
+whole-timeline overflow check.
 
 Every coding mode adds **spatial adaptive quantization** (`aq`
 option 1..=3; `encode_idr_intra_au_aq`, `with_aq` on the low-delay
