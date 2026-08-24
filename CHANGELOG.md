@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — HRD signalling + Annex C conformance (`hrd`), round 451 (2026-08-24)
+
+`with_hrd` on the low-delay AND pyramid encoders / the registry `hrd`
+option (requires `bitrate` + `bufsize` + an explicit `fps`; all three
+coding modes): the SPS VUI now declares a §E.2.2 `hrd_parameters( )`
+delivery schedule — NAL HRD, one CPB at the target rate (rounded up
+onto the eq. E-87 64 b/s lattice) and the VBV size (eq. E-88 16-bit
+lattice), VBR, AU-level, fixed picture rate — every IRAP access unit
+carries a §D.2.2 buffering-period SEI and every access unit a §D.2.3
+pic-timing SEI (the pyramid's `pic_dpb_output_delay` encodes its
+dyadic reorder schedule; the buffering periods keep `delay + offset`
+constant per §D.3.2 with the eq. C-18 bound honoured at mid-stream
+IRAPs). An exact integer Annex C clock (`encoder::hrd::HrdClock`,
+u128 arithmetic over a common denominator — bit-deterministic, no
+rounding) both emits those fields and hard-caps every access unit so
+its final CPB arrival never passes its nominal removal: the §C.4
+no-underflow condition holds by construction, composing with the VBV
+re-encode loop. Self-checked by a bitstream-only §C.2 replay in CI
+(`tests/hrd_conformance.rs`: parse the VUI/SEI back, replay arrivals
+and removals exactly, assert §C.4 conditions 2 and 3, eq. C-18,
+§D.3.2 delay bounds and display-order DPB output monotonicity across
+low-delay / pyramid / all-intra / registry configurations) — and
+validated black-box: a reference decoder accepts the SEI-bearing
+streams (the SEI rides between the parameter sets and the slice, so
+the context-dependent parse lands after SPS activation) and decodes
+them byte-exact to the encoder reconstructions.
+
 ### Added — §D.2.2 / §D.2.3 buffering-period + pic-timing SEI parse, round 451 (2026-08-24)
 
 `sei::BufferingPeriodSei::parse` / `sei::PicTimingSei::parse`: the two

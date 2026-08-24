@@ -22,6 +22,7 @@ pub mod bitwriter;
 mod aq;
 #[doc(hidden)]
 pub mod cabac;
+pub mod hrd;
 pub mod inter;
 pub mod intra;
 pub mod loopfilter;
@@ -66,6 +67,10 @@ enum EncodeMode {
         aq: u8,
         /// §E.2.1 VUI timing declaration (an explicit `fps` option).
         timing: Option<(u32, u32)>,
+        /// HRD signalling (the `hrd` option): the §E.2.2 schedule the
+        /// SPS VUI declares plus the Annex C clock that emits and
+        /// enforces the per-AU §D.2.2 / §D.2.3 SEI.
+        hrd: Option<(hrd::HrdSignalCfg, hrd::HrdClock)>,
     },
     /// Low-delay inter coding (`mode = "inter"`): `IDR, P, P, …`
     /// GOPs through [`inter::LowDelayPEncoder`] (`qp` option, default
@@ -143,6 +148,16 @@ use oxideav_core::{
 /// The `aq` option (1..=3, `"intra"` / `"inter"` modes) enables
 /// spatial adaptive quantization: per-CTB QP offsets from luma
 /// activity, signalled through §7.3.8.10 `cu_qp_delta`.
+///
+/// The `hrd` option (`"1"` / `"true"`; requires `bitrate`, `bufsize`
+/// AND an explicit `fps`) declares and enforces HRD conformance: the
+/// SPS VUI gains a §E.2.2 `hrd_parameters( )` delivery schedule (NAL
+/// HRD, one CPB at the target rate and VBV size, VBR, fixed picture
+/// rate), every IRAP access unit carries a §D.2.2 buffering-period
+/// SEI, every access unit a §D.2.3 pic-timing SEI (the pyramid's
+/// `pic_dpb_output_delay` carries its reorder schedule), and coded
+/// sizes are additionally capped by an exact Annex C CPB replay so
+/// the emitted stream satisfies the §C.4 conformance conditions.
 ///
 /// 4:2:0 8-bit, dimensions multiples of 16.
 pub struct H265Encoder {
@@ -320,6 +335,14 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // Declare the frame rate in the SPS VUI only when the caller
     // stated it (an explicit `fps` option).
     let fps_declared = params.options.get("fps").is_some();
+    // `hrd` — HRD signalling + Annex C enforcement (requires
+    // bitrate + bufsize + an explicit fps).
+    let hrd_on = parse_flag(params, "hrd")?;
+    if hrd_on && (bitrate.is_none() || bufsize.is_none() || !fps_declared) {
+        return Err(Error::InvalidData(
+            "h265 encode: hrd requires the bitrate, bufsize and fps options".into(),
+        ));
+    }
     // ABR configuration when `bitrate` is set: an explicit `qp`
     // option seeds the controller's starting QP.
     let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
@@ -369,6 +392,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
                 aq: parse_aq(params)?,
                 timing: fps_declared.then_some((fps.1, fps.0)),
+                hrd: hrd_on.then(|| {
+                    let signal =
+                        hrd::HrdSignalCfg::for_rate(bitrate.unwrap_or(64), bufsize.unwrap_or(16));
+                    (signal, hrd::HrdClock::new(signal, fps.0, fps.1))
+                }),
             }
         }
         Some("inter") => {
@@ -399,6 +427,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
+                enc = enc.with_hrd(hrd_on);
                 EncodeMode::Pyramid {
                     enc,
                     delay: i64::from(g.trailing_zeros()),
@@ -427,6 +456,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if bitrate.is_some() {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
+                enc = enc.with_hrd(hrd_on);
                 EncodeMode::Inter(enc)
             }
         }
@@ -505,6 +535,7 @@ impl Encoder for H265Encoder {
                 rc,
                 aq,
                 timing,
+                hrd,
             } => {
                 let mut frame_qp = match rc {
                     Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
@@ -513,8 +544,30 @@ impl Encoder for H265Encoder {
                 let cfg = intra::SpsCfg {
                     cu_qp_delta: *aq > 0,
                     timing: *timing,
+                    hrd: hrd.as_ref().map(|(signal, _)| *signal),
                     ..intra::SpsCfg::legacy(1)
                 };
+                // The HRD SEI prefix: every frame is an IRAP access
+                // unit, so each carries a §D.2.2 buffering period
+                // beside its §D.2.3 pic timing (no output delay:
+                // decode order == display order).
+                let sei = hrd.as_mut().map(|(_, clock)| {
+                    let (delay, offset) = clock.begin_buffering_period();
+                    let payloads = [
+                        (
+                            hrd::SEI_BUFFERING_PERIOD,
+                            hrd::buffering_period_payload(delay, offset),
+                        ),
+                        (
+                            hrd::SEI_PIC_TIMING,
+                            hrd::pic_timing_payload(clock.au_cpb_removal_delay_minus1(), 0),
+                        ),
+                    ];
+                    let mut framed = vec![0, 0, 0, 1];
+                    framed.extend(hrd::sei_prefix_nal(&payloads));
+                    framed
+                });
+                let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
                 let code = |frame_qp: i32| -> Result<Vec<u8>> {
                     Ok(intra::encode_idr_intra_au_full(
                         &y,
@@ -531,17 +584,32 @@ impl Encoder for H265Encoder {
                     .au)
                 };
                 let mut au = code(frame_qp)?;
-                // VBV constraint (`bufsize`): re-encode at a higher
-                // QP until the AU fits the modelled decoder buffer.
-                if let Some(cap) = rc.as_ref().and_then(|r| r.vbv_frame_cap()) {
+                // VBV (`bufsize`) / HRD constraint: re-encode at a
+                // higher QP until the whole AU (SEI included) fits
+                // the modelled decoder buffer and the Annex C
+                // arrival window.
+                let cap = match (
+                    rc.as_ref().and_then(|r| r.vbv_frame_cap()),
+                    hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
+                ) {
+                    (Some(v), Some(h)) => Some(v.min(h)),
+                    (v, h) => v.or(h),
+                };
+                if let Some(cap) = cap {
                     let ceiling = rc.as_ref().map_or(51, |r| r.max_qp());
-                    while au.len() as u64 * 8 > cap && frame_qp < ceiling {
+                    while au.len() as u64 * 8 + sei_bits > cap && frame_qp < ceiling {
                         frame_qp = (frame_qp + 3).min(ceiling);
                         au = code(frame_qp)?;
                     }
                 }
+                if let Some(sei) = &sei {
+                    hrd::splice_sei_before_vcl(&mut au, sei);
+                }
                 if let Some(rc) = rc {
                     rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);
+                }
+                if let Some((_, clock)) = hrd {
+                    clock.push_au(au.len() as u64 * 8);
                 }
                 (au, true)
             }

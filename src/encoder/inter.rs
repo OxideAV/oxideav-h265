@@ -49,6 +49,10 @@ use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
+use crate::encoder::hrd::{
+    buffering_period_payload, pic_timing_payload, sei_prefix_nal, HrdClock, HrdSignalCfg,
+    SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+};
 use crate::encoder::intra::{
     chroma_qp_420, code_tb, encode_cu_qp_delta, encode_idr_intra_au_full, gather_refs, pred_params,
     search_best_mode, ssd, zscan_avail, IntraEncodeError, SpsCfg,
@@ -280,6 +284,14 @@ pub struct LowDelayPEncoder {
     /// §E.2.1 VUI timing declaration `(num_units_in_tick,
     /// time_scale)` for the stream's SPS (`None` = no VUI).
     timing: Option<(u32, u32)>,
+    /// The rate-control configuration behind `rc` (kept for HRD
+    /// signalling, which derives its schedule from it).
+    rc_cfg: Option<RateControlCfg>,
+    /// HRD signalling requested ([`Self::with_hrd`]).
+    hrd_on: bool,
+    /// The signalled §E.2.2 schedule + Annex C clock, built at the
+    /// first frame when `hrd_on`.
+    hrd: Option<(HrdSignalCfg, HrdClock)>,
 }
 
 impl LowDelayPEncoder {
@@ -310,6 +322,9 @@ impl LowDelayPEncoder {
             rc: None,
             aq: 0,
             timing: None,
+            rc_cfg: None,
+            hrd_on: false,
+            hrd: None,
         })
     }
 
@@ -375,7 +390,42 @@ impl LowDelayPEncoder {
     #[must_use]
     pub fn with_rate_control(mut self, cfg: &RateControlCfg) -> Self {
         self.rc = Some(RateController::new(cfg, self.width, self.height));
+        self.rc_cfg = Some(*cfg);
         self
+    }
+
+    /// Declare and enforce HRD conformance: the SPS VUI gains a
+    /// §E.2.2 `hrd_parameters( )` schedule (NAL HRD, one CPB at the
+    /// rate-control target and VBV size), every IDR access unit
+    /// carries a §D.2.2 buffering-period SEI, every access unit a
+    /// §D.2.3 pic-timing SEI, and the coded sizes are additionally
+    /// capped by an exact Annex C CPB replay (re-encoding at a
+    /// higher QP like the VBV path) so the emitted stream satisfies
+    /// the §C.4 conformance conditions. Requires
+    /// [`Self::with_rate_control`] with [`RateControlCfg::with_vbv`]
+    /// AND [`Self::with_frame_rate`]; [`Self::encode_frame`] errors
+    /// otherwise.
+    #[must_use]
+    pub fn with_hrd(mut self, on: bool) -> Self {
+        self.hrd_on = on;
+        self
+    }
+
+    /// Build the HRD schedule + clock on the first frame (validating
+    /// the [`Self::with_hrd`] prerequisites).
+    fn ensure_hrd(&mut self) -> Result<(), IntraEncodeError> {
+        if !self.hrd_on || self.hrd.is_some() {
+            return Ok(());
+        }
+        let (Some(cfg), Some((num_units, time_scale))) = (&self.rc_cfg, self.timing) else {
+            return Err(IntraEncodeError::HrdConfig);
+        };
+        let Some(vbv) = cfg.vbv_buffer_bits else {
+            return Err(IntraEncodeError::HrdConfig);
+        };
+        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv);
+        self.hrd = Some((signal, HrdClock::new(signal, time_scale, num_units)));
+        Ok(())
     }
 
     /// Encode the next frame in display order.
@@ -410,18 +460,52 @@ impl LowDelayPEncoder {
             }),
             None => self.qp,
         };
-        // Code the frame at `frame_qp`; under a VBV constraint,
-        // re-encode at a higher QP until the access unit fits the
-        // modelled decoder buffer (or the QP ceiling is reached).
+        // The AU's HRD SEI prefix (buffering period on IDRs, pic
+        // timing on every AU), built BEFORE coding: its bits count
+        // toward the Annex C / VBV budgets.
+        self.ensure_hrd()?;
+        let sei = self.hrd.as_mut().map(|(_, clock)| {
+            let mut payloads = Vec::with_capacity(2);
+            if idr_now {
+                let (delay, offset) = clock.begin_buffering_period();
+                payloads.push((
+                    SEI_BUFFERING_PERIOD,
+                    buffering_period_payload(delay, offset),
+                ));
+            }
+            payloads.push((
+                SEI_PIC_TIMING,
+                // Decode order == display order: no output delay.
+                pic_timing_payload(clock.au_cpb_removal_delay_minus1(), 0),
+            ));
+            let mut framed = vec![0, 0, 0, 1];
+            framed.extend(sei_prefix_nal(&payloads));
+            framed
+        });
+        let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
+        // Code the frame at `frame_qp`; under a VBV / HRD constraint,
+        // re-encode at a higher QP until the whole access unit (SEI
+        // included) fits the modelled decoder buffer AND the Annex C
+        // arrival window (or the QP ceiling is reached).
+        let cap = match (
+            self.rc.as_ref().and_then(RateController::vbv_frame_cap),
+            self.hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
+        ) {
+            (Some(v), Some(h)) => Some(v.min(h)),
+            (v, h) => v.or(h),
+        };
         let mut coded = self.code_frame_at(frame, idr_now, frame_qp)?;
-        if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+        if let Some(cap) = cap {
             let qp_ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
-            while coded.0.len() as u64 * 8 > cap && frame_qp < qp_ceiling {
+            while coded.0.len() as u64 * 8 + sei_bits > cap && frame_qp < qp_ceiling {
                 frame_qp = (frame_qp + 3).min(qp_ceiling);
                 coded = self.code_frame_at(frame, idr_now, frame_qp)?;
             }
         }
-        let (au, keyframe, recon, stats) = coded;
+        let (mut au, keyframe, recon, stats) = coded;
+        if let Some(sei) = &sei {
+            crate::encoder::hrd::splice_sei_before_vcl(&mut au, sei);
+        }
         // Commit the reference / POC state and the model feedback.
         if idr_now {
             self.prevs = vec![recon.clone()];
@@ -441,6 +525,9 @@ impl LowDelayPEncoder {
                 frame_qp,
                 au.len() as u64 * 8,
             );
+        }
+        if let Some((_, clock)) = &mut self.hrd {
+            clock.push_au(au.len() as u64 * 8);
         }
         // GOP wrap: schedule the next IDR.
         if self.gop > 0 && self.poc >= self.gop as i32 {
@@ -481,6 +568,7 @@ impl LowDelayPEncoder {
                     amp: self.amp,
                     cu_qp_delta: self.aq > 0,
                     timing: self.timing,
+                    hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
                 },
                 &self.filters,
                 self.aq,

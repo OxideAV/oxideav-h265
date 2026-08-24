@@ -99,6 +99,9 @@ pub enum IntraEncodeError {
     BadQp(i32),
     /// Adaptive-quantization strength outside 0..=3.
     BadAq(u8),
+    /// HRD signalling enabled without its prerequisites (rate
+    /// control with a VBV buffer and an explicit frame rate).
+    HrdConfig,
 }
 
 impl core::fmt::Display for IntraEncodeError {
@@ -115,6 +118,9 @@ impl core::fmt::Display for IntraEncodeError {
             } => write!(f, "{plane} plane has {got} samples, expected {expected}"),
             Self::BadQp(qp) => write!(f, "slice QP {qp} outside 0..=51"),
             Self::BadAq(aq) => write!(f, "aq strength {aq} outside 0..=3"),
+            Self::HrdConfig => f.write_str(
+                "hrd signalling requires rate control with a VBV buffer and an explicit frame rate",
+            ),
         }
     }
 }
@@ -162,6 +168,9 @@ pub(crate) struct SpsCfg {
     /// fps_num)`. `None` omits the VUI entirely (the historical
     /// streams).
     pub timing: Option<(u32, u32)>,
+    /// §E.2.2 HRD delivery schedule to declare inside the VUI
+    /// (requires `timing`); `None` keeps the VUI HRD-free.
+    pub hrd: Option<crate::encoder::hrd::HrdSignalCfg>,
 }
 
 impl SpsCfg {
@@ -175,6 +184,7 @@ impl SpsCfg {
             amp: false,
             cu_qp_delta: false,
             timing: None,
+            hrd: None,
         }
     }
 }
@@ -245,7 +255,14 @@ pub(crate) fn write_sps_cfg(
             w.put_bits(num_units_in_tick, 32); // vui_num_units_in_tick
             w.put_bits(time_scale, 32); // vui_time_scale
             w.put_bit(0); // vui_poc_proportional_to_timing_flag
-            w.put_bit(0); // vui_hrd_parameters_present_flag
+            match &cfg.hrd {
+                None => w.put_bit(0), // vui_hrd_parameters_present_flag
+                Some(hrd) => {
+                    w.put_bit(1); // vui_hrd_parameters_present_flag
+                                  // §E.2.2 hrd_parameters( 1, 0 ).
+                    crate::encoder::hrd::write_hrd_parameters(&mut w, hrd);
+                }
+            }
             w.put_bit(0); // bitstream_restriction_flag
         }
     }

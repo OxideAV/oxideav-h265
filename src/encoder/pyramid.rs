@@ -47,6 +47,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::encoder::hrd::{
+    buffering_period_payload, pic_timing_payload, sei_prefix_nal, HrdClock, HrdSignalCfg,
+    SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+};
 use crate::encoder::inter::{encode_inter_slice, FrameRecon, FrameStats, SliceSpec, YuvFrame};
 use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
 use crate::encoder::loopfilter::LoopFilterCfg;
@@ -166,6 +170,15 @@ pub struct PyramidEncoder {
     /// §E.2.1 VUI timing declaration `(num_units_in_tick,
     /// time_scale)` for the stream's SPS (`None` = no VUI).
     timing: Option<(u32, u32)>,
+    /// The rate-control configuration behind `rc` (kept for HRD
+    /// signalling).
+    rc_cfg: Option<RateControlCfg>,
+    /// HRD signalling requested ([`Self::with_hrd`]).
+    hrd_on: bool,
+    /// The signalled §E.2.2 schedule + Annex C clock, built at the
+    /// first frame when `hrd_on`. The clock advances once per access
+    /// unit in DECODE order.
+    hrd: Option<(HrdSignalCfg, HrdClock)>,
 }
 
 impl PyramidEncoder {
@@ -205,6 +218,9 @@ impl PyramidEncoder {
             rc: None,
             aq: 0,
             timing: None,
+            rc_cfg: None,
+            hrd_on: false,
+            hrd: None,
         })
     }
 
@@ -259,7 +275,81 @@ impl PyramidEncoder {
     #[must_use]
     pub fn with_rate_control(mut self, cfg: &RateControlCfg) -> Self {
         self.rc = Some(RateController::new(cfg, self.width, self.height));
+        self.rc_cfg = Some(*cfg);
         self
+    }
+
+    /// Declare and enforce HRD conformance (see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_hrd`]): the
+    /// SPS VUI gains the §E.2.2 schedule, the IDR carries a §D.2.2
+    /// buffering-period SEI, every access unit a §D.2.3 pic-timing
+    /// SEI whose `pic_dpb_output_delay` carries the pyramid's
+    /// reorder schedule, and coded sizes are capped by the exact
+    /// Annex C replay. Requires [`Self::with_rate_control`] with
+    /// [`RateControlCfg::with_vbv`] AND [`Self::with_frame_rate`].
+    #[must_use]
+    pub fn with_hrd(mut self, on: bool) -> Self {
+        self.hrd_on = on;
+        self
+    }
+
+    /// Build the HRD schedule + clock on the first frame (validating
+    /// the [`Self::with_hrd`] prerequisites).
+    fn ensure_hrd(&mut self) -> Result<(), PyramidError> {
+        if !self.hrd_on || self.hrd.is_some() {
+            return Ok(());
+        }
+        let (Some(cfg), Some((num_units, time_scale))) = (&self.rc_cfg, self.timing) else {
+            return Err(PyramidError::Encode(IntraEncodeError::HrdConfig));
+        };
+        let Some(vbv) = cfg.vbv_buffer_bits else {
+            return Err(PyramidError::Encode(IntraEncodeError::HrdConfig));
+        };
+        let signal = HrdSignalCfg::for_rate(cfg.bits_per_second, vbv);
+        self.hrd = Some((signal, HrdClock::new(signal, time_scale, num_units)));
+        Ok(())
+    }
+
+    /// The §D.2.3 pic-timing SEI prefix (plus the §D.2.2 buffering
+    /// period when `bp`) for the access unit about to be coded at
+    /// display index `display`, framed as Annex B bytes — `None`
+    /// without HRD signalling. Advances no clock state except the
+    /// pending buffering period.
+    fn sei_prefix(&mut self, bp: bool, display: u64) -> Option<Vec<u8>> {
+        let reorder = u64::from(self.depth());
+        let (_, clock) = self.hrd.as_mut()?;
+        let mut payloads = Vec::with_capacity(2);
+        if bp {
+            let (delay, offset) = clock.begin_buffering_period();
+            payloads.push((
+                SEI_BUFFERING_PERIOD,
+                buffering_period_payload(delay, offset),
+            ));
+        }
+        // Output at elemental tick `reorder + display`, removal at
+        // tick `m`: the eq. C-15 output delay in ticks.
+        let out_delay = (reorder + display).saturating_sub(clock.next_decode_index());
+        payloads.push((
+            SEI_PIC_TIMING,
+            pic_timing_payload(
+                clock.au_cpb_removal_delay_minus1(),
+                u32::try_from(out_delay).unwrap_or(u32::MAX),
+            ),
+        ));
+        let mut framed = vec![0, 0, 0, 1];
+        framed.extend(sei_prefix_nal(&payloads));
+        Some(framed)
+    }
+
+    /// The joint VBV + Annex C bit budget for the next access unit.
+    fn au_cap(&self) -> Option<u64> {
+        match (
+            self.rc.as_ref().and_then(RateController::vbv_frame_cap),
+            self.hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
+        ) {
+            (Some(v), Some(h)) => Some(v.min(h)),
+            (v, h) => v.or(h),
+        }
     }
 
     /// The number of pyramid layers below the anchors
@@ -279,6 +369,7 @@ impl PyramidEncoder {
             amp: self.amp,
             cu_qp_delta: self.aq > 0,
             timing: self.timing,
+            hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
         }
     }
 
@@ -310,12 +401,15 @@ impl PyramidEncoder {
             }
         }
 
+        self.ensure_hrd()?;
         if self.anchor.is_none() {
             // The leading IDR (POC 0, layer 0).
             let mut idr_qp = match &mut self.rc {
                 Some(rc) => rc.pick_qp(FrameClass::Intra),
                 None => self.qp,
             };
+            let sei = self.sei_prefix(true, 0);
+            let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
             let code = |qp: i32| {
                 encode_idr_intra_au_full(
                     frame.y,
@@ -330,16 +424,20 @@ impl PyramidEncoder {
                 )
             };
             let mut idr = code(idr_qp)?;
-            // VBV constraint: re-encode at a higher QP until the IDR
-            // access unit fits the modelled decoder buffer (or the QP
-            // ceiling is reached) — the same hard guarantee as the
-            // low-delay arm.
-            if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+            // VBV / HRD constraint: re-encode at a higher QP until
+            // the IDR access unit (SEI included) fits the modelled
+            // decoder buffer and the Annex C arrival window (or the
+            // QP ceiling is reached) — the same hard guarantee as
+            // the low-delay arm.
+            if let Some(cap) = self.au_cap() {
                 let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
-                while idr.au.len() as u64 * 8 > cap && idr_qp < ceiling {
+                while idr.au.len() as u64 * 8 + sei_bits > cap && idr_qp < ceiling {
                     idr_qp = (idr_qp + 3).min(ceiling);
                     idr = code(idr_qp)?;
                 }
+            }
+            if let Some(sei) = &sei {
+                crate::encoder::hrd::splice_sei_before_vcl(&mut idr.au, sei);
             }
             let recon = FrameRecon {
                 y: idr.recon_y,
@@ -351,6 +449,9 @@ impl PyramidEncoder {
             self.next_display = 1;
             if let Some(rc) = &mut self.rc {
                 rc.update(FrameClass::Intra, idr_qp, idr.au.len() as u64 * 8);
+            }
+            if let Some((_, clock)) = &mut self.hrd {
+                clock.push_au(idr.au.len() as u64 * 8);
             }
             return Ok(vec![PyramidAu {
                 au: idr.au,
@@ -440,15 +541,20 @@ impl PyramidEncoder {
         retained: &[i32],
         base: i32,
     ) -> PyramidAu {
+        let sei = self.sei_prefix(false, s.poc as u64);
+        let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
         let mut bump = 0i32;
         let mut au = self.code_slice(frame, s, retained, self.layer_qp(base, s.layer));
-        if let Some(cap) = self.rc.as_ref().and_then(RateController::vbv_frame_cap) {
+        if let Some(cap) = self.au_cap() {
             let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
-            while au.au.len() as u64 * 8 > cap && au.qp < ceiling {
+            while au.au.len() as u64 * 8 + sei_bits > cap && au.qp < ceiling {
                 bump += 3;
                 let qp = (self.layer_qp(base, s.layer) + bump).min(ceiling);
                 au = self.code_slice(frame, s, retained, qp);
             }
+        }
+        if let Some(sei) = &sei {
+            crate::encoder::hrd::splice_sei_before_vcl(&mut au.au, sei);
         }
         if let Some(rc) = &mut self.rc {
             // Feed back at the BASE QP (not the slice's layer QP) plus
@@ -462,6 +568,9 @@ impl PyramidEncoder {
                 (base + bump).clamp(0, 51),
                 au.au.len() as u64 * 8,
             );
+        }
+        if let Some((_, clock)) = &mut self.hrd {
+            clock.push_au(au.au.len() as u64 * 8);
         }
         au
     }
