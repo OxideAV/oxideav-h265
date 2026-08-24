@@ -159,17 +159,40 @@ Every coding path also accepts **average-bitrate rate control**
 low-delay AND pyramid APIs): a deterministic integer-only controller
 on the §8.6.3 quantizer lattice (`bits ≈ C / 2^(QP/6)`, per-class
 complexity EWMA, leaky-bucket budget, bounded per-frame QP
-excursions) elects each frame's `SliceQpY` — the pyramid elects a
-base QP per mini-GOP under its per-layer offsets — through
-`slice_qp_delta` alone, so streams stay conforming, decode bit-exact
-through this crate's decoder and a black-box reference decoder, and
-land within a few percent of the requested rate (measured 1.4–6.2 %
-across 60k–600k b/s low-delay targets; ≤13 % on 30-frame pyramid
-clips, converging with length). A **VBV constraint** (`bufsize`
-option / `with_vbv`) additionally hard-caps every access unit to a
-modelled decoder buffer — frames that would underflow it are
-re-encoded at a higher QP (leaky-bucket replay CI-pinned; low-delay
-and all-intra paths).
+excursions) elects each frame's `SliceQpY` — every pyramid slice at
+its own decode instant, the per-layer offsets riding on top
+(`pyramidstep` option / `with_layer_qp_step`, wire-verified against
+the slice headers) — through `slice_qp_delta` alone, so streams stay
+conforming and decode bit-exact through this crate's decoder and a
+black-box reference decoder. CI-gated accuracy
+(`tests/rate_accuracy.rs`): every configuration of the
+low-delay/pyramid × targets × B-slice/filter/AQ × VBV/HRD matrix
+lands within 1.6 % of target over 60–65 frames (low-delay within
+1 %), with a monotone rate ladder on both paths. A **VBV
+constraint** (`bufsize` option / `with_vbv`) hard-caps EVERY access
+unit to a modelled decoder buffer at its own decode instant — the
+low-delay, all-intra AND hierarchical-B paths (the mini-GOP burst's
+anchor P and each B layer included) re-encode at a higher QP
+whatever would underflow it (leaky-bucket replays CI-pinned on both
+GOP shapes against unconstrained twins that provably overshoot).
+
+**HRD conformance** (`hrd` option / `with_hrd`; requires rate
+control + VBV + an explicit frame rate): the SPS VUI declares a
+§E.2.2 `hrd_parameters( )` delivery schedule (NAL HRD, one CPB at
+the target rate and VBV size, VBR, fixed picture rate), every IRAP
+access unit carries a §D.2.2 buffering-period SEI and every access
+unit a §D.2.3 pic-timing SEI (the pyramid's `pic_dpb_output_delay`
+encodes its dyadic reorder schedule; buffering periods keep
+`delay + offset` constant per §D.3.2 with the eq. C-18 bound
+honoured at mid-stream IRAPs), and an exact integer Annex C clock
+additionally hard-caps every access unit so its final CPB arrival
+never passes its nominal removal — the §C.4 conditions hold by
+construction. Self-checked in CI by a bitstream-only §C.2 replay
+(VUI/SEI parsed back, arrivals/removals recomputed exactly, §C.4
+no-overflow/no-underflow, C-18 and display-order output
+monotonicity asserted across the config matrix) and validated
+black-box: a reference decoder accepts the SEI-bearing streams
+without complaint and decodes them byte-exact (two golden pins).
 
 Every coding mode adds **spatial adaptive quantization** (`aq`
 option 1..=3; `encode_idr_intra_au_aq`, `with_aq` on the low-delay
@@ -209,7 +232,10 @@ streams byte-stable).
   out (`mode = "pcm"` lossless or `mode = "intra"` at a chosen QP).
   `make_decoder` / `make_encoder` are the direct factory endpoints.
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
-  bodies), VUI + HRD (§E.2), slice segment headers (§7.3.6, all slice
+  bodies), VUI + HRD (§E.2), SEI (§7.3.5 framing; typed §D.2
+  payloads incl. the context-dependent §D.2.2 buffering-period and
+  §D.2.3 pic-timing bodies — parsed decode-side AND emitted
+  encode-side), slice segment headers (§7.3.6, all slice
   types, RPS forms, `ref_pic_lists_modification()`,
   `pred_weight_table()`, entry points incl. dependent segments),
   §7.4.8 RPS materialization, scaling lists (§7.3.4 / §7.4.5), and
