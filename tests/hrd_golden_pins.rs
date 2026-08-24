@@ -1,0 +1,138 @@
+//! Golden pins for the round-451 HRD arms: two streams whose exact
+//! bytes were validated OUT OF BAND against a black-box reference
+//! decoder (accepted without warnings, decoded byte-exact to the
+//! encoder reconstructions) at pin time.
+//!
+//! * `r451-lowdelay-hrd.hevc` — low-delay GOP-10 at 150 kb/s under a
+//!   12 kbit VBV with full HRD signalling (25 fps), 30 frames: three
+//!   buffering periods (C-18-bounded mid-stream initial delays), a
+//!   pic-timing SEI on every AU.
+//! * `r451-pyramid-hrd.hevc` — GOP-8 hierarchical-B at 150 kb/s
+//!   under an 18 kbit VBV with AQ 2 and full HRD signalling
+//!   (30 fps), 21 frames: the reorder schedule carried in
+//!   `pic_dpb_output_delay`.
+//!
+//! Re-encoding the same deterministic clips must reproduce the
+//! golden bytes exactly, and the goldens must decode bit-exactly to
+//! the fresh encoder reconstructions through the crate's own
+//! decoder. Any intentional change to the rate controller, the HRD
+//! clock, the SEI layout or the coding tools shows up here as a
+//! byte diff — cross-decode before updating the pins.
+
+use oxideav_h265::decode_annexb_sequence;
+use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
+use oxideav_h265::encoder::pyramid::PyramidEncoder;
+use oxideav_h265::encoder::rate::RateControlCfg;
+
+const GOLDEN_LOWDELAY: &[u8] = include_bytes!("fixture_bytes/r451-lowdelay-hrd.hevc");
+const GOLDEN_PYRAMID: &[u8] = include_bytes!("fixture_bytes/r451-pyramid-hrd.hevc");
+
+const W: usize = 64;
+const H: usize = 48;
+
+fn noise(seed: &mut u32) -> u8 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    (*seed >> 24) as u8
+}
+
+fn clip(n: usize) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut seed = 0x51D5_EED5u32;
+    (0..n)
+        .map(|t| {
+            let y: Vec<u8> = (0..W * H)
+                .map(|i| {
+                    let (x, yy) = (i % W, i / W);
+                    let base = ((x * 5 + yy * 3) % 170) as i32 + i32::from(noise(&mut seed) % 14);
+                    let (sx, sy) = ((3 + t * 2) % (W - 12), (6 + t) % (H - 12));
+                    if x >= sx && x < sx + 10 && yy >= sy && yy < sy + 10 {
+                        (base + 70).clamp(0, 255) as u8
+                    } else {
+                        base.clamp(0, 255) as u8
+                    }
+                })
+                .collect();
+            let cb: Vec<u8> = (0..W * H / 4).map(|i| (90 + (i + t) % 60) as u8).collect();
+            let cr: Vec<u8> = (0..W * H / 4).map(|i| (160 - (i + t) % 50) as u8).collect();
+            (y, cb, cr)
+        })
+        .collect()
+}
+
+#[test]
+fn golden_lowdelay_hrd_is_reproduced_and_decodes_to_recon() {
+    let planes = clip(30);
+    let mut enc = LowDelayPEncoder::new(W, H, 26, 10)
+        .expect("encoder")
+        .with_frame_rate(25, 1)
+        .with_rate_control(&RateControlCfg::new(150_000, 25, 1).with_vbv(12_000))
+        .with_hrd(true);
+    let mut stream = Vec::new();
+    let mut recons = Vec::new();
+    for (y, cb, cr) in &planes {
+        let f = enc.encode_frame(&YuvFrame { y, cb, cr }).expect("encode");
+        stream.extend_from_slice(&f.au);
+        recons.push(f.recon);
+    }
+    assert_eq!(
+        stream, GOLDEN_LOWDELAY,
+        "deterministic re-encode reproduces the externally validated golden stream"
+    );
+    let decoded = decode_annexb_sequence(GOLDEN_LOWDELAY).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
+    for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+        let mut expect = rec.y.clone();
+        expect.extend_from_slice(&rec.cb);
+        expect.extend_from_slice(&rec.cr);
+        assert_eq!(
+            dec.picture.to_planar_u8().expect("8-bit"),
+            expect,
+            "frame {i}"
+        );
+    }
+}
+
+#[test]
+fn golden_pyramid_hrd_is_reproduced_and_decodes_to_recon() {
+    let planes = clip(21);
+    let mut enc = PyramidEncoder::new(W, H, 26, 8)
+        .expect("encoder")
+        .with_frame_rate(30, 1)
+        .with_aq(2)
+        .with_rate_control(&RateControlCfg::new(150_000, 30, 1).with_vbv(18_000))
+        .with_hrd(true);
+    let mut stream = Vec::new();
+    let mut recons: Vec<Option<oxideav_h265::encoder::inter::FrameRecon>> =
+        vec![None; planes.len()];
+    let push = |aus: Vec<oxideav_h265::encoder::pyramid::PyramidAu>,
+                stream: &mut Vec<u8>,
+                recons: &mut Vec<Option<oxideav_h265::encoder::inter::FrameRecon>>| {
+        for au in aus {
+            stream.extend_from_slice(&au.au);
+            recons[au.display_order] = Some(au.recon);
+        }
+    };
+    for (y, cb, cr) in &planes {
+        let aus = enc.encode_frame(&YuvFrame { y, cb, cr }).expect("encode");
+        push(aus, &mut stream, &mut recons);
+    }
+    push(enc.flush(), &mut stream, &mut recons);
+    assert_eq!(
+        stream, GOLDEN_PYRAMID,
+        "deterministic re-encode reproduces the externally validated golden stream"
+    );
+    let decoded = decode_annexb_sequence(GOLDEN_PYRAMID).expect("decode");
+    assert_eq!(decoded.len(), planes.len());
+    for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+        let rec = rec.as_ref().expect("coded");
+        let mut expect = rec.y.clone();
+        expect.extend_from_slice(&rec.cb);
+        expect.extend_from_slice(&rec.cr);
+        assert_eq!(
+            dec.picture.to_planar_u8().expect("8-bit"),
+            expect,
+            "frame {i}"
+        );
+    }
+}

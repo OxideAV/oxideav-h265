@@ -33,6 +33,18 @@ streams (the SEI rides between the parameter sets and the slice, so
 the context-dependent parse lands after SPS activation) and decodes
 them byte-exact to the encoder reconstructions.
 
+### Added — HRD golden pins (`r451-lowdelay-hrd` / `r451-pyramid-hrd`), round 451 (2026-08-24)
+
+Two CI-pinned golden streams for the HRD arms, both validated out of
+band against a black-box reference decoder at pin time (accepted
+without warnings, decoded byte-exact to the encoder
+reconstructions): a 30-frame low-delay GOP-10 stream at 150 kb/s /
+12 kbit VBV with full HRD signalling (three buffering periods, so
+the C-18-bounded mid-stream initial delays are pinned), and a
+21-frame GOP-8 pyramid at 150 kb/s / 18 kbit VBV with AQ 2 and HRD
+(the reorder schedule pinned in `pic_dpb_output_delay`).
+Deterministic re-encodes must reproduce the bytes exactly.
+
 ### Added — hierarchical QP offsets on the wire + registry `pyramidstep`, round 451 (2026-08-24)
 
 The pyramid's per-layer rate allocation is now a registry surface
