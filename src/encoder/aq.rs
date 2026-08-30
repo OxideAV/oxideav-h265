@@ -28,36 +28,45 @@ fn log2_q3(x: u64) -> i64 {
     8 * il + frac
 }
 
-/// Per-CTB (16x16, raster order) QP offsets for the `width`x`height`
-/// luma plane `y` at AQ `strength` (0 = all zeros; 1..=3 = QP per
-/// octave of activity ratio, clamped to ±6).
-pub(crate) fn ctb_aq_deltas(y: &[u8], width: usize, height: usize, strength: u8) -> Vec<i32> {
-    const CTB: usize = 16;
-    let (ctbs_x, ctbs_y) = (width / CTB, height / CTB);
+/// Per-CTB (`ctb`x`ctb`, raster order, edge CTBs clipped by the
+/// picture) QP offsets for the `width`x`height` luma plane `y` at AQ
+/// `strength` (0 = all zeros; 1..=3 = QP per octave of activity ratio,
+/// clamped to ±6).
+pub(crate) fn ctb_aq_deltas(
+    y: &[u8],
+    width: usize,
+    height: usize,
+    strength: u8,
+    ctb: usize,
+) -> Vec<i32> {
+    let (ctbs_x, ctbs_y) = (width.div_ceil(ctb), height.div_ceil(ctb));
     let n = ctbs_x * ctbs_y;
     if strength == 0 {
         return vec![0; n];
     }
-    // Activity per CTB: 1 + mean-absolute-deviation sum (the +1 keeps
-    // the log finite on perfectly flat blocks).
+    // Activity per CTB: 1 + mean-absolute-deviation sum, normalized to
+    // the 16x16 sample count so the octave scale is size-independent
+    // (the +1 keeps the log finite on perfectly flat blocks).
     let mut log_act = Vec::with_capacity(n);
-    for ctb in 0..n {
-        let x0 = (ctb % ctbs_x) * CTB;
-        let y0 = (ctb / ctbs_x) * CTB;
+    for idx in 0..n {
+        let x0 = (idx % ctbs_x) * ctb;
+        let y0 = (idx / ctbs_x) * ctb;
+        let (w, h) = ((width - x0).min(ctb), (height - y0).min(ctb));
         let mut sum = 0u64;
-        for j in 0..CTB {
-            for i in 0..CTB {
+        for j in 0..h {
+            for i in 0..w {
                 sum += u64::from(y[(y0 + j) * width + x0 + i]);
             }
         }
-        let mean = sum / (CTB * CTB) as u64;
+        let count = (w * h) as u64;
+        let mean = sum / count;
         let mut dev = 0u64;
-        for j in 0..CTB {
-            for i in 0..CTB {
+        for j in 0..h {
+            for i in 0..w {
                 dev += u64::from(y[(y0 + j) * width + x0 + i]).abs_diff(mean);
             }
         }
-        log_act.push(log2_q3(1 + dev));
+        log_act.push(log2_q3(1 + dev * 256 / count));
     }
     let avg: i64 = log_act.iter().sum::<i64>() / n as i64;
     log_act
@@ -96,7 +105,7 @@ mod tests {
     #[test]
     fn strength_zero_is_all_zeros() {
         let y = vec![128u8; 64 * 32];
-        assert_eq!(ctb_aq_deltas(&y, 64, 32, 0), vec![0; 8]);
+        assert_eq!(ctb_aq_deltas(&y, 64, 32, 0, 16), vec![0; 8]);
     }
 
     #[test]
@@ -116,7 +125,7 @@ mod tests {
             })
             .collect();
         for strength in 1..=3u8 {
-            let d = ctb_aq_deltas(&y, w, h, strength);
+            let d = ctb_aq_deltas(&y, w, h, strength, 16);
             assert_eq!(d.len(), 8);
             for (ctb, &delta) in d.iter().enumerate() {
                 let flat = ctb % 4 < 2;
@@ -129,7 +138,7 @@ mod tests {
             }
             // Stronger AQ spreads at least as wide.
             if strength > 1 {
-                let d1 = ctb_aq_deltas(&y, w, h, 1);
+                let d1 = ctb_aq_deltas(&y, w, h, 1, 16);
                 let spread = |v: &[i32]| v.iter().max().unwrap() - v.iter().min().unwrap();
                 assert!(spread(&d) >= spread(&d1));
             }

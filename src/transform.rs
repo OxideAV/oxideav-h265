@@ -388,6 +388,23 @@ pub(crate) fn forward_dct_1d(input: &[i64], n_tbs: usize) -> Vec<i64> {
         .collect()
 }
 
+/// Encoder-side forward DST-VII 1-D (the `trType == 1` 4x4 alternate
+/// transform): `y[ i ] = Σ_j DST4[ i ][ j ] * x[ j ]` — the transpose of
+/// the eq. 8-316 synthesis, so an inverse-transformed forward output
+/// reproduces the input up to the encoder's normalization shifts.
+pub(crate) fn forward_dst4_1d(input: &[i64]) -> Vec<i64> {
+    debug_assert_eq!(input.len(), 4, "forward_dst4_1d is 4-point only");
+    (0..4)
+        .map(|i| {
+            input
+                .iter()
+                .enumerate()
+                .map(|(j, &xj)| DST4[i][j] as i64 * xj)
+                .sum()
+        })
+        .collect()
+}
+
 /// §8.6.4 — transformation process for scaled transform coefficients.
 ///
 /// Inputs:

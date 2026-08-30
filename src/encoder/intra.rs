@@ -178,6 +178,13 @@ pub(crate) struct SpsCfg {
     /// §E.2.2 HRD delivery schedule to declare inside the VUI
     /// (requires `timing`); `None` keeps the VUI HRD-free.
     pub hrd: Option<crate::encoder::hrd::HrdSignalCfg>,
+    /// The quadtree-coder geometry ([`crate::encoder::ctu::TreeCfg`]):
+    /// `Some` routes the picture through the recursive coding-quadtree
+    /// coder (CTB 16 / 32 / 64, `MinCbSizeY == 8`, RD-elected splits,
+    /// deeper RQTs, 4x4 DST intra TUs). `None` keeps the historical
+    /// fixed-geometry coders byte-stable. When set, `min_cb_log2`
+    /// must be 3 (the quadtree streams always signal MinCb 8).
+    pub tree: Option<crate::encoder::ctu::TreeCfg>,
 }
 
 impl SpsCfg {
@@ -192,6 +199,7 @@ impl SpsCfg {
             cu_qp_delta: false,
             timing: None,
             hrd: None,
+            tree: None,
         }
     }
 }
@@ -209,9 +217,18 @@ pub(crate) fn write_sps_cfg(
     cfg: &SpsCfg,
     sao_enabled: bool,
 ) -> Vec<u8> {
+    let ctb_log2 = cfg.tree.map_or(CTB_LOG2, |t| t.ctb_log2);
+    let max_tb_log2 = cfg.tree.map_or(CTB_LOG2, |t| t.max_tb_log2());
+    let (th_intra, th_inter) = cfg
+        .tree
+        .map_or((0, 0), |t| (t.th_depth_intra, t.th_depth_inter));
     debug_assert!(
-        !cfg.amp || cfg.min_cb_log2 < CTB_LOG2,
+        !cfg.amp || cfg.min_cb_log2 < ctb_log2,
         "AMP requires log2CbSize > MinCbLog2SizeY (Table 9-45)"
+    );
+    debug_assert!(
+        cfg.tree.is_none() || cfg.min_cb_log2 == 3,
+        "quadtree streams signal MinCbSizeY == 8"
     );
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
@@ -231,11 +248,11 @@ pub(crate) fn write_sps_cfg(
     w.ue(cfg.max_num_reorder_pics); // sps_max_num_reorder_pics[0]
     w.ue(0); // sps_max_latency_increase_plus1[0]
     w.ue(cfg.min_cb_log2 - 3); // log2_min_luma_coding_block_size_minus3
-    w.ue(CTB_LOG2 - cfg.min_cb_log2); // log2_diff_max_min_luma_coding_block_size (CTB 16)
+    w.ue(ctb_log2 - cfg.min_cb_log2); // log2_diff_max_min_luma_coding_block_size
     w.ue(0); // log2_min_luma_transform_block_size_minus2 (4)
-    w.ue(2); // log2_diff_max_min_luma_transform_block_size (16)
-    w.ue(0); // max_transform_hierarchy_depth_inter
-    w.ue(0); // max_transform_hierarchy_depth_intra
+    w.ue(max_tb_log2 - 2); // log2_diff_max_min_luma_transform_block_size
+    w.ue(th_inter); // max_transform_hierarchy_depth_inter
+    w.ue(th_intra); // max_transform_hierarchy_depth_intra
     w.put_bit(0); // scaling_list_enabled_flag
     w.put_bit(u8::from(cfg.amp)); // amp_enabled_flag
     w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
@@ -331,7 +348,7 @@ fn quant_scale(qp_rem: u32) -> i64 {
 /// over rows with `shift1 = log2TbS + BitDepth − 9`, stage 2 over
 /// columns with `shift2 = log2TbS + 6` — the normalization that makes
 /// the §8.6.3 dequant + §8.6.4 inverse reproduce the residual.
-fn forward_transform(res: &[i32], n: usize) -> Vec<i32> {
+pub(crate) fn forward_transform(res: &[i32], n: usize) -> Vec<i32> {
     let log2 = n.trailing_zeros();
     let shift1 = log2 + BIT_DEPTH - 9;
     let shift2 = log2 + 6;
@@ -363,7 +380,7 @@ fn forward_transform(res: &[i32], n: usize) -> Vec<i32> {
 /// (15 − BitDepth − log2TbS)` (the inverse of the §8.6.3 eq. 8-309
 /// scaling chain) and a one-third rounding offset; clamped to the
 /// §7.4.9.11 CoeffMax.
-fn quantize(coef: &[i32], n: usize, qp: u32) -> Vec<i32> {
+pub(crate) fn quantize(coef: &[i32], n: usize, qp: u32) -> Vec<i32> {
     let log2 = n.trailing_zeros();
     let qbits = 14 + qp / 6 + (15 - BIT_DEPTH - log2);
     let scale = quant_scale(qp % 6);
@@ -527,7 +544,7 @@ pub(crate) fn ssd(a: &[u8], b: &[i32]) -> u64 {
 /// coefficient costs roughly its magnitude's bit length (sig flag +
 /// sign + level bins); a coded-but-empty TB is nearly free, a coded
 /// TB pays a small last-sig overhead.
-fn rate_proxy(levels: &[i32]) -> u64 {
+pub(crate) fn rate_proxy(levels: &[i32]) -> u64 {
     let bits: u64 = levels
         .iter()
         .filter(|&&l| l != 0)
@@ -718,6 +735,11 @@ pub(crate) fn encode_idr_intra_au_full(
     check("cb", cb, width * height / 4)?;
     check("cr", cr, width * height / 4)?;
 
+    if cfg.tree.is_some() {
+        return crate::encoder::ctu::encode_intra_picture_tree(
+            y, cb, cr, width, height, qp, cfg, lf, aq,
+        );
+    }
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
@@ -727,7 +749,7 @@ pub(crate) fn encode_idr_intra_au_full(
     let lambda = lambda_of(qp);
     // Spatial AQ: per-CTB QP offsets against the slice QP (all zero
     // at `aq == 0`).
-    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq);
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq, CTB);
 
     let mut recon_y = vec![0u8; width * height];
     let mut recon_cb = vec![0u8; cw * ch];
@@ -947,6 +969,8 @@ pub(crate) fn encode_idr_intra_au_full(
                 src: [y, cb, cr],
                 field: &field,
                 shapes: &shapes,
+                ctb_log2: 4,
+                tree: None,
             },
             lf,
         );
@@ -1300,6 +1324,25 @@ pub(crate) fn encode_idr_intra_au_full(
     w.align_zero();
     let slice_rbsp = w.finish();
 
+    let au = assemble_idr_au(width, height, cfg, lf, &slice_rbsp);
+    Ok(IntraEncodedAu {
+        au,
+        recon_y,
+        recon_cb,
+        recon_cr,
+    })
+}
+
+/// Wrap one coded IDR slice RBSP into its Annex B access unit
+/// (`VPS + SPS + PPS + IDR_N_LP`), shared by the fixed-geometry and
+/// quadtree intra coders.
+pub(crate) fn assemble_idr_au(
+    width: usize,
+    height: usize,
+    cfg: &SpsCfg,
+    lf: &LoopFilterCfg,
+    slice_rbsp: &[u8],
+) -> Vec<u8> {
     let level_idc = level_idc_for(width * height);
     // The reorder-free streams keep the historical VPS bounds (1, 0)
     // so every golden pin stays byte-stable; a reordering
@@ -1327,14 +1370,9 @@ pub(crate) fn encode_idr_intra_au_full(
             0,
             &write_pps_full(false, false, lf.deblocking, None, cfg.cu_qp_delta),
         ), // PPS_NUT
-        nal_unit(20, 0, 0, &slice_rbsp), // IDR_N_LP
+        nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP
     ];
-    Ok(IntraEncodedAu {
-        au: annexb(&units),
-        recon_y,
-        recon_cb,
-        recon_cr,
-    })
+    annexb(&units)
 }
 
 #[cfg(test)]

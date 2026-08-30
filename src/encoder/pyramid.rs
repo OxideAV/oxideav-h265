@@ -182,6 +182,8 @@ pub struct PyramidEncoder {
     /// first frame when `hrd_on`. The clock advances once per access
     /// unit in DECODE order.
     hrd: Option<(HrdSignalCfg, HrdClock)>,
+    /// Quadtree-coder geometry ([`Self::with_tree`]).
+    tree: Option<crate::encoder::ctu::TreeCfg>,
 }
 
 impl PyramidEncoder {
@@ -225,7 +227,17 @@ impl PyramidEncoder {
             hrd_on: false,
             cbr_on: false,
             hrd: None,
+            tree: None,
         })
+    }
+
+    /// Route every picture through the recursive coding-quadtree
+    /// coder — see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_tree`].
+    #[must_use]
+    pub fn with_tree(mut self, tree: crate::encoder::ctu::TreeCfg) -> Self {
+        self.tree = Some(tree);
+        self
     }
 
     /// Declare the stream's frame rate in the SPS VUI — see
@@ -406,11 +418,16 @@ impl PyramidEncoder {
         SpsCfg {
             max_dec_pic_buffering_minus1: self.depth() + 1,
             max_num_reorder_pics: self.depth(),
-            min_cb_log2: if self.amp { 3 } else { 4 },
+            min_cb_log2: if self.amp || self.tree.is_some() {
+                3
+            } else {
+                4
+            },
             amp: self.amp,
             cu_qp_delta: self.aq > 0,
             timing: self.timing,
             hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
+            tree: self.tree,
         }
     }
 
@@ -645,6 +662,7 @@ impl PyramidEncoder {
             lf: &self.filters,
             big_cu: self.amp,
             aq: self.aq,
+            tree: self.tree,
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAu {

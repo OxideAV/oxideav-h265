@@ -175,6 +175,58 @@ impl IntraModeField {
         );
     }
 
+    /// Copy out the cells covering the luma rectangle (clipped to the
+    /// picture), row-major, for a later [`Self::restore_rect`] — the
+    /// encoder's coding-quadtree search rolls trial decisions back
+    /// with these.
+    #[must_use]
+    pub(crate) fn snapshot_rect(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
+        let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0) * 3);
+        for by in by0..by1 {
+            for bx in bx0..bx1 {
+                let c = self.cells[by * self.w_blocks + bx];
+                out.push(c.intra_pred_mode_y);
+                out.push(match c.pred_mode {
+                    CuPredMode::Intra => 0,
+                    CuPredMode::Inter => 1,
+                    CuPredMode::Skip => 2,
+                });
+                out.push(u8::from(c.pcm_flag) | (u8::from(c.written) << 1));
+            }
+        }
+        out
+    }
+
+    /// Write back a [`Self::snapshot_rect`] copy of the same rectangle.
+    pub(crate) fn restore_rect(&mut self, x: usize, y: usize, w: usize, h: usize, snap: &[u8]) {
+        let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
+        let mut it = snap.chunks_exact(3);
+        for by in by0..by1 {
+            for bx in bx0..bx1 {
+                let c = it.next().expect("snapshot geometry");
+                self.cells[by * self.w_blocks + bx] = Cell {
+                    intra_pred_mode_y: c[0],
+                    pred_mode: match c[1] {
+                        0 => CuPredMode::Intra,
+                        1 => CuPredMode::Inter,
+                        _ => CuPredMode::Skip,
+                    },
+                    pcm_flag: c[2] & 1 != 0,
+                    written: c[2] & 2 != 0,
+                };
+            }
+        }
+    }
+
+    fn rect_cells(&self, x: usize, y: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let bx0 = x >> MIN_BLOCK_LOG2;
+        let by0 = y >> MIN_BLOCK_LOG2;
+        let bx1 = ((x + w).min(self.w_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
+        let by1 = ((y + h).min(self.h_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
+        (bx0, by0, bx1, by1)
+    }
+
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, cell: Cell) {
         let bx0 = x >> MIN_BLOCK_LOG2;
         let by0 = y >> MIN_BLOCK_LOG2;

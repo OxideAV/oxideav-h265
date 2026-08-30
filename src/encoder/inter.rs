@@ -187,16 +187,16 @@ struct Depth1Levels {
 /// One list's non-merge (AMVP) signalling group: `ref_idx_lX` (when
 /// that list has more than one active reference), the §7.3.8.9
 /// `mvd_coding( )` pair, and `mvp_lX_flag`.
-#[derive(Clone, Copy)]
-struct AmvpGroup {
-    ref_idx: u8,
-    mvd: Mv,
-    mvp_flag: u8,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AmvpGroup {
+    pub(crate) ref_idx: u8,
+    pub(crate) mvd: Mv,
+    pub(crate) mvp_flag: u8,
 }
 
 /// One prediction unit's §7.3.8.6 signalling (merge or AMVP).
-#[derive(Clone, Copy)]
-enum PuSyntax {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PuSyntax {
     /// `merge_flag == 1`, `merge_idx`.
     Merge { merge_idx: usize },
     /// `merge_flag == 0`: `inter_pred_idc` (on B slices) selects the
@@ -295,6 +295,8 @@ pub struct LowDelayPEncoder {
     /// The signalled §E.2.2 schedule + Annex C clock, built at the
     /// first frame when `hrd_on`.
     hrd: Option<(HrdSignalCfg, HrdClock)>,
+    /// Quadtree-coder geometry ([`Self::with_tree`]).
+    tree: Option<crate::encoder::ctu::TreeCfg>,
 }
 
 impl LowDelayPEncoder {
@@ -329,7 +331,22 @@ impl LowDelayPEncoder {
             hrd_on: false,
             cbr_on: false,
             hrd: None,
+            tree: None,
         })
+    }
+
+    /// Route every picture through the recursive coding-quadtree
+    /// coder ([`crate::encoder::ctu`]) at the given [`TreeCfg`]
+    /// geometry: CTB 16 / 32 / 64 with RD-elected `split_cu_flag`
+    /// quadtrees down to `MinCbSizeY == 8`, deeper residual
+    /// quadtrees (`max_transform_hierarchy_depth_* > 0`), 4x4
+    /// DST-VII intra luma TUs and intra `PART_NxN`. Composes with
+    /// [`Self::with_amp`] (which then only switches the asymmetric
+    /// shapes into the CU ladder).
+    #[must_use]
+    pub fn with_tree(mut self, tree: crate::encoder::ctu::TreeCfg) -> Self {
+        self.tree = Some(tree);
+        self
     }
 
     /// Declare the stream's frame rate (`fps_num / fps_den` frames
@@ -608,11 +625,16 @@ impl LowDelayPEncoder {
                 &SpsCfg {
                     max_dec_pic_buffering_minus1: 2,
                     max_num_reorder_pics: 0,
-                    min_cb_log2: if self.amp { 3 } else { 4 },
+                    min_cb_log2: if self.amp || self.tree.is_some() {
+                        3
+                    } else {
+                        4
+                    },
                     amp: self.amp,
                     cu_qp_delta: self.aq > 0,
                     timing: self.timing,
                     hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
+                    tree: self.tree,
                 },
                 &self.filters,
                 self.aq,
@@ -656,6 +678,7 @@ impl LowDelayPEncoder {
                 lf: &self.filters,
                 big_cu: self.amp,
                 aq: self.aq,
+                tree: self.tree,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
@@ -693,22 +716,22 @@ pub fn encode_low_delay_p(
 
 /// The slice header's in-loop-filter fields (§7.3.6.1): the enabled
 /// filter set plus this slice's elections.
-struct SliceLfSignalling<'a> {
+pub(crate) struct SliceLfSignalling<'a> {
     /// The stream's filter configuration (drives field presence: the
     /// SAO gates exist iff the SPS enables SAO, the deblocking
     /// override group iff the PPS enables the override).
-    cfg: &'a LoopFilterCfg,
+    pub(crate) cfg: &'a LoopFilterCfg,
     /// This slice's deblocking election
     /// (`slice_deblocking_filter_disabled_flag == !deblock_on`).
-    deblock_on: bool,
+    pub(crate) deblock_on: bool,
     /// Elected `slice_beta_offset_div2`.
-    beta_offset_div2: i32,
+    pub(crate) beta_offset_div2: i32,
     /// Elected `slice_tc_offset_div2`.
-    tc_offset_div2: i32,
+    pub(crate) tc_offset_div2: i32,
     /// Elected `slice_sao_luma_flag`.
-    sao_luma: bool,
+    pub(crate) sao_luma: bool,
     /// Elected `slice_sao_chroma_flag`.
-    sao_chroma: bool,
+    pub(crate) sao_chroma: bool,
 }
 
 /// Everything one P / B slice's coding depends on beyond the frame
@@ -744,6 +767,11 @@ pub(crate) struct SliceSpec<'a> {
     /// 1..=3 = per-CTB `cu_qp_delta` signalling — the stream's PPS
     /// must carry `cu_qp_delta_enabled_flag == 1`).
     pub aq: u8,
+    /// Quadtree-coder geometry: `Some` routes the slice through
+    /// [`crate::encoder::ctu`] (recursive coding quadtrees; `big_cu`
+    /// then selects `amp_enabled_flag` only). `None` keeps the
+    /// historical fixed-geometry coder byte-stable.
+    pub tree: Option<crate::encoder::ctu::TreeCfg>,
 }
 
 /// §7.3.6.1 — the P / B slice-segment header: an inline §7.4.8
@@ -754,7 +782,11 @@ pub(crate) struct SliceSpec<'a> {
 /// gates when the SPS enables SAO, the deblocking override group when
 /// the PPS enables the override, the across-slices flag when any
 /// filter is active).
-fn write_inter_slice_header(w: &mut BitWriter, spec: &SliceSpec<'_>, lf: &SliceLfSignalling<'_>) {
+pub(crate) fn write_inter_slice_header(
+    w: &mut BitWriter,
+    spec: &SliceSpec<'_>,
+    lf: &SliceLfSignalling<'_>,
+) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
     w.ue(u32::from(!spec.b_slice)); // slice_type (0 = B, 1 = P)
@@ -824,7 +856,7 @@ fn write_inter_slice_header(w: &mut BitWriter, spec: &SliceSpec<'_>, lf: &SliceL
 }
 
 /// Extract an `n`x`n` block of `plane` at `(x0, y0)` as `i32`s.
-fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> {
+pub(crate) fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> {
     let mut out = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
@@ -835,7 +867,7 @@ fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> 
 }
 
 /// Store an `n`x`n` block back into `plane` at `(x0, y0)`.
-fn store(plane: &mut [u8], pw: usize, x0: usize, y0: usize, n: usize, s: &[u8]) {
+pub(crate) fn store(plane: &mut [u8], pw: usize, x0: usize, y0: usize, n: usize, s: &[u8]) {
     for j in 0..n {
         plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + n].copy_from_slice(&s[j * n..(j + 1) * n]);
     }
@@ -843,7 +875,7 @@ fn store(plane: &mut [u8], pw: usize, x0: usize, y0: usize, n: usize, s: &[u8]) 
 
 /// The [`crate::binarization::PartMode`] twin of a [`PartMode`] (the
 /// loop-filter descriptors speak the binarization enum).
-fn bin_part_mode(p: PartMode) -> crate::binarization::PartMode {
+pub(crate) fn bin_part_mode(p: PartMode) -> crate::binarization::PartMode {
     use crate::binarization::PartMode as B;
     match p {
         PartMode::Part2Nx2N => B::Part2Nx2N,
@@ -859,7 +891,7 @@ fn bin_part_mode(p: PartMode) -> crate::binarization::PartMode {
 
 /// `true` for the horizontal-split two-PU shapes (`PART_2NxN` /
 /// `PART_2NxnU` / `PART_2NxnD`) — Table 9-45 bin 1.
-fn part_is_horizontal(p: PartMode) -> bool {
+pub(crate) fn part_is_horizontal(p: PartMode) -> bool {
     matches!(
         p,
         PartMode::Part2NxN | PartMode::Part2NxnU | PartMode::Part2NxnD
@@ -867,7 +899,7 @@ fn part_is_horizontal(p: PartMode) -> bool {
 }
 
 /// `true` for the four asymmetric shapes.
-fn part_is_amp(p: PartMode) -> bool {
+pub(crate) fn part_is_amp(p: PartMode) -> bool {
     matches!(
         p,
         PartMode::Part2NxnU | PartMode::Part2NxnD | PartMode::PartNLx2N | PartMode::PartNRx2N
@@ -876,7 +908,7 @@ fn part_is_amp(p: PartMode) -> bool {
 
 /// The merge / skip PU syntax for candidate `merge_idx` (the §7.3.8.6
 /// fields the §8.5.3.2.2 derivation reads).
-fn merge_pu(merge_idx: usize) -> PredictionUnit {
+pub(crate) fn merge_pu(merge_idx: usize) -> PredictionUnit {
     PredictionUnit {
         merge_flag: true,
         merge_idx: Some(merge_idx as u8),
@@ -959,7 +991,7 @@ fn pick_ref<'r>(
 /// selects whether the Cb / Cr planes are predicted too (the SAD
 /// search runs luma-only).
 #[allow(clippy::too_many_arguments)]
-fn predict_block(
+pub(crate) fn predict_block(
     refs_l0: &[RefPlanes],
     refs_l1: &[RefPlanes],
     x0: usize,
@@ -1018,14 +1050,22 @@ fn predict_block(
 }
 
 /// Copy a `w`x`h` block into a `bw`-wide buffer at `(bx, by)`.
-fn blit(dst: &mut [i32], bw: usize, bx: usize, by: usize, src: &[i32], w: usize, h: usize) {
+pub(crate) fn blit(
+    dst: &mut [i32],
+    bw: usize,
+    bx: usize,
+    by: usize,
+    src: &[i32],
+    w: usize,
+    h: usize,
+) {
     for j in 0..h {
         dst[(by + j) * bw + bx..(by + j) * bw + bx + w].copy_from_slice(&src[j * w..(j + 1) * w]);
     }
 }
 
 /// Extract an `n`x`n` sub-block of a `bw`-wide buffer at `(bx, by)`.
-fn sub_block(buf: &[i32], bw: usize, bx: usize, by: usize, n: usize) -> Vec<i32> {
+pub(crate) fn sub_block(buf: &[i32], bw: usize, bx: usize, by: usize, n: usize) -> Vec<i32> {
     let mut out = Vec::with_capacity(n * n);
     for j in 0..n {
         out.extend_from_slice(&buf[(by + j) * bw + bx..(by + j) * bw + bx + n]);
@@ -1049,16 +1089,16 @@ fn uni_l0(mv: Mv) -> PuMotion {
 
 /// The previous frame's reconstruction as `i32` planes (the
 /// §8.5.3.3.3 interpolation input).
-struct RefPlanes {
-    y: Vec<i32>,
-    cb: Vec<i32>,
-    cr: Vec<i32>,
-    width: usize,
-    height: usize,
+pub(crate) struct RefPlanes {
+    pub(crate) y: Vec<i32>,
+    pub(crate) cb: Vec<i32>,
+    pub(crate) cr: Vec<i32>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
 }
 
 /// Luma SAD between a prediction and the source block.
-fn sad(pred: &[i32], src: &[i32]) -> u64 {
+pub(crate) fn sad(pred: &[i32], src: &[i32]) -> u64 {
     pred.iter()
         .zip(src.iter())
         .map(|(&p, &s)| u64::from(p.abs_diff(s)))
@@ -1075,13 +1115,13 @@ fn mvd_component_bits(v: i32) -> u64 {
 }
 
 /// Rate proxy for a full mvd pair.
-fn mvd_bits(mvd: Mv) -> u64 {
+pub(crate) fn mvd_bits(mvd: Mv) -> u64 {
     mvd_component_bits(mvd[0]) + mvd_component_bits(mvd[1])
 }
 
 /// Crude bit-cost proxy for one TB's quantized levels (mirrors the
 /// intra encoder's heuristic).
-fn levels_rate(levels: &[i32]) -> u64 {
+pub(crate) fn levels_rate(levels: &[i32]) -> u64 {
     let bits: u64 = levels
         .iter()
         .filter(|&&l| l != 0)
@@ -1244,24 +1284,24 @@ fn fractional_me(
 }
 
 /// Inputs shared by every per-PU decision of one slice.
-struct PuChooseCtx<'a> {
-    refs_l0: &'a [RefPlanes],
-    refs_l1: &'a [RefPlanes],
-    mv_ctx: &'a PuMvContext<'a>,
-    lambda_me: u64,
-    b_slice: bool,
+pub(crate) struct PuChooseCtx<'a> {
+    pub(crate) refs_l0: &'a [RefPlanes],
+    pub(crate) refs_l1: &'a [RefPlanes],
+    pub(crate) mv_ctx: &'a PuMvContext<'a>,
+    pub(crate) lambda_me: u64,
+    pub(crate) b_slice: bool,
     /// B slice whose two reference lists differ (hierarchical B): the
     /// AMVP election searches L1 and the bi combination too. A
     /// low-delay B (both lists the same pictures) keeps the L0-only
     /// search — L1 would duplicate it bin for bin at a higher rate.
-    two_sided: bool,
+    pub(crate) two_sided: bool,
 }
 
 /// Choose merge-vs-AMVP for one prediction unit against `field` (the
 /// motion state the decoder will have when resolving this PU), by
 /// luma SAD + λ·signalling-bins. Returns the syntax, the resolved
 /// motion, and the motion-rate proxy.
-fn choose_pu(
+pub(crate) fn choose_pu(
     field: &MotionField,
     geom: &PuGeometry,
     available: &dyn Fn(i32, i32) -> bool,
@@ -1401,7 +1441,7 @@ fn amvp_search_list(
 /// L0 — and, on a two-sided B slice, on L1 plus the bi-predictive
 /// combination of the two winners. Returns the syntax, the resolved
 /// motion, the rate proxy and the search cost.
-fn amvp_search(
+pub(crate) fn amvp_search(
     field: &MotionField,
     geom: &PuGeometry,
     available: &dyn Fn(i32, i32) -> bool,
@@ -1482,7 +1522,7 @@ fn amvp_search(
 
 /// Encode `merge_idx` (§9.3.3.10 TR with `cMax = MaxNumMergeCand − 1`:
 /// bin 0 context-coded, the rest bypass).
-fn encode_merge_idx(
+pub(crate) fn encode_merge_idx(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
@@ -1521,7 +1561,12 @@ pub(crate) fn encode_eg_k(w: &mut BitWriter, cabac: &mut CabacEncoder, value: u3
 /// `decode_mvd_pair` reads: both `abs_mvd_greater0_flag`s, both
 /// `abs_mvd_greater1_flag`s, then per component the EG1
 /// `abs_mvd_minus2` escape and `mvd_sign_flag`.
-fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut SliceContexts, mvd: Mv) {
+pub(crate) fn encode_mvd_pair(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    mvd: Mv,
+) {
     let g0 = [mvd[0] != 0, mvd[1] != 0];
     for &g in &g0 {
         cabac.encode_decision(w, &mut ctxs.abs_mvd_greater0_flag[0], u8::from(g));
@@ -1554,7 +1599,7 @@ fn encode_mvd_pair(w: &mut BitWriter, cabac: &mut CabacEncoder, ctxs: &mut Slice
 /// list codes `ref_idx_lX` (a single context bin — at most two active
 /// references per list), `mvd_coding` (`mvd_l1_zero_flag == 0`) and
 /// `mvp_lX_flag`.
-fn encode_pu_syntax(
+pub(crate) fn encode_pu_syntax(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
@@ -1562,6 +1607,28 @@ fn encode_pu_syntax(
     b_slice: bool,
     n_l0: usize,
     n_l1: usize,
+) {
+    encode_pu_syntax_at(w, cabac, ctxs, pu, b_slice, n_l0, n_l1, 0, (CTB, CTB));
+}
+
+/// [`encode_pu_syntax`] for an arbitrary coding-tree position: `ct_depth`
+/// selects the `inter_pred_idc` bin-0 context (`ctxInc = CtDepth`), and
+/// the PU shape `(nPbW, nPbH)` the `nPbW + nPbH == 12` single-bin form
+/// (Table 9-47: "0" = `PRED_L0`, "1" = `PRED_L1`, ctxInc 4 — bi
+/// prediction is not signallable there). `ref_idx_lX` is the §9.3.3
+/// TR of `cMax = num_ref_idx_lX_active_minus1` with bins 0 / 1
+/// context-coded (ctxInc 0 / 1) and the rest bypass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pu_syntax_at(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    pu: &PuSyntax,
+    b_slice: bool,
+    n_l0: usize,
+    n_l1: usize,
+    ct_depth: u32,
+    (n_pb_w, n_pb_h): (usize, usize),
 ) {
     match pu {
         PuSyntax::Merge { merge_idx } => {
@@ -1571,25 +1638,58 @@ fn encode_pu_syntax(
         PuSyntax::Amvp { l0, l1 } => {
             cabac.encode_decision(w, &mut ctxs.merge_flag[0], 0);
             if b_slice {
-                let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
-                if l0.is_some() && l1.is_some() {
-                    cabac.encode_decision(w, &mut head[0], 1); // PRED_BI
+                if n_pb_w + n_pb_h == 12 {
+                    debug_assert!(
+                        !(l0.is_some() && l1.is_some()),
+                        "8x4 / 4x8 PUs cannot be bi-predicted (§7.4.9.6)"
+                    );
+                    cabac.encode_decision(w, &mut ctxs.inter_pred_idc[4], u8::from(l1.is_some()));
                 } else {
-                    cabac.encode_decision(w, &mut head[0], 0);
-                    cabac.encode_decision(w, &mut tail[0], u8::from(l1.is_some()));
+                    let slot = ct_depth.min(3) as usize;
+                    let (head, tail) = ctxs.inter_pred_idc.split_at_mut(4);
+                    if l0.is_some() && l1.is_some() {
+                        cabac.encode_decision(w, &mut head[slot], 1); // PRED_BI
+                    } else {
+                        cabac.encode_decision(w, &mut head[slot], 0);
+                        cabac.encode_decision(w, &mut tail[0], u8::from(l1.is_some()));
+                    }
                 }
             }
             for (group, n_active) in [(l0, n_l0), (l1, n_l1)] {
                 let Some(g) = group else { continue };
                 if n_active > 1 {
-                    // §9.3.3 TR cMax = num_ref_idx_lX_active_minus1 ==
-                    // 1: a single context-coded bin (ctxInc 0).
-                    debug_assert!(n_active == 2, "at most two active references per list");
-                    cabac.encode_decision(w, &mut ctxs.ref_idx[0], g.ref_idx);
+                    encode_ref_idx(w, cabac, ctxs, g.ref_idx, n_active as u32 - 1);
                 }
                 encode_mvd_pair(w, cabac, ctxs, g.mvd);
                 cabac.encode_decision(w, &mut ctxs.mvp_flag[0], g.mvp_flag);
             }
+        }
+    }
+}
+
+/// `ref_idx_lX` (§9.3.3 TR, `cMax = num_ref_idx_lX_active_minus1`): bin
+/// 0 on ctxInc 0, bin 1 on ctxInc 1, the remaining bins bypass — the
+/// write-side dual of [`crate::binarization::decode_ref_idx`].
+pub(crate) fn encode_ref_idx(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    ref_idx: u8,
+    c_max: u32,
+) {
+    if c_max == 0 {
+        return;
+    }
+    let v = u32::from(ref_idx);
+    for bin in 0..c_max {
+        let one = v > bin;
+        match bin {
+            0 => cabac.encode_decision(w, &mut ctxs.ref_idx[0], u8::from(one)),
+            1 => cabac.encode_decision(w, &mut ctxs.ref_idx[1], u8::from(one)),
+            _ => cabac.encode_bypass(w, u8::from(one)),
+        }
+        if !one {
+            break;
         }
     }
 }
@@ -1607,6 +1707,9 @@ pub(crate) fn encode_inter_slice(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, FrameRecon, FrameStats) {
+    if spec.tree.is_some() {
+        return crate::encoder::ctu::encode_inter_slice_tree(frame, spec, width, height);
+    }
     let (poc, qp, b_slice, lf) = (spec.poc, spec.qp, spec.b_slice, spec.lf);
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
@@ -1617,7 +1720,7 @@ pub(crate) fn encode_inter_slice(
     let lambda = lambda_of(qp);
     // Spatial AQ: per-CTB QP offsets against the slice QP (all zero
     // at `spec.aq == 0`); signalled through cu_qp_delta.
-    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq);
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, CTB);
 
     let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
     let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
@@ -2281,6 +2384,8 @@ pub(crate) fn encode_inter_slice(
                 src: [frame.y, frame.cb, frame.cr],
                 field: &field,
                 shapes: &shapes,
+                ctb_log2: 4,
+                tree: None,
             },
             lf,
         );

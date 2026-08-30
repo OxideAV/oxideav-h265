@@ -22,6 +22,7 @@ pub mod bitwriter;
 mod aq;
 #[doc(hidden)]
 pub mod cabac;
+pub mod ctu;
 pub mod hrd;
 pub mod inter;
 pub mod intra;

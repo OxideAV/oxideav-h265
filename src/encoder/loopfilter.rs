@@ -197,8 +197,28 @@ pub(crate) struct FilterInput<'a> {
     pub src: [&'a [u8]; 3],
     /// The picture's motion / mode field (§8.7.2.4 bS input).
     pub field: &'a MotionField,
-    /// Per-CTB coding shapes (raster order).
+    /// Per-CTB coding shapes (raster order) — the legacy one-CU-per-CTB
+    /// geometry (ignored when [`Self::tree`] is set).
     pub shapes: &'a [CtbShape],
+    /// `CtbLog2SizeY` (4 for the legacy geometry; the quadtree coder
+    /// passes 4..=6 and its CTBs may be clipped by the picture edge).
+    pub ctb_log2: u32,
+    /// The quadtree coder's per-CU deblocking layout: the coding-order
+    /// [`DeblockCuDesc`] list (β/tC offsets are patched per sweep
+    /// candidate) plus the per-4x4 §8.6.1 `QpY` map for the exact
+    /// §8.7.2.5.3 per-position `QpP` reads.
+    pub tree: Option<TreeLayout<'a>>,
+}
+
+/// The quadtree coder's deblocking inputs (see [`FilterInput::tree`]).
+pub(crate) struct TreeLayout<'a> {
+    /// Coding-order CU descriptors (any slice β/tC offsets inside are
+    /// overwritten per sweep candidate).
+    pub descs: &'a [DeblockCuDesc],
+    /// Per-4x4-cell `QpY` (row-major, `w_cells` wide).
+    pub qp_cells: &'a [i8],
+    /// Cell-grid width.
+    pub w_cells: usize,
 }
 
 /// One frame's elected filter signalling + the filtered reconstruction.
@@ -344,14 +364,14 @@ fn eval_component(
     plane_w: usize,
     x0: usize,
     y0: usize,
-    n: usize,
+    (nw, nh): (usize, usize),
 ) -> u64 {
     if comp.sao_type_idx == 0 {
-        return region_ssd(base, plane, src, plane_w, x0, y0, n, n);
+        return region_ssd(base, plane, src, plane_w, x0, y0, nw, nh);
     }
-    apply_sao_ctb_full(base, scratch, plane, comp, x0, y0, n, n, None, None);
-    let d = region_ssd(scratch, plane, src, plane_w, x0, y0, n, n);
-    restore_region(scratch, base, plane, x0, y0, n, n);
+    apply_sao_ctb_full(base, scratch, plane, comp, x0, y0, nw, nh, None, None);
+    let d = region_ssd(scratch, plane, src, plane_w, x0, y0, nw, nh);
+    restore_region(scratch, base, plane, x0, y0, nw, nh);
     d
 }
 
@@ -368,15 +388,15 @@ fn edge_candidate(
     plane_w: usize,
     x0: usize,
     y0: usize,
-    n: usize,
+    (nw, nh): (usize, usize),
     eo_class: u8,
 ) -> SaoComponent {
     let (h0, v0, h1, v1) = crate::sao::eo_pos(eo_class);
     let (pw, ph) = base.plane_dims(plane);
     let mut cnt = [0i64; 5];
     let mut sum = [0i64; 5];
-    for j in 0..n {
-        for i in 0..n {
+    for j in 0..nh {
+        for i in 0..nw {
             let (x, y) = ((x0 + i) as i32, (y0 + j) as i32);
             let in_pic =
                 |xx: i32, yy: i32| xx >= 0 && yy >= 0 && (xx as usize) < pw && (yy as usize) < ph;
@@ -436,12 +456,12 @@ fn band_candidate(
     plane_w: usize,
     x0: usize,
     y0: usize,
-    n: usize,
+    (nw, nh): (usize, usize),
 ) -> SaoComponent {
     let mut cnt = [0i64; 32];
     let mut sum = [0i64; 32];
-    for j in 0..n {
-        for i in 0..n {
+    for j in 0..nh {
+        for i in 0..nw {
             let cur = base.sample(plane, x0 + i, y0 + j);
             let band = (cur >> 3) as usize & 31;
             cnt[band] += 1;
@@ -497,12 +517,13 @@ fn choose_luma(
     width: usize,
     x0: usize,
     y0: usize,
+    (rw, rh): (usize, usize),
     lambda: u64,
 ) -> (SaoComponent, u64) {
     let off = SaoComponent::default();
     let mut best = (
         off,
-        region_ssd(base, Plane::Luma, src, width, x0, y0, CTB, CTB) + lambda,
+        region_ssd(base, Plane::Luma, src, width, x0, y0, rw, rh) + lambda,
     );
     let mut consider = |comp: SaoComponent, scratch: &mut Picture| {
         let d = eval_component(
@@ -514,7 +535,7 @@ fn choose_luma(
             width,
             x0,
             y0,
-            CTB,
+            (rw, rh),
         );
         let cost = d + lambda * component_rate(&comp, true);
         if cost < best.1 {
@@ -522,12 +543,12 @@ fn choose_luma(
         }
     };
     consider(
-        band_candidate(base, Plane::Luma, src, width, x0, y0, CTB),
+        band_candidate(base, Plane::Luma, src, width, x0, y0, (rw, rh)),
         scratch,
     );
     for eo_class in 0..4u8 {
         consider(
-            edge_candidate(base, Plane::Luma, src, width, x0, y0, CTB, eo_class),
+            edge_candidate(base, Plane::Luma, src, width, x0, y0, (rw, rh), eo_class),
             scratch,
         );
     }
@@ -546,9 +567,9 @@ fn choose_chroma(
     cw: usize,
     cx0: usize,
     cy0: usize,
+    n: (usize, usize),
     lambda: u64,
 ) -> ([SaoComponent; 2], u64) {
-    let n = CTB / 2;
     let dist_pair = |cb: &SaoComponent, cr: &SaoComponent, scratch: &mut Picture| -> u64 {
         eval_component(
             base,
@@ -607,10 +628,11 @@ fn resolved_ctb_dist(
     input: &FilterInput<'_>,
     x0: usize,
     y0: usize,
+    (rw, rh): (usize, usize),
     sao_luma: bool,
     sao_chroma: bool,
 ) -> u64 {
-    let (cw, cx0, cy0, n) = (input.width / 2, x0 / 2, y0 / 2, CTB / 2);
+    let (cw, cx0, cy0, n) = (input.width / 2, x0 / 2, y0 / 2, (rw / 2, rh / 2));
     let mut d = 0u64;
     let luma = if sao_luma {
         &r.components[0]
@@ -626,7 +648,7 @@ fn resolved_ctb_dist(
         input.width,
         x0,
         y0,
-        CTB,
+        (rw, rh),
     );
     let (cbc, crc) = if sao_chroma {
         (&r.components[1], &r.components[2])
@@ -678,8 +700,31 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         for beta in [-2i32, 0, 2] {
             for tc in [-2i32, 0, 2] {
                 let mut filtered = pre.clone();
-                let descs = ctb_deblock_descs(input.shapes, width, height, input.ctb_qps, beta, tc);
-                deblock_picture_full(&mut filtered, input.field, &descs, None, None);
+                match &input.tree {
+                    None => {
+                        let descs =
+                            ctb_deblock_descs(input.shapes, width, height, input.ctb_qps, beta, tc);
+                        deblock_picture_full(&mut filtered, input.field, &descs, None, None);
+                    }
+                    Some(t) => {
+                        let mut descs = t.descs.to_vec();
+                        for d in &mut descs {
+                            d.cu.params.beta_offset_div2 = beta;
+                            d.cu.params.tc_offset_div2 = tc;
+                        }
+                        let qp_map = crate::deblock::QpMap {
+                            cells: t.qp_cells,
+                            w_cells: t.w_cells,
+                        };
+                        deblock_picture_full(
+                            &mut filtered,
+                            input.field,
+                            &descs,
+                            Some(qp_map),
+                            None,
+                        );
+                    }
+                }
                 let cost = ssd(&filtered) + input.lambda * (3 + se_bits(beta) + se_bits(tc));
                 if cost < best_cost {
                     best_cost = cost;
@@ -696,18 +741,21 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
     };
 
     // ---- §8.7.3 SAO estimation (per CTB, on the deblocked picture) ----
-    let ctbs_x = width / CTB;
-    let ctbs_y = height / CTB;
+    let ctb = 1usize << input.ctb_log2;
+    let ctbs_x = width.div_ceil(ctb);
+    let ctbs_y = height.div_ceil(ctb);
     let mut sao_ctbs: Vec<SaoCtbParams> = Vec::new();
     let mut grid: Vec<ResolvedSao> = Vec::new();
     if cfg.sao() {
         let mut scratch = base.clone();
         sao_ctbs.reserve(ctbs_x * ctbs_y);
         grid.reserve(ctbs_x * ctbs_y);
-        for ctb in 0..ctbs_x * ctbs_y {
-            let (rx, ry) = (ctb % ctbs_x, ctb / ctbs_x);
-            let (x0, y0) = (rx * CTB, ry * CTB);
+        for ctb_idx in 0..ctbs_x * ctbs_y {
+            let (rx, ry) = (ctb_idx % ctbs_x, ctb_idx / ctbs_x);
+            let (x0, y0) = (rx * ctb, ry * ctb);
             let (cx0, cy0) = (x0 / 2, y0 / 2);
+            // The CTB region, clipped by the picture edge.
+            let (rw, rh) = ((width - x0).min(ctb), (height - y0).min(ctb));
 
             // Explicit candidate: per-component election.
             let mut comps = [SaoComponent::default(); 3];
@@ -720,13 +768,14 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     width,
                     x0,
                     y0,
+                    (rw, rh),
                     input.lambda,
                 );
                 comps[0] = c;
                 explicit_cost += cost;
             } else {
                 explicit_cost +=
-                    region_ssd(&base, Plane::Luma, input.src[0], width, x0, y0, CTB, CTB);
+                    region_ssd(&base, Plane::Luma, input.src[0], width, x0, y0, rw, rh);
             }
             if cfg.sao_chroma {
                 let ([cb, cr], cost) = choose_chroma(
@@ -737,15 +786,16 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     width / 2,
                     cx0,
                     cy0,
+                    (rw / 2, rh / 2),
                     input.lambda,
                 );
                 comps[1] = cb;
                 comps[2] = cr;
                 explicit_cost += cost;
             } else {
-                let (cw, n) = (width / 2, CTB / 2);
-                explicit_cost += region_ssd(&base, Plane::Cb, input.src[1], cw, cx0, cy0, n, n)
-                    + region_ssd(&base, Plane::Cr, input.src[2], cw, cx0, cy0, n, n);
+                let (cw, nw, nh) = (width / 2, rw / 2, rh / 2);
+                explicit_cost += region_ssd(&base, Plane::Cb, input.src[1], cw, cx0, cy0, nw, nh)
+                    + region_ssd(&base, Plane::Cr, input.src[2], cw, cx0, cy0, nw, nh);
             }
             // Declining the available merges costs one bin each.
             let decline_bins = u64::from(rx > 0) + u64::from(ry > 0);
@@ -761,7 +811,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
             // Whole-CTB merge candidates (inherit ALL components).
             let mut best = (explicit_params, explicit_resolved, explicit_cost);
             if rx > 0 {
-                let left = grid[ctb - 1];
+                let left = grid[ctb_idx - 1];
                 let d = resolved_ctb_dist(
                     &base,
                     &mut scratch,
@@ -769,6 +819,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     input,
                     x0,
                     y0,
+                    (rw, rh),
                     cfg.sao_luma,
                     cfg.sao_chroma,
                 );
@@ -786,7 +837,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                 }
             }
             if ry > 0 {
-                let above = grid[ctb - ctbs_x];
+                let above = grid[ctb_idx - ctbs_x];
                 let d = resolved_ctb_dist(
                     &base,
                     &mut scratch,
@@ -794,6 +845,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     input,
                     x0,
                     y0,
+                    (rw, rh),
                     cfg.sao_luma,
                     cfg.sao_chroma,
                 );
@@ -823,7 +875,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         apply_sao_picture_full(
             &base,
             &grid,
-            CTB_LOG2,
+            input.ctb_log2,
             1,
             slice_sao_luma,
             slice_sao_chroma,
@@ -1112,7 +1164,7 @@ mod tests {
             }
         }
         let src = vec![104u8; 256];
-        let cand = band_candidate(&pic, Plane::Luma, &src, 16, 0, 0, 16);
+        let cand = band_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16));
         assert_eq!(cand.sao_type_idx, 1);
         // Band 12 must be one of the four covered bands, with offset +4.
         let covered: Vec<usize> = (0..4)
@@ -1142,7 +1194,7 @@ mod tests {
         // Source: flatten toward 100 ⇒ minima want +10 (clamped 7),
         // maxima want −10 (clamped −7 ⇒ abs 7).
         let src = vec![100u8; 256];
-        let cand = edge_candidate(&pic, Plane::Luma, &src, 16, 0, 0, 16, 0);
+        let cand = edge_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16), 0);
         assert_eq!(cand.sao_type_idx, 2);
         assert_eq!(cand.eo_class, 0);
         assert_eq!(cand.offset_abs[0], 7, "category 1 (local min) clamped +7");
@@ -1181,6 +1233,8 @@ mod tests {
             src: [&src_y, &src_c, &src_c],
             field: &field,
             shapes: &shapes,
+            ctb_log2: 4,
+            tree: None,
         };
         let out = filter_frame(&input, &LoopFilterCfg::all());
         assert!(out.slice_sao_luma || out.slice_sao_chroma, "SAO elected");
@@ -1260,6 +1314,8 @@ mod tests {
             src: [&src_y, &cpl, &cpl],
             field: &field,
             shapes: &shapes,
+            ctb_log2: 4,
+            tree: None,
         };
         let cfg = LoopFilterCfg {
             deblocking: true,
