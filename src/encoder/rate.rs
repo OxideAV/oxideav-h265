@@ -286,8 +286,18 @@ fn initial_qp_for_bpp(frame_bits: u64, luma_samples: usize) -> i32 {
     44
 }
 
-/// Integer square root (floor), deterministic — the SAD-domain
-/// motion-search λ is the square root of the SSD-domain mode λ.
+/// The SAD-domain motion-search λ for an SSD-domain mode λ:
+/// `3 · isqrt(λ) / 2` (the square-root relation between the two
+/// distortion domains, with a 1.5× weight that keeps the motion
+/// field coherent once the grid scan can reach far minima — measured
+/// on periodic and smooth pans: the 1× weight lost ~8 % rate on the
+/// low-delay chain at QP 32, 2× lost ~15 % at QP 27 on smooth
+/// content).
+pub(crate) fn motion_lambda(lambda: u64) -> u64 {
+    (3 * isqrt_u64(lambda)).div_ceil(2)
+}
+
+/// Integer square root (floor), deterministic.
 pub(crate) fn isqrt_u64(v: u64) -> u64 {
     if v < 2 {
         return v;

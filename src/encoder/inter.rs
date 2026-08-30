@@ -84,6 +84,10 @@ const BIT_DEPTH: u8 = 8;
 const MAX_MERGE: usize = 5;
 /// The greedy integer-search iteration cap (diamond steps).
 const ME_MAX_STEPS: usize = 24;
+/// The subsampled grid scan's half-width in luma samples (every
+/// second position over ±radius is scored ahead of the pattern
+/// search).
+const ME_GRID_RADIUS: i32 = 24;
 /// The z-order offsets of the four depth-1 transform units within a
 /// CTB (§6.5.2 z-scan of the four halves).
 const Z_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
@@ -1274,31 +1278,113 @@ fn integer_me(
             .unwrap_or(0)
             * lambda_me
     };
-    let mut best = seeds[0];
-    let mut best_cost = u64::MAX;
-    for &s in seeds {
-        let c = sad_at(s[0], s[1]) + mv_cost(s[0], s[1]);
-        if c < best_cost {
-            best_cost = c;
-            best = s;
-        }
-    }
-    for _ in 0..ME_MAX_STEPS {
-        let mut improved = false;
-        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let (mx, my) = (best[0] + dx, best[1] + dy);
-            let c = sad_at(mx, my) + mv_cost(mx, my);
-            if c < best_cost {
-                best_cost = c;
-                best = [mx, my];
-                improved = true;
+    // Pattern refinement (coarse-to-fine square search at steps 8 /
+    // 4 / 2 luma samples, then the small diamond) from a start point.
+    let refine = |start: [i32; 2], start_cost: u64| -> ([i32; 2], u64) {
+        let mut best = start;
+        let mut best_cost = start_cost;
+        for step in [8i32, 4, 2] {
+            for _ in 0..ME_MAX_STEPS {
+                let mut improved = false;
+                for (dx, dy) in [
+                    (step, 0),
+                    (-step, 0),
+                    (0, step),
+                    (0, -step),
+                    (step, step),
+                    (step, -step),
+                    (-step, step),
+                    (-step, -step),
+                ] {
+                    let (mx, my) = (best[0] + dx, best[1] + dy);
+                    let c = sad_at(mx, my) + mv_cost(mx, my);
+                    if c < best_cost {
+                        best_cost = c;
+                        best = [mx, my];
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
             }
         }
-        if !improved {
-            break;
+        for _ in 0..ME_MAX_STEPS {
+            let mut improved = false;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (mx, my) = (best[0] + dx, best[1] + dy);
+                let c = sad_at(mx, my) + mv_cost(mx, my);
+                if c < best_cost {
+                    best_cost = c;
+                    best = [mx, my];
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        (best, best_cost)
+    };
+
+    // Start 1: the best seed (predictors / merge candidates / zero).
+    let mut seed_best = seeds[0];
+    let mut seed_cost = u64::MAX;
+    for &s in seeds {
+        let c = sad_at(s[0], s[1]) + mv_cost(s[0], s[1]);
+        if c < seed_cost {
+            seed_cost = c;
+            seed_best = s;
         }
     }
-    best
+    let (best_a, cost_a) = refine(seed_best, seed_cost);
+
+    // Start 2: a subsampled grid scan — every second integer position
+    // over ±ME_GRID_RADIUS around the zero vector, scored on a 2x2
+    // subsampled SAD (blocks of 16x16 and up) — so a narrow true
+    // minimum on a periodic texture is always visited; its winner is
+    // refined the same way and the cheaper final result is kept.
+    let sub = usize::from(w * h >= 256) + 1;
+    let sad_sub = |mx: i32, my: i32| -> u64 {
+        let mut acc = 0u64;
+        for j in (0..h).step_by(sub) {
+            for i in (0..w).step_by(sub) {
+                let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
+                let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
+                let r = refp.y[ry as usize * refp.width + rx as usize];
+                acc += u64::from(r.abs_diff(src_y[j * w + i]));
+            }
+        }
+        acc * (sub * sub) as u64
+    };
+    let mut grid: Option<([i32; 2], u64)> = None;
+    let mut gy = -ME_GRID_RADIUS;
+    while gy <= ME_GRID_RADIUS {
+        let mut gx = -ME_GRID_RADIUS;
+        while gx <= ME_GRID_RADIUS {
+            let c = sad_sub(gx, gy) + mv_cost(gx, gy);
+            let better = match grid {
+                Some((_, bc)) => c < bc,
+                None => true,
+            };
+            if better {
+                grid = Some(([gx, gy], c));
+            }
+            gx += 2;
+        }
+        gy += 2;
+    }
+    match grid {
+        Some((g, _)) if g != best_a => {
+            let (best_b, cost_b) = refine(g, sad_at(g[0], g[1]) + mv_cost(g[0], g[1]));
+            if cost_b < cost_a {
+                best_b
+            } else {
+                best_a
+            }
+        }
+        _ => best_a,
+    }
 }
 
 /// Half- then quarter-pel refinement around `best` (quarter-pel
@@ -1909,7 +1995,7 @@ pub(crate) fn encode_inter_slice(
         let qp_y = ctb_qp as u32;
         let qp_c = chroma_qp_420(ctb_qp);
         let lambda = lambda_of(ctb_qp);
-        let lambda_me = crate::encoder::rate::isqrt_u64(lambda);
+        let lambda_me = crate::encoder::rate::motion_lambda(lambda);
         let src = [
             extract(frame.y, width, x0, y0, CTB),
             extract(frame.cb, cw, cx0, cy0, 8),

@@ -33,8 +33,8 @@ may carry non-zero slice offsets.
 SHA-256:
 
 ```
-e12ae43d2cdde85f9a2d61009498a1f314ca827772edd1b7c0e72c877d8cb7a3  r429-lf-pgop-qp27.hevc
-9d64801361722f9a9266e305cc5bf679d9c319a5c864cc4ae0d06ad3137b8942  r429-lf-bgop-qp33.hevc
+a04fae07c49f603cf2da0eae10bed0c8efef15abd10e3bb0afdf4f98695f1582  r429-lf-pgop-qp27.hevc
+567130b696815bff5b45e6e1bfc9039312682b43d7a2443da9e52db057cd0409  r429-lf-bgop-qp33.hevc
 519f84b77cd6fe7f7a93fe367a639c2f8033934bb85776833ad12fd0c78c367d  r429-lf-intra-qp32.hevc
 ```
 
@@ -59,3 +59,9 @@ to the zero vector above QP 35). Both were re-validated byte-exact
 against the same black-box reference decoder (ffmpeg 8.1.2 CLI, same
 invocation) and the SHA-256 lines above were updated; the intra
 stream is unaffected.
+
+The same two streams were regenerated once more in round 453 when the
+integer motion search gained its two-start form (subsampled ±24 grid
+scan + coarse-to-fine square search beside the seed-refined result)
+and the motion λ its 1.5× weight; re-validated byte-exact the same
+way, SHA-256 lines updated.

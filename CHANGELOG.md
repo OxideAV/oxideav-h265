@@ -27,6 +27,24 @@ runs per reference. Three golden streams (low-delay B refs 4 + TMVP
 3 + TMVP + filters + AQ) are byte-exact through a black-box reference
 decoder and CI-pinned.
 
+### Changed — two-start integer motion search, round 453
+
+The integer search runs two starts and keeps the cheaper refined
+result: the seed set (predictors, merge candidates, zero) and a
+subsampled grid scan (every second position over ±24 luma samples,
+2x2-subsampled SAD on 16x16+ blocks); each start is refined by a
+coarse-to-fine square search (steps 8 / 4 / 2) then the small
+diamond. On a periodic pan the old greedy diamond sat in wrong
+minima at 2–8-frame distances and the hierarchical-B pyramid coded
+the residual instead (a layer-2 B frame at the cost of its P anchor);
+measured on 9 CIF frames at QP 27 / 32 the GOP-8 pyramid moves from
+113 286 / 57 847 bytes to 63 297 / 37 619 at equal-or-better PSNR
+(with temporal MVP: 61 792 / 37 484; CTB-64 quadtree + 2 refs + TMVP:
+55 512 / 32 946 at +0.2 / +0.6 dB). Motion λ = 3·isqrt(mode λ)/2
+(the 1× weight cost ~8 % low-delay rate at QP 32 once far minima were
+reachable). Every inter golden pin was regenerated and re-validated
+black-box.
+
 ### Fixed — motion-search λ collapsed the search above QP 35, round 453
 
 The integer / fractional motion search and the merge / AMVP elections

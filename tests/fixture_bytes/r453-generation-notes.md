@@ -50,9 +50,18 @@ SHA-256:
 
 ```
 cccdd13185551f03d5aaf0ba43637831302e2b01776cdf4f47a6266330a2a5e4  r453-tree-intra-ctb64-qp30.hevc
-3fe7878512ff6bed4f238e0ecbc6d4330ae1421d45fbe56949429756ad681bfd  r453-tree-pgop-ctb32-qp30.hevc
-f0899d3047119903d9ac9da37b2fa72f1eb619e801bd18a0ed29dd85ba29cc90  r453-tree-bpyr-ctb64-qp31.hevc
-177054a7cfcb7e5338d228b6a4258fa3e0ca6df149d308ee6a3bff11953d365c  r453-lowdelay-b-refs4-tmvp-qp29.hevc
-b1ed063e88cd76567d67c36405006670f9c984ebaec633b23fa415b8265f3c3c  r453-pyramid-refs2-tmvp-qp29.hevc
-dfc093ee1401ab7cfc52cf0b1599d15360a31a8f8b7f89cfa28091745ac82e72  r453-tree-pyramid-refs3-tmvp-qp29.hevc
+8d1e52db5929b28fdc464408664ab5258305bb8e1dc83bb6531d0f3b01457b70  r453-tree-pgop-ctb32-qp30.hevc
+c4d6d4f307cb046f320c7f17d37ddfe2746ae3317cc678214f273fbb1fbc522c  r453-tree-bpyr-ctb64-qp31.hevc
+302350977a620f2dee1f7a6c145ee17c9a16758e21f753687bc3d7b9ed6417a2  r453-lowdelay-b-refs4-tmvp-qp29.hevc
+8a459d762bcd0c0ca816bc6a135c94253d5ccd5e3e68db66deacd36ce1d12e8a  r453-pyramid-refs2-tmvp-qp29.hevc
+019a2793af8f682d8db39669e6fab0f6904bf9bcd680bcc426cdd660d224e779  r453-tree-pyramid-refs3-tmvp-qp29.hevc
 ```
+
+## Motion-search re-pin
+
+Every inter stream above was regenerated after the integer motion
+search gained its two-start form (subsampled ±24 grid scan +
+coarse-to-fine square search beside the seed-refined result; motion
+λ = 3·isqrt(mode λ)/2) — the change that closed the pyramid's
+periodic-texture collapse — and re-validated byte-exact through the
+same black-box invocation; the SHA-256 lines are the final values.

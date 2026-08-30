@@ -1241,7 +1241,7 @@ fn code_inter_cu(
     let qp_y = ctb_qp as u32;
     let qp_c = chroma_qp_420(ctb_qp);
     let lambda = ctx.lambda_of(ctb_qp);
-    let lambda_me = crate::encoder::rate::isqrt_u64(lambda);
+    let lambda_me = crate::encoder::rate::motion_lambda(lambda);
     let mv_ctx = ctx.mv_ctx.expect("inter slice has motion context");
     let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
     let src = [
