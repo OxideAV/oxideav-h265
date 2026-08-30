@@ -362,7 +362,7 @@ fn pyramid_option_validation() {
         params.options.insert("mode", "inter");
         params
     };
-    for bad in ["3", "32", "0", "x"] {
+    for bad in ["1", "32", "0", "x"] {
         let mut params = base();
         params.options.insert("pyramid", bad);
         assert!(
@@ -370,6 +370,23 @@ fn pyramid_option_validation() {
             "pyramid={bad} must be rejected"
         );
     }
+    // Any mini-GOP length in 2..=16 is legal (non-dyadic lengths use
+    // the midpoint schedule); adaptive closing rides on `pyramid`.
+    for ok in ["3", "5", "12"] {
+        let mut params = base();
+        params.options.insert("pyramid", ok);
+        params.options.insert("adaptivegop", "1");
+        assert!(
+            oxideav_h265::make_encoder(&params).is_ok(),
+            "pyramid={ok} must be accepted"
+        );
+    }
+    let mut params = base();
+    params.options.insert("adaptivegop", "1");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "adaptivegop without pyramid must be rejected"
+    );
     let mut params = base();
     params.options.insert("pyramid", "4");
     params.options.insert("gop", "3");

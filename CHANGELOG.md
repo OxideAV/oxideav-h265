@@ -6,6 +6,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — adaptive / non-dyadic mini-GOPs on the pyramid path, round 453 (2026-08-30)
+
+`PyramidEncoder` takes any mini-GOP length in 2..=16 (the registry
+`pyramid` option likewise): non-dyadic lengths run the same midpoint
+schedule, and the SPS `sps_max_num_reorder_pics` /
+`sps_max_dec_pic_buffering_minus1` are derived exactly from the
+schedule's reorder depth and retained-reference maximum (`reorder_delay`
+exposes the dts lag). `with_adaptive_gop` / the `adaptivegop` option
+closes a mini-GOP at a scene cut (luma MAD between consecutive input
+frames > 4x the running average and > 16/sample): the frames before
+the cut are coded as a shorter mini-GOP and the cut frame opens the
+next, so no B slice straddles the cut. The flush tail is now coded as
+a short mini-GOP instead of a low-delay P chain (the r451 HRD pyramid
+pin's four-frame tail became `P, B, B, B`, 5 % smaller; re-validated
+black-box). The §E.2.2/§D.2.3 HRD signalling holds for every length
+(the conformance replay covers the tails).
+
 ### Added — non-uniform tile-grid encoding, round 453 (2026-08-30)
 
 `PcmAuOptions::tile_spans`: explicit per-column widths / per-row

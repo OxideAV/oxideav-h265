@@ -404,6 +404,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "h265 encode: pyramidstep requires the pyramid option".into(),
         ));
     }
+    // `adaptivegop` — close mini-GOPs at scene cuts (requires `pyramid`).
+    let adaptive_gop = parse_flag(params, "adaptivegop")?;
+    if adaptive_gop && params.options.get("pyramid").is_none() {
+        return Err(Error::InvalidData(
+            "h265 encode: adaptivegop requires the pyramid option".into(),
+        ));
+    }
     // ABR configuration when `bitrate` is set: an explicit `qp`
     // option seeds the controller's starting QP.
     let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
@@ -493,10 +500,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 let g = v
                     .parse::<usize>()
                     .ok()
-                    .filter(|g| g.is_power_of_two() && (2..=16).contains(g))
+                    .filter(|g| (2..=16).contains(g))
                     .ok_or_else(|| {
                         Error::InvalidData(format!(
-                            "h265 encode: pyramid must be a power of two in 2..=16, got {v:?}"
+                            "h265 encode: pyramid must be in 2..=16, got {v:?}"
                         ))
                     })?;
                 // `pyramidstep` — the per-layer QP step of the
@@ -526,7 +533,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some(n) = refs {
                     enc = enc.with_refs(n);
                 }
-                enc = enc.with_temporal_mvp(tmvp);
+                enc = enc.with_temporal_mvp(tmvp).with_adaptive_gop(adaptive_gop);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -534,9 +541,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
                 enc = enc.with_hrd(hrd_on).with_cbr(cbr_on);
+                let delay = i64::from(enc.reorder_delay());
                 EncodeMode::Pyramid {
                     enc,
-                    delay: i64::from(g.trailing_zeros()),
+                    delay,
                     pts_by_display: Vec::new(),
                     decode_count: 0,
                 }

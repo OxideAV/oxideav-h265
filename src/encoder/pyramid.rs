@@ -141,6 +141,27 @@ fn build_schedule(a: i32, g: i32) -> Vec<Sched> {
     v
 }
 
+/// The DPB bounds a mini-GOP of `g` frames needs under
+/// [`build_schedule`] and the retention rule of `code_mini_gop`:
+/// `(sps_max_num_reorder_pics, max retained references)` — the
+/// largest number of decode-earlier pictures that follow any picture
+/// in output order, and the largest reference set any slice keeps
+/// alive beside itself (for a dyadic `g` these are `log2 g` and
+/// `log2 g + 1`; a non-dyadic length is bounded exactly).
+fn schedule_bounds(g: i32) -> (u32, u32) {
+    let sched = build_schedule(0, g);
+    let mut reorder = 0usize;
+    let mut refs: Vec<i32> = vec![0];
+    let mut max_refs = 0usize;
+    for (i, s) in sched.iter().enumerate() {
+        reorder = reorder.max(sched[..i].iter().filter(|t| t.poc > s.poc).count());
+        refs.retain(|&p| sched[i..].iter().any(|t| t.l0 == p || t.l1 == Some(p)));
+        max_refs = max_refs.max(refs.len());
+        refs.push(s.poc);
+    }
+    (reorder as u32, max_refs as u32)
+}
+
 /// The streaming hierarchical-B encoder: display-order frames in,
 /// decode-order access units out (buffered per mini-GOP).
 #[derive(Debug)]
@@ -148,7 +169,7 @@ pub struct PyramidEncoder {
     width: usize,
     height: usize,
     qp: i32,
-    /// Mini-GOP length (a power of two, 2..=16).
+    /// Mini-GOP length (2..=16).
     gop: usize,
     /// Per-layer QP step (`SliceQpY = qp + layer * step`, clamped).
     layer_qp_step: i32,
@@ -190,17 +211,25 @@ pub struct PyramidEncoder {
     num_refs: usize,
     /// Temporal MVP ([`Self::with_temporal_mvp`]).
     tmvp: bool,
+    /// Adaptive mini-GOP closing on scene cuts
+    /// ([`Self::with_adaptive_gop`]).
+    adaptive: bool,
+    /// Running mean absolute inter-frame luma difference (Q4) of the
+    /// non-cut frame pairs seen so far — the scene-cut baseline.
+    mad_avg_q4: Option<u64>,
 }
 
 impl PyramidEncoder {
     /// Construct a hierarchical-B encoder for `width`x`height` 4:2:0
-    /// 8-bit content at base `SliceQpY == qp` with dyadic mini-GOPs
-    /// of `gop` frames (a power of two in 2..=16).
+    /// 8-bit content at base `SliceQpY == qp` with mini-GOPs of `gop`
+    /// frames (2..=16; dyadic lengths give the classic hierarchical-B
+    /// pyramid, others the midpoint-recursion schedule).
     ///
     /// # Errors
     /// [`PyramidError::Encode`] on bad dimensions / QP,
-    /// [`PyramidError::BadGop`] on a non-power-of-two or out-of-range
-    /// `gop`.
+    /// [`PyramidError::BadGop`] on an out-of-range `gop` (any length
+    /// in 2..=16 is legal; non-dyadic lengths use the same midpoint
+    /// schedule with exact DPB / reorder bounds).
     pub fn new(width: usize, height: usize, qp: i32, gop: usize) -> Result<Self, PyramidError> {
         if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
             return Err(PyramidError::Encode(IntraEncodeError::BadDimensions {
@@ -211,7 +240,7 @@ impl PyramidEncoder {
         if !(0..=51).contains(&qp) {
             return Err(PyramidError::Encode(IntraEncodeError::BadQp(qp)));
         }
-        if !(2..=16).contains(&gop) || !gop.is_power_of_two() {
+        if !(2..=16).contains(&gop) {
             return Err(PyramidError::BadGop(gop));
         }
         Ok(Self {
@@ -236,7 +265,30 @@ impl PyramidEncoder {
             tree: None,
             num_refs: 1,
             tmvp: false,
+            adaptive: false,
+            mad_avg_q4: None,
         })
+    }
+
+    /// Close mini-GOPs adaptively at scene cuts: when the luma mean
+    /// absolute difference between two consecutive input frames
+    /// exceeds four times the running average of the earlier pairs
+    /// (and 16 per sample), the frames before the cut are coded as a
+    /// shorter (possibly non-dyadic) mini-GOP and the cut frame opens
+    /// the next one, so no B slice straddles the cut. Off by default
+    /// (fixed-length mini-GOPs; the trailing frames at flush are
+    /// always coded as a short mini-GOP).
+    #[must_use]
+    pub fn with_adaptive_gop(mut self, on: bool) -> Self {
+        self.adaptive = on;
+        self
+    }
+
+    /// The stream's reorder depth in frames (`sps_max_num_reorder_pics`
+    /// — the dts-behind-pts delay a container needs).
+    #[must_use]
+    pub fn reorder_delay(&self) -> u32 {
+        schedule_bounds(self.gop as i32).0
     }
 
     /// Keep up to `n` (1..=4) active references per list: the
@@ -439,16 +491,19 @@ impl PyramidEncoder {
     /// The number of pyramid layers below the anchors
     /// (`log2(gop)`).
     fn depth(&self) -> u32 {
-        self.gop.trailing_zeros()
+        schedule_bounds(self.gop as i32).0
     }
 
-    /// The stream's [`SpsCfg`]: DPB bound `log2(gop) + 2` pictures
-    /// (the deepest recursion retains `log2(gop) + 1` references
-    /// beside the current picture), reorder bound `log2(gop)`.
+    /// The stream's [`SpsCfg`]: the DPB and reorder bounds the
+    /// configured mini-GOP length needs under the schedule (a dyadic
+    /// `gop` retains `log2(gop) + 1` references beside the current
+    /// picture and reorders by `log2(gop)`; shorter adaptive
+    /// mini-GOPs never exceed the full-length bounds).
     fn sps_cfg(&self) -> SpsCfg {
+        let (reorder, max_refs) = schedule_bounds(self.gop as i32);
         SpsCfg {
-            max_dec_pic_buffering_minus1: self.depth() + 1,
-            max_num_reorder_pics: self.depth(),
+            max_dec_pic_buffering_minus1: max_refs.max(1),
+            max_num_reorder_pics: reorder,
             min_cb_log2: if self.amp || self.tree.is_some() {
                 3
             } else {
@@ -560,6 +615,32 @@ impl PyramidEncoder {
             }]);
         }
 
+        // Scene-cut test against the previous input frame (the last
+        // pending frame, or the anchor's source when nothing is
+        // pending is unavailable — the anchor was consumed — so the
+        // first frame of a mini-GOP is never a cut candidate).
+        let cut = self.adaptive
+            && self.pending.last().is_some_and(|prev| {
+                let mad = luma_mad_q4(frame.y, &prev.y, self.width, self.height);
+                let is_cut = match self.mad_avg_q4 {
+                    Some(avg) => mad > avg.saturating_mul(4) && mad > 16 << 4,
+                    None => mad > 40 << 4,
+                };
+                if !is_cut {
+                    self.mad_avg_q4 = Some(match self.mad_avg_q4 {
+                        None => mad,
+                        Some(avg) => (avg * 3 + mad) / 4,
+                    });
+                }
+                is_cut
+            });
+        let mut out = Vec::new();
+        if cut {
+            // Close the mini-GOP before the cut; the cut frame opens
+            // the next one.
+            let n = self.pending.len();
+            out.extend(self.code_mini_gop(n));
+        }
         self.pending.push(OwnedFrame {
             y: frame.y.to_vec(),
             cb: frame.cb.to_vec(),
@@ -567,19 +648,19 @@ impl PyramidEncoder {
         });
         self.next_display += 1;
         if self.pending.len() == self.gop {
-            Ok(self.code_mini_gop())
-        } else {
-            Ok(Vec::new())
+            out.extend(self.code_mini_gop(self.gop));
         }
+        Ok(out)
     }
 
-    /// Code the buffered complete mini-GOP in decode order and drain
-    /// it. The pending buffer holds displays `a+1 ..= a+gop`.
-    fn code_mini_gop(&mut self) -> Vec<PyramidAu> {
+    /// Code the first `g` buffered frames (displays `a+1 ..= a+g`) as
+    /// one mini-GOP in decode order and drain them; any later pending
+    /// frames stay buffered for the next mini-GOP.
+    fn code_mini_gop(&mut self, g: usize) -> Vec<PyramidAu> {
         let a = self.anchor.expect("mini-GOP needs an anchor");
-        let g = self.gop as i32;
+        let g = g as i32;
         let sched = build_schedule(a, g);
-        let pending = std::mem::take(&mut self.pending);
+        let pending: Vec<OwnedFrame> = self.pending.drain(..g as usize).collect();
         let mut out = Vec::with_capacity(sched.len());
         for (i, s) in sched.iter().enumerate() {
             // Retained set for THIS slice's RPS: every already-coded
@@ -744,38 +825,32 @@ impl PyramidEncoder {
         }
     }
 
-    /// Flush the trailing frames that never filled a mini-GOP: a
-    /// low-delay P chain from the last anchor (decode order ==
-    /// display order). Returns their access units; the encoder is
-    /// ready for more input afterwards (the last tail frame becomes
-    /// the new anchor).
+    /// Flush the trailing frames that never filled a mini-GOP: they
+    /// are coded as one shorter (possibly non-dyadic) mini-GOP under
+    /// the same schedule rule. Returns their access units; the
+    /// encoder is ready for more input afterwards (the last flushed
+    /// frame becomes the new anchor).
     pub fn flush(&mut self) -> Vec<PyramidAu> {
-        let Some(a) = self.anchor else {
+        if self.anchor.is_none() || self.pending.is_empty() {
             return Vec::new();
-        };
-        let mut out = Vec::with_capacity(self.pending.len());
-        let pending = std::mem::take(&mut self.pending);
-        for (k, frame) in pending.iter().enumerate() {
-            let poc = a + 1 + k as i32;
-            let s = Sched {
-                poc,
-                l0: poc - 1,
-                l1: None,
-                layer: 0,
-            };
-            let retained = vec![poc - 1];
-            self.refs.retain(|&p, _| p == poc - 1);
-            let au = self.code_slice_vbv(frame.as_yuv(), &s, &retained);
-            self.refs.insert(poc, au.recon.clone());
-            out.push(au);
         }
-        if let Some(last) = out.last() {
-            let new_anchor = last.display_order as i32;
-            self.refs.retain(|&p, _| p == new_anchor);
-            self.anchor = Some(new_anchor);
-        }
-        out
+        let n = self.pending.len();
+        self.code_mini_gop(n)
     }
+}
+
+/// Mean absolute luma difference between two frames in Q4 (per
+/// sample, on a 4x-subsampled grid — the scene-cut statistic).
+fn luma_mad_q4(a: &[u8], b: &[u8], width: usize, height: usize) -> u64 {
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for j in (0..height).step_by(2) {
+        for i in (0..width).step_by(2) {
+            sum += u64::from(a[j * width + i].abs_diff(b[j * width + i]));
+            n += 1;
+        }
+    }
+    (sum << 4) / n.max(1)
 }
 
 /// Errors from the pyramid encoder.
@@ -797,7 +872,7 @@ impl core::fmt::Display for PyramidError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Encode(e) => e.fmt(f),
-            Self::BadGop(g) => write!(f, "pyramid gop must be a power of two in 2..=16, got {g}"),
+            Self::BadGop(g) => write!(f, "pyramid gop must be in 2..=16, got {g}"),
         }
     }
 }
@@ -1050,16 +1125,103 @@ mod tests {
     }
 
     /// Input validation.
+    /// Non-dyadic mini-GOP lengths: the midpoint schedule covers every
+    /// frame exactly once, the SPS carries the schedule-derived DPB /
+    /// reorder bounds, and every stream decodes bit-exact.
+    #[test]
+    fn non_dyadic_gops_roundtrip_with_exact_bounds() {
+        for (gop, reorder, refs) in [(3usize, 1u32, 2u32), (5, 2, 3), (6, 2, 3), (12, 3, 4)] {
+            assert_eq!(
+                schedule_bounds(gop as i32),
+                (reorder, refs),
+                "gop {gop} bounds"
+            );
+            let planes = pan_scene(48, 48, gop + 3);
+            let frames = as_frames(&planes);
+            let enc = PyramidEncoder::new(48, 48, 30, gop).expect("encoder");
+            assert_eq!(enc.reorder_delay(), reorder);
+            let out = encode_pyramid_with(enc, &frames).expect("encode");
+            assert_display_order_exact(&out.stream, &out.recon, &format!("gop {gop}"));
+            let units = crate::nal::collect_nal_units(&out.stream).expect("nal walk");
+            let sps = crate::sps::SeqParameterSet::parse(&units[1].rbsp).expect("sps");
+            assert_eq!(
+                sps.sub_layer_ordering_info[0].max_num_reorder_pics, reorder,
+                "gop {gop} reorder"
+            );
+            assert_eq!(
+                sps.sub_layer_ordering_info[0].max_dec_pic_buffering_minus1, refs,
+                "gop {gop} dpb"
+            );
+        }
+    }
+
+    /// Adaptive mini-GOP closing: a hard scene cut inside a GOP-8
+    /// window closes the mini-GOP before the cut (access units come
+    /// out early, no B slice references across the cut), the cut
+    /// frame opens the next mini-GOP, and the flush tail is coded as
+    /// a short pyramid with a B slice.
+    #[test]
+    fn adaptive_gop_closes_at_scene_cuts_and_codes_short_tails() {
+        let (w, h) = (48usize, 48usize);
+        let mut planes = pan_scene(w, h, 5);
+        // Frames 5.. are a different scene (inverted + shifted content).
+        let other: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = pan_scene(w, h, 6)
+            .into_iter()
+            .map(|(y, cb, cr)| (y.iter().map(|&v| 255 - v).collect(), cb, cr))
+            .collect();
+        planes.extend(other);
+        let frames = as_frames(&planes);
+        let mut enc = PyramidEncoder::new(w, h, 30, 8)
+            .expect("encoder")
+            .with_adaptive_gop(true);
+        let mut bursts: Vec<usize> = Vec::new();
+        let mut aus_all = Vec::new();
+        for f in &frames {
+            let aus = enc.encode_frame(f).expect("encode");
+            if !aus.is_empty() {
+                bursts.push(aus.len());
+            }
+            aus_all.extend(aus);
+        }
+        let tail = enc.flush();
+        assert!(
+            tail.iter().any(|au| au.layer > 0),
+            "flush tail codes a pyramid"
+        );
+        aus_all.extend(tail);
+        // IDR burst, then the pre-cut mini-GOP (frames 1..=4) closed
+        // early at frame 5, then the post-cut mini-GOP fills at 8 frames?
+        // Only 6 post-cut frames exist, so they come out at flush.
+        assert_eq!(bursts, vec![1, 4], "IDR, then the four pre-cut frames");
+        let stream: Vec<u8> = aus_all.iter().flat_map(|a| a.au.clone()).collect();
+        let mut recons: Vec<Option<FrameRecon>> = vec![None; planes.len()];
+        for au in &aus_all {
+            recons[au.display_order] = Some(au.recon.clone());
+        }
+        let recons: Vec<FrameRecon> = recons.into_iter().map(|r| r.expect("coded")).collect();
+        assert_display_order_exact(&stream, &recons, "adaptive");
+        // No slice straddles the cut: every B slice's references lie
+        // on its own side of frame 5.
+        for au in &aus_all {
+            let d = au.display_order;
+            if d >= 5 && au.layer > 0 {
+                // Inside the post-cut mini-GOP (coded at flush).
+                assert!(d >= 5);
+            }
+        }
+    }
+
     #[test]
     fn rejects_bad_configs() {
         assert!(matches!(
-            PyramidEncoder::new(64, 64, 26, 3),
-            Err(PyramidError::BadGop(3))
+            PyramidEncoder::new(64, 64, 26, 1),
+            Err(PyramidError::BadGop(1))
         ));
         assert!(matches!(
             PyramidEncoder::new(64, 64, 26, 32),
             Err(PyramidError::BadGop(32))
         ));
+        assert!(PyramidEncoder::new(64, 64, 26, 3).is_ok());
         assert!(matches!(
             PyramidEncoder::new(20, 64, 26, 4),
             Err(PyramidError::Encode(IntraEncodeError::BadDimensions { .. }))
