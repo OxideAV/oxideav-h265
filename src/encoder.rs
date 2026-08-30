@@ -59,6 +59,9 @@ enum EncodeMode {
     Intra {
         /// Constant `SliceQpY` when `rc` is off.
         qp: i32,
+        /// Quadtree-coder geometry (the `ctb` option; `None` keeps
+        /// the fixed-geometry bootstrap coder).
+        tree: Option<ctu::TreeCfg>,
         /// The §8.7 in-loop filter switches.
         lf: loopfilter::LoopFilterCfg,
         /// ABR controller (the `bitrate` / `fps` options).
@@ -311,6 +314,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             }),
         }
     };
+    // `ctb` — quadtree-coder CTB size (16 / 32 / 64): routes the
+    // intra / inter modes through the recursive coding-quadtree coder
+    // (encoder::ctu) instead of the fixed one-CU-per-CTB bootstrap.
+    let parse_ctb = |params: &CodecParameters| -> Result<Option<ctu::TreeCfg>> {
+        match params.options.get("ctb") {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<usize>()
+                .ok()
+                .and_then(ctu::TreeCfg::new)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::InvalidData(format!("h265 encode: ctb must be 16, 32 or 64, got {v:?}"))
+                }),
+        }
+    };
+    let tree = parse_ctb(params)?;
     let bitrate = parse_bitrate(params)?;
     // `bufsize` — VBV buffer size in bits, optional `k` / `M` suffix
     // (requires `bitrate`).
@@ -399,6 +419,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     "h265 encode: the aq option requires mode \"intra\"".into(),
                 ));
             }
+            if tree.is_some() {
+                return Err(Error::InvalidData(
+                    "h265 encode: the ctb option requires mode \"intra\" or \"inter\"".into(),
+                ));
+            }
             EncodeMode::Pcm
         }
         Some("intra") => {
@@ -410,6 +435,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             let qp = parse_qp(params)?;
             EncodeMode::Intra {
                 qp,
+                tree,
                 lf: parse_lf(params)?,
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
                 aq: parse_aq(params)?,
@@ -475,6 +501,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?)
                     .with_aq(parse_aq(params)?);
+                if let Some(t) = tree {
+                    enc = enc.with_tree(t);
+                }
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -504,6 +533,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     .with_amp(parse_flag(params, "amp")?)
                     .with_loop_filters(parse_lf(params)?)
                     .with_aq(parse_aq(params)?);
+                if let Some(t) = tree {
+                    enc = enc.with_tree(t);
+                }
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -585,6 +617,7 @@ impl Encoder for H265Encoder {
             ),
             EncodeMode::Intra {
                 qp,
+                tree,
                 lf,
                 rc,
                 aq,
@@ -599,6 +632,8 @@ impl Encoder for H265Encoder {
                     cu_qp_delta: *aq > 0,
                     timing: *timing,
                     hrd: hrd.as_ref().map(|(signal, _)| *signal),
+                    min_cb_log2: if tree.is_some() { 3 } else { 4 },
+                    tree: *tree,
                     ..intra::SpsCfg::legacy(1)
                 };
                 // The HRD SEI prefix: every frame is an IRAP access

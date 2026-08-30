@@ -6,6 +6,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — recursive coding-quadtree encoder (CTB 32/64), round 453 (2026-08-30)
+
+A new `encoder::ctu` coder (`with_tree` on both GOP encoders, the
+registry `ctb` option: 16 / 32 / 64) codes I / P / B slices with real
+§7.3.8.4 coding quadtrees: RD-elected `split_cu_flag` recursion from
+the CTB down to `MinCbSizeY == 8` (full encoder-state rollback around
+each trial), the whole skip / merge / AMVP / two-PU(+AMP) / intra CU
+ladder at every node, recursive §7.3.8.8 residual quadtrees
+(`max_transform_hierarchy_depth_* > 0` with the forced-split and
+inference rules mirrored from the decode side, `blkIdx == 3` deferred
+4x4 chroma included), §8.6.4 DST-VII 4x4 intra luma TUs (new forward
+DST), and intra `PART_NxN`. Emission mirrors the decoder's parse tree
+rule for rule — §9.3.4.2.2 ctxIncs off per-4x4 `CtDepth` / skip
+cells, Table 9-45 `part_mode` forms, `inter_pred_idc` at ctxInc
+`CtDepth`, TR `ref_idx`, §7.3.8.14 `delta_qp` once per quantization
+group with the §8.6.1 `QpY` thread mirrored into per-CU deblocking
+descriptors and a per-4x4 QP map. The loop-filter and AQ stages
+generalized to any CTB size (clipped edge CTBs). Three golden streams
+(intra CTB 64, P GOP CTB 32 + filters + AQ, hierarchical-B CTB 64 +
+AMP; non-CTB-multiple geometries) are byte-exact through a black-box
+reference decoder and CI-pinned; the historical fixed-geometry
+streams stay byte-stable.
+
 ### Added — CBR delivery schedule (`cbr`) + filler data, round 451 (2026-08-24)
 
 `with_cbr` on both GOP encoders / the registry `cbr` option (requires
