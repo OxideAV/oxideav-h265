@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — non-uniform tile-grid encoding, round 453 (2026-08-30)
+
+`PcmAuOptions::tile_spans`: explicit per-column widths / per-row
+heights (in CTBs) put the tiled single-slice PCM picture on a
+`uniform_spacing_flag == 0` grid — the PPS carries
+`column_width_minus1[]` / `row_height_minus1[]`, the CTB walk follows
+the §6.5.1 explicit boundaries (per-tile §7.3.8.1 subsets, §9.3.2.2
+context re-initialization, §7.4.7.1 entry points as before). Spans
+must partition the picture exactly (validated). A 3x2 explicit-grid
+stream is lossless through a black-box reference decoder and
+CI-pinned.
+
 ### Added — encoder temporal MVP + multi-reference lists, round 453 (2026-08-30)
 
 `with_temporal_mvp` / the registry `tmvp` option: the SPS signals

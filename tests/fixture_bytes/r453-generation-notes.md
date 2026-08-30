@@ -65,3 +65,15 @@ coarse-to-fine square search beside the seed-refined result; motion
 λ = 3·isqrt(mode λ)/2) — the change that closed the pyramid's
 periodic-texture collapse — and re-validated byte-exact through the
 same black-box invocation; the SHA-256 lines are the final values.
+
+## Non-uniform tile grid (`../nonuniform_tiles.rs`)
+
+Same tooling; the expected output is the SOURCE picture (PCM is
+lossless). `r453-pcm-tiles-explicit-96x64.hevc`: a 96x64 PCM IDR
+coded as one slice over an explicit 3x2 tile grid
+(`uniform_spacing_flag == 0`, `column_width_minus1 = {0, 2}`,
+`row_height_minus1 = {2}`) with per-tile subsets + entry points.
+
+```
+76d2746c83b86390a50b0cb63ea02067ac277e16a83c1fdc2c9af4ed0a0a49a4  r453-pcm-tiles-explicit-96x64.hevc
+```

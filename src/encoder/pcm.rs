@@ -79,6 +79,15 @@ pub struct PcmAuOptions {
     /// `entry_point_offset_minus1[]` block. Requires `columns * rows >=
     /// 2`; incompatible with multi-segment / SAO options.
     pub tiles: Option<(u32, u32)>,
+    /// Explicit (non-uniform) tile grid: the CTB widths of EVERY tile
+    /// column and the CTB heights of EVERY tile row
+    /// (`uniform_spacing_flag == 0`, PPS `column_width_minus1[]` /
+    /// `row_height_minus1[]` for all but the last entry, §6.5.1 eqs
+    /// 6-3 / 6-4 explicit branch). Each span must be at least one
+    /// CTB and the spans must sum to the picture's CTB columns /
+    /// rows; at least two tiles in total. Overrides [`Self::tiles`]
+    /// (which then need not be set).
+    pub tile_spans: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 impl Default for PcmAuOptions {
@@ -91,6 +100,58 @@ impl Default for PcmAuOptions {
             sao_luma_eo_vertical: false,
             pcm_loop_filter_disabled: true,
             tiles: None,
+            tile_spans: None,
+        }
+    }
+}
+
+/// A PPS tile grid (uniform or explicit spacing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TileGrid {
+    /// Tile columns.
+    pub cols: u32,
+    /// Tile rows.
+    pub rows: u32,
+    /// `uniform_spacing_flag`.
+    pub uniform: bool,
+    /// `column_width_minus1[ i ]` for `i < cols − 1` (explicit only).
+    pub column_width_minus1: Vec<u32>,
+    /// `row_height_minus1[ j ]` for `j < rows − 1` (explicit only).
+    pub row_height_minus1: Vec<u32>,
+}
+
+impl TileGrid {
+    /// A `uniform_spacing_flag == 1` grid.
+    pub(crate) fn uniform(cols: u32, rows: u32) -> Self {
+        Self {
+            cols,
+            rows,
+            uniform: true,
+            column_width_minus1: Vec::new(),
+            row_height_minus1: Vec::new(),
+        }
+    }
+
+    /// An explicit grid from the full span lists (every column width
+    /// / row height in CTBs; the last entries are implied on the wire).
+    pub(crate) fn explicit(widths: &[u32], heights: &[u32]) -> Self {
+        Self {
+            cols: widths.len() as u32,
+            rows: heights.len() as u32,
+            uniform: false,
+            column_width_minus1: widths[..widths.len() - 1].iter().map(|w| w - 1).collect(),
+            row_height_minus1: heights[..heights.len() - 1].iter().map(|h| h - 1).collect(),
+        }
+    }
+
+    /// The §6.5.1 [`TilingParams`] of this grid.
+    pub(crate) fn tiling_params(&self) -> TilingParams {
+        TilingParams {
+            num_tile_columns_minus1: self.cols - 1,
+            num_tile_rows_minus1: self.rows - 1,
+            uniform_spacing_flag: self.uniform,
+            column_width_minus1: self.column_width_minus1.clone(),
+            row_height_minus1: self.row_height_minus1.clone(),
         }
     }
 }
@@ -336,6 +397,25 @@ pub(crate) fn write_pps_full(
     tiles: Option<(u32, u32)>,
     cu_qp_delta: bool,
 ) -> Vec<u8> {
+    let grid = tiles.map(|(c, r)| TileGrid::uniform(c, r));
+    write_pps_grid(
+        dependent_slice_segments_enabled,
+        deblocking_enabled,
+        deblocking_override_enabled,
+        grid.as_ref(),
+        cu_qp_delta,
+    )
+}
+
+/// [`write_pps_full`] over an arbitrary [`TileGrid`] (uniform or
+/// explicit `column_width_minus1[]` / `row_height_minus1[]`).
+pub(crate) fn write_pps_grid(
+    dependent_slice_segments_enabled: bool,
+    deblocking_enabled: bool,
+    deblocking_override_enabled: bool,
+    tiles: Option<&TileGrid>,
+    cu_qp_delta: bool,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
     w.ue(0); // pps_seq_parameter_set_id
@@ -361,10 +441,18 @@ pub(crate) fn write_pps_full(
     w.put_bit(0); // transquant_bypass_enabled_flag
     w.put_bit(u8::from(tiles.is_some())); // tiles_enabled_flag
     w.put_bit(0); // entropy_coding_sync_enabled_flag
-    if let Some((cols, rows)) = tiles {
-        w.ue(cols - 1); // num_tile_columns_minus1
-        w.ue(rows - 1); // num_tile_rows_minus1
-        w.put_bit(1); // uniform_spacing_flag
+    if let Some(grid) = tiles {
+        w.ue(grid.cols - 1); // num_tile_columns_minus1
+        w.ue(grid.rows - 1); // num_tile_rows_minus1
+        w.put_bit(u8::from(grid.uniform)); // uniform_spacing_flag
+        if !grid.uniform {
+            for &cw in &grid.column_width_minus1 {
+                w.ue(cw); // column_width_minus1[i]
+            }
+            for &rh in &grid.row_height_minus1 {
+                w.ue(rh); // row_height_minus1[i]
+            }
+        }
         w.put_bit(0); // loop_filter_across_tiles_enabled_flag
     }
     w.put_bit(1); // pps_loop_filter_across_slices_enabled_flag
@@ -609,8 +697,8 @@ fn write_tiled_idr_slice(
     width: usize,
     height: usize,
     opts: &PcmAuOptions,
+    grid: &TileGrid,
 ) -> Vec<u8> {
-    let (cols, rows) = opts.tiles.expect("caller checked the tile grid");
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
@@ -621,13 +709,7 @@ fn write_tiled_idr_slice(
         height as u32,
         CTB_LOG2,
         2, // MinTbLog2SizeY (SPS: log2_min_luma_transform_block_size = 4)
-        &TilingParams {
-            num_tile_columns_minus1: cols - 1,
-            num_tile_rows_minus1: rows - 1,
-            uniform_spacing_flag: true,
-            column_width_minus1: Vec::new(),
-            row_height_minus1: Vec::new(),
-        },
+        &grid.tiling_params(),
     )
     .expect("validated tile geometry");
 
@@ -804,20 +886,41 @@ fn encode_au(
     // Tile grid: at least two tiles, each column/row at least one CTB
     // wide/tall; the tiled picture is a single slice segment with SAO
     // off (the tile-scan SAO merge availability is out of this
-    // bootstrap's scope).
-    if let Some((cols, rows)) = opts.tiles {
+    // bootstrap's scope). An explicit span list must partition the
+    // picture's CTB columns / rows exactly.
+    let grid: Option<TileGrid> = match (&opts.tile_spans, opts.tiles) {
+        (Some((widths, heights)), _) => {
+            if widths.is_empty()
+                || heights.is_empty()
+                || widths.iter().any(|&w| w == 0)
+                || heights.iter().any(|&h| h == 0)
+                || widths.iter().sum::<u32>() as usize != width / CTB
+                || heights.iter().sum::<u32>() as usize != height / CTB
+                || widths.len() * heights.len() < 2
+            {
+                return Err(PcmEncodeError::BadDimensions { width, height });
+            }
+            Some(TileGrid::explicit(widths, heights))
+        }
+        (None, Some((cols, rows))) => {
+            if cols == 0
+                || rows == 0
+                || cols * rows < 2
+                || cols as usize > width / CTB
+                || rows as usize > height / CTB
+            {
+                return Err(PcmEncodeError::BadDimensions { width, height });
+            }
+            Some(TileGrid::uniform(cols, rows))
+        }
+        (None, None) => None,
+    };
+    if let Some(g) = &grid {
         let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
-        if cols == 0
-            || rows == 0
-            || cols * rows < 2
-            || cols as usize > width / CTB
-            || rows as usize > height / CTB
-            || segments != 1
-            || !opts.independent_slices.is_empty()
-            || sao
-        {
+        if segments != 1 || !opts.independent_slices.is_empty() || sao {
             return Err(PcmEncodeError::BadDimensions { width, height });
         }
+        let _ = g;
     }
     let check = |plane: &'static str, buf: &[u8], expected: usize| {
         if buf.len() != expected {
@@ -834,9 +937,9 @@ fn encode_au(
     check("cb", cb, width * height / 4)?;
     check("cr", cr, width * height / 4)?;
 
-    let level_idc = opts.tiles.map_or_else(
+    let level_idc = grid.as_ref().map_or_else(
         || level_idc_for(width * height),
-        |(c, r)| level_idc_for(width * height).max(level_idc_for_tiles(c, r)),
+        |g| level_idc_for(width * height).max(level_idc_for_tiles(g.cols, g.rows)),
     );
     let dependent_mode = opts.independent_slices.is_empty() && segments > 1;
     let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
@@ -852,11 +955,11 @@ fn encode_au(
             34,
             0,
             0,
-            &write_pps(dependent_mode, opts.deblocking, opts.tiles),
+            &write_pps_grid(dependent_mode, opts.deblocking, false, grid.as_ref(), false),
         ), // PPS_NUT
     ];
-    if opts.tiles.is_some() {
-        let rbsp = write_tiled_idr_slice(y, cb, cr, width, height, &opts);
+    if let Some(g) = &grid {
+        let rbsp = write_tiled_idr_slice(y, cb, cr, width, height, &opts, g);
         units.push(nal_unit(20, 0, 0, &rbsp)); // IDR_N_LP
     } else {
         for rbsp in write_idr_slice_segments(y, cb, cr, width, height, &opts) {
@@ -1076,6 +1179,61 @@ mod tests {
                 expected,
                 "{w}x{h} {cols}x{rows} tiles: lossless roundtrip"
             );
+        }
+    }
+
+    /// Explicit (`uniform_spacing_flag == 0`) tile grids: the PPS
+    /// carries `column_width_minus1[]` / `row_height_minus1[]`, the
+    /// tile scan walks the explicit §6.5.1 boundaries, and the stream
+    /// decodes bit-exact lossless through the crate's own decoder.
+    #[test]
+    fn explicit_tile_grid_roundtrips_and_signals() {
+        for (w, h, widths, heights) in [
+            (96usize, 64usize, vec![1u32, 3, 2], vec![3u32, 1]), // 6x4 CTBs
+            (80, 48, vec![2, 1, 2], vec![1, 2]),                 // 5x3 CTBs
+            (64, 64, vec![3, 1], vec![1, 3]),                    // 4x4 CTBs
+            (48, 16, vec![1, 2], vec![1]),                       // single row
+        ] {
+            let (y, cb, cr) = gradient_planes(w, h);
+            let opts = PcmAuOptions {
+                tile_spans: Some((widths.clone(), heights.clone())),
+                ..PcmAuOptions::default()
+            };
+            let au = encode_idr_pcm_au_opts(&y, &cb, &cr, w, h, opts).expect("encode");
+            let units = crate::nal::collect_nal_units(&au).expect("walk");
+            let pps = PicParameterSet::parse(&units[2].rbsp).expect("pps");
+            assert!(pps.tiles_enabled_flag);
+            assert!(!pps.tiles.uniform_spacing_flag);
+            assert_eq!(pps.tiles.num_tile_columns_minus1 as usize, widths.len() - 1);
+            assert_eq!(pps.tiles.num_tile_rows_minus1 as usize, heights.len() - 1);
+            let cw: Vec<u32> = widths[..widths.len() - 1].iter().map(|v| v - 1).collect();
+            let rh: Vec<u32> = heights[..heights.len() - 1].iter().map(|v| v - 1).collect();
+            assert_eq!(pps.tiles.column_width_minus1, cw);
+            assert_eq!(pps.tiles.row_height_minus1, rh);
+            let frames = crate::sequence::decode_annexb_sequence(&au).expect("decode");
+            assert_eq!(frames.len(), 1);
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&y);
+            expected.extend_from_slice(&cb);
+            expected.extend_from_slice(&cr);
+            assert_eq!(
+                frames[0].picture.to_planar_u8().expect("8-bit"),
+                expected,
+                "{w}x{h} {widths:?}/{heights:?}: lossless roundtrip"
+            );
+        }
+        // Spans that do not partition the picture are rejected.
+        let (y, cb, cr) = gradient_planes(64, 64);
+        for spans in [
+            (vec![1u32, 2], vec![2u32, 2]), // columns sum to 3 of 4
+            (vec![2, 2], vec![0, 4]),       // zero-height row
+            (vec![4], vec![4]),             // one tile
+        ] {
+            let opts = PcmAuOptions {
+                tile_spans: Some(spans),
+                ..PcmAuOptions::default()
+            };
+            assert!(encode_idr_pcm_au_opts(&y, &cb, &cr, 64, 64, opts).is_err());
         }
     }
 
