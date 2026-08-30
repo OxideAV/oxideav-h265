@@ -178,6 +178,10 @@ pub(crate) struct SpsCfg {
     /// §E.2.2 HRD delivery schedule to declare inside the VUI
     /// (requires `timing`); `None` keeps the VUI HRD-free.
     pub hrd: Option<crate::encoder::hrd::HrdSignalCfg>,
+    /// `sps_temporal_mvp_enabled_flag` — the P / B slices may then
+    /// switch on `slice_temporal_mvp_enabled_flag` and use the
+    /// §8.5.3.2.8 collocated candidate.
+    pub temporal_mvp: bool,
     /// The quadtree-coder geometry ([`crate::encoder::ctu::TreeCfg`]):
     /// `Some` routes the picture through the recursive coding-quadtree
     /// coder (CTB 16 / 32 / 64, `MinCbSizeY == 8`, RD-elected splits,
@@ -199,6 +203,7 @@ impl SpsCfg {
             cu_qp_delta: false,
             timing: None,
             hrd: None,
+            temporal_mvp: false,
             tree: None,
         }
     }
@@ -259,7 +264,7 @@ pub(crate) fn write_sps_cfg(
     w.put_bit(0); // pcm_enabled_flag
     w.ue(0); // num_short_term_ref_pic_sets
     w.put_bit(0); // long_term_ref_pics_present_flag
-    w.put_bit(0); // sps_temporal_mvp_enabled_flag
+    w.put_bit(u8::from(cfg.temporal_mvp)); // sps_temporal_mvp_enabled_flag
     w.put_bit(0); // strong_intra_smoothing_enabled_flag
     match cfg.timing {
         None => w.put_bit(0), // vui_parameters_present_flag
@@ -1347,7 +1352,7 @@ pub(crate) fn assemble_idr_au(
     // The reorder-free streams keep the historical VPS bounds (1, 0)
     // so every golden pin stays byte-stable; a reordering
     // (hierarchical-B) stream signals its honest DPB bounds.
-    let vps = if cfg.max_num_reorder_pics == 0 {
+    let vps = if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
         write_vps(level_idc)
     } else {
         write_vps_cfg(

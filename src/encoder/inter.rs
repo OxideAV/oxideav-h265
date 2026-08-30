@@ -108,6 +108,12 @@ pub struct FrameRecon {
     pub cb: Vec<u8>,
     /// Reconstructed Cr plane.
     pub cr: Vec<u8>,
+    /// The picture's decoded motion field (per-4x4 `PredFlagLX` /
+    /// `RefIdxLX`-as-POC / `MvLX`, intra cells marked) — the
+    /// §8.5.3.2.9 collocated-picture input when a later slice
+    /// enables temporal MVP against this picture. Always set on
+    /// encoder outputs (an IDR carries an all-intra field).
+    pub motion_field: Option<MotionField>,
 }
 
 /// The encoded low-delay sequence: the Annex B stream (`VPS + SPS +
@@ -297,6 +303,10 @@ pub struct LowDelayPEncoder {
     hrd: Option<(HrdSignalCfg, HrdClock)>,
     /// Quadtree-coder geometry ([`Self::with_tree`]).
     tree: Option<crate::encoder::ctu::TreeCfg>,
+    /// Active references per list ([`Self::with_refs`], 1..=4).
+    refs: usize,
+    /// Temporal MVP ([`Self::with_temporal_mvp`]).
+    tmvp: bool,
 }
 
 impl LowDelayPEncoder {
@@ -332,7 +342,31 @@ impl LowDelayPEncoder {
             cbr_on: false,
             hrd: None,
             tree: None,
+            refs: 2,
+            tmvp: false,
         })
+    }
+
+    /// Keep `n` (1..=4) active references per list: `RefPicListX[i]`
+    /// = the reconstruction of POC − 1 − i, `num_ref_idx_lX_active`
+    /// signalled, motion estimation per reference. The default is 2
+    /// (the historical streams). Out-of-range values clamp.
+    #[must_use]
+    pub fn with_refs(mut self, n: usize) -> Self {
+        self.refs = n.clamp(1, 4);
+        self
+    }
+
+    /// Enable temporal motion-vector prediction:
+    /// `sps_temporal_mvp_enabled_flag`, every P / B slice signals
+    /// `slice_temporal_mvp_enabled_flag == 1` with `RefPicList0[0]`
+    /// (the previous picture) as the §8.3.5 collocated picture, so
+    /// the §8.5.3.2.8 temporal merge / AMVP candidates enter every
+    /// PU's election against the retained motion fields.
+    #[must_use]
+    pub fn with_temporal_mvp(mut self, on: bool) -> Self {
+        self.tmvp = on;
+        self
     }
 
     /// Route every picture through the recursive coding-quadtree
@@ -573,7 +607,7 @@ impl LowDelayPEncoder {
             self.poc = 1;
         } else {
             self.prevs.insert(0, recon.clone());
-            self.prevs.truncate(2);
+            self.prevs.truncate(self.refs);
             self.poc += 1;
         }
         if let Some(rc) = &mut self.rc {
@@ -634,6 +668,7 @@ impl LowDelayPEncoder {
                     cu_qp_delta: self.aq > 0,
                     timing: self.timing,
                     hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
+                    temporal_mvp: self.tmvp,
                     tree: self.tree,
                 },
                 &self.filters,
@@ -646,6 +681,8 @@ impl LowDelayPEncoder {
                     y: idr.recon_y,
                     cb: idr.recon_cb,
                     cr: idr.recon_cr,
+                    // An IDR's motion field is all-intra.
+                    motion_field: Some(MotionField::new(self.width, self.height)),
                 },
                 FrameStats {
                     intra: (self.width / CTB) * (self.height / CTB),
@@ -659,7 +696,7 @@ impl LowDelayPEncoder {
             let l0: Vec<(i32, &FrameRecon)> = self
                 .prevs
                 .iter()
-                .take(2)
+                .take(self.refs)
                 .enumerate()
                 .map(|(i, rec)| (self.poc - 1 - i as i32, rec))
                 .collect();
@@ -679,6 +716,12 @@ impl LowDelayPEncoder {
                 big_cu: self.amp,
                 aq: self.aq,
                 tree: self.tree,
+                tmvp: TmvpSpec {
+                    sps_enabled: self.tmvp,
+                    slice_enabled: self.tmvp,
+                    collocated_from_l0: true,
+                    collocated_ref_idx: 0,
+                },
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
@@ -772,6 +815,22 @@ pub(crate) struct SliceSpec<'a> {
     /// then selects `amp_enabled_flag` only). `None` keeps the
     /// historical fixed-geometry coder byte-stable.
     pub tree: Option<crate::encoder::ctu::TreeCfg>,
+    /// Temporal-MVP signalling for this slice.
+    pub tmvp: TmvpSpec,
+}
+
+/// The §7.3.6.1 temporal-MVP fields of one P / B slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TmvpSpec {
+    /// The SPS `sps_temporal_mvp_enabled_flag` (drives the presence
+    /// of `slice_temporal_mvp_enabled_flag`).
+    pub sps_enabled: bool,
+    /// `slice_temporal_mvp_enabled_flag`.
+    pub slice_enabled: bool,
+    /// `collocated_from_l0_flag` (B slices; P slices infer 1).
+    pub collocated_from_l0: bool,
+    /// `collocated_ref_idx` into the selected list.
+    pub collocated_ref_idx: u32,
 }
 
 /// §7.3.6.1 — the P / B slice-segment header: an inline §7.4.8
@@ -810,7 +869,9 @@ pub(crate) fn write_inter_slice_header(
         w.put_bit(u8::from(used)); // used_by_curr_pic_s1_flag[i]
         prev = delta;
     }
-    // sps_temporal_mvp_enabled_flag == 0: nothing.
+    if spec.tmvp.sps_enabled {
+        w.put_bit(u8::from(spec.tmvp.slice_enabled)); // slice_temporal_mvp_enabled_flag
+    }
     if lf.cfg.sao() {
         // SPS SAO enabled: the per-slice component gates are present.
         w.put_bit(u8::from(lf.sao_luma)); // slice_sao_luma_flag
@@ -832,7 +893,17 @@ pub(crate) fn write_inter_slice_header(
     if spec.b_slice {
         w.put_bit(0); // mvd_l1_zero_flag
     }
-    // cabac_init_present_flag == 0; TMVP off; WP off.
+    // cabac_init_present_flag == 0.
+    if spec.tmvp.slice_enabled {
+        if spec.b_slice {
+            w.put_bit(u8::from(spec.tmvp.collocated_from_l0)); // collocated_from_l0_flag
+        }
+        let from_l0 = !spec.b_slice || spec.tmvp.collocated_from_l0;
+        if (from_l0 && n_l0 > 1) || (!from_l0 && n_l1 > 1) {
+            w.ue(spec.tmvp.collocated_ref_idx); // collocated_ref_idx
+        }
+    }
+    // WP off.
     w.ue((5 - MAX_MERGE) as u32); // five_minus_max_num_merge_cand
     w.se(spec.qp - 26); // slice_qp_delta
     if lf.cfg.deblocking {
@@ -1749,6 +1820,7 @@ pub(crate) fn encode_inter_slice(
         y: vec![0u8; width * height],
         cb: vec![0u8; cw * ch],
         cr: vec![0u8; cw * ch],
+        motion_field: None,
     };
     let mut field = MotionField::new(width, height);
     // §8.4.2 luma-mode records for the intra-fallback MPM lists (an
@@ -1797,6 +1869,7 @@ pub(crate) fn encode_inter_slice(
     // §8.5.3.2.2 NoBackwardPredFlag: 1 iff every active reference of
     // both lists precedes the current picture in output order.
     let no_backward_pred = !l0_pocs.iter().chain(l1_pocs.iter()).any(|&p| p > poc);
+    let (col_poc, col_field) = collocated_picture(spec);
     let mv_ctx = PuMvContext {
         curr_poc: poc,
         slice_is_b: b_slice,
@@ -1807,14 +1880,14 @@ pub(crate) fn encode_inter_slice(
         num_ref_idx_l0_active: n_l0,
         num_ref_idx_l1_active: if b_slice { n_l1 } else { 0 },
         log2_par_mrg_level: 2,
-        temporal_mvp_enabled: false,
-        collocated_from_l0_flag: true,
-        col_poc: 0,
+        temporal_mvp_enabled: spec.tmvp.slice_enabled,
+        collocated_from_l0_flag: !b_slice || spec.tmvp.collocated_from_l0,
+        col_poc,
         no_backward_pred,
         ref_poc: &ref_poc,
         ref_long_term: &ref_long_term,
         ref_short_term: &ref_short_term,
-        col_field: None,
+        col_field,
         col_ref_long_term: &col_ref_long_term,
         use_integer_mv: false,
         two_versions_curr_pic: false,
@@ -2774,7 +2847,44 @@ pub(crate) fn encode_inter_slice(
         cabac.encode_terminate(&mut w, u8::from(ctb == ctbs_x * ctbs_y - 1));
     }
     w.align_zero();
+    recon.motion_field = Some(field);
     (w.finish(), recon, stats)
+}
+
+/// §8.3.5 — the collocated picture of `spec`: `(PicOrderCnt(ColPic),
+/// its motion field)`; `(0, None)` when the slice keeps temporal MVP
+/// off or the selected reference carries no field.
+pub(crate) fn collocated_picture<'a>(spec: &SliceSpec<'a>) -> (i32, Option<&'a MotionField>) {
+    if !spec.tmvp.slice_enabled {
+        return (0, None);
+    }
+    let from_l0 = !spec.b_slice || spec.tmvp.collocated_from_l0;
+    let list = if from_l0 { &spec.l0 } else { &spec.l1 };
+    match list.get(spec.tmvp.collocated_ref_idx as usize) {
+        Some(&(poc, rec)) => (poc, rec.motion_field.as_ref()),
+        None => (0, None),
+    }
+}
+
+/// §8.3.4 — build `RefPicList0` / `RefPicList1` from the used
+/// short-term sets: `before` (StCurrBefore, closest first) and
+/// `after` (StCurrAfter, closest first). `RefPicListTemp0` cycles
+/// `before ++ after` and `RefPicListTemp1` cycles `after ++ before`
+/// until `num_ref_idx_lX_active` entries are filled.
+pub(crate) fn build_ref_lists(
+    before: &[i32],
+    after: &[i32],
+    n_l0: usize,
+    n_l1: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    let cycle = |first: &[i32], second: &[i32], n: usize| -> Vec<i32> {
+        let temp: Vec<i32> = first.iter().chain(second.iter()).copied().collect();
+        if temp.is_empty() {
+            return Vec::new();
+        }
+        (0..n).map(|i| temp[i % temp.len()]).collect()
+    };
+    (cycle(before, after, n_l0), cycle(after, before, n_l1))
 }
 
 #[cfg(test)]

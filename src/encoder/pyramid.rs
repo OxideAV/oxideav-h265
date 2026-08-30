@@ -51,7 +51,9 @@ use crate::encoder::hrd::{
     buffering_period_payload, filler_data_nal_framed, pic_timing_payload, sei_prefix_nal, HrdClock,
     HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
 };
-use crate::encoder::inter::{encode_inter_slice, FrameRecon, FrameStats, SliceSpec, YuvFrame};
+use crate::encoder::inter::{
+    build_ref_lists, encode_inter_slice, FrameRecon, FrameStats, SliceSpec, TmvpSpec, YuvFrame,
+};
 use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
 use crate::encoder::loopfilter::LoopFilterCfg;
 use crate::encoder::nal::{annexb, nal_unit};
@@ -184,6 +186,10 @@ pub struct PyramidEncoder {
     hrd: Option<(HrdSignalCfg, HrdClock)>,
     /// Quadtree-coder geometry ([`Self::with_tree`]).
     tree: Option<crate::encoder::ctu::TreeCfg>,
+    /// Active references per list ([`Self::with_refs`], 1..=4).
+    num_refs: usize,
+    /// Temporal MVP ([`Self::with_temporal_mvp`]).
+    tmvp: bool,
 }
 
 impl PyramidEncoder {
@@ -228,7 +234,32 @@ impl PyramidEncoder {
             cbr_on: false,
             hrd: None,
             tree: None,
+            num_refs: 1,
+            tmvp: false,
         })
+    }
+
+    /// Keep up to `n` (1..=4) active references per list: the
+    /// §8.3.4 lists are built from every retained reference the
+    /// mini-GOP schedule still holds — `RefPicList0` past pictures
+    /// first (closest first) then future, `RefPicList1` future first
+    /// — truncated to `n`, with `num_ref_idx_lX_active` signalled and
+    /// motion estimation per reference. The default is 1 (the
+    /// historical one-boundary-per-list streams).
+    #[must_use]
+    pub fn with_refs(mut self, n: usize) -> Self {
+        self.num_refs = n.clamp(1, 4);
+        self
+    }
+
+    /// Enable temporal motion-vector prediction: every P / B slice
+    /// signals `slice_temporal_mvp_enabled_flag == 1`; the §8.3.5
+    /// collocated picture is `RefPicList1[0]` (the future boundary)
+    /// on B slices and `RefPicList0[0]` on the anchor P slices.
+    #[must_use]
+    pub fn with_temporal_mvp(mut self, on: bool) -> Self {
+        self.tmvp = on;
+        self
     }
 
     /// Route every picture through the recursive coding-quadtree
@@ -427,6 +458,7 @@ impl PyramidEncoder {
             cu_qp_delta: self.aq > 0,
             timing: self.timing,
             hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
+            temporal_mvp: self.tmvp,
             tree: self.tree,
         }
     }
@@ -502,6 +534,8 @@ impl PyramidEncoder {
                 y: idr.recon_y,
                 cb: idr.recon_cb,
                 cr: idr.recon_cr,
+                // An IDR's motion field is all-intra.
+                motion_field: Some(crate::motion::MotionField::new(self.width, self.height)),
             };
             self.refs.insert(0, recon.clone());
             self.anchor = Some(0);
@@ -636,20 +670,47 @@ impl PyramidEncoder {
     fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32], qp: i32) -> PyramidAu {
         let b_slice = s.l1.is_some();
         let rec_of = |p: i32| -> &FrameRecon { self.refs.get(&p).expect("retained recon") };
-        let l0 = vec![(s.l0, rec_of(s.l0))];
-        let l1: Vec<(i32, &FrameRecon)> = s.l1.map(|p| (p, rec_of(p))).into_iter().collect();
+        // The used short-term sets (§8.3.4 StCurrBefore / StCurrAfter,
+        // closest first): the schedule's boundaries first, then the
+        // nearest other retained pictures on each side up to `refs`.
+        let mut before: Vec<i32> = vec![s.l0];
+        let mut after: Vec<i32> = s.l1.into_iter().collect();
+        if self.num_refs > 1 {
+            let mut past: Vec<i32> = retained
+                .iter()
+                .copied()
+                .filter(|&p| p < s.poc && p != s.l0)
+                .collect();
+            past.sort_unstable_by(|a, b| b.cmp(a));
+            before.extend(past.into_iter().take(self.num_refs - 1));
+            if b_slice {
+                let mut future: Vec<i32> = retained
+                    .iter()
+                    .copied()
+                    .filter(|&p| p > s.poc && Some(p) != s.l1)
+                    .collect();
+                future.sort_unstable();
+                after.extend(future.into_iter().take(self.num_refs - 1));
+            }
+        }
+        let total = before.len() + after.len();
+        let n_l0 = self.num_refs.min(total);
+        let n_l1 = if b_slice { self.num_refs.min(total) } else { 0 };
+        let (l0_pocs, l1_pocs) = build_ref_lists(&before, &after, n_l0, n_l1);
+        let l0: Vec<(i32, &FrameRecon)> = l0_pocs.iter().map(|&p| (p, rec_of(p))).collect();
+        let l1: Vec<(i32, &FrameRecon)> = l1_pocs.iter().map(|&p| (p, rec_of(p))).collect();
         // Inline §7.4.8 RPS: negative pics closest-first, positive
-        // pics closest-first; used flags mark the active references.
+        // pics closest-first; used flags mark the used sets.
         let rps_neg: Vec<(u32, bool)> = retained
             .iter()
             .rev()
             .filter(|&&p| p < s.poc)
-            .map(|&p| ((s.poc - p) as u32, p == s.l0))
+            .map(|&p| ((s.poc - p) as u32, before.contains(&p)))
             .collect();
         let rps_pos: Vec<(u32, bool)> = retained
             .iter()
             .filter(|&&p| p > s.poc)
-            .map(|&p| ((p - s.poc) as u32, Some(p) == s.l1))
+            .map(|&p| ((p - s.poc) as u32, after.contains(&p)))
             .collect();
         let spec = SliceSpec {
             poc: s.poc,
@@ -663,6 +724,13 @@ impl PyramidEncoder {
             big_cu: self.amp,
             aq: self.aq,
             tree: self.tree,
+            tmvp: TmvpSpec {
+                sps_enabled: self.tmvp,
+                slice_enabled: self.tmvp,
+                // B: the future boundary (RefPicList1[0]); P: RefPicList0[0].
+                collocated_from_l0: !b_slice,
+                collocated_ref_idx: 0,
+            },
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAu {

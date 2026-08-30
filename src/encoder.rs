@@ -331,6 +331,25 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
     let tree = parse_ctb(params)?;
+    // `tmvp` — temporal motion-vector prediction (inter mode).
+    let tmvp = parse_flag(params, "tmvp")?;
+    // `refs` — active references per list, 1..=4 (inter mode).
+    let refs = match params.options.get("refs") {
+        None => None,
+        Some(v) => Some(
+            v.parse::<usize>()
+                .ok()
+                .filter(|n| (1..=4).contains(n))
+                .ok_or_else(|| {
+                    Error::InvalidData(format!("h265 encode: refs must be 1..=4, got {v:?}"))
+                })?,
+        ),
+    };
+    if (tmvp || refs.is_some()) && params.options.get("mode") != Some("inter") {
+        return Err(Error::InvalidData(
+            "h265 encode: the tmvp / refs options require mode \"inter\"".into(),
+        ));
+    }
     let bitrate = parse_bitrate(params)?;
     // `bufsize` — VBV buffer size in bits, optional `k` / `M` suffix
     // (requires `bitrate`).
@@ -504,6 +523,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some(t) = tree {
                     enc = enc.with_tree(t);
                 }
+                if let Some(n) = refs {
+                    enc = enc.with_refs(n);
+                }
+                enc = enc.with_temporal_mvp(tmvp);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -536,6 +559,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some(t) = tree {
                     enc = enc.with_tree(t);
                 }
+                if let Some(n) = refs {
+                    enc = enc.with_refs(n);
+                }
+                enc = enc.with_temporal_mvp(tmvp);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }

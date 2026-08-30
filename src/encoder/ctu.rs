@@ -321,6 +321,7 @@ impl EncState {
                 y: vec![0u8; width * height],
                 cb: vec![0u8; cw * ch],
                 cr: vec![0u8; cw * ch],
+                motion_field: None,
             },
             field: MotionField::new(width, height),
             modes: IntraModeField::new(width, height, ctb_log2),
@@ -2703,6 +2704,7 @@ pub(crate) fn encode_inter_slice_tree(
     };
     let col_ref_long_term = |_poc: i32| false;
     let no_backward_pred = !l0_pocs.iter().chain(l1_pocs.iter()).any(|&p| p > spec.poc);
+    let (col_poc, col_field) = crate::encoder::inter::collocated_picture(spec);
     let mv_ctx = PuMvContext {
         curr_poc: spec.poc,
         slice_is_b: spec.b_slice,
@@ -2713,14 +2715,14 @@ pub(crate) fn encode_inter_slice_tree(
         num_ref_idx_l0_active: n_l0,
         num_ref_idx_l1_active: if spec.b_slice { n_l1 } else { 0 },
         log2_par_mrg_level: 2,
-        temporal_mvp_enabled: false,
-        collocated_from_l0_flag: true,
-        col_poc: 0,
+        temporal_mvp_enabled: spec.tmvp.slice_enabled,
+        collocated_from_l0_flag: !spec.b_slice || spec.tmvp.collocated_from_l0,
+        col_poc,
         no_backward_pred,
         ref_poc: &ref_poc,
         ref_long_term: &ref_long_term,
         ref_short_term: &ref_short_term,
-        col_field: None,
+        col_field,
         col_ref_long_term: &col_ref_long_term,
         use_integer_mv: false,
         two_versions_curr_pic: false,
@@ -2756,7 +2758,14 @@ pub(crate) fn encode_inter_slice_tree(
     crate::encoder::inter::write_inter_slice_header(&mut w, spec, &lf_sig);
     let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
     emit_slice_data(&ctx, &coded, &mut w, raw_slice_type, spec.aq > 0);
-    (w.finish(), coded.recon, coded.stats)
+    let CodedPicture {
+        mut recon,
+        st,
+        stats,
+        ..
+    } = coded;
+    recon.motion_field = Some(st.field);
+    (w.finish(), recon, stats)
 }
 
 #[cfg(test)]

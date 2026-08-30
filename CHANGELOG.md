@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — encoder temporal MVP + multi-reference lists, round 453 (2026-08-30)
+
+`with_temporal_mvp` / the registry `tmvp` option: the SPS signals
+`sps_temporal_mvp_enabled_flag`, every P / B slice
+`slice_temporal_mvp_enabled_flag == 1` with the §7.3.6.1
+`collocated_from_l0_flag` / `collocated_ref_idx` block (collocated
+`RefPicList0[0]` on low-delay / anchor slices, `RefPicList1[0]` on
+pyramid B slices), each reference now retains its decoded motion
+field (`FrameRecon::motion_field`), and the §8.5.3.2.8 temporal
+merge / AMVP candidates enter every PU election through the decode-
+side derivation. `with_refs(n)` / the `refs` option (1..=4): the
+low-delay path keeps `n` past references, the hierarchical-B path
+builds `RefPicList0` / `RefPicList1` per §8.3.4 from the retained
+pictures (past-then-future / future-then-past, cycled, truncated to
+`num_ref_idx_lX_active`), the inline RPS marks the used sets, TR
+`ref_idx_lX` is coded beyond two references, and motion estimation
+runs per reference. Three golden streams (low-delay B refs 4 + TMVP
++ filters; GOP-8 pyramid refs 2 + TMVP; CTB-32 quadtree pyramid refs
+3 + TMVP + filters + AQ) are byte-exact through a black-box reference
+decoder and CI-pinned.
+
+### Fixed — motion-search λ collapsed the search above QP 35, round 453
+
+The integer / fractional motion search and the merge / AMVP elections
+priced mvd bins with the SSD-domain mode λ against SAD distortion;
+from QP 36 a 16x16 block could not pay for any non-zero mvd, the
+search returned the zero vector and every CTB fell back to intra (a
+CIF P frame cost as much as its IDR: 9 frames at QP 37 went
+153 336 → 21 873 bytes at 25.5 → 25.2 dB after the fix). The motion λ
+is now the integer square root of the mode λ; below QP 36 the
+operating points move by < 0.2 %. The affected golden pins were
+regenerated and re-validated black-box (notes updated).
+
 ### Added — recursive coding-quadtree encoder (CTB 32/64), round 453 (2026-08-30)
 
 A new `encoder::ctu` coder (`with_tree` on both GOP encoders, the
