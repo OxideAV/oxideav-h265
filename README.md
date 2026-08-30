@@ -90,132 +90,98 @@ byte-exact. Coverage:
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
   extradata with length-prefixed packets.
 
-**Encoder: intra + low-delay inter + hierarchical-B GOPs with AMP
-and in-loop filters, registered.** `make_encoder` / `H265Encoder`
+**Encoder: recursive coding-quadtree I/P/B coding at CTB 16/32/64
+with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop
+filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
-* `mode = "inter"` (`qp` 0..=51, `gop` IDR period, `bslices`, `amp`,
-  `pyramid`) — low-delay `IDR, P, P, …` / `IDR, B, B, …` GOPs
-  (`encoder::inter::LowDelayPEncoder`, one frame in / one AU out) or
-  dyadic **hierarchical-B pyramids**
-  (`encoder::pyramid::PyramidEncoder`, `pyramid = 2/4/8/16`):
-  per-CTU **skip / merge / AMVP / two-PU-partition / intra**
-  decisions under an SSD + λ·rate heuristic, with **two active
-  reference pictures** on the low-delay path (POC − 1 / POC − 2,
-  `ref_idx_l0` signalled). Motion candidates are resolved through
-  the crate's own DECODE-side §8.5.3.2 merge/AMVP derivation against
-  the in-progress motion field (§6.4.2 availability included),
-  motion estimation is a seeded greedy integer diamond plus
-  half-/quarter-pel refinement against the crate's §8.5.3.3.3
-  interpolation, two-PU CUs carry the §7.4.9.8 forced depth-1 RQT,
-  and a `pred_mode_flag == 1` intra fallback rescues scene changes.
-  The **AMP configuration** (`amp` option / `with_amp`) moves the
-  stream to `MinCbSizeY == 8` + `amp_enabled_flag == 1` (explicit
-  `split_cu_flag`, the Table 9-45 big-CU `part_mode` column) and
-  elects `PART_2NxnU / PART_2NxnD / PART_nLx2N / PART_nRx2N`
-  alongside the symmetric shapes — on quarter-offset motion-boundary
-  content the shapes buy **−20 to −29 % bytes at equal PSNR**. The
-  **pyramid** codes each mini-GOP out of display order (next anchor
-  as P first, then the midpoint B recursion with the past boundary
-  on `RefPicList0` and the FUTURE boundary on `RefPicList1`),
-  signals per-slice negative + positive short-term RPS with
-  `sps_max_num_reorder_pics = log2(gop)`, allocates rate by
-  per-layer QP offsets, and searches uni-L0 / uni-L1 / **bi AMVP**
-  per PU (`inter_pred_idc` `PRED_L0/L1/BI` all emitted); on a
-  noisy-pan clip the GOP-8 pyramid takes **−11.5 % bytes** vs the
-  low-delay chain at qp 27. Every stream decodes **bit-exact** to
-  the encoder reconstruction through this crate's decoder AND a
-  black-box reference decoder (multi-QP, multi-shape sweeps; golden
-  GOP / AMP / pyramid / composition streams CI-pinned). Per-frame
-  `FrameStats` expose the skip/merge/AMVP/intra/bi/rect/amp/ref1
-  decisions.
+* `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
+  `refs`, `tmvp`, `pyramid` / `pyramidstep` / `adaptivegop`) —
+  low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
+  or hierarchical-B mini-GOPs of ANY length 2..=16
+  (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
+  classic pyramid, others the same midpoint schedule with
+  schedule-exact `sps_max_num_reorder_pics` / DPB bounds;
+  `adaptivegop` closes a mini-GOP at scene cuts so no B slice
+  straddles one, and flush tails code as short pyramids). Per-CU
+  **skip / merge / AMVP / two-PU(+AMP) / intra** decisions under an
+  SSD + λ·bins cost at every node of a real §7.3.8.4 **coding
+  quadtree** (the `ctb` option: 16 / 32 / 64 with `MinCbSizeY == 8`,
+  RD-elected `split_cu_flag` with full encoder-state rollback,
+  recursive §7.3.8.8 RQTs, 4x4 DST-VII intra luma TUs, intra
+  `PART_NxN`; without `ctb` the historical one-CU-per-CTB coder keeps
+  its streams byte-stable). Motion candidates resolve through the
+  crate's own DECODE-side §8.5.3.2 derivation — **temporal MVP**
+  included (`tmvp`: `slice_temporal_mvp_enabled_flag`, the §7.3.6.1
+  collocated block, per-reference retained motion fields) — over
+  §8.3.4-built lists of up to four references per list (`refs`; the
+  pyramid's L0/L1 cycle past-then-future / future-then-past across
+  every retained picture, TR `ref_idx` coded, ME per reference).
+  The two-start integer search (predictor seeds AND a subsampled
+  ±24 grid scan, each refined coarse-to-fine then to quarter-pel
+  against the crate's §8.5.3.3.3 interpolation) holds up on periodic
+  textures at multi-frame distances; the motion λ is the SAD-domain
+  `3·isqrt(λ_mode)/2`. On a 9-frame CIF noisy pan at QP 27 / 32 the
+  GOP-8 pyramid with TMVP + 2 refs takes **−4.5 % / −16 % bytes vs
+  the low-delay chain**, and the CTB-64 quadtree another **−10 % /
+  −12 %** on top (+0.2 / +0.55 dB); at CTB 64 the all-intra /
+  low-delay legs run **−11 % / −17 % bytes at +0.4..+0.6 dB** vs the
+  CTB-16 coder. Every stream decodes **bit-exact** to the encoder
+  reconstruction through this crate's decoder AND a black-box
+  reference decoder (golden pins across the quadtree / TMVP /
+  multi-ref / CTU-RC axes CI-pinned). Per-frame `FrameStats` expose
+  the skip/merge/amvp/intra/bi/rect/amp/ref1 decisions.
 * `mode = "intra"` — per-CTU §8.4 intra prediction over the
-  encoder's own reconstruction (all 35 modes, per-CTB `PART_2Nx2N`
-  vs `PART_NxN` rate-distortion decision with per-PB modes, §8.4.2
-  MPM signalling, mode-dependent scans), forward DCT-II + reciprocal
-  quantization, full §7.3.8 syntax through the bin-exact §7.3.8.11
-  residual encoder (golden interop stream CI-pinned).
+  encoder's own reconstruction (all 35 modes; at `ctb` 16/32/64 the
+  full quadtree with per-TU prediction, RD-elected RQT depth and
+  DST-VII 4x4 TUs; `PART_2Nx2N` vs `PART_NxN` per MinCb CU, §8.4.2
+  MPM signalling, mode-dependent scans), forward DCT-II/DST-VII +
+  reciprocal quantization, full §7.3.8 syntax through the bin-exact
+  §7.3.8.11 residual encoder.
 * `mode = "pcm"` (default) — the lossless PCM-IDR bootstrap
   (every CTB a 16×16 PCM CU; options for dependent segments,
   multi-slice plans, deblocking, band / edge SAO syntax, and true
-  multi-tile single-slice pictures with §7.4.7.1 entry points).
+  multi-tile single-slice pictures — uniform grids OR explicit
+  non-uniform spans (`PcmAuOptions::tile_spans`,
+  `uniform_spacing_flag == 0`) — with §7.4.7.1 entry points).
 
 Both coding modes accept the §8.7 **in-loop filters** (`deblock` /
 `sao` codec options, `LoopFilterCfg` on the direct APIs): the encoder
 reconstructs through its own decode-side §8.7.2 deblocking (per-slice
-election over off + a {−2, 0, 2}² β/tC-offset sweep, signalled via
-the §7.3.6.1 override group) and §8.7.3 SAO (per-CTB statistics-driven band / edge
-offset estimation with merge-left/up pricing, every candidate
-measured with the decoder's own apply, `encode_sao_ctb` the bin-exact
-§7.3.8.3 dual of the parse) — so the filtered pictures its references
-and outputs hold are exactly a conforming decoder's. Filtered P/B
-GOPs across a 72-configuration sweep decode byte-exact through a
-black-box reference decoder (three golden filtered streams
-CI-pinned); on the interop clip the filters buy up to +1.5 dB luma
-PSNR at equal rate.
+election over off + a {−2, 0, 2}² β/tC-offset sweep) and §8.7.3 SAO
+(per-CTB statistics-driven band / edge estimation with
+merge-left/up pricing, every candidate measured with the decoder's
+own apply) — at any CTB size, over per-CU deblocking descriptors and
+a per-4x4 §8.6.1 `QpY` map — so the filtered pictures its references
+and outputs hold are exactly a conforming decoder's.
 
 Every coding path also accepts **average-bitrate rate control**
-(`bitrate` / `fps` codec options, `with_rate_control` on the
-low-delay AND pyramid APIs): a deterministic integer-only controller
-on the §8.6.3 quantizer lattice (`bits ≈ C / 2^(QP/6)`, per-class
-complexity EWMA, leaky-bucket budget, bounded per-frame QP
-excursions) elects each frame's `SliceQpY` — every pyramid slice at
-its own decode instant, the per-layer offsets riding on top
-(`pyramidstep` option / `with_layer_qp_step`, wire-verified against
-the slice headers) — through `slice_qp_delta` alone, so streams stay
-conforming and decode bit-exact through this crate's decoder and a
-black-box reference decoder. CI-gated accuracy
-(`tests/rate_accuracy.rs`): every configuration of the
-low-delay/pyramid × targets × B-slice/filter/AQ × VBV/HRD matrix
+(`bitrate` / `fps`; `with_rate_control` on the low-delay AND pyramid
+APIs): a deterministic integer-only controller on the §8.6.3
+quantizer lattice elects each frame's `SliceQpY` through
+`slice_qp_delta` alone. CI-gated accuracy (`tests/rate_accuracy.rs`):
+the low-delay/pyramid × targets × B-slice/filter/AQ × VBV/HRD matrix
 lands within 1.6 % of target over 60–65 frames (low-delay within
-1 %), with a monotone rate ladder on both paths. A **VBV
-constraint** (`bufsize` option / `with_vbv`) hard-caps EVERY access
-unit to a modelled decoder buffer at its own decode instant — the
-low-delay, all-intra AND hierarchical-B paths (the mini-GOP burst's
-anchor P and each B layer included) re-encode at a higher QP
-whatever would underflow it (leaky-bucket replays CI-pinned on both
-GOP shapes against unconstrained twins that provably overshoot).
-
-**HRD conformance** (`hrd` option / `with_hrd`; requires rate
-control + VBV + an explicit frame rate): the SPS VUI declares a
-§E.2.2 `hrd_parameters( )` delivery schedule (NAL HRD, one CPB at
-the target rate and VBV size, VBR, fixed picture rate), every IRAP
-access unit carries a §D.2.2 buffering-period SEI and every access
-unit a §D.2.3 pic-timing SEI (the pyramid's `pic_dpb_output_delay`
-encodes its dyadic reorder schedule; buffering periods keep
-`delay + offset` constant per §D.3.2 with the eq. C-18 bound
-honoured at mid-stream IRAPs), and an exact integer Annex C clock
-additionally hard-caps every access unit so its final CPB arrival
-never passes its nominal removal — the §C.4 conditions hold by
-construction. Self-checked in CI by a bitstream-only §C.2 replay
-(VUI/SEI parsed back, arrivals/removals recomputed exactly, §C.4
-no-overflow/no-underflow, C-18 and display-order output
-monotonicity asserted across the config matrix) and validated
-black-box: a reference decoder accepts the SEI-bearing streams
-without complaint and decodes them byte-exact (two golden pins).
-The `cbr` option / `with_cbr` switches the schedule to
-constant-bit-rate delivery (`cbr_flag == 1`): back-to-back eq. C-3
-arrivals, mid-stream initial delays held to the two-sided eq. C-19
-bound, and §7.3.4 filler-data NAL units padding channel underruns so
-the CPB cannot overflow — CBR-replayed in the same CI harness with a
-whole-timeline overflow check.
-
-Every coding mode adds **spatial adaptive quantization** (`aq`
-option 1..=3; `encode_idr_intra_au_aq`, `with_aq` on the low-delay
-and pyramid APIs): per-CTB QP offsets from luma activity, signalled
-through §7.3.8.10 / §7.4.9.14 `cu_qp_delta` (per-CTB QP writing —
-§9.3.3.10 binarization, the §8.6.1 `qPY_PREV` prediction mirror
-incl. the skip / `rqt_root_cbf == 0` / no-cbf inheritance, per-CTB
-QP-dependent §8.7.2 deblocking, per-CTB λ in the mode decisions),
-composing with GOPs, B slices, pyramids, the in-loop filters and
-rate control — byte-exact through this crate's decoder and a
-black-box reference decoder across modes × strengths × QPs × filter
-configurations.
-
-An explicit `fps` (or `with_frame_rate`) additionally declares the
-frame rate in the SPS as a §E.2.1 VUI `vui_timing_info` block
-(probes report the true rate; omitted otherwise, keeping historical
-streams byte-stable).
+1 %), with a monotone rate ladder on both paths. **CTU-level rate
+feedback** (`cturc`; quadtree coder + rate control) additionally
+moves each CTB's `QpY` by up to ±3 through §7.3.8.14 `cu_qp_delta`
+against a shadow-CABAC count of the picture's running size vs the
+pro-rata frame budget (steadier per-frame sizes; composes with AQ /
+TMVP / VBV). A **VBV constraint** (`bufsize` / `with_vbv`) hard-caps
+EVERY access unit at its own decode instant on the low-delay,
+all-intra AND hierarchical-B paths (re-encode at a higher QP as the
+backstop). **HRD conformance** (`hrd` / `with_hrd`): §E.2.2
+`hrd_parameters( )` in the SPS VUI, §D.2.2 buffering-period +
+§D.2.3 pic-timing SEI on every access unit (the pyramid's
+`pic_dpb_output_delay` carries its reorder schedule — non-dyadic
+mini-GOPs and short tails included), and an exact integer Annex C
+clock capping every AU so the §C.4 conditions hold by construction
+— self-checked by a bitstream-only §C.2 replay in CI and validated
+black-box. The `cbr` option / `with_cbr` switches to
+constant-bit-rate delivery (`cbr_flag == 1`, eq. C-19 bounds,
+§7.3.4 filler-data padding). **Spatial adaptive quantization**
+(`aq` 1..=3) signals per-CTB activity offsets through `cu_qp_delta`
+on every coding mode. An explicit `fps` declares §E.2.1 VUI timing.
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -268,29 +234,27 @@ streams byte-stable).
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Thirty-six embedded-fixture regression pins (the 17-stream staged
+Forty-four embedded-fixture regression pins (the 17-stream staged
 corpus incl. true tiles + self-built weighted-prediction,
 per-slice-loop-filter, hvcC, golden-intra-interop, golden-P-GOP
-interop, the round-431 AMP / pyramid / composition interop pins, and
-the nine round-410 tool-axis conformance pins), lossless PCM /
-exact-reconstruction intra / bit-exact low-delay- and
-hierarchical-B-GOP encoder↔decoder roundtrips at multiple
-geometries / QPs / partitions / slice types, and ~930 unit tests.
+interop, the round-431 AMP / pyramid / composition interop pins, the
+nine round-410 tool-axis conformance pins, and the round-453
+quadtree / TMVP+multi-ref / CTU-rate-feedback / explicit-tile-grid
+pins — every encoder pin byte-exact through a black-box reference
+decoder at pin time), lossless PCM / exact-reconstruction intra /
+bit-exact low-delay- and hierarchical-B-GOP encoder↔decoder
+roundtrips at multiple geometries / QPs / partitions / slice types,
+and ~960 unit tests.
 
 ## Not yet implemented
 
-* Larger encoder CTB sizes, deeper encoder RQTs / coding quadtrees
-  (the AMP configuration codes 16x16 CUs above an 8x8 MinCb, but
-  never splits), 4x4-luma DST TUs, encoder temporal MVP, more than
-  one active reference per list on the pyramid path, and adaptive
-  (non-dyadic) GOP structures.
-* VBV on the pyramid path (mini-GOP burst budgeting), §E.2.2/§E.2.3
-  HRD-parameter signalling for the VBV model, and CTU-level rate
-  feedback inside a frame (`cu_qp_delta` is used for spatial AQ; the
-  rate controller allocates at frame granularity, with whole-frame
-  re-encode as the VBV backstop).
-* Non-uniform (`uniform_spacing_flag == 0`) tile-grid *encoding*
-  (decode side is implemented).
+* Encoder tools beyond the current set: encoder-side WPP / tile
+  parallel emission, weighted prediction estimation, sign data
+  hiding, RDOQ, scaling-list-aware quantization, and SCC-tool
+  (palette / IBC / ACT) encoding; the quadtree coder keeps
+  `max_transform_hierarchy_depth_* == 1` and leaves 8x4 / 4x8 inter
+  PUs and intra `PART_NxN` above `MinCbSizeY` out of the ladder;
+  CTU-level rate feedback rides only the quadtree coder.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both
