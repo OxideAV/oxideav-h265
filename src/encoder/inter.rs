@@ -1836,7 +1836,7 @@ pub(crate) fn encode_inter_slice(
         let qp_y = ctb_qp as u32;
         let qp_c = chroma_qp_420(ctb_qp);
         let lambda = lambda_of(ctb_qp);
-        let lambda_me = lambda;
+        let lambda_me = crate::encoder::rate::isqrt_u64(lambda);
         let src = [
             extract(frame.y, width, x0, y0, CTB),
             extract(frame.cb, cw, cx0, cy0, 8),
@@ -2874,8 +2874,12 @@ mod tests {
         );
     }
 
-    /// A static scene (all frames identical) should code P frames as
-    /// (almost) all-skip: tiny payloads, bit-exact reconstruction.
+    /// A static scene (all frames identical) codes its P frames as
+    /// (almost) all-skip: tiny payloads, and every decoded P frame is
+    /// at least as close to the source as the IDR reconstruction it
+    /// predicts from (the SAD-domain motion λ lets a CU re-code the
+    /// IDR's quantization ripple when that is the cheaper RD choice,
+    /// so the P frames need not be sample-identical to frame 0).
     #[test]
     fn static_scene_is_skip_coded() {
         let one = scene(64, 64, 1).remove(0);
@@ -2884,13 +2888,38 @@ mod tests {
         let enc = encode_low_delay_p(&frames, 64, 64, 26).expect("encode");
         let decoded = decode_annexb_sequence(&enc.stream).expect("decode");
         assert_eq!(decoded.len(), 3);
-        // Frames 1 and 2 must reproduce frame 0's reconstruction
-        // exactly (skip copies the reference).
-        let f0 = decoded[0].picture.to_planar_u8().expect("8-bit");
-        for d in &decoded[1..] {
-            assert_eq!(d.picture.to_planar_u8().expect("8-bit"), f0);
+        // Decoder output == encoder reconstruction, frame by frame.
+        for (i, (d, rec)) in decoded.iter().zip(enc.recon.iter()).enumerate() {
+            let mut expect = rec.y.clone();
+            expect.extend_from_slice(&rec.cb);
+            expect.extend_from_slice(&rec.cr);
+            assert_eq!(
+                d.picture.to_planar_u8().expect("8-bit"),
+                expect,
+                "frame {i}"
+            );
         }
-        // Each all-skip P slice is a handful of bytes.
+        // Nearly every CTB is skip, and no P frame drifts away from
+        // the source relative to the IDR.
+        let sad = |rec: &FrameRecon| -> u64 {
+            rec.y
+                .iter()
+                .zip(planes[0].0.iter())
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum()
+        };
+        let idr_sad = sad(&enc.recon[0]);
+        for (i, (st, rec)) in enc.stats.iter().zip(enc.recon.iter()).enumerate().skip(1) {
+            assert!(
+                st.skip >= 15,
+                "frame {i}: expected >= 15/16 skip CTBs, got {st:?}"
+            );
+            assert!(
+                sad(rec) <= idr_sad,
+                "frame {i}: P recon drifted from the source"
+            );
+        }
+        // Each (almost) all-skip P slice is a handful of bytes.
         let idr_len =
             encode_idr_intra_au_cfg(&planes[0].0, &planes[0].1, &planes[0].2, 64, 64, 26, 2)
                 .expect("intra")
@@ -2898,8 +2927,8 @@ mod tests {
                 .len();
         let p_bytes = enc.stream.len() - idr_len;
         assert!(
-            p_bytes < 80,
-            "two all-skip 64x64 P frames should be tiny, got {p_bytes} B"
+            p_bytes < 128,
+            "two near-all-skip P slices should be tiny, got {p_bytes} bytes"
         );
     }
 

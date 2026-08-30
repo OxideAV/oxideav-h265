@@ -33,8 +33,8 @@ may carry non-zero slice offsets.
 SHA-256:
 
 ```
-3e3231a97204b3ba4accf9fb186ddc23f04a54d7ccc8dda30a23a0917f3e261b  r429-lf-pgop-qp27.hevc
-4aa2284a9dee54e9dd2f448197f5095e3238f656fe1539b3affbaa3f1059cf71  r429-lf-bgop-qp33.hevc
+e12ae43d2cdde85f9a2d61009498a1f314ca827772edd1b7c0e72c877d8cb7a3  r429-lf-pgop-qp27.hevc
+9d64801361722f9a9266e305cc5bf679d9c319a5c864cc4ae0d06ad3137b8942  r429-lf-bgop-qp33.hevc
 519f84b77cd6fe7f7a93fe367a639c2f8033934bb85776833ad12fd0c78c367d  r429-lf-intra-qp32.hevc
 ```
 
@@ -49,3 +49,13 @@ reference decode matched the encoder reconstruction byte-exactly
 the three pins included). The in-tree unit tests hold the same
 streams bit-exact through this crate's own decoder, closing the
 three-way contract.
+
+## Round-453 re-pin
+
+The two GOP streams were regenerated in round 453 after the
+motion-search λ moved to the SAD domain (integer square root of the
+SSD-domain mode λ; the previous SSD-domain value collapsed the search
+to the zero vector above QP 35). Both were re-validated byte-exact
+against the same black-box reference decoder (ffmpeg 8.1.2 CLI, same
+invocation) and the SHA-256 lines above were updated; the intra
+stream is unaffected.

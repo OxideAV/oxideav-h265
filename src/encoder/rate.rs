@@ -286,6 +286,22 @@ fn initial_qp_for_bpp(frame_bits: u64, luma_samples: usize) -> i32 {
     44
 }
 
+/// Integer square root (floor), deterministic — the SAD-domain
+/// motion-search λ is the square root of the SSD-domain mode λ.
+pub(crate) fn isqrt_u64(v: u64) -> u64 {
+    if v < 2 {
+        return v;
+    }
+    let mut x = 1u64 << ((64 - v.leading_zeros()).div_ceil(2));
+    loop {
+        let y = (x + v / x) / 2;
+        if y >= x {
+            return x;
+        }
+        x = y;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
