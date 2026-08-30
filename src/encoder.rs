@@ -62,6 +62,8 @@ enum EncodeMode {
         /// Quadtree-coder geometry (the `ctb` option; `None` keeps
         /// the fixed-geometry bootstrap coder).
         tree: Option<ctu::TreeCfg>,
+        /// CTU-level rate feedback (the `cturc` option).
+        ctu_rc: bool,
         /// The §8.7 in-loop filter switches.
         lf: loopfilter::LoopFilterCfg,
         /// ABR controller (the `bitrate` / `fps` options).
@@ -331,6 +333,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
     let tree = parse_ctb(params)?;
+    // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
+    let ctu_rc = parse_flag(params, "cturc")?;
+    if ctu_rc && (params.options.get("bitrate").is_none() || tree.is_none()) {
+        return Err(Error::InvalidData(
+            "h265 encode: cturc requires the bitrate and ctb options".into(),
+        ));
+    }
     // `tmvp` — temporal motion-vector prediction (inter mode).
     let tmvp = parse_flag(params, "tmvp")?;
     // `refs` — active references per list, 1..=4 (inter mode).
@@ -462,6 +471,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             EncodeMode::Intra {
                 qp,
                 tree,
+                ctu_rc,
                 lf: parse_lf(params)?,
                 rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
                 aq: parse_aq(params)?,
@@ -533,7 +543,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some(n) = refs {
                     enc = enc.with_refs(n);
                 }
-                enc = enc.with_temporal_mvp(tmvp).with_adaptive_gop(adaptive_gop);
+                enc = enc
+                    .with_temporal_mvp(tmvp)
+                    .with_adaptive_gop(adaptive_gop)
+                    .with_ctu_rate_control(ctu_rc);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -570,7 +583,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some(n) = refs {
                     enc = enc.with_refs(n);
                 }
-                enc = enc.with_temporal_mvp(tmvp);
+                enc = enc.with_temporal_mvp(tmvp).with_ctu_rate_control(ctu_rc);
                 if fps_declared {
                     enc = enc.with_frame_rate(fps.0, fps.1);
                 }
@@ -653,6 +666,7 @@ impl Encoder for H265Encoder {
             EncodeMode::Intra {
                 qp,
                 tree,
+                ctu_rc,
                 lf,
                 rc,
                 aq,
@@ -663,8 +677,13 @@ impl Encoder for H265Encoder {
                     Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
                     None => *qp,
                 };
+                let budget = if *ctu_rc && tree.is_some() {
+                    rc.as_ref().and_then(|r| r.last_budget_bits())
+                } else {
+                    None
+                };
                 let cfg = intra::SpsCfg {
-                    cu_qp_delta: *aq > 0,
+                    cu_qp_delta: *aq > 0 || budget.is_some(),
                     timing: *timing,
                     hrd: hrd.as_ref().map(|(signal, _)| *signal),
                     min_cb_log2: if tree.is_some() { 3 } else { 4 },
@@ -703,6 +722,7 @@ impl Encoder for H265Encoder {
                         &cfg,
                         lf,
                         *aq,
+                        budget,
                     )
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .au)

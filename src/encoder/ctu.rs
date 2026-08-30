@@ -265,6 +265,11 @@ struct SliceCtx<'a> {
     src: [&'a [u8]; 3],
     qp: i32,
     aq_deltas: &'a [i32],
+    /// CTU-level rate feedback: the frame's bit budget. When set, each
+    /// CTB's QP moves off `qp + aq` by up to ±3 against the running
+    /// coded size (a shadow CABAC emission of every coded CTB) versus
+    /// the pro-rata budget.
+    ctu_rc: Option<u64>,
     b_slice: bool,
     intra_slice: bool,
     refs_l0: &'a [RefPlanes],
@@ -1712,14 +1717,13 @@ fn code_quadtree(
     y0: usize,
     log2: u32,
     depth: u32,
+    ctb_qp: i32,
 ) -> (CuNode, u64) {
     let n = 1usize << log2;
     let fits = x0 + n <= ctx.width && y0 + n <= ctx.height;
     let min_cb = ctx.cfg.min_cb_log2();
 
     let code_leaf = |ctx: &SliceCtx<'_>, st: &mut EncState| -> (CuNode, u64) {
-        let ctb_idx = (y0 >> ctx.cfg.ctb_log2) * ctx.ctbs_x() + (x0 >> ctx.cfg.ctb_log2);
-        let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx]).clamp(0, 51);
         let cu = if ctx.intra_slice {
             code_intra_cu(ctx, st, x0, y0, log2, depth, ctb_qp)
         } else {
@@ -1736,7 +1740,7 @@ fn code_quadtree(
         for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
             let (cx, cy) = (x0 + zx * half, y0 + zy * half);
             if cx < ctx.width && cy < ctx.height {
-                let (node, c) = code_quadtree(ctx, st, cx, cy, log2 - 1, depth + 1);
+                let (node, c) = code_quadtree(ctx, st, cx, cy, log2 - 1, depth + 1, ctb_qp);
                 children[k] = Some(node);
                 cost += c;
             }
@@ -1754,8 +1758,6 @@ fn code_quadtree(
     }
     // The flag is coded: RD-compare the unsplit CU vs the four
     // children (one flag bin either way).
-    let ctb_idx = (y0 >> ctx.cfg.ctb_log2) * ctx.ctbs_x() + (x0 >> ctx.cfg.ctb_log2);
-    let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx]).clamp(0, 51);
     let lambda = ctx.lambda_of(ctb_qp);
     let before = st.snapshot(ctx, x0, y0, n);
     let (leaf_node, leaf_cost) = code_leaf(ctx, st);
@@ -1795,7 +1797,7 @@ struct QpWalk {
     descs: Vec<DeblockCuDesc>,
 }
 
-fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], aq_on: bool) -> QpWalk {
+fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], ctb_qps: &[i32], aq_on: bool) -> QpWalk {
     let w_cells = ctx.width.div_ceil(4);
     let h_cells = ctx.height.div_ceil(4);
     let mut walk = QpWalk {
@@ -1805,7 +1807,7 @@ fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], aq_on: bool) -> QpWalk {
     };
     let mut qp_prev = ctx.qp; // qPY_PREV (SliceQpY at the slice start)
     for (ctb_idx, plan) in plans.iter().enumerate() {
-        let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx]).clamp(0, 51);
+        let ctb_qp = ctb_qps[ctb_idx];
         // §7.3.8.14: the delta is transmitted in the first TU of the
         // CTB (== quantization group) with any cbf.
         let mut delta_coded = false;
@@ -2375,6 +2377,8 @@ struct TtCtx<'a> {
 /// the loop-filter elections, and the per-CU stats.
 struct CodedPicture {
     plans: Vec<CuNode>,
+    /// The QP each CTB was coded at (slice QP + AQ + rate feedback).
+    ctb_qps: Vec<i32>,
     /// The pass-1 cell / field state (pass 2 reads the ctxInc cells).
     st: EncState,
     recon: FrameRecon,
@@ -2389,17 +2393,76 @@ struct CodedPicture {
 
 /// Pass 1 + filters for one picture (I, P or B).
 #[allow(clippy::too_many_lines)]
-fn code_picture(ctx: &SliceCtx<'_>, lf: &LoopFilterCfg, aq_on: bool) -> CodedPicture {
+fn code_picture(
+    ctx: &SliceCtx<'_>,
+    lf: &LoopFilterCfg,
+    cu_qp_delta: bool,
+    slice_type_raw: u8,
+) -> CodedPicture {
     let mut st = EncState::new(ctx.width, ctx.height, ctx.cfg.ctb_log2);
     let ctbs_x = ctx.ctbs_x();
     let ctbs_y = ctx.ctbs_y();
+    let n_ctbs = ctbs_x * ctbs_y;
     let ctb = 1usize << ctx.cfg.ctb_log2;
-    let mut plans: Vec<CuNode> = Vec::with_capacity(ctbs_x * ctbs_y);
-    for ctb_idx in 0..ctbs_x * ctbs_y {
+    let mut plans: Vec<CuNode> = Vec::with_capacity(n_ctbs);
+    let mut ctb_qps: Vec<i32> = Vec::with_capacity(n_ctbs);
+    // CTU-level rate feedback: a shadow CABAC emission of every coded
+    // CTB (no SAO syntax — that is elected after the filters) tracks
+    // the picture's running coded size against the pro-rata budget.
+    let mut shadow: Option<(CabacEncoder, SliceContexts, BitWriter, i32)> = ctx.ctu_rc.map(|_| {
+        (
+            CabacEncoder::new(),
+            SliceContexts::init(init_type(slice_type_raw, false), ctx.qp),
+            BitWriter::new(),
+            ctx.qp,
+        )
+    });
+    for ctb_idx in 0..n_ctbs {
         let x0 = (ctb_idx % ctbs_x) * ctb;
         let y0 = (ctb_idx / ctbs_x) * ctb;
-        let (node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0);
+        let rc_adj = match (ctx.ctu_rc, &shadow) {
+            (Some(budget), Some((_, _, w, _))) if ctb_idx > 0 => {
+                let so_far = w.bit_len() as u64;
+                let expected = budget.saturating_mul(ctb_idx as u64) / n_ctbs as u64;
+                // Ratio in Q8: over-spending raises the QP, under-
+                // spending lowers it, in bounded steps (±3).
+                match so_far.saturating_mul(256).checked_div(expected) {
+                    None => 0,
+                    Some(r) if r > 512 => 3,
+                    Some(r) if r > 384 => 2,
+                    Some(r) if r > 320 => 1,
+                    Some(r) if r < 128 => -3,
+                    Some(r) if r < 192 => -2,
+                    Some(r) if r < 224 => -1,
+                    Some(_) => 0,
+                }
+            }
+            _ => 0,
+        };
+        let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx] + rc_adj).clamp(0, 51);
+        let (node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
+        if let Some((cabac, ctxs, w, qp_prev)) = shadow.as_mut() {
+            let mut qg = QgState {
+                coded: false,
+                qp_prev: *qp_prev,
+                ctb_qp,
+                enabled: cu_qp_delta,
+            };
+            let mut em = Emitter {
+                ctx,
+                st: &st,
+                w,
+                cabac,
+                ctxs,
+            };
+            em.emit_quadtree(&node, x0, y0, ctx.cfg.ctb_log2, 0, &mut qg);
+            if qg.coded {
+                *qp_prev = ctb_qp;
+            }
+            cabac.encode_terminate(w, 0);
+        }
         plans.push(node);
+        ctb_qps.push(ctb_qp);
     }
 
     // Stats.
@@ -2436,10 +2499,11 @@ fn code_picture(ctx: &SliceCtx<'_>, lf: &LoopFilterCfg, aq_on: bool) -> CodedPic
     }
 
     // ---- §8.7 loop filters ----
-    let walk = qp_walk(ctx, &plans, aq_on);
+    let walk = qp_walk(ctx, &plans, &ctb_qps, cu_qp_delta);
     let recon = st.recon.clone();
     let mut out = CodedPicture {
         plans,
+        ctb_qps,
         st,
         recon,
         stats,
@@ -2497,7 +2561,7 @@ fn emit_slice_data(
     coded: &CodedPicture,
     w: &mut BitWriter,
     slice_type_raw: u8,
-    aq_on: bool,
+    cu_qp_delta: bool,
 ) {
     let st = &coded.st;
     let mut cabac = CabacEncoder::new();
@@ -2521,12 +2585,12 @@ fn emit_slice_data(
                 coded.sao_chroma,
             );
         }
-        let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx]).clamp(0, 51);
+        let ctb_qp = coded.ctb_qps[ctb_idx];
         let mut qg = QgState {
             coded: false,
             qp_prev,
             ctb_qp,
-            enabled: aq_on,
+            enabled: cu_qp_delta,
         };
         let mut em = Emitter {
             ctx,
@@ -2536,7 +2600,7 @@ fn emit_slice_data(
             ctxs: &mut ctxs,
         };
         em.emit_quadtree(plan, x0, y0, ctx.cfg.ctb_log2, 0, &mut qg);
-        if aq_on && qg.coded {
+        if qg.coded {
             qp_prev = ctb_qp;
         }
         cabac.encode_terminate(w, u8::from(ctb_idx == ctbs_x * ctbs_y - 1));
@@ -2557,6 +2621,7 @@ pub(crate) fn encode_intra_picture_tree(
     cfg: &SpsCfg,
     lf: &LoopFilterCfg,
     aq: u8,
+    ctu_rc: Option<u64>,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     let tree = cfg.tree.expect("tree config present");
     if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
@@ -2594,6 +2659,7 @@ pub(crate) fn encode_intra_picture_tree(
         src: [y, cb, cr],
         qp,
         aq_deltas: &aq_deltas,
+        ctu_rc,
         b_slice: false,
         intra_slice: true,
         refs_l0: &[],
@@ -2602,7 +2668,12 @@ pub(crate) fn encode_intra_picture_tree(
         two_sided: false,
         tiling: &tiling,
     };
-    let coded = code_picture(&ctx, lf, aq > 0);
+    let cu_qp_delta = aq > 0 || ctu_rc.is_some();
+    debug_assert!(
+        cfg.cu_qp_delta || !cu_qp_delta,
+        "cu_qp_delta signalling needs the PPS flag"
+    );
+    let coded = code_picture(&ctx, lf, cu_qp_delta, 2);
 
     // ---- slice_segment_header( ) — I slice, IDR ----
     let mut w = BitWriter::new();
@@ -2628,7 +2699,7 @@ pub(crate) fn encode_intra_picture_tree(
     }
     w.rbsp_trailing_bits();
 
-    emit_slice_data(&ctx, &coded, &mut w, 2, aq > 0);
+    emit_slice_data(&ctx, &coded, &mut w, 2, cu_qp_delta);
     let slice_rbsp = w.finish();
     let au = crate::encoder::intra::assemble_idr_au(width, height, cfg, lf, &slice_rbsp);
     Ok(IntraEncodedAu {
@@ -2736,6 +2807,7 @@ pub(crate) fn encode_inter_slice_tree(
         src: [frame.y, frame.cb, frame.cr],
         qp: spec.qp,
         aq_deltas: &aq_deltas,
+        ctu_rc: spec.ctu_rc,
         b_slice: spec.b_slice,
         intra_slice: false,
         refs_l0: &refs_l0,
@@ -2744,7 +2816,9 @@ pub(crate) fn encode_inter_slice_tree(
         two_sided,
         tiling: &tiling,
     };
-    let coded = code_picture(&ctx, spec.lf, spec.aq > 0);
+    let cu_qp_delta = spec.aq > 0 || spec.ctu_rc.is_some();
+    let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
+    let coded = code_picture(&ctx, spec.lf, cu_qp_delta, raw_slice_type);
 
     let lf_sig = SliceLfSignalling {
         cfg: spec.lf,
@@ -2756,8 +2830,7 @@ pub(crate) fn encode_inter_slice_tree(
     };
     let mut w = BitWriter::new();
     crate::encoder::inter::write_inter_slice_header(&mut w, spec, &lf_sig);
-    let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
-    emit_slice_data(&ctx, &coded, &mut w, raw_slice_type, spec.aq > 0);
+    emit_slice_data(&ctx, &coded, &mut w, raw_slice_type, cu_qp_delta);
     let CodedPicture {
         mut recon,
         st,
@@ -2808,6 +2881,7 @@ mod tests {
             &tree_cfg(ctb),
             &LoopFilterCfg::off(),
             0,
+            None,
         )
         .expect("encode");
         let frames = decode_annexb_sequence(&au.au).expect("decode");

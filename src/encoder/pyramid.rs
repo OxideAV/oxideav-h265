@@ -214,6 +214,8 @@ pub struct PyramidEncoder {
     /// Adaptive mini-GOP closing on scene cuts
     /// ([`Self::with_adaptive_gop`]).
     adaptive: bool,
+    /// CTU-level rate feedback ([`Self::with_ctu_rate_control`]).
+    ctu_rc: bool,
     /// Running mean absolute inter-frame luma difference (Q4) of the
     /// non-cut frame pairs seen so far — the scene-cut baseline.
     mad_avg_q4: Option<u64>,
@@ -267,7 +269,26 @@ impl PyramidEncoder {
             tmvp: false,
             adaptive: false,
             mad_avg_q4: None,
+            ctu_rc: false,
         })
+    }
+
+    /// CTU-level rate feedback inside every picture — see
+    /// [`crate::encoder::inter::LowDelayPEncoder::with_ctu_rate_control`].
+    #[must_use]
+    pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
+        self.ctu_rc = on;
+        self
+    }
+
+    /// The frame budget the CTU-level feedback tracks (`None` when
+    /// off, without rate control, or on the fixed-geometry coder).
+    fn ctu_budget(&self) -> Option<u64> {
+        if self.ctu_rc && self.tree.is_some() {
+            self.rc.as_ref().and_then(RateController::last_budget_bits)
+        } else {
+            None
+        }
     }
 
     /// Close mini-GOPs adaptively at scene cuts: when the luma mean
@@ -510,7 +531,7 @@ impl PyramidEncoder {
                 4
             },
             amp: self.amp,
-            cu_qp_delta: self.aq > 0,
+            cu_qp_delta: self.aq > 0 || (self.ctu_rc && self.tree.is_some() && self.rc.is_some()),
             timing: self.timing,
             hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
             temporal_mvp: self.tmvp,
@@ -566,6 +587,7 @@ impl PyramidEncoder {
                     &self.sps_cfg(),
                     &self.filters,
                     self.aq,
+                    self.ctu_budget(),
                 )
             };
             let mut idr = code(idr_qp)?;
@@ -812,6 +834,7 @@ impl PyramidEncoder {
                 collocated_from_l0: !b_slice,
                 collocated_ref_idx: 0,
             },
+            ctu_rc: self.ctu_budget(),
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAu {

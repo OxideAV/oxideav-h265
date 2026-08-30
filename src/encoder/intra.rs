@@ -638,7 +638,18 @@ pub fn encode_idr_intra_au_lf(
     qp: i32,
     lf: &LoopFilterCfg,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
-    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &SpsCfg::legacy(1), lf, 0)
+    encode_idr_intra_au_full(
+        y,
+        cb,
+        cr,
+        width,
+        height,
+        qp,
+        &SpsCfg::legacy(1),
+        lf,
+        0,
+        None,
+    )
 }
 
 /// [`encode_idr_intra_au_lf`] with spatial **adaptive quantization**:
@@ -666,7 +677,7 @@ pub fn encode_idr_intra_au_aq(
         cu_qp_delta: aq > 0,
         ..SpsCfg::legacy(1)
     };
-    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &cfg, lf, aq)
+    encode_idr_intra_au_full(y, cb, cr, width, height, qp, &cfg, lf, aq, None)
 }
 
 /// [`encode_idr_intra_au`] with an explicit
@@ -692,6 +703,7 @@ pub(crate) fn encode_idr_intra_au_cfg(
         &SpsCfg::legacy(max_dec_pic_buffering_minus1),
         &LoopFilterCfg::off(),
         0,
+        None,
     )
 }
 
@@ -711,6 +723,7 @@ pub(crate) fn encode_idr_intra_au_full(
     cfg: &SpsCfg,
     lf: &LoopFilterCfg,
     aq: u8,
+    ctu_rc: Option<u64>,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(IntraEncodeError::BadDimensions { width, height });
@@ -742,7 +755,7 @@ pub(crate) fn encode_idr_intra_au_full(
 
     if cfg.tree.is_some() {
         return crate::encoder::ctu::encode_intra_picture_tree(
-            y, cb, cr, width, height, qp, cfg, lf, aq,
+            y, cb, cr, width, height, qp, cfg, lf, aq, ctu_rc,
         );
     }
     let (cw, ch) = (width / 2, height / 2);

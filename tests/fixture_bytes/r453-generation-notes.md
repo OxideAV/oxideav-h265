@@ -52,7 +52,7 @@ SHA-256:
 cccdd13185551f03d5aaf0ba43637831302e2b01776cdf4f47a6266330a2a5e4  r453-tree-intra-ctb64-qp30.hevc
 8d1e52db5929b28fdc464408664ab5258305bb8e1dc83bb6531d0f3b01457b70  r453-tree-pgop-ctb32-qp30.hevc
 c4d6d4f307cb046f320c7f17d37ddfe2746ae3317cc678214f273fbb1fbc522c  r453-tree-bpyr-ctb64-qp31.hevc
-302350977a620f2dee1f7a6c145ee17c9a16758e21f753687bc3d7b9ed6417a2  r453-lowdelay-b-refs4-tmvp-qp29.hevc
+7a039bf3111dd09cfdf1f8499e92dadbbf688484111fd876f428070057fc4adc  r453-lowdelay-b-refs4-tmvp-qp29.hevc
 8a459d762bcd0c0ca816bc6a135c94253d5ccd5e3e68db66deacd36ce1d12e8a  r453-pyramid-refs2-tmvp-qp29.hevc
 019a2793af8f682d8db39669e6fab0f6904bf9bcd680bcc426cdd660d224e779  r453-tree-pyramid-refs3-tmvp-qp29.hevc
 ```
@@ -76,4 +76,21 @@ coded as one slice over an explicit 3x2 tile grid
 
 ```
 76d2746c83b86390a50b0cb63ea02067ac277e16a83c1fdc2c9af4ed0a0a49a4  r453-pcm-tiles-explicit-96x64.hevc
+```
+
+`r453-lowdelay-b-refs4-tmvp-qp29.hevc` was regenerated once more when
+the low-delay SPS started signalling `sps_max_dec_pic_buffering_minus1
+= refs` (4 here; it had kept the two-reference value) — re-validated
+the same way, SHA-256 updated.
+
+## CTU-level rate feedback (`../ctu_rate_control.rs`)
+
+Same tooling and comparison. `r453-tree-lowdelay-cturc-120k.hevc`:
+64x64, 12 frames (flat left half / busy right half, slow pan),
+low-delay P GOP 20, CTB-32 quadtree, deblock + SAO, ABR 120 kb/s at
+25 fps with CTU-level feedback (per-CTB `cu_qp_delta` against the
+pro-rata frame budget).
+
+```
+81e050632665bd442ab7426803c905b7448daec23c5c7211533c3c57651e908f  r453-tree-lowdelay-cturc-120k.hevc
 ```

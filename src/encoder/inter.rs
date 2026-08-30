@@ -311,6 +311,8 @@ pub struct LowDelayPEncoder {
     refs: usize,
     /// Temporal MVP ([`Self::with_temporal_mvp`]).
     tmvp: bool,
+    /// CTU-level rate feedback ([`Self::with_ctu_rate_control`]).
+    ctu_rc: bool,
 }
 
 impl LowDelayPEncoder {
@@ -348,7 +350,29 @@ impl LowDelayPEncoder {
             tree: None,
             refs: 2,
             tmvp: false,
+            ctu_rc: false,
         })
+    }
+
+    /// CTU-level rate feedback inside every frame (quadtree coder +
+    /// rate control only): each CTB's `QpY` moves off the frame QP by
+    /// up to ±3 through §7.3.8.14 `cu_qp_delta`, tracking a shadow
+    /// CABAC count of the picture's coded size against the
+    /// controller's pro-rata frame budget. Composes with spatial AQ.
+    #[must_use]
+    pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
+        self.ctu_rc = on;
+        self
+    }
+
+    /// The frame budget the CTU-level feedback tracks (`None` when
+    /// off, without rate control, or on the fixed-geometry coder).
+    fn ctu_budget(&self) -> Option<u64> {
+        if self.ctu_rc && self.tree.is_some() {
+            self.rc.as_ref().and_then(RateController::last_budget_bits)
+        } else {
+            None
+        }
     }
 
     /// Keep `n` (1..=4) active references per list: `RefPicListX[i]`
@@ -661,7 +685,9 @@ impl LowDelayPEncoder {
                 self.height,
                 qp,
                 &SpsCfg {
-                    max_dec_pic_buffering_minus1: 2,
+                    // The current picture plus every short-term
+                    // reference the P / B slices keep.
+                    max_dec_pic_buffering_minus1: self.refs.max(2) as u32,
                     max_num_reorder_pics: 0,
                     min_cb_log2: if self.amp || self.tree.is_some() {
                         3
@@ -669,7 +695,7 @@ impl LowDelayPEncoder {
                         4
                     },
                     amp: self.amp,
-                    cu_qp_delta: self.aq > 0,
+                    cu_qp_delta: self.aq > 0 || self.ctu_budget().is_some(),
                     timing: self.timing,
                     hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
                     temporal_mvp: self.tmvp,
@@ -677,6 +703,7 @@ impl LowDelayPEncoder {
                 },
                 &self.filters,
                 self.aq,
+                self.ctu_budget(),
             )?;
             Ok((
                 idr.au,
@@ -726,6 +753,7 @@ impl LowDelayPEncoder {
                     collocated_from_l0: true,
                     collocated_ref_idx: 0,
                 },
+                ctu_rc: self.ctu_budget(),
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
@@ -821,6 +849,10 @@ pub(crate) struct SliceSpec<'a> {
     pub tree: Option<crate::encoder::ctu::TreeCfg>,
     /// Temporal-MVP signalling for this slice.
     pub tmvp: TmvpSpec,
+    /// CTU-level rate feedback (quadtree coder only): the frame's bit
+    /// budget; per-CTB `cu_qp_delta` then tracks the running coded
+    /// size against it. Requires the PPS `cu_qp_delta_enabled_flag`.
+    pub ctu_rc: Option<u64>,
 }
 
 /// The §7.3.6.1 temporal-MVP fields of one P / B slice.

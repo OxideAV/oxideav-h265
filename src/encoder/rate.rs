@@ -143,6 +143,9 @@ pub(crate) struct RateController {
     /// starts at `size`, refills by [`Self::target`] per frame and
     /// drains whole-frame in `update`.
     vbv: Option<(i64, i64)>,
+    /// The bit budget the most recent [`Self::pick_qp`] aimed the
+    /// frame at (the CTU-level feedback's per-frame allocation).
+    last_budget: Option<u64>,
 }
 
 impl RateController {
@@ -172,7 +175,15 @@ impl RateController {
                 let size = b.clamp(256, i64::MAX as u64) as i64;
                 (size, size)
             }),
+            last_budget: None,
         }
+    }
+
+    /// The bit budget the most recent [`Self::pick_qp`] aimed at
+    /// (`None` before the first election) — the frame allocation the
+    /// quadtree coder's CTU-level feedback tracks inside the picture.
+    pub(crate) fn last_budget_bits(&self) -> Option<u64> {
+        self.last_budget
     }
 
     /// The hard VBV budget for the NEXT frame (its coded size must
@@ -200,6 +211,7 @@ impl RateController {
             // re-encode loop stays a rare emergency.
             desired = desired.min((fullness.max(64) as u64).saturating_mul(3) / 4);
         }
+        self.last_budget = Some(desired);
         let complexity = self.complexity[class.idx()].or_else(|| {
             // Cold class: borrow the other class through the
             // intra/inter cost ratio.

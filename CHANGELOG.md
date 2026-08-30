@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — CTU-level rate feedback (`cturc`), round 453 (2026-08-31)
+
+`with_ctu_rate_control` on both GOP encoders / the registry `cturc`
+option (quadtree coder + rate control): inside every picture a shadow
+CABAC emission of each coded CTB tracks the running coded size
+against the controller's pro-rata frame budget, and the next CTB's
+`QpY` moves off `SliceQpY (+ AQ)` by up to ±3 through §7.3.8.14
+`cu_qp_delta` (one quantization group per CTB, the §8.6.1 `qPY_PREV`
+thread mirrored into the deblocking QP map). Composes with AQ, TMVP,
+VBV / HRD (the whole-AU caps still hold). Measured on a
+flat-left / busy-right 64x64 pan, 40 frames at 120 kb/s: 23 782 vs
+23 856 bytes for 24 000 targeted, P-frame size coefficient of
+variation 0.61 → 0.50. A 12-frame stream is byte-exact through a
+black-box reference decoder and CI-pinned. Also: the low-delay SPS
+now signals `sps_max_dec_pic_buffering_minus1 = refs` (it had kept
+the two-reference value under `with_refs(3..4)`; the refs-4 pin was
+re-validated).
+
 ### Added — adaptive / non-dyadic mini-GOPs on the pyramid path, round 453 (2026-08-30)
 
 `PyramidEncoder` takes any mini-GOP length in 2..=16 (the registry
