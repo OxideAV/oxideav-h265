@@ -349,44 +349,7 @@ fn write_sps(
     w.finish()
 }
 
-/// §7.3.2.3 — the all-defaults PPS (deblocking disabled), optionally
-/// with a uniform tile grid (`tiles_enabled_flag == 1`,
-/// `uniform_spacing_flag == 1`,
-/// `loop_filter_across_tiles_enabled_flag == 0`).
-pub(crate) fn write_pps(
-    dependent_slice_segments_enabled: bool,
-    deblocking_enabled: bool,
-    tiles: Option<(u32, u32)>,
-) -> Vec<u8> {
-    write_pps_lf(
-        dependent_slice_segments_enabled,
-        deblocking_enabled,
-        false,
-        tiles,
-    )
-}
-
-/// [`write_pps`] with `deblocking_filter_override_enabled_flag`
-/// control: the loop-filter encoders write the PPS with
-/// `pps_deblocking_filter_disabled_flag == 1` +
-/// `deblocking_filter_override_enabled_flag == 1` so every slice
-/// elects deblocking on/off itself (§7.3.6.1 override group).
-pub(crate) fn write_pps_lf(
-    dependent_slice_segments_enabled: bool,
-    deblocking_enabled: bool,
-    deblocking_override_enabled: bool,
-    tiles: Option<(u32, u32)>,
-) -> Vec<u8> {
-    write_pps_full(
-        dependent_slice_segments_enabled,
-        deblocking_enabled,
-        deblocking_override_enabled,
-        tiles,
-        false,
-    )
-}
-
-/// [`write_pps_lf`] with `cu_qp_delta_enabled_flag` control: the
+/// §7.3.2.3 — the all-defaults PPS with `cu_qp_delta_enabled_flag` control: the
 /// adaptive-quantization encoders signal per-CTB QP through §7.3.8.10
 /// `cu_qp_delta` (`diff_cu_qp_delta_depth == 0`, one quantization
 /// group per CTB).
@@ -892,8 +855,8 @@ fn encode_au(
         (Some((widths, heights)), _) => {
             if widths.is_empty()
                 || heights.is_empty()
-                || widths.iter().any(|&w| w == 0)
-                || heights.iter().any(|&h| h == 0)
+                || widths.contains(&0)
+                || heights.contains(&0)
                 || widths.iter().sum::<u32>() as usize != width / CTB
                 || heights.iter().sum::<u32>() as usize != height / CTB
                 || widths.len() * heights.len() < 2
