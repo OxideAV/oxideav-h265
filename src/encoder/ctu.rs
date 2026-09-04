@@ -54,12 +54,13 @@ use crate::encoder::inter::{
     FrameStats, PuChooseCtx, PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, YuvFrame,
 };
 use crate::encoder::intra::{
-    chroma_qp_420, encode_cu_qp_delta, forward_transform, quantize, rate_proxy, IntraEncodeError,
+    chroma_qp_420, encode_cu_qp_delta, forward_transform, rate_proxy, IntraEncodeError,
     IntraEncodedAu, SpsCfg,
 };
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
 };
+use crate::encoder::quant::{quantize_tb, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -69,6 +70,7 @@ use crate::intra_pred::{
 use crate::motion::{MotionCell, MotionField};
 use crate::pu_mv::{pu_partitions, resolve_pu_motion, PartMode, PuGeometry, PuMotion, PuMvContext};
 use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::scan::ScanIdx;
 use crate::slice_data::SaoCtbParams;
 use crate::transform::{forward_dst4_1d, residual_block, BlockParams, Component, PredMode};
 
@@ -83,6 +85,7 @@ const Z_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 /// quadtree depths, always `MinCbLog2SizeY == 3` and
 /// `MaxTbLog2SizeY == min( CtbLog2SizeY, 5 )`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TreeCfg {
     /// `CtbLog2SizeY` (4..=6).
     pub ctb_log2: u32,
@@ -90,6 +93,10 @@ pub struct TreeCfg {
     pub th_depth_intra: u32,
     /// `max_transform_hierarchy_depth_inter`.
     pub th_depth_inter: u32,
+    /// PPS `sign_data_hiding_enabled_flag == 1`: the §7.3.8.11
+    /// `signHidden` sub-blocks omit their first sign, the levels
+    /// parity-adjusted by the cheapest ±1 move.
+    pub sign_hiding: bool,
 }
 
 impl TreeCfg {
@@ -107,7 +114,25 @@ impl TreeCfg {
             ctb_log2,
             th_depth_intra: 1,
             th_depth_inter: 1,
+            sign_hiding: false,
         })
+    }
+
+    /// Set `max_transform_hierarchy_depth_intra` / `_inter` (0..=3;
+    /// the residual quadtrees may then split that many levels below
+    /// the coding block, down to 4x4 luma TBs).
+    #[must_use]
+    pub fn with_tu_depth(mut self, intra: u32, inter: u32) -> Self {
+        self.th_depth_intra = intra.min(3);
+        self.th_depth_inter = inter.min(3);
+        self
+    }
+
+    /// Switch sign data hiding on / off.
+    #[must_use]
+    pub fn with_sign_hiding(mut self, on: bool) -> Self {
+        self.sign_hiding = on;
+        self
     }
 
     /// `MinCbLog2SizeY` (always 3: 8x8 minimum coding blocks).
@@ -507,6 +532,39 @@ fn forward_transform_dst4(res: &[i32]) -> Vec<i32> {
     coef
 }
 
+/// The quantization tools one TB is coded with.
+#[derive(Clone, Copy)]
+struct TbTools {
+    /// The §7.4.9.11 scan of the block (mode-dependent on intra).
+    scan: ScanIdx,
+    /// Sample-domain λ.
+    lambda: u64,
+    /// Sign-data-hiding parity adjustment.
+    sign_hiding: bool,
+}
+
+impl TbTools {
+    /// The tools for a TB of the CU under decision: the scan from
+    /// the prediction type / intra mode.
+    fn new(
+        ctx: &SliceCtx<'_>,
+        lambda: u64,
+        cu_is_intra: bool,
+        log2: u32,
+        c_idx: u8,
+        mode: u8,
+    ) -> Self {
+        // The mode-decision λ prices PROXY bins (`rate_proxy`
+        // overstates residual bits); the quantizer prices exact bins
+        // at λ/2.
+        Self {
+            scan: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, u32::from(mode)),
+            lambda: lambda / 2,
+            sign_hiding: ctx.cfg.sign_hiding,
+        }
+    }
+}
+
 /// Transform + quantize one TB and reconstruct through the decode-side
 /// §8.6.2 path (the intra-luma 4x4 case taking the DST-VII pair).
 /// Returns `(levels, recon_samples)`.
@@ -517,6 +575,7 @@ fn code_tb(
     qp: u32,
     component: Component,
     pred_mode: PredMode,
+    tools: TbTools,
 ) -> (Vec<i32>, Vec<u8>) {
     let res: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
     let coef = if pred_mode == PredMode::Intra && component == Component::Luma && n == 4 {
@@ -524,7 +583,17 @@ fn code_tb(
     } else {
         forward_transform(&res, n)
     };
-    let levels = quantize(&coef, n, qp);
+    let levels = quantize_tb(
+        &coef,
+        &TbQuant {
+            log2: n.trailing_zeros(),
+            qp,
+            is_chroma: component != Component::Luma,
+            scan: tools.scan,
+            lambda: tools.lambda,
+            sign_hiding: tools.sign_hiding,
+        },
+    );
     let recon: Vec<u8> = if levels.iter().all(|&v| v == 0) {
         pred.iter().map(|&p| p.clamp(0, 255) as u8).collect()
     } else {
@@ -719,6 +788,7 @@ fn search_mode_64(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize) -> u8
 /// Code one intra luma TB at `(x, y)` (predict from the frame recon,
 /// transform, reconstruct into the frame recon). Returns
 /// `(levels, dist, mode_pred_sad_unused)`.
+#[allow(clippy::too_many_arguments)]
 fn code_intra_luma_tb(
     ctx: &SliceCtx<'_>,
     st: &mut EncState,
@@ -727,18 +797,29 @@ fn code_intra_luma_tb(
     n: usize,
     mode: u8,
     qp_y: u32,
+    lambda: u64,
 ) -> (Vec<i32>, u64) {
     let marked = gather_luma_refs(ctx, &st.recon.y, x, y, n);
     let pred = intra_predict_with_substitution(&marked, &pred_params(mode, PredComponent::Luma))
         .expect("legal prediction params");
     let src = extract(ctx.src[0], ctx.width, x, y, n);
-    let (levels, recon) = code_tb(&src, &pred, n, qp_y, Component::Luma, PredMode::Intra);
+    let tools = TbTools::new(ctx, lambda, true, n.trailing_zeros(), 0, mode);
+    let (levels, recon) = code_tb(
+        &src,
+        &pred,
+        n,
+        qp_y,
+        Component::Luma,
+        PredMode::Intra,
+        tools,
+    );
     let dist = ssd_u8(&recon, &src);
     store(&mut st.recon.y, ctx.width, x, y, n, &recon);
     (levels, dist)
 }
 
 /// Code one intra chroma TB pair at chroma `(cx, cy)` size `n`.
+#[allow(clippy::too_many_arguments)]
 fn code_intra_chroma_tbs(
     ctx: &SliceCtx<'_>,
     st: &mut EncState,
@@ -747,6 +828,7 @@ fn code_intra_chroma_tbs(
     n: usize,
     mode_c: u8,
     qp_c: u32,
+    lambda: u64,
 ) -> (Vec<i32>, Vec<i32>, u64) {
     let cw = ctx.width / 2;
     let mut do_plane = |plane_idx: usize, comp: Component, pc: PredComponent| -> (Vec<i32>, u64) {
@@ -758,7 +840,15 @@ fn code_intra_chroma_tbs(
         let pred = intra_predict_with_substitution(&marked, &pred_params(mode_c, pc))
             .expect("legal prediction params");
         let src = extract(ctx.src[plane_idx], cw, cx, cy, n);
-        let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra);
+        let tools = TbTools::new(
+            ctx,
+            lambda,
+            true,
+            n.trailing_zeros(),
+            plane_idx as u8,
+            mode_c,
+        );
+        let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra, tools);
         let dist = ssd_u8(&recon, &src);
         let recon_plane = match plane_idx {
             1 => &mut st.recon.cb,
@@ -803,9 +893,9 @@ fn intra_rqt(
 
     let leaf_eval = |st: &mut EncState| -> (TuNode, u64, u64) {
         let n = 1usize << log2;
-        let (y_lv, d_y) = code_intra_luma_tb(ctx, st, x, y, n, mode, qp_y);
+        let (y_lv, d_y) = code_intra_luma_tb(ctx, st, x, y, n, mode, qp_y, lambda);
         let (cb, cr, d_c) = if log2 >= 3 {
-            code_intra_chroma_tbs(ctx, st, x / 2, y / 2, n / 2, mode_c, qp_c)
+            code_intra_chroma_tbs(ctx, st, x / 2, y / 2, n / 2, mode_c, qp_c, lambda)
         } else {
             (Vec::new(), Vec::new(), 0)
         };
@@ -848,7 +938,8 @@ fn intra_rqt(
         }
         // Deferred 4x4 chroma at the log2 == 3 split parent.
         let (cb, cr) = if log2 == 3 {
-            let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x / 2, y / 2, 4, mode_c, qp_c);
+            let (cb, cr, d_c) =
+                code_intra_chroma_tbs(ctx, st, x / 2, y / 2, 4, mode_c, qp_c, lambda);
             dist += d_c;
             rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
             (cb, cr)
@@ -966,7 +1057,7 @@ fn code_intra_cu(
             let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
             let src = extract(ctx.src[0], ctx.width, px, py, 4);
             let (m, _) = search_best_mode(&marked, &src);
-            let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y);
+            let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
             // §8.4.2: later PBs' candidate lists see this PB's mode.
             st.modes.record_intra_pb(px, py, 4, m, false);
             pb_modes[k] = m;
@@ -974,7 +1065,8 @@ fn code_intra_cu(
             dist += d;
             luma_lv.push(lv);
         }
-        let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x0 / 2, y0 / 2, 4, pb_modes[0], qp_c);
+        let (cb, cr, d_c) =
+            code_intra_chroma_tbs(ctx, st, x0 / 2, y0 / 2, 4, pb_modes[0], qp_c, lambda);
         dist += d_c;
         rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
         let cost_nxn = dist + lambda * (rate + base_bins + 4 * 7);
@@ -1061,7 +1153,16 @@ fn inter_rqt(
         let n_cb = bufs.n_cb;
         let src_y = sub_block(bufs.src_y, n_cb, x, y, n);
         let pred_y = sub_block(bufs.pred_y, n_cb, x, y, n);
-        let (y_lv, y_rc) = code_tb(&src_y, &pred_y, n, qp_y, Component::Luma, PredMode::Inter);
+        let tools = |c_idx: u8| TbTools::new(ctx, lambda, false, log2, c_idx, 0);
+        let (y_lv, y_rc) = code_tb(
+            &src_y,
+            &pred_y,
+            n,
+            qp_y,
+            Component::Luma,
+            PredMode::Inter,
+            tools(0),
+        );
         let mut dist = ssd_u8(&y_rc, &src_y);
         let mut rate = rate_proxy(&y_lv) + 1;
         let mut local = LocalRecon {
@@ -1073,12 +1174,27 @@ fn inter_rqt(
             let hc = n / 2;
             let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, hc);
             let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, hc);
-            let (cb_lv, cb_rc) =
-                code_tb(&src_cb, &pred_cb, hc, qp_c, Component::Cb, PredMode::Inter);
+            let chroma_tools = |c_idx: u8| TbTools::new(ctx, lambda, false, log2 - 1, c_idx, 0);
+            let (cb_lv, cb_rc) = code_tb(
+                &src_cb,
+                &pred_cb,
+                hc,
+                qp_c,
+                Component::Cb,
+                PredMode::Inter,
+                chroma_tools(1),
+            );
             let src_cr = sub_block(bufs.src_cr, n_cb / 2, x / 2, y / 2, hc);
             let pred_cr = sub_block(bufs.pred_cr, n_cb / 2, x / 2, y / 2, hc);
-            let (cr_lv, cr_rc) =
-                code_tb(&src_cr, &pred_cr, hc, qp_c, Component::Cr, PredMode::Inter);
+            let (cr_lv, cr_rc) = code_tb(
+                &src_cr,
+                &pred_cr,
+                hc,
+                qp_c,
+                Component::Cr,
+                PredMode::Inter,
+                chroma_tools(2),
+            );
             dist += ssd_u8(&cb_rc, &src_cb) + ssd_u8(&cr_rc, &src_cr);
             rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
             local.cb = cb_rc;
@@ -1155,12 +1271,27 @@ fn inter_rqt(
             let n_cb = bufs.n_cb;
             let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, 4);
             let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, 4);
-            let (cb_lv, cb_rc) =
-                code_tb(&src_cb, &pred_cb, 4, qp_c, Component::Cb, PredMode::Inter);
+            let chroma_tools = |c_idx: u8| TbTools::new(ctx, lambda, false, 2, c_idx, 0);
+            let (cb_lv, cb_rc) = code_tb(
+                &src_cb,
+                &pred_cb,
+                4,
+                qp_c,
+                Component::Cb,
+                PredMode::Inter,
+                chroma_tools(1),
+            );
             let src_cr = sub_block(bufs.src_cr, n_cb / 2, x / 2, y / 2, 4);
             let pred_cr = sub_block(bufs.pred_cr, n_cb / 2, x / 2, y / 2, 4);
-            let (cr_lv, cr_rc) =
-                code_tb(&src_cr, &pred_cr, 4, qp_c, Component::Cr, PredMode::Inter);
+            let (cr_lv, cr_rc) = code_tb(
+                &src_cr,
+                &pred_cr,
+                4,
+                qp_c,
+                Component::Cr,
+                PredMode::Inter,
+                chroma_tools(2),
+            );
             dist += ssd_u8(&cb_rc, &src_cb) + ssd_u8(&cr_rc, &src_cr);
             rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
             local.cb = cb_rc;
@@ -2344,7 +2475,7 @@ impl Emitter<'_, '_> {
             log2_trafo_size: log2,
             is_chroma: c_idx != 0,
             scan_idx: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, u32::from(mode)),
-            sign_data_hiding_enabled_flag: false,
+            sign_data_hiding_enabled_flag: self.ctx.cfg.sign_hiding,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
             persistent_rice_adaptation_enabled_flag: false,

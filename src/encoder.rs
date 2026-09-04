@@ -43,6 +43,9 @@ mod rdpcm_streams;
 mod scc_streams;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod quant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod residual;
 
 /// Registry-encoder coding mode, selected by the `mode` codec option.
@@ -332,7 +335,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 }),
         }
     };
-    let tree = parse_ctb(params)?;
+    let mut tree = parse_ctb(params)?;
+    // Quadtree-coder tools (each requires `ctb`): `sdh` — sign data
+    // hiding.
+    let sdh = parse_flag(params, "sdh")?;
+    if sdh && tree.is_none() {
+        return Err(Error::InvalidData(
+            "h265 encode: the sdh option requires the ctb option".into(),
+        ));
+    }
+    if let Some(t) = tree.as_mut() {
+        *t = t.with_sign_hiding(sdh);
+    }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
     let ctu_rc = parse_flag(params, "cturc")?;
     if ctu_rc && (params.options.get("bitrate").is_none() || tree.is_none()) {

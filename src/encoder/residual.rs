@@ -12,10 +12,17 @@
 //! array with identical context-state evolution (pinned by the
 //! differential tests below).
 //!
+//! Sign data hiding: with `sign_data_hiding_enabled_flag == 1` the
+//! first-in-scan-order sign of every `signHidden` sub-block is
+//! omitted, and the caller's levels must already carry the
+//! §7.3.8.11 parity (`sumAbsLevel % 2 == 1` ⇔ that coefficient is
+//! negative — [`crate::encoder::quant::quantize_tb`] enforces it);
+//! a parity mismatch is reported as
+//! [`ResidualEncodeError::SignParity`] rather than emitted.
+//!
 //! Scope bounds (the emitting encoder's fixed configuration, not
-//! §7.3.8.11 limits): `sign_data_hiding_enabled_flag == 0` (a hidden
-//! sign would require parity-forcing the quantized levels) and no
-//! transform-skip / transquant-bypass residual rewrites.
+//! §7.3.8.11 limits): no transform-skip / transquant-bypass residual
+//! rewrites.
 
 use crate::binarization::{
     coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
@@ -51,9 +58,11 @@ pub enum ResidualEncodeError {
     /// A |level| exceeds the §7.4.9.11 CoeffMax bound for the
     /// non-extended-precision profiles (`2^15 − 1`).
     LevelOutOfRange(i32),
-    /// `sign_data_hiding_enabled_flag == 1` — this encoder does not
-    /// parity-force levels for hidden signs.
-    SignHidingUnsupported,
+    /// `sign_data_hiding_enabled_flag == 1` and a `signHidden`
+    /// sub-block's `sumAbsLevel` parity disagrees with the sign of
+    /// its first-in-scan-order coefficient (the decoder would flip
+    /// it): the levels were not parity-adjusted.
+    SignParity,
 }
 
 impl core::fmt::Display for ResidualEncodeError {
@@ -70,8 +79,8 @@ impl core::fmt::Display for ResidualEncodeError {
             }
             Self::AllZero => write!(f, "residual encode: all-zero block (cbf must be 0)"),
             Self::LevelOutOfRange(v) => write!(f, "residual encode: level {v} out of range"),
-            Self::SignHidingUnsupported => {
-                write!(f, "residual encode: sign data hiding not supported")
+            Self::SignParity => {
+                write!(f, "residual encode: sign-hiding parity mismatch")
             }
         }
     }
@@ -208,9 +217,6 @@ pub fn encode_residual_coding(
     let scan_idx_num = u32::from(params.scan_idx.index());
     if scan_idx_num > 2 {
         return Err(ResidualEncodeError::UnsupportedScanIdx(params.scan_idx));
-    }
-    if params.sign_data_hiding_enabled_flag {
-        return Err(ResidualEncodeError::SignHidingUnsupported);
     }
     let size = 1usize << log2;
     if levels.len() != size * size {
@@ -426,7 +432,20 @@ pub fn encode_residual_coding(
                 first_sig_scan_pos = n as i32;
             }
         }
-        let _ = (first_sig_scan_pos, last_sig_scan_pos); // sign hiding off
+        // §7.3.8.11 signHidden.
+        let sign_hidden = params.sign_data_hiding_enabled_flag
+            && !params.sign_hidden_suppressed
+            && last_sig_scan_pos - first_sig_scan_pos > 3;
+        if sign_hidden {
+            let sum_abs: u64 = (0..16usize)
+                .filter(|&n| sig[n] == 1)
+                .map(|n| u64::from(coeff_at(i as usize, n).unsigned_abs()))
+                .sum();
+            let negative = coeff_at(i as usize, first_sig_scan_pos as usize) < 0;
+            if (sum_abs % 2 == 1) != negative {
+                return Err(ResidualEncodeError::SignParity);
+            }
+        }
 
         // greater-2 flag — at most once per sub-block.
         let mut g2 = [0u8; 16];
@@ -442,9 +461,10 @@ pub fn encode_residual_coding(
             g2[last_greater1_scan_pos as usize] = bin;
         }
 
-        // coeff_sign_flag pass (bypass; sign hiding disabled).
+        // coeff_sign_flag pass (bypass), the hidden first sign
+        // omitted.
         for n in (0..16usize).rev() {
-            if sig[n] == 1 {
+            if sig[n] == 1 && !(sign_hidden && n as i32 == first_sig_scan_pos) {
                 let sign = u8::from(coeff_at(i as usize, n) < 0);
                 cabac.encode_bypass(w, sign);
             }
@@ -619,6 +639,31 @@ mod tests {
         levels[4 * size + 4] = 5; // sub-block (1,1) DC only
         levels[0] = -9;
         roundtrip(&params(4, false, ScanIdx::Diagonal), &levels);
+    }
+
+    #[test]
+    fn sign_hiding_omits_the_first_sign_and_rejects_bad_parity() {
+        let mut p = params(2, false, ScanIdx::Diagonal);
+        p.sign_data_hiding_enabled_flag = true;
+        // Diagonal 4x4 scan: position 0 is (0,0), position 15 is
+        // (3,3); a nonzero at both gives a spread of 15 > 3.
+        let mut levels = [0i32; 16];
+        levels[15] = 1; // last: (3,3)
+        levels[0] = -2; // first in scan order: DC, sum 3 odd => negative
+        roundtrip(&p, &levels);
+        levels[0] = 2; // sum 3 odd but positive: parity mismatch
+        let mut w = BitWriter::new();
+        let mut cabac = CabacEncoder::new();
+        let mut ctx = ResidualContexts::init(0, 26);
+        assert_eq!(
+            encode_residual_coding(&mut w, &mut cabac, &mut ctx, &p, &levels),
+            Err(ResidualEncodeError::SignParity)
+        );
+        // A spread <= 3 sub-block hides nothing.
+        let mut narrow = [0i32; 16];
+        narrow[0] = 3;
+        narrow[1] = 1; // scan position 1 => spread 1
+        roundtrip(&p, &narrow);
     }
 
     #[test]

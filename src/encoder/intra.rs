@@ -1386,7 +1386,14 @@ pub(crate) fn assemble_idr_au(
             34,
             0,
             0,
-            &write_pps_full(false, false, lf.deblocking, None, cfg.cu_qp_delta),
+            &write_pps_full(
+                false,
+                false,
+                lf.deblocking,
+                None,
+                cfg.cu_qp_delta,
+                cfg.tree.is_some_and(|t| t.sign_hiding),
+            ),
         ), // PPS_NUT
         nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP
     ];

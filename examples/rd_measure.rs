@@ -79,11 +79,12 @@ fn parse_tools(s: &str) -> Result<Tools, String> {
 }
 
 fn tree_cfg(ctb: usize, t: &Tools) -> TreeCfg {
-    let mut cfg = TreeCfg::new(ctb).expect("ctb 16/32/64");
-    cfg.th_depth_intra = t.tu_depth;
-    cfg.th_depth_inter = t.tu_depth;
+    let cfg = TreeCfg::new(ctb)
+        .expect("ctb 16/32/64")
+        .with_tu_depth(t.tu_depth, t.tu_depth)
+        .with_sign_hiding(t.sdh);
     assert!(
-        !(t.rdoq || t.sdh || t.scaling_lists || t.wpp || t.weighted_pred || t.tiles.is_some()),
+        !(t.rdoq || t.scaling_lists || t.wpp || t.weighted_pred || t.tiles.is_some()),
         "tool not wired yet"
     );
     cfg

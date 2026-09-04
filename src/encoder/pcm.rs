@@ -359,6 +359,7 @@ pub(crate) fn write_pps_full(
     deblocking_override_enabled: bool,
     tiles: Option<(u32, u32)>,
     cu_qp_delta: bool,
+    sign_data_hiding: bool,
 ) -> Vec<u8> {
     let grid = tiles.map(|(c, r)| TileGrid::uniform(c, r));
     write_pps_grid(
@@ -367,6 +368,7 @@ pub(crate) fn write_pps_full(
         deblocking_override_enabled,
         grid.as_ref(),
         cu_qp_delta,
+        sign_data_hiding,
     )
 }
 
@@ -378,6 +380,7 @@ pub(crate) fn write_pps_grid(
     deblocking_override_enabled: bool,
     tiles: Option<&TileGrid>,
     cu_qp_delta: bool,
+    sign_data_hiding: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
@@ -385,7 +388,7 @@ pub(crate) fn write_pps_grid(
     w.put_bit(u8::from(dependent_slice_segments_enabled)); // dependent_slice_segments_enabled_flag
     w.put_bit(0); // output_flag_present_flag
     w.put_bits(0, 3); // num_extra_slice_header_bits
-    w.put_bit(0); // sign_data_hiding_enabled_flag
+    w.put_bit(u8::from(sign_data_hiding)); // sign_data_hiding_enabled_flag
     w.put_bit(0); // cabac_init_present_flag
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
@@ -918,7 +921,14 @@ fn encode_au(
             34,
             0,
             0,
-            &write_pps_grid(dependent_mode, opts.deblocking, false, grid.as_ref(), false),
+            &write_pps_grid(
+                dependent_mode,
+                opts.deblocking,
+                false,
+                grid.as_ref(),
+                false,
+                false,
+            ),
         ), // PPS_NUT
     ];
     if let Some(g) = &grid {

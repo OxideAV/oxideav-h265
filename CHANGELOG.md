@@ -6,6 +6,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* sign data hiding (`sign_data_hiding_enabled_flag`) on the quadtree coder — §7.3.8.11 `signHidden` sub-blocks omit their first sign, the levels parity-adjusted by the cheapest ±1 move (`TreeCfg::with_sign_hiding`, registry `sdh`); the residual encoder gains the hidden-sign path with a parity guard
+- *(examples)* `rd_measure` — BD-rate harness over a deterministic synthetic corpus with decoder-exactness checks and .hevc/.yuv dumps for black-box validation
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-h265/compare/v0.0.9...v0.0.10) - 2026-08-30
 
 ### Added

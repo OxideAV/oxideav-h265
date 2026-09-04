@@ -96,7 +96,7 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `pyramid` / `pyramidstep` / `adaptivegop`) —
+  `refs`, `tmvp`, `sdh`, `pyramid` / `pyramidstep` / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
   (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
@@ -183,6 +183,14 @@ constant-bit-rate delivery (`cbr_flag == 1`, eq. C-19 bounds,
 (`aq` 1..=3) signals per-CTB activity offsets through `cu_qp_delta`
 on every coding mode. An explicit `fps` declares §E.2.1 VUI timing.
 
+**Quantization tools** (quadtree coder, `TreeCfg` builders / registry
+options, off by default so the golden pins stay byte-stable): **sign
+data hiding** (`sdh`: PPS `sign_data_hiding_enabled_flag`, the
+§7.3.8.11 `signHidden` sub-blocks omit their first-in-scan sign and
+the levels are parity-adjusted by the cheapest ±1 move under a
+sample-domain distortion + rate estimate) — −2.5..−4 % bytes on the
+`rd_measure` corpus at near-neutral BD-rate.
+
 4:2:0 8-bit, dimensions multiples of 16.
 
 ## What's implemented
@@ -249,12 +257,12 @@ and ~960 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: encoder-side WPP / tile
-  parallel emission, weighted prediction estimation, sign data
-  hiding, RDOQ, scaling-list-aware quantization, and SCC-tool
-  (palette / IBC / ACT) encoding; the quadtree coder keeps
+  parallel emission, weighted prediction estimation, RDOQ,
+  scaling-list-aware quantization, and SCC-tool (palette / IBC /
+  ACT) encoding; the quadtree coder keeps
   `max_transform_hierarchy_depth_* == 1` and leaves 8x4 / 4x8 inter
-  PUs and intra `PART_NxN` above `MinCbSizeY` out of the ladder;
-  CTU-level rate feedback rides only the quadtree coder.
+  PUs out of the ladder; CTU-level rate feedback and the
+  quantization tools ride only the quadtree coder.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both
