@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-h265/compare/v0.0.10...v0.0.11) - 2026-09-04
+
+### Added
+
+- *(encoder)* tile-parallel pass 1 under the core ExecutionContext contract
+- *(encoder)* encoder-side WPP and tiles on the quadtree coder (wpp / tiles)
+- *(encoder)* weighted prediction estimation (wp) — §7.3.6.3 pred_weight_table from fade detection
+- *(encoder)* scaling-list-aware quantization (sl) — default + custom §7.3.4 lists
+- *(encoder)* deeper transform hierarchy (tudepth) + 8x4 / 4x8 inter PUs in the quadtree ladder
+- *(encoder)* RDOQ on the quadtree coder (rdoq)
+- *(encoder)* sign data hiding on the quadtree coder (sdh)
+
+### Other
+
+- round-456 status — quantization / hierarchy / weighted-prediction / WPP-tile tools, composed pins, unit-test count
+- *(encoder)* round-456 tool pins — composed RDOQ/SDH/tu2/WP/WPP pyramid + tiles/scaling-list/AQ low-delay streams, black-box validated
+- *(examples)* rd_measure — BD-rate harness over a deterministic synthetic corpus
+
 ### Added
 
 - *(encoder)* tile-parallel pass 1 under the core `ExecutionContext` contract: the quadtree coder decides the tiles of a picture independently (own state, own shadow coder, per-tile pro-rata CTU-rate budget) on up to `threads` workers (`LowDelayPEncoder` / `PyramidEncoder::with_threads`, `Encoder::set_execution_context` on the registry encoder), merged in tile-scan order — serial by default and bit-identical for any budget (CI-pinned); the decode-side `PuMvContext` closures gained `Sync` bounds
