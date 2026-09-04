@@ -224,7 +224,10 @@ the WPP+tiles combination follows the spec text and the crate's
 decoder (byte-exact on the seven official WPP+tile conformance
 streams) but the surveyed black-box reference decoder diverges on it
 (it also misdecodes the official `WPP_AND_TILE_*` streams), so that
-combination is decoder-pinned only.
+combination is decoder-pinned only. Tiled pictures are decided
+**tile-parallel** under the core `ExecutionContext` budget
+(`with_threads` / `set_execution_context`; serial by default,
+bit-identical for any worker count).
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -291,9 +294,9 @@ and ~960 unit tests.
 
 ## Not yet implemented
 
-* Encoder tools beyond the current set: a parallel (multi-threaded)
-  tile encode under the core `ExecutionContext` budget — every path
-  is serial today — and SCC-tool (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
+* Encoder tools beyond the current set: SCC-tool (palette / IBC /
+  ACT) encoding, and a WPP-parallel (row-pipelined) pass 1 — only
+  tiles fan out today; CTU-level rate feedback and the quantization /
   hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU

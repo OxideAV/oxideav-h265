@@ -109,7 +109,8 @@ enum EncodeMode {
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+    CodecId, CodecParameters, Encoder, Error, ExecutionContext, Frame, Packet, PixelFormat, Result,
+    TimeBase,
 };
 
 /// H.265 registry encoder behind the [`oxideav_core::Encoder`]
@@ -192,6 +193,11 @@ pub struct H265Encoder {
     /// Packet time base (`fps_den / fps_num` from the `fps` option;
     /// default 1/25).
     time_base: TimeBase,
+    /// The [`ExecutionContext`] worker budget (1 until the host sets
+    /// one): the quadtree coder decides the tiles of a picture on up
+    /// to this many threads. Serial by default; the bytes never
+    /// depend on it.
+    threads: usize,
 }
 
 /// Former name of [`H265Encoder`] (from when the registry encoder was
@@ -658,6 +664,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ready: VecDeque::new(),
         frame_index: 0,
         time_base: TimeBase::new(i64::from(fps.1), i64::from(fps.0)),
+        threads: 1,
     }))
 }
 
@@ -732,6 +739,7 @@ impl Encoder for H265Encoder {
                     hrd: hrd.as_ref().map(|(signal, _)| *signal),
                     min_cb_log2: if tree.is_some() { 3 } else { 4 },
                     tree: *tree,
+                    threads: self.threads,
                     ..intra::SpsCfg::legacy(1)
                 };
                 // The HRD SEI prefix: every frame is an IRAP access
@@ -857,6 +865,15 @@ impl Encoder for H265Encoder {
 
     fn receive_packet(&mut self) -> Result<Packet> {
         self.ready.pop_front().ok_or(Error::NeedMore)
+    }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.threads = ctx.threads.max(1);
+        match &mut self.mode {
+            EncodeMode::Inter(enc) => enc.set_threads(self.threads),
+            EncodeMode::Pyramid { enc, .. } => enc.set_threads(self.threads),
+            EncodeMode::Pcm | EncodeMode::Intra { .. } => {}
+        }
     }
 
     fn flush(&mut self) -> Result<()> {

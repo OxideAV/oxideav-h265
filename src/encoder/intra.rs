@@ -189,6 +189,11 @@ pub(crate) struct SpsCfg {
     /// fixed-geometry coders byte-stable. When set, `min_cb_log2`
     /// must be 3 (the quadtree streams always signal MinCb 8).
     pub tree: Option<crate::encoder::ctu::TreeCfg>,
+    /// Not stream syntax: the pass-1 fan-out budget of the quadtree
+    /// coder (tiles decided in parallel by up to this many workers;
+    /// 1 = serial, the [`oxideav_core::ExecutionContext`] default).
+    /// The coded bytes never depend on it.
+    pub threads: usize,
 }
 
 impl SpsCfg {
@@ -205,6 +210,7 @@ impl SpsCfg {
             hrd: None,
             temporal_mvp: false,
             tree: None,
+            threads: 1,
         }
     }
 }

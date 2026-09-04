@@ -216,6 +216,8 @@ pub struct PyramidEncoder {
     adaptive: bool,
     /// CTU-level rate feedback ([`Self::with_ctu_rate_control`]).
     ctu_rc: bool,
+    /// Pass-1 worker budget ([`Self::with_threads`]).
+    threads: usize,
     /// Running mean absolute inter-frame luma difference (Q4) of the
     /// non-cut frame pairs seen so far — the scene-cut baseline.
     mad_avg_q4: Option<u64>,
@@ -270,6 +272,7 @@ impl PyramidEncoder {
             adaptive: false,
             mad_avg_q4: None,
             ctu_rc: false,
+            threads: 1,
         })
     }
 
@@ -279,6 +282,19 @@ impl PyramidEncoder {
     pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
         self.ctu_rc = on;
         self
+    }
+
+    /// Bound the quadtree coder's pass-1 fan-out (tiles decided on up
+    /// to `n` threads; serial by default, bytes independent of `n`).
+    #[must_use]
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = n.max(1);
+        self
+    }
+
+    /// [`Self::with_threads`] on a constructed encoder.
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = n.max(1);
     }
 
     /// The frame budget the CTU-level feedback tracks (`None` when
@@ -536,6 +552,7 @@ impl PyramidEncoder {
             hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
             temporal_mvp: self.tmvp,
             tree: self.tree,
+            threads: self.threads,
         }
     }
 
@@ -835,6 +852,7 @@ impl PyramidEncoder {
                 collocated_ref_idx: 0,
             },
             ctu_rc: self.ctu_budget(),
+            threads: self.threads,
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAu {

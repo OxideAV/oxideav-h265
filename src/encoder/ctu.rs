@@ -472,6 +472,8 @@ struct SliceCtx<'a> {
     /// weighted prediction; else the reference planes themselves).
     me_refs_l0: &'a [RefPlanes],
     me_refs_l1: &'a [RefPlanes],
+    /// Pass-1 worker budget (tiles decided in parallel; 1 = serial).
+    threads: usize,
 }
 
 impl SliceCtx<'_> {
@@ -2906,27 +2908,74 @@ struct CodedPicture {
     sao_ctbs: Vec<SaoCtbParams>,
 }
 
-/// Pass 1 + filters for one picture (I, P or B).
-#[allow(clippy::too_many_lines)]
-fn code_picture(
-    ctx: &SliceCtx<'_>,
-    lf: &LoopFilterCfg,
-    cu_qp_delta: bool,
-    slice_type_raw: u8,
-) -> CodedPicture {
+/// One tile's pass-1 job: its tile-scan range and luma rectangle.
+struct TileJob {
+    ts_start: usize,
+    ts_end: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+}
+
+/// The §6.5.1 tile grid as pass-1 jobs (tile-scan order).
+fn tile_jobs(ctx: &SliceCtx<'_>) -> Vec<TileJob> {
+    let ctb = 1usize << ctx.cfg.ctb_log2;
+    let ctbs_x = ctx.ctbs_x();
+    let col_bd = ctx.tiling.col_bd();
+    let row_bd = ctx.tiling.row_bd();
+    let mut jobs = Vec::new();
+    for r in 0..row_bd.len() - 1 {
+        for c in 0..col_bd.len() - 1 {
+            let (cx0, cx1) = (col_bd[c] as usize, col_bd[c + 1] as usize);
+            let (cy0, cy1) = (row_bd[r] as usize, row_bd[r + 1] as usize);
+            let rs = cy0 * ctbs_x + cx0;
+            let ts_start = ctx.tiling.ctb_addr_rs_to_ts(rs as u32) as usize;
+            let x0 = cx0 * ctb;
+            let y0 = cy0 * ctb;
+            jobs.push(TileJob {
+                ts_start,
+                ts_end: ts_start + (cx1 - cx0) * (cy1 - cy0),
+                x0,
+                y0,
+                w: (cx1 * ctb).min(ctx.width) - x0,
+                h: (cy1 * ctb).min(ctx.height) - y0,
+            });
+        }
+    }
+    jobs
+}
+
+/// One tile's pass-1 output: the state it decided into (only its
+/// rectangle is meaningful) and its CTB plans in tile-scan order.
+struct TileOut {
+    st: EncState,
+    plans: Vec<CuNode>,
+    ctb_qps: Vec<i32>,
+}
+
+/// Pass 1 over one tile: the CTU decisions in tile-scan order with the
+/// tile's own shadow entropy coder (§9.3.2.1 re-initializes at the
+/// tile start, so the shadow's context states — and with them RDOQ —
+/// never depend on other tiles) and, under CTU-level rate feedback,
+/// the tile's pro-rata share of the frame budget.
+fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta: bool) -> TileOut {
     let mut st = EncState::new(ctx.width, ctx.height, ctx.cfg.ctb_log2);
     let ctbs_x = ctx.ctbs_x();
-    let ctbs_y = ctx.ctbs_y();
-    let n_ctbs = ctbs_x * ctbs_y;
+    let n_ctbs = ctbs_x * ctx.ctbs_y();
+    let n_tile = job.ts_end - job.ts_start;
     let ctb = 1usize << ctx.cfg.ctb_log2;
-    let mut plans: Vec<CuNode> = Vec::with_capacity(n_ctbs);
-    let mut ctb_qps: Vec<i32> = Vec::with_capacity(n_ctbs);
+    let mut plans: Vec<CuNode> = Vec::with_capacity(n_tile);
+    let mut ctb_qps: Vec<i32> = Vec::with_capacity(n_tile);
     // CTU-level rate feedback: a shadow CABAC emission of every coded
     // CTB (no SAO syntax — that is elected after the filters) tracks
-    // the picture's running coded size against the pro-rata budget.
+    // the tile's running coded size against its pro-rata budget.
     // RDOQ prices its bins at the same shadow's residual context
     // states (refreshed at every CTB start). The shadow walks the
-    // same tile / WPP subset structure as the final emission.
+    // same WPP subset structure as the final emission.
+    let tile_budget = ctx
+        .ctu_rc
+        .map(|b| b.saturating_mul(n_tile as u64) / n_ctbs as u64);
     let mut shadow: Option<(EntropyCoder, i32)> =
         (ctx.ctu_rc.is_some() || ctx.cfg.rdoq).then(|| {
             (
@@ -2934,21 +2983,21 @@ fn code_picture(
                 ctx.qp,
             )
         });
-    for ctb_idx in 0..n_ctbs {
-        // Coding order is the §6.5.1 tile scan.
-        let rs = ctx.ctb_rs(ctb_idx);
+    for ts in job.ts_start..job.ts_end {
+        let local = ts - job.ts_start;
+        let rs = ctx.ctb_rs(ts);
         let x0 = (rs % ctbs_x) * ctb;
         let y0 = (rs / ctbs_x) * ctb;
         if let Some((coder, qp_prev)) = shadow.as_mut() {
-            coder.begin_ctb(ctx, ctb_idx);
-            if ctx.qp_prev_resets(ctb_idx) {
+            coder.begin_ctb(ctx, ts);
+            if ctx.qp_prev_resets(ts) {
                 *qp_prev = ctx.qp;
             }
         }
-        let rc_adj = match (ctx.ctu_rc, &shadow) {
-            (Some(budget), Some((coder, _))) if ctb_idx > 0 => {
+        let rc_adj = match (tile_budget, &shadow) {
+            (Some(budget), Some((coder, _))) if local > 0 => {
                 let so_far = coder.bit_len();
-                let expected = budget.saturating_mul(ctb_idx as u64) / n_ctbs as u64;
+                let expected = budget.saturating_mul(local as u64) / n_tile as u64;
                 // Ratio in Q8: over-spending raises the QP, under-
                 // spending lowers it, in bounded steps (±3).
                 match so_far.saturating_mul(256).checked_div(expected) {
@@ -2964,7 +3013,7 @@ fn code_picture(
             }
             _ => 0,
         };
-        let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx] + rc_adj).clamp(0, 51);
+        let ctb_qp = (ctx.qp + ctx.aq_deltas[rs] + rc_adj).clamp(0, 51);
         if ctx.cfg.rdoq {
             st.rdoq_model = shadow.as_ref().map(|(coder, _)| RdoqModel {
                 contexts: coder.ctxs.residual.clone(),
@@ -2989,11 +3038,106 @@ fn code_picture(
             if qg.coded {
                 *qp_prev = ctb_qp;
             }
-            coder.end_ctb(ctx, ctb_idx, ctb_idx + 1 == n_ctbs);
+            coder.end_ctb(ctx, ts, ts + 1 == job.ts_end);
         }
         plans.push(node);
         ctb_qps.push(ctb_qp);
     }
+    TileOut { st, plans, ctb_qps }
+}
+
+/// Copy a tile's rectangle of decided state into the picture state.
+fn merge_tile(master: &mut EncState, tile: &EncState, ctx: &SliceCtx<'_>, job: &TileJob) {
+    let (x0, y0, w, h) = (job.x0, job.y0, job.w, job.h);
+    let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
+    let y = rect_copy(&tile.recon.y, ctx.width, x0, y0, w, h);
+    rect_paste(&mut master.recon.y, ctx.width, x0, y0, w, h, &y);
+    let cb = rect_copy(&tile.recon.cb, cw, cx0, cy0, w / 2, h / 2);
+    rect_paste(&mut master.recon.cb, cw, cx0, cy0, w / 2, h / 2, &cb);
+    let cr = rect_copy(&tile.recon.cr, cw, cx0, cy0, w / 2, h / 2);
+    rect_paste(&mut master.recon.cr, cw, cx0, cy0, w / 2, h / 2, &cr);
+    let field = tile.field.snapshot_rect(x0, y0, w, h);
+    master.field.restore_rect(x0, y0, w, h, &field);
+    let modes = tile.modes.snapshot_rect(x0, y0, w, h);
+    master.modes.restore_rect(x0, y0, w, h, &modes);
+    let bx1 = (x0 + w).div_ceil(4).min(master.w_cells);
+    let by1 = (y0 + h).div_ceil(4).min(master.h_cells);
+    for by in y0 / 4..by1 {
+        for bx in x0 / 4..bx1 {
+            let c = by * master.w_cells + bx;
+            master.ct_depth[c] = tile.ct_depth[c];
+            master.skip[c] = tile.skip[c];
+        }
+    }
+}
+
+/// Pass 1 + filters for one picture (I, P or B). The tiles are decided
+/// independently (each in its own state — §6.4.1 availability never
+/// crosses a tile boundary) on up to `ctx.threads` workers, then
+/// merged in tile-scan order; the result is identical for any budget.
+#[allow(clippy::too_many_lines)]
+fn code_picture(
+    ctx: &SliceCtx<'_>,
+    lf: &LoopFilterCfg,
+    cu_qp_delta: bool,
+    slice_type_raw: u8,
+) -> CodedPicture {
+    let ctbs_x = ctx.ctbs_x();
+    let ctbs_y = ctx.ctbs_y();
+    let n_ctbs = ctbs_x * ctbs_y;
+    let ctb = 1usize << ctx.cfg.ctb_log2;
+    let jobs = tile_jobs(ctx);
+    let workers = ctx.threads.min(jobs.len()).max(1);
+    let outs: Vec<TileOut> = if workers <= 1 {
+        jobs.iter()
+            .map(|job| code_tile(ctx, job, slice_type_raw, cu_qp_delta))
+            .collect()
+    } else {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut done: Vec<Option<TileOut>> = (0..jobs.len()).map(|_| None).collect();
+        let handles: Vec<Vec<(usize, TileOut)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= jobs.len() {
+                                break;
+                            }
+                            mine.push((i, code_tile(ctx, &jobs[i], slice_type_raw, cu_qp_delta)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|h| h.join().expect("tile worker"))
+                .collect()
+        });
+        for (i, out) in handles.into_iter().flatten() {
+            done[i] = Some(out);
+        }
+        done.into_iter()
+            .map(|o| o.expect("every tile decided"))
+            .collect()
+    };
+    let (mut st, plans, ctb_qps) = if outs.len() == 1 {
+        let TileOut { st, plans, ctb_qps } = outs.into_iter().next().expect("one tile");
+        (st, plans, ctb_qps)
+    } else {
+        let mut st = EncState::new(ctx.width, ctx.height, ctx.cfg.ctb_log2);
+        let mut plans = Vec::with_capacity(n_ctbs);
+        let mut ctb_qps = Vec::with_capacity(n_ctbs);
+        for (job, out) in jobs.iter().zip(outs) {
+            merge_tile(&mut st, &out.st, ctx, job);
+            plans.extend(out.plans);
+            ctb_qps.extend(out.ctb_qps);
+        }
+        (st, plans, ctb_qps)
+    };
+    st.rdoq_model = None;
 
     // Stats.
     let mut stats = FrameStats::default();
@@ -3235,6 +3379,7 @@ pub(crate) fn encode_intra_picture_tree(
         wp: None,
         me_refs_l0: &[],
         me_refs_l1: &[],
+        threads: cfg.threads,
     };
     let cu_qp_delta = aq > 0 || ctu_rc.is_some();
     debug_assert!(
@@ -3428,6 +3573,7 @@ pub(crate) fn encode_inter_slice_tree(
         wp: wp_tables.as_ref().map(|t| &t.resolved),
         me_refs_l0,
         me_refs_l1,
+        threads: spec.threads,
     };
     let cu_qp_delta = spec.aq > 0 || spec.ctu_rc.is_some();
     let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
@@ -3763,6 +3909,40 @@ mod tests {
         }
         let stream: Vec<u8> = aus.concat();
         assert_eq!(decode_annexb_sequence(&stream).expect("decode").len(), 2);
+    }
+
+    /// The tile-parallel pass 1 is bit-identical to the serial one
+    /// (2x2 tiles, RDOQ + WPP + AQ + filters, P and B slices).
+    #[test]
+    fn tree_parallel_tiles_match_serial() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        let (w, h) = (96, 64);
+        let frames = scene(w, h, 3);
+        let cfg = TreeCfg::new(16)
+            .expect("ctb")
+            .with_tiles(TileLayout::uniform(2, 2))
+            .with_wpp(true)
+            .with_rdoq(true);
+        let encode = |threads: usize| -> Vec<u8> {
+            let mut enc = LowDelayPEncoder::new(w, h, 30, 0)
+                .expect("encoder")
+                .with_tree(cfg)
+                .with_b_slices(true)
+                .with_aq(1)
+                .with_loop_filters(LoopFilterCfg::all())
+                .with_threads(threads);
+            let mut stream = Vec::new();
+            for (y, cb, cr) in &frames {
+                stream.extend_from_slice(
+                    &enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame").au,
+                );
+            }
+            stream
+        };
+        let serial = encode(1);
+        assert_eq!(encode(4), serial, "4 workers");
+        assert_eq!(encode(2), serial, "2 workers");
+        assert_eq!(decode_annexb_sequence(&serial).expect("decode").len(), 3);
     }
 
     #[test]

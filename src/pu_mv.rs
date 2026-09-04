@@ -235,17 +235,17 @@ pub struct PuMvContext<'a> {
     pub no_backward_pred: bool,
     /// Resolve `(list, ref_idx)` of the current PU's reference list to a
     /// reference-picture POC.
-    pub ref_poc: &'a dyn Fn(usize, i32) -> i32,
+    pub ref_poc: &'a (dyn Fn(usize, i32) -> i32 + Sync),
     /// Resolve `(list, ref_idx)` to whether the picture is long-term.
-    pub ref_long_term: &'a dyn Fn(usize, i32) -> bool,
+    pub ref_long_term: &'a (dyn Fn(usize, i32) -> bool + Sync),
     /// Resolve `(list, ref_idx)` to whether the picture is short-term.
-    pub ref_short_term: &'a dyn Fn(usize, i32) -> bool,
+    pub ref_short_term: &'a (dyn Fn(usize, i32) -> bool + Sync),
     /// The collocated picture's per-block motion field (§8.5.3.2.9), when
     /// `slice_temporal_mvp_enabled_flag` and a `ColPic` was selected.
     pub col_field: Option<&'a MotionField>,
     /// Resolve the collocated picture's stored `refIdxCol` reference POC to
     /// whether that reference is long-term (the §8.5.3.2.9 scaling gate).
-    pub col_ref_long_term: &'a dyn Fn(i32) -> bool,
+    pub col_ref_long_term: &'a (dyn Fn(i32) -> bool + Sync),
     /// `use_integer_mv_flag` (§7.4.7.1) — selects the eqs 8-98..8-101 /
     /// 8-124..8-125 integer-resolution motion-vector path for every
     /// reference.
@@ -257,7 +257,7 @@ pub struct PuMvContext<'a> {
     /// the CURRENT picture (§8.3.4 currPic — intra block copy). Its
     /// motion vectors take the integer-resolution path regardless of
     /// `use_integer_mv`.
-    pub is_curr_pic: &'a dyn Fn(usize, i32) -> bool,
+    pub is_curr_pic: &'a (dyn Fn(usize, i32) -> bool + Sync),
 }
 
 impl std::fmt::Debug for PuMvContext<'_> {
@@ -863,10 +863,10 @@ mod tests {
     }
 
     fn base_ctx<'a>(
-        ref_poc: &'a dyn Fn(usize, i32) -> i32,
-        long: &'a dyn Fn(usize, i32) -> bool,
-        short: &'a dyn Fn(usize, i32) -> bool,
-        col_long: &'a dyn Fn(i32) -> bool,
+        ref_poc: &'a (dyn Fn(usize, i32) -> i32 + Sync),
+        long: &'a (dyn Fn(usize, i32) -> bool + Sync),
+        short: &'a (dyn Fn(usize, i32) -> bool + Sync),
+        col_long: &'a (dyn Fn(i32) -> bool + Sync),
     ) -> PuMvContext<'a> {
         PuMvContext {
             curr_poc: 4,

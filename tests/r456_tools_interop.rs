@@ -143,3 +143,47 @@ fn lowdelay_tiles_sl_rdoq_aq_pin() {
     assert_eq!(stream, golden, "stream drifted off the validated pin");
     assert_display_order_exact(&stream, &recons, w, h);
 }
+
+/// The registry encoder honours the core `ExecutionContext` budget:
+/// a tiled stream encoded on three workers is byte-identical to the
+/// serial default.
+#[test]
+fn registry_execution_context_is_byte_transparent() {
+    use oxideav_core::{
+        CodecParameters, ExecutionContext, Frame, PixelFormat, VideoFrame, VideoPlane,
+    };
+    let (w, h) = (96usize, 64usize);
+    let frames = scene(w, h, 3);
+    let encode = |threads: Option<usize>| -> Vec<u8> {
+        let mut p = CodecParameters::video("h265".into());
+        p.width = Some(w as u32);
+        p.height = Some(h as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p.options.insert("mode", "inter");
+        p.options.insert("ctb", "32");
+        p.options.insert("tiles", "2x2");
+        p.options.insert("rdoq", "1");
+        p.options.insert("qp", "30");
+        let mut enc = oxideav_h265::make_encoder(&p).expect("encoder");
+        if let Some(n) = threads {
+            enc.set_execution_context(&ExecutionContext::with_threads(n));
+        }
+        let plane = |data: &[u8], stride: usize| VideoPlane {
+            stride,
+            data: data.to_vec(),
+        };
+        let mut stream = Vec::new();
+        for (y, cb, cr) in &frames {
+            enc.send_frame(&Frame::Video(VideoFrame {
+                pts: None,
+                planes: vec![plane(y, w), plane(cb, w / 2), plane(cr, w / 2)],
+            }))
+            .expect("send");
+            stream.extend_from_slice(&enc.receive_packet().expect("packet").data);
+        }
+        stream
+    };
+    let serial = encode(None);
+    assert_eq!(encode(Some(3)), serial, "three workers");
+    assert_eq!(decode_annexb_sequence(&serial).expect("decode").len(), 3);
+}

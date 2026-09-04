@@ -1237,10 +1237,10 @@ mod tests {
     /// Build a single-reference P-slice context: one short-term reference at
     /// POC 0, current picture at POC 4, temporal MVP disabled.
     fn p_ctx<'a>(
-        ref_poc: &'a dyn Fn(usize, i32) -> i32,
-        long: &'a dyn Fn(usize, i32) -> bool,
-        short: &'a dyn Fn(usize, i32) -> bool,
-        col_long: &'a dyn Fn(i32) -> bool,
+        ref_poc: &'a (dyn Fn(usize, i32) -> i32 + Sync),
+        long: &'a (dyn Fn(usize, i32) -> bool + Sync),
+        short: &'a (dyn Fn(usize, i32) -> bool + Sync),
+        col_long: &'a (dyn Fn(i32) -> bool + Sync),
     ) -> PuMvContext<'a> {
         PuMvContext {
             curr_poc: 4,

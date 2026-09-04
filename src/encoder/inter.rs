@@ -314,6 +314,9 @@ pub struct LowDelayPEncoder {
     tmvp: bool,
     /// CTU-level rate feedback ([`Self::with_ctu_rate_control`]).
     ctu_rc: bool,
+    /// Pass-1 worker budget ([`Self::with_threads`] /
+    /// [`Self::set_threads`]; tiles decided in parallel).
+    threads: usize,
 }
 
 impl LowDelayPEncoder {
@@ -352,6 +355,7 @@ impl LowDelayPEncoder {
             refs: 2,
             tmvp: false,
             ctu_rc: false,
+            threads: 1,
         })
     }
 
@@ -364,6 +368,21 @@ impl LowDelayPEncoder {
     pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
         self.ctu_rc = on;
         self
+    }
+
+    /// Bound the quadtree coder's pass-1 fan-out: the tiles of a
+    /// tiled picture are decided on up to `n` threads (the
+    /// [`oxideav_core::ExecutionContext`] contract — serial by
+    /// default; the coded bytes never depend on `n`).
+    #[must_use]
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = n.max(1);
+        self
+    }
+
+    /// [`Self::with_threads`] on a constructed encoder.
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = n.max(1);
     }
 
     /// The frame budget the CTU-level feedback tracks (`None` when
@@ -701,6 +720,7 @@ impl LowDelayPEncoder {
                     hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
                     temporal_mvp: self.tmvp,
                     tree: self.tree,
+                    threads: self.threads,
                 },
                 &self.filters,
                 self.aq,
@@ -755,6 +775,7 @@ impl LowDelayPEncoder {
                     collocated_ref_idx: 0,
                 },
                 ctu_rc: self.ctu_budget(),
+                threads: self.threads,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
@@ -854,6 +875,8 @@ pub(crate) struct SliceSpec<'a> {
     /// budget; per-CTB `cu_qp_delta` then tracks the running coded
     /// size against it. Requires the PPS `cu_qp_delta_enabled_flag`.
     pub ctu_rc: Option<u64>,
+    /// Pass-1 worker budget (tiles decided in parallel; 1 = serial).
+    pub threads: usize,
 }
 
 /// The §7.3.6.1 temporal-MVP fields of one P / B slice.
