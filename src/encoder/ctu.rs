@@ -52,7 +52,7 @@ use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::inter::{
     amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx, encode_pu_syntax_at, extract,
-    merge_pu, part_is_amp, part_is_horizontal, predict_block, store, sub_block, FrameRecon,
+    merge_pu, part_is_amp, part_is_horizontal, predict_block_wp, store, sub_block, FrameRecon,
     FrameStats, PuChooseCtx, PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, YuvFrame,
 };
 use crate::encoder::intra::{
@@ -64,6 +64,7 @@ use crate::encoder::loopfilter::{
 };
 use crate::encoder::quant::{quantize_tb, scaling_lists_for, RdoqModel, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
+use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
     intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
@@ -109,6 +110,10 @@ pub struct TreeCfg {
     /// 0 off, 1 the §7.4.5 defaults, 2 / 3 the flattened / steepened
     /// custom families (transmitted in the SPS).
     pub scaling_lists: u8,
+    /// PPS `weighted_pred_flag` / `weighted_bipred_flag == 1`: every
+    /// P / B slice carries a §7.3.6.3 `pred_weight_table( )` estimated
+    /// by fade detection ([`crate::encoder::wp`]).
+    pub weighted_pred: bool,
 }
 
 impl TreeCfg {
@@ -129,7 +134,15 @@ impl TreeCfg {
             rdoq: false,
             sign_hiding: false,
             scaling_lists: 0,
+            weighted_pred: false,
         })
+    }
+
+    /// Switch explicit weighted prediction (fade estimation) on / off.
+    #[must_use]
+    pub fn with_weighted_pred(mut self, on: bool) -> Self {
+        self.weighted_pred = on;
+        self
     }
 
     /// Select the scaling lists (0 off, 1 default, 2 flattened, 3
@@ -334,6 +347,12 @@ struct SliceCtx<'a> {
     /// The §7.4.5 `ScalingFactor` matrices when the stream enables
     /// scaling lists.
     scaling: Option<&'a ScalingFactors>,
+    /// The slice's explicit weighted-prediction tables.
+    wp: Option<&'a SliceWpTables>,
+    /// Motion-search reference planes (luma-weighted copies under
+    /// weighted prediction; else the reference planes themselves).
+    me_refs_l0: &'a [RefPlanes],
+    me_refs_l1: &'a [RefPlanes],
 }
 
 impl SliceCtx<'_> {
@@ -1467,6 +1486,9 @@ fn code_inter_cu(
     let choose_ctx = PuChooseCtx {
         refs_l0: ctx.refs_l0,
         refs_l1: ctx.refs_l1,
+        me_refs_l0: ctx.me_refs_l0,
+        me_refs_l1: ctx.me_refs_l1,
+        wp: ctx.wp,
         mv_ctx,
         lambda_me,
         b_slice: ctx.b_slice,
@@ -1555,7 +1577,8 @@ fn code_inter_cu(
         let (best_merge_idx, best_merge_motion) = merge_cands
             .iter()
             .map(|&(idx, m)| {
-                let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x0, y0, n, n, &m, false);
+                let pred =
+                    predict_block_wp(ctx.refs_l0, ctx.refs_l1, x0, y0, n, n, &m, false, ctx.wp);
                 (
                     crate::encoder::inter::sad(&pred.luma, &src[0]) + lambda_me * (idx as u64 + 1),
                     idx,
@@ -1567,7 +1590,7 @@ fn code_inter_cu(
             .expect("merge list is never empty");
 
         // Skip.
-        let merge_pred = predict_block(
+        let merge_pred = predict_block_wp(
             ctx.refs_l0,
             ctx.refs_l1,
             x0,
@@ -1576,6 +1599,7 @@ fn code_inter_cu(
             n,
             &best_merge_motion,
             true,
+            ctx.wp,
         );
         let clip = |v: &[i32]| -> Vec<u8> { v.iter().map(|&p| p.clamp(0, 255) as u8).collect() };
         let skip_recon = LocalRecon {
@@ -1619,7 +1643,17 @@ fn code_inter_cu(
             &choose_ctx,
             &merge_cands,
         );
-        let amvp_pred = predict_block(ctx.refs_l0, ctx.refs_l1, x0, y0, n, n, &amvp_motion, true);
+        let amvp_pred = predict_block_wp(
+            ctx.refs_l0,
+            ctx.refs_l1,
+            x0,
+            y0,
+            n,
+            n,
+            &amvp_motion,
+            true,
+            ctx.wp,
+        );
         let (a_tree, a_recon, a_dist, a_rate) = code_residual(&amvp_pred, true);
         cands.push(InterCand {
             kind: TreeCuKind::Amvp { pu: amvp_syntax },
@@ -1701,7 +1735,7 @@ fn code_inter_cu(
                 let (p0, p1) = cell_pocs(ctx, &motion);
                 st.field
                     .fill_rect(r.x_pb, r.y_pb, r.n_pb_w, r.n_pb_h, motion.to_cell(p0, p1));
-                let p = predict_block(
+                let p = predict_block_wp(
                     ctx.refs_l0,
                     ctx.refs_l1,
                     r.x_pb,
@@ -1710,6 +1744,7 @@ fn code_inter_cu(
                     r.n_pb_h,
                     &motion,
                     true,
+                    ctx.wp,
                 );
                 blit(
                     &mut pred_y,
@@ -2878,6 +2913,9 @@ pub(crate) fn encode_intra_picture_tree(
         two_sided: false,
         tiling: &tiling,
         scaling: scaling.as_ref(),
+        wp: None,
+        me_refs_l0: &[],
+        me_refs_l1: &[],
     };
     let cu_qp_delta = aq > 0 || ctu_rc.is_some();
     debug_assert!(
@@ -2963,6 +3001,23 @@ pub(crate) fn encode_inter_slice_tree(
     };
     let refs_l0 = to_planes(&spec.l0);
     let refs_l1 = to_planes(&spec.l1);
+    // Explicit weighted prediction: fade-fitted tables per reference,
+    // luma-weighted reference copies for the motion search.
+    let wp_tables = tree.weighted_pred.then(|| {
+        let l0: Vec<&FrameRecon> = spec.l0.iter().map(|&(_, r)| r).collect();
+        let l1: Vec<&FrameRecon> = spec.l1.iter().map(|&(_, r)| r).collect();
+        crate::encoder::wp::estimate(frame, &l0, &l1, width, height)
+    });
+    let me_planes = wp_tables.as_ref().map(|t| {
+        (
+            crate::encoder::wp::weighted_ref_planes(&refs_l0, &t.l0),
+            crate::encoder::wp::weighted_ref_planes(&refs_l1, &t.l1),
+        )
+    });
+    let (me_refs_l0, me_refs_l1): (&[RefPlanes], &[RefPlanes]) = match &me_planes {
+        Some((a, b)) => (a, b),
+        None => (&refs_l0, &refs_l1),
+    };
     let l0_pocs: Vec<i32> = spec.l0.iter().map(|&(p, _)| p).collect();
     let l1_pocs: Vec<i32> = spec.l1.iter().map(|&(p, _)| p).collect();
     let n_l0 = l0_pocs.len() as i32;
@@ -3028,6 +3083,9 @@ pub(crate) fn encode_inter_slice_tree(
         two_sided,
         tiling: &tiling,
         scaling: scaling.as_ref(),
+        wp: wp_tables.as_ref().map(|t| &t.resolved),
+        me_refs_l0,
+        me_refs_l1,
     };
     let cu_qp_delta = spec.aq > 0 || spec.ctu_rc.is_some();
     let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
@@ -3042,7 +3100,7 @@ pub(crate) fn encode_inter_slice_tree(
         sao_chroma: coded.sao_chroma,
     };
     let mut w = BitWriter::new();
-    crate::encoder::inter::write_inter_slice_header(&mut w, spec, &lf_sig);
+    crate::encoder::inter::write_inter_slice_header(&mut w, spec, &lf_sig, wp_tables.as_ref());
     emit_slice_data(&ctx, &coded, &mut w, raw_slice_type, cu_qp_delta);
     let CodedPicture {
         mut recon,
@@ -3200,6 +3258,73 @@ mod tests {
     /// sign hiding): the SPS carries scaling_list_enabled_flag (and
     /// the §7.3.4 body for the custom families) and every stream
     /// reconstructs sample-exact through the decoder.
+    /// Weighted prediction on a fading clip, P and B (pyramid) paths:
+    /// the slices carry pred_weight_table( ) entries and the streams
+    /// reconstruct sample-exact.
+    #[test]
+    fn tree_weighted_pred_roundtrips_on_a_fade() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        use crate::encoder::pyramid::PyramidEncoder;
+        let (w, h) = (96, 64);
+        let base = scene(w, h, 1).remove(0);
+        // Brightness ramps 100 % -> 55 % over six frames.
+        let frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..6u32)
+            .map(|f| {
+                let g = 100 - f * 9;
+                let fade = |p: &[u8]| -> Vec<u8> {
+                    p.iter().map(|&v| (u32::from(v) * g / 100) as u8).collect()
+                };
+                (fade(&base.0), fade(&base.1), fade(&base.2))
+            })
+            .collect();
+        let cfg = TreeCfg::new(32).expect("ctb 32").with_weighted_pred(true);
+        let mut enc = LowDelayPEncoder::new(w, h, 28, 0)
+            .expect("encoder")
+            .with_tree(cfg)
+            .with_b_slices(true)
+            .with_loop_filters(LoopFilterCfg::all());
+        let mut stream = Vec::new();
+        let mut recons = Vec::new();
+        for (y, cb, cr) in &frames {
+            let f = enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame");
+            stream.extend_from_slice(&f.au);
+            recons.push(f.recon);
+        }
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), recons.len());
+        for (f, rec) in decoded.iter().zip(recons.iter()) {
+            let planar = f.picture.to_planar_u8().unwrap();
+            assert_eq!(planar[..w * h], rec.y[..], "luma mismatch");
+            assert_eq!(planar[w * h..w * h + w * h / 4], rec.cb[..]);
+            assert_eq!(planar[w * h + w * h / 4..], rec.cr[..]);
+        }
+        // Pyramid (two-sided B, bi-pred weights).
+        let mut enc = PyramidEncoder::new(w, h, 28, 4)
+            .expect("encoder")
+            .with_tree(cfg)
+            .with_loop_filters(LoopFilterCfg::all());
+        let mut aus = Vec::new();
+        for (y, cb, cr) in &frames {
+            aus.extend(enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame"));
+        }
+        aus.extend(enc.flush());
+        let mut stream = Vec::new();
+        let mut recons: Vec<Option<FrameRecon>> = (0..frames.len()).map(|_| None).collect();
+        for au in aus {
+            stream.extend_from_slice(&au.au);
+            recons[au.display_order] = Some(au.recon);
+        }
+        let decoded = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(decoded.len(), recons.len());
+        for (f, rec) in decoded.iter().zip(recons.iter()) {
+            let rec = rec.as_ref().unwrap();
+            let planar = f.picture.to_planar_u8().unwrap();
+            assert_eq!(planar[..w * h], rec.y[..], "pyramid luma mismatch");
+            assert_eq!(planar[w * h..w * h + w * h / 4], rec.cb[..]);
+            assert_eq!(planar[w * h + w * h / 4..], rec.cr[..]);
+        }
+    }
+
     #[test]
     fn tree_scaling_lists_roundtrip() {
         for (mode, b) in [(1u8, false), (2, true), (3, false)] {

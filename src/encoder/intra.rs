@@ -1405,6 +1405,7 @@ pub(crate) fn assemble_idr_au(
                 None,
                 cfg.cu_qp_delta,
                 cfg.tree.is_some_and(|t| t.sign_hiding),
+                cfg.tree.is_some_and(|t| t.weighted_pred),
             ),
         ), // PPS_NUT
         nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP

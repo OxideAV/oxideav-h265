@@ -360,6 +360,7 @@ pub(crate) fn write_pps_full(
     tiles: Option<(u32, u32)>,
     cu_qp_delta: bool,
     sign_data_hiding: bool,
+    weighted_pred: bool,
 ) -> Vec<u8> {
     let grid = tiles.map(|(c, r)| TileGrid::uniform(c, r));
     write_pps_grid(
@@ -369,6 +370,7 @@ pub(crate) fn write_pps_full(
         grid.as_ref(),
         cu_qp_delta,
         sign_data_hiding,
+        weighted_pred,
     )
 }
 
@@ -381,6 +383,7 @@ pub(crate) fn write_pps_grid(
     tiles: Option<&TileGrid>,
     cu_qp_delta: bool,
     sign_data_hiding: bool,
+    weighted_pred: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
@@ -402,8 +405,8 @@ pub(crate) fn write_pps_grid(
     w.se(0); // pps_cb_qp_offset
     w.se(0); // pps_cr_qp_offset
     w.put_bit(0); // pps_slice_chroma_qp_offsets_present_flag
-    w.put_bit(0); // weighted_pred_flag
-    w.put_bit(0); // weighted_bipred_flag
+    w.put_bit(u8::from(weighted_pred)); // weighted_pred_flag
+    w.put_bit(u8::from(weighted_pred)); // weighted_bipred_flag
     w.put_bit(0); // transquant_bypass_enabled_flag
     w.put_bit(u8::from(tiles.is_some())); // tiles_enabled_flag
     w.put_bit(0); // entropy_coding_sync_enabled_flag
@@ -926,6 +929,7 @@ fn encode_au(
                 opts.deblocking,
                 false,
                 grid.as_ref(),
+                false,
                 false,
                 false,
             ),

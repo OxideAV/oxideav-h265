@@ -47,6 +47,9 @@ pub mod quant;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod residual;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod wp;
 
 /// Registry-encoder coding mode, selected by the `mode` codec option.
 #[derive(Debug)]
@@ -355,13 +358,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             Error::InvalidData(format!("h265 encode: sl must be 0..=3, got {v:?}"))
         })?),
     };
-    if (sdh || rdoq || tudepth.is_some() || sl.is_some()) && tree.is_none() {
+    // `wp` — explicit weighted prediction (fade estimation).
+    let wp = parse_flag(params, "wp")?;
+    if (sdh || rdoq || tudepth.is_some() || sl.is_some() || wp) && tree.is_none() {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh / rdoq / tudepth / sl options require the ctb option".into(),
+            "h265 encode: the sdh / rdoq / tudepth / sl / wp options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
-        *t = t.with_sign_hiding(sdh).with_rdoq(rdoq);
+        *t = t
+            .with_sign_hiding(sdh)
+            .with_rdoq(rdoq)
+            .with_weighted_pred(wp);
         if let Some(d) = tudepth {
             *t = t.with_tu_depth(d, d);
         }

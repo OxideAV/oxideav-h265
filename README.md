@@ -96,7 +96,7 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `pyramid` /
+  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `wp`, `pyramid` /
   `pyramidstep` / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
@@ -203,7 +203,15 @@ the cheapest ±1 move under a sample-domain distortion + rate estimate)
 family written through §7.3.4 `scaling_list_data( )` — every
 quantizer path prices each position at its Table 7-3 / 7-4
 `ScalingFactor`; an HVS weighting: the defaults trade −15 % bytes for
-−1..−3 dB luma PSNR).
+−1..−3 dB luma PSNR). **Weighted prediction** (`wp`; inter modes):
+every P / B slice carries a §7.3.6.3 `pred_weight_table( )` — luma
+and chroma weights per reference fitted by motion-robust moment
+matching (a fade detector; identity entries are inferred, and an
+identity explicit combine equals the default one bit for bit), the
+motion search running on luma-weighted reference copies and the
+prediction through the decoder's own §8.5.3.3.4.3 uni / bi combine —
+**−26 % / −44 % BD-rate on the fading scene** (pyramid / low-delay;
+−7.5 % / −14 % mean over the corpus).
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -271,8 +279,7 @@ and ~960 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: encoder-side WPP / tile
-  parallel emission, weighted prediction estimation, and SCC-tool
-  (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
+  parallel emission and SCC-tool (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
   hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU

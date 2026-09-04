@@ -87,11 +87,9 @@ fn tree_cfg(ctb: usize, t: &Tools) -> TreeCfg {
         .with_tu_depth(t.tu_depth, t.tu_depth)
         .with_rdoq(t.rdoq)
         .with_sign_hiding(t.sdh)
-        .with_scaling_lists(t.scaling_lists);
-    assert!(
-        !(t.wpp || t.weighted_pred || t.tiles.is_some()),
-        "tool not wired yet"
-    );
+        .with_scaling_lists(t.scaling_lists)
+        .with_weighted_pred(t.weighted_pred);
+    assert!(!(t.wpp || t.tiles.is_some()), "tool not wired yet");
     cfg
 }
 

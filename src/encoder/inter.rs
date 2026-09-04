@@ -64,8 +64,9 @@ use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
 use crate::encoder::residual::encode_residual_coding;
 use crate::inter_pred::{
-    predict_inter_pu, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
+    predict_inter_pu_weighted, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
 };
+use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{intra_predict_with_substitution, Component as PredComponent};
 use crate::motion::{derive_chroma_mv, MotionCell, MotionField, Mv};
@@ -881,6 +882,7 @@ pub(crate) fn write_inter_slice_header(
     w: &mut BitWriter,
     spec: &SliceSpec<'_>,
     lf: &SliceLfSignalling<'_>,
+    wp: Option<&crate::encoder::wp::WpTables>,
 ) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
@@ -939,7 +941,13 @@ pub(crate) fn write_inter_slice_header(
             w.ue(spec.tmvp.collocated_ref_idx); // collocated_ref_idx
         }
     }
-    // WP off.
+    // §7.3.6.1: pred_weight_table( ) when the PPS enables weighted
+    // prediction for this slice type (both flags follow the tree
+    // configuration's weighted_pred).
+    if spec.tree.is_some_and(|t| t.weighted_pred) {
+        let tables = wp.expect("weighted-prediction stream without tables");
+        crate::encoder::wp::write_pred_weight_table(w, tables, spec.b_slice);
+    }
     w.ue((5 - MAX_MERGE) as u32); // five_minus_max_num_merge_cand
     w.se(spec.qp - 26); // slice_qp_delta
     if lf.cfg.deblocking {
@@ -1108,6 +1116,24 @@ pub(crate) fn predict_block(
     motion: &PuMotion,
     chroma: bool,
 ) -> InterPrediction {
+    predict_block_wp(refs_l0, refs_l1, x0, y0, w, h, motion, chroma, None)
+}
+
+/// [`predict_block`] with the §8.5.3.3.4.3 explicit weighted combine
+/// when the slice carries weight tables (`wp == None` is the default
+/// combine).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_block_wp(
+    refs_l0: &[RefPlanes],
+    refs_l1: &[RefPlanes],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    motion: &PuMotion,
+    chroma: bool,
+    wp: Option<&SliceWpTables>,
+) -> InterPrediction {
     fn list(refp: &RefPlanes, pred_flag: bool, mv: Mv, chroma: bool) -> ListPrediction<'_> {
         let luma = RefPlane::new(&refp.y, refp.width, refp.height).expect("legal ref plane");
         let (cb, cr) = if chroma {
@@ -1153,7 +1179,8 @@ pub(crate) fn predict_block(
         bit_depth_luma: BIT_DEPTH,
         bit_depth_chroma: BIT_DEPTH,
     };
-    predict_inter_pu(&l0, &l1, &geom).expect("legal prediction geometry")
+    let weights = wp.map(|t| t.resolve_pu(motion));
+    predict_inter_pu_weighted(&l0, &l1, &geom, weights.as_ref()).expect("legal prediction geometry")
 }
 
 /// Copy a `w`x`h` block into a `bw`-wide buffer at `(bx, by)`.
@@ -1476,6 +1503,13 @@ fn fractional_me(
 pub(crate) struct PuChooseCtx<'a> {
     pub(crate) refs_l0: &'a [RefPlanes],
     pub(crate) refs_l1: &'a [RefPlanes],
+    /// The motion-search reference planes (the luma-weighted copies
+    /// under explicit weighted prediction; else `refs_lX`).
+    pub(crate) me_refs_l0: &'a [RefPlanes],
+    pub(crate) me_refs_l1: &'a [RefPlanes],
+    /// The slice's explicit weighted-prediction tables, when the PPS
+    /// enables them.
+    pub(crate) wp: Option<&'a SliceWpTables>,
     pub(crate) mv_ctx: &'a PuMvContext<'a>,
     pub(crate) lambda_me: u64,
     pub(crate) b_slice: bool,
@@ -1510,7 +1544,7 @@ pub(crate) fn choose_pu(
     let (merge_cost, merge_idx, merge_motion) = merge_cands
         .iter()
         .map(|&(idx, m)| {
-            let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &m, false);
+            let pred = predict_block_wp(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &m, false, ctx.wp);
             (
                 sad(&pred.luma, src_y) + ctx.lambda_me * (idx as u64 + 2),
                 idx,
@@ -1550,9 +1584,14 @@ fn amvp_search_list(
 ) -> Option<(AmvpGroup, PuMotion, u64, u64)> {
     let (x, y, w, h) = (geom.x_pb, geom.y_pb, geom.n_pb_w, geom.n_pb_h);
     let refs = if list == 0 { ctx.refs_l0 } else { ctx.refs_l1 };
+    let me_refs = if list == 0 {
+        ctx.me_refs_l0
+    } else {
+        ctx.me_refs_l1
+    };
     let mv_of = |m: &PuMotion| if list == 0 { m.mv_l0 } else { m.mv_l1 };
     let mut best: Option<(AmvpGroup, PuMotion, u64, u64)> = None;
-    for (r, refp) in refs.iter().enumerate() {
+    for (r, refp) in me_refs.iter().enumerate() {
         let mvp = [
             mv_of(&resolve_pu_motion(
                 field,
@@ -1608,7 +1647,7 @@ fn amvp_search_list(
         );
         // merge_flag + mvp_flag + ref_idx bin (2 refs) + idc (B) + mvd.
         let rate = 2 + mvd_bits(mvd) + u64::from(refs.len() > 1) + u64::from(ctx.b_slice) * 2;
-        let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false);
+        let pred = predict_block_wp(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false, ctx.wp);
         let cost = sad(&pred.luma, src_y) + ctx.lambda_me * rate;
         let improved = match &best {
             None => true,
@@ -1693,7 +1732,7 @@ pub(crate) fn amvp_search(
         let rate = 2
             + (mvd_bits(g0.mvd) + 1 + u64::from(ctx.refs_l0.len() > 1))
             + (mvd_bits(g1.mvd) + 1 + u64::from(ctx.refs_l1.len() > 1));
-        let pred = predict_block(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false);
+        let pred = predict_block_wp(ctx.refs_l0, ctx.refs_l1, x, y, w, h, &motion, false, ctx.wp);
         let cost = sad(&pred.luma, src_y) + ctx.lambda_me * rate;
         cands.push((
             PuSyntax::Amvp {
@@ -2103,6 +2142,9 @@ pub(crate) fn encode_inter_slice(
             let choose_ctx = PuChooseCtx {
                 refs_l0: &refs_l0,
                 refs_l1: &refs_l1,
+                me_refs_l0: &refs_l0,
+                me_refs_l1: &refs_l1,
+                wp: None,
                 mv_ctx: &mv_ctx,
                 lambda_me,
                 b_slice,
@@ -2595,7 +2637,7 @@ pub(crate) fn encode_inter_slice(
 
     // ---- slice_segment_header( ) ----
     let mut w = BitWriter::new();
-    write_inter_slice_header(&mut w, spec, &lf_sig);
+    write_inter_slice_header(&mut w, spec, &lf_sig, None);
 
     // ---- slice_segment_data( ) — pass 2: syntax emission ----
     let mut cabac = CabacEncoder::new();
