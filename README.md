@@ -280,17 +280,19 @@ bit-identical for any worker count).
   reference lists, §8.3.5 collocated picture, the DPB, and the
   per-picture decode cycle threading motion fields for temporal MVP.
 
-Forty-four embedded-fixture regression pins (the 17-stream staged
+Forty-six embedded-fixture regression pins (the 17-stream staged
 corpus incl. true tiles + self-built weighted-prediction,
 per-slice-loop-filter, hvcC, golden-intra-interop, golden-P-GOP
 interop, the round-431 AMP / pyramid / composition interop pins, the
-nine round-410 tool-axis conformance pins, and the round-453
+nine round-410 tool-axis conformance pins, the round-453
 quadtree / TMVP+multi-ref / CTU-rate-feedback / explicit-tile-grid
-pins — every encoder pin byte-exact through a black-box reference
-decoder at pin time), lossless PCM / exact-reconstruction intra /
+pins, and the round-456 composed-tool pins (RDOQ + sign hiding +
+depth-2 RQTs + weighted prediction + WPP pyramid; tiles + scaling
+lists + AQ low-delay) — every encoder pin byte-exact through a
+black-box reference decoder at pin time), lossless PCM / exact-reconstruction intra /
 bit-exact low-delay- and hierarchical-B-GOP encoder↔decoder
 roundtrips at multiple geometries / QPs / partitions / slice types,
-and ~960 unit tests.
+and ~985 unit tests.
 
 ## Not yet implemented
 
