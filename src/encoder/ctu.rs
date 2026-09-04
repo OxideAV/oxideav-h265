@@ -51,9 +51,10 @@ use crate::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, TransformSplit};
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::inter::{
-    amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx, encode_pu_syntax_at, extract,
-    merge_pu, part_is_amp, part_is_horizontal, predict_block_wp, store, sub_block, FrameRecon,
-    FrameStats, PuChooseCtx, PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, YuvFrame,
+    amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx, encode_pu_syntax_at,
+    entry_point_offsets, extract, merge_pu, part_is_amp, part_is_horizontal, predict_block_wp,
+    store, sub_block, write_entry_points, FrameRecon, FrameStats, PuChooseCtx, PuSyntax, RefPlanes,
+    SliceLfSignalling, SliceSpec, YuvFrame,
 };
 use crate::encoder::intra::{
     chroma_qp_420, encode_cu_qp_delta, forward_transform, rate_proxy, IntraEncodeError,
@@ -62,6 +63,7 @@ use crate::encoder::intra::{
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
 };
+use crate::encoder::pcm::TileGrid;
 use crate::encoder::quant::{quantize_tb, scaling_lists_for, RdoqModel, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
 use crate::inter_recon::SliceWpTables;
@@ -114,6 +116,107 @@ pub struct TreeCfg {
     /// P / B slice carries a §7.3.6.3 `pred_weight_table( )` estimated
     /// by fade detection ([`crate::encoder::wp`]).
     pub weighted_pred: bool,
+    /// PPS `entropy_coding_sync_enabled_flag == 1` (wavefront
+    /// parallel processing): one substream per CTB row of a tile with
+    /// the §9.3.2.2 context storage after the row's second CTB and
+    /// synchronization at the next row start, `end_of_subset_one_bit`
+    /// + byte alignment between rows and §7.3.6.1 entry points.
+    pub wpp: bool,
+    /// The tile grid (`tiles_enabled_flag == 1` when more than one
+    /// tile): CTBs coded in the §6.5.1 tile scan, availability cut at
+    /// tile boundaries, fresh contexts + engine per tile, one subset
+    /// per tile with entry points; the in-loop filters stay
+    /// picture-wide (`loop_filter_across_tiles_enabled_flag == 1`).
+    pub tiles: TileLayout,
+}
+
+/// A tile grid for [`TreeCfg`]: uniform spacing, or explicit
+/// `column_width_minus1[ ]` / `row_height_minus1[ ]` spans (up to 8
+/// columns / rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileLayout {
+    /// Tile columns (1..=8).
+    pub cols: u8,
+    /// Tile rows (1..=8).
+    pub rows: u8,
+    /// `uniform_spacing_flag`.
+    pub uniform: bool,
+    /// `column_width_minus1[ i ]` for `i < cols − 1` (explicit only).
+    pub col_w_minus1: [u8; 7],
+    /// `row_height_minus1[ j ]` for `j < rows − 1` (explicit only).
+    pub row_h_minus1: [u8; 7],
+}
+
+impl TileLayout {
+    /// The single-tile layout (`tiles_enabled_flag == 0`).
+    #[must_use]
+    pub const fn single() -> Self {
+        Self {
+            cols: 1,
+            rows: 1,
+            uniform: true,
+            col_w_minus1: [0; 7],
+            row_h_minus1: [0; 7],
+        }
+    }
+
+    /// A `uniform_spacing_flag == 1` grid (each dimension clamped to
+    /// 1..=8).
+    #[must_use]
+    pub fn uniform(cols: u8, rows: u8) -> Self {
+        Self {
+            cols: cols.clamp(1, 8),
+            rows: rows.clamp(1, 8),
+            ..Self::single()
+        }
+    }
+
+    /// An explicit grid from the column widths / row heights in CTBs
+    /// of every column / row but the last (`uniform_spacing_flag ==
+    /// 0`); at most 7 entries each are kept.
+    #[must_use]
+    pub fn explicit(col_widths: &[u8], row_heights: &[u8]) -> Self {
+        let mut l = Self::single();
+        l.uniform = false;
+        l.cols = (col_widths.len().min(7) + 1) as u8;
+        l.rows = (row_heights.len().min(7) + 1) as u8;
+        for (i, &w) in col_widths.iter().take(7).enumerate() {
+            l.col_w_minus1[i] = w.max(1) - 1;
+        }
+        for (j, &h) in row_heights.iter().take(7).enumerate() {
+            l.row_h_minus1[j] = h.max(1) - 1;
+        }
+        l
+    }
+
+    /// More than one tile?
+    #[must_use]
+    pub fn on(&self) -> bool {
+        self.cols > 1 || self.rows > 1
+    }
+
+    /// The PPS grid (`None` for a single tile).
+    pub(crate) fn grid(&self) -> Option<TileGrid> {
+        self.on().then(|| TileGrid {
+            cols: u32::from(self.cols),
+            rows: u32::from(self.rows),
+            uniform: self.uniform,
+            column_width_minus1: self.col_w_minus1[..usize::from(self.cols) - 1]
+                .iter()
+                .map(|&v| u32::from(v))
+                .collect(),
+            row_height_minus1: self.row_h_minus1[..usize::from(self.rows) - 1]
+                .iter()
+                .map(|&v| u32::from(v))
+                .collect(),
+        })
+    }
+
+    /// The §6.5.1 tiling parameters.
+    pub(crate) fn params(&self) -> TilingParams {
+        self.grid()
+            .map_or_else(TilingParams::single_tile, |g| g.tiling_params())
+    }
 }
 
 impl TreeCfg {
@@ -135,7 +238,23 @@ impl TreeCfg {
             sign_hiding: false,
             scaling_lists: 0,
             weighted_pred: false,
+            wpp: false,
+            tiles: TileLayout::single(),
         })
+    }
+
+    /// Switch wavefront parallel processing signalling on / off.
+    #[must_use]
+    pub fn with_wpp(mut self, on: bool) -> Self {
+        self.wpp = on;
+        self
+    }
+
+    /// Select the tile grid.
+    #[must_use]
+    pub fn with_tiles(mut self, tiles: TileLayout) -> Self {
+        self.tiles = tiles;
+        self
     }
 
     /// Switch explicit weighted prediction (fade estimation) on / off.
@@ -366,6 +485,67 @@ impl SliceCtx<'_> {
 
     fn ctbs_y(&self) -> usize {
         self.height.div_ceil(1 << self.cfg.ctb_log2)
+    }
+
+    /// Raster address of the CTB at tile-scan index `ts`.
+    fn ctb_rs(&self, ts: usize) -> usize {
+        self.tiling.ctb_addr_ts_to_rs(ts as u32) as usize
+    }
+
+    /// The CTB at tile-scan index `ts` starts a tile (fresh contexts,
+    /// engine and `qPY_PREV`).
+    fn tile_start(&self, ts: usize) -> bool {
+        ts == 0 || self.tiling.tile_id(ts as u32) != self.tiling.tile_id(ts as u32 - 1)
+    }
+
+    /// The CTB at tile-scan index `ts` starts a CTB row of its tile
+    /// (§9.3.2.2 WPP synchronization point, §8.6.1 `qPY_PREV` reset)
+    /// — only meaningful when `cfg.wpp`.
+    fn row_start_in_tile(&self, ts: usize) -> bool {
+        let rs = self.ctb_rs(ts) as u32;
+        let w = self.ctbs_x() as u32;
+        rs % w == 0
+            || self.tiling.tile_id(self.tiling.ctb_addr_rs_to_ts(rs - 1))
+                != self.tiling.tile_id(ts as u32)
+    }
+
+    /// The CTB at tile-scan index `ts` is the one after which the
+    /// §9.3.2.2 WPP storage fires (the second CTB of a row of a tile).
+    fn wpp_store_after(&self, ts: usize) -> bool {
+        let rs = self.ctb_rs(ts) as u32;
+        let w = self.ctbs_x() as u32;
+        rs % w == 1
+            || (rs > 1
+                && self.tiling.tile_id(ts as u32)
+                    != self.tiling.tile_id(self.tiling.ctb_addr_rs_to_ts(rs - 2)))
+    }
+
+    /// Whether the §8.6.1 `qPY_PREV` resets to `SliceQpY` at the CTB
+    /// at tile-scan index `ts` (first QG in the slice / tile / WPP row).
+    fn qp_prev_resets(&self, ts: usize) -> bool {
+        self.tile_start(ts) || (self.cfg.wpp && self.row_start_in_tile(ts))
+    }
+
+    /// A subset boundary follows the CTB at tile-scan index `ts`
+    /// (`end_of_subset_one_bit` + byte alignment): the next CTB starts
+    /// a tile, or (WPP) a CTB row of a tile.
+    fn subset_ends_after(&self, ts: usize) -> bool {
+        let next = ts + 1;
+        if next >= self.ctbs_x() * self.ctbs_y() {
+            return false;
+        }
+        (self.cfg.tiles.on() && self.tile_start(next))
+            || (self.cfg.wpp && self.row_start_in_tile(next))
+    }
+
+    /// §9.3.2.2 availability of the spatial neighbour T (eq. 9-3) of
+    /// the CTB at tile-scan index `ts`.
+    fn wpp_sync_available(&self, ts: usize) -> bool {
+        let rs = self.ctb_rs(ts);
+        let ctb = 1usize << self.cfg.ctb_log2;
+        let (x0, y0) = ((rs % self.ctbs_x()) * ctb, (rs / self.ctbs_x()) * ctb);
+        let (xt, yt) = ((x0 + ctb) as i64, y0 as i64 - ctb as i64);
+        self.z_avail(x0, y0, xt, yt)
     }
 
     /// §6.4.1 z-scan availability of luma location `(nx, ny)` for the
@@ -2044,6 +2224,10 @@ fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], ctb_qps: &[i32], aq_on: bool) -
     let mut qp_prev = ctx.qp; // qPY_PREV (SliceQpY at the slice start)
     for (ctb_idx, plan) in plans.iter().enumerate() {
         let ctb_qp = ctb_qps[ctb_idx];
+        // §8.6.1: the first QG of a tile / WPP row restarts at SliceQpY.
+        if ctx.qp_prev_resets(ctb_idx) {
+            qp_prev = ctx.qp;
+        }
         // §7.3.8.14: the delta is transmitted in the first TU of the
         // CTB (== quantization group) with any cbf.
         let mut delta_coded = false;
@@ -2159,8 +2343,12 @@ impl Emitter<'_, '_> {
         let fits = x0 + n <= self.ctx.width && y0 + n <= self.ctx.height;
         let split = matches!(node, CuNode::Split(_));
         if fits && log2 > self.ctx.cfg.min_cb_log2() {
+            // §9.3.4.2.2 availability is the §6.4.1 one (slice / tile
+            // boundaries cut it), not merely "already coded".
             let (l_depth, l_avail) = self.st.nb_ct_depth(x0, y0, Neighbour::Left);
             let (a_depth, a_avail) = self.st.nb_ct_depth(x0, y0, Neighbour::Above);
+            let l_avail = l_avail && self.ctx.z_avail(x0, y0, x0 as i64 - 1, y0 as i64);
+            let a_avail = a_avail && self.ctx.z_avail(x0, y0, x0 as i64, y0 as i64 - 1);
             let inc = split_cu_flag_ctx_inc(l_depth, l_avail, a_depth, a_avail, depth) as usize;
             self.cabac
                 .encode_decision(self.w, &mut self.ctxs.split_cu_flag[inc], u8::from(split));
@@ -2193,6 +2381,8 @@ impl Emitter<'_, '_> {
         if !self.ctx.intra_slice {
             let (l_skip, l_avail) = self.st.nb_skip(x0, y0, Neighbour::Left);
             let (a_skip, a_avail) = self.st.nb_skip(x0, y0, Neighbour::Above);
+            let l_avail = l_avail && self.ctx.z_avail(x0, y0, x0 as i64 - 1, y0 as i64);
+            let a_avail = a_avail && self.ctx.z_avail(x0, y0, x0 as i64, y0 as i64 - 1);
             let inc = cu_skip_flag_ctx_inc(l_skip, l_avail, a_skip, a_avail) as usize;
             self.cabac
                 .encode_decision(self.w, &mut self.ctxs.cu_skip_flag[inc], u8::from(is_skip));
@@ -2605,6 +2795,93 @@ struct TtCtx<'a> {
 }
 
 // ---------------------------------------------------------------------
+// Substream entropy coder (tiles / WPP subsets)
+// ---------------------------------------------------------------------
+
+/// The slice's arithmetic coder over its §7.3.8.1 subsets: one
+/// [`CabacEncoder`] + [`SliceContexts`] pair re-armed at every tile
+/// start (§9.3.2.2 initialization) and, under WPP, synchronized from
+/// the stored second-CTB state at every CTB row start of a tile
+/// (§9.3.2.5), the bytes of each subset kept apart for the §7.3.6.1
+/// entry points. Shared by the shadow emission (rate feedback / RDOQ
+/// context states) and the final slice-data emission so both see the
+/// identical context evolution.
+struct EntropyCoder {
+    init_type: u8,
+    slice_qp: i32,
+    cabac: CabacEncoder,
+    ctxs: SliceContexts,
+    w: BitWriter,
+    /// `TableStateIdxWpp` / `TableMpsValWpp` storage.
+    wpp_store: Option<SliceContexts>,
+    subsets: Vec<Vec<u8>>,
+    /// Bits of the finished subsets.
+    bits_done: u64,
+}
+
+impl EntropyCoder {
+    fn new(init_type: u8, slice_qp: i32) -> Self {
+        Self {
+            init_type,
+            slice_qp,
+            cabac: CabacEncoder::new(),
+            ctxs: SliceContexts::init(init_type, slice_qp),
+            w: BitWriter::new(),
+            wpp_store: None,
+            subsets: Vec::new(),
+            bits_done: 0,
+        }
+    }
+
+    /// §9.3.2.1 at the CTB at tile-scan index `ts`: re-initialize at a
+    /// tile start, synchronize (or re-initialize) at a WPP row start.
+    fn begin_ctb(&mut self, ctx: &SliceCtx<'_>, ts: usize) {
+        if ts == 0 {
+            return;
+        }
+        if ctx.tile_start(ts) {
+            self.ctxs = SliceContexts::init(self.init_type, self.slice_qp);
+            self.wpp_store = None;
+        } else if ctx.cfg.wpp && ctx.row_start_in_tile(ts) {
+            self.ctxs = match (&self.wpp_store, ctx.wpp_sync_available(ts)) {
+                (Some(stored), true) => stored.clone(),
+                _ => SliceContexts::init(self.init_type, self.slice_qp),
+            };
+        }
+    }
+
+    /// After the CTU syntax of the CTB at tile-scan index `ts`: the
+    /// WPP storage, `end_of_slice_segment_flag`, and the subset end
+    /// (`end_of_subset_one_bit` + byte alignment, fresh engine).
+    fn end_ctb(&mut self, ctx: &SliceCtx<'_>, ts: usize, last: bool) {
+        if ctx.cfg.wpp && ctx.wpp_store_after(ts) {
+            self.wpp_store = Some(self.ctxs.clone());
+        }
+        self.cabac.encode_terminate(&mut self.w, u8::from(last));
+        if last {
+            self.w.align_zero();
+            self.close_subset();
+        } else if ctx.subset_ends_after(ts) {
+            self.cabac.encode_terminate(&mut self.w, 1); // end_of_subset_one_bit
+            self.w.align_zero(); // byte_alignment( )
+            self.close_subset();
+        }
+    }
+
+    fn close_subset(&mut self) {
+        let bytes = std::mem::take(&mut self.w).finish();
+        self.bits_done += 8 * bytes.len() as u64;
+        self.subsets.push(bytes);
+        self.cabac = CabacEncoder::new();
+    }
+
+    /// Bits emitted so far (finished subsets + the open one).
+    fn bit_len(&self) -> u64 {
+        self.bits_done + self.w.bit_len() as u64
+    }
+}
+
+// ---------------------------------------------------------------------
 // Whole-picture drivers
 // ---------------------------------------------------------------------
 
@@ -2612,8 +2889,10 @@ struct TtCtx<'a> {
 /// (everything after the slice header), the filtered reconstruction,
 /// the loop-filter elections, and the per-CU stats.
 struct CodedPicture {
+    /// Per CTB in CODING (tile-scan) order.
     plans: Vec<CuNode>,
-    /// The QP each CTB was coded at (slice QP + AQ + rate feedback).
+    /// The QP each CTB was coded at (slice QP + AQ + rate feedback),
+    /// coding order.
     ctb_qps: Vec<i32>,
     /// The pass-1 cell / field state (pass 2 reads the ctxInc cells).
     st: EncState,
@@ -2646,22 +2925,29 @@ fn code_picture(
     // CTB (no SAO syntax — that is elected after the filters) tracks
     // the picture's running coded size against the pro-rata budget.
     // RDOQ prices its bins at the same shadow's residual context
-    // states (refreshed at every CTB start).
-    let mut shadow: Option<(CabacEncoder, SliceContexts, BitWriter, i32)> =
+    // states (refreshed at every CTB start). The shadow walks the
+    // same tile / WPP subset structure as the final emission.
+    let mut shadow: Option<(EntropyCoder, i32)> =
         (ctx.ctu_rc.is_some() || ctx.cfg.rdoq).then(|| {
             (
-                CabacEncoder::new(),
-                SliceContexts::init(init_type(slice_type_raw, false), ctx.qp),
-                BitWriter::new(),
+                EntropyCoder::new(init_type(slice_type_raw, false), ctx.qp),
                 ctx.qp,
             )
         });
     for ctb_idx in 0..n_ctbs {
-        let x0 = (ctb_idx % ctbs_x) * ctb;
-        let y0 = (ctb_idx / ctbs_x) * ctb;
+        // Coding order is the §6.5.1 tile scan.
+        let rs = ctx.ctb_rs(ctb_idx);
+        let x0 = (rs % ctbs_x) * ctb;
+        let y0 = (rs / ctbs_x) * ctb;
+        if let Some((coder, qp_prev)) = shadow.as_mut() {
+            coder.begin_ctb(ctx, ctb_idx);
+            if ctx.qp_prev_resets(ctb_idx) {
+                *qp_prev = ctx.qp;
+            }
+        }
         let rc_adj = match (ctx.ctu_rc, &shadow) {
-            (Some(budget), Some((_, _, w, _))) if ctb_idx > 0 => {
-                let so_far = w.bit_len() as u64;
+            (Some(budget), Some((coder, _))) if ctb_idx > 0 => {
+                let so_far = coder.bit_len();
                 let expected = budget.saturating_mul(ctb_idx as u64) / n_ctbs as u64;
                 // Ratio in Q8: over-spending raises the QP, under-
                 // spending lowers it, in bounded steps (±3).
@@ -2680,12 +2966,12 @@ fn code_picture(
         };
         let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx] + rc_adj).clamp(0, 51);
         if ctx.cfg.rdoq {
-            st.rdoq_model = shadow.as_ref().map(|(_, ctxs, _, _)| RdoqModel {
-                contexts: ctxs.residual.clone(),
+            st.rdoq_model = shadow.as_ref().map(|(coder, _)| RdoqModel {
+                contexts: coder.ctxs.residual.clone(),
             });
         }
         let (node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
-        if let Some((cabac, ctxs, w, qp_prev)) = shadow.as_mut() {
+        if let Some((coder, qp_prev)) = shadow.as_mut() {
             let mut qg = QgState {
                 coded: false,
                 qp_prev: *qp_prev,
@@ -2695,15 +2981,15 @@ fn code_picture(
             let mut em = Emitter {
                 ctx,
                 st: &st,
-                w,
-                cabac,
-                ctxs,
+                w: &mut coder.w,
+                cabac: &mut coder.cabac,
+                ctxs: &mut coder.ctxs,
             };
             em.emit_quadtree(&node, x0, y0, ctx.cfg.ctb_log2, 0, &mut qg);
             if qg.coded {
                 *qp_prev = ctb_qp;
             }
-            cabac.encode_terminate(w, 0);
+            coder.end_ctb(ctx, ctb_idx, ctb_idx + 1 == n_ctbs);
         }
         plans.push(node);
         ctb_qps.push(ctb_qp);
@@ -2759,6 +3045,11 @@ fn code_picture(
         sao_ctbs: Vec::new(),
     };
     if lf.any() {
+        let tile_ids: Option<Vec<u32>> = ctx.cfg.tiles.on().then(|| {
+            (0..n_ctbs as u32)
+                .map(|rs| ctx.tiling.tile_id(ctx.tiling.ctb_addr_rs_to_ts(rs)))
+                .collect()
+        });
         let ctb_qps: Vec<i32> = (0..ctbs_x * ctbs_y)
             .map(|i| {
                 let x0 = (i % ctbs_x) * ctb;
@@ -2782,6 +3073,7 @@ fn code_picture(
                     qp_cells: &walk.cells,
                     w_cells: walk.w_cells,
                 }),
+                tile_ids: tile_ids.as_deref(),
             },
             lf,
         );
@@ -2798,33 +3090,45 @@ fn code_picture(
     out
 }
 
-/// Pass 2: emit the slice data (CTU loop) for a coded picture into `w`
-/// (already holding the slice header). `slice_type_raw` per §7.4.7.1.
+/// Pass 2: emit the slice data (CTU loop, §6.5.1 tile scan) for a
+/// coded picture as its §7.3.8.1 subsets (one per tile / WPP row;
+/// a single subset otherwise). `slice_type_raw` per §7.4.7.1.
 fn emit_slice_data(
     ctx: &SliceCtx<'_>,
     coded: &CodedPicture,
-    w: &mut BitWriter,
     slice_type_raw: u8,
     cu_qp_delta: bool,
-) {
+) -> Vec<Vec<u8>> {
     let st = &coded.st;
-    let mut cabac = CabacEncoder::new();
-    let mut ctxs = SliceContexts::init(init_type(slice_type_raw, false), ctx.qp);
+    let mut coder = EntropyCoder::new(init_type(slice_type_raw, false), ctx.qp);
     let ctbs_x = ctx.ctbs_x();
     let ctbs_y = ctx.ctbs_y();
+    let n_ctbs = ctbs_x * ctbs_y;
     let ctb = 1usize << ctx.cfg.ctb_log2;
     let mut qp_prev = ctx.qp;
     for (ctb_idx, plan) in coded.plans.iter().enumerate() {
-        let x0 = (ctb_idx % ctbs_x) * ctb;
-        let y0 = (ctb_idx / ctbs_x) * ctb;
+        let rs = ctx.ctb_rs(ctb_idx);
+        let x0 = (rs % ctbs_x) * ctb;
+        let y0 = (rs / ctbs_x) * ctb;
+        coder.begin_ctb(ctx, ctb_idx);
+        if ctx.qp_prev_resets(ctb_idx) {
+            qp_prev = ctx.qp;
+        }
         if coded.sao_luma || coded.sao_chroma {
+            let same_tile = |other: usize| {
+                ctx.tiling
+                    .tile_id(ctx.tiling.ctb_addr_rs_to_ts(other as u32))
+                    == ctx.tiling.tile_id(ctb_idx as u32)
+            };
+            let can_left = rs % ctbs_x > 0 && same_tile(rs - 1);
+            let can_up = rs / ctbs_x > 0 && same_tile(rs - ctbs_x);
             encode_sao_ctb(
-                w,
-                &mut cabac,
-                &mut ctxs,
-                &coded.sao_ctbs[ctb_idx],
-                ctb_idx % ctbs_x,
-                ctb_idx / ctbs_x,
+                &mut coder.w,
+                &mut coder.cabac,
+                &mut coder.ctxs,
+                &coded.sao_ctbs[rs],
+                can_left,
+                can_up,
                 coded.sao_luma,
                 coded.sao_chroma,
             );
@@ -2839,17 +3143,32 @@ fn emit_slice_data(
         let mut em = Emitter {
             ctx,
             st,
-            w,
-            cabac: &mut cabac,
-            ctxs: &mut ctxs,
+            w: &mut coder.w,
+            cabac: &mut coder.cabac,
+            ctxs: &mut coder.ctxs,
         };
         em.emit_quadtree(plan, x0, y0, ctx.cfg.ctb_log2, 0, &mut qg);
         if qg.coded {
             qp_prev = ctb_qp;
         }
-        cabac.encode_terminate(w, u8::from(ctb_idx == ctbs_x * ctbs_y - 1));
+        coder.end_ctb(ctx, ctb_idx, ctb_idx + 1 == n_ctbs);
     }
-    w.align_zero();
+    coder.subsets
+}
+
+/// Append the slice-data subsets after a byte-aligned header.
+fn append_subsets(w: &mut BitWriter, subsets: &[Vec<u8>]) {
+    for s in subsets {
+        for &b in s {
+            w.put_bits(u32::from(b), 8);
+        }
+    }
+}
+
+/// The §7.3.6.1 entry-point block is present iff the PPS enables
+/// tiles or entropy coding sync.
+fn entry_points_present(cfg: &TreeCfg) -> bool {
+    cfg.tiles.on() || cfg.wpp
 }
 
 /// Encode one 4:2:0 8-bit frame as a quadtree intra IDR slice RBSP +
@@ -2894,7 +3213,7 @@ pub(crate) fn encode_intra_picture_tree(
 
     let ctb = 1usize << tree.ctb_log2;
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq, ctb);
-    let tiling = make_tiling(width, height, tree.ctb_log2);
+    let tiling = make_tiling(width, height, &tree);
     let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
     let ctx = SliceCtx {
         cfg: tree,
@@ -2923,6 +3242,7 @@ pub(crate) fn encode_intra_picture_tree(
         "cu_qp_delta signalling needs the PPS flag"
     );
     let coded = code_picture(&ctx, lf, cu_qp_delta, 2);
+    let subsets = emit_slice_data(&ctx, &coded, 2, cu_qp_delta);
 
     // ---- slice_segment_header( ) — I slice, IDR ----
     let mut w = BitWriter::new();
@@ -2946,9 +3266,11 @@ pub(crate) fn encode_intra_picture_tree(
     if coded.sao_luma || coded.sao_chroma || coded.deblock_on {
         w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
     }
+    if entry_points_present(&tree) {
+        write_entry_points(&mut w, &entry_point_offsets(&subsets));
+    }
     w.rbsp_trailing_bits();
-
-    emit_slice_data(&ctx, &coded, &mut w, 2, cu_qp_delta);
+    append_subsets(&mut w, &subsets);
     let slice_rbsp = w.finish();
     let au = crate::encoder::intra::assemble_idr_au(width, height, cfg, lf, &slice_rbsp);
     Ok(IntraEncodedAu {
@@ -2959,18 +3281,38 @@ pub(crate) fn encode_intra_picture_tree(
     })
 }
 
-fn make_tiling(width: usize, height: usize, ctb_log2: u32) -> PictureTiling {
-    let ctb = 1usize << ctb_log2;
+fn make_tiling(width: usize, height: usize, cfg: &TreeCfg) -> PictureTiling {
+    let ctb = 1usize << cfg.ctb_log2;
+    let ctbs_x = width.div_ceil(ctb) as u32;
+    let ctbs_y = height.div_ceil(ctb) as u32;
+    // A grid the picture cannot hold (more columns / rows than CTBs,
+    // or explicit spans past the edge) falls back to a single tile.
+    let params = cfg.tiles.params();
+    let fits = u32::from(cfg.tiles.cols) <= ctbs_x
+        && u32::from(cfg.tiles.rows) <= ctbs_y
+        && (cfg.tiles.uniform
+            || (params
+                .column_width_minus1
+                .iter()
+                .map(|w| w + 1)
+                .sum::<u32>()
+                < ctbs_x
+                && params.row_height_minus1.iter().map(|h| h + 1).sum::<u32>() < ctbs_y));
+    let params = if fits {
+        params
+    } else {
+        TilingParams::single_tile()
+    };
     PictureTiling::new(
-        width.div_ceil(ctb) as u32,
-        height.div_ceil(ctb) as u32,
+        ctbs_x,
+        ctbs_y,
         width as u32,
         height as u32,
-        ctb_log2,
+        cfg.ctb_log2,
         2,
-        &TilingParams::single_tile(),
+        &params,
     )
-    .expect("legal single-tile geometry")
+    .expect("legal tile geometry")
 }
 
 /// Encode one P / B frame as a quadtree TRAIL_R slice (the tree twin
@@ -2984,7 +3326,7 @@ pub(crate) fn encode_inter_slice_tree(
     let tree = spec.tree.expect("tree config present");
     let ctb = 1usize << tree.ctb_log2;
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, ctb);
-    let tiling = make_tiling(width, height, tree.ctb_log2);
+    let tiling = make_tiling(width, height, &tree);
     let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
 
     let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
@@ -3099,9 +3441,17 @@ pub(crate) fn encode_inter_slice_tree(
         sao_luma: coded.sao_luma,
         sao_chroma: coded.sao_chroma,
     };
+    let subsets = emit_slice_data(&ctx, &coded, raw_slice_type, cu_qp_delta);
+    let offsets = entry_points_present(&tree).then(|| entry_point_offsets(&subsets));
     let mut w = BitWriter::new();
-    crate::encoder::inter::write_inter_slice_header(&mut w, spec, &lf_sig, wp_tables.as_ref());
-    emit_slice_data(&ctx, &coded, &mut w, raw_slice_type, cu_qp_delta);
+    crate::encoder::inter::write_inter_slice_header(
+        &mut w,
+        spec,
+        &lf_sig,
+        wp_tables.as_ref(),
+        offsets.as_deref(),
+    );
+    append_subsets(&mut w, &subsets);
     let CodedPicture {
         mut recon,
         st,
@@ -3323,6 +3673,96 @@ mod tests {
             assert_eq!(planar[w * h..w * h + w * h / 4], rec.cb[..]);
             assert_eq!(planar[w * h + w * h / 4..], rec.cr[..]);
         }
+    }
+
+    /// WPP, uniform / explicit tiles and both together — with RDOQ
+    /// (the shadow coder's subset structure), AQ (per-tile / per-row
+    /// qPY_PREV resets) and the in-loop filters (tile-gated SAO
+    /// merges) — on I / P / B slices: every stream reconstructs
+    /// sample-exact through the decoder.
+    #[test]
+    fn tree_wpp_and_tiles_roundtrip() {
+        let cases: Vec<(TreeCfg, bool, u8)> = vec![
+            (
+                TreeCfg::new(16)
+                    .expect("ctb")
+                    .with_wpp(true)
+                    .with_rdoq(true),
+                false,
+                1,
+            ),
+            (
+                TreeCfg::new(16)
+                    .expect("ctb")
+                    .with_tiles(TileLayout::uniform(2, 2))
+                    .with_rdoq(true),
+                true,
+                2,
+            ),
+            (
+                TreeCfg::new(16)
+                    .expect("ctb")
+                    .with_tiles(TileLayout::explicit(&[1, 3], &[2]))
+                    .with_wpp(true)
+                    .with_sign_hiding(true),
+                false,
+                0,
+            ),
+            (
+                TreeCfg::new(32)
+                    .expect("ctb")
+                    .with_tiles(TileLayout::uniform(2, 1))
+                    .with_wpp(true),
+                true,
+                1,
+            ),
+        ];
+        for (cfg, b, aq) in cases {
+            assert_gop_tree_roundtrip_cfg(cfg, b, LoopFilterCfg::all(), aq);
+        }
+    }
+
+    /// The tiled / WPP streams really carry the subset structure: the
+    /// slice header declares the entry points and the PPS the flags.
+    #[test]
+    fn tree_wpp_tiles_signal_entry_points() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        let (w, h) = (96, 64);
+        let frames = scene(w, h, 2);
+        let cfg = TreeCfg::new(16)
+            .expect("ctb")
+            .with_tiles(TileLayout::uniform(2, 2))
+            .with_wpp(true);
+        let mut enc = LowDelayPEncoder::new(w, h, 30, 0)
+            .expect("encoder")
+            .with_tree(cfg);
+        let mut aus = Vec::new();
+        for (y, cb, cr) in &frames {
+            aus.push(enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame").au);
+        }
+        let units = crate::nal::collect_nal_units(&aus[0]).expect("walk");
+        let sps = crate::sps::SeqParameterSet::parse(&units[1].rbsp).expect("sps");
+        let pps = crate::pps::PicParameterSet::parse(&units[2].rbsp).expect("pps");
+        assert!(pps.tiles_enabled_flag && pps.entropy_coding_sync_enabled_flag);
+        assert!(pps.loop_filter_across_tiles_enabled_flag);
+        assert_eq!(pps.tiles.num_tile_columns_minus1, 1);
+        assert_eq!(pps.tiles.num_tile_rows_minus1, 1);
+        // 6 x 4 CTBs, 2x2 tiles of 3x2 CTBs, WPP: 2 rows per tile => 8
+        // subsets => 7 entry points on the I and the P slice.
+        let p_units = crate::nal::collect_nal_units(&aus[1]).expect("walk");
+        for u in [&units[3], &p_units[0]] {
+            let header = crate::slice::SliceSegmentHeader::parse(
+                &u.rbsp,
+                u.header.nal_unit_type,
+                &sps,
+                &pps,
+            )
+            .expect("slice header");
+            let eps = header.entry_point_offsets.expect("entry points present");
+            assert_eq!(eps.num_entry_point_offsets, 7);
+        }
+        let stream: Vec<u8> = aus.concat();
+        assert_eq!(decode_annexb_sequence(&stream).expect("decode").len(), 2);
     }
 
     #[test]

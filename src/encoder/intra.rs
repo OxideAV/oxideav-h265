@@ -1001,6 +1001,7 @@ pub(crate) fn encode_idr_intra_au_full(
                 shapes: &shapes,
                 ctb_log2: 4,
                 tree: None,
+                tile_ids: None,
             },
             lf,
         );
@@ -1062,8 +1063,8 @@ pub(crate) fn encode_idr_intra_au_full(
                 &mut cabac,
                 &mut ctxs,
                 &sao_ctbs[ctb],
-                ctb % ctbs_x,
-                ctb / ctbs_x,
+                ctb % ctbs_x > 0,
+                ctb / ctbs_x > 0,
                 slice_sao_luma,
                 slice_sao_chroma,
             );
@@ -1402,10 +1403,11 @@ pub(crate) fn assemble_idr_au(
                 false,
                 false,
                 lf.deblocking,
-                None,
+                cfg.tree.and_then(|t| t.tiles.grid()).as_ref(),
                 cfg.cu_qp_delta,
                 cfg.tree.is_some_and(|t| t.sign_hiding),
                 cfg.tree.is_some_and(|t| t.weighted_pred),
+                cfg.tree.is_some_and(|t| t.wpp),
             ),
         ), // PPS_NUT
         nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP

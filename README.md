@@ -96,8 +96,8 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `wp`, `pyramid` /
-  `pyramidstep` / `adaptivegop`) —
+  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `wp`, `wpp`,
+  `tiles`, `pyramid` / `pyramidstep` / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
   (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
@@ -211,7 +211,20 @@ identity explicit combine equals the default one bit for bit), the
 motion search running on luma-weighted reference copies and the
 prediction through the decoder's own §8.5.3.3.4.3 uni / bi combine —
 **−26 % / −44 % BD-rate on the fading scene** (pyramid / low-delay;
-−7.5 % / −14 % mean over the corpus).
+−7.5 % / −14 % mean over the corpus). **WPP and tiles** (`wpp`,
+`tiles=CxR`; `TileLayout::uniform` / `explicit` on the direct API):
+tile-scan coding with §6.4.1 availability cut at tile boundaries,
+per-tile context / engine re-initialization, the §9.3.2.2 WPP context
+storage after a tile row's second CTB and synchronization at the next
+row start, one byte-aligned subset per tile row with §7.3.6.1 entry
+points, per-tile / per-row `qPY_PREV` resets, tile-gated SAO merges,
+filters picture-wide across tiles — +1.1 % bytes for WPP, +3.9 % for
+a 2x2 grid. WPP-only and tiles-only streams are black-box validated;
+the WPP+tiles combination follows the spec text and the crate's
+decoder (byte-exact on the seven official WPP+tile conformance
+streams) but the surveyed black-box reference decoder diverges on it
+(it also misdecodes the official `WPP_AND_TILE_*` streams), so that
+combination is decoder-pinned only.
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -278,8 +291,9 @@ and ~960 unit tests.
 
 ## Not yet implemented
 
-* Encoder tools beyond the current set: encoder-side WPP / tile
-  parallel emission and SCC-tool (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
+* Encoder tools beyond the current set: a parallel (multi-threaded)
+  tile encode under the core `ExecutionContext` budget — every path
+  is serial today — and SCC-tool (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
   hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU

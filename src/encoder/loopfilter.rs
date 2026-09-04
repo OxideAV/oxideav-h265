@@ -208,6 +208,10 @@ pub(crate) struct FilterInput<'a> {
     /// candidate) plus the per-4x4 §8.6.1 `QpY` map for the exact
     /// §8.7.2.5.3 per-position `QpP` reads.
     pub tree: Option<TreeLayout<'a>>,
+    /// Per-CTB (raster order) `TileId` when the picture is tiled: the
+    /// §7.3.8.3 `sao_merge_left/up_flag` candidates exist only inside
+    /// the CTB's tile. `None` = a single tile.
+    pub tile_ids: Option<&'a [u32]>,
 }
 
 /// The quadtree coder's deblocking inputs (see [`FilterInput::tree`]).
@@ -797,8 +801,16 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                 explicit_cost += region_ssd(&base, Plane::Cb, input.src[1], cw, cx0, cy0, nw, nh)
                     + region_ssd(&base, Plane::Cr, input.src[2], cw, cx0, cy0, nw, nh);
             }
+            // §7.3.8.3: the merge candidates must lie in the same tile.
+            let same_tile = |other: usize| -> bool {
+                input
+                    .tile_ids
+                    .map_or(true, |ids| ids[other] == ids[ctb_idx])
+            };
+            let can_left = rx > 0 && same_tile(ctb_idx - 1);
+            let can_up = ry > 0 && same_tile(ctb_idx - ctbs_x);
             // Declining the available merges costs one bin each.
-            let decline_bins = u64::from(rx > 0) + u64::from(ry > 0);
+            let decline_bins = u64::from(can_left) + u64::from(can_up);
             explicit_cost += input.lambda * decline_bins;
 
             let explicit_params = SaoCtbParams {
@@ -810,7 +822,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
 
             // Whole-CTB merge candidates (inherit ALL components).
             let mut best = (explicit_params, explicit_resolved, explicit_cost);
-            if rx > 0 {
+            if can_left {
                 let left = grid[ctb_idx - 1];
                 let d = resolved_ctb_dist(
                     &base,
@@ -836,7 +848,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     );
                 }
             }
-            if ry > 0 {
+            if can_up {
                 let above = grid[ctb_idx - ctbs_x];
                 let d = resolved_ctb_dist(
                     &base,
@@ -849,7 +861,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     cfg.sao_luma,
                     cfg.sao_chroma,
                 );
-                let cost = d + input.lambda * (1 + u64::from(rx > 0));
+                let cost = d + input.lambda * (1 + u64::from(can_left));
                 if cost < best.2 {
                     best = (
                         SaoCtbParams {
@@ -907,25 +919,26 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
 
 /// §7.3.8.3 `sao( rx, ry )` — the bin-exact dual of
 /// [`crate::slice_data::decode_sao`] for a single-slice, single-tile
-/// picture (merge-left available iff `rx > 0`, merge-up iff `ry > 0`).
+/// picture (`can_left` / `can_up`: the §7.3.8.3 merge candidates exist —
+/// left / up CTB inside the picture, slice and tile).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sao_ctb(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
     params: &SaoCtbParams,
-    rx: usize,
-    ry: usize,
+    can_left: bool,
+    can_up: bool,
     slice_sao_luma: bool,
     slice_sao_chroma: bool,
 ) {
-    if rx > 0 {
+    if can_left {
         cabac.encode_decision(w, &mut ctxs.sao_merge_flag[0], u8::from(params.merge_left));
         if params.merge_left {
             return;
         }
     }
-    if ry > 0 {
+    if can_up {
         cabac.encode_decision(w, &mut ctxs.sao_merge_flag[0], u8::from(params.merge_up));
         if params.merge_up {
             return;
@@ -1068,7 +1081,14 @@ mod tests {
         let mut enc = CabacEncoder::new();
         let mut ectx = SliceContexts::init(0, 26);
         encode_sao_ctb(
-            &mut w, &mut enc, &mut ectx, params, rx, ry, sao_luma, sao_chroma,
+            &mut w,
+            &mut enc,
+            &mut ectx,
+            params,
+            rx > 0,
+            ry > 0,
+            sao_luma,
+            sao_chroma,
         );
         enc.encode_terminate(&mut w, 1);
         let bytes = w.finish();
@@ -1235,6 +1255,7 @@ mod tests {
             shapes: &shapes,
             ctb_log2: 4,
             tree: None,
+            tile_ids: None,
         };
         let out = filter_frame(&input, &LoopFilterCfg::all());
         assert!(out.slice_sao_luma || out.slice_sao_chroma, "SAO elected");
@@ -1316,6 +1337,7 @@ mod tests {
             shapes: &shapes,
             ctb_log2: 4,
             tree: None,
+            tile_ids: None,
         };
         let cfg = LoopFilterCfg {
             deblocking: true,

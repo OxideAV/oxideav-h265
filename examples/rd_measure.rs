@@ -23,7 +23,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use oxideav_h265::encoder::ctu::TreeCfg;
+use oxideav_h265::encoder::ctu::{TileLayout, TreeCfg};
 use oxideav_h265::encoder::inter::{FrameRecon, LowDelayPEncoder, YuvFrame};
 use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
 use oxideav_h265::encoder::pyramid::PyramidEncoder;
@@ -82,14 +82,17 @@ fn parse_tools(s: &str) -> Result<Tools, String> {
 }
 
 fn tree_cfg(ctb: usize, t: &Tools) -> TreeCfg {
-    let cfg = TreeCfg::new(ctb)
+    let mut cfg = TreeCfg::new(ctb)
         .expect("ctb 16/32/64")
         .with_tu_depth(t.tu_depth, t.tu_depth)
         .with_rdoq(t.rdoq)
         .with_sign_hiding(t.sdh)
         .with_scaling_lists(t.scaling_lists)
-        .with_weighted_pred(t.weighted_pred);
-    assert!(!(t.wpp || t.tiles.is_some()), "tool not wired yet");
+        .with_weighted_pred(t.weighted_pred)
+        .with_wpp(t.wpp);
+    if let Some((c, r)) = t.tiles {
+        cfg = cfg.with_tiles(TileLayout::uniform(c as u8, r as u8));
+    }
     cfg
 }
 

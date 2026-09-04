@@ -353,29 +353,35 @@ fn write_sps(
 /// adaptive-quantization encoders signal per-CTB QP through §7.3.8.10
 /// `cu_qp_delta` (`diff_cu_qp_delta_depth == 0`, one quantization
 /// group per CTB).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_pps_full(
     dependent_slice_segments_enabled: bool,
     deblocking_enabled: bool,
     deblocking_override_enabled: bool,
-    tiles: Option<(u32, u32)>,
+    tiles: Option<&TileGrid>,
     cu_qp_delta: bool,
     sign_data_hiding: bool,
     weighted_pred: bool,
+    entropy_coding_sync: bool,
 ) -> Vec<u8> {
-    let grid = tiles.map(|(c, r)| TileGrid::uniform(c, r));
     write_pps_grid(
         dependent_slice_segments_enabled,
         deblocking_enabled,
         deblocking_override_enabled,
-        grid.as_ref(),
+        tiles,
         cu_qp_delta,
         sign_data_hiding,
         weighted_pred,
+        entropy_coding_sync,
+        // The coding-mode streams keep the in-loop filters picture-wide
+        // across tile boundaries (their filter passes are picture-wide).
+        tiles.is_some(),
     )
 }
 
 /// [`write_pps_full`] over an arbitrary [`TileGrid`] (uniform or
 /// explicit `column_width_minus1[]` / `row_height_minus1[]`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_pps_grid(
     dependent_slice_segments_enabled: bool,
     deblocking_enabled: bool,
@@ -384,6 +390,8 @@ pub(crate) fn write_pps_grid(
     cu_qp_delta: bool,
     sign_data_hiding: bool,
     weighted_pred: bool,
+    entropy_coding_sync: bool,
+    loop_filter_across_tiles: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pps_pic_parameter_set_id
@@ -409,7 +417,7 @@ pub(crate) fn write_pps_grid(
     w.put_bit(u8::from(weighted_pred)); // weighted_bipred_flag
     w.put_bit(0); // transquant_bypass_enabled_flag
     w.put_bit(u8::from(tiles.is_some())); // tiles_enabled_flag
-    w.put_bit(0); // entropy_coding_sync_enabled_flag
+    w.put_bit(u8::from(entropy_coding_sync)); // entropy_coding_sync_enabled_flag
     if let Some(grid) = tiles {
         w.ue(grid.cols - 1); // num_tile_columns_minus1
         w.ue(grid.rows - 1); // num_tile_rows_minus1
@@ -422,7 +430,7 @@ pub(crate) fn write_pps_grid(
                 w.ue(rh); // row_height_minus1[i]
             }
         }
-        w.put_bit(0); // loop_filter_across_tiles_enabled_flag
+        w.put_bit(u8::from(loop_filter_across_tiles)); // loop_filter_across_tiles_enabled_flag
     }
     w.put_bit(1); // pps_loop_filter_across_slices_enabled_flag
     w.put_bit(1); // deblocking_filter_control_present_flag
@@ -635,7 +643,7 @@ fn write_pcm_ctu(
 /// bytes. Returns the length and the carry-out zero run. The dual of
 /// the counting the §7.4.7.1 `entry_point_offset_minus1[i]` values
 /// perform over the coded slice-segment data.
-fn escaped_len(bytes: &[u8], mut zero_run: u32) -> (usize, u32) {
+pub(crate) fn escaped_len(bytes: &[u8], mut zero_run: u32) -> (usize, u32) {
     let mut len = 0usize;
     for &b in bytes {
         if zero_run >= 2 && b <= 0x03 {
@@ -929,6 +937,8 @@ fn encode_au(
                 opts.deblocking,
                 false,
                 grid.as_ref(),
+                false,
+                false,
                 false,
                 false,
                 false,

@@ -883,6 +883,7 @@ pub(crate) fn write_inter_slice_header(
     spec: &SliceSpec<'_>,
     lf: &SliceLfSignalling<'_>,
     wp: Option<&crate::encoder::wp::WpTables>,
+    entry_points: Option<&[u32]>,
 ) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.ue(0); // slice_pic_parameter_set_id
@@ -966,8 +967,46 @@ pub(crate) fn write_inter_slice_header(
         // some in-loop filter is active for this slice.
         w.put_bit(1); // slice_loop_filter_across_slices_enabled_flag
     }
-    // No tiles / WPP: no entry points.
+    // §7.3.6.1: the entry-point block when the PPS enables tiles or
+    // entropy coding sync (`entry_point_offset_minus1[ i ]` values).
+    if let Some(offsets) = entry_points {
+        write_entry_points(w, offsets);
+    }
     w.rbsp_trailing_bits(); // byte_alignment()
+}
+
+/// §7.3.6.1 `num_entry_point_offsets` / `offset_len_minus1` /
+/// `entry_point_offset_minus1[ i ]` (the values already minus one).
+pub(crate) fn write_entry_points(w: &mut BitWriter, offsets: &[u32]) {
+    w.ue(offsets.len() as u32); // num_entry_point_offsets
+    if !offsets.is_empty() {
+        let offset_len = offsets
+            .iter()
+            .map(|&o| 32 - o.leading_zeros())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u8;
+        w.ue(u32::from(offset_len) - 1); // offset_len_minus1
+        for &o in offsets {
+            w.put_bits(o, offset_len); // entry_point_offset_minus1[i]
+        }
+    }
+}
+
+/// The §7.4.7.1 `entry_point_offset_minus1[ i ]` values of a subset
+/// list: CODED byte lengths of every subset but the last, the
+/// emulation-prevention zero run threading across subset boundaries
+/// (the header's byte_alignment( ) one bit leaves its last byte
+/// nonzero, so the first subset starts with a zero run of 0).
+pub(crate) fn entry_point_offsets(subsets: &[Vec<u8>]) -> Vec<u32> {
+    let mut offsets = Vec::new();
+    let mut zero_run = 0u32;
+    for s in &subsets[..subsets.len().saturating_sub(1)] {
+        let (len, zr) = crate::encoder::pcm::escaped_len(s, zero_run);
+        zero_run = zr;
+        offsets.push(len as u32 - 1);
+    }
+    offsets
 }
 
 /// Extract an `n`x`n` block of `plane` at `(x0, y0)` as `i32`s.
@@ -2621,6 +2660,7 @@ pub(crate) fn encode_inter_slice(
                 shapes: &shapes,
                 ctb_log2: 4,
                 tree: None,
+                tile_ids: None,
             },
             lf,
         );
@@ -2637,7 +2677,7 @@ pub(crate) fn encode_inter_slice(
 
     // ---- slice_segment_header( ) ----
     let mut w = BitWriter::new();
-    write_inter_slice_header(&mut w, spec, &lf_sig, None);
+    write_inter_slice_header(&mut w, spec, &lf_sig, None, None);
 
     // ---- slice_segment_data( ) — pass 2: syntax emission ----
     let mut cabac = CabacEncoder::new();
@@ -2657,8 +2697,8 @@ pub(crate) fn encode_inter_slice(
                 &mut cabac,
                 &mut ctxs,
                 &sao_ctbs[ctb],
-                ctb % ctbs_x,
-                ctb / ctbs_x,
+                ctb % ctbs_x > 0,
+                ctb / ctbs_x > 0,
                 lf_sig.sao_luma,
                 lf_sig.sao_chroma,
             );
