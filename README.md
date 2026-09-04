@@ -96,8 +96,8 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `rdoq`, `sdh`, `pyramid` / `pyramidstep` /
-  `adaptivegop`) —
+  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `pyramid` / `pyramidstep`
+  / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
   (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
@@ -109,9 +109,10 @@ with three modes:
   SSD + λ·bins cost at every node of a real §7.3.8.4 **coding
   quadtree** (the `ctb` option: 16 / 32 / 64 with `MinCbSizeY == 8`,
   RD-elected `split_cu_flag` with full encoder-state rollback,
-  recursive §7.3.8.8 RQTs, 4x4 DST-VII intra luma TUs, intra
-  `PART_NxN`; without `ctb` the historical one-CU-per-CTB coder keeps
-  its streams byte-stable). Motion candidates resolve through the
+  recursive §7.3.8.8 RQTs to `max_transform_hierarchy_depth_*` 0..=3
+  (`tudepth`, RD-elected at every node), 4x4 DST-VII intra luma TUs,
+  intra `PART_NxN`, 8x4 / 4x8 inter PUs; without `ctb` the historical
+  one-CU-per-CTB coder keeps its streams byte-stable). Motion candidates resolve through the
   crate's own DECODE-side §8.5.3.2 derivation — **temporal MVP**
   included (`tmvp`: `slice_temporal_mvp_enabled_flag`, the §7.3.6.1
   collocated block, per-reference retained motion fields) — over
@@ -267,10 +268,11 @@ and ~960 unit tests.
 * Encoder tools beyond the current set: encoder-side WPP / tile
   parallel emission, weighted prediction estimation,
   scaling-list-aware quantization, and SCC-tool (palette / IBC /
-  ACT) encoding; the quadtree coder keeps
-  `max_transform_hierarchy_depth_* == 1` and leaves 8x4 / 4x8 inter
-  PUs out of the ladder; CTU-level rate feedback and the
-  quantization tools ride only the quadtree coder.
+  ACT) encoding; CTU-level rate feedback and the quantization /
+  hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
+  above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
+  intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
+  path covers that geometry.)
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

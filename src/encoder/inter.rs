@@ -1676,7 +1676,9 @@ pub(crate) fn amvp_search(
             cost,
         ));
     }
-    if let (Some((g0, _, _, _)), Some((g1, _, _, _))) = (&l0, &l1) {
+    // §7.4.9.6 / Table 9-46: an 8x4 / 4x8 PU (`nPbW + nPbH == 12`)
+    // cannot signal PRED_BI.
+    if let (Some((g0, _, _, _)), Some((g1, _, _, _)), true) = (&l0, &l1, w + h != 12) {
         // Bi combination of the two single-list winners: the AMVP
         // predictor derivation of each list is independent of the
         // other, so the resolved per-list MVs match the uni winners.

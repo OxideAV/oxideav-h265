@@ -1,9 +1,11 @@
 //! General coding-tree encoder — recursive §7.3.8.4 coding quadtrees
 //! at CTB 16 / 32 / 64 with rate-distortion-elected `split_cu_flag`,
 //! recursive §7.3.8.8 residual quadtrees
-//! (`max_transform_hierarchy_depth_*` > 0), §8.6.4 DST-VII 4x4 intra
-//! luma TUs, and `MinCbSizeY == 8` coding units (intra `PART_NxN`
-//! with four 4x4 luma PBs included).
+//! (`max_transform_hierarchy_depth_*` 0..=3, RD-elected at every
+//! node), §8.6.4 DST-VII 4x4 intra luma TUs, and `MinCbSizeY == 8`
+//! coding units (intra `PART_NxN` with four 4x4 luma PBs, and the
+//! 8x4 / 4x8 `PART_2NxN` / `PART_Nx2N` inter PUs — uni-predicted per
+//! §8.5.3.2.2 step 10 / Table 9-46).
 //!
 //! This module is the quadtree twin of the fixed-geometry
 //! [`crate::encoder::intra`] / [`crate::encoder::inter`] bootstrap
@@ -1601,10 +1603,12 @@ fn code_inter_cu(
         });
     }
 
-    // ---- two-PU partitions (log2 > 3: 8x4 / 4x8 PUs stay out) ----
-    if log2 > 3 {
+    // ---- two-PU partitions (8x4 / 4x8 PUs at log2 == 3, uni-pred
+    // only per §8.5.3.2.2 step 10 / Table 9-46; AMP shapes only above
+    // MinCbSizeY per Table 9-45) ----
+    {
         let mut parts = vec![PartMode::Part2NxN, PartMode::PartNx2N];
-        if ctx.amp {
+        if ctx.amp && log2 > ctx.cfg.min_cb_log2() {
             parts.extend([
                 PartMode::Part2NxnU,
                 PartMode::Part2NxnD,
@@ -3114,12 +3118,16 @@ mod tests {
     }
 
     fn assert_gop_tree_roundtrip(ctb: usize, b_slices: bool, lf: LoopFilterCfg, aq: u8) {
+        assert_gop_tree_roundtrip_cfg(TreeCfg::new(ctb).expect("legal ctb"), b_slices, lf, aq);
+    }
+
+    fn assert_gop_tree_roundtrip_cfg(cfg: TreeCfg, b_slices: bool, lf: LoopFilterCfg, aq: u8) {
         use crate::encoder::inter::LowDelayPEncoder;
         let (w, h) = (96, 64);
         let frames = scene(w, h, 4);
         let mut enc = LowDelayPEncoder::new(w, h, 30, 0)
             .expect("encoder")
-            .with_tree(TreeCfg::new(ctb).expect("legal ctb"))
+            .with_tree(cfg)
             .with_b_slices(b_slices)
             .with_loop_filters(lf)
             .with_aq(aq);
@@ -3138,6 +3146,40 @@ mod tests {
             assert_eq!(planar[w * h..w * h + w * h / 4], rec.cb[..]);
             assert_eq!(planar[w * h + w * h / 4..], rec.cr[..]);
         }
+    }
+
+    /// Depth-2 / depth-3 residual quadtrees with 8x4 / 4x8 PUs and
+    /// the quantization tools on, P and B slices: every stream must
+    /// reconstruct sample-exact through the decoder.
+    #[test]
+    fn tree_deep_rqt_and_small_pus_roundtrip() {
+        for (depth, b) in [(2u32, false), (3, true), (2, true)] {
+            let cfg = TreeCfg::new(32)
+                .expect("ctb 32")
+                .with_tu_depth(depth, depth)
+                .with_rdoq(true)
+                .with_sign_hiding(true);
+            assert_gop_tree_roundtrip_cfg(cfg, b, LoopFilterCfg::all(), 0);
+        }
+    }
+
+    /// The deeper ladder actually elects 8x4 / 4x8 PUs and depth-2
+    /// transform splits on a busy P frame.
+    #[test]
+    fn tree_deep_ladder_elects_small_pus_and_deep_splits() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        let (w, h) = (96, 64);
+        let frames = scene(w, h, 3);
+        let cfg = TreeCfg::new(32).expect("ctb 32").with_tu_depth(2, 2);
+        let mut enc = LowDelayPEncoder::new(w, h, 24, 0)
+            .expect("encoder")
+            .with_tree(cfg);
+        let mut rect = 0usize;
+        for (y, cb, cr) in &frames {
+            let f = enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame");
+            rect += f.stats.rect;
+        }
+        assert!(rect > 0, "no rectangular PU elected at all");
     }
 
     #[test]

@@ -340,13 +340,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // hiding; `rdoq` — rate-distortion optimised quantization.
     let sdh = parse_flag(params, "sdh")?;
     let rdoq = parse_flag(params, "rdoq")?;
-    if (sdh || rdoq) && tree.is_none() {
+    // `tudepth` — max_transform_hierarchy_depth_intra / _inter (0..=3).
+    let tudepth = match params.options.get("tudepth") {
+        None => None,
+        Some(v) => Some(v.parse::<u32>().ok().filter(|d| *d <= 3).ok_or_else(|| {
+            Error::InvalidData(format!("h265 encode: tudepth must be 0..=3, got {v:?}"))
+        })?),
+    };
+    if (sdh || rdoq || tudepth.is_some()) && tree.is_none() {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh / rdoq options require the ctb option".into(),
+            "h265 encode: the sdh / rdoq / tudepth options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
         *t = t.with_sign_hiding(sdh).with_rdoq(rdoq);
+        if let Some(d) = tudepth {
+            *t = t.with_tu_depth(d, d);
+        }
     }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
     let ctu_rc = parse_flag(params, "cturc")?;

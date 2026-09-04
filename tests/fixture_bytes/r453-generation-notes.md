@@ -94,3 +94,18 @@ pro-rata frame budget).
 ```
 81e050632665bd442ab7426803c905b7448daec23c5c7211533c3c57651e908f  r453-tree-lowdelay-cturc-120k.hevc
 ```
+
+## Round-456 ladder re-pin
+
+`r453-tree-pgop-ctb32-qp30.hevc`, `r453-tree-pyramid-refs3-tmvp-qp29.hevc`
+and `r453-tree-lowdelay-cturc-120k.hevc` were regenerated when the
+quadtree ladder gained the 8x4 / 4x8 `PART_2NxN` / `PART_Nx2N` inter
+PUs at `MinCbSizeY` (uni-predicted per §8.5.3.2.2 step 10 /
+Table 9-46) — every other pin was unaffected — and re-validated
+byte-exact through the same black-box invocation. SHA-256 (final):
+
+```
+75bf091cdfec737a9897785e16fa633a502e3d002ae2c54c3b8d3455f8136d0b  r453-tree-lowdelay-cturc-120k.hevc
+3ec83d6d21d838325a0ac9196abcb1a2f31123f3f8aa86775ee2099c89537f9a  r453-tree-pgop-ctb32-qp30.hevc
+c9711b1ff92609f78f2cd106b6fc75b4fad26cbcbf84dc360c703ed58c917f56  r453-tree-pyramid-refs3-tmvp-qp29.hevc
+```
