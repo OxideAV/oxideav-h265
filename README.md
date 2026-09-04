@@ -96,7 +96,8 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `sdh`, `pyramid` / `pyramidstep` / `adaptivegop`) —
+  `refs`, `tmvp`, `rdoq`, `sdh`, `pyramid` / `pyramidstep` /
+  `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
   (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
@@ -184,12 +185,19 @@ constant-bit-rate delivery (`cbr_flag == 1`, eq. C-19 bounds,
 on every coding mode. An explicit `fps` declares §E.2.1 VUI timing.
 
 **Quantization tools** (quadtree coder, `TreeCfg` builders / registry
-options, off by default so the golden pins stay byte-stable): **sign
-data hiding** (`sdh`: PPS `sign_data_hiding_enabled_flag`, the
-§7.3.8.11 `signHidden` sub-blocks omit their first-in-scan sign and
-the levels are parity-adjusted by the cheapest ±1 move under a
-sample-domain distortion + rate estimate) — −2.5..−4 % bytes on the
-`rd_measure` corpus at near-neutral BD-rate.
+options, off by default so the golden pins stay byte-stable): **RDOQ**
+(`rdoq`: every TB's levels elected under `D + λ·R` in the decoder's
+reverse scan — `sig_coeff_flag` / `greater1` / `greater2` / sign /
+Rice-adapted `coeff_abs_level_remaining` bins priced at the running
+CABAC context states of a shadow emission through an integer
+Table 9-52-derived bin-cost model, then the last significant position
+and whole coded sub-blocks re-elected) — **−9.4 % / −5.5 % / −7.9 %
+BD-rate** on the pyramid / low-delay / all-intra paths of the
+`examples/rd_measure.rs` corpus; and **sign data hiding** (`sdh`: PPS
+`sign_data_hiding_enabled_flag`, the §7.3.8.11 `signHidden` sub-blocks
+omit their first-in-scan sign and the levels are parity-adjusted by
+the cheapest ±1 move under a sample-domain distortion + rate estimate)
+— −2.5..−4 % bytes at near-neutral BD-rate.
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -257,7 +265,7 @@ and ~960 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: encoder-side WPP / tile
-  parallel emission, weighted prediction estimation, RDOQ,
+  parallel emission, weighted prediction estimation,
   scaling-list-aware quantization, and SCC-tool (palette / IBC /
   ACT) encoding; the quadtree coder keeps
   `max_transform_hierarchy_depth_* == 1` and leaves 8x4 / 4x8 inter

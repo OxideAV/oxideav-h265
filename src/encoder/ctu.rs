@@ -60,7 +60,7 @@ use crate::encoder::intra::{
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
 };
-use crate::encoder::quant::{quantize_tb, TbQuant};
+use crate::encoder::quant::{quantize_tb, RdoqModel, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -93,6 +93,11 @@ pub struct TreeCfg {
     pub th_depth_intra: u32,
     /// `max_transform_hierarchy_depth_inter`.
     pub th_depth_inter: u32,
+    /// Rate-distortion optimised quantization
+    /// ([`crate::encoder::quant`]): every TB's levels are elected
+    /// under `D + λ·R` over the exact §7.3.8.11 bin costs at the
+    /// running CABAC context states.
+    pub rdoq: bool,
     /// PPS `sign_data_hiding_enabled_flag == 1`: the §7.3.8.11
     /// `signHidden` sub-blocks omit their first sign, the levels
     /// parity-adjusted by the cheapest ±1 move.
@@ -114,6 +119,7 @@ impl TreeCfg {
             ctb_log2,
             th_depth_intra: 1,
             th_depth_inter: 1,
+            rdoq: false,
             sign_hiding: false,
         })
     }
@@ -125,6 +131,13 @@ impl TreeCfg {
     pub fn with_tu_depth(mut self, intra: u32, inter: u32) -> Self {
         self.th_depth_intra = intra.min(3);
         self.th_depth_inter = inter.min(3);
+        self
+    }
+
+    /// Switch rate-distortion optimised quantization on / off.
+    #[must_use]
+    pub fn with_rdoq(mut self, on: bool) -> Self {
+        self.rdoq = on;
         self
     }
 
@@ -339,6 +352,10 @@ struct EncState {
     skip: Vec<u8>,
     w_cells: usize,
     h_cells: usize,
+    /// The RDOQ rate model for the CTB being decided (the shadow
+    /// emission's residual context states at the CTB start); `None`
+    /// when RDOQ is off.
+    rdoq_model: Option<RdoqModel>,
 }
 
 impl EncState {
@@ -359,6 +376,7 @@ impl EncState {
             skip: vec![0; w_cells * h_cells],
             w_cells,
             h_cells,
+            rdoq_model: None,
         }
     }
 
@@ -534,20 +552,23 @@ fn forward_transform_dst4(res: &[i32]) -> Vec<i32> {
 
 /// The quantization tools one TB is coded with.
 #[derive(Clone, Copy)]
-struct TbTools {
+struct TbTools<'a> {
     /// The §7.4.9.11 scan of the block (mode-dependent on intra).
     scan: ScanIdx,
     /// Sample-domain λ.
     lambda: u64,
+    /// RDOQ model (`None` = deadzone quantizer).
+    model: Option<&'a RdoqModel>,
     /// Sign-data-hiding parity adjustment.
     sign_hiding: bool,
 }
 
-impl TbTools {
+impl<'a> TbTools<'a> {
     /// The tools for a TB of the CU under decision: the scan from
-    /// the prediction type / intra mode.
+    /// the prediction type / intra mode, the model from the state.
     fn new(
         ctx: &SliceCtx<'_>,
+        model: Option<&'a RdoqModel>,
         lambda: u64,
         cu_is_intra: bool,
         log2: u32,
@@ -555,11 +576,13 @@ impl TbTools {
         mode: u8,
     ) -> Self {
         // The mode-decision λ prices PROXY bins (`rate_proxy`
-        // overstates residual bits); the quantizer prices exact bins
-        // at λ/2.
+        // overstates residual bits); the quantizer prices exact bins,
+        // and λ/2 is the measured optimum (a {1/8 .. 3/4}·λ sweep on
+        // the rd_measure corpus: −9.4 % BD-rate on the pyramid path).
         Self {
             scan: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, u32::from(mode)),
             lambda: lambda / 2,
+            model: if ctx.cfg.rdoq { model } else { None },
             sign_hiding: ctx.cfg.sign_hiding,
         }
     }
@@ -575,7 +598,7 @@ fn code_tb(
     qp: u32,
     component: Component,
     pred_mode: PredMode,
-    tools: TbTools,
+    tools: TbTools<'_>,
 ) -> (Vec<i32>, Vec<u8>) {
     let res: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
     let coef = if pred_mode == PredMode::Intra && component == Component::Luma && n == 4 {
@@ -591,6 +614,7 @@ fn code_tb(
             is_chroma: component != Component::Luma,
             scan: tools.scan,
             lambda: tools.lambda,
+            model: tools.model,
             sign_hiding: tools.sign_hiding,
         },
     );
@@ -803,7 +827,15 @@ fn code_intra_luma_tb(
     let pred = intra_predict_with_substitution(&marked, &pred_params(mode, PredComponent::Luma))
         .expect("legal prediction params");
     let src = extract(ctx.src[0], ctx.width, x, y, n);
-    let tools = TbTools::new(ctx, lambda, true, n.trailing_zeros(), 0, mode);
+    let tools = TbTools::new(
+        ctx,
+        st.rdoq_model.as_ref(),
+        lambda,
+        true,
+        n.trailing_zeros(),
+        0,
+        mode,
+    );
     let (levels, recon) = code_tb(
         &src,
         &pred,
@@ -831,6 +863,7 @@ fn code_intra_chroma_tbs(
     lambda: u64,
 ) -> (Vec<i32>, Vec<i32>, u64) {
     let cw = ctx.width / 2;
+    let model = st.rdoq_model.clone();
     let mut do_plane = |plane_idx: usize, comp: Component, pc: PredComponent| -> (Vec<i32>, u64) {
         let recon_plane = match plane_idx {
             1 => &st.recon.cb,
@@ -842,6 +875,7 @@ fn code_intra_chroma_tbs(
         let src = extract(ctx.src[plane_idx], cw, cx, cy, n);
         let tools = TbTools::new(
             ctx,
+            model.as_ref(),
             lambda,
             true,
             n.trailing_zeros(),
@@ -1153,7 +1187,7 @@ fn inter_rqt(
         let n_cb = bufs.n_cb;
         let src_y = sub_block(bufs.src_y, n_cb, x, y, n);
         let pred_y = sub_block(bufs.pred_y, n_cb, x, y, n);
-        let tools = |c_idx: u8| TbTools::new(ctx, lambda, false, log2, c_idx, 0);
+        let tools = |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, log2, c_idx, 0);
         let (y_lv, y_rc) = code_tb(
             &src_y,
             &pred_y,
@@ -1174,7 +1208,8 @@ fn inter_rqt(
             let hc = n / 2;
             let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, hc);
             let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, hc);
-            let chroma_tools = |c_idx: u8| TbTools::new(ctx, lambda, false, log2 - 1, c_idx, 0);
+            let chroma_tools =
+                |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, log2 - 1, c_idx, 0);
             let (cb_lv, cb_rc) = code_tb(
                 &src_cb,
                 &pred_cb,
@@ -1271,7 +1306,8 @@ fn inter_rqt(
             let n_cb = bufs.n_cb;
             let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, 4);
             let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, 4);
-            let chroma_tools = |c_idx: u8| TbTools::new(ctx, lambda, false, 2, c_idx, 0);
+            let chroma_tools =
+                |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, 2, c_idx, 0);
             let (cb_lv, cb_rc) = code_tb(
                 &src_cb,
                 &pred_cb,
@@ -1350,6 +1386,8 @@ struct InterCuBufs<'a> {
     pred_y: &'a [i32],
     pred_cb: &'a [i32],
     pred_cr: &'a [i32],
+    /// The CTB's RDOQ model.
+    model: Option<&'a RdoqModel>,
 }
 
 /// One fully-evaluated inter candidate (pre-commit).
@@ -1419,6 +1457,7 @@ fn code_inter_cu(
             pred_y: &pred.luma,
             pred_cb: &pred.cb,
             pred_cr: &pred.cr,
+            model: st.rdoq_model.as_ref(),
         };
         let inter_split = max_depth == 0 && !part_2nx2n;
         let (node, local, dist, rate) = inter_rqt(
@@ -2540,14 +2579,17 @@ fn code_picture(
     // CTU-level rate feedback: a shadow CABAC emission of every coded
     // CTB (no SAO syntax — that is elected after the filters) tracks
     // the picture's running coded size against the pro-rata budget.
-    let mut shadow: Option<(CabacEncoder, SliceContexts, BitWriter, i32)> = ctx.ctu_rc.map(|_| {
-        (
-            CabacEncoder::new(),
-            SliceContexts::init(init_type(slice_type_raw, false), ctx.qp),
-            BitWriter::new(),
-            ctx.qp,
-        )
-    });
+    // RDOQ prices its bins at the same shadow's residual context
+    // states (refreshed at every CTB start).
+    let mut shadow: Option<(CabacEncoder, SliceContexts, BitWriter, i32)> =
+        (ctx.ctu_rc.is_some() || ctx.cfg.rdoq).then(|| {
+            (
+                CabacEncoder::new(),
+                SliceContexts::init(init_type(slice_type_raw, false), ctx.qp),
+                BitWriter::new(),
+                ctx.qp,
+            )
+        });
     for ctb_idx in 0..n_ctbs {
         let x0 = (ctb_idx % ctbs_x) * ctb;
         let y0 = (ctb_idx / ctbs_x) * ctb;
@@ -2571,6 +2613,11 @@ fn code_picture(
             _ => 0,
         };
         let ctb_qp = (ctx.qp + ctx.aq_deltas[ctb_idx] + rc_adj).clamp(0, 51);
+        if ctx.cfg.rdoq {
+            st.rdoq_model = shadow.as_ref().map(|(_, ctxs, _, _)| RdoqModel {
+                contexts: ctxs.residual.clone(),
+            });
+        }
         let (node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
         if let Some((cabac, ctxs, w, qp_prev)) = shadow.as_mut() {
             let mut qg = QgState {

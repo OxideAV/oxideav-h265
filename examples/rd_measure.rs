@@ -82,9 +82,10 @@ fn tree_cfg(ctb: usize, t: &Tools) -> TreeCfg {
     let cfg = TreeCfg::new(ctb)
         .expect("ctb 16/32/64")
         .with_tu_depth(t.tu_depth, t.tu_depth)
+        .with_rdoq(t.rdoq)
         .with_sign_hiding(t.sdh);
     assert!(
-        !(t.rdoq || t.scaling_lists || t.wpp || t.weighted_pred || t.tiles.is_some()),
+        !(t.scaling_lists || t.wpp || t.weighted_pred || t.tiles.is_some()),
         "tool not wired yet"
     );
     cfg

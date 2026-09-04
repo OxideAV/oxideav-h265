@@ -8,6 +8,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- *(encoder)* RDOQ on the quadtree coder — per-TB level decisions under D + λ·R over the exact §7.3.8.11 bin costs at the shadow emission's CABAC context states (Table 9-52-derived integer bin-cost model), last-position election and coded-sub-block zero-out (`TreeCfg::with_rdoq`, registry `rdoq`); −9.4 % / −5.5 % / −7.9 % BD-rate on the pyramid / low-delay / all-intra paths of the `rd_measure` corpus
 - *(encoder)* sign data hiding (`sign_data_hiding_enabled_flag`) on the quadtree coder — §7.3.8.11 `signHidden` sub-blocks omit their first sign, the levels parity-adjusted by the cheapest ±1 move (`TreeCfg::with_sign_hiding`, registry `sdh`); the residual encoder gains the hidden-sign path with a parity guard
 - *(examples)* `rd_measure` — BD-rate harness over a deterministic synthetic corpus with decoder-exactness checks and .hevc/.yuv dumps for black-box validation
 

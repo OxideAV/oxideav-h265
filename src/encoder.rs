@@ -337,15 +337,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     let mut tree = parse_ctb(params)?;
     // Quadtree-coder tools (each requires `ctb`): `sdh` — sign data
-    // hiding.
+    // hiding; `rdoq` — rate-distortion optimised quantization.
     let sdh = parse_flag(params, "sdh")?;
-    if sdh && tree.is_none() {
+    let rdoq = parse_flag(params, "rdoq")?;
+    if (sdh || rdoq) && tree.is_none() {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh option requires the ctb option".into(),
+            "h265 encode: the sdh / rdoq options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
-        *t = t.with_sign_hiding(sdh);
+        *t = t.with_sign_hiding(sdh).with_rdoq(rdoq);
     }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
     let ctu_rc = parse_flag(params, "cturc")?;
