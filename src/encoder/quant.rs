@@ -44,7 +44,9 @@ use crate::binarization::{
     sig_coeff_flag_sig_ctx_log2_2, Greater1State,
 };
 use crate::cabac::{ContextModel, RANGE_TAB_LPS};
+use crate::encoder::bitwriter::BitWriter;
 use crate::residual::ResidualContexts;
+use crate::scaling_list::{ScalingFactorMatrix, ScalingListData, NUM_MATRIX_IDS, NUM_SIZE_IDS};
 use crate::scan::{scan_order, ScanIdx};
 use crate::transform::LEVEL_SCALE;
 
@@ -138,6 +140,66 @@ impl RdoqModel {
     }
 }
 
+/// The scaling lists a stream configuration selects
+/// ([`crate::encoder::ctu::TreeCfg::scaling_lists`]): `0` none
+/// (`scaling_list_enabled_flag == 0`), `1` the §7.4.5 Table 7-5 /
+/// 7-6 defaults (enabled, no `scaling_list_data( )` transmitted), `2`
+/// a flattened custom family (each default factor's deviation from
+/// 16 halved) and `3` a steepened one (deviation doubled), the custom
+/// families transmitted explicitly in the SPS. Returns `(data,
+/// transmitted)`; `None` for `0`.
+#[must_use]
+pub fn scaling_lists_for(mode: u8) -> Option<(ScalingListData, bool)> {
+    match mode {
+        0 => None,
+        1 => Some((ScalingListData::all_default(), false)),
+        m => {
+            let mut data = ScalingListData::all_default();
+            for size_lists in data.lists.iter_mut() {
+                for list in size_lists.iter_mut() {
+                    for c in list.coef.iter_mut() {
+                        let dev = i32::from(*c) - 16;
+                        let dev = if m == 2 { dev / 2 } else { dev * 2 };
+                        *c = (16 + dev).clamp(1, 255) as u16;
+                    }
+                    // Custom DC factors stay at the default 16.
+                    list.dc_coef = 16;
+                }
+            }
+            Some((data, true))
+        }
+    }
+}
+
+/// §7.3.4 `scaling_list_data( )` — every slot coded explicitly
+/// (`scaling_list_pred_mode_flag == 1`): the `sizeId > 1` DC
+/// coefficient, then the DPCM `scaling_list_delta_coef` run over the
+/// up-right-diagonal-ordered list (each delta the −128..=127
+/// representative of `coef − nextCoef` mod 256).
+pub fn write_scaling_list_data(w: &mut BitWriter, data: &ScalingListData) {
+    for size_id in 0..NUM_SIZE_IDS {
+        let step = if size_id == 3 { 3 } else { 1 };
+        let mut matrix_id = 0usize;
+        while matrix_id < NUM_MATRIX_IDS {
+            let list = &data.lists[size_id][matrix_id];
+            w.put_bit(1); // scaling_list_pred_mode_flag
+            let coef_num = 64.min(1usize << (4 + (size_id << 1)));
+            let mut next_coef: i32 = 8;
+            if size_id > 1 {
+                w.se(i32::from(list.dc_coef) - 8); // scaling_list_dc_coef_minus8
+                next_coef = i32::from(list.dc_coef);
+            }
+            for &c in list.coef.iter().take(coef_num) {
+                let delta = (i32::from(c) - next_coef).rem_euclid(256);
+                let delta = if delta > 127 { delta - 256 } else { delta };
+                w.se(delta); // scaling_list_delta_coef
+                next_coef = i32::from(c);
+            }
+            matrix_id += step;
+        }
+    }
+}
+
 /// One transform block's quantization request.
 #[derive(Debug, Clone, Copy)]
 pub struct TbQuant<'a> {
@@ -155,13 +217,37 @@ pub struct TbQuant<'a> {
     pub model: Option<&'a RdoqModel>,
     /// Apply the sign-data-hiding parity adjustment.
     pub sign_hiding: bool,
+    /// The §7.4.5 `ScalingFactor[ sizeId ][ matrixId ]` matrix of the
+    /// block (`scaling_list_enabled_flag == 1`); `None` is the flat
+    /// `m[ x ][ y ] == 16` of §8.6.3.
+    pub scaling: Option<&'a ScalingFactorMatrix>,
 }
 
 /// §8.6.3-derived reciprocal quantizer scale (`round( 2^20 /
-/// levelScale[ qP % 6 ] )`).
+/// levelScale[ qP % 6 ] )`) — the flat `m == 16` case.
 fn quant_scale(qp_rem: u32) -> u64 {
     let ls = u64::from(LEVEL_SCALE[qp_rem as usize] as u32);
     ((1u64 << 20) + ls / 2) / ls
+}
+
+/// The per-position reciprocal scale under a scaling list:
+/// `round( 2^20 · 16 / ( levelScale[ qP % 6 ] · m[ x ][ y ] ) )`,
+/// the inverse of the eq. 8-309 `m · levelScale` product.
+fn quant_scale_m(qp_rem: u32, m: u16) -> u64 {
+    let d = u64::from(LEVEL_SCALE[qp_rem as usize] as u32) * u64::from(m.max(1));
+    ((1u64 << 24) + d / 2) / d
+}
+
+/// One reciprocal scale per coefficient (row-major).
+fn scales_of(req: &TbQuant<'_>, count: usize) -> Vec<u64> {
+    match req.scaling {
+        None => vec![quant_scale(req.qp % 6); count],
+        Some(sf) => sf
+            .coef
+            .iter()
+            .map(|&m| quant_scale_m(req.qp % 6, m))
+            .collect(),
+    }
 }
 
 /// `qBits = 14 + qP / 6 + ( 15 − BitDepth − log2TbS )`.
@@ -206,13 +292,14 @@ fn deadzone_level(q: u64, qbits: u32) -> u64 {
 #[must_use]
 pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
     let qbits = q_bits(req.log2, req.qp);
-    let scale = quant_scale(req.qp % 6);
+    let scales = scales_of(req, coef.len());
     let q: Vec<u64> = coef
         .iter()
-        .map(|&c| u64::from(c.unsigned_abs()) * scale)
+        .zip(&scales)
+        .map(|(&c, &scale)| u64::from(c.unsigned_abs()) * scale)
         .collect();
     let mut levels: Vec<i32> = match req.model {
-        Some(model) => rdoq_levels(&q, coef, req, model, qbits, scale),
+        Some(model) => rdoq_levels(&q, coef, req, model, qbits, &scales),
         None => q
             .iter()
             .zip(coef)
@@ -220,7 +307,7 @@ pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
             .collect(),
     };
     if req.sign_hiding && levels.iter().any(|&l| l != 0) {
-        apply_sign_hiding(&mut levels, &q, coef, req, qbits, scale);
+        apply_sign_hiding(&mut levels, &q, coef, req, qbits, &scales);
     }
     levels
 }
@@ -258,7 +345,7 @@ fn rdoq_levels(
     req: &TbQuant<'_>,
     model: &RdoqModel,
     qbits: u32,
-    scale: u64,
+    scales: &[u64],
 ) -> Vec<i32> {
     let log2 = req.log2;
     let size = 1usize << log2;
@@ -335,6 +422,7 @@ fn rdoq_levels(
         for n in (0..=start_n).rev() {
             let (idx, xc, yc, _, _) = index_of(sb_i, n);
             let qv = q[idx];
+            let scale = scales[idx];
             let dist0 = coef_sq_err(qv, 0, qbits, scale) * 256;
             // sig_coeff_flag context (always priced; the last-position
             // election subtracts it for the elected last).
@@ -579,7 +667,7 @@ fn apply_sign_hiding(
     coef: &[i32],
     req: &TbQuant<'_>,
     qbits: u32,
-    scale: u64,
+    scales: &[u64],
 ) {
     let log2 = req.log2;
     let size = 1usize << log2;
@@ -648,6 +736,7 @@ fn apply_sign_hiding(
                 1
             };
             let rate_of = |l: u64| -> u64 { lam * 256 * level_bits_estimate(l) };
+            let scale = scales[idx];
             let d_cur = coef_sq_err(q[idx], cur_abs, qbits, scale) * 256 + rate_of(cur_abs);
             for delta in [1i64, -1] {
                 let new_abs = cur_abs as i64 + delta;
@@ -767,6 +856,7 @@ mod tests {
                         lambda: 1u64 << ((qp - 9) / 3),
                         model: Some(&model),
                         sign_hiding: false,
+                        scaling: None,
                     };
                     let levels = quantize_tb(&coef, &req);
                     let plain = quantize_tb(&coef, &TbQuant { model: None, ..req });
@@ -808,6 +898,7 @@ mod tests {
                             lambda: 64,
                             model: use_model.then_some(&model),
                             sign_hiding: true,
+                            scaling: None,
                         };
                         let levels = quantize_tb(&coef, &req);
                         if levels.iter().any(|&l| l != 0) {
@@ -815,6 +906,96 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Under the default §7.4.5 lists a flat-16 4x4 matrix reproduces
+    /// the unscaled levels, and the 8x8 intra list (larger factors
+    /// at high frequencies) quantizes those positions coarser; the
+    /// levels stay encodable with and without RDOQ / sign hiding.
+    #[test]
+    fn scaling_lists_scale_per_position_and_roundtrip() {
+        use crate::scaling_list::ScalingListData;
+        let sf = ScalingListData::all_default().scaling_factors(1);
+        let model = RdoqModel::slice_initial(0, 30);
+        for log2 in 2..=5u32 {
+            let coef = synthetic_coefs(log2, 5, 900);
+            let matrix = &sf.factors[log2 as usize - 2][0];
+            for (use_model, sdh) in [(false, false), (true, false), (true, true)] {
+                let base = TbQuant {
+                    log2,
+                    qp: 30,
+                    is_chroma: false,
+                    scan: ScanIdx::Diagonal,
+                    lambda: 64,
+                    model: use_model.then_some(&model),
+                    sign_hiding: sdh,
+                    scaling: None,
+                };
+                let flat = quantize_tb(&coef, &base);
+                let scaled = quantize_tb(
+                    &coef,
+                    &TbQuant {
+                        scaling: Some(matrix),
+                        ..base
+                    },
+                );
+                if log2 == 2 {
+                    assert_eq!(flat, scaled, "flat 4x4 list is a no-op");
+                } else if !use_model {
+                    // Every factor >= 16: never a larger magnitude.
+                    for (f, s) in flat.iter().zip(&scaled) {
+                        assert!(s.unsigned_abs() <= f.unsigned_abs());
+                    }
+                }
+                if scaled.iter().any(|&l| l != 0) {
+                    roundtrip(&params(log2, ScanIdx::Diagonal, sdh), &scaled);
+                }
+            }
+        }
+    }
+
+    /// The §7.3.4 writer round-trips through the crate's parser for
+    /// every family, and the custom families differ from the default.
+    #[test]
+    fn scaling_list_writer_roundtrips_through_the_parser() {
+        use crate::bitreader::BitReader;
+        for mode in 1..=3u8 {
+            let (data, transmitted) = scaling_lists_for(mode).expect("lists");
+            assert_eq!(transmitted, mode >= 2);
+            let mut w = BitWriter::new();
+            write_scaling_list_data(&mut w, &data);
+            w.rbsp_trailing_bits();
+            let bytes = w.finish();
+            let parsed = ScalingListData::parse(&mut BitReader::new(&bytes)).expect("parse");
+            // sizeId 3 only transmits matrixId 0 / 3; the other slots
+            // keep their defaults in both.
+            for size_id in 0..NUM_SIZE_IDS {
+                for matrix_id in 0..NUM_MATRIX_IDS {
+                    if size_id == 3 && matrix_id % 3 != 0 {
+                        continue;
+                    }
+                    let (a, b) = (
+                        &parsed.lists[size_id][matrix_id],
+                        &data.lists[size_id][matrix_id],
+                    );
+                    assert_eq!(
+                        a.coef, b.coef,
+                        "size {size_id} matrix {matrix_id} mode {mode}"
+                    );
+                    // The DC factor only exists for sizeId > 1 (the
+                    // parser leaves the unused slots at 8).
+                    if size_id > 1 {
+                        assert_eq!(a.dc_coef, b.dc_coef, "dc size {size_id} matrix {matrix_id}");
+                    }
+                }
+            }
+            if mode >= 2 {
+                assert_ne!(
+                    data.lists[1][0].coef,
+                    ScalingListData::all_default().lists[1][0].coef
+                );
             }
         }
     }
@@ -832,6 +1013,7 @@ mod tests {
                     lambda: 1,
                     model: None,
                     sign_hiding: false,
+                    scaling: None,
                 };
                 assert_eq!(
                     quantize_tb(&coef, &req),

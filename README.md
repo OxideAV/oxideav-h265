@@ -96,8 +96,8 @@ filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
 * `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
-  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `pyramid` / `pyramidstep`
-  / `adaptivegop`) —
+  `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `pyramid` /
+  `pyramidstep` / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
   or hierarchical-B mini-GOPs of ANY length 2..=16
   (`encoder::pyramid::PyramidEncoder`, dyadic lengths giving the
@@ -198,7 +198,12 @@ BD-rate** on the pyramid / low-delay / all-intra paths of the
 `sign_data_hiding_enabled_flag`, the §7.3.8.11 `signHidden` sub-blocks
 omit their first-in-scan sign and the levels are parity-adjusted by
 the cheapest ±1 move under a sample-domain distortion + rate estimate)
-— −2.5..−4 % bytes at near-neutral BD-rate.
+— −2.5..−4 % bytes at near-neutral BD-rate; and **scaling lists**
+(`sl` 1..=3: the §7.4.5 defaults, or a flattened / steepened custom
+family written through §7.3.4 `scaling_list_data( )` — every
+quantizer path prices each position at its Table 7-3 / 7-4
+`ScalingFactor`; an HVS weighting: the defaults trade −15 % bytes for
+−1..−3 dB luma PSNR).
 
 4:2:0 8-bit, dimensions multiples of 16.
 
@@ -266,9 +271,8 @@ and ~960 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: encoder-side WPP / tile
-  parallel emission, weighted prediction estimation,
-  scaling-list-aware quantization, and SCC-tool (palette / IBC /
-  ACT) encoding; CTU-level rate feedback and the quantization /
+  parallel emission, weighted prediction estimation, and SCC-tool
+  (palette / IBC / ACT) encoding; CTU-level rate feedback and the quantization /
   hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU

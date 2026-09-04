@@ -16,7 +16,8 @@
 //! ```
 //!
 //! Tool tokens: `rdoq`, `sdh`, `tu2` (transform hierarchy depth 2),
-//! `tu3`, `sl` (default scaling lists), `wpp`, `tiles2x2`, `wp`
+//! `tu3`, `sl` / `sl2` / `sl3` (default / flattened / steepened
+//! scaling lists), `wpp`, `tiles2x2`, `wp`
 //! (weighted prediction), `amp`, `tmvp`, `refs2`, `noaq`.
 
 use std::fmt::Write as _;
@@ -40,7 +41,7 @@ struct Tools {
     rdoq: bool,
     sdh: bool,
     tu_depth: u32,
-    scaling_lists: bool,
+    scaling_lists: u8,
     wpp: bool,
     tiles: Option<(u32, u32)>,
     weighted_pred: bool,
@@ -62,7 +63,9 @@ fn parse_tools(s: &str) -> Result<Tools, String> {
             "sdh" => t.sdh = true,
             "tu2" => t.tu_depth = 2,
             "tu3" => t.tu_depth = 3,
-            "sl" => t.scaling_lists = true,
+            "sl" => t.scaling_lists = 1,
+            "sl2" => t.scaling_lists = 2,
+            "sl3" => t.scaling_lists = 3,
             "wpp" => t.wpp = true,
             "tiles2x2" => t.tiles = Some((2, 2)),
             "tiles2x1" => t.tiles = Some((2, 1)),
@@ -83,9 +86,10 @@ fn tree_cfg(ctb: usize, t: &Tools) -> TreeCfg {
         .expect("ctb 16/32/64")
         .with_tu_depth(t.tu_depth, t.tu_depth)
         .with_rdoq(t.rdoq)
-        .with_sign_hiding(t.sdh);
+        .with_sign_hiding(t.sdh)
+        .with_scaling_lists(t.scaling_lists);
     assert!(
-        !(t.scaling_lists || t.wpp || t.weighted_pred || t.tiles.is_some()),
+        !(t.wpp || t.weighted_pred || t.tiles.is_some()),
         "tool not wired yet"
     );
     cfg

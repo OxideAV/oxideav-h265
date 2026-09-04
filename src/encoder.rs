@@ -347,15 +347,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             Error::InvalidData(format!("h265 encode: tudepth must be 0..=3, got {v:?}"))
         })?),
     };
-    if (sdh || rdoq || tudepth.is_some()) && tree.is_none() {
+    // `sl` — scaling lists (0 off, 1 default, 2 flattened, 3
+    // steepened).
+    let sl = match params.options.get("sl") {
+        None => None,
+        Some(v) => Some(v.parse::<u8>().ok().filter(|m| *m <= 3).ok_or_else(|| {
+            Error::InvalidData(format!("h265 encode: sl must be 0..=3, got {v:?}"))
+        })?),
+    };
+    if (sdh || rdoq || tudepth.is_some() || sl.is_some()) && tree.is_none() {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh / rdoq / tudepth options require the ctb option".into(),
+            "h265 encode: the sdh / rdoq / tudepth / sl options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
         *t = t.with_sign_hiding(sdh).with_rdoq(rdoq);
         if let Some(d) = tudepth {
             *t = t.with_tu_depth(d, d);
+        }
+        if let Some(m) = sl {
+            *t = t.with_scaling_lists(m);
         }
     }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).

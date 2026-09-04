@@ -62,7 +62,7 @@ use crate::encoder::intra::{
 use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
 };
-use crate::encoder::quant::{quantize_tb, RdoqModel, TbQuant};
+use crate::encoder::quant::{quantize_tb, scaling_lists_for, RdoqModel, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -72,6 +72,7 @@ use crate::intra_pred::{
 use crate::motion::{MotionCell, MotionField};
 use crate::pu_mv::{pu_partitions, resolve_pu_motion, PartMode, PuGeometry, PuMotion, PuMvContext};
 use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::scaling_list::{ScalingFactorMatrix, ScalingFactors};
 use crate::scan::ScanIdx;
 use crate::slice_data::SaoCtbParams;
 use crate::transform::{forward_dst4_1d, residual_block, BlockParams, Component, PredMode};
@@ -104,6 +105,10 @@ pub struct TreeCfg {
     /// `signHidden` sub-blocks omit their first sign, the levels
     /// parity-adjusted by the cheapest ±1 move.
     pub sign_hiding: bool,
+    /// Scaling lists ([`crate::encoder::quant::scaling_lists_for`]):
+    /// 0 off, 1 the §7.4.5 defaults, 2 / 3 the flattened / steepened
+    /// custom families (transmitted in the SPS).
+    pub scaling_lists: u8,
 }
 
 impl TreeCfg {
@@ -123,7 +128,16 @@ impl TreeCfg {
             th_depth_inter: 1,
             rdoq: false,
             sign_hiding: false,
+            scaling_lists: 0,
         })
+    }
+
+    /// Select the scaling lists (0 off, 1 default, 2 flattened, 3
+    /// steepened).
+    #[must_use]
+    pub fn with_scaling_lists(mut self, mode: u8) -> Self {
+        self.scaling_lists = mode.min(3);
+        self
     }
 
     /// Set `max_transform_hierarchy_depth_intra` / `_inter` (0..=3;
@@ -317,6 +331,9 @@ struct SliceCtx<'a> {
     mv_ctx: Option<&'a PuMvContext<'a>>,
     two_sided: bool,
     tiling: &'a PictureTiling,
+    /// The §7.4.5 `ScalingFactor` matrices when the stream enables
+    /// scaling lists.
+    scaling: Option<&'a ScalingFactors>,
 }
 
 impl SliceCtx<'_> {
@@ -563,13 +580,16 @@ struct TbTools<'a> {
     model: Option<&'a RdoqModel>,
     /// Sign-data-hiding parity adjustment.
     sign_hiding: bool,
+    /// The block's `ScalingFactor[ sizeId ][ matrixId ]` (Table 7-3 /
+    /// 7-4) when scaling lists are on.
+    scaling: Option<&'a ScalingFactorMatrix>,
 }
 
 impl<'a> TbTools<'a> {
     /// The tools for a TB of the CU under decision: the scan from
     /// the prediction type / intra mode, the model from the state.
     fn new(
-        ctx: &SliceCtx<'_>,
+        ctx: &SliceCtx<'a>,
         model: Option<&'a RdoqModel>,
         lambda: u64,
         cu_is_intra: bool,
@@ -577,6 +597,11 @@ impl<'a> TbTools<'a> {
         c_idx: u8,
         mode: u8,
     ) -> Self {
+        // Table 7-3 sizeId = log2 − 2; Table 7-4 matrixId = 3·inter +
+        // cIdx.
+        let scaling = ctx.scaling.map(|sf| {
+            &sf.factors[log2 as usize - 2][3 * usize::from(!cu_is_intra) + usize::from(c_idx)]
+        });
         // The mode-decision λ prices PROXY bins (`rate_proxy`
         // overstates residual bits); the quantizer prices exact bins,
         // and λ/2 is the measured optimum (a {1/8 .. 3/4}·λ sweep on
@@ -586,6 +611,7 @@ impl<'a> TbTools<'a> {
             lambda: lambda / 2,
             model: if ctx.cfg.rdoq { model } else { None },
             sign_hiding: ctx.cfg.sign_hiding,
+            scaling,
         }
     }
 }
@@ -618,6 +644,7 @@ fn code_tb(
             lambda: tools.lambda,
             model: tools.model,
             sign_hiding: tools.sign_hiding,
+            scaling: tools.scaling,
         },
     );
     let recon: Vec<u8> = if levels.iter().all(|&v| v == 0) {
@@ -625,7 +652,7 @@ fn code_tb(
     } else {
         let r = residual_block(
             &levels,
-            None,
+            tools.scaling,
             BlockParams {
                 n_tbs: n,
                 q_p: qp,
@@ -2833,6 +2860,7 @@ pub(crate) fn encode_intra_picture_tree(
     let ctb = 1usize << tree.ctb_log2;
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq, ctb);
     let tiling = make_tiling(width, height, tree.ctb_log2);
+    let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
     let ctx = SliceCtx {
         cfg: tree,
         amp: cfg.amp,
@@ -2849,6 +2877,7 @@ pub(crate) fn encode_intra_picture_tree(
         mv_ctx: None,
         two_sided: false,
         tiling: &tiling,
+        scaling: scaling.as_ref(),
     };
     let cu_qp_delta = aq > 0 || ctu_rc.is_some();
     debug_assert!(
@@ -2918,6 +2947,7 @@ pub(crate) fn encode_inter_slice_tree(
     let ctb = 1usize << tree.ctb_log2;
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, ctb);
     let tiling = make_tiling(width, height, tree.ctb_log2);
+    let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
 
     let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
     let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
@@ -2997,6 +3027,7 @@ pub(crate) fn encode_inter_slice_tree(
         mv_ctx: Some(&mv_ctx),
         two_sided,
         tiling: &tiling,
+        scaling: scaling.as_ref(),
     };
     let cu_qp_delta = spec.aq > 0 || spec.ctu_rc.is_some();
     let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };
@@ -3165,6 +3196,22 @@ mod tests {
 
     /// The deeper ladder actually elects 8x4 / 4x8 PUs and depth-2
     /// transform splits on a busy P frame.
+    /// Default and custom scaling lists on P / B GOPs (with RDOQ +
+    /// sign hiding): the SPS carries scaling_list_enabled_flag (and
+    /// the §7.3.4 body for the custom families) and every stream
+    /// reconstructs sample-exact through the decoder.
+    #[test]
+    fn tree_scaling_lists_roundtrip() {
+        for (mode, b) in [(1u8, false), (2, true), (3, false)] {
+            let cfg = TreeCfg::new(32)
+                .expect("ctb 32")
+                .with_scaling_lists(mode)
+                .with_rdoq(true)
+                .with_sign_hiding(mode == 3);
+            assert_gop_tree_roundtrip_cfg(cfg, b, LoopFilterCfg::all(), 0);
+        }
+    }
+
     #[test]
     fn tree_deep_ladder_elects_small_pus_and_deep_splits() {
         use crate::encoder::inter::LowDelayPEncoder;

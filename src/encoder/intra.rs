@@ -258,7 +258,19 @@ pub(crate) fn write_sps_cfg(
     w.ue(max_tb_log2 - 2); // log2_diff_max_min_luma_transform_block_size
     w.ue(th_inter); // max_transform_hierarchy_depth_inter
     w.ue(th_intra); // max_transform_hierarchy_depth_intra
-    w.put_bit(0); // scaling_list_enabled_flag
+    match cfg
+        .tree
+        .and_then(|t| crate::encoder::quant::scaling_lists_for(t.scaling_lists))
+    {
+        None => w.put_bit(0), // scaling_list_enabled_flag
+        Some((data, transmitted)) => {
+            w.put_bit(1); // scaling_list_enabled_flag
+            w.put_bit(u8::from(transmitted)); // sps_scaling_list_data_present_flag
+            if transmitted {
+                crate::encoder::quant::write_scaling_list_data(&mut w, &data);
+            }
+        }
+    }
     w.put_bit(u8::from(cfg.amp)); // amp_enabled_flag
     w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
     w.put_bit(0); // pcm_enabled_flag
