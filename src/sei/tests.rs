@@ -195,6 +195,26 @@ fn active_parameter_sets_decode() {
     }
 }
 
+/// §D.3.23 bounds `num_sps_ids_minus1` to 0..=15: a larger count is
+/// an error, not an allocation of that many ids (a scheduled fuzz run
+/// once drove an 11 GiB `Vec::with_capacity` through this path).
+#[test]
+fn active_parameter_sets_rejects_oversized_sps_id_count() {
+    // active_video_parameter_set_id=0 (u4), self_contained=1,
+    // no_update=1, num_sps_ids_minus1=16 (ue '000010001'), pad.
+    // Bits: 0000 1 1 0000 1000 1 0 -> 0x0C 0x22.
+    let body = [0x0C, 0x22];
+    let rbsp = sei_rbsp_one(129, &body);
+    match parse_sei_rbsp(&rbsp, SeiNalType::Prefix) {
+        Err(SeiError::ValueOutOfRange {
+            payload_type: 129,
+            field: "num_sps_ids_minus1",
+            got: 16,
+        }) => {}
+        other => panic!("expected ValueOutOfRange, got {other:?}"),
+    }
+}
+
 #[test]
 fn user_data_unregistered_decode() {
     let mut body = Vec::new();

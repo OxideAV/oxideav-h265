@@ -12,6 +12,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - *(decoder)* `ProfileTierLevel` now exposes `general_profile_compatibility_flags` and the 48-bit `general_constraint_indicator_flags` (the `hvcC` fields), with `profile_compatible`, `one_picture_only_constraint_flag` and `is_still_picture_profile` helpers
 - *(tests)* HEIF/HEIC still-picture interop pins (`tests/heic_stills.rs`, 25 vendored streams from three real-world producers, 232 KB): Main / Main 10 / Main Still Picture / RExt stills at 8 / 10 / 12 bits, 4:2:0 / 4:2:2 / 4:4:4 / monochrome, lossless, conformance windows, 2x2 and 18x14 pictures, CTB 16 + slices + WPP, transform skip + `cu_transquant_bypass` + RDOQ, tool-off axes, 8x8 quantization groups with chroma QP offsets, VUI timing + HRD + AUD + SEI — byte-exact against a black-box reference decoder on the Annex B path AND the `hvcC` length-prefixed path; the local matrix behind them is 134 streams (2x2 .. 8000x2000 and 12 MP grid tiles), 133 byte-exact and one where the reference decoder differs by a single chroma sample per plane while the stream's own decoded-picture-hash SEI agrees with this crate
 
+- *(encoder)* any-size input on every registry mode: the coded picture is the caller's size rounded up to a multiple of 16 (edge-replicated padding) and a §7.4.3.2.1 conformance window (`SpsCfg::conformance_window`, `PcmAuOptions::conformance_window`, `LowDelayPEncoder` / `PyramidEncoder::with_conformance_window`) crops it back — to the even rounding of an odd size, 4:2:0 crops being in units of two luma samples; `general_level_idc` now honours the §A.4.1 b) / c) side bound `Sqrt( MaxLumaPs * 8 )` and the Table A.8 levels 6.3 / 7 / 7.2
+- *(encoder)* `still` option (pcm / intra modes; `SpsCfg::still`, `PcmAuOptions::still`): Annex A.3.4 Main Still Picture signalling — `general_profile_idc == 3` with the Main / Main 10 / Main Still Picture compatibility flags and `general_one_picture_only_constraint_flag` (so Main 10 Still Picture decoders accept it too), a one-picture DPB (`sps_max_dec_pic_buffering_minus1 == 0` in VPS and SPS) — the profile HEIF `hvc1` image items carry; golden pins in `tests/still_encoder.rs` (intra CTB 64 + loop filters, and lossless PCM, on a 333x217 picture), both byte-exact through a black-box reference decoder and accepted at 334x218 by three third-party HEIF readers once wrapped in a minimal container
+
+- *(examples)* `encode_still` — any-size 4:2:0 picture through the registry encoder with `key=value` options and a `threads=N` fan-out knob, reporting bytes + wall time (the still-picture RD / speed harness)
+
+### Fixed
+
+- *(sei)* `active_parameter_sets` bounds `num_sps_ids_minus1` to the §D.3.23 range 0..=15 (`SeiError::ValueOutOfRange`); an unbounded count sized an 11 GiB allocation under the scheduled fuzz run (`parse_annexb` OOM artifact, now rejected)
+
 ### Changed
 
 - *(package)* `tests/` and `fuzz/` are excluded from the published crate (crates.io size cap; the vendored streams stay in the repository)

@@ -245,7 +245,20 @@ combination is decoder-pinned only. Tiled pictures are decided
 (`with_threads` / `set_execution_context`; serial by default,
 bit-identical for any worker count).
 
-4:2:0 8-bit, dimensions multiples of 16.
+4:2:0 8-bit input of **any size** (round 460): the coded picture is
+the size rounded up to a multiple of 16 with edge-replicated padding
+and a §7.4.3.2.1 conformance window crops it back (an odd size crops
+to its even rounding — 4:2:0 windows are in units of two luma
+samples — and the container's clean aperture names the odd last
+column / row). The `still` option (`pcm` / `intra` modes) signals
+every access unit as an Annex A.3.4 **Main Still Picture** bitstream
+(`general_profile_idc == 3`, Main / Main 10 / Main Still Picture
+compatibility flags, `general_one_picture_only_constraint_flag`, a
+one-picture DPB) — the profile a HEIF `hvc1` item carries; such
+stills, wrapped in a minimal container, open in three third-party
+HEIF readers and decode byte-exact through a black-box reference
+decoder (`tests/still_encoder.rs`). `general_level_idc` follows
+Table A.8 by picture size AND side length (levels 1 .. 7.2).
 
 ## What's implemented
 

@@ -85,6 +85,16 @@ pub enum SeiError {
     },
     /// A bit-level read inside a typed payload body failed.
     Bit(BitReaderError),
+    /// A typed payload body carried a syntax-element value outside its
+    /// §D.3 range (the value would size an allocation or a loop).
+    ValueOutOfRange {
+        /// The §D.2 `payloadType`.
+        payload_type: u32,
+        /// The offending syntax element.
+        field: &'static str,
+        /// Its decoded value.
+        got: u64,
+    },
 }
 
 impl From<BitReaderError> for SeiError {
@@ -108,6 +118,14 @@ impl core::fmt::Display for SeiError {
                 write!(f, "SEI payload type {payload_type} body truncated")
             }
             Self::Bit(e) => write!(f, "SEI bit read error: {e}"),
+            Self::ValueOutOfRange {
+                payload_type,
+                field,
+                got,
+            } => write!(
+                f,
+                "SEI payload type {payload_type}: {field} = {got} out of range"
+            ),
         }
     }
 }
@@ -586,9 +604,16 @@ fn decode_active_parameter_sets(body: &[u8]) -> Result<ActiveParameterSets, SeiE
     let self_contained_cvs_flag = r.u1().map_err(|_| err())? != 0;
     let no_parameter_set_update_flag = r.u1().map_err(|_| err())? != 0;
     let num_sps_ids_minus1 = r.ue().map_err(|_| err())?;
-    let count = (num_sps_ids_minus1 as usize)
-        .checked_add(1)
-        .ok_or_else(err)?;
+    // §D.3.23: num_sps_ids_minus1 shall be in the range 0..=15 (an
+    // unbounded count once sized a multi-GiB allocation under fuzzing).
+    if num_sps_ids_minus1 > 15 {
+        return Err(SeiError::ValueOutOfRange {
+            payload_type: 129,
+            field: "num_sps_ids_minus1",
+            got: u64::from(num_sps_ids_minus1),
+        });
+    }
+    let count = num_sps_ids_minus1 as usize + 1;
     let mut active_seq_parameter_set_ids = Vec::with_capacity(count);
     for _ in 0..count {
         active_seq_parameter_set_ids.push(r.ue().map_err(|_| err())?);

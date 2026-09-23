@@ -57,12 +57,67 @@ fn encoder_to_decoder_roundtrip_is_lossless() {
     assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
 }
 
+/// Unaligned dimensions are no longer refused (round 460): the
+/// registry encoder pads a 50x32 picture to a 64x32 coded picture and
+/// crops it back through a §7.4.3.2.1 conformance window; only a zero
+/// dimension is rejected.
 #[test]
-fn encoder_rejects_unaligned_dimensions() {
+fn encoder_pads_unaligned_dimensions_and_rejects_zero() {
     let mut params = CodecParameters::video("h265".into());
     params.width = Some(50);
     params.height = Some(32);
-    assert!(oxideav_h265::make_encoder(&params).is_err());
+    let mut enc = oxideav_h265::make_encoder(&params).expect("unaligned size accepted");
+    let planes = |w: usize, h: usize| {
+        vec![
+            VideoPlane {
+                stride: w,
+                data: (0..w * h).map(|i| (i % 251) as u8).collect(),
+            },
+            VideoPlane {
+                stride: w / 2,
+                data: vec![100; w * h / 4],
+            },
+            VideoPlane {
+                stride: w / 2,
+                data: vec![150; w * h / 4],
+            },
+        ]
+    };
+    enc.send_frame(&Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: planes(50, 32),
+    }))
+    .expect("send");
+    let pkt = enc.receive_packet().expect("packet");
+    let frames = oxideav_h265::decode_annexb_sequence(&pkt.data).expect("decodes");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        (
+            frames[0].picture.width_luma(),
+            frames[0].picture.height_luma()
+        ),
+        (64, 32),
+        "coded size"
+    );
+    let out = frames[0].output_picture();
+    assert_eq!(
+        (out.width_luma(), out.height_luma()),
+        (50, 32),
+        "cropped size"
+    );
+    // Lossless PCM: the cropped luma is the source.
+    let luma = out.plane(oxideav_h265::picture::Plane::Luma);
+    assert!(luma
+        .iter()
+        .enumerate()
+        .all(|(i, &v)| v == i32::from((i % 251) as u8)));
+
+    for (w, h) in [(0u32, 32u32), (50, 0)] {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(w);
+        params.height = Some(h);
+        assert!(oxideav_h265::make_encoder(&params).is_err(), "{w}x{h}");
+    }
 }
 
 /// `mode = "intra"`: the registry encoder runs the real CABAC intra

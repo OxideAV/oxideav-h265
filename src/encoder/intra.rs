@@ -54,7 +54,9 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for, write_pps_full, write_ptl, write_vps, write_vps_cfg};
+use crate::encoder::pcm::{
+    level_idc_for_dims, write_pps_full, write_ptl_cfg, write_vps, write_vps_cfg,
+};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -194,6 +196,21 @@ pub(crate) struct SpsCfg {
     /// 1 = serial, the [`oxideav_core::ExecutionContext`] default).
     /// The coded bytes never depend on it.
     pub threads: usize,
+    /// §7.4.3.2.1 conformance cropping window as `(conf_win_right_offset,
+    /// conf_win_bottom_offset)` in chroma units (`SubWidthC` /
+    /// `SubHeightC` == 2 luma samples each for 4:2:0); left / top are
+    /// 0. `None` codes the whole picture as output (the historical
+    /// streams). The registry encoder pads a picture of any size to a
+    /// CTB-friendly coded size and crops it back through this window.
+    pub conformance_window: Option<(u32, u32)>,
+    /// Still-picture signalling (Annex A.3.4): the VPS / SPS PTL names
+    /// the Main Still Picture profile (`general_profile_idc == 3`,
+    /// compatibility flags 1 / 2 / 3, `general_one_picture_only_
+    /// constraint_flag == 1` so Main 10 Still Picture decoders accept
+    /// it too), and `sps_max_dec_pic_buffering_minus1[ 0 ] == 0`. Only
+    /// meaningful for a single-picture (all-IDR) stream; the caller
+    /// must also set `max_dec_pic_buffering_minus1 == 0`.
+    pub still: bool,
 }
 
 impl SpsCfg {
@@ -211,6 +228,8 @@ impl SpsCfg {
             temporal_mvp: false,
             tree: None,
             threads: 1,
+            conformance_window: None,
+            still: false,
         }
     }
 }
@@ -245,12 +264,21 @@ pub(crate) fn write_sps_cfg(
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl(&mut w, level_idc);
+    write_ptl_cfg(&mut w, level_idc, cfg.still);
     w.ue(0); // sps_seq_parameter_set_id
     w.ue(1); // chroma_format_idc = 4:2:0
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
-    w.put_bit(0); // conformance_window_flag
+    match cfg.conformance_window {
+        None => w.put_bit(0), // conformance_window_flag
+        Some((right, bottom)) => {
+            w.put_bit(1); // conformance_window_flag
+            w.ue(0); // conf_win_left_offset
+            w.ue(right); // conf_win_right_offset
+            w.ue(0); // conf_win_top_offset
+            w.ue(bottom); // conf_win_bottom_offset
+        }
+    }
     w.ue(0); // bit_depth_luma_minus8
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
@@ -1380,17 +1408,21 @@ pub(crate) fn assemble_idr_au(
     lf: &LoopFilterCfg,
     slice_rbsp: &[u8],
 ) -> Vec<u8> {
-    let level_idc = level_idc_for(width * height);
+    let level_idc = level_idc_for_dims(width, height);
     // The reorder-free streams keep the historical VPS bounds (1, 0)
     // so every golden pin stays byte-stable; a reordering
-    // (hierarchical-B) stream signals its honest DPB bounds.
-    let vps = if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
+    // (hierarchical-B) stream signals its honest DPB bounds, a still
+    // its one-picture DPB and profile.
+    let vps = if cfg.still {
+        write_vps_cfg(level_idc, 0, 0, true)
+    } else if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
         write_vps(level_idc)
     } else {
         write_vps_cfg(
             level_idc,
             cfg.max_dec_pic_buffering_minus1,
             cfg.max_num_reorder_pics,
+            false,
         )
     };
     let units = vec![

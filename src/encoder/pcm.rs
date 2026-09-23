@@ -88,6 +88,15 @@ pub struct PcmAuOptions {
     /// rows; at least two tiles in total. Overrides [`Self::tiles`]
     /// (which then need not be set).
     pub tile_spans: Option<(Vec<u32>, Vec<u32>)>,
+    /// §7.4.3.2.1 conformance cropping window as
+    /// `(conf_win_right_offset, conf_win_bottom_offset)` in chroma
+    /// units (2 luma samples each); left / top 0. `None` outputs the
+    /// whole coded picture.
+    pub conformance_window: Option<(u32, u32)>,
+    /// Annex A.3.4 Main Still Picture signalling (profile 3, the
+    /// one-picture-only constraint, a one-picture DPB) — for a
+    /// single-picture stream.
+    pub still: bool,
 }
 
 impl Default for PcmAuOptions {
@@ -101,6 +110,8 @@ impl Default for PcmAuOptions {
             pcm_loop_filter_disabled: true,
             tiles: None,
             tile_spans: None,
+            conformance_window: None,
+            still: false,
         }
     }
 }
@@ -195,28 +206,38 @@ impl core::fmt::Display for PcmEncodeError {
 
 impl std::error::Error for PcmEncodeError {}
 
-/// Table A.8 — pick the smallest `general_level_idc` whose `MaxLumaPs`
-/// covers the picture. (A PCM payload can exceed a level's bit-rate
-/// ceilings for large / high-rate content; this bootstrap levels by
-/// luma picture size, the binding constraint for its intended
-/// small-picture use.)
-pub(crate) fn level_idc_for(luma_ps: usize) -> u8 {
-    const LEVELS: [(usize, u8); 9] = [
-        (36_864, 30),      // 1
-        (122_880, 60),     // 2
-        (245_760, 63),     // 2.1
-        (552_960, 90),     // 3
-        (983_040, 93),     // 3.1
-        (2_228_224, 120),  // 4
-        (8_912_896, 150),  // 5
-        (35_651_584, 180), // 6
-        (usize::MAX, 186), // 6.2
-    ];
-    LEVELS
+/// Table A.8 — the `MaxLumaPs` ladder as `(MaxLumaPs, general_level_idc)`
+/// (levels 1 .. 7.2; `general_level_idc == 30 * level`).
+const LEVEL_LUMA_PS: [(usize, u8); 11] = [
+    (36_864, 30),       // 1
+    (122_880, 60),      // 2
+    (245_760, 63),      // 2.1
+    (552_960, 90),      // 3
+    (983_040, 93),      // 3.1
+    (2_228_224, 120),   // 4
+    (8_912_896, 150),   // 5
+    (35_651_584, 180),  // 6
+    (80_216_064, 189),  // 6.3
+    (142_606_336, 210), // 7
+    (usize::MAX, 216),  // 7.2 (the ladder's top; oversize pictures get it)
+];
+
+/// Table A.8 — the smallest `general_level_idc` whose `MaxLumaPs`
+/// covers `width * height` AND (§A.4.1 b) / c)) whose side bound holds: both
+/// `pic_width_in_luma_samples` and `pic_height_in_luma_samples` must
+/// not exceed `Sqrt( MaxLumaPs * 8 )` (a 4096x64 strip is level 4
+/// territory by width although its 262 144 samples fit level 2.1).
+pub(crate) fn level_idc_for_dims(width: usize, height: usize) -> u8 {
+    let luma_ps = width * height;
+    let side = width.max(height);
+    LEVEL_LUMA_PS
         .iter()
-        .find(|(max_ps, _)| luma_ps <= *max_ps)
+        .find(|(max_ps, _)| {
+            // side <= Sqrt(MaxLumaPs * 8)  <=>  side^2 <= MaxLumaPs * 8
+            luma_ps <= *max_ps && (*max_ps == usize::MAX || side * side <= *max_ps * 8)
+        })
         .map(|&(_, idc)| idc)
-        .unwrap_or(186)
+        .unwrap_or(216)
 }
 
 /// Table A.8 — the smallest `general_level_idc` whose `MaxTileCols` /
@@ -241,25 +262,41 @@ fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
         .unwrap_or(180)
 }
 
-/// §7.3.3 `profile_tier_level( 1, 0 )` — Main profile, Main tier.
-pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
+/// §7.3.3 `profile_tier_level( 1, 0 )` — Main profile, Main tier, or
+/// with `still` the Annex A.3.4 **Main Still Picture** signalling:
+/// `general_profile_idc == 3` with
+/// `general_profile_compatibility_flag[ 1 / 2 / 3 ]` (the A.3.4 NOTE
+/// expects 1 and 2 beside 3: a Main Still Picture bitstream is a Main
+/// and a Main 10 bitstream), and the one-picture-only flag set —
+/// because compatibility flag 2 is set, §7.3.3 lays the 43-bit block
+/// out as `general_reserved_zero_7bits`, then
+/// `general_one_picture_only_constraint_flag`, then 35 zero bits —
+/// which per A.3.3 also indicates Main 10 Still Picture conformance.
+pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
     w.put_bits(0, 2); // general_profile_space
     w.put_bit(0); // general_tier_flag
-    w.put_bits(1, 5); // general_profile_idc = 1 (Main)
-                      // general_profile_compatibility_flag[0..32]: Main (1) is also
-                      // decodable by Main 10 (2) decoders.
+    w.put_bits(if still { 3 } else { 1 }, 5); // general_profile_idc
+                                              // general_profile_compatibility_flag[0..32]: Main (1) is also
+                                              // decodable by Main 10 (2) decoders; a still adds flag 3.
     let mut compat: u32 = 0;
     compat |= 1 << (31 - 1); // flag[1] — Main
     compat |= 1 << (31 - 2); // flag[2] — Main 10
+    if still {
+        compat |= 1 << (31 - 3); // flag[3] — Main Still Picture
+    }
     w.put_bits(compat, 32);
     w.put_bit(1); // general_progressive_source_flag
     w.put_bit(0); // general_interlaced_source_flag
     w.put_bit(1); // general_non_packed_constraint_flag
     w.put_bit(1); // general_frame_only_constraint_flag
-                  // Main profile: general_reserved_zero_43bits.
+                  // Compatibility flag 2 set: general_reserved_zero_7bits,
+                  // general_one_picture_only_constraint_flag,
+                  // general_reserved_zero_35bits (43 bits).
+    w.put_bits(0, 7);
+    w.put_bit(u8::from(still)); // general_one_picture_only_constraint_flag
     w.put_bits(0, 32);
-    w.put_bits(0, 11);
-    // Profile 1: general_inbld_flag = 0.
+    w.put_bits(0, 3);
+    // Profile 1 / 3: general_inbld_flag = 0.
     w.put_bit(0);
     w.put_bits(u32::from(level_idc), 8); // general_level_idc
                                          // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
@@ -267,16 +304,18 @@ pub(crate) fn write_ptl(w: &mut BitWriter, level_idc: u8) {
 
 /// §7.3.2.1 — the minimal single-layer VPS.
 pub(crate) fn write_vps(level_idc: u8) -> Vec<u8> {
-    write_vps_cfg(level_idc, 1, 0)
+    write_vps_cfg(level_idc, 1, 0, false)
 }
 
 /// [`write_vps`] with explicit `vps_max_dec_pic_buffering_minus1[0]` /
 /// `vps_max_num_reorder_pics[0]` (the hierarchical-B encoder holds
-/// more references and reorders output).
+/// more references and reorders output) and the still-picture PTL
+/// (`still`, see [`write_ptl_cfg`]).
 pub(crate) fn write_vps_cfg(
     level_idc: u8,
     max_dec_pic_buffering_minus1: u32,
     max_num_reorder_pics: u32,
+    still: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // vps_video_parameter_set_id
@@ -286,7 +325,7 @@ pub(crate) fn write_vps_cfg(
     w.put_bits(0, 3); // vps_max_sub_layers_minus1
     w.put_bit(1); // vps_temporal_id_nesting_flag
     w.put_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
-    write_ptl(&mut w, level_idc);
+    write_ptl_cfg(&mut w, level_idc, still);
     w.put_bit(1); // vps_sub_layer_ordering_info_present_flag
     w.ue(max_dec_pic_buffering_minus1); // vps_max_dec_pic_buffering_minus1[0]
     w.ue(max_num_reorder_pics); // vps_max_num_reorder_pics[0]
@@ -306,22 +345,33 @@ fn write_sps(
     level_idc: u8,
     sao_enabled: bool,
     pcm_loop_filter_disabled: bool,
+    conformance_window: Option<(u32, u32)>,
+    still: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(0, 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl(&mut w, level_idc);
+    write_ptl_cfg(&mut w, level_idc, still);
     w.ue(0); // sps_seq_parameter_set_id
     w.ue(1); // chroma_format_idc = 4:2:0
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
-    w.put_bit(0); // conformance_window_flag
+    match conformance_window {
+        None => w.put_bit(0), // conformance_window_flag
+        Some((right, bottom)) => {
+            w.put_bit(1); // conformance_window_flag
+            w.ue(0); // conf_win_left_offset
+            w.ue(right); // conf_win_right_offset
+            w.ue(0); // conf_win_top_offset
+            w.ue(bottom); // conf_win_bottom_offset
+        }
+    }
     w.ue(0); // bit_depth_luma_minus8
     w.ue(0); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     w.put_bit(1); // sps_sub_layer_ordering_info_present_flag
-    w.ue(1); // sps_max_dec_pic_buffering_minus1[0]
+    w.ue(u32::from(!still)); // sps_max_dec_pic_buffering_minus1[0] (0 for a still)
     w.ue(0); // sps_max_num_reorder_pics[0]
     w.ue(0); // sps_max_latency_increase_plus1[0]
     w.ue(CTB_LOG2 - 3); // log2_min_luma_coding_block_size_minus3 (16)
@@ -915,18 +965,31 @@ fn encode_au(
     check("cr", cr, width * height / 4)?;
 
     let level_idc = grid.as_ref().map_or_else(
-        || level_idc_for(width * height),
-        |g| level_idc_for(width * height).max(level_idc_for_tiles(g.cols, g.rows)),
+        || level_idc_for_dims(width, height),
+        |g| level_idc_for_dims(width, height).max(level_idc_for_tiles(g.cols, g.rows)),
     );
     let dependent_mode = opts.independent_slices.is_empty() && segments > 1;
     let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
+    let vps = if opts.still {
+        write_vps_cfg(level_idc, 0, 0, true)
+    } else {
+        write_vps(level_idc)
+    };
     let mut units = vec![
-        nal_unit(32, 0, 0, &write_vps(level_idc)), // VPS_NUT
+        nal_unit(32, 0, 0, &vps), // VPS_NUT
         nal_unit(
             33,
             0,
             0,
-            &write_sps(width, height, level_idc, sao, opts.pcm_loop_filter_disabled),
+            &write_sps(
+                width,
+                height,
+                level_idc,
+                sao,
+                opts.pcm_loop_filter_disabled,
+                opts.conformance_window,
+                opts.still,
+            ),
         ), // SPS_NUT
         nal_unit(
             34,
@@ -958,6 +1021,27 @@ fn encode_au(
 
 #[cfg(test)]
 mod tests {
+    /// Table A.8: the level ladder by luma picture size AND the
+    /// §A.4.1 b) / c) side bound `Sqrt( MaxLumaPs * 8 )`.
+    #[test]
+    fn level_idc_for_dims_applies_size_and_side_bounds() {
+        use super::level_idc_for_dims;
+        assert_eq!(level_idc_for_dims(16, 16), 30); // level 1
+        assert_eq!(level_idc_for_dims(336, 224), 60); // level 2
+        assert_eq!(level_idc_for_dims(1024, 768), 93); // level 3.1
+        assert_eq!(level_idc_for_dims(1920, 1080), 120); // level 4
+        assert_eq!(level_idc_for_dims(4032, 3024), 180); // level 6 (12.2 MP)
+        assert_eq!(level_idc_for_dims(8000, 2000), 180); // 16 MP, side 8000 <= 16 888
+        assert_eq!(level_idc_for_dims(8000, 5000), 189); // 40 MP -> level 6.3
+        assert_eq!(level_idc_for_dims(12000, 10000), 210); // 120 MP -> level 7
+        assert_eq!(level_idc_for_dims(16000, 16000), 216); // beyond level 7's MaxLumaPs
+                                                           // 4096 x 64 = 262 144 samples fit level 3 (552 960) but the
+                                                           // width exceeds Sqrt( 552 960 * 8 ) = 2103; level 4 allows
+                                                           // Sqrt( 2 228 224 * 8 ) = 4222.
+        assert_eq!(level_idc_for_dims(4096, 64), 120);
+        assert_eq!(level_idc_for_dims(2048, 64), 90); // 131 072 samples, side 2048 <= 2103
+    }
+
     use super::*;
     use crate::pps::PicParameterSet;
     use crate::sps::SeqParameterSet;

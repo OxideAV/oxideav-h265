@@ -317,6 +317,9 @@ pub struct LowDelayPEncoder {
     /// Pass-1 worker budget ([`Self::with_threads`] /
     /// [`Self::set_threads`]; tiles decided in parallel).
     threads: usize,
+    /// §7.4.3.2.1 conformance cropping window `(right, bottom)` in
+    /// chroma units, `None` = whole picture ([`Self::with_conformance_window`]).
+    conformance_window: Option<(u32, u32)>,
 }
 
 impl LowDelayPEncoder {
@@ -356,6 +359,7 @@ impl LowDelayPEncoder {
             tmvp: false,
             ctu_rc: false,
             threads: 1,
+            conformance_window: None,
         })
     }
 
@@ -377,6 +381,17 @@ impl LowDelayPEncoder {
     #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = n.max(1);
+        self
+    }
+
+    /// Declare a §7.4.3.2.1 conformance cropping window: the coded
+    /// picture keeps its CTB-friendly size, decoders output only the
+    /// top-left `width − 2 * right` x `height − 2 * bottom` luma
+    /// samples (`right` / `bottom` in chroma units of two luma
+    /// samples; both must leave at least one output sample).
+    #[must_use]
+    pub fn with_conformance_window(mut self, right: u32, bottom: u32) -> Self {
+        self.conformance_window = Some((right, bottom));
         self
     }
 
@@ -721,6 +736,8 @@ impl LowDelayPEncoder {
                     temporal_mvp: self.tmvp,
                     tree: self.tree,
                     threads: self.threads,
+                    conformance_window: self.conformance_window,
+                    still: false,
                 },
                 &self.filters,
                 self.aq,

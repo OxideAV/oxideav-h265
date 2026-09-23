@@ -181,12 +181,41 @@ use oxideav_core::{
 /// padding underruns so the CPB cannot overflow (needs a `bufsize`
 /// of at least two frame intervals of the bitrate).
 ///
-/// 4:2:0 8-bit, dimensions multiples of 16.
+/// The `still` option (`"1"` / `"true"`; `"pcm"` / `"intra"` modes)
+/// signals every access unit as an Annex A.3.4 **Main Still Picture**
+/// bitstream — `general_profile_idc == 3` with the Main / Main 10 /
+/// Main Still Picture compatibility flags and
+/// `general_one_picture_only_constraint_flag`, a one-picture DPB
+/// (`sps_max_dec_pic_buffering_minus1 == 0`) — the form HEIF `hvc1`
+/// image items carry (each access unit is already a self-contained
+/// `VPS + SPS + PPS + IDR` single-picture CVS in those modes).
+///
+/// 4:2:0 8-bit input of ANY nonzero size: the coded picture is the
+/// size rounded up to a multiple of 16 (edge-replicated padding) and
+/// a §7.4.3.2.1 conformance window crops it back — to the even
+/// rounding of an odd size, since 4:2:0 crops are in units of two
+/// luma samples (a container's clean aperture expresses the odd last
+/// column / row). `general_level_idc` follows Table A.8 by picture
+/// size and side length.
 pub struct H265Encoder {
     codec_id: CodecId,
     output_params: CodecParameters,
+    /// The caller's picture size (the output size after cropping).
     width: usize,
     height: usize,
+    /// `pic_width_in_luma_samples` / `pic_height_in_luma_samples`:
+    /// the caller's size rounded up to a multiple of 16 (the coders'
+    /// CTB-friendly geometry); input planes are edge-replicated into
+    /// the padding.
+    coded_width: usize,
+    coded_height: usize,
+    /// The §7.4.3.2.1 window cropping the coded picture back to the
+    /// caller's size (right / bottom offsets in chroma units), `None`
+    /// when no padding was needed.
+    crop: Option<(u32, u32)>,
+    /// The `still` option: Main Still Picture profile signalling on
+    /// every (single-picture) access unit.
+    still: bool,
     mode: EncodeMode,
     ready: VecDeque<Packet>,
     frame_index: i64,
@@ -225,11 +254,12 @@ impl std::fmt::Debug for H265Encoder {
 /// off), the ABR pair `bitrate` / `fps` (intra / inter modes:
 /// per-frame QP elected against a target average bitrate), and `aq`
 /// (intra / inter modes: spatial adaptive quantization via per-CTB
-/// `cu_qp_delta`, strength 1..=3).
+/// `cu_qp_delta`, strength 1..=3), plus `still` (pcm / intra modes:
+/// Main Still Picture profile signalling).
 ///
 /// # Errors
-/// [`Error::InvalidData`] when width / height are missing or not
-/// nonzero multiples of 16, the pixel format is declared and is not
+/// [`Error::InvalidData`] when width / height are missing or zero,
+/// the pixel format is declared and is not
 /// 4:2:0 8-bit planar, or a codec option is malformed.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -240,11 +270,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         .height
         .ok_or_else(|| Error::InvalidData("h265 encode: height is required".into()))?
         as usize;
-    if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
+    if width == 0 || height == 0 {
         return Err(Error::InvalidData(format!(
-            "h265 encode: dimensions must be nonzero multiples of 16, got {width}x{height}"
+            "h265 encode: dimensions must be nonzero, got {width}x{height}"
         )));
     }
+    // The coders work on CTB-friendly pictures (multiples of 16);
+    // anything else is padded by edge replication and cropped back by
+    // a §7.4.3.2.1 conformance window. 4:2:0 crops are in units of
+    // two luma samples, so an odd size outputs one extra column / row
+    // (the container's clean-aperture is the place for odd sizes).
+    let coded_width = width.div_ceil(16) * 16;
+    let coded_height = height.div_ceil(16) * 16;
+    let out_width = width.div_ceil(2) * 2;
+    let out_height = height.div_ceil(2) * 2;
+    let crop = (coded_width != out_width || coded_height != out_height).then(|| {
+        (
+            ((coded_width - out_width) / 2) as u32,
+            ((coded_height - out_height) / 2) as u32,
+        )
+    });
     if let Some(pf) = params.pixel_format {
         if pf != PixelFormat::Yuv420P {
             return Err(Error::InvalidData(format!(
@@ -471,6 +516,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ));
     }
     // ABR configuration when `bitrate` is set: an explicit `qp`
+    // `still` — Annex A.3.4 Main Still Picture signalling; every
+    // access unit of the two intra modes is a self-contained
+    // single-picture CVS, which is exactly what the profile
+    // describes. Meaningless for the inter GOPs.
+    let still = parse_flag(params, "still")?;
+    if still && params.options.get("mode") == Some("inter") {
+        return Err(Error::InvalidData(
+            "h265 encode: the still option requires mode \"pcm\" or \"intra\"".into(),
+        ));
+    }
     // option seeds the controller's starting QP.
     let rc_cfg = |params: &CodecParameters, qp: i32| -> rate::RateControlCfg {
         let mut cfg = rate::RateControlCfg::new(bitrate.unwrap_or(0), fps.0, fps.1);
@@ -523,7 +578,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 tree,
                 ctu_rc,
                 lf: parse_lf(params)?,
-                rc: bitrate.map(|_| rate::RateController::new(&rc_cfg(params, qp), width, height)),
+                rc: bitrate.map(|_| {
+                    rate::RateController::new(&rc_cfg(params, qp), coded_width, coded_height)
+                }),
                 aq: parse_aq(params)?,
                 timing: fps_declared.then_some((fps.1, fps.0)),
                 hrd: match hrd_on {
@@ -581,7 +638,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                             ))
                         })?,
                 };
-                let mut enc = pyramid::PyramidEncoder::new(width, height, qp, g)
+                let mut enc = pyramid::PyramidEncoder::new(coded_width, coded_height, qp, g)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_layer_qp_step(step)
                     .with_amp(parse_flag(params, "amp")?)
@@ -604,6 +661,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
                 enc = enc.with_hrd(hrd_on).with_cbr(cbr_on);
+                if let Some((r, b)) = crop {
+                    enc = enc.with_conformance_window(r, b);
+                }
                 let delay = i64::from(enc.reorder_delay());
                 EncodeMode::Pyramid {
                     enc,
@@ -621,7 +681,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     })?,
                 };
                 let b_slices = parse_flag(params, "bslices")?;
-                let mut enc = inter::LowDelayPEncoder::new(width, height, qp, gop)
+                let mut enc = inter::LowDelayPEncoder::new(coded_width, coded_height, qp, gop)
                     .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
                     .with_b_slices(b_slices)
                     .with_amp(parse_flag(params, "amp")?)
@@ -641,6 +701,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     enc = enc.with_rate_control(&rc_cfg(params, qp));
                 }
                 enc = enc.with_hrd(hrd_on).with_cbr(cbr_on);
+                if let Some((r, b)) = crop {
+                    enc = enc.with_conformance_window(r, b);
+                }
                 EncodeMode::Inter(enc)
             }
         }
@@ -660,6 +723,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         output_params,
         width,
         height,
+        coded_width,
+        coded_height,
+        crop,
+        still,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
@@ -688,30 +755,53 @@ impl Encoder for H265Encoder {
                 v.planes.len()
             )));
         }
-        // Repack each plane row-by-row (strides may exceed the width).
-        let pack = |idx: usize, w: usize, h: usize| -> Result<Vec<u8>> {
+        // Repack each plane row-by-row (strides may exceed the width)
+        // into the coded geometry, replicating the last column / row
+        // into the padding a conformance window crops away again.
+        let pack = |idx: usize, w: usize, h: usize, cw: usize, ch: usize| -> Result<Vec<u8>> {
             let plane = &v.planes[idx];
-            if plane.stride < w || plane.data.len() < plane.stride * h {
+            if plane.stride < w || plane.data.len() < plane.stride * (h - 1) + w {
                 return Err(Error::InvalidData(format!(
                     "h265 encode: plane {idx} too small (stride {}, len {})",
                     plane.stride,
                     plane.data.len()
                 )));
             }
-            let mut out = Vec::with_capacity(w * h);
-            for row in 0..h {
-                out.extend_from_slice(&plane.data[row * plane.stride..row * plane.stride + w]);
+            let mut out = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                let src_row = row.min(h - 1);
+                let line = &plane.data[src_row * plane.stride..src_row * plane.stride + w];
+                out.extend_from_slice(line);
+                out.resize(out.len() + (cw - w), line[w - 1]);
             }
             Ok(out)
         };
-        let y = pack(0, self.width, self.height)?;
-        let cb = pack(1, self.width / 2, self.height / 2)?;
-        let cr = pack(2, self.width / 2, self.height / 2)?;
+        let (cw, ch) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let y = pack(
+            0,
+            self.width,
+            self.height,
+            self.coded_width,
+            self.coded_height,
+        )?;
+        let cb = pack(1, cw, ch, self.coded_width / 2, self.coded_height / 2)?;
+        let cr = pack(2, cw, ch, self.coded_width / 2, self.coded_height / 2)?;
 
         let (au, keyframe) = match &mut self.mode {
             EncodeMode::Pcm => (
-                pcm::encode_idr_pcm_au(&y, &cb, &cr, self.width, self.height)
-                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
+                pcm::encode_idr_pcm_au_opts(
+                    &y,
+                    &cb,
+                    &cr,
+                    self.coded_width,
+                    self.coded_height,
+                    pcm::PcmAuOptions {
+                        conformance_window: self.crop,
+                        still: self.still,
+                        ..pcm::PcmAuOptions::default()
+                    },
+                )
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
             EncodeMode::Intra {
@@ -740,7 +830,9 @@ impl Encoder for H265Encoder {
                     min_cb_log2: if tree.is_some() { 3 } else { 4 },
                     tree: *tree,
                     threads: self.threads,
-                    ..intra::SpsCfg::legacy(1)
+                    conformance_window: self.crop,
+                    still: self.still,
+                    ..intra::SpsCfg::legacy(u32::from(!self.still))
                 };
                 // The HRD SEI prefix: every frame is an IRAP access
                 // unit, so each carries a §D.2.2 buffering period
@@ -768,8 +860,8 @@ impl Encoder for H265Encoder {
                         &y,
                         &cb,
                         &cr,
-                        self.width,
-                        self.height,
+                        self.coded_width,
+                        self.coded_height,
                         frame_qp,
                         &cfg,
                         lf,
