@@ -255,7 +255,10 @@ impl std::fmt::Debug for H265Encoder {
 /// per-frame QP elected against a target average bitrate), and `aq`
 /// (intra / inter modes: spatial adaptive quantization via per-CTB
 /// `cu_qp_delta`, strength 1..=3), plus `still` (pcm / intra modes:
-/// Main Still Picture profile signalling).
+/// Main Still Picture profile signalling), and the quadtree-coder
+/// tools `sdh` / `rdoq` / `tudepth` / `sl` / `wp` / `wpp` / `tiles=CxR`
+/// (all require `ctb`; `tiles` is the pass-1 fan-out unit under
+/// [`oxideav_core::Encoder::set_execution_context`]).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or zero,
@@ -411,21 +414,45 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     // `wp` — explicit weighted prediction (fade estimation).
     let wp = parse_flag(params, "wp")?;
-    if (sdh || rdoq || tudepth.is_some() || sl.is_some() || wp) && tree.is_none() {
+    // `wpp` — entropy_coding_sync_enabled_flag; `tiles=CxR` — a
+    // uniform tile grid (1..=8 columns / rows, more than one tile in
+    // total; the pass-1 fan-out unit under `set_execution_context`).
+    let wpp = parse_flag(params, "wpp")?;
+    let tiles = match params.options.get("tiles") {
+        None => None,
+        Some(v) => {
+            let grid = v
+                .split_once('x')
+                .and_then(|(c, r)| Some((c.parse::<u8>().ok()?, r.parse::<u8>().ok()?)))
+                .filter(|&(c, r)| (1..=8).contains(&c) && (1..=8).contains(&r) && c * r > 1);
+            Some(grid.ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "h265 encode: tiles must be CxR with 1..=8 columns / rows and more than one tile, got {v:?}"
+                ))
+            })?)
+        }
+    };
+    if (sdh || rdoq || tudepth.is_some() || sl.is_some() || wp || wpp || tiles.is_some())
+        && tree.is_none()
+    {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh / rdoq / tudepth / sl / wp options require the ctb option".into(),
+            "h265 encode: the sdh / rdoq / tudepth / sl / wp / wpp / tiles options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
         *t = t
             .with_sign_hiding(sdh)
             .with_rdoq(rdoq)
-            .with_weighted_pred(wp);
+            .with_weighted_pred(wp)
+            .with_wpp(wpp);
         if let Some(d) = tudepth {
             *t = t.with_tu_depth(d, d);
         }
         if let Some(m) = sl {
             *t = t.with_scaling_lists(m);
+        }
+        if let Some((c, r)) = tiles {
+            *t = t.with_tiles(ctu::TileLayout::uniform(c, r));
         }
     }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).

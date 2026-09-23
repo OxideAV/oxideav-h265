@@ -329,6 +329,97 @@ fn odd_size_without_still_pads_and_crops_on_every_mode() {
     }
 }
 
+/// The registry `tiles=CxR` / `wpp` options reach the quadtree coder
+/// (round 460 — they were documented but never parsed): a 2x2 grid
+/// still decodes byte-exact, signals `tiles_enabled_flag`, and the
+/// bytes do not depend on the execution-context worker count; `wpp`
+/// signals `entropy_coding_sync_enabled_flag`; both need `ctb`.
+#[test]
+fn registry_tiles_and_wpp_options_reach_the_quadtree_coder() {
+    use oxideav_core::ExecutionContext;
+    use oxideav_h265::pps::PicParameterSet;
+
+    let pps_of = |stream: &[u8]| {
+        let rbsp = NalIter::new(stream)
+            .flatten()
+            .find(|u| u.header.nal_unit_type == 34)
+            .map(|u| u.rbsp)
+            .expect("PPS");
+        PicParameterSet::parse(&rbsp).expect("PPS parses")
+    };
+    let encode = |opts: &[(&str, &str)], threads: usize| -> Vec<u8> {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(W as u32);
+        params.height = Some(H as u32);
+        for (k, v) in opts {
+            params.options.insert(*k, *v);
+        }
+        let mut enc = oxideav_h265::make_encoder(&params).expect("factory");
+        enc.set_execution_context(&ExecutionContext { threads });
+        enc.send_frame(&frame(W, H, &still(W, H))).expect("send");
+        enc.receive_packet().expect("packet").data
+    };
+    let base = [
+        ("mode", "intra"),
+        ("still", "1"),
+        ("ctb", "32"),
+        ("qp", "32"),
+    ];
+    let tiled: Vec<(&str, &str)> = base.iter().copied().chain([("tiles", "2x2")]).collect();
+    let serial = encode(&tiled, 1);
+    let parallel = encode(&tiled, 4);
+    assert_eq!(serial, parallel, "tile fan-out never changes the bytes");
+    let pps = pps_of(&serial);
+    assert!(pps.tiles_enabled_flag, "tiles_enabled_flag");
+    assert_eq!(
+        (
+            pps.tiles.num_tile_columns_minus1,
+            pps.tiles.num_tile_rows_minus1
+        ),
+        (1, 1),
+        "2x2 grid"
+    );
+    let frames = decode_annexb_sequence(&serial).expect("tiled still decodes");
+    assert_eq!(frames.len(), 1);
+    let out = frames[0].output_picture();
+    assert_eq!((out.width_luma(), out.height_luma()), (334, 218));
+
+    let wpp: Vec<(&str, &str)> = base.iter().copied().chain([("wpp", "1")]).collect();
+    let stream = encode(&wpp, 1);
+    assert!(
+        pps_of(&stream).entropy_coding_sync_enabled_flag,
+        "entropy_coding_sync_enabled_flag"
+    );
+    assert_eq!(
+        decode_annexb_sequence(&stream)
+            .expect("WPP still decodes")
+            .len(),
+        1
+    );
+
+    for (k, v) in [("tiles", "2x2"), ("wpp", "1")] {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(64);
+        params.height = Some(64);
+        params.options.insert("mode", "intra");
+        params.options.insert(k, v);
+        assert!(
+            oxideav_h265::make_encoder(&params).is_err(),
+            "{k} needs ctb"
+        );
+    }
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(64);
+    params.height = Some(64);
+    params.options.insert("mode", "intra");
+    params.options.insert("ctb", "32");
+    params.options.insert("tiles", "1x1");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "1x1 is not a grid"
+    );
+}
+
 /// `still` is refused on the inter GOP modes.
 #[test]
 fn still_rejects_inter_mode() {
