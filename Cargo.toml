@@ -12,6 +12,9 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-h265"
 keywords = ["multimedia", "video", "h265", "hevc", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
+# Vendored test streams and the fuzz workspace stay out of the
+# published crate (crates.io size cap).
+exclude = ["/tests", "/fuzz"]
 
 [dependencies]
 oxideav-core = "0.1"

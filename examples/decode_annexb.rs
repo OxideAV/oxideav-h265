@@ -40,10 +40,11 @@ fn main() {
         if !frame.output {
             continue;
         }
-        let planar = frame
-            .picture
+        // The §7.4.3.2.1 conformance-cropped output picture.
+        let picture = frame.output_picture();
+        let planar = picture
             .to_planar_u8()
-            .unwrap_or_else(|| frame.picture.to_planar_le16());
+            .unwrap_or_else(|| picture.to_planar_le16());
         out.write_all(&planar).expect("write output");
     }
     eprintln!("{} frame(s) decoded", frames.len());

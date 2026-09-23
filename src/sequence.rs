@@ -146,8 +146,95 @@ pub struct DecodedFrame {
     /// `pic_output_flag` — `false` pictures are decoded (they may be
     /// referenced) but not output.
     pub output: bool,
-    /// The reconstructed, in-loop-filtered picture.
+    /// The reconstructed, in-loop-filtered picture at the coded size
+    /// (`pic_width_in_luma_samples x pic_height_in_luma_samples`).
     pub picture: Picture,
+    /// The §7.4.3.2.1 conformance cropping window of the active SPS in
+    /// luma samples — the rectangle a conforming decoder outputs
+    /// ([`DecodedFrame::output_picture`]). Equal to the whole coded
+    /// picture when `conformance_window_flag == 0`.
+    pub crop: CropWindow,
+}
+
+/// A §7.4.3.2.1 output cropping rectangle in luma samples: the
+/// conformance window offsets scaled by `SubWidthC` / `SubHeightC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropWindow {
+    /// Left edge (`SubWidthC * conf_win_left_offset`).
+    pub x0: usize,
+    /// Top edge (`SubHeightC * conf_win_top_offset`).
+    pub y0: usize,
+    /// Output width in luma samples.
+    pub width: usize,
+    /// Output height in luma samples.
+    pub height: usize,
+}
+
+impl CropWindow {
+    /// The §7.4.3.2.1 window of `sps`: luma columns
+    /// `SubWidthC * conf_win_left_offset ..= pic_width − (SubWidthC *
+    /// conf_win_right_offset + 1)` and the matching rows; a window
+    /// that would be empty or overflow the picture falls back to the
+    /// whole coded picture.
+    #[must_use]
+    pub fn from_sps(sps: &SeqParameterSet) -> Self {
+        let w = sps.pic_width_in_luma_samples as usize;
+        let h = sps.pic_height_in_luma_samples as usize;
+        let whole = Self {
+            x0: 0,
+            y0: 0,
+            width: w,
+            height: h,
+        };
+        if !sps.conformance_window_flag {
+            return whole;
+        }
+        // Table 6-1: SubWidthC / SubHeightC are 1 for monochrome and
+        // 4:4:4 (and for separate colour planes, ChromaArrayType 0).
+        let (sw, sh) = match sps.chroma_format_idc {
+            1 => (2usize, 2usize),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let cw = &sps.conformance_window;
+        let x0 = sw * cw.left_offset as usize;
+        let y0 = sh * cw.top_offset as usize;
+        let x1 = sw * cw.right_offset as usize;
+        let y1 = sh * cw.bottom_offset as usize;
+        if x0 + x1 >= w || y0 + y1 >= h {
+            return whole;
+        }
+        Self {
+            x0,
+            y0,
+            width: w - x0 - x1,
+            height: h - y0 - y1,
+        }
+    }
+
+    /// True when the window is the whole coded picture.
+    #[must_use]
+    pub fn is_whole(&self, picture: &Picture) -> bool {
+        self.x0 == 0
+            && self.y0 == 0
+            && self.width == picture.width_luma()
+            && self.height == picture.height_luma()
+    }
+}
+
+impl DecodedFrame {
+    /// The picture a conforming decoder outputs: [`Self::picture`] cut
+    /// to [`Self::crop`] (a copy, or the picture itself when the
+    /// window covers it).
+    #[must_use]
+    pub fn output_picture(&self) -> Picture {
+        self.picture.cropped(
+            self.crop.x0,
+            self.crop.y0,
+            self.crop.width,
+            self.crop.height,
+        )
+    }
 }
 
 /// One slice segment of the picture being assembled.
@@ -507,6 +594,7 @@ impl SequenceDecoder {
             poc: poc.val,
             output,
             picture: picture.clone(),
+            crop: CropWindow::from_sps(sps),
         });
         self.state
             .store_picture(poc, indep.layer_id, picture, motion);

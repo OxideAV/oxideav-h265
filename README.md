@@ -88,7 +88,23 @@ byte-exact. Coverage:
   pins are decoder-pins);
 * both transport forms: Annex B extradata/packets AND `hvcC`
   (`HEVCDecoderConfigurationRecord`, ISO/IEC 14496-15 §8.3.3.1)
-  extradata with length-prefixed packets.
+  extradata with length-prefixed packets, with the §7.4.3.2.1
+  conformance window applied to every output frame (`DecodedFrame::
+  output_picture`, the registry `VideoFrame`);
+* **HEIF/HEIC stills** (round 460): a 134-stream black-box matrix of
+  HEVC image items from three real-world producers (an OS image
+  converter's hardware encoder, a third-party software encoder
+  through a HEIF library, a general-purpose image converter) — 2x2 ..
+  8000x2000 pictures and 12 MP grid tiles, 8 / 10 / 12-bit, 4:2:0 /
+  4:2:2 / 4:4:4 / monochrome, lossless, Main / Main 10 / Main Still
+  Picture / RExt profile signalling, conformance windows, CTB 16 with
+  slices + WPP, transform skip, `cu_transquant_bypass`, 8x8
+  quantization groups, VUI / HRD / SEI — decodes byte-exact on 133;
+  on the one remaining (CTB 16, `max-tu-size 8`) the reference
+  decoder differs by a single chroma sample per plane while the
+  stream's own decoded-picture-hash SEI matches this decoder.
+  Twenty-five of them are vendored and CI-pinned on both transport
+  paths (`tests/heic_stills.rs`).
 
 **Encoder: recursive coding-quadtree I/P/B coding at CTB 16/32/64
 with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop

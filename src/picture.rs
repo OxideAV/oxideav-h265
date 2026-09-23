@@ -105,6 +105,48 @@ impl Picture {
         }
     }
 
+    /// The §7.4.3.2.1 output-cropped copy of this picture: the luma
+    /// rectangle starting at `(x0, y0)` of `width x height` samples,
+    /// with the chroma planes cut at the matching `SubWidthC` /
+    /// `SubHeightC`-scaled positions (Table 6-1). `x0 + width` /
+    /// `y0 + height` are clamped to the coded picture; a window
+    /// covering the whole picture returns an identical copy.
+    #[must_use]
+    pub fn cropped(&self, x0: usize, y0: usize, width: usize, height: usize) -> Self {
+        let x0 = x0.min(self.width_luma);
+        let y0 = y0.min(self.height_luma);
+        let width = width.min(self.width_luma - x0);
+        let height = height.min(self.height_luma - y0);
+        if x0 == 0 && y0 == 0 && width == self.width_luma && height == self.height_luma {
+            return self.clone();
+        }
+        let (sw, sh) = sub_wh_c(self.chroma_array_type);
+        let (cx0, cy0, cw, ch) = if self.chroma_array_type == 0 {
+            (0, 0, 0, 0)
+        } else {
+            (x0 / sw, y0 / sh, width / sw, height / sh)
+        };
+        let cut = |src: &[i32], stride: usize, x0: usize, y0: usize, w: usize, h: usize| {
+            let mut out = Vec::with_capacity(w * h);
+            for y in y0..y0 + h {
+                out.extend_from_slice(&src[y * stride + x0..y * stride + x0 + w]);
+            }
+            out
+        };
+        Self {
+            width_luma: width,
+            height_luma: height,
+            width_chroma: cw,
+            height_chroma: ch,
+            chroma_array_type: self.chroma_array_type,
+            bit_depth_luma: self.bit_depth_luma,
+            bit_depth_chroma: self.bit_depth_chroma,
+            luma: cut(&self.luma, self.width_luma, x0, y0, width, height),
+            cb: cut(&self.cb, self.width_chroma, cx0, cy0, cw, ch),
+            cr: cut(&self.cr, self.width_chroma, cx0, cy0, cw, ch),
+        }
+    }
+
     /// `pic_width_in_luma_samples`.
     #[inline]
     #[must_use]

@@ -117,8 +117,13 @@ impl H265Decoder {
                 continue;
             }
             let pts = self.pts_queue.pop().map(|r| r.0);
-            self.ready
-                .push_back(Frame::Video(video_frame(&f.picture, pts)));
+            // §7.4.3.2.1 — output the conformance-cropped picture.
+            let frame = if f.crop.is_whole(&f.picture) {
+                video_frame(&f.picture, pts)
+            } else {
+                video_frame(&f.output_picture(), pts)
+            };
+            self.ready.push_back(Frame::Video(frame));
         }
     }
 }

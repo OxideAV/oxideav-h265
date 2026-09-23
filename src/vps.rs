@@ -174,6 +174,19 @@ pub struct ProfileTierLevel {
     /// `30 × level_number`, e.g. 30 == level 1.0, 90 == level 3.0,
     /// 120 == level 4.0.
     pub general_level_idc: u8,
+    /// `general_profile_compatibility_flag[ j ]` for `j` in 0..32,
+    /// packed MSB-first (`flag[0]` is bit 31, `flag[31]` bit 0) — the
+    /// byte order ISO/IEC 14496-15 `hvcC` copies verbatim.
+    pub general_profile_compatibility_flags: u32,
+    /// The 48 bits from `general_progressive_source_flag` through
+    /// `general_inbld_flag` / `general_reserved_zero_bit` inclusive,
+    /// packed MSB-first in the low 48 bits (bit 47 =
+    /// `general_progressive_source_flag`): the ISO/IEC 14496-15
+    /// `general_constraint_indicator_flags` field. The §7.3.3
+    /// profile-conditional constraint flags live here — e.g.
+    /// `general_one_picture_only_constraint_flag` (Main 10 Still
+    /// Picture: bit 47 − 11 = 36 when profile 2 / compat[2] is set).
+    pub general_constraint_indicator_flags: u64,
     /// For each present sub-layer, whether its profile entry was
     /// signalled (`sub_layer_profile_present_flag[i]`).
     pub sub_layer_profile_present: [bool; HEVC_MAX_SUB_LAYERS],
@@ -186,6 +199,38 @@ pub struct ProfileTierLevel {
 }
 
 impl ProfileTierLevel {
+    /// `general_profile_compatibility_flag[ j ]`.
+    #[must_use]
+    pub fn profile_compatible(&self, j: u8) -> bool {
+        j < 32 && (self.general_profile_compatibility_flags >> (31 - j)) & 1 != 0
+    }
+
+    /// `general_one_picture_only_constraint_flag` as §7.3.3 places it:
+    /// bit 11 of the 43-bit block for the format-range-extension
+    /// profiles (idc / compat 4..=11), bit 7 of the 43-bit block for
+    /// Main 10 (idc / compat 2) — and absent (false) otherwise.
+    #[must_use]
+    pub fn one_picture_only_constraint_flag(&self) -> bool {
+        let idc = self.general_profile_idc;
+        let ext = (4..=11).any(|j| idc == j || self.profile_compatible(j));
+        let main10 = idc == 2 || self.profile_compatible(2);
+        // The 43-bit block occupies bits 43..=1 of the 48-bit field
+        // (bits 47..=44 are the four source / packing / frame flags);
+        // the flag is its 8th bit in BOTH layouts — bit 36.
+        (ext || main10) && (self.general_constraint_indicator_flags >> 36) & 1 != 0
+    }
+
+    /// True when the profile signalling names a still-picture profile
+    /// (Annex A): Main Still Picture (`general_profile_idc == 3` or
+    /// compat[3]), or `general_one_picture_only_constraint_flag`
+    /// together with a Main 10 / format-range-extension profile.
+    #[must_use]
+    pub fn is_still_picture_profile(&self) -> bool {
+        self.general_profile_idc == 3
+            || self.profile_compatible(3)
+            || self.one_picture_only_constraint_flag()
+    }
+
     /// Parse a `profile_tier_level(profilePresentFlag, maxNumSubLayersMinus1)`
     /// invocation per §7.3.3. `profile_present_flag` is supplied by
     /// the calling context — for the VPS / SPS path it is always 1.
@@ -199,6 +244,8 @@ impl ProfileTierLevel {
             general_tier_flag: false,
             general_profile_idc: 0,
             general_level_idc: 0,
+            general_profile_compatibility_flags: 0,
+            general_constraint_indicator_flags: 0,
             sub_layer_profile_present: [false; HEVC_MAX_SUB_LAYERS],
             sub_layer_level_present: [false; HEVC_MAX_SUB_LAYERS],
             sub_layer_level_idc: [0; HEVC_MAX_SUB_LAYERS],
@@ -208,20 +255,19 @@ impl ProfileTierLevel {
             ptl.general_profile_space = br.u(2)? as u8;
             ptl.general_tier_flag = br.u1()? != 0;
             ptl.general_profile_idc = br.u(5)? as u8;
-            // 32 compatibility flags — skipped wholesale; the calling
-            // application can re-parse them from the bit position if
-            // needed later.
-            br.skip(32)?;
-            // progressive / interlaced / non_packed / frame_only
-            br.skip(4)?;
-            // The conditional block beneath these flags always consumes
+            // 32 compatibility flags, kept MSB-first (flag[0] = bit 31).
+            ptl.general_profile_compatibility_flags = br.u(32)?;
+            // progressive / interlaced / non_packed / frame_only, then
+            // the conditional block beneath them, which always consumes
             // exactly 43 bits regardless of profile_idc (per the
             // `/* not affected by this condition */` comment in §7.3.3
             // — the chroma-constraint, range-extension, and reserved
-            // alternatives all sum to 43 bits).
-            br.skip(43)?;
-            // general_inbld_flag OR general_reserved_zero_bit — always 1 bit.
-            br.skip(1)?;
+            // alternatives all sum to 43 bits), then general_inbld_flag
+            // OR general_reserved_zero_bit — always 1 bit: 48 bits, the
+            // `hvcC` general_constraint_indicator_flags.
+            let hi = u64::from(br.u(16)?);
+            let lo = u64::from(br.u(32)?);
+            ptl.general_constraint_indicator_flags = (hi << 32) | lo;
         }
         // general_level_idc is always present (no `profilePresentFlag`
         // guard in the §7.3.3 syntax).
