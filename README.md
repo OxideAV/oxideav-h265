@@ -258,7 +258,19 @@ one-picture DPB) — the profile a HEIF `hvc1` item carries; such
 stills, wrapped in a minimal container, open in three third-party
 HEIF readers and decode byte-exact through a black-box reference
 decoder (`tests/still_encoder.rs`). `general_level_idc` follows
-Table A.8 by picture size AND side length (levels 1 .. 7.2).
+Table A.8 by picture size AND side length (levels 1 .. 7.2). The
+**intra mode decision** has three effort levels (`rd` 0..=2,
+`TreeCfg::with_intra_rd`; a still defaults to 2): level 1 scores all
+35 modes by SATD + λ·signalling bins and elects the chroma mode
+(`intra_chroma_pred_mode` 0..=4) by Cb + Cr SATD, level 2 codes a
+short list of luma modes for real through the RD-elected RQT —
+−3.1 % / −4.2 % BD-rate on a 1024x768 photograph and −4.6 % / −5.6 %
+on a 4032x3024 one, at 1.3x / 2.2x the time of the level-0 SAD
+search. Against a third-party HEIF encoder's default preset on the
+same photographs (identical YUV input, luma PSNR), level 2 stands at
+**+0.3 % BD-rate on the 12 MP still** (+6.4 % on the 1024x768 one);
+the 12 MP still codes in 8.3 s on 8 workers with `tiles=4x4` at
+level 2 (38 s serial; 3.4 s / 17.7 s at level 0).
 
 ## What's implemented
 

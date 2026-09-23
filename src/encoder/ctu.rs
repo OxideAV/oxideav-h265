@@ -128,6 +128,14 @@ pub struct TreeCfg {
     /// per tile with entry points; the in-loop filters stay
     /// picture-wide (`loop_filter_across_tiles_enabled_flag == 1`).
     pub tiles: TileLayout,
+    /// Intra mode-decision effort: 0 = the historical SAD search with
+    /// derived (DM) chroma; 1 = SATD + λ·signalling-bins rough
+    /// decision over all 35 modes with a rough chroma-mode election
+    /// (`intra_chroma_pred_mode` 0..=4), one full coding pass; 2 = the
+    /// same rough decision keeping a short list (3 modes at 4x4 / 8x8,
+    /// 2 above, plus the most-probable mode) each coded for real
+    /// through the RD-elected RQT, the cheapest kept.
+    pub intra_rd: u8,
 }
 
 /// A tile grid for [`TreeCfg`]: uniform spacing, or explicit
@@ -240,6 +248,7 @@ impl TreeCfg {
             weighted_pred: false,
             wpp: false,
             tiles: TileLayout::single(),
+            intra_rd: 0,
         })
     }
 
@@ -247,6 +256,14 @@ impl TreeCfg {
     #[must_use]
     pub fn with_wpp(mut self, on: bool) -> Self {
         self.wpp = on;
+        self
+    }
+
+    /// Intra mode-decision effort (see [`Self::intra_rd`]; values
+    /// above 2 clamp to 2).
+    #[must_use]
+    pub fn with_intra_rd(mut self, level: u8) -> Self {
+        self.intra_rd = level.min(2);
         self
     }
 
@@ -399,8 +416,13 @@ enum TreeCuKind {
     /// Two-PU inter partition.
     TwoPu { part: PartMode, pus: [PuSyntax; 2] },
     /// Intra: `PART_2Nx2N` (one PB) or, at `MinCbSizeY`, `PART_NxN`
-    /// (four PBs). `modes[0]` is replicated for 2Nx2N.
-    Intra { modes: [u8; 4], nxn: bool },
+    /// (four PBs). `modes[0]` is replicated for 2Nx2N; `chroma` is the
+    /// coded `intra_chroma_pred_mode` (4 = derived from luma).
+    Intra {
+        modes: [u8; 4],
+        nxn: bool,
+        chroma: u8,
+    },
 }
 
 /// One coded coding unit (a quadtree leaf).
@@ -984,6 +1006,169 @@ fn search_best_mode(marked: &MarkedReferenceSamples, src: &[i32]) -> (u8, Vec<i3
     best
 }
 
+/// In-place 1-D Walsh–Hadamard butterfly over `v` (a power-of-two
+/// length): the sequency-agnostic sum-of-absolute-transformed-
+/// differences kernel.
+fn hadamard_1d(v: &mut [i64]) {
+    let mut h = 1;
+    while h < v.len() {
+        let mut i = 0;
+        while i < v.len() {
+            for j in i..i + h {
+                let (a, b) = (v[j], v[j + h]);
+                v[j] = a + b;
+                v[j + h] = a - b;
+            }
+            i += 2 * h;
+        }
+        h *= 2;
+    }
+}
+
+/// SATD of one `m x m` block (`m` 4 or 8) of `src − pred` read at
+/// `(bx, by)` inside `n x n` buffers: the 2-D Hadamard of the
+/// difference, summed in magnitude.
+fn satd_block(src: &[i32], pred: &[i32], n: usize, bx: usize, by: usize, m: usize) -> u64 {
+    let mut d = [0i64; 64];
+    for y in 0..m {
+        for x in 0..m {
+            d[y * m + x] = i64::from(src[(by + y) * n + bx + x] - pred[(by + y) * n + bx + x]);
+        }
+    }
+    for y in 0..m {
+        hadamard_1d(&mut d[y * m..(y + 1) * m]);
+    }
+    let mut col = [0i64; 8];
+    let mut sum = 0u64;
+    for x in 0..m {
+        for y in 0..m {
+            col[y] = d[y * m + x];
+        }
+        hadamard_1d(&mut col[..m]);
+        sum += col[..m].iter().map(|c| c.unsigned_abs()).sum::<u64>();
+    }
+    sum
+}
+
+/// Sum of absolute Hadamard-transformed differences of an `n x n`
+/// block (`n` >= 4): 4x4 kernels for a 4x4 block, 8x8 kernels tiled
+/// over larger ones, normalized to the SAD scale (the same λ prices
+/// both).
+fn satd(src: &[i32], pred: &[i32], n: usize) -> u64 {
+    if n == 4 {
+        return (satd_block(src, pred, 4, 0, 0, 4) + 1) >> 1;
+    }
+    let mut sum = 0u64;
+    let mut by = 0;
+    while by < n {
+        let mut bx = 0;
+        while bx < n {
+            sum += satd_block(src, pred, n, bx, by, 8);
+            bx += 8;
+        }
+        by += 8;
+    }
+    (sum + 2) >> 2
+}
+
+/// §7.3.8.5 luma mode signalling cost in bins: `prev_intra_luma_pred_
+/// flag` + `mpm_idx` (1 / 2 bypass bins) for a most-probable mode,
+/// else the flag + the 5-bit `rem_intra_luma_pred_mode`.
+fn luma_mode_bins(mode: u8, mpm: &[u8; 3]) -> u64 {
+    match mpm.iter().position(|&m| m == mode) {
+        Some(0) => 2,
+        Some(_) => 3,
+        None => 6,
+    }
+}
+
+/// The §8.4.2 `candModeList` of the PB at `(x, y)` from the recorded
+/// mode field (left / above availability per §6.4.1).
+fn mpm_list(ctx: &SliceCtx<'_>, st: &EncState, x: usize, y: usize) -> [u8; 3] {
+    let avail_l = ctx.z_avail(x, y, x as i64 - 1, y as i64);
+    let avail_a = ctx.z_avail(x, y, x as i64, y as i64 - 1);
+    let a = st
+        .modes
+        .cand_intra_pred_mode(x, y, Neighbour::Left, avail_l);
+    let b = st
+        .modes
+        .cand_intra_pred_mode(x, y, Neighbour::Above, avail_a);
+    intra_luma_cand_mode_list(a, b)
+}
+
+/// Rough mode decision: every §8.4.2 mode scored by SATD of its
+/// prediction against the source plus `λ_me` times its signalling
+/// bins; the best `keep` modes in ascending cost (the most-probable
+/// mode appended when it did not make the cut — it is the cheapest
+/// to signal and a frequent RD winner).
+fn rough_intra_modes(
+    marked: &MarkedReferenceSamples,
+    src: &[i32],
+    n: usize,
+    mpm: &[u8; 3],
+    lambda_me: u64,
+    keep: usize,
+) -> Vec<u8> {
+    let mut scored: Vec<(u64, u8)> = (0..=34u8)
+        .map(|mode| {
+            let pred =
+                intra_predict_with_substitution(marked, &pred_params(mode, PredComponent::Luma))
+                    .expect("legal prediction params");
+            (
+                satd(src, &pred, n) + lambda_me * luma_mode_bins(mode, mpm),
+                mode,
+            )
+        })
+        .collect();
+    scored.sort_by_key(|&(c, m)| (c, m));
+    let mut out: Vec<u8> = scored.iter().take(keep).map(|&(_, m)| m).collect();
+    if !out.contains(&mpm[0]) {
+        out.push(mpm[0]);
+    }
+    out
+}
+
+/// Rough chroma mode election for the intra CU at luma `(x0, y0)`
+/// size `n` whose luma mode is `luma_mode`: the five
+/// `intra_chroma_pred_mode` values (Table 8-2: planar / 26 / 10 / 1
+/// with the mode-34 substitution, or 4 = the luma mode) scored by the
+/// SATD of the Cb + Cr predictions from the current reconstruction
+/// plus `λ_me` times the §9.3.3.8 bins (1 for 4, 3 otherwise).
+/// Returns `(intra_chroma_pred_mode, IntraPredModeC)`.
+fn elect_chroma_mode(
+    ctx: &SliceCtx<'_>,
+    st: &EncState,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    luma_mode: u8,
+    lambda_me: u64,
+) -> (u8, u8) {
+    let (cx0, cy0, nc) = (x0 / 2, y0 / 2, n / 2);
+    let cw = ctx.width / 2;
+    let src_cb = extract(ctx.src[1], cw, cx0, cy0, nc);
+    let src_cr = extract(ctx.src[2], cw, cx0, cy0, nc);
+    let marked_cb = gather_chroma_refs(ctx, &st.recon.cb, cx0, cy0, nc);
+    let marked_cr = gather_chroma_refs(ctx, &st.recon.cr, cx0, cy0, nc);
+    let mut best = (4u8, luma_mode, u64::MAX);
+    for idx in [4u8, 0, 1, 2, 3] {
+        let mode_c = crate::binarization::derive_intra_pred_mode_c(idx, luma_mode, false);
+        let pred_cb =
+            intra_predict_with_substitution(&marked_cb, &pred_params(mode_c, PredComponent::Cb))
+                .expect("legal prediction params");
+        let pred_cr =
+            intra_predict_with_substitution(&marked_cr, &pred_params(mode_c, PredComponent::Cr))
+                .expect("legal prediction params");
+        let cost = satd(&src_cb, &pred_cb, nc)
+            + satd(&src_cr, &pred_cr, nc)
+            + lambda_me * if idx == 4 { 1 } else { 3 };
+        if cost < best.2 {
+            best = (idx, mode_c, cost);
+        }
+    }
+    (best.0, best.1)
+}
+
 /// Pick the 64x64 intra CU's single PB mode: the CU is forced to four
 /// 32x32 TUs, so each candidate mode is scored by SAD over the four
 /// TU predictions with in-CU (not-yet-reconstructed) reference reads
@@ -1244,11 +1429,33 @@ fn intra_rqt(
 }
 
 /// Code the best intra CU at `(x0, y0)` size `1 << log2` INTO the
+/// state, dispatching on the configured mode-decision effort
+/// ([`TreeCfg::intra_rd`]).
+#[allow(clippy::too_many_arguments)]
+fn code_intra_cu(
+    ctx: &SliceCtx<'_>,
+    st: &mut EncState,
+    x0: usize,
+    y0: usize,
+    log2: u32,
+    depth: u32,
+    ctb_qp: i32,
+) -> CuCoded {
+    if ctx.cfg.intra_rd == 0 {
+        code_intra_cu_legacy(ctx, st, x0, y0, log2, depth, ctb_qp)
+    } else {
+        code_intra_cu_rd(ctx, st, x0, y0, log2, depth, ctb_qp)
+    }
+}
+
+/// The `intra_rd == 0` intra CU coder (byte-stable with the historical
+/// streams): SAD mode search, derived chroma mode. Codes the best
+/// intra CU at `(x0, y0)` size `1 << log2` INTO the
 /// state (reconstruction + mode field + cells): `PART_2Nx2N` with the
 /// RD-elected RQT, and additionally `PART_NxN` (four 4x4 PBs, DST
 /// TUs) at `MinCbSizeY`.
 #[allow(clippy::too_many_arguments)]
-fn code_intra_cu(
+fn code_intra_cu_legacy(
     ctx: &SliceCtx<'_>,
     st: &mut EncState,
     x0: usize,
@@ -1301,6 +1508,7 @@ fn code_intra_cu(
         kind: TreeCuKind::Intra {
             modes: [mode; 4],
             nxn: false,
+            chroma: 4,
         },
         motions: Vec::new(),
         tree: Some(tree_2n),
@@ -1355,6 +1563,205 @@ fn code_intra_cu(
                 kind: TreeCuKind::Intra {
                     modes: pb_modes,
                     nxn: true,
+                    chroma: 4,
+                },
+                motions: Vec::new(),
+                tree: Some(TuNode::Split { children, cb, cr }),
+                cost: cost_nxn,
+            }
+        } else {
+            st.restore(ctx, &after_2n);
+            cu_2n
+        }
+    } else {
+        cu_2n
+    };
+
+    // Commit the non-recon state.
+    st.field.fill_rect(
+        x0,
+        y0,
+        n,
+        n,
+        MotionCell {
+            is_intra: true,
+            ref_poc_l0: i32::MIN,
+            ref_poc_l1: i32::MIN,
+            ..MotionCell::default()
+        },
+    );
+    st.fill_cells(x0, y0, n, depth as i8, 0);
+    cu
+}
+
+/// The `intra_rd >= 1` intra CU coder: SATD + λ·bins rough decision,
+/// chroma-mode election, full RD over the short list at level 2.
+/// Codes the best intra CU at `(x0, y0)` size `1 << log2` INTO the
+/// state (reconstruction + mode field + cells): `PART_2Nx2N` with the
+/// RD-elected RQT, and additionally `PART_NxN` (four 4x4 PBs, DST
+/// TUs) at `MinCbSizeY`.
+#[allow(clippy::too_many_arguments)]
+fn code_intra_cu_rd(
+    ctx: &SliceCtx<'_>,
+    st: &mut EncState,
+    x0: usize,
+    y0: usize,
+    log2: u32,
+    depth: u32,
+    ctb_qp: i32,
+) -> CuCoded {
+    let n = 1usize << log2;
+    let qp_y = ctb_qp as u32;
+    let qp_c = chroma_qp_420(ctb_qp);
+    let lambda = ctx.lambda_of(ctb_qp);
+    let lambda_me = crate::encoder::rate::motion_lambda(lambda);
+    // Per-CU syntax overhead proxy: pred_mode (P/B) + part_mode (at
+    // MinCb); the luma / chroma mode bins are priced per candidate.
+    let base_bins = u64::from(!ctx.intra_slice) + u64::from(log2 == ctx.cfg.min_cb_log2());
+    let chroma_bins = |idx: u8| if idx == 4 { 1 } else { 3 };
+
+    let before = st.snapshot(ctx, x0, y0, n);
+    let mpm = mpm_list(ctx, st, x0, y0);
+
+    // ---- PART_2Nx2N ----
+    // Rough decision (SATD + λ_me·bins over all 35 modes) keeps a
+    // short list; each survivor is then coded for real through the
+    // RD-elected RQT (with its own chroma mode election) and the
+    // cheapest SSD + λ·bins candidate is kept.
+    let cands: Vec<u8> = if log2 == 6 {
+        vec![search_mode_64(ctx, st, x0, y0)]
+    } else {
+        let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
+        let src = extract(ctx.src[0], ctx.width, x0, y0, n);
+        let keep = match (ctx.cfg.intra_rd, log2) {
+            (1, _) => 1,
+            (_, 3) => 3,
+            _ => 2,
+        };
+        let mut c = rough_intra_modes(&marked, &src, n, &mpm, lambda_me, keep);
+        if ctx.cfg.intra_rd == 1 {
+            c.truncate(1);
+        }
+        c
+    };
+    let max_depth_2n = ctx.cfg.th_depth_intra; // IntraSplitFlag == 0
+    let mut best_2n: Option<(u8, u8, TuNode, u64, Snap)> = None;
+    for (k, &mode) in cands.iter().enumerate() {
+        if k > 0 {
+            st.restore(ctx, &before);
+        }
+        let (chroma_idx, mode_c) = elect_chroma_mode(ctx, st, x0, y0, n, mode, lambda_me);
+        let (tree, dist, rate) = intra_rqt(
+            ctx,
+            st,
+            x0,
+            y0,
+            log2,
+            0,
+            max_depth_2n,
+            mode,
+            mode_c,
+            qp_y,
+            qp_c,
+            lambda,
+        );
+        let cost = dist
+            + lambda * (rate + base_bins + luma_mode_bins(mode, &mpm) + chroma_bins(chroma_idx));
+        if best_2n.as_ref().map_or(true, |b| cost < b.3) {
+            best_2n = Some((mode, chroma_idx, tree, cost, st.snapshot(ctx, x0, y0, n)));
+        }
+    }
+    let (mode, chroma_2n, tree_2n, cost_2n, after_2n_coded) = best_2n.expect("a candidate");
+    if cands.len() > 1 {
+        st.restore(ctx, &after_2n_coded);
+    }
+    let cu_2n = CuCoded {
+        x0,
+        y0,
+        log2,
+        kind: TreeCuKind::Intra {
+            modes: [mode; 4],
+            nxn: false,
+            chroma: chroma_2n,
+        },
+        motions: Vec::new(),
+        tree: Some(tree_2n),
+        cost: cost_2n,
+    };
+    // The mode field is only consulted by LATER PBs; record after.
+    st.modes.record_intra_pb(x0, y0, n, mode, false);
+
+    // ---- PART_NxN at MinCbSizeY (four 4x4 PBs, forced depth-1) ----
+    let cu = if log2 == ctx.cfg.min_cb_log2() && log2 == 3 {
+        let after_2n = st.snapshot(ctx, x0, y0, n);
+        st.restore(ctx, &before);
+        let mut pb_modes = [0u8; 4];
+        let mut luma_lv: Vec<Vec<i32>> = Vec::with_capacity(4);
+        let mut dist = 0u64;
+        let mut rate = 0u64;
+        let mut mode_bins = 0u64;
+        for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
+            let (px, py) = (x0 + zx * 4, y0 + zy * 4);
+            let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
+            let src = extract(ctx.src[0], ctx.width, px, py, 4);
+            let pb_mpm = mpm_list(ctx, st, px, py);
+            let mut pb_cands = rough_intra_modes(&marked, &src, 4, &pb_mpm, lambda_me, 3);
+            if ctx.cfg.intra_rd == 1 {
+                pb_cands.truncate(1);
+            }
+            // Full RD over the survivors on this 4x4 TB.
+            let pb_before = st.snapshot(ctx, px, py, 4);
+            let mut best: Option<(u8, Vec<i32>, u64, u64, Snap)> = None;
+            for (i, &m) in pb_cands.iter().enumerate() {
+                if i > 0 {
+                    st.restore(ctx, &pb_before);
+                }
+                let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
+                let bins = rate_proxy(&lv) + 1 + luma_mode_bins(m, &pb_mpm);
+                let cost = d + lambda * bins;
+                if best.as_ref().map_or(true, |b| cost < b.3) {
+                    best = Some((m, lv, d, cost, st.snapshot(ctx, px, py, 4)));
+                }
+            }
+            let (m, lv, d, _, after) = best.expect("a candidate");
+            if pb_cands.len() > 1 {
+                st.restore(ctx, &after);
+            }
+            // §8.4.2: later PBs' candidate lists see this PB's mode.
+            st.modes.record_intra_pb(px, py, 4, m, false);
+            pb_modes[k] = m;
+            mode_bins += luma_mode_bins(m, &pb_mpm);
+            rate += rate_proxy(&lv) + 1;
+            dist += d;
+            luma_lv.push(lv);
+        }
+        let (chroma_nxn, mode_c) = elect_chroma_mode(ctx, st, x0, y0, 8, pb_modes[0], lambda_me);
+        let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x0 / 2, y0 / 2, 4, mode_c, qp_c, lambda);
+        dist += d_c;
+        rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
+        let cost_nxn = dist + lambda * (rate + base_bins + mode_bins + chroma_bins(chroma_nxn));
+        if cost_nxn < cost_2n {
+            let children: Box<[TuNode; 4]> = Box::new(
+                luma_lv
+                    .into_iter()
+                    .map(|y| TuNode::Leaf {
+                        y,
+                        cb: Vec::new(),
+                        cr: Vec::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|_| ())
+                    .expect("four leaves"),
+            );
+            CuCoded {
+                x0,
+                y0,
+                log2,
+                kind: TreeCuKind::Intra {
+                    modes: pb_modes,
+                    nxn: true,
+                    chroma: chroma_nxn,
                 },
                 motions: Vec::new(),
                 tree: Some(TuNode::Split { children, cb, cr }),
@@ -1982,7 +2389,12 @@ fn code_inter_cu(
             search_mode_64(ctx, st, x0, y0)
         } else {
             let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
-            search_best_mode(&marked, &src[0]).0
+            if ctx.cfg.intra_rd == 0 {
+                search_best_mode(&marked, &src[0]).0
+            } else {
+                let mpm = mpm_list(ctx, st, x0, y0);
+                rough_intra_modes(&marked, &src[0], n, &mpm, lambda_me, 1)[0]
+            }
         };
         // Predict + code the whole CU as its (possibly forced-split)
         // intra transform tree, on a scratch copy of the recon rect.
@@ -2011,6 +2423,7 @@ fn code_inter_cu(
             kind: TreeCuKind::Intra {
                 modes: [mode; 4],
                 nxn: false,
+                chroma: 4,
             },
             motions: Vec::new(),
             tree: Some(tree),
@@ -2030,7 +2443,7 @@ fn code_inter_cu(
     store(&mut st.recon.cr, cw, cx0, cy0, n / 2, &chosen.recon.cr);
     let is_skip = matches!(chosen.kind, TreeCuKind::Skip { .. });
     match &chosen.kind {
-        TreeCuKind::Intra { modes, nxn } => {
+        TreeCuKind::Intra { modes, nxn, .. } => {
             st.field.fill_rect(
                 x0,
                 y0,
@@ -2462,7 +2875,7 @@ impl Emitter<'_, '_> {
                     u8::from(cu.tree.is_some()),
                 );
             }
-            TreeCuKind::Intra { modes, nxn } => {
+            TreeCuKind::Intra { modes, nxn, chroma } => {
                 if !self.ctx.intra_slice {
                     self.cabac
                         .encode_decision(self.w, &mut self.ctxs.pred_mode_flag[0], 1);
@@ -2539,16 +2952,29 @@ impl Emitter<'_, '_> {
                         }
                     }
                 }
-                // intra_chroma_pred_mode = 4 (derived): bin "0".
-                self.cabac
-                    .encode_decision(self.w, &mut self.ctxs.intra_chroma_pred_mode[0], 0);
+                // intra_chroma_pred_mode (Table 9-46): "0" for 4
+                // (derived from luma), else "1" + two bypass bins.
+                if *chroma == 4 {
+                    self.cabac
+                        .encode_decision(self.w, &mut self.ctxs.intra_chroma_pred_mode[0], 0);
+                } else {
+                    self.cabac
+                        .encode_decision(self.w, &mut self.ctxs.intra_chroma_pred_mode[0], 1);
+                    self.cabac.encode_bypass_bits(self.w, u32::from(*chroma), 2);
+                }
             }
         }
         // ---- transform tree ----
         let cu_is_intra = matches!(cu.kind, TreeCuKind::Intra { .. });
-        let (intra_split, modes4) = match &cu.kind {
-            TreeCuKind::Intra { modes, nxn } => (*nxn, *modes),
-            _ => (false, [0u8; 4]),
+        let (intra_split, modes4, mode_c) = match &cu.kind {
+            TreeCuKind::Intra { modes, nxn, chroma } => (
+                *nxn,
+                *modes,
+                // §8.4.3 IntraPredModeC from the coded chroma index and
+                // the first PB's luma mode (the chroma TBs' scan).
+                crate::binarization::derive_intra_pred_mode_c(*chroma, modes[0], false),
+            ),
+            _ => (false, [0u8; 4], 0),
         };
         if let Some(tree) = &cu.tree {
             let max_depth = if cu_is_intra {
@@ -2567,6 +2993,7 @@ impl Emitter<'_, '_> {
                 cu_is_intra,
                 intra_split,
                 modes4,
+                mode_c,
                 max_depth,
                 inter_split,
             };
@@ -2715,7 +3142,7 @@ impl Emitter<'_, '_> {
                         self.emit_residual(y_lv, log2, 0, tt.cu_is_intra, mode);
                     }
                     if log2 > 2 {
-                        let mode_c = tt.modes4[0];
+                        let mode_c = tt.mode_c;
                         if TuNode::any_nonzero(cb) {
                             self.emit_residual(cb, log2 - 1, 1, tt.cu_is_intra, mode_c);
                         }
@@ -2749,7 +3176,7 @@ impl Emitter<'_, '_> {
         // delta_qp) iff its own cbf_luma or the parent chroma was set;
         // the deferred chroma is coded in that same transform_unit.
         let _ = qg;
-        let mode_c = tt.modes4[0];
+        let mode_c = tt.mode_c;
         if cbf_cb {
             self.emit_residual(cb, parent_log2 - 1, 1, tt.cu_is_intra, mode_c);
         }
@@ -2792,6 +3219,8 @@ struct TtCtx<'a> {
     cu_is_intra: bool,
     intra_split: bool,
     modes4: [u8; 4],
+    /// `IntraPredModeC` (intra CUs): the chroma TBs' scan selector.
+    mode_c: u8,
     max_depth: u32,
     inter_split: bool,
 }
@@ -3610,6 +4039,43 @@ pub(crate) fn encode_inter_slice_tree(
 
 #[cfg(test)]
 mod tests {
+    /// SATD: zero difference is zero; a constant difference of `d`
+    /// over an `n x n` block is `n * n * d` before the SAD-scale
+    /// normalization (only the DC Hadamard coefficient is nonzero);
+    /// a single-sample difference spreads to every coefficient.
+    #[test]
+    fn satd_kernels_match_hadamard_identities() {
+        for n in [4usize, 8, 16, 32] {
+            let src: Vec<i32> = (0..n * n).map(|i| (i % 17) as i32 + 40).collect();
+            assert_eq!(satd(&src, &src, n), 0, "n={n}");
+            let pred: Vec<i32> = src.iter().map(|&v| v - 3).collect();
+            // Every 8x8 (or the 4x4) kernel sees DC = m*m*3.
+            let expected = if n == 4 {
+                (4 * 4 * 3 + 1) >> 1
+            } else {
+                ((n / 8) * (n / 8) * 8 * 8 * 3 + 2) >> 2
+            };
+            assert_eq!(satd(&src, &pred, n), expected as u64, "n={n}");
+        }
+        let mut pred = vec![0i32; 16];
+        let src = vec![0i32; 16];
+        pred[5] = 8;
+        // One impulse of 8: all 16 4x4 Hadamard coefficients are ±8.
+        assert_eq!(satd(&src, &pred, 4), (16 * 8 + 1) >> 1);
+    }
+
+    /// §7.3.8.5 luma mode bins: 2 / 3 / 3 for the three most-probable
+    /// modes, 6 (flag + 5-bit remainder) otherwise.
+    #[test]
+    fn luma_mode_bins_follow_the_mpm_binarization() {
+        let mpm = [26u8, 10, 0];
+        assert_eq!(luma_mode_bins(26, &mpm), 2);
+        assert_eq!(luma_mode_bins(10, &mpm), 3);
+        assert_eq!(luma_mode_bins(0, &mpm), 3);
+        assert_eq!(luma_mode_bins(1, &mpm), 6);
+        assert_eq!(luma_mode_bins(34, &mpm), 6);
+    }
+
     use super::*;
     use crate::encoder::inter::YuvFrame;
     use crate::sequence::decode_annexb_sequence;

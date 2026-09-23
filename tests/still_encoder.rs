@@ -195,8 +195,8 @@ fn registry_decode_md5(stream: &[u8], w: usize, h: usize) -> String {
 
 /// Golden digests (stream bytes, cropped decode) validated black-box
 /// at pin time.
-const INTRA_STREAM_MD5: &str = "43d0d0979faea7e5dfe54154f9c9cc78";
-const INTRA_DECODE_MD5: &str = "866cbe5eb755da846cd33463a8a93262";
+const INTRA_STREAM_MD5: &str = "8d960e2040aad2ea436ca0cdde6e8946";
+const INTRA_DECODE_MD5: &str = "855d75f82f8ad62c8dbd78a835a0d53a";
 const PCM_STREAM_MD5: &str = "bd53ba698547bc58dc626a159aab13f4";
 const PCM_DECODE_MD5: &str = "475f10c4835f4eba613c82c7ab990cf2";
 
@@ -418,6 +418,54 @@ fn registry_tiles_and_wpp_options_reach_the_quadtree_coder() {
         oxideav_h265::make_encoder(&params).is_err(),
         "1x1 is not a grid"
     );
+}
+
+/// The `rd` option (intra mode-decision effort): level 0 is the
+/// historical SAD search (byte-stable), a still defaults to level 2,
+/// level 1 / 2 streams differ from level 0 and decode; `rd` needs
+/// `ctb`.
+#[test]
+fn rd_levels_select_the_intra_decision() {
+    let base = [
+        ("mode", "intra"),
+        ("still", "1"),
+        ("ctb", "32"),
+        ("qp", "30"),
+    ];
+    let with = |rd: Option<&'static str>| -> Vec<u8> {
+        let opts: Vec<(&str, &str)> = base.iter().copied().chain(rd.map(|v| ("rd", v))).collect();
+        encode_one(&opts, W, H)
+    };
+    let rd0 = with(Some("0"));
+    let rd1 = with(Some("1"));
+    let rd2 = with(Some("2"));
+    let default = with(None);
+    assert_eq!(default, rd2, "a still defaults to rd 2");
+    assert_ne!(rd0, rd1, "level 1 changes the decision");
+    assert_ne!(rd1, rd2, "level 2 changes the decision");
+    assert!(
+        rd2.len() < rd0.len(),
+        "level 2 is cheaper at QP 30 ({} vs {} bytes)",
+        rd2.len(),
+        rd0.len()
+    );
+    for stream in [&rd0, &rd1, &rd2] {
+        assert_eq!(decode_annexb_sequence(stream).expect("decodes").len(), 1);
+    }
+    // Without `still`, the historical level 0 is the default.
+    let plain = encode_one(&[("mode", "intra"), ("ctb", "32"), ("qp", "30")], W, H);
+    let plain0 = encode_one(
+        &[("mode", "intra"), ("ctb", "32"), ("qp", "30"), ("rd", "0")],
+        W,
+        H,
+    );
+    assert_eq!(plain, plain0, "no still: rd defaults to 0");
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(64);
+    params.height = Some(64);
+    params.options.insert("mode", "intra");
+    params.options.insert("rd", "1");
+    assert!(oxideav_h265::make_encoder(&params).is_err(), "rd needs ctb");
 }
 
 /// `still` is refused on the inter GOP modes.

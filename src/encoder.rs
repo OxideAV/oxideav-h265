@@ -257,8 +257,12 @@ impl std::fmt::Debug for H265Encoder {
 /// `cu_qp_delta`, strength 1..=3), plus `still` (pcm / intra modes:
 /// Main Still Picture profile signalling), and the quadtree-coder
 /// tools `sdh` / `rdoq` / `tudepth` / `sl` / `wp` / `wpp` / `tiles=CxR`
-/// (all require `ctb`; `tiles` is the pass-1 fan-out unit under
-/// [`oxideav_core::Encoder::set_execution_context`]).
+/// / `rd` (all require `ctb`; `tiles` is the pass-1 fan-out unit under
+/// [`oxideav_core::Encoder::set_execution_context`]; `rd` 0..=2 is the
+/// intra mode-decision effort — 0 the historical SAD search, 1 a
+/// SATD + signalling-bins rough decision with chroma-mode election,
+/// 2 additionally a full coding pass over a short list of luma modes
+/// — defaulting to 2 for a `still` and 0 otherwise).
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or zero,
@@ -432,11 +436,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             })?)
         }
     };
-    if (sdh || rdoq || tudepth.is_some() || sl.is_some() || wp || wpp || tiles.is_some())
+    // `rd` — intra mode-decision effort (0..=2; default 2 for a still,
+    // 0 otherwise — the historical streams stay byte-stable).
+    let rd = match params.options.get("rd") {
+        None => None,
+        Some(v) => Some(v.parse::<u8>().ok().filter(|d| *d <= 2).ok_or_else(|| {
+            Error::InvalidData(format!("h265 encode: rd must be 0..=2, got {v:?}"))
+        })?),
+    };
+    if (sdh
+        || rdoq
+        || tudepth.is_some()
+        || sl.is_some()
+        || wp
+        || wpp
+        || tiles.is_some()
+        || rd.is_some())
         && tree.is_none()
     {
         return Err(Error::InvalidData(
-            "h265 encode: the sdh / rdoq / tudepth / sl / wp / wpp / tiles options require the ctb option".into(),
+            "h265 encode: the sdh / rdoq / tudepth / sl / wp / wpp / tiles / rd options require the ctb option".into(),
         ));
     }
     if let Some(t) = tree.as_mut() {
@@ -454,6 +473,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         if let Some((c, r)) = tiles {
             *t = t.with_tiles(ctu::TileLayout::uniform(c, r));
         }
+        *t = t.with_intra_rd(rd.unwrap_or(u8::from(parse_flag(params, "still")?) * 2));
     }
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
     let ctu_rc = parse_flag(params, "cturc")?;
