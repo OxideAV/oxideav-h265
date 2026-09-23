@@ -195,8 +195,8 @@ fn registry_decode_md5(stream: &[u8], w: usize, h: usize) -> String {
 
 /// Golden digests (stream bytes, cropped decode) validated black-box
 /// at pin time.
-const INTRA_STREAM_MD5: &str = "8d960e2040aad2ea436ca0cdde6e8946";
-const INTRA_DECODE_MD5: &str = "855d75f82f8ad62c8dbd78a835a0d53a";
+const INTRA_STREAM_MD5: &str = "9baa64d540f89ee7cae6f43a8ac96ea4";
+const INTRA_DECODE_MD5: &str = "c2fc2a55c0ec1dac0b51d5148e864a37";
 const PCM_STREAM_MD5: &str = "bd53ba698547bc58dc626a159aab13f4";
 const PCM_DECODE_MD5: &str = "475f10c4835f4eba613c82c7ab990cf2";
 

@@ -267,8 +267,9 @@ short list of luma modes for real through the RD-elected RQT —
 −3.1 % / −4.2 % BD-rate on a 1024x768 photograph and −4.6 % / −5.6 %
 on a 4032x3024 one, at 1.3x / 2.2x the time of the level-0 SAD
 search. Against a third-party HEIF encoder's default preset on the
-same photographs (identical YUV input, luma PSNR), level 2 stands at
-**+0.3 % BD-rate on the 12 MP still** (+6.4 % on the 1024x768 one);
+same photographs (identical YUV input, luma PSNR), level 2 — with
+its halved mode-decision λ — stands at **−1.4 % BD-rate on the 12 MP
+still** (+4.3 % on the 1024x768 one);
 the 12 MP still codes in 8.3 s on 8 workers with `tiles=4x4` at
 level 2 (38 s serial; 3.4 s / 17.7 s at level 0).
 

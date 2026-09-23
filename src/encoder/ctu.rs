@@ -499,8 +499,20 @@ struct SliceCtx<'a> {
 }
 
 impl SliceCtx<'_> {
+    /// The mode-decision λ (SSD per bin): the power-of-two ladder
+    /// `2^((QP−9)/3)` of the historical coders, halved under the
+    /// `intra_rd >= 1` decision — a {25, 35, 50, 70, 85, 100, 125} %
+    /// sweep on two photographs put the optimum at one half (−1.5 % /
+    /// −1.0 % BD-rate on the 1024x768 / 4032x3024 stills; the SATD
+    /// rough decision and the exact-bin RDOQ leave less for the proxy
+    /// bins to guard against).
     fn lambda_of(&self, q: i32) -> u64 {
-        1u64 << (q.unsigned_abs().saturating_sub(9) / 3)
+        let base = 1u64 << (q.unsigned_abs().saturating_sub(9) / 3);
+        if self.cfg.intra_rd == 0 {
+            base
+        } else {
+            base.div_ceil(2)
+        }
     }
 
     fn ctbs_x(&self) -> usize {
@@ -1173,8 +1185,16 @@ fn elect_chroma_mode(
 /// 32x32 TUs, so each candidate mode is scored by SAD over the four
 /// TU predictions with in-CU (not-yet-reconstructed) reference reads
 /// substituted from the SOURCE picture — a search heuristic only; the
-/// actual coding pass predicts from the real reconstruction.
-fn search_mode_64(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize) -> u8 {
+/// actual coding pass predicts from the real reconstruction. With
+/// `rough` set (`intra_rd >= 1`) the score is SATD + `λ_me` times the
+/// mode's signalling bins against `mpm`, as for the smaller CUs.
+fn search_mode_64(
+    ctx: &SliceCtx<'_>,
+    st: &EncState,
+    x0: usize,
+    y0: usize,
+    rough: Option<(&[u8; 3], u64)>,
+) -> u8 {
     let mut best = (0u8, u64::MAX);
     let read = |x: i64, y: i64| -> i32 {
         let (xu, yu) = (x as usize, y as usize);
@@ -1211,11 +1231,17 @@ fn search_mode_64(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize) -> u8
                 intra_predict_with_substitution(&marked, &pred_params(mode, PredComponent::Luma))
                     .expect("legal prediction params");
             let src = extract(ctx.src[0], ctx.width, tx, ty, 32);
-            cost += src
-                .iter()
-                .zip(pred.iter())
-                .map(|(&s, &p)| u64::from(s.abs_diff(p)))
-                .sum::<u64>();
+            cost += match rough {
+                Some(_) => satd(&src, &pred, 32),
+                None => src
+                    .iter()
+                    .zip(pred.iter())
+                    .map(|(&s, &p)| u64::from(s.abs_diff(p)))
+                    .sum::<u64>(),
+            };
+        }
+        if let Some((mpm, lambda_me)) = rough {
+            cost += lambda_me * luma_mode_bins(mode, mpm);
         }
         if cost < best.1 {
             best = (mode, cost);
@@ -1476,7 +1502,7 @@ fn code_intra_cu_legacy(
 
     // ---- PART_2Nx2N ----
     let mode = if log2 == 6 {
-        search_mode_64(ctx, st, x0, y0)
+        search_mode_64(ctx, st, x0, y0, None)
     } else {
         let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
         let src = extract(ctx.src[0], ctx.width, x0, y0, n);
@@ -1629,7 +1655,7 @@ fn code_intra_cu_rd(
     // RD-elected RQT (with its own chroma mode election) and the
     // cheapest SSD + λ·bins candidate is kept.
     let cands: Vec<u8> = if log2 == 6 {
-        vec![search_mode_64(ctx, st, x0, y0)]
+        vec![search_mode_64(ctx, st, x0, y0, Some((&mpm, lambda_me)))]
     } else {
         let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
         let src = extract(ctx.src[0], ctx.width, x0, y0, n);
@@ -2386,7 +2412,7 @@ fn code_inter_cu(
     // ---- intra fallback (2Nx2N, leaf TU shape kept simple) ----
     {
         let mode = if log2 == 6 {
-            search_mode_64(ctx, st, x0, y0)
+            search_mode_64(ctx, st, x0, y0, None)
         } else {
             let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
             if ctx.cfg.intra_rd == 0 {
