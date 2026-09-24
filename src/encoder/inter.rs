@@ -320,6 +320,10 @@ pub struct LowDelayPEncoder {
     /// §7.4.3.2.1 conformance cropping window `(right, bottom)` in
     /// chroma units, `None` = whole picture ([`Self::with_conformance_window`]).
     conformance_window: Option<(u32, u32)>,
+    /// §E.2.1 video-signal VUI block ([`Self::with_video_signal`]).
+    video_signal: Option<crate::encoder::intra::VideoSignal>,
+    /// Parameter-set ids ([`Self::with_parameter_set_ids`]).
+    ids: crate::encoder::intra::ParameterSetIds,
 }
 
 impl LowDelayPEncoder {
@@ -360,6 +364,8 @@ impl LowDelayPEncoder {
             ctu_rc: false,
             threads: 1,
             conformance_window: None,
+            video_signal: None,
+            ids: crate::encoder::intra::ParameterSetIds::default(),
         })
     }
 
@@ -392,6 +398,22 @@ impl LowDelayPEncoder {
     #[must_use]
     pub fn with_conformance_window(mut self, right: u32, bottom: u32) -> Self {
         self.conformance_window = Some((right, bottom));
+        self
+    }
+
+    /// Declare the §E.2.1 `video_signal_type` VUI block (sample range
+    /// + optional H.273 colour description) in the SPS.
+    #[must_use]
+    pub fn with_video_signal(mut self, vs: crate::encoder::intra::VideoSignal) -> Self {
+        self.video_signal = Some(vs);
+        self
+    }
+
+    /// The VPS / SPS / PPS ids the stream's parameter sets and slice
+    /// headers carry.
+    #[must_use]
+    pub fn with_parameter_set_ids(mut self, ids: crate::encoder::intra::ParameterSetIds) -> Self {
+        self.ids = ids;
         self
     }
 
@@ -738,6 +760,8 @@ impl LowDelayPEncoder {
                     threads: self.threads,
                     conformance_window: self.conformance_window,
                     still: false,
+                    video_signal: self.video_signal,
+                    ids: self.ids,
                 },
                 &self.filters,
                 self.aq,
@@ -783,6 +807,7 @@ impl LowDelayPEncoder {
                 l0,
                 lf: &self.filters,
                 big_cu: self.amp,
+                pps_id: self.ids.pps,
                 aq: self.aq,
                 tree: self.tree,
                 tmvp: TmvpSpec {
@@ -877,6 +902,8 @@ pub(crate) struct SliceSpec<'a> {
     /// `part_mode` column, no intra `part_mode`). Implied by the AMP
     /// stream configuration.
     pub big_cu: bool,
+    /// `slice_pic_parameter_set_id`.
+    pub pps_id: u8,
     /// Spatial adaptive-quantization strength (0 = constant slice QP;
     /// 1..=3 = per-CTB `cu_qp_delta` signalling — the stream's PPS
     /// must carry `cu_qp_delta_enabled_flag == 1`).
@@ -926,7 +953,7 @@ pub(crate) fn write_inter_slice_header(
     entry_points: Option<&[u32]>,
 ) {
     w.put_bit(1); // first_slice_segment_in_pic_flag
-    w.ue(0); // slice_pic_parameter_set_id
+    w.ue(u32::from(spec.pps_id)); // slice_pic_parameter_set_id
     w.ue(u32::from(!spec.b_slice)); // slice_type (0 = B, 1 = P)
     w.put_bits((spec.poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb
     w.put_bit(0); // short_term_ref_pic_set_sps_flag

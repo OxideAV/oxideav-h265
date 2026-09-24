@@ -271,7 +271,12 @@ same photographs (identical YUV input, luma PSNR), level 2 — with
 its halved mode-decision λ — stands at **−1.4 % BD-rate on the 12 MP
 still** (+4.3 % on the 1024x768 one);
 the 12 MP still codes in 8.3 s on 8 workers with `tiles=4x4` at
-level 2 (38 s serial; 3.4 s / 17.7 s at level 0).
+level 2 (38 s serial; 3.4 s / 17.7 s at level 0). Two container-facing knobs
+ride every mode: the §E.2.1 `video_signal_type` VUI block (`range`,
+`colorprim` / `transfer` / `matrix` — the field an OS image reader
+takes the sample range from) and the parameter-set ids (`vpsid` /
+`spsid` / `ppsid`, so sibling streams in one container can carry
+distinct VPS / SPS / PPS).
 
 ## What's implemented
 
@@ -345,6 +350,15 @@ and ~985 unit tests.
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
   path covers that geometry.)
+* Encoder input formats beyond 4:2:0 8-bit: 10-bit (Main 10 Still
+  Picture), 4:2:2 / 4:4:4 (Main 4:4:4 Still Picture) and monochrome
+  stills decode from every producer but cannot be encoded yet; an
+  odd-sized picture crops to its even rounding (the container's
+  clean aperture carries the odd last column / row).
+* Still-picture encoder speed: the level-2 mode decision is ~2x the
+  level-0 time serially (38 s for a 12 MP still; 8.3 s on 8 workers
+  with `tiles=4x4`) against ~1 s for the third-party encoder's
+  multi-threaded default preset — no WPP fan-out, no SIMD.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

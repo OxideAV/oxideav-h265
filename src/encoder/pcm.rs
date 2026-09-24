@@ -97,6 +97,11 @@ pub struct PcmAuOptions {
     /// one-picture-only constraint, a one-picture DPB) — for a
     /// single-picture stream.
     pub still: bool,
+    /// §E.2.1 `video_signal_type` VUI block (sample range + H.273
+    /// colour description); `None` writes no VUI.
+    pub video_signal: Option<crate::encoder::intra::VideoSignal>,
+    /// The VPS / SPS / PPS ids.
+    pub ids: crate::encoder::intra::ParameterSetIds,
 }
 
 impl Default for PcmAuOptions {
@@ -112,6 +117,8 @@ impl Default for PcmAuOptions {
             tile_spans: None,
             conformance_window: None,
             still: false,
+            video_signal: None,
+            ids: crate::encoder::intra::ParameterSetIds::default(),
         }
     }
 }
@@ -302,12 +309,7 @@ pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
                                          // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
 }
 
-/// §7.3.2.1 — the minimal single-layer VPS.
-pub(crate) fn write_vps(level_idc: u8) -> Vec<u8> {
-    write_vps_cfg(level_idc, 1, 0, false)
-}
-
-/// [`write_vps`] with explicit `vps_max_dec_pic_buffering_minus1[0]` /
+/// §7.3.2.1 — the minimal single-layer VPS with explicit `vps_max_dec_pic_buffering_minus1[0]` /
 /// `vps_max_num_reorder_pics[0]` (the hierarchical-B encoder holds
 /// more references and reorders output) and the still-picture PTL
 /// (`still`, see [`write_ptl_cfg`]).
@@ -316,9 +318,10 @@ pub(crate) fn write_vps_cfg(
     max_dec_pic_buffering_minus1: u32,
     max_num_reorder_pics: u32,
     still: bool,
+    vps_id: u8,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.put_bits(0, 4); // vps_video_parameter_set_id
+    w.put_bits(u32::from(vps_id.min(15)), 4); // vps_video_parameter_set_id
     w.put_bit(1); // vps_base_layer_internal_flag
     w.put_bit(1); // vps_base_layer_available_flag
     w.put_bits(0, 6); // vps_max_layers_minus1
@@ -339,6 +342,7 @@ pub(crate) fn write_vps_cfg(
 }
 
 /// §7.3.2.2 — the fixed-geometry SPS (4:2:0, 8-bit, CTB 16, PCM on).
+#[allow(clippy::too_many_arguments)]
 fn write_sps(
     width: usize,
     height: usize,
@@ -347,13 +351,15 @@ fn write_sps(
     pcm_loop_filter_disabled: bool,
     conformance_window: Option<(u32, u32)>,
     still: bool,
+    video_signal: Option<&crate::encoder::intra::VideoSignal>,
+    ids: crate::encoder::intra::ParameterSetIds,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.put_bits(0, 4); // sps_video_parameter_set_id
+    w.put_bits(u32::from(ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
     write_ptl_cfg(&mut w, level_idc, still);
-    w.ue(0); // sps_seq_parameter_set_id
+    w.ue(u32::from(ids.sps)); // sps_seq_parameter_set_id
     w.ue(1); // chroma_format_idc = 4:2:0
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
@@ -393,7 +399,23 @@ fn write_sps(
     w.put_bit(0); // long_term_ref_pics_present_flag
     w.put_bit(0); // sps_temporal_mvp_enabled_flag
     w.put_bit(0); // strong_intra_smoothing_enabled_flag
-    w.put_bit(0); // vui_parameters_present_flag
+    match video_signal {
+        None => w.put_bit(0), // vui_parameters_present_flag
+        Some(vs) => {
+            // §E.2.1 vui_parameters( ) — only the video-signal group.
+            w.put_bit(1); // vui_parameters_present_flag
+            w.put_bit(0); // aspect_ratio_info_present_flag
+            w.put_bit(0); // overscan_info_present_flag
+            crate::encoder::intra::write_video_signal_type(&mut w, Some(vs));
+            w.put_bit(0); // chroma_loc_info_present_flag
+            w.put_bit(0); // neutral_chroma_indication_flag
+            w.put_bit(0); // field_seq_flag
+            w.put_bit(0); // frame_field_info_present_flag
+            w.put_bit(0); // default_display_window_flag
+            w.put_bit(0); // vui_timing_info_present_flag
+            w.put_bit(0); // bitstream_restriction_flag
+        }
+    }
     w.put_bit(0); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.finish()
@@ -413,6 +435,7 @@ pub(crate) fn write_pps_full(
     sign_data_hiding: bool,
     weighted_pred: bool,
     entropy_coding_sync: bool,
+    ids: crate::encoder::intra::ParameterSetIds,
 ) -> Vec<u8> {
     write_pps_grid(
         dependent_slice_segments_enabled,
@@ -426,6 +449,7 @@ pub(crate) fn write_pps_full(
         // The coding-mode streams keep the in-loop filters picture-wide
         // across tile boundaries (their filter passes are picture-wide).
         tiles.is_some(),
+        ids,
     )
 }
 
@@ -442,10 +466,11 @@ pub(crate) fn write_pps_grid(
     weighted_pred: bool,
     entropy_coding_sync: bool,
     loop_filter_across_tiles: bool,
+    ids: crate::encoder::intra::ParameterSetIds,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.ue(0); // pps_pic_parameter_set_id
-    w.ue(0); // pps_seq_parameter_set_id
+    w.ue(u32::from(ids.pps)); // pps_pic_parameter_set_id
+    w.ue(u32::from(ids.sps)); // pps_seq_parameter_set_id
     w.put_bit(u8::from(dependent_slice_segments_enabled)); // dependent_slice_segments_enabled_flag
     w.put_bit(0); // output_flag_present_flag
     w.put_bits(0, 3); // num_extra_slice_header_bits
@@ -557,7 +582,7 @@ fn write_idr_slice_segments(
         let first = seg_idx == 0;
         w.put_bit(u8::from(first)); // first_slice_segment_in_pic_flag
         w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
-        w.ue(0); // slice_pic_parameter_set_id
+        w.ue(u32::from(opts.ids.pps)); // slice_pic_parameter_set_id
         if !first {
             if dependent_mode {
                 w.put_bit(1); // dependent_slice_segment_flag
@@ -790,7 +815,7 @@ fn write_tiled_idr_slice(
     let mut h = BitWriter::new();
     h.put_bit(1); // first_slice_segment_in_pic_flag
     h.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
-    h.ue(0); // slice_pic_parameter_set_id
+    h.ue(u32::from(opts.ids.pps)); // slice_pic_parameter_set_id
     h.ue(2); // slice_type = I
     h.se(SLICE_QP - 26); // slice_qp_delta
     if opts.deblocking {
@@ -971,9 +996,9 @@ fn encode_au(
     let dependent_mode = opts.independent_slices.is_empty() && segments > 1;
     let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
     let vps = if opts.still {
-        write_vps_cfg(level_idc, 0, 0, true)
+        write_vps_cfg(level_idc, 0, 0, true, opts.ids.vps)
     } else {
-        write_vps(level_idc)
+        write_vps_cfg(level_idc, 1, 0, false, opts.ids.vps)
     };
     let mut units = vec![
         nal_unit(32, 0, 0, &vps), // VPS_NUT
@@ -989,6 +1014,8 @@ fn encode_au(
                 opts.pcm_loop_filter_disabled,
                 opts.conformance_window,
                 opts.still,
+                opts.video_signal.as_ref(),
+                opts.ids,
             ),
         ), // SPS_NUT
         nal_unit(
@@ -1005,6 +1032,7 @@ fn encode_au(
                 false,
                 false,
                 false,
+                opts.ids,
             ),
         ), // PPS_NUT
     ];

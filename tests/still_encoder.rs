@@ -478,3 +478,193 @@ fn still_rejects_inter_mode() {
     params.options.insert("still", "1");
     assert!(oxideav_h265::make_encoder(&params).is_err());
 }
+
+/// The `range` / `colorprim` / `transfer` / `matrix` options write the
+/// §E.2.1 `video_signal_type` VUI block on every mode (pcm, legacy
+/// intra, quadtree intra, low-delay, pyramid): `video_full_range_flag`
+/// and the H.273 code points parse back, a missing code point reads 2
+/// (unspecified), no option writes no VUI, and every stream decodes.
+#[test]
+fn video_signal_options_write_the_vui_block_on_every_mode() {
+    let modes: [&[(&str, &str)]; 5] = [
+        &[("mode", "pcm")],
+        &[("mode", "intra"), ("qp", "30")],
+        &[
+            ("mode", "intra"),
+            ("qp", "30"),
+            ("ctb", "32"),
+            ("still", "1"),
+        ],
+        &[("mode", "inter"), ("qp", "30"), ("gop", "0")],
+        &[("mode", "inter"), ("qp", "30"), ("pyramid", "2")],
+    ];
+    for mode in modes {
+        let opts: Vec<(&str, &str)> = mode
+            .iter()
+            .copied()
+            .chain([
+                ("range", "full"),
+                ("colorprim", "1"),
+                ("transfer", "13"),
+                ("matrix", "6"),
+            ])
+            .collect();
+        let stream = encode_one(&opts, 64, 48);
+        let sps = sps_of(&stream);
+        let vui = sps
+            .vui_parameters
+            .as_ref()
+            .unwrap_or_else(|| panic!("{mode:?}: VUI present"));
+        assert!(vui.video_signal_type_present_flag, "{mode:?}");
+        let vs = vui
+            .video_signal_type
+            .as_ref()
+            .expect("video_signal_type block");
+        assert_eq!(vs.video_format, 5, "{mode:?}: video_format unspecified");
+        assert!(vs.video_full_range_flag, "{mode:?}: full range");
+        let cd = vs.colour_description.as_ref().expect("colour description");
+        assert_eq!(
+            (
+                cd.colour_primaries,
+                cd.transfer_characteristics,
+                cd.matrix_coeffs
+            ),
+            (1, 13, 6),
+            "{mode:?}: colour description"
+        );
+        assert_eq!(
+            decode_annexb_sequence(&stream).expect("decodes").len(),
+            1,
+            "{mode:?}"
+        );
+
+        // Limited range with only the matrix given: primaries /
+        // transfer read 2 (unspecified).
+        let opts: Vec<(&str, &str)> = mode
+            .iter()
+            .copied()
+            .chain([("range", "limited"), ("matrix", "1")])
+            .collect();
+        let vui = sps_of(&encode_one(&opts, 64, 48))
+            .vui_parameters
+            .expect("VUI present");
+        let vs = vui.video_signal_type.expect("video_signal_type block");
+        assert!(!vs.video_full_range_flag, "{mode:?}");
+        let cd = vs.colour_description.expect("colour description");
+        assert_eq!(
+            (
+                cd.colour_primaries,
+                cd.transfer_characteristics,
+                cd.matrix_coeffs
+            ),
+            (2, 2, 1)
+        );
+
+        // No option: no VUI at all (the historical streams).
+        let opts: Vec<(&str, &str)> = mode.to_vec();
+        let sps = sps_of(&encode_one(&opts, 64, 48));
+        assert!(
+            sps.vui_parameters.is_none(),
+            "{mode:?}: no VUI without the options"
+        );
+    }
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(64);
+    params.height = Some(48);
+    params.options.insert("range", "wide");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "unknown range word"
+    );
+}
+
+/// `vpsid` / `spsid` / `ppsid` reach the VPS, SPS, PPS and every slice
+/// header on every mode, the streams decode, and the ranges are
+/// enforced.
+#[test]
+fn parameter_set_id_options_reach_every_parameter_set_and_slice() {
+    use oxideav_h265::pps::PicParameterSet;
+    use oxideav_h265::slice::SliceSegmentHeader;
+    use oxideav_h265::HevcVps;
+
+    let modes: [&[(&str, &str)]; 5] = [
+        &[("mode", "pcm")],
+        &[("mode", "intra"), ("qp", "30")],
+        &[
+            ("mode", "intra"),
+            ("qp", "30"),
+            ("ctb", "32"),
+            ("still", "1"),
+        ],
+        &[("mode", "inter"), ("qp", "30"), ("gop", "0")],
+        &[("mode", "inter"), ("qp", "30"), ("pyramid", "2")],
+    ];
+    for mode in modes {
+        let opts: Vec<(&str, &str)> = mode
+            .iter()
+            .copied()
+            .chain([("vpsid", "3"), ("spsid", "5"), ("ppsid", "7")])
+            .collect();
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(64);
+        params.height = Some(48);
+        for (k, v) in &opts {
+            params.options.insert(*k, *v);
+        }
+        let mut enc = oxideav_h265::make_encoder(&params).expect("factory");
+        let src = still(64, 48);
+        enc.send_frame(&frame(64, 48, &src)).expect("send 0");
+        enc.send_frame(&frame(64, 48, &src)).expect("send 1");
+        enc.flush().expect("flush");
+        let mut stream = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            stream.extend_from_slice(&pkt.data);
+        }
+        let units: Vec<_> = NalIter::new(&stream).flatten().collect();
+        let vps = HevcVps::parse(
+            &units
+                .iter()
+                .find(|u| u.header.nal_unit_type == 32)
+                .expect("VPS")
+                .rbsp,
+        )
+        .expect("VPS parses");
+        assert_eq!(vps.vps_id, 3, "{mode:?}");
+        let sps = sps_of(&stream);
+        assert_eq!((sps.vps_id, sps.sps_id), (3, 5), "{mode:?}");
+        let pps = PicParameterSet::parse(
+            &units
+                .iter()
+                .find(|u| u.header.nal_unit_type == 34)
+                .expect("PPS")
+                .rbsp,
+        )
+        .expect("PPS parses");
+        assert_eq!((pps.pps_id, pps.sps_id), (7, 5), "{mode:?}");
+        let mut slices = 0;
+        for u in units.iter().filter(|u| u.header.is_vcl()) {
+            let h = SliceSegmentHeader::parse(&u.rbsp, u.header.nal_unit_type, &sps, &pps)
+                .unwrap_or_else(|e| panic!("{mode:?}: slice header: {e}"));
+            assert_eq!(h.slice_pic_parameter_set_id, 7, "{mode:?}");
+            slices += 1;
+        }
+        assert!(slices >= 2, "{mode:?}: both pictures' slices");
+        assert_eq!(
+            decode_annexb_sequence(&stream).expect("decodes").len(),
+            2,
+            "{mode:?}"
+        );
+    }
+    for (k, v) in [
+        ("vpsid", "16"),
+        ("spsid", "16"),
+        ("ppsid", "64"),
+        ("ppsid", "x"),
+    ] {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(64);
+        params.height = Some(48);
+        params.options.insert(k, v);
+        assert!(oxideav_h265::make_encoder(&params).is_err(), "{k}={v}");
+    }
+}

@@ -3848,7 +3848,7 @@ pub(crate) fn encode_intra_picture_tree(
     let mut w = BitWriter::new();
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.put_bit(0); // no_output_of_prior_pics_flag
-    w.ue(0); // slice_pic_parameter_set_id
+    w.ue(u32::from(cfg.ids.pps)); // slice_pic_parameter_set_id
     w.ue(2); // slice_type = I
     if lf.sao() {
         w.put_bit(u8::from(coded.sao_luma));

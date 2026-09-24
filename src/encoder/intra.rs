@@ -54,9 +54,7 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{
-    level_idc_for_dims, write_pps_full, write_ptl_cfg, write_vps, write_vps_cfg,
-};
+use crate::encoder::pcm::{level_idc_for_dims, write_pps_full, write_ptl_cfg, write_vps_cfg};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -152,6 +150,49 @@ pub struct IntraEncodedAu {
 
 /// The stream-level geometry / buffering knobs of the shared SPS
 /// (everything the intra, low-delay and hierarchical-B encoders vary
+/// §E.2.1 / §E.3.1 `video_signal_type` VUI declaration: the sample
+/// range and, optionally, the H.273 colour description a still or
+/// stream carries (an image reader such as the OS's takes the sample
+/// range from THIS field, not from the container).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoSignal {
+    /// `video_full_range_flag`: 1 = full-range samples (0..255 at
+    /// 8-bit), 0 = the limited 16..235 / 16..240 video range.
+    pub full_range: bool,
+    /// `colour_description_present_flag` block as `(colour_primaries,
+    /// transfer_characteristics, matrix_coeffs)` — H.273 code points
+    /// (2 = unspecified). `None` omits the block.
+    pub colour: Option<(u8, u8, u8)>,
+}
+
+/// The parameter-set ids a stream's VPS / SPS / PPS and slice headers
+/// carry (§7.4.2.1 `vps_video_parameter_set_id` 0..=15, §7.4.3.2.1
+/// `sps_seq_parameter_set_id` 0..=15, §7.4.3.3.1
+/// `pps_pic_parameter_set_id` 0..=63). A container holding sibling
+/// streams (a HEIF image and its alpha plane) can give each distinct
+/// parameter sets this way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParameterSetIds {
+    /// `vps_video_parameter_set_id` / `sps_video_parameter_set_id` (0..=15).
+    pub vps: u8,
+    /// `sps_seq_parameter_set_id` / `pps_seq_parameter_set_id` (0..=15).
+    pub sps: u8,
+    /// `pps_pic_parameter_set_id` / `slice_pic_parameter_set_id` (0..=63).
+    pub pps: u8,
+}
+
+impl ParameterSetIds {
+    /// Clamp to the legal ranges.
+    #[must_use]
+    pub fn new(vps: u8, sps: u8, pps: u8) -> Self {
+        Self {
+            vps: vps.min(15),
+            sps: sps.min(15),
+            pps: pps.min(63),
+        }
+    }
+}
+
 /// between them; the rest of the SPS is fixed 4:2:0 8-bit CTB-16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpsCfg {
@@ -211,6 +252,12 @@ pub(crate) struct SpsCfg {
     /// meaningful for a single-picture (all-IDR) stream; the caller
     /// must also set `max_dec_pic_buffering_minus1 == 0`.
     pub still: bool,
+    /// §E.2.1 `video_signal_type` VUI block (`None` omits it; with a
+    /// timing declaration absent too, no VUI is written at all).
+    pub video_signal: Option<VideoSignal>,
+    /// The VPS / SPS / PPS ids the parameter sets and slice headers
+    /// carry.
+    pub ids: ParameterSetIds,
 }
 
 impl SpsCfg {
@@ -230,6 +277,8 @@ impl SpsCfg {
             threads: 1,
             conformance_window: None,
             still: false,
+            video_signal: None,
+            ids: ParameterSetIds::default(),
         }
     }
 }
@@ -261,11 +310,11 @@ pub(crate) fn write_sps_cfg(
         "quadtree streams signal MinCbSizeY == 8"
     );
     let mut w = BitWriter::new();
-    w.put_bits(0, 4); // sps_video_parameter_set_id
+    w.put_bits(u32::from(cfg.ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
     write_ptl_cfg(&mut w, level_idc, cfg.still);
-    w.ue(0); // sps_seq_parameter_set_id
+    w.ue(u32::from(cfg.ids.sps)); // sps_seq_parameter_set_id
     w.ue(1); // chroma_format_idc = 4:2:0
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
@@ -312,38 +361,65 @@ pub(crate) fn write_sps_cfg(
     w.put_bit(0); // long_term_ref_pics_present_flag
     w.put_bit(u8::from(cfg.temporal_mvp)); // sps_temporal_mvp_enabled_flag
     w.put_bit(0); // strong_intra_smoothing_enabled_flag
-    match cfg.timing {
-        None => w.put_bit(0), // vui_parameters_present_flag
-        Some((num_units_in_tick, time_scale)) => {
-            // §E.2.1 vui_parameters( ) — everything off except the
-            // timing declaration.
-            w.put_bit(1); // vui_parameters_present_flag
-            w.put_bit(0); // aspect_ratio_info_present_flag
-            w.put_bit(0); // overscan_info_present_flag
-            w.put_bit(0); // video_signal_type_present_flag
-            w.put_bit(0); // chroma_loc_info_present_flag
-            w.put_bit(0); // neutral_chroma_indication_flag
-            w.put_bit(0); // field_seq_flag
-            w.put_bit(0); // frame_field_info_present_flag
-            w.put_bit(0); // default_display_window_flag
-            w.put_bit(1); // vui_timing_info_present_flag
-            w.put_bits(num_units_in_tick, 32); // vui_num_units_in_tick
-            w.put_bits(time_scale, 32); // vui_time_scale
-            w.put_bit(0); // vui_poc_proportional_to_timing_flag
-            match &cfg.hrd {
-                None => w.put_bit(0), // vui_hrd_parameters_present_flag
-                Some(hrd) => {
-                    w.put_bit(1); // vui_hrd_parameters_present_flag
-                                  // §E.2.2 hrd_parameters( 1, 0 ).
-                    crate::encoder::hrd::write_hrd_parameters(&mut w, hrd);
+    if cfg.timing.is_none() && cfg.video_signal.is_none() {
+        w.put_bit(0); // vui_parameters_present_flag
+    } else {
+        // §E.2.1 vui_parameters( ) — everything off except the
+        // video-signal and / or timing declarations.
+        w.put_bit(1); // vui_parameters_present_flag
+        w.put_bit(0); // aspect_ratio_info_present_flag
+        w.put_bit(0); // overscan_info_present_flag
+        write_video_signal_type(&mut w, cfg.video_signal.as_ref());
+        w.put_bit(0); // chroma_loc_info_present_flag
+        w.put_bit(0); // neutral_chroma_indication_flag
+        w.put_bit(0); // field_seq_flag
+        w.put_bit(0); // frame_field_info_present_flag
+        w.put_bit(0); // default_display_window_flag
+        match cfg.timing {
+            None => w.put_bit(0), // vui_timing_info_present_flag
+            Some((num_units_in_tick, time_scale)) => {
+                w.put_bit(1); // vui_timing_info_present_flag
+                w.put_bits(num_units_in_tick, 32); // vui_num_units_in_tick
+                w.put_bits(time_scale, 32); // vui_time_scale
+                w.put_bit(0); // vui_poc_proportional_to_timing_flag
+                match &cfg.hrd {
+                    None => w.put_bit(0), // vui_hrd_parameters_present_flag
+                    Some(hrd) => {
+                        w.put_bit(1); // vui_hrd_parameters_present_flag
+                                      // §E.2.2 hrd_parameters( 1, 0 ).
+                        crate::encoder::hrd::write_hrd_parameters(&mut w, hrd);
+                    }
                 }
             }
-            w.put_bit(0); // bitstream_restriction_flag
         }
+        w.put_bit(0); // bitstream_restriction_flag
     }
     w.put_bit(0); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.finish()
+}
+
+/// §E.2.1 — the `video_signal_type_present_flag` group of
+/// `vui_parameters( )`: `video_format` 5 (unspecified, Table E.2),
+/// the range flag and the optional H.273 colour description.
+pub(crate) fn write_video_signal_type(w: &mut BitWriter, vs: Option<&VideoSignal>) {
+    match vs {
+        None => w.put_bit(0), // video_signal_type_present_flag
+        Some(vs) => {
+            w.put_bit(1); // video_signal_type_present_flag
+            w.put_bits(5, 3); // video_format = 5 (unspecified)
+            w.put_bit(u8::from(vs.full_range)); // video_full_range_flag
+            match vs.colour {
+                None => w.put_bit(0), // colour_description_present_flag
+                Some((primaries, transfer, matrix)) => {
+                    w.put_bit(1); // colour_description_present_flag
+                    w.put_bits(u32::from(primaries), 8); // colour_primaries
+                    w.put_bits(u32::from(transfer), 8); // transfer_characteristics
+                    w.put_bits(u32::from(matrix), 8); // matrix_coeffs
+                }
+            }
+        }
+    }
 }
 
 /// §7.3.8.14 / §9.3.3.10 — encode one `cu_qp_delta` (`CuQpDeltaVal ==
@@ -1054,7 +1130,7 @@ pub(crate) fn encode_idr_intra_au_full(
     let mut w = BitWriter::new();
     w.put_bit(1); // first_slice_segment_in_pic_flag
     w.put_bit(0); // no_output_of_prior_pics_flag (IRAP NAL)
-    w.ue(0); // slice_pic_parameter_set_id
+    w.ue(u32::from(cfg.ids.pps)); // slice_pic_parameter_set_id
     w.ue(2); // slice_type = I
     if lf.sao() {
         // SPS SAO enabled: the per-slice component gates are present.
@@ -1414,15 +1490,16 @@ pub(crate) fn assemble_idr_au(
     // (hierarchical-B) stream signals its honest DPB bounds, a still
     // its one-picture DPB and profile.
     let vps = if cfg.still {
-        write_vps_cfg(level_idc, 0, 0, true)
+        write_vps_cfg(level_idc, 0, 0, true, cfg.ids.vps)
     } else if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
-        write_vps(level_idc)
+        write_vps_cfg(level_idc, 1, 0, false, cfg.ids.vps)
     } else {
         write_vps_cfg(
             level_idc,
             cfg.max_dec_pic_buffering_minus1,
             cfg.max_num_reorder_pics,
             false,
+            cfg.ids.vps,
         )
     };
     let units = vec![
@@ -1446,6 +1523,7 @@ pub(crate) fn assemble_idr_au(
                 cfg.tree.is_some_and(|t| t.sign_hiding),
                 cfg.tree.is_some_and(|t| t.weighted_pred),
                 cfg.tree.is_some_and(|t| t.wpp),
+                cfg.ids,
             ),
         ), // PPS_NUT
         nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP

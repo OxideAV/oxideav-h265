@@ -190,6 +190,16 @@ use oxideav_core::{
 /// image items carry (each access unit is already a self-contained
 /// `VPS + SPS + PPS + IDR` single-picture CVS in those modes).
 ///
+/// The `range` option (`"full"` / `"limited"`) and the H.273 code
+/// points `colorprim` / `transfer` / `matrix` (0..=255; any given one
+/// enables the colour description, the others defaulting to 2 =
+/// unspecified) write the §E.2.1 `video_signal_type` block into the
+/// SPS VUI — an image reader takes the sample range from there, so a
+/// full-range still MUST say so. `vpsid` / `spsid` / `ppsid` (0..=15 /
+/// 0..=15 / 0..=63) set the parameter-set ids, letting a container
+/// give sibling streams (an image and its alpha plane) distinct
+/// parameter sets. All default off / 0 (byte-stable).
+///
 /// 4:2:0 8-bit input of ANY nonzero size: the coded picture is the
 /// size rounded up to a multiple of 16 (edge-replicated padding) and
 /// a §7.4.3.2.1 conformance window crops it back — to the even
@@ -216,6 +226,10 @@ pub struct H265Encoder {
     /// The `still` option: Main Still Picture profile signalling on
     /// every (single-picture) access unit.
     still: bool,
+    /// The `range` / `colorprim` / `transfer` / `matrix` options.
+    video_signal: Option<intra::VideoSignal>,
+    /// The `vpsid` / `spsid` / `ppsid` options.
+    ids: intra::ParameterSetIds,
     mode: EncodeMode,
     ready: VecDeque<Packet>,
     frame_index: i64,
@@ -563,6 +577,52 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ));
     }
     // ABR configuration when `bitrate` is set: an explicit `qp`
+    // `range` (`full` / `limited`) + `colorprim` / `transfer` /
+    // `matrix` (H.273 code points 0..=255) — the §E.2.1
+    // video_signal_type VUI block; missing colour code points default
+    // to 2 (unspecified) when any is given.
+    let video_signal = {
+        let range = match params.options.get("range") {
+            None => None,
+            Some("full") | Some("pc") => Some(true),
+            Some("limited") | Some("tv") => Some(false),
+            Some(v) => {
+                return Err(Error::InvalidData(format!(
+                    "h265 encode: range must be \"full\" or \"limited\", got {v:?}"
+                )))
+            }
+        };
+        let code = |key: &str| -> Result<Option<u8>> {
+            match params.options.get(key) {
+                None => Ok(None),
+                Some(v) => v.parse::<u8>().map(Some).map_err(|_| {
+                    Error::InvalidData(format!(
+                        "h265 encode: {key} must be an H.273 code point 0..=255, got {v:?}"
+                    ))
+                }),
+            }
+        };
+        let (cp, tc, mc) = (code("colorprim")?, code("transfer")?, code("matrix")?);
+        let colour = (cp.is_some() || tc.is_some() || mc.is_some())
+            .then(|| (cp.unwrap_or(2), tc.unwrap_or(2), mc.unwrap_or(2)));
+        (range.is_some() || colour.is_some()).then(|| intra::VideoSignal {
+            full_range: range.unwrap_or(false),
+            colour,
+        })
+    };
+    // `vpsid` / `spsid` / `ppsid` — the parameter-set ids (0..=15 /
+    // 0..=15 / 0..=63).
+    let ids = {
+        let id = |key: &str, max: u8| -> Result<u8> {
+            match params.options.get(key) {
+                None => Ok(0),
+                Some(v) => v.parse::<u8>().ok().filter(|i| *i <= max).ok_or_else(|| {
+                    Error::InvalidData(format!("h265 encode: {key} must be 0..={max}, got {v:?}"))
+                }),
+            }
+        };
+        intra::ParameterSetIds::new(id("vpsid", 15)?, id("spsid", 15)?, id("ppsid", 63)?)
+    };
     // `still` — Annex A.3.4 Main Still Picture signalling; every
     // access unit of the two intra modes is a self-contained
     // single-picture CVS, which is exactly what the profile
@@ -711,6 +771,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some((r, b)) = crop {
                     enc = enc.with_conformance_window(r, b);
                 }
+                if let Some(vs) = video_signal {
+                    enc = enc.with_video_signal(vs);
+                }
+                enc = enc.with_parameter_set_ids(ids);
                 let delay = i64::from(enc.reorder_delay());
                 EncodeMode::Pyramid {
                     enc,
@@ -751,6 +815,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 if let Some((r, b)) = crop {
                     enc = enc.with_conformance_window(r, b);
                 }
+                if let Some(vs) = video_signal {
+                    enc = enc.with_video_signal(vs);
+                }
+                enc = enc.with_parameter_set_ids(ids);
                 EncodeMode::Inter(enc)
             }
         }
@@ -774,6 +842,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         coded_height,
         crop,
         still,
+        video_signal,
+        ids,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
@@ -845,6 +915,8 @@ impl Encoder for H265Encoder {
                     pcm::PcmAuOptions {
                         conformance_window: self.crop,
                         still: self.still,
+                        video_signal: self.video_signal,
+                        ids: self.ids,
                         ..pcm::PcmAuOptions::default()
                     },
                 )
@@ -879,6 +951,8 @@ impl Encoder for H265Encoder {
                     threads: self.threads,
                     conformance_window: self.crop,
                     still: self.still,
+                    video_signal: self.video_signal,
+                    ids: self.ids,
                     ..intra::SpsCfg::legacy(u32::from(!self.still))
                 };
                 // The HRD SEI prefix: every frame is an IRAP access

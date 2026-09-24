@@ -221,6 +221,10 @@ pub struct PyramidEncoder {
     /// §7.4.3.2.1 conformance cropping window `(right, bottom)` in
     /// chroma units, `None` = whole picture ([`Self::with_conformance_window`]).
     conformance_window: Option<(u32, u32)>,
+    /// §E.2.1 video-signal VUI block ([`Self::with_video_signal`]).
+    video_signal: Option<crate::encoder::intra::VideoSignal>,
+    /// Parameter-set ids ([`Self::with_parameter_set_ids`]).
+    ids: crate::encoder::intra::ParameterSetIds,
     /// Running mean absolute inter-frame luma difference (Q4) of the
     /// non-cut frame pairs seen so far — the scene-cut baseline.
     mad_avg_q4: Option<u64>,
@@ -277,6 +281,8 @@ impl PyramidEncoder {
             ctu_rc: false,
             threads: 1,
             conformance_window: None,
+            video_signal: None,
+            ids: crate::encoder::intra::ParameterSetIds::default(),
         })
     }
 
@@ -304,6 +310,22 @@ impl PyramidEncoder {
     #[must_use]
     pub fn with_conformance_window(mut self, right: u32, bottom: u32) -> Self {
         self.conformance_window = Some((right, bottom));
+        self
+    }
+
+    /// Declare the §E.2.1 `video_signal_type` VUI block (sample range
+    /// + optional H.273 colour description) in the SPS.
+    #[must_use]
+    pub fn with_video_signal(mut self, vs: crate::encoder::intra::VideoSignal) -> Self {
+        self.video_signal = Some(vs);
+        self
+    }
+
+    /// The VPS / SPS / PPS ids the stream's parameter sets and slice
+    /// headers carry.
+    #[must_use]
+    pub fn with_parameter_set_ids(mut self, ids: crate::encoder::intra::ParameterSetIds) -> Self {
+        self.ids = ids;
         self
     }
 
@@ -570,6 +592,8 @@ impl PyramidEncoder {
             threads: self.threads,
             conformance_window: self.conformance_window,
             still: false,
+            video_signal: self.video_signal,
+            ids: self.ids,
         }
     }
 
@@ -859,6 +883,7 @@ impl PyramidEncoder {
             l1,
             lf: &self.filters,
             big_cu: self.amp,
+            pps_id: self.ids.pps,
             aq: self.aq,
             tree: self.tree,
             tmvp: TmvpSpec {
