@@ -278,9 +278,7 @@ impl PpsExtensionFlags {
     /// in the bit stream. When a multilayer / 3D body precedes it, the
     /// SCC body stays inside the opaque tail.
     fn scc_decodable_in_place(&self) -> bool {
-        self.pps_scc_extension_flag
-            && !self.pps_multilayer_extension_flag
-            && !self.pps_3d_extension_flag
+        self.pps_scc_extension_flag && !self.pps_3d_extension_flag
     }
 
     /// True when an extension body still follows the (range + optionally
@@ -288,15 +286,407 @@ impl PpsExtensionFlags {
     /// `pps_extension_data_flag` while-loop, or an SCC body whose
     /// multilayer / 3D predecessor kept it opaque.
     fn has_opaque_body_after_decoded(&self) -> bool {
-        if self.pps_multilayer_extension_flag || self.pps_3d_extension_flag {
-            // The first un-decoded body is the multilayer / 3D one;
-            // everything from there (incl. any SCC body) is opaque.
+        if self.pps_3d_extension_flag {
+            // The first un-decoded body is the 3D one; everything from
+            // there (incl. any SCC body) is opaque.
             return true;
         }
-        // No multilayer / 3D body: SCC (if present) was decoded in
-        // place, so only the pps_extension_data_flag while-loop may
-        // remain.
+        // No 3D body: range / multilayer / SCC (if present) were
+        // decoded in place, so only the pps_extension_data_flag
+        // while-loop may remain.
         self.pps_extension_4bits != 0
+    }
+}
+
+/// One `ref_loc_offset_layer_id[ i ]` entry of
+/// `pps_multilayer_extension( )` (F.7.3.2.3.4): the scaled reference
+/// layer offsets, reference region offsets and resampling phase set the
+/// H.8.1.4 inter-layer reference derivation reads. Absent offsets are 0
+/// (F.7.4.3.3.4); an absent phase set leaves the luma phases 0, the
+/// horizontal chroma phase `+8` and the vertical chroma phase inferred
+/// at decode time from the scaling ratio (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefLocOffset {
+    /// `ref_loc_offset_layer_id[ i ]` (`u(6)`).
+    pub ref_loc_offset_layer_id: u8,
+    /// `scaled_ref_layer_offset_present_flag[ i ]`.
+    pub scaled_ref_layer_offset_present_flag: bool,
+    /// `scaled_ref_layer_left_offset` (units of `SubWidthC` luma samples).
+    pub scaled_ref_layer_left_offset: i32,
+    /// `scaled_ref_layer_top_offset`.
+    pub scaled_ref_layer_top_offset: i32,
+    /// `scaled_ref_layer_right_offset`.
+    pub scaled_ref_layer_right_offset: i32,
+    /// `scaled_ref_layer_bottom_offset`.
+    pub scaled_ref_layer_bottom_offset: i32,
+    /// `ref_region_offset_present_flag[ i ]`.
+    pub ref_region_offset_present_flag: bool,
+    /// `ref_region_left_offset`.
+    pub ref_region_left_offset: i32,
+    /// `ref_region_top_offset`.
+    pub ref_region_top_offset: i32,
+    /// `ref_region_right_offset`.
+    pub ref_region_right_offset: i32,
+    /// `ref_region_bottom_offset`.
+    pub ref_region_bottom_offset: i32,
+    /// `resample_phase_set_present_flag[ i ]`.
+    pub resample_phase_set_present_flag: bool,
+    /// `phase_hor_luma` (0..=31; 0 when absent).
+    pub phase_hor_luma: u8,
+    /// `phase_ver_luma` (0..=31; 0 when absent).
+    pub phase_ver_luma: u8,
+    /// `phase_hor_chroma_plus8` (0..=63; 8 when absent).
+    pub phase_hor_chroma_plus8: u8,
+    /// `phase_ver_chroma_plus8` (0..=63); `None` when absent — inferred
+    /// per F.7.4.3.3.4 from the reference / scaled region heights (8 for
+    /// 4:4:4) by the H.8.1.4.1 derivation.
+    pub phase_ver_chroma_plus8: Option<u8>,
+}
+
+/// One leaf octant of `colour_mapping_octants( )` (F.7.3.2.3.6): the
+/// four `coded_res_flag` / residual triples of one
+/// `( idxShiftY, idxCb, idxCr )` cell, with the F-50 combined residual
+/// `( ( res_coeff_q << CMResLSBits ) + res_coeff_r ) << cm_res_quant_bits`
+/// signed by `res_coeff_s` already applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CmOctantCell {
+    /// `idxShiftY` of the cell.
+    pub idx_y: u8,
+    /// `idxCb`.
+    pub idx_cb: u8,
+    /// `idxCr`.
+    pub idx_cr: u8,
+    /// `coded_res_flag[ .. ][ j ]` for `j = 0..4`.
+    pub coded_res_flag: [bool; 4],
+    /// The signed residual per `j` (0..4) and colour component `c`
+    /// (0..3), 0 when not coded.
+    pub res: [[i32; 3]; 4],
+}
+
+/// The `( inpDepth, idxY, idxCb, idxCr, inpLength )` arguments of one
+/// `colour_mapping_octants( )` invocation.
+#[derive(Debug, Clone, Copy)]
+struct OctantCursor {
+    inp_depth: u8,
+    idx_y: u32,
+    idx_cb: u32,
+    idx_cr: u32,
+    inp_length: u32,
+}
+
+/// Decoded `colour_mapping_table( )` (F.7.3.2.3.5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ColourMappingTable {
+    /// `cm_ref_layer_id[ i ]` for `i = 0..=num_cm_ref_layers_minus1`.
+    pub cm_ref_layer_id: Vec<u8>,
+    /// `cm_octant_depth` (`u(2)`).
+    pub cm_octant_depth: u8,
+    /// `cm_y_part_num_log2` (`u(2)`).
+    pub cm_y_part_num_log2: u8,
+    /// `luma_bit_depth_cm_input_minus8`.
+    pub luma_bit_depth_cm_input_minus8: u32,
+    /// `chroma_bit_depth_cm_input_minus8`.
+    pub chroma_bit_depth_cm_input_minus8: u32,
+    /// `luma_bit_depth_cm_output_minus8`.
+    pub luma_bit_depth_cm_output_minus8: u32,
+    /// `chroma_bit_depth_cm_output_minus8`.
+    pub chroma_bit_depth_cm_output_minus8: u32,
+    /// `cm_res_quant_bits` (`u(2)`).
+    pub cm_res_quant_bits: u8,
+    /// `cm_delta_flc_bits_minus1` (`u(2)`).
+    pub cm_delta_flc_bits_minus1: u8,
+    /// `cm_adapt_threshold_u_delta` (0 when absent).
+    pub cm_adapt_threshold_u_delta: i32,
+    /// `cm_adapt_threshold_v_delta` (0 when absent).
+    pub cm_adapt_threshold_v_delta: i32,
+    /// Every leaf cell in `colour_mapping_octants( )` recursion order.
+    pub cells: Vec<CmOctantCell>,
+}
+
+impl ColourMappingTable {
+    /// `CMResLSBits` (F.7.4.3.3.5).
+    #[must_use]
+    pub fn cm_res_ls_bits(&self) -> u8 {
+        let v = 10i64 + i64::from(self.luma_bit_depth_cm_input_minus8)
+            - i64::from(self.luma_bit_depth_cm_output_minus8)
+            - i64::from(self.cm_res_quant_bits)
+            - (i64::from(self.cm_delta_flc_bits_minus1) + 1);
+        v.clamp(0, 32) as u8
+    }
+
+    fn parse(br: &mut BitReader<'_>) -> Result<Self, PpsError> {
+        let num_cm_ref_layers_minus1 = br.ue()?;
+        if num_cm_ref_layers_minus1 > 61 {
+            return Err(PpsError::ValueOutOfRange {
+                field: "num_cm_ref_layers_minus1",
+                got: i64::from(num_cm_ref_layers_minus1),
+            });
+        }
+        let mut cm_ref_layer_id = Vec::with_capacity(num_cm_ref_layers_minus1 as usize + 1);
+        for _ in 0..=num_cm_ref_layers_minus1 {
+            cm_ref_layer_id.push(br.u(6)? as u8);
+        }
+        let cm_octant_depth = br.u(2)? as u8;
+        let cm_y_part_num_log2 = br.u(2)? as u8;
+        // F.7.4.3.3.5: cm_y_part_num_log2 + cm_octant_depth in 0..=3.
+        if cm_octant_depth + cm_y_part_num_log2 > 3 {
+            return Err(PpsError::ValueOutOfRange {
+                field: "cm_y_part_num_log2",
+                got: i64::from(cm_y_part_num_log2),
+            });
+        }
+        let luma_bit_depth_cm_input_minus8 = br.ue()?;
+        let chroma_bit_depth_cm_input_minus8 = br.ue()?;
+        let luma_bit_depth_cm_output_minus8 = br.ue()?;
+        let chroma_bit_depth_cm_output_minus8 = br.ue()?;
+        for (name, v) in [
+            (
+                "luma_bit_depth_cm_input_minus8",
+                luma_bit_depth_cm_input_minus8,
+            ),
+            (
+                "chroma_bit_depth_cm_input_minus8",
+                chroma_bit_depth_cm_input_minus8,
+            ),
+            (
+                "luma_bit_depth_cm_output_minus8",
+                luma_bit_depth_cm_output_minus8,
+            ),
+            (
+                "chroma_bit_depth_cm_output_minus8",
+                chroma_bit_depth_cm_output_minus8,
+            ),
+        ] {
+            if v > 8 {
+                return Err(PpsError::ValueOutOfRange {
+                    field: name,
+                    got: i64::from(v),
+                });
+            }
+        }
+        let cm_res_quant_bits = br.u(2)? as u8;
+        let cm_delta_flc_bits_minus1 = br.u(2)? as u8;
+        let (cm_adapt_threshold_u_delta, cm_adapt_threshold_v_delta) = if cm_octant_depth == 1 {
+            (br.se()?, br.se()?)
+        } else {
+            (0, 0)
+        };
+        let mut table = Self {
+            cm_ref_layer_id,
+            cm_octant_depth,
+            cm_y_part_num_log2,
+            luma_bit_depth_cm_input_minus8,
+            chroma_bit_depth_cm_input_minus8,
+            luma_bit_depth_cm_output_minus8,
+            chroma_bit_depth_cm_output_minus8,
+            cm_res_quant_bits,
+            cm_delta_flc_bits_minus1,
+            cm_adapt_threshold_u_delta,
+            cm_adapt_threshold_v_delta,
+            cells: Vec::new(),
+        };
+        let ls_bits = table.cm_res_ls_bits();
+        let root = OctantCursor {
+            inp_depth: 0,
+            idx_y: 0,
+            idx_cb: 0,
+            idx_cr: 0,
+            inp_length: 1u32 << cm_octant_depth,
+        };
+        table.parse_octants(br, ls_bits, root)?;
+        Ok(table)
+    }
+
+    /// `colour_mapping_octants( inpDepth, idxY, idxCb, idxCr, inpLength )`
+    /// (F.7.3.2.3.6). Recursion depth is bounded by `cm_octant_depth`
+    /// (<= 3) and the cell count by `8^depth * PartNumY` (<= 512 * 8).
+    fn parse_octants(
+        &mut self,
+        br: &mut BitReader<'_>,
+        ls_bits: u8,
+        cur: OctantCursor,
+    ) -> Result<(), PpsError> {
+        let OctantCursor {
+            inp_depth,
+            idx_y,
+            idx_cb,
+            idx_cr,
+            inp_length,
+        } = cur;
+        let part_num_y = 1u32 << self.cm_y_part_num_log2;
+        let split_octant_flag = if inp_depth < self.cm_octant_depth {
+            br.u1()? != 0
+        } else {
+            false
+        };
+        if split_octant_flag {
+            let half = inp_length / 2;
+            for k in 0..2 {
+                for m in 0..2 {
+                    for n in 0..2 {
+                        self.parse_octants(
+                            br,
+                            ls_bits,
+                            OctantCursor {
+                                inp_depth: inp_depth + 1,
+                                idx_y: idx_y + part_num_y * k * half,
+                                idx_cb: idx_cb + m * half,
+                                idx_cr: idx_cr + n * half,
+                                inp_length: half,
+                            },
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for i in 0..part_num_y {
+            let idx_shift_y = idx_y + (i << (self.cm_octant_depth - inp_depth));
+            let mut cell = CmOctantCell {
+                idx_y: idx_shift_y as u8,
+                idx_cb: idx_cb as u8,
+                idx_cr: idx_cr as u8,
+                ..CmOctantCell::default()
+            };
+            for j in 0..4 {
+                cell.coded_res_flag[j] = br.u1()? != 0;
+                if cell.coded_res_flag[j] {
+                    for c in 0..3 {
+                        let q = br.ue()?;
+                        if q > 1 << 16 {
+                            return Err(PpsError::ValueOutOfRange {
+                                field: "res_coeff_q",
+                                got: i64::from(q),
+                            });
+                        }
+                        let r = if ls_bits > 0 { br.u(ls_bits)? } else { 0 };
+                        let s = if q != 0 || r != 0 {
+                            br.u1()? != 0
+                        } else {
+                            false
+                        };
+                        let mag =
+                            ((i64::from(q) << ls_bits) + i64::from(r)) << self.cm_res_quant_bits;
+                        cell.res[j][c] = (if s { -mag } else { mag }) as i32;
+                    }
+                }
+            }
+            self.cells.push(cell);
+        }
+        Ok(())
+    }
+}
+
+/// Decoded `pps_multilayer_extension( )` body (F.7.3.2.3.4), present
+/// when [`PpsExtensionFlags::pps_multilayer_extension_flag`] is set.
+/// Per F.7.4.3.3.4 every field is inferred to 0 / absent when the body
+/// is not signalled.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PpsMultilayerExtension {
+    /// `poc_reset_info_present_flag`.
+    pub poc_reset_info_present_flag: bool,
+    /// `pps_infer_scaling_list_flag`.
+    pub pps_infer_scaling_list_flag: bool,
+    /// `pps_scaling_list_ref_layer_id` (`u(6)`; 0 when absent).
+    pub pps_scaling_list_ref_layer_id: u8,
+    /// The `num_ref_loc_offsets` entries.
+    pub ref_loc_offsets: Vec<RefLocOffset>,
+    /// `colour_mapping_enabled_flag`.
+    pub colour_mapping_enabled_flag: bool,
+    /// The `colour_mapping_table( )` when enabled.
+    pub colour_mapping_table: Option<ColourMappingTable>,
+}
+
+impl PpsMultilayerExtension {
+    /// The reference layer location offsets signalled for
+    /// `ref_loc_offset_layer_id == nuh_layer_id`, if any.
+    #[must_use]
+    pub fn ref_loc_offset_for(&self, nuh_layer_id: u8) -> Option<&RefLocOffset> {
+        self.ref_loc_offsets
+            .iter()
+            .find(|o| o.ref_loc_offset_layer_id == nuh_layer_id)
+    }
+
+    fn parse(br: &mut BitReader<'_>) -> Result<Self, PpsError> {
+        let poc_reset_info_present_flag = br.u1()? != 0;
+        let pps_infer_scaling_list_flag = br.u1()? != 0;
+        let pps_scaling_list_ref_layer_id = if pps_infer_scaling_list_flag {
+            br.u(6)? as u8
+        } else {
+            0
+        };
+        let num_ref_loc_offsets = br.ue()?;
+        // F.7.4.3.3.4: 0 .. vps_max_layers_minus1 (<= 62).
+        if num_ref_loc_offsets > 62 {
+            return Err(PpsError::ValueOutOfRange {
+                field: "num_ref_loc_offsets",
+                got: i64::from(num_ref_loc_offsets),
+            });
+        }
+        let bound = |name: &'static str, v: i32| -> Result<i32, PpsError> {
+            if !(-(1 << 14)..(1 << 14)).contains(&v) {
+                return Err(PpsError::ValueOutOfRange {
+                    field: name,
+                    got: i64::from(v),
+                });
+            }
+            Ok(v)
+        };
+        let mut ref_loc_offsets = Vec::with_capacity(num_ref_loc_offsets as usize);
+        for _ in 0..num_ref_loc_offsets {
+            let mut o = RefLocOffset {
+                ref_loc_offset_layer_id: br.u(6)? as u8,
+                phase_hor_chroma_plus8: 8,
+                ..RefLocOffset::default()
+            };
+            o.scaled_ref_layer_offset_present_flag = br.u1()? != 0;
+            if o.scaled_ref_layer_offset_present_flag {
+                o.scaled_ref_layer_left_offset = bound("scaled_ref_layer_left_offset", br.se()?)?;
+                o.scaled_ref_layer_top_offset = bound("scaled_ref_layer_top_offset", br.se()?)?;
+                o.scaled_ref_layer_right_offset = bound("scaled_ref_layer_right_offset", br.se()?)?;
+                o.scaled_ref_layer_bottom_offset =
+                    bound("scaled_ref_layer_bottom_offset", br.se()?)?;
+            }
+            o.ref_region_offset_present_flag = br.u1()? != 0;
+            if o.ref_region_offset_present_flag {
+                o.ref_region_left_offset = bound("ref_region_left_offset", br.se()?)?;
+                o.ref_region_top_offset = bound("ref_region_top_offset", br.se()?)?;
+                o.ref_region_right_offset = bound("ref_region_right_offset", br.se()?)?;
+                o.ref_region_bottom_offset = bound("ref_region_bottom_offset", br.se()?)?;
+            }
+            o.resample_phase_set_present_flag = br.u1()? != 0;
+            if o.resample_phase_set_present_flag {
+                let ph = |br: &mut BitReader<'_>, name: &'static str, max: u32| {
+                    let v = br.ue()?;
+                    if v > max {
+                        return Err(PpsError::ValueOutOfRange {
+                            field: name,
+                            got: i64::from(v),
+                        });
+                    }
+                    Ok(v as u8)
+                };
+                o.phase_hor_luma = ph(br, "phase_hor_luma", 31)?;
+                o.phase_ver_luma = ph(br, "phase_ver_luma", 31)?;
+                o.phase_hor_chroma_plus8 = ph(br, "phase_hor_chroma_plus8", 63)?;
+                o.phase_ver_chroma_plus8 = Some(ph(br, "phase_ver_chroma_plus8", 63)?);
+            }
+            ref_loc_offsets.push(o);
+        }
+        let colour_mapping_enabled_flag = br.u1()? != 0;
+        let colour_mapping_table = if colour_mapping_enabled_flag {
+            Some(ColourMappingTable::parse(br)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            poc_reset_info_present_flag,
+            pps_infer_scaling_list_flag,
+            pps_scaling_list_ref_layer_id,
+            ref_loc_offsets,
+            colour_mapping_enabled_flag,
+            colour_mapping_table,
+        })
     }
 }
 
@@ -698,6 +1088,11 @@ pub struct PicParameterSet {
     /// otherwise; per §7.4.3.3.2 every field is then inferred to 0 /
     /// empty.
     pub pps_range_extension: Option<PpsRangeExtension>,
+    /// Decoded `pps_multilayer_extension()` body (F.7.3.2.3.4), present
+    /// when `extension_flags.pps_multilayer_extension_flag` is set.
+    /// `None` otherwise; per F.7.4.3.3.4 every field is then inferred
+    /// to 0 / absent.
+    pub pps_multilayer_extension: Option<PpsMultilayerExtension>,
     /// Decoded `pps_scc_extension()` body (§7.3.2.3.3), present when
     /// `extension_flags.pps_scc_extension_flag` is set **and** no opaque
     /// multilayer / 3D body precedes it. `None` otherwise; per
@@ -924,59 +1319,71 @@ impl PicParameterSet {
         let slice_segment_header_extension_present_flag = br.u1()? != 0;
 
         let pps_extension_present_flag = br.u1()? != 0;
-        let (extension_flags, pps_range_extension, pps_scc_extension, opaque_tail) =
-            if pps_extension_present_flag {
-                // §7.3.2.3.1: when the gate is open, decode the eight bits
-                // of typed extension flags first.
-                let pps_range_extension_flag = br.u1()? != 0;
-                let pps_multilayer_extension_flag = br.u1()? != 0;
-                let pps_3d_extension_flag = br.u1()? != 0;
-                let pps_scc_extension_flag = br.u1()? != 0;
-                let pps_extension_4bits = br.u(4)? as u8;
-                let flags = PpsExtensionFlags {
-                    pps_range_extension_flag,
-                    pps_multilayer_extension_flag,
-                    pps_3d_extension_flag,
-                    pps_scc_extension_flag,
-                    pps_extension_4bits,
-                };
-                // §7.3.2.3.1: the range extension (if signalled) is the
-                // first body to follow the eight typed flag bits, so decode
-                // it in full. Its leading
-                // log2_max_transform_skip_block_size_minus2 is present only
-                // when transform_skip_enabled_flag was set in the general
-                // body.
-                let range_ext = if flags.pps_range_extension_flag {
-                    Some(PpsRangeExtension::parse(br, transform_skip_enabled_flag)?)
-                } else {
-                    None
-                };
-                // §7.3.2.3.1 body order is range, multilayer, 3d, scc. The
-                // SCC body can be decoded in place only when no
-                // (still-opaque) multilayer / 3D body precedes it;
-                // otherwise it stays inside the opaque tail.
-                let scc_ext = if flags.scc_decodable_in_place() {
-                    Some(PpsSccExtension::parse(br)?)
-                } else {
-                    None
-                };
-                // If any still-opaque body (a multilayer / 3D body, an SCC
-                // body kept opaque by such a predecessor, or the
-                // pps_extension_data_flag while-loop) follows, capture the
-                // rest of the RBSP as an opaque tail starting at the first
-                // un-decoded body's bit position. Otherwise only
-                // rbsp_trailing_bits remains, consumed implicitly.
-                let tail = if flags.has_opaque_body_after_decoded() {
-                    Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
-                } else {
-                    None
-                };
-                (Some(flags), range_ext, scc_ext, tail)
-            } else {
-                // §7.4.3.3.1: every extension flag inferred to 0; only
-                // rbsp_trailing_bits remains, consumed implicitly.
-                (None, None, None, None)
+        let (
+            extension_flags,
+            pps_range_extension,
+            pps_multilayer_extension,
+            pps_scc_extension,
+            opaque_tail,
+        ) = if pps_extension_present_flag {
+            // §7.3.2.3.1: when the gate is open, decode the eight bits
+            // of typed extension flags first.
+            let pps_range_extension_flag = br.u1()? != 0;
+            let pps_multilayer_extension_flag = br.u1()? != 0;
+            let pps_3d_extension_flag = br.u1()? != 0;
+            let pps_scc_extension_flag = br.u1()? != 0;
+            let pps_extension_4bits = br.u(4)? as u8;
+            let flags = PpsExtensionFlags {
+                pps_range_extension_flag,
+                pps_multilayer_extension_flag,
+                pps_3d_extension_flag,
+                pps_scc_extension_flag,
+                pps_extension_4bits,
             };
+            // §7.3.2.3.1: the range extension (if signalled) is the
+            // first body to follow the eight typed flag bits, so decode
+            // it in full. Its leading
+            // log2_max_transform_skip_block_size_minus2 is present only
+            // when transform_skip_enabled_flag was set in the general
+            // body.
+            let range_ext = if flags.pps_range_extension_flag {
+                Some(PpsRangeExtension::parse(br, transform_skip_enabled_flag)?)
+            } else {
+                None
+            };
+            // F.7.3.2.3.4: the multilayer body follows the range
+            // extension and is decoded in place.
+            let multilayer_ext = if flags.pps_multilayer_extension_flag {
+                Some(PpsMultilayerExtension::parse(br)?)
+            } else {
+                None
+            };
+            // §7.3.2.3.1 body order is range, multilayer, 3d, scc. The
+            // SCC body can be decoded in place only when no
+            // (still-opaque) 3D body precedes it; otherwise it stays
+            // inside the opaque tail.
+            let scc_ext = if flags.scc_decodable_in_place() {
+                Some(PpsSccExtension::parse(br)?)
+            } else {
+                None
+            };
+            // If any still-opaque body (a multilayer / 3D body, an SCC
+            // body kept opaque by such a predecessor, or the
+            // pps_extension_data_flag while-loop) follows, capture the
+            // rest of the RBSP as an opaque tail starting at the first
+            // un-decoded body's bit position. Otherwise only
+            // rbsp_trailing_bits remains, consumed implicitly.
+            let tail = if flags.has_opaque_body_after_decoded() {
+                Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
+            } else {
+                None
+            };
+            (Some(flags), range_ext, multilayer_ext, scc_ext, tail)
+        } else {
+            // §7.4.3.3.1: every extension flag inferred to 0; only
+            // rbsp_trailing_bits remains, consumed implicitly.
+            (None, None, None, None, None)
+        };
 
         Ok(Self {
             pps_id: pps_id_raw as u8,
@@ -1014,6 +1421,7 @@ impl PicParameterSet {
             pps_extension_present_flag,
             extension_flags,
             pps_range_extension,
+            pps_multilayer_extension,
             pps_scc_extension,
             opaque_tail,
         })
@@ -1568,11 +1976,12 @@ mod tests {
         assert!(scc.pps_curr_pic_ref_enabled_flag);
     }
 
-    /// When a `pps_multilayer_extension()` body precedes the SCC body,
-    /// the SCC body cannot be decoded in place; the whole span stays in
-    /// the opaque tail.
+    /// F.7.3.2.3.4: a `pps_multilayer_extension()` body (poc-reset
+    /// present, one reference-layer offset set with scaled offsets and
+    /// a phase set, no colour mapping) is decoded in place and the SCC
+    /// body after it too — no opaque tail.
     #[test]
-    fn pps_scc_stays_opaque_behind_multilayer_body() {
+    fn pps_multilayer_then_scc_bodies_decode_in_place() {
         let mut bits = minimal_pps_prefix_bits();
         bits += "1"; // pps_extension_present_flag = 1
         bits += "0"; // pps_range_extension_flag = 0
@@ -1580,7 +1989,27 @@ mod tests {
         bits += "0"; // pps_3d_extension_flag = 0
         bits += "1"; // pps_scc_extension_flag = 1
         bits += "0000"; // pps_extension_4bits = 0
-        bits += "11001100"; // opaque multilayer + scc span sentinel
+                        // pps_multilayer_extension():
+        bits += "1"; // poc_reset_info_present_flag = 1
+        bits += "0"; // pps_infer_scaling_list_flag = 0
+        bits += "010"; // num_ref_loc_offsets = 1 (ue)
+        bits += "000000"; // ref_loc_offset_layer_id[0] = 0 (u(6))
+        bits += "1"; // scaled_ref_layer_offset_present_flag = 1
+        bits += "010"; // scaled_ref_layer_left_offset = 1 (se)
+        bits += "011"; // scaled_ref_layer_top_offset = -1 (se)
+        bits += "1"; // scaled_ref_layer_right_offset = 0
+        bits += "1"; // scaled_ref_layer_bottom_offset = 0
+        bits += "0"; // ref_region_offset_present_flag = 0
+        bits += "1"; // resample_phase_set_present_flag = 1
+        bits += "1"; // phase_hor_luma = 0
+        bits += "010"; // phase_ver_luma = 1
+        bits += "0001001"; // phase_hor_chroma_plus8 = 8 (ue)
+        bits += "0001100"; // phase_ver_chroma_plus8 = 11 (ue)
+        bits += "0"; // colour_mapping_enabled_flag = 0
+                     // pps_scc_extension():
+        bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
+        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
         while bits.len() % 8 != 0 {
             bits += "0";
@@ -1590,6 +2019,117 @@ mod tests {
         let flags = pps.extension_flags.expect("extension flag block");
         assert!(flags.pps_multilayer_extension_flag);
         assert!(flags.pps_scc_extension_flag);
+        let ml = pps
+            .pps_multilayer_extension
+            .as_ref()
+            .expect("multilayer body");
+        assert!(ml.poc_reset_info_present_flag);
+        assert!(!ml.pps_infer_scaling_list_flag);
+        assert_eq!(ml.ref_loc_offsets.len(), 1);
+        let o = ml.ref_loc_offset_for(0).expect("offsets for layer 0");
+        assert_eq!(
+            (
+                o.scaled_ref_layer_left_offset,
+                o.scaled_ref_layer_top_offset,
+                o.scaled_ref_layer_right_offset,
+                o.scaled_ref_layer_bottom_offset
+            ),
+            (1, -1, 0, 0)
+        );
+        assert!(!o.ref_region_offset_present_flag);
+        assert_eq!((o.phase_hor_luma, o.phase_ver_luma), (0, 1));
+        assert_eq!(o.phase_hor_chroma_plus8, 8);
+        assert_eq!(o.phase_ver_chroma_plus8, Some(11));
+        assert!(!ml.colour_mapping_enabled_flag);
+        assert!(
+            pps.pps_scc_extension
+                .expect("scc body")
+                .pps_curr_pic_ref_enabled_flag
+        );
+        assert!(pps.opaque_tail.is_none());
+    }
+
+    /// A `colour_mapping_table( )` with `cm_octant_depth == 1`: one
+    /// split at the root, eight leaf octants, one coded residual.
+    #[test]
+    fn pps_colour_mapping_table_octants_parse() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0"; // range
+        bits += "1"; // multilayer
+        bits += "0"; // 3d
+        bits += "0"; // scc
+        bits += "0000"; // 4bits
+        bits += "0"; // poc_reset_info_present_flag
+        bits += "0"; // pps_infer_scaling_list_flag
+        bits += "1"; // num_ref_loc_offsets = 0
+        bits += "1"; // colour_mapping_enabled_flag = 1
+        bits += "1"; // num_cm_ref_layers_minus1 = 0
+        bits += "000000"; // cm_ref_layer_id[0] = 0
+        bits += "01"; // cm_octant_depth = 1
+        bits += "00"; // cm_y_part_num_log2 = 0
+        bits += "1"; // luma_bit_depth_cm_input_minus8 = 0
+        bits += "1"; // chroma_bit_depth_cm_input_minus8 = 0
+        bits += "1"; // luma_bit_depth_cm_output_minus8 = 0
+        bits += "1"; // chroma_bit_depth_cm_output_minus8 = 0
+        bits += "00"; // cm_res_quant_bits = 0
+        bits += "00"; // cm_delta_flc_bits_minus1 = 0 → CMResLSBits = 9
+        bits += "1"; // cm_adapt_threshold_u_delta = 0
+        bits += "1"; // cm_adapt_threshold_v_delta = 0
+                     // colour_mapping_octants( 0, 0, 0, 0, 2 ):
+        bits += "1"; // split_octant_flag = 1
+                     // eight leaves at depth 1 (no split flag), PartNumY = 1:
+                     // leaf 0: j=0 coded with residuals (q=1, r=3, s=1) x3, j=1..3 not coded
+        bits += "1"; // coded_res_flag[0]
+        for _ in 0..3 {
+            bits += "010"; // res_coeff_q = 1
+            bits += "000000011"; // res_coeff_r = 3 (u(9))
+            bits += "1"; // res_coeff_s = 1
+        }
+        bits += "000"; // coded_res_flag[1..4] = 0
+        for _ in 0..7 {
+            bits += "0000"; // remaining leaves: nothing coded
+        }
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("colour-mapping PPS parse");
+        let ml = pps
+            .pps_multilayer_extension
+            .as_ref()
+            .expect("multilayer body");
+        let cm = ml
+            .colour_mapping_table
+            .as_ref()
+            .expect("colour mapping table");
+        assert_eq!(cm.cm_res_ls_bits(), 9);
+        assert_eq!(cm.cells.len(), 8);
+        assert!(cm.cells[0].coded_res_flag[0]);
+        assert_eq!(cm.cells[0].res[0], [-515, -515, -515]);
+        assert_eq!(cm.cells[7].res, [[0; 3]; 4]);
+        assert!(pps.opaque_tail.is_none());
+    }
+
+    /// A `pps_3d_extension()` body (Annex I, still opaque) keeps the
+    /// SCC body behind it in the opaque tail.
+    #[test]
+    fn pps_scc_stays_opaque_behind_3d_body() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "0"; // pps_range_extension_flag = 0
+        bits += "0"; // pps_multilayer_extension_flag = 0
+        bits += "1"; // pps_3d_extension_flag = 1
+        bits += "1"; // pps_scc_extension_flag = 1
+        bits += "0000"; // pps_extension_4bits = 0
+        bits += "11001100"; // opaque 3d + scc span sentinel
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while bits.len() % 8 != 0 {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("3d PPS parse");
         assert!(pps.pps_scc_extension.is_none());
         assert!(pps.opaque_tail.is_some());
     }

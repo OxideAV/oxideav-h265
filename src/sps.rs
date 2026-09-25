@@ -177,6 +177,11 @@ pub enum SpsError {
     Ptl(VpsError),
     /// A `vui_parameters()` parse (§E.2.1) from the SPS failed.
     Vui(VuiError),
+    /// An Annex F multilayer-extension SPS (`nuh_layer_id > 0` with
+    /// `sps_ext_or_max_sub_layers_minus1 == 7`, F.7.3.2.2.1) infers its
+    /// sub-layer count and representation format from the active VPS,
+    /// but no VPS (or none listing the layer) was supplied.
+    MissingVps,
 }
 
 impl core::fmt::Display for SpsError {
@@ -190,6 +195,9 @@ impl core::fmt::Display for SpsError {
             Self::Bitstream(e) => write!(f, "bitstream error during SPS parse: {e}"),
             Self::Ptl(e) => write!(f, "profile_tier_level error during SPS parse: {e}"),
             Self::Vui(e) => write!(f, "vui_parameters error during SPS parse: {e}"),
+            Self::MissingVps => f.write_str(
+                "multilayer-extension SPS (F.7.3.2.2.1) needs the active VPS to infer its fields",
+            ),
         }
     }
 }
@@ -677,9 +685,7 @@ impl SpsExtensionFlags {
     /// it in the bit stream. When a multilayer / 3D body precedes it,
     /// the SCC body stays inside the opaque tail.
     fn scc_decodable_in_place(&self) -> bool {
-        self.sps_scc_extension_flag
-            && !self.sps_multilayer_extension_flag
-            && !self.sps_3d_extension_flag
+        self.sps_scc_extension_flag && !self.sps_3d_extension_flag
     }
 
     /// True when an extension body still follows the (range +
@@ -687,16 +693,25 @@ impl SpsExtensionFlags {
     /// 3D body, the `sps_extension_data_flag` while-loop, or an
     /// SCC body whose multilayer/3D predecessor kept it opaque.
     fn has_opaque_body_after_decoded(&self) -> bool {
-        if self.sps_multilayer_extension_flag || self.sps_3d_extension_flag {
-            // The first un-decoded body is the multilayer / 3D one;
-            // everything from there (incl. any SCC body) is opaque.
+        if self.sps_3d_extension_flag {
+            // The first un-decoded body is the 3D one; everything from
+            // there (incl. any SCC body) is opaque.
             return true;
         }
-        // No multilayer / 3D body: SCC (if present) was decoded in
-        // place, so only the sps_extension_data_flag while-loop may
-        // remain.
+        // No 3D body: range / multilayer / SCC (if present) were
+        // decoded in place, so only the sps_extension_data_flag
+        // while-loop may remain.
         self.sps_extension_4bits != 0
     }
+}
+
+/// Decoded `sps_multilayer_extension()` body per F.7.3.2.2.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpsMultilayerExtension {
+    /// `inter_view_mv_vert_constraint_flag` — an encoder-side
+    /// constraint (vertical inter-layer MV components <= 56 luma
+    /// samples); no effect on the decoding process.
+    pub inter_view_mv_vert_constraint_flag: bool,
 }
 
 /// Decoded `sps_scc_extension()` body per §7.3.2.2.3, present when
@@ -914,7 +929,30 @@ impl SpsRangeExtension {
 pub struct SeqParameterSet {
     /// `sps_video_parameter_set_id` (`u(4)`, range 0..=15).
     pub vps_id: u8,
-    /// `sps_max_sub_layers_minus1` (`u(3)`, range 0..=6).
+    /// `nuh_layer_id` of the NAL unit the SPS was carried in (0 for
+    /// the base-spec [`Self::parse`] path).
+    pub nuh_layer_id: u8,
+    /// `sps_ext_or_max_sub_layers_minus1` (F.7.3.2.2.1, `u(3)`) when
+    /// `nuh_layer_id > 0`; equal to `sps_max_sub_layers_minus1`
+    /// otherwise.
+    pub sps_ext_or_max_sub_layers_minus1: u8,
+    /// `MultiLayerExtSpsFlag` (F.7.3.2.2.1): `nuh_layer_id != 0 &&
+    /// sps_ext_or_max_sub_layers_minus1 == 7`. When set, the profile /
+    /// tier / level, representation format and sub-layer ordering
+    /// blocks are absent and inferred from the active VPS
+    /// (F.7.4.3.2.1).
+    pub multilayer_ext_sps_flag: bool,
+    /// `update_rep_format_flag` (F.7.3.2.2.1; false when absent).
+    pub update_rep_format_flag: bool,
+    /// `sps_rep_format_idx` (F.7.3.2.2.1, `u(8)`; 0 when absent).
+    pub sps_rep_format_idx: u8,
+    /// `sps_infer_scaling_list_flag` (F.7.3.2.2.1; false when absent).
+    pub sps_infer_scaling_list_flag: bool,
+    /// `sps_scaling_list_ref_layer_id` (F.7.3.2.2.1, `u(6)`; 0 when
+    /// absent).
+    pub sps_scaling_list_ref_layer_id: u8,
+    /// `sps_max_sub_layers_minus1` (`u(3)`, range 0..=6). Inferred
+    /// from `vps_max_sub_layers_minus1` for a multilayer-extension SPS.
     pub max_sub_layers_minus1: u8,
     /// `sps_temporal_id_nesting_flag`.
     pub temporal_id_nesting_flag: bool,
@@ -1029,9 +1067,14 @@ pub struct SeqParameterSet {
     /// `extension_flags.sps_range_extension_flag` is set. `None`
     /// otherwise; per §7.4.3.2.2 every field is then inferred to 0.
     pub sps_range_extension: Option<SpsRangeExtension>,
+    /// Decoded `sps_multilayer_extension()` body (F.7.3.2.2.4),
+    /// present when `extension_flags.sps_multilayer_extension_flag` is
+    /// set. `None` otherwise (`inter_view_mv_vert_constraint_flag`
+    /// inferred 0).
+    pub sps_multilayer_extension: Option<SpsMultilayerExtension>,
     /// Decoded `sps_scc_extension()` body (§7.3.2.2.3), present when
     /// `extension_flags.sps_scc_extension_flag` is set **and** no
-    /// opaque multilayer / 3D body precedes it. `None` otherwise; per
+    /// opaque 3D body precedes it. `None` otherwise; per
     /// §7.4.3.2.3 every field is then inferred to 0 / empty.
     pub sps_scc_extension: Option<SpsSccExtension>,
     /// Opaque suffix of the SPS RBSP. Populated when
@@ -1052,7 +1095,53 @@ impl SeqParameterSet {
     /// NAL header has been removed (see [`crate::nal::NalUnit`]).
     pub fn parse(rbsp: &[u8]) -> Result<Self, SpsError> {
         let mut br = BitReader::new(rbsp);
-        Self::parse_inner(&mut br, rbsp)
+        Self::parse_inner(&mut br, rbsp, 0, None)
+    }
+
+    /// Parse `seq_parameter_set_rbsp()` carried in a NAL unit with the
+    /// given `nuh_layer_id` (F.7.3.2.2.1). For `nuh_layer_id > 0` the
+    /// leading `u(3)` is `sps_ext_or_max_sub_layers_minus1`; the value
+    /// 7 selects the multilayer-extension form whose profile / tier /
+    /// level, representation format (picture size, chroma format, bit
+    /// depths, conformance window) and sub-layer ordering info are
+    /// inferred from `vps` — the active VPS, required in that case
+    /// ([`SpsError::MissingVps`] otherwise). The inferred values fill
+    /// the ordinary fields so downstream code needs no special case.
+    ///
+    /// # Errors
+    /// [`SpsError`] on truncation, a range violation, or a
+    /// multilayer-extension SPS without a usable VPS.
+    pub fn parse_layered(
+        rbsp: &[u8],
+        nuh_layer_id: u8,
+        vps: Option<&crate::vps::HevcVps>,
+    ) -> Result<Self, SpsError> {
+        let mut br = BitReader::new(rbsp);
+        Self::parse_inner(&mut br, rbsp, nuh_layer_id, vps)
+    }
+
+    /// The copy of this SPS with the F.7.4.3.2.1 representation-format
+    /// override applied: for a picture of a dependent (non-independent)
+    /// layer the chroma format, picture size, bit depths and conformance
+    /// window come from the VPS `rep_format( )` and the SPS's own values
+    /// are ignored.
+    #[must_use]
+    pub fn with_rep_format(&self, rf: &crate::vps_ext::RepFormat) -> Self {
+        let mut out = self.clone();
+        out.chroma_format_idc = rf.chroma_format_vps_idc;
+        out.separate_colour_plane_flag = rf.separate_colour_plane_vps_flag;
+        out.pic_width_in_luma_samples = u32::from(rf.pic_width_vps_in_luma_samples);
+        out.pic_height_in_luma_samples = u32::from(rf.pic_height_vps_in_luma_samples);
+        out.bit_depth_luma_minus8 = rf.bit_depth_vps_luma_minus8;
+        out.bit_depth_chroma_minus8 = rf.bit_depth_vps_chroma_minus8;
+        out.conformance_window_flag = rf.conformance_window_vps_flag;
+        out.conformance_window = ConformanceWindow {
+            left_offset: rf.conf_win_vps_left_offset,
+            right_offset: rf.conf_win_vps_right_offset,
+            top_offset: rf.conf_win_vps_top_offset,
+            bottom_offset: rf.conf_win_vps_bottom_offset,
+        };
+        out
     }
 
     /// Materialise the full SPS-level `short_term_ref_pic_sets[]`
@@ -1093,19 +1182,44 @@ impl SeqParameterSet {
         Ok(out)
     }
 
-    fn parse_inner(br: &mut BitReader<'_>, rbsp: &[u8]) -> Result<Self, SpsError> {
+    fn parse_inner(
+        br: &mut BitReader<'_>,
+        rbsp: &[u8],
+        nuh_layer_id: u8,
+        vps: Option<&crate::vps::HevcVps>,
+    ) -> Result<Self, SpsError> {
         let vps_id = br.u(4)? as u8;
-        let max_sub_layers_minus1 = br.u(3)? as u8;
+        // F.7.3.2.2.1: sps_max_sub_layers_minus1 for the base layer,
+        // sps_ext_or_max_sub_layers_minus1 otherwise — 7 selects the
+        // multilayer-extension form.
+        let sps_ext_or_max_sub_layers_minus1 = br.u(3)? as u8;
+        let multilayer_ext_sps_flag = nuh_layer_id != 0 && sps_ext_or_max_sub_layers_minus1 == 7;
+        let vps_ext = vps.and_then(|v| v.extension.as_ref());
+        let max_sub_layers_minus1 = if multilayer_ext_sps_flag {
+            vps.ok_or(SpsError::MissingVps)?.max_sub_layers_minus1
+        } else {
+            sps_ext_or_max_sub_layers_minus1
+        };
         if max_sub_layers_minus1 > 6 {
             return Err(SpsError::ValueOutOfRange {
                 field: "sps_max_sub_layers_minus1",
                 got: max_sub_layers_minus1 as u32,
             });
         }
-        let temporal_id_nesting_flag = br.u1()? != 0;
-
-        // profile_tier_level( 1, sps_max_sub_layers_minus1 )
-        let ptl = ProfileTierLevel::parse(br, true, max_sub_layers_minus1)?;
+        let (temporal_id_nesting_flag, ptl) = if multilayer_ext_sps_flag {
+            // F.7.4.3.2.1 inference: the VPS nesting flag (or 1 for a
+            // single sub-layer); no profile_tier_level( ) is signalled.
+            let v = vps.ok_or(SpsError::MissingVps)?;
+            let nesting = max_sub_layers_minus1 == 0 || v.temporal_id_nesting_flag;
+            (nesting, ProfileTierLevel::absent())
+        } else {
+            let nesting = br.u1()? != 0;
+            // profile_tier_level( 1, sps_max_sub_layers_minus1 )
+            (
+                nesting,
+                ProfileTierLevel::parse(br, true, max_sub_layers_minus1)?,
+            )
+        };
 
         let sps_id_raw = br.ue()?;
         if sps_id_raw > 15 {
@@ -1116,7 +1230,36 @@ impl SeqParameterSet {
         }
         let sps_id = sps_id_raw as u8;
 
-        let chroma_format_idc_raw = br.ue()?;
+        // F.7.3.2.2.1: a multilayer-extension SPS carries
+        // update_rep_format_flag / sps_rep_format_idx instead of the
+        // chroma-format .. bit-depth block; the values come from the
+        // VPS rep_format( ) (F.7.4.3.2.1).
+        let mut update_rep_format_flag = false;
+        let mut sps_rep_format_idx = 0u8;
+        let inferred_rep_format = if multilayer_ext_sps_flag {
+            update_rep_format_flag = br.u1()? != 0;
+            let ext = vps_ext.ok_or(SpsError::MissingVps)?;
+            let rf = if update_rep_format_flag {
+                sps_rep_format_idx = br.u(8)? as u8;
+                ext.rep_formats.get(usize::from(sps_rep_format_idx)).ok_or(
+                    SpsError::ValueOutOfRange {
+                        field: "sps_rep_format_idx",
+                        got: u32::from(sps_rep_format_idx),
+                    },
+                )?
+            } else {
+                ext.rep_format_for_layer(nuh_layer_id)
+                    .ok_or(SpsError::MissingVps)?
+            };
+            Some(*rf)
+        } else {
+            None
+        };
+
+        let chroma_format_idc_raw = match inferred_rep_format {
+            Some(rf) => u32::from(rf.chroma_format_vps_idc),
+            None => br.ue()?,
+        };
         if chroma_format_idc_raw > 3 {
             return Err(SpsError::ValueOutOfRange {
                 field: "chroma_format_idc",
@@ -1125,10 +1268,10 @@ impl SeqParameterSet {
         }
         let chroma_format_idc = chroma_format_idc_raw as u8;
 
-        let separate_colour_plane_flag = if chroma_format_idc == 3 {
-            br.u1()? != 0
-        } else {
-            false
+        let separate_colour_plane_flag = match inferred_rep_format {
+            Some(rf) => rf.separate_colour_plane_vps_flag,
+            None if chroma_format_idc == 3 => br.u1()? != 0,
+            None => false,
         };
 
         // §A.4.1 items b) / c): each dimension "shall be less than or
@@ -1138,14 +1281,20 @@ impl SeqParameterSet {
         // the ceiling here keeps every downstream PicWidthInCtbsY /
         // PicSizeInCtbsY derivation (eqs. 7-15 .. 7-19) inside u32.
         const MAX_LUMA_DIMENSION: u32 = 33_776;
-        let pic_width_in_luma_samples = br.ue()?;
+        let pic_width_in_luma_samples = match inferred_rep_format {
+            Some(rf) => u32::from(rf.pic_width_vps_in_luma_samples),
+            None => br.ue()?,
+        };
         if pic_width_in_luma_samples == 0 || pic_width_in_luma_samples > MAX_LUMA_DIMENSION {
             return Err(SpsError::ValueOutOfRange {
                 field: "pic_width_in_luma_samples",
                 got: pic_width_in_luma_samples,
             });
         }
-        let pic_height_in_luma_samples = br.ue()?;
+        let pic_height_in_luma_samples = match inferred_rep_format {
+            Some(rf) => u32::from(rf.pic_height_vps_in_luma_samples),
+            None => br.ue()?,
+        };
         if pic_height_in_luma_samples == 0 || pic_height_in_luma_samples > MAX_LUMA_DIMENSION {
             return Err(SpsError::ValueOutOfRange {
                 field: "pic_height_in_luma_samples",
@@ -1153,26 +1302,40 @@ impl SeqParameterSet {
             });
         }
 
-        let conformance_window_flag = br.u1()? != 0;
-        let conformance_window = if conformance_window_flag {
-            ConformanceWindow {
+        let conformance_window_flag = match inferred_rep_format {
+            Some(rf) => rf.conformance_window_vps_flag,
+            None => br.u1()? != 0,
+        };
+        let conformance_window = match inferred_rep_format {
+            Some(rf) => ConformanceWindow {
+                left_offset: rf.conf_win_vps_left_offset,
+                right_offset: rf.conf_win_vps_right_offset,
+                top_offset: rf.conf_win_vps_top_offset,
+                bottom_offset: rf.conf_win_vps_bottom_offset,
+            },
+            None if conformance_window_flag => ConformanceWindow {
                 left_offset: br.ue()?,
                 right_offset: br.ue()?,
                 top_offset: br.ue()?,
                 bottom_offset: br.ue()?,
-            }
-        } else {
-            ConformanceWindow::default()
+            },
+            None => ConformanceWindow::default(),
         };
 
-        let bit_depth_luma_minus8_raw = br.ue()?;
+        let bit_depth_luma_minus8_raw = match inferred_rep_format {
+            Some(rf) => u32::from(rf.bit_depth_vps_luma_minus8),
+            None => br.ue()?,
+        };
         if bit_depth_luma_minus8_raw > 8 {
             return Err(SpsError::ValueOutOfRange {
                 field: "bit_depth_luma_minus8",
                 got: bit_depth_luma_minus8_raw,
             });
         }
-        let bit_depth_chroma_minus8_raw = br.ue()?;
+        let bit_depth_chroma_minus8_raw = match inferred_rep_format {
+            Some(rf) => u32::from(rf.bit_depth_vps_chroma_minus8),
+            None => br.ue()?,
+        };
         if bit_depth_chroma_minus8_raw > 8 {
             return Err(SpsError::ValueOutOfRange {
                 field: "bit_depth_chroma_minus8",
@@ -1188,29 +1351,45 @@ impl SeqParameterSet {
             });
         }
 
-        let sub_layer_ordering_info_present_flag = br.u1()? != 0;
         let last = max_sub_layers_minus1 as usize;
-        let start = if sub_layer_ordering_info_present_flag {
-            0usize
-        } else {
-            last
-        };
         let mut sub_layer_ordering_info = [SubLayerOrderingInfo::default(); HEVC_MAX_SUB_LAYERS];
-        for entry in sub_layer_ordering_info
-            .iter_mut()
-            .take(last + 1)
-            .skip(start)
-        {
-            let max_dpb = br.ue()?;
-            let max_reorder = br.ue()?;
-            let max_lat = br.ue()?;
-            *entry = SubLayerOrderingInfo {
-                max_dec_pic_buffering_minus1: max_dpb,
-                max_num_reorder_pics: max_reorder,
-                max_latency_increase_plus1: max_lat,
-            };
-        }
-        if !sub_layer_ordering_info_present_flag {
+        let sub_layer_ordering_info_present_flag = if multilayer_ext_sps_flag {
+            // F.7.4.3.2.1: inferred from the VPS (dpb_size( ) of the
+            // target OLS; the sequence driver refines it once the
+            // operating point is known). Seed from the base VPS
+            // ordering info so the reorder bound is never unset.
+            let v = vps.ok_or(SpsError::MissingVps)?;
+            for (dst, src) in sub_layer_ordering_info
+                .iter_mut()
+                .zip(v.sub_layer_ordering_info.iter())
+            {
+                *dst = SubLayerOrderingInfo {
+                    max_dec_pic_buffering_minus1: src.max_dec_pic_buffering_minus1,
+                    max_num_reorder_pics: src.max_num_reorder_pics,
+                    max_latency_increase_plus1: src.max_latency_increase_plus1,
+                };
+            }
+            false
+        } else {
+            let present = br.u1()? != 0;
+            let start = if present { 0usize } else { last };
+            for entry in sub_layer_ordering_info
+                .iter_mut()
+                .take(last + 1)
+                .skip(start)
+            {
+                let max_dpb = br.ue()?;
+                let max_reorder = br.ue()?;
+                let max_lat = br.ue()?;
+                *entry = SubLayerOrderingInfo {
+                    max_dec_pic_buffering_minus1: max_dpb,
+                    max_num_reorder_pics: max_reorder,
+                    max_latency_increase_plus1: max_lat,
+                };
+            }
+            present
+        };
+        if !sub_layer_ordering_info_present_flag && !multilayer_ext_sps_flag {
             // §7.4.3.2.1: when the present flag is 0, every lower-indexed
             // sub-layer inherits the [max_sub_layers_minus1] triple.
             let copy = sub_layer_ordering_info[last];
@@ -1297,15 +1476,26 @@ impl SeqParameterSet {
         let scaling_list_enabled_flag = br.u1()? != 0;
         let mut sps_scaling_list_data_present_flag = false;
         let mut scaling_list_data = None;
+        let mut sps_infer_scaling_list_flag = false;
+        let mut sps_scaling_list_ref_layer_id = 0u8;
         if scaling_list_enabled_flag {
-            // §7.3.2.2: when scaling_list_enabled_flag == 1, an inner
-            // sps_scaling_list_data_present_flag gates the explicit
-            // scaling_list_data() structure (§7.3.4). When the inner
-            // flag is 0 the default scaling lists (§7.4.5 Tables 7-5 /
-            // 7-6) apply, so the SPS still parses.
-            sps_scaling_list_data_present_flag = br.u1()? != 0;
-            if sps_scaling_list_data_present_flag {
-                scaling_list_data = Some(ScalingListData::parse(br)?);
+            // F.7.3.2.2.1: a multilayer-extension SPS may instead
+            // inherit the lists of a reference layer's active SPS.
+            if multilayer_ext_sps_flag {
+                sps_infer_scaling_list_flag = br.u1()? != 0;
+            }
+            if sps_infer_scaling_list_flag {
+                sps_scaling_list_ref_layer_id = br.u(6)? as u8;
+            } else {
+                // §7.3.2.2: when scaling_list_enabled_flag == 1, an inner
+                // sps_scaling_list_data_present_flag gates the explicit
+                // scaling_list_data() structure (§7.3.4). When the inner
+                // flag is 0 the default scaling lists (§7.4.5 Tables 7-5 /
+                // 7-6) apply, so the SPS still parses.
+                sps_scaling_list_data_present_flag = br.u1()? != 0;
+                if sps_scaling_list_data_present_flag {
+                    scaling_list_data = Some(ScalingListData::parse(br)?);
+                }
             }
         }
 
@@ -1414,6 +1604,7 @@ impl SeqParameterSet {
             sps_extension_present_flag,
             extension_flags,
             sps_range_extension,
+            sps_multilayer_extension,
             sps_scc_extension,
             opaque_tail,
         ) = if br.bits_left() == 0 {
@@ -1448,10 +1639,19 @@ impl SeqParameterSet {
                 } else {
                     None
                 };
+                // F.7.3.2.2.4: the one-flag multilayer body follows
+                // the range extension.
+                let multilayer_ext = if flags.sps_multilayer_extension_flag {
+                    Some(SpsMultilayerExtension {
+                        inter_view_mv_vert_constraint_flag: br.u1()? != 0,
+                    })
+                } else {
+                    None
+                };
                 // §7.3.2.2.1 body order is range, multilayer, 3d, scc.
                 // The SCC body can be decoded in place only when no
-                // (still-opaque) multilayer / 3D body precedes it;
-                // otherwise it stays inside the opaque tail.
+                // (still-opaque) 3D body precedes it; otherwise it
+                // stays inside the opaque tail.
                 let scc_ext = if flags.scc_decodable_in_place() {
                     Some(SpsSccExtension::parse(
                         br,
@@ -1473,17 +1673,24 @@ impl SeqParameterSet {
                 } else {
                     None
                 };
-                (true, Some(flags), range_ext, scc_ext, tail)
+                (true, Some(flags), range_ext, multilayer_ext, scc_ext, tail)
             } else {
                 // No extension present. Only the rbsp_trailing_bits
                 // remain — a single `1` bit followed by zero-padding
                 // to a byte boundary. We do not require the caller to
                 // have validated it; surface nothing for the opaque tail.
-                (false, None, None, None, None)
+                (false, None, None, None, None, None)
             }
         };
 
         Ok(Self {
+            nuh_layer_id,
+            sps_ext_or_max_sub_layers_minus1,
+            multilayer_ext_sps_flag,
+            update_rep_format_flag,
+            sps_rep_format_idx,
+            sps_infer_scaling_list_flag,
+            sps_scaling_list_ref_layer_id,
             vps_id,
             max_sub_layers_minus1,
             temporal_id_nesting_flag,
@@ -1525,6 +1732,7 @@ impl SeqParameterSet {
             sps_extension_present_flag,
             extension_flags,
             sps_range_extension,
+            sps_multilayer_extension,
             sps_scc_extension,
             opaque_tail,
         })
@@ -3108,12 +3316,11 @@ mod tests {
         assert!(!scc.intra_boundary_filtering_disabled_flag);
     }
 
-    /// When `sps_scc_extension_flag == 1` but a `sps_multilayer_extension()`
-    /// body precedes it (§7.3.2.2.1 body order), the SCC body cannot be
-    /// decoded in place and the whole multilayer-onward span — including
-    /// the SCC body — stays in the opaque tail.
+    /// F.7.3.2.2.1 body order: `sps_multilayer_extension()` (one flag,
+    /// decoded in place) precedes the SCC body, which is then decoded in
+    /// place too — no opaque tail.
     #[test]
-    fn scc_stays_opaque_behind_multilayer_body() {
+    fn multilayer_then_scc_bodies_decode_in_place() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
@@ -3127,15 +3334,51 @@ mod tests {
         s += "0"; // sps_3d_extension_flag = 0
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
-        s += "11001100"; // opaque multilayer + scc span sentinel
+                     // sps_multilayer_extension():
+        s += "1"; // inter_view_mv_vert_constraint_flag = 1
+                  // sps_scc_extension():
+        s += "1"; // sps_curr_pic_ref_enabled_flag = 1
+        s += "0"; // palette_mode_enabled_flag = 0
+        s += "01"; // motion_vector_resolution_control_idc = 1 (u(2))
+        s += "0"; // intra_boundary_filtering_disabled_flag = 0
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         let flags = sps.extension_flags.expect("extension flag block");
         assert!(flags.sps_multilayer_extension_flag);
         assert!(flags.sps_scc_extension_flag);
-        // Multilayer body is still opaque, so the SCC body cannot be
-        // decoded in place; both stay in the captured tail.
+        let ml = sps.sps_multilayer_extension.expect("multilayer body");
+        assert!(ml.inter_view_mv_vert_constraint_flag);
+        let scc = sps.sps_scc_extension.expect("scc extension body");
+        assert!(scc.sps_curr_pic_ref_enabled_flag);
+        assert_eq!(scc.motion_vector_resolution_control_idc, 1);
+        assert!(sps.opaque_tail.is_none());
+    }
+
+    /// A `sps_3d_extension()` body (Annex I, still opaque) keeps the
+    /// SCC body behind it in the opaque tail.
+    #[test]
+    fn scc_stays_opaque_behind_3d_body() {
+        let mut s = synthesised_prefix_bits();
+        s += "0"; // pcm
+        s += "1"; // num_short_term=0
+        s += "0"; // long_term=0
+        s += "1"; // temporal_mvp
+        s += "1"; // strong_intra_smoothing
+        s += "0"; // vui=0
+        s += "1"; // sps_extension_present_flag = 1
+        s += "0"; // sps_range_extension_flag = 0
+        s += "0"; // sps_multilayer_extension_flag = 0
+        s += "1"; // sps_3d_extension_flag = 1
+        s += "1"; // sps_scc_extension_flag = 1
+        s += "0000"; // sps_extension_4bits = 0
+        s += "11001100"; // opaque 3d + scc span sentinel
+        s += "1"; // rbsp_trailing_bits stop bit
+        let bytes = bits_to_bytes(&s);
+        let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
+        let flags = sps.extension_flags.expect("extension flag block");
+        assert!(flags.sps_3d_extension_flag);
+        assert!(flags.sps_scc_extension_flag);
         assert!(sps.sps_scc_extension.is_none());
         assert!(sps.opaque_tail.is_some());
     }

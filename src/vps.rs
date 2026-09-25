@@ -206,6 +206,23 @@ pub struct ProfileTierLevel {
 }
 
 impl ProfileTierLevel {
+    /// An all-zero `profile_tier_level( )` — the value a
+    /// multilayer-extension SPS (F.7.3.2.2.1, no PTL signalled) carries.
+    #[must_use]
+    pub fn absent() -> Self {
+        Self {
+            general_profile_space: 0,
+            general_tier_flag: false,
+            general_profile_idc: 0,
+            general_level_idc: 0,
+            general_profile_compatibility_flags: 0,
+            general_constraint_indicator_flags: 0,
+            sub_layer_profile_present: [false; HEVC_MAX_SUB_LAYERS],
+            sub_layer_level_present: [false; HEVC_MAX_SUB_LAYERS],
+            sub_layer_level_idc: [0; HEVC_MAX_SUB_LAYERS],
+        }
+    }
+
     /// `general_profile_compatibility_flag[ j ]`.
     #[must_use]
     pub fn profile_compatible(&self, j: u8) -> bool {

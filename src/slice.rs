@@ -1450,6 +1450,33 @@ pub struct SliceSegmentHeader {
     /// `slice_segment_header_extension_present_flag == 0` or the parser
     /// stopped before this point.
     pub slice_segment_header_extension_length: Option<u32>,
+    /// Annex F (F.7.3.6.1) `inter_layer_pred_enabled_flag`, `Some`
+    /// only when signalled (`nuh_layer_id > 0`,
+    /// `default_ref_layers_active_flag == 0`, a direct reference layer).
+    pub inter_layer_pred_enabled_flag: Option<bool>,
+    /// `num_inter_layer_ref_pics_minus1` when signalled.
+    pub num_inter_layer_ref_pics_minus1: Option<u32>,
+    /// `inter_layer_pred_layer_idc[ i ]` for `i < NumActiveRefLayerPics`
+    /// (signalled or inferred per F.7.4.7.1).
+    pub inter_layer_pred_layer_idc: Vec<u8>,
+    /// `NumActiveRefLayerPics` (eq. F-53; 0 without a layer context).
+    pub num_active_ref_layer_pics: u32,
+    /// `RefPicLayerId[ i ]` (eq. F-54) — the `nuh_layer_id` of each
+    /// inter-layer reference picture, in increasing order.
+    pub ref_pic_layer_id: Vec<u8>,
+    /// `poc_reset_idc` (F.7.3.6.1 header extension; 0 when absent).
+    pub poc_reset_idc: u8,
+    /// `poc_reset_period_id` when signalled.
+    pub poc_reset_period_id: Option<u8>,
+    /// `full_poc_reset_flag` (false when absent).
+    pub full_poc_reset_flag: bool,
+    /// `poc_lsb_val` (0 when absent).
+    pub poc_lsb_val: u32,
+    /// `poc_msb_cycle_val_present_flag` (signalled or inferred per
+    /// F.7.4.7.1).
+    pub poc_msb_cycle_val_present_flag: bool,
+    /// `poc_msb_cycle_val` (0 when absent).
+    pub poc_msb_cycle_val: u32,
     /// Byte offset, from the start of the RBSP, of the first byte of
     /// `slice_segment_data()` — i.e. the position immediately after
     /// `byte_alignment()`. `None` when the header was not parsed all
@@ -1478,7 +1505,133 @@ pub struct SliceSegmentHeader {
     pub opaque_tail: Option<OpaqueTail>,
 }
 
+/// The Annex F layer-level inputs the F.7.3.6.1 slice segment header
+/// parse needs for a picture with `nuh_layer_id > 0` (and for the
+/// `poc_reset_*` header-extension fields of any layer): the VPS
+/// extension's dependency graph for the layer, the `default_ref_layers_
+/// active_flag` / `max_one_active_ref_layer_flag` /
+/// `poc_lsb_not_present_flag` / `vps_poc_lsb_aligned_flag` gates and the
+/// eq. F-52 `refLayerPicIdc` list for the picture's `TemporalId`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SliceLayerContext {
+    /// `nuh_layer_id` of the slice's NAL unit.
+    pub nuh_layer_id: u8,
+    /// `TemporalId` of the slice's NAL unit.
+    pub temporal_id: u8,
+    /// `IdDirectRefLayer[ nuh_layer_id ][ .. ]`.
+    pub direct_ref_layer_ids: Vec<u8>,
+    /// `refLayerPicIdc[ j ]` for `j < numRefLayerPics` (eq. F-52):
+    /// indices into [`Self::direct_ref_layer_ids`].
+    pub ref_layer_pic_idc: Vec<u8>,
+    /// `default_ref_layers_active_flag`.
+    pub default_ref_layers_active_flag: bool,
+    /// `max_one_active_ref_layer_flag`.
+    pub max_one_active_ref_layer_flag: bool,
+    /// `poc_lsb_not_present_flag[ LayerIdxInVps[ nuh_layer_id ] ]`.
+    pub poc_lsb_not_present_flag: bool,
+    /// `vps_poc_lsb_aligned_flag`.
+    pub vps_poc_lsb_aligned_flag: bool,
+}
+
+impl SliceLayerContext {
+    /// Build the context for a NAL unit of `nuh_layer_id` / `temporal_id`
+    /// from the active VPS. A VPS without `vps_extension( )` (or one not
+    /// listing the layer) yields the single-layer context: no direct
+    /// reference layers, no POC-reset gates.
+    #[must_use]
+    pub fn from_vps(vps: &crate::vps::HevcVps, nuh_layer_id: u8, temporal_id: u8) -> Self {
+        let Some(ext) = vps.extension.as_ref() else {
+            return Self {
+                nuh_layer_id,
+                temporal_id,
+                ..Self::default()
+            };
+        };
+        let m = &ext.layers;
+        let direct_ref_layer_ids = m.direct_ref_layers(nuh_layer_id).to_vec();
+        let cur_idx = m.layer_idx(nuh_layer_id);
+        // Eq. F-52.
+        let mut ref_layer_pic_idc = Vec::new();
+        for (i, &rl) in direct_ref_layer_ids.iter().enumerate() {
+            let Some(ref_idx) = m.layer_idx(rl) else {
+                continue;
+            };
+            let sub_layers_max = ext
+                .sub_layers_vps_max_minus1
+                .get(ref_idx)
+                .copied()
+                .unwrap_or(0);
+            let max_tid = cur_idx
+                .and_then(|c| ext.max_tid_il_ref_pics_plus1.get(ref_idx)?.get(c))
+                .copied()
+                .unwrap_or(7);
+            if sub_layers_max >= temporal_id && (temporal_id == 0 || max_tid > temporal_id) {
+                ref_layer_pic_idc.push(i as u8);
+            }
+        }
+        Self {
+            nuh_layer_id,
+            temporal_id,
+            direct_ref_layer_ids,
+            ref_layer_pic_idc,
+            default_ref_layers_active_flag: ext.default_ref_layers_active_flag,
+            max_one_active_ref_layer_flag: ext.max_one_active_ref_layer_flag,
+            poc_lsb_not_present_flag: cur_idx
+                .and_then(|c| ext.poc_lsb_not_present_flag.get(c))
+                .copied()
+                .unwrap_or(false),
+            vps_poc_lsb_aligned_flag: ext.vps_poc_lsb_aligned_flag,
+        }
+    }
+
+    /// `NumDirectRefLayers[ nuh_layer_id ]`.
+    #[must_use]
+    pub fn num_direct_ref_layers(&self) -> usize {
+        self.direct_ref_layer_ids.len()
+    }
+}
+
+/// Eq. F-53, the branch reached once `inter_layer_pred_enabled_flag`
+/// is 1: `max_one_active_ref_layer_flag || NumDirectRefLayers == 1`
+/// selects a single picture, otherwise `num_inter_layer_ref_pics_minus1
+/// + 1`.
+fn num_active_ref_layer_pics_f53(l: &SliceLayerContext, num_minus1: Option<u32>) -> u32 {
+    if l.max_one_active_ref_layer_flag || l.num_direct_ref_layers() == 1 {
+        1
+    } else {
+        num_minus1.unwrap_or(0) + 1
+    }
+}
+
+/// The decoded `slice_segment_header_extension` block (F.7.3.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HeaderExtension {
+    length: Option<u32>,
+    poc_reset_idc: u8,
+    poc_reset_period_id: Option<u8>,
+    full_poc_reset_flag: bool,
+    poc_lsb_val: u32,
+    poc_msb_cycle_val_present_flag: bool,
+    poc_msb_cycle_val: u32,
+}
+
 impl SliceSegmentHeader {
+    /// `discardable_flag` (F.7.3.6.1): the first
+    /// `num_extra_slice_header_bits` bit. Meaningful for Annex F
+    /// bitstreams; a base-spec stream's `slice_reserved_flag[ 0 ]`
+    /// reads the same bit (inferred 0 when absent).
+    #[must_use]
+    pub fn discardable_flag(&self) -> bool {
+        self.slice_reserved_flags.first().copied().unwrap_or(false)
+    }
+
+    /// `cross_layer_bla_flag` (F.7.3.6.1): the second
+    /// `num_extra_slice_header_bits` bit (inferred 0 when absent).
+    #[must_use]
+    pub fn cross_layer_bla_flag(&self) -> bool {
+        self.slice_reserved_flags.get(1).copied().unwrap_or(false)
+    }
+
     /// Parse `slice_segment_header()` from the first bit of the
     /// (already-unescaped) slice-segment-layer RBSP body — i.e. after
     /// the two-byte NAL header has been removed (see
@@ -1498,7 +1651,32 @@ impl SliceSegmentHeader {
         sps: &SeqParameterSet,
         pps: &PicParameterSet,
     ) -> Result<Self, SliceError> {
+        Self::parse_layered(rbsp, nal_unit_type, sps, pps, None)
+    }
+
+    /// Parse `slice_segment_header()` per F.7.3.6.1 with the Annex F
+    /// layer context: the `nuh_layer_id`-gated `slice_pic_order_cnt_lsb`
+    /// of an IDR picture, the inter-layer prediction block
+    /// (`inter_layer_pred_enabled_flag`, `num_inter_layer_ref_pics_minus1`,
+    /// `inter_layer_pred_layer_idc[ ]` → `NumActiveRefLayerPics` /
+    /// `RefPicLayerId[ ]`), the eq. F-56 `NumPicTotalCurr` for the
+    /// `ref_pic_lists_modification( )` gate, and the typed
+    /// `poc_reset_*` / `poc_msb_cycle_val` header-extension fields.
+    /// `layer == None` is the base-specification parse (a single-layer
+    /// stream); a base-layer picture of a multi-layer stream should still
+    /// pass its context so the header extension decodes.
+    ///
+    /// # Errors
+    /// [`SliceError`] on truncation or a range violation.
+    pub fn parse_layered(
+        rbsp: &[u8],
+        nal_unit_type: u8,
+        sps: &SeqParameterSet,
+        pps: &PicParameterSet,
+        layer: Option<&SliceLayerContext>,
+    ) -> Result<Self, SliceError> {
         let mut br = BitReader::new(rbsp);
+        let layer_id = layer.map_or(0, |l| l.nuh_layer_id);
 
         let first_slice_segment_in_pic_flag = br.u1()? != 0;
 
@@ -1550,6 +1728,11 @@ impl SliceSegmentHeader {
         let mut num_long_term_pics: Option<u32> = None;
         let mut long_term_ref_pics: Vec<SliceLongTermRefPic> = Vec::new();
         let mut slice_temporal_mvp_enabled_flag = false;
+        let mut inter_layer_pred_enabled_flag: Option<bool> = None;
+        let mut num_inter_layer_ref_pics_minus1: Option<u32> = None;
+        let mut inter_layer_pred_layer_idc: Vec<u8> = Vec::new();
+        let mut num_active_ref_layer_pics = 0u32;
+        let mut ref_pic_layer_id: Vec<u8> = Vec::new();
 
         if !dependent_slice_segment_flag {
             for _ in 0..pps.num_extra_slice_header_bits {
@@ -1568,8 +1751,12 @@ impl SliceSegmentHeader {
             }
 
             // Non-IDR POC + reference-picture-set block (§7.3.6.1).
+            // F.7.3.6.1: an IDR picture of a non-base layer also
+            // carries slice_pic_order_cnt_lsb unless
+            // poc_lsb_not_present_flag says otherwise.
             let is_idr = nal_unit_type == IDR_W_RADL || nal_unit_type == IDR_N_LP;
-            if !is_idr {
+            let layer_poc_lsb = layer_id > 0 && !layer.is_some_and(|l| l.poc_lsb_not_present_flag);
+            if !is_idr || layer_poc_lsb {
                 // slice_pic_order_cnt_lsb u(v), width log2_max_poc_lsb_minus4+4.
                 let poc_lsb_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
                 let poc_lsb = br.u(poc_lsb_bits)?;
@@ -1580,7 +1767,8 @@ impl SliceSegmentHeader {
                     });
                 }
                 slice_pic_order_cnt_lsb = Some(poc_lsb);
-
+            }
+            if !is_idr {
                 // short_term_ref_pic_set_sps_flag u(1).
                 let st_sps_flag = br.u1()? != 0;
                 short_term_ref_pic_set_sps_flag = Some(st_sps_flag);
@@ -1623,6 +1811,77 @@ impl SliceSegmentHeader {
                     slice_temporal_mvp_enabled_flag = br.u1()? != 0;
                 }
             }
+
+            // F.7.3.6.1 inter-layer prediction block + the F-52 .. F-54
+            // NumActiveRefLayerPics / RefPicLayerId derivation.
+            if let Some(l) = layer {
+                let num_direct = l.num_direct_ref_layers();
+                let num_ref_layer_pics = l.ref_layer_pic_idc.len();
+                if l.nuh_layer_id > 0 && !l.default_ref_layers_active_flag && num_direct > 0 {
+                    let enabled = br.u1()? != 0;
+                    inter_layer_pred_enabled_flag = Some(enabled);
+                    if enabled && num_direct > 1 {
+                        let bits = ceil_log2(num_direct as u32);
+                        if !l.max_one_active_ref_layer_flag {
+                            let n = br.u(bits)?;
+                            if n as usize >= num_direct {
+                                return Err(SliceError::ValueOutOfRange {
+                                    field: "num_inter_layer_ref_pics_minus1",
+                                    got: i64::from(n),
+                                });
+                            }
+                            num_inter_layer_ref_pics_minus1 = Some(n);
+                        }
+                        let active =
+                            num_active_ref_layer_pics_f53(l, num_inter_layer_ref_pics_minus1);
+                        if active as usize != num_direct {
+                            for _ in 0..active {
+                                let idc = br.u(bits)? as u8;
+                                if usize::from(idc) >= num_direct
+                                    || inter_layer_pred_layer_idc.last().is_some_and(|&p| idc <= p)
+                                {
+                                    return Err(SliceError::ValueOutOfRange {
+                                        field: "inter_layer_pred_layer_idc",
+                                        got: i64::from(idc),
+                                    });
+                                }
+                                inter_layer_pred_layer_idc.push(idc);
+                            }
+                        }
+                    }
+                }
+                num_active_ref_layer_pics = if l.nuh_layer_id == 0 || num_ref_layer_pics == 0 {
+                    0
+                } else if l.default_ref_layers_active_flag {
+                    num_ref_layer_pics as u32
+                } else if !inter_layer_pred_enabled_flag.unwrap_or(false) {
+                    0
+                } else {
+                    num_active_ref_layer_pics_f53(l, num_inter_layer_ref_pics_minus1)
+                };
+                // F.7.4.7.1: inter_layer_pred_layer_idc[ i ] inferred to
+                // refLayerPicIdc[ i ] when not present.
+                if inter_layer_pred_layer_idc.len() < num_active_ref_layer_pics as usize {
+                    inter_layer_pred_layer_idc = l
+                        .ref_layer_pic_idc
+                        .iter()
+                        .take(num_active_ref_layer_pics as usize)
+                        .copied()
+                        .collect();
+                }
+                // Eq. F-54.
+                for &idc in &inter_layer_pred_layer_idc {
+                    let id = l
+                        .direct_ref_layer_ids
+                        .get(usize::from(idc))
+                        .copied()
+                        .ok_or(SliceError::ValueOutOfRange {
+                            field: "inter_layer_pred_layer_idc",
+                            got: i64::from(idc),
+                        })?;
+                    ref_pic_layer_id.push(id);
+                }
+            }
         }
 
         // SAO block (§7.3.6.1) — inside the !dependent gate: a dependent
@@ -1645,7 +1904,8 @@ impl SliceSegmentHeader {
             // block sit OUTSIDE the !dependent gate — a dependent slice
             // segment signals its own substream entry points.
             let entry_point_offsets = parse_entry_point_offsets(&mut br, sps, pps)?;
-            let slice_segment_header_extension_length = parse_header_extension(&mut br, pps)?;
+            let hext = parse_header_extension(&mut br, sps, pps, nal_unit_type, layer)?;
+            let slice_segment_header_extension_length = hext.length;
             let byte_offset = consume_byte_alignment(&mut br)?;
             return Ok(Self {
                 first_slice_segment_in_pic_flag,
@@ -1688,6 +1948,17 @@ impl SliceSegmentHeader {
                 slice_loop_filter_across_slices_enabled_flag: None,
                 entry_point_offsets,
                 slice_segment_header_extension_length,
+                inter_layer_pred_enabled_flag: None,
+                num_inter_layer_ref_pics_minus1: None,
+                inter_layer_pred_layer_idc: Vec::new(),
+                num_active_ref_layer_pics: 0,
+                ref_pic_layer_id: Vec::new(),
+                poc_reset_idc: hext.poc_reset_idc,
+                poc_reset_period_id: hext.poc_reset_period_id,
+                full_poc_reset_flag: hext.full_poc_reset_flag,
+                poc_lsb_val: hext.poc_lsb_val,
+                poc_msb_cycle_val_present_flag: hext.poc_msb_cycle_val_present_flag,
+                poc_msb_cycle_val: hext.poc_msb_cycle_val,
                 byte_offset_to_slice_data: Some(byte_offset),
                 ref_pic_lists_modification: None,
                 opaque_tail: None,
@@ -1807,11 +2078,21 @@ impl SliceSegmentHeader {
             ) {
                 ActiveShortTermRps::Materialized(m) => {
                     let lt_used = collect_used_by_curr_pic_lt(&long_term_ref_pics, sps);
-                    let inputs = NumPicTotalCurrInputs::from_used_flags(
+                    let mut inputs = NumPicTotalCurrInputs::from_used_flags(
                         &m.used_by_curr_pic_s0,
                         &m.used_by_curr_pic_s1,
                         &lt_used,
                     );
+                    // §7.4.7.2 / F.7.4.7.2 closing terms: the currPic
+                    // entry of intra block copy and the inter-layer
+                    // reference pictures.
+                    inputs.pps_curr_pic_ref_enabled_flag = pps
+                        .pps_scc_extension
+                        .as_ref()
+                        .is_some_and(|e| e.pps_curr_pic_ref_enabled_flag);
+                    inputs.nal_unit_type = nal_unit_type;
+                    inputs.num_active_ref_layer_pics = num_active_ref_layer_pics;
+                    inputs.multilayer_extension = layer.is_some();
                     let npc = inputs.compute();
                     if npc > 1 {
                         let l0_active =
@@ -1882,6 +2163,17 @@ impl SliceSegmentHeader {
                         slice_loop_filter_across_slices_enabled_flag: None,
                         entry_point_offsets: None,
                         slice_segment_header_extension_length: None,
+                        inter_layer_pred_enabled_flag,
+                        num_inter_layer_ref_pics_minus1,
+                        inter_layer_pred_layer_idc: inter_layer_pred_layer_idc.clone(),
+                        num_active_ref_layer_pics,
+                        ref_pic_layer_id: ref_pic_layer_id.clone(),
+                        poc_reset_idc: 0,
+                        poc_reset_period_id: None,
+                        full_poc_reset_flag: false,
+                        poc_lsb_val: 0,
+                        poc_msb_cycle_val_present_flag: false,
+                        poc_msb_cycle_val: 0,
                         byte_offset_to_slice_data: None,
                         ref_pic_lists_modification: None,
                         opaque_tail: Some(OpaqueTail::capture_at(br.bit_pos(), rbsp)),
@@ -2149,7 +2441,8 @@ impl SliceSegmentHeader {
         let entry_point_offsets = parse_entry_point_offsets(&mut br, sps, pps)?;
 
         // Slice-segment-header extension block (§7.3.6.1).
-        let slice_segment_header_extension_length = parse_header_extension(&mut br, pps)?;
+        let hext = parse_header_extension(&mut br, sps, pps, nal_unit_type, layer)?;
+        let slice_segment_header_extension_length = hext.length;
 
         let byte_offset = consume_byte_alignment(&mut br)?;
 
@@ -2196,6 +2489,17 @@ impl SliceSegmentHeader {
             ),
             entry_point_offsets,
             slice_segment_header_extension_length,
+            inter_layer_pred_enabled_flag,
+            num_inter_layer_ref_pics_minus1,
+            inter_layer_pred_layer_idc,
+            num_active_ref_layer_pics,
+            ref_pic_layer_id,
+            poc_reset_idc: hext.poc_reset_idc,
+            poc_reset_period_id: hext.poc_reset_period_id,
+            full_poc_reset_flag: hext.full_poc_reset_flag,
+            poc_lsb_val: hext.poc_lsb_val,
+            poc_msb_cycle_val_present_flag: hext.poc_msb_cycle_val_present_flag,
+            poc_msb_cycle_val: hext.poc_msb_cycle_val,
             byte_offset_to_slice_data: Some(byte_offset),
             ref_pic_lists_modification,
             opaque_tail: None,
@@ -2293,21 +2597,94 @@ fn parse_entry_point_offsets(
     }))
 }
 
-/// §7.3.6.1 — the slice-segment-header extension block (length +
-/// skipped payload bytes), present for BOTH independent and dependent
-/// slice segments when the PPS signals it.
+/// §7.3.6.1 / F.7.3.6.1 — the slice-segment-header extension block,
+/// present for BOTH independent and dependent slice segments when the
+/// PPS signals it: the length, then (when the PPS multilayer extension
+/// has `poc_reset_info_present_flag`) `poc_reset_idc` /
+/// `poc_reset_period_id` / `full_poc_reset_flag` / `poc_lsb_val`, the
+/// `vps_poc_lsb_aligned_flag`-gated `poc_msb_cycle_val_present_flag` /
+/// `poc_msb_cycle_val`, and the remaining
+/// `slice_segment_header_extension_data_bit`s skipped.
 fn parse_header_extension(
     br: &mut BitReader<'_>,
+    sps: &SeqParameterSet,
     pps: &PicParameterSet,
-) -> Result<Option<u32>, SliceError> {
+    nal_unit_type: u8,
+    layer: Option<&SliceLayerContext>,
+) -> Result<HeaderExtension, SliceError> {
     if !pps.slice_segment_header_extension_present_flag {
-        return Ok(None);
+        return Ok(HeaderExtension::default());
     }
     let len = br.ue()?;
-    for _ in 0..len {
-        br.skip(8)?;
+    // §7.4.7.1: 0..=256 bytes.
+    if len > 256 {
+        return Err(SliceError::ValueOutOfRange {
+            field: "slice_segment_header_extension_length",
+            got: i64::from(len),
+        });
     }
-    Ok(Some(len))
+    let start = br.bit_pos();
+    let end = start + 8 * len as usize;
+    let mut out = HeaderExtension {
+        length: Some(len),
+        ..HeaderExtension::default()
+    };
+    let poc_reset_info_present = pps
+        .pps_multilayer_extension
+        .as_ref()
+        .is_some_and(|e| e.poc_reset_info_present_flag);
+    // Reading past the declared length is a malformed header, not a
+    // silent truncation: every field below checks `end` first.
+    let check = |br: &BitReader<'_>, bits: usize| -> Result<(), SliceError> {
+        if br.bit_pos() + bits > end {
+            return Err(SliceError::ValueOutOfRange {
+                field: "slice_segment_header_extension_length",
+                got: i64::from(len),
+            });
+        }
+        Ok(())
+    };
+    if poc_reset_info_present {
+        check(br, 2)?;
+        out.poc_reset_idc = br.u(2)? as u8;
+    }
+    if out.poc_reset_idc != 0 {
+        check(br, 6)?;
+        out.poc_reset_period_id = Some(br.u(6)? as u8);
+    }
+    if out.poc_reset_idc == 3 {
+        let poc_lsb_bits = usize::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4;
+        check(br, 1 + poc_lsb_bits)?;
+        out.full_poc_reset_flag = br.u1()? != 0;
+        out.poc_lsb_val = br.u(poc_lsb_bits as u8)?;
+    }
+    // Eq. F-55.
+    let kind = crate::poc::NalKind::new(nal_unit_type);
+    let cra_or_bla = kind.is_cra() || kind.is_bla();
+    let (aligned, num_direct) = layer.map_or((false, 0), |l| {
+        (l.vps_poc_lsb_aligned_flag, l.num_direct_ref_layers())
+    });
+    let poc_msb_val_required = cra_or_bla && (!aligned || num_direct == 0);
+    if !poc_msb_val_required && aligned {
+        check(br, 1)?;
+        out.poc_msb_cycle_val_present_flag = br.u1()? != 0;
+    } else {
+        // F.7.4.7.1 inference.
+        out.poc_msb_cycle_val_present_flag = len != 0 && poc_msb_val_required;
+    }
+    if out.poc_msb_cycle_val_present_flag {
+        check(br, 1)?;
+        out.poc_msb_cycle_val = br.ue()?;
+        if br.bit_pos() > end {
+            return Err(SliceError::ValueOutOfRange {
+                field: "poc_msb_cycle_val",
+                got: i64::from(out.poc_msb_cycle_val),
+            });
+        }
+    }
+    // slice_segment_header_extension_data_bit — ignored.
+    br.skip(end - br.bit_pos())?;
+    Ok(out)
 }
 
 /// §7.4.7.1 upper bound on the slice header's
