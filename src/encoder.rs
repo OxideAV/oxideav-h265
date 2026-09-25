@@ -31,14 +31,14 @@ pub mod pyramid;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[cfg(test)]
 mod ccp_streams;
+#[cfg(test)]
+mod layered_streams;
 #[doc(hidden)]
 pub mod nal;
 #[cfg(test)]
 mod palette_streams;
 pub mod pcm;
 pub mod rate;
-#[cfg(test)]
-mod layered_streams;
 #[cfg(test)]
 mod rdpcm_streams;
 #[cfg(test)]
@@ -229,6 +229,9 @@ pub struct H265Encoder {
     /// caller's size (right / bottom offsets in chroma units), `None`
     /// when no padding was needed.
     crop: Option<(u32, u32)>,
+    /// The PCM still layout (8-bit 4:2:0 unless another planar input
+    /// format selected a lossless PCM layout).
+    layout: pcm::PcmLayout,
     /// The `still` option: Main Still Picture profile signalling on
     /// every (single-picture) access unit.
     still: bool,
@@ -302,33 +305,69 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "h265 encode: dimensions must be nonzero, got {width}x{height}"
         )));
     }
-    // The coders work on CTB-friendly pictures (multiples of 16);
-    // anything else is padded by edge replication and cropped back by
-    // a §7.4.3.2.1 conformance window. 4:2:0 crops are in units of
-    // two luma samples, so an odd size outputs one extra column / row
-    // (the container's clean-aperture is the place for odd sizes).
-    let coded_width = width.div_ceil(16) * 16;
-    let coded_height = height.div_ceil(16) * 16;
-    let out_width = width.div_ceil(2) * 2;
-    let out_height = height.div_ceil(2) * 2;
-    let crop = (coded_width != out_width || coded_height != out_height).then(|| {
-        (
-            ((coded_width - out_width) / 2) as u32,
-            ((coded_height - out_height) / 2) as u32,
-        )
-    });
     // `YuvJ420P` is the full-range alias of `Yuv420P` (same planar
     // layout): accepted as its twin, and its range is preserved in
     // the VUI unless the caller says otherwise (see `video_signal`).
     // The 4:2:2 / 4:4:4 `YuvJ*` twins wait for those coders.
-    let full_range_input = params.pixel_format == Some(PixelFormat::YuvJ420P);
-    if let Some(pf) = params.pixel_format {
-        if !matches!(pf, PixelFormat::Yuv420P | PixelFormat::YuvJ420P) {
-            return Err(Error::InvalidData(format!(
-                "h265 encode: only yuv420p input is supported, got {pf:?}"
-            )));
+    let full_range_input = matches!(
+        params.pixel_format,
+        Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
+    );
+    // Every other planar layout — monochrome, 4:2:2, 4:4:4, 10 / 12 /
+    // 16-bit — is a lossless PCM still (`mode = "pcm"`): the intra /
+    // inter coders are 8-bit 4:2:0 only.
+    let layout = match params.pixel_format {
+        None | Some(PixelFormat::Yuv420P | PixelFormat::YuvJ420P) => pcm::PcmLayout::default(),
+        Some(pf) => {
+            let (chroma_format_idc, bit_depth) = match pf {
+                PixelFormat::Gray8 => (0, 8),
+                PixelFormat::Gray10Le => (0, 10),
+                PixelFormat::Gray12Le => (0, 12),
+                PixelFormat::Gray16Le => (0, 16),
+                PixelFormat::Yuv420P10Le => (1, 10),
+                PixelFormat::Yuv420P12Le => (1, 12),
+                PixelFormat::Yuv422P | PixelFormat::YuvJ422P => (2, 8),
+                PixelFormat::Yuv422P10Le => (2, 10),
+                PixelFormat::Yuv422P12Le => (2, 12),
+                PixelFormat::Yuv444P | PixelFormat::YuvJ444P => (3, 8),
+                PixelFormat::Yuv444P10Le => (3, 10),
+                PixelFormat::Yuv444P12Le => (3, 12),
+                other => {
+                    return Err(Error::InvalidData(format!(
+                    "h265 encode: unsupported pixel format {other:?} (planar YUV 4:2:0 / 4:2:2 / \
+                         4:4:4 at 8 / 10 / 12 bits or grey at 8 / 10 / 12 / 16 bits)"
+                )))
+                }
+            };
+            if params.options.get("mode").unwrap_or("pcm") != "pcm" {
+                return Err(Error::InvalidData(format!(
+                    "h265 encode: {pf:?} input is supported by mode \"pcm\" only (the intra / inter \
+                     coders take yuv420p)"
+                )));
+            }
+            pcm::PcmLayout {
+                chroma_format_idc,
+                bit_depth,
+            }
         }
-    }
+    };
+    // The coders work on CTB-friendly pictures (multiples of 16);
+    // anything else is padded by edge replication and cropped back by
+    // a §7.4.3.2.1 conformance window. The window offsets are in
+    // chroma units (SubWidthC / SubHeightC luma samples), so a 4:2:0
+    // odd size outputs one extra column / row (the container's
+    // clean-aperture is the place for odd sizes).
+    let (sub_w, sub_h) = layout.sub_wh();
+    let coded_width = width.div_ceil(16) * 16;
+    let coded_height = height.div_ceil(16) * 16;
+    let out_width = width.div_ceil(sub_w) * sub_w;
+    let out_height = height.div_ceil(sub_h) * sub_h;
+    let crop = (coded_width != out_width || coded_height != out_height).then(|| {
+        (
+            ((coded_width - out_width) / sub_w) as u32,
+            ((coded_height - out_height) / sub_h) as u32,
+        )
+    });
     let parse_qp = |params: &CodecParameters| -> Result<i32> {
         match params.options.get("qp") {
             None => Ok(26),
@@ -844,10 +883,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     let mut output_params = params.clone();
     output_params.media_type = oxideav_core::MediaType::Video;
-    output_params.pixel_format = Some(if full_range_input {
-        PixelFormat::YuvJ420P
-    } else {
-        PixelFormat::Yuv420P
+    output_params.pixel_format = Some(match params.pixel_format {
+        Some(pf) if layout != pcm::PcmLayout::default() => pf,
+        _ if full_range_input => PixelFormat::YuvJ420P,
+        _ => PixelFormat::Yuv420P,
     });
     // Parameter sets ride in band in every access unit; no extradata.
     output_params.extradata.clear();
@@ -862,12 +901,111 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         still,
         video_signal,
         ids,
+        layout,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
         time_base: TimeBase::new(i64::from(fps.1), i64::from(fps.0)),
         threads: 1,
     }))
+}
+
+impl H265Encoder {
+    /// The lossless PCM path for every layout other than 8-bit 4:2:0:
+    /// the planes (one byte per sample at 8 bits, little-endian 16-bit
+    /// otherwise; one plane for monochrome) are edge-padded to the
+    /// coded size and written through [`pcm::encode_idr_pcm_au_wide`].
+    fn send_frame_wide(&mut self, v: &oxideav_core::VideoFrame) -> Result<()> {
+        let layout = self.layout;
+        let (sub_w, sub_h) = layout.sub_wh();
+        let planes_needed = if layout.chroma_format_idc == 0 { 1 } else { 3 };
+        if v.planes.len() < planes_needed {
+            return Err(Error::InvalidData(format!(
+                "h265 encode: expected {planes_needed} planes for {:?}, got {}",
+                self.output_params.pixel_format,
+                v.planes.len()
+            )));
+        }
+        let wide = layout.bit_depth > 8;
+        let bps = if wide { 2 } else { 1 };
+        let pack = |idx: usize, w: usize, h: usize, cw: usize, ch: usize| -> Result<Vec<u16>> {
+            let plane = &v.planes[idx];
+            if plane.stride < w * bps || plane.data.len() < plane.stride * (h - 1) + w * bps {
+                return Err(Error::InvalidData(format!(
+                    "h265 encode: plane {idx} too small (stride {}, len {})",
+                    plane.stride,
+                    plane.data.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                let src_row = row.min(h - 1);
+                let line = &plane.data[src_row * plane.stride..src_row * plane.stride + w * bps];
+                if wide {
+                    out.extend(
+                        line.chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]])),
+                    );
+                } else {
+                    out.extend(line.iter().map(|&b| u16::from(b)));
+                }
+                let last = out[out.len() - 1];
+                out.resize(out.len() + (cw - w), last);
+            }
+            Ok(out)
+        };
+        let y = pack(
+            0,
+            self.width,
+            self.height,
+            self.coded_width,
+            self.coded_height,
+        )?;
+        let (cb, cr) = if layout.chroma_format_idc == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let (cw, ch) = (self.width.div_ceil(sub_w), self.height.div_ceil(sub_h));
+            (
+                pack(
+                    1,
+                    cw,
+                    ch,
+                    self.coded_width / sub_w,
+                    self.coded_height / sub_h,
+                )?,
+                pack(
+                    2,
+                    cw,
+                    ch,
+                    self.coded_width / sub_w,
+                    self.coded_height / sub_h,
+                )?,
+            )
+        };
+        let au = pcm::encode_idr_pcm_au_wide(
+            &y,
+            &cb,
+            &cr,
+            self.coded_width,
+            self.coded_height,
+            pcm::PcmAuOptions {
+                conformance_window: self.crop,
+                still: self.still,
+                video_signal: self.video_signal,
+                ids: self.ids,
+                layout,
+                ..pcm::PcmAuOptions::default()
+            },
+        )
+        .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+        let mut pkt = Packet::new(0, self.time_base, au);
+        pkt.pts = v.pts.or(Some(self.frame_index));
+        pkt.dts = pkt.pts;
+        pkt.flags.keyframe = true;
+        self.frame_index += 1;
+        self.ready.push_back(pkt);
+        Ok(())
+    }
 }
 
 impl Encoder for H265Encoder {
@@ -884,6 +1022,9 @@ impl Encoder for H265Encoder {
             Frame::Video(v) => v,
             _ => return Err(Error::InvalidData("h265 encode: video frames only".into())),
         };
+        if self.layout != pcm::PcmLayout::default() {
+            return self.send_frame_wide(v);
+        }
         if v.planes.len() != 3 {
             return Err(Error::InvalidData(format!(
                 "h265 encode: expected 3 planes (yuv420p), got {}",

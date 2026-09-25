@@ -525,6 +525,9 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
             "{mode:?}: an explicit range wins"
         );
     }
+    // The 4:2:2 / 4:4:4 twins are lossless PCM layouts: accepted on
+    // the pcm mode (full range signalled), refused by the intra / inter
+    // coders.
     for pf in [
         PixelFormat::YuvJ422P,
         PixelFormat::YuvJ444P,
@@ -534,7 +537,150 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
         params.width = Some(64);
         params.height = Some(48);
         params.pixel_format = Some(pf);
-        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?}");
+        assert!(oxideav_h265::make_encoder(&params).is_ok(), "{pf:?} pcm");
+        params.options.insert("mode", "intra");
+        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?} intra");
+    }
+}
+
+/// Every HEIC sample layout a producer writes — monochrome, 4:2:0,
+/// 4:2:2, 4:4:4 at 8 / 10 / 12 bits (and 16-bit grey) — encodes as a
+/// lossless PCM still through the registry: the Annex A signalling
+/// matches the layout (Main / Main 10 Still Picture, or a format range
+/// extensions profile with the Table A.2 row's constraint flags plus the
+/// intra / one-picture-only flags), the SPS carries the chroma format
+/// and bit depths, and the registry decoder returns the input samples
+/// exactly (odd sizes cropped per the layout's chroma units).
+#[test]
+fn pcm_still_layout_matrix_is_lossless_and_signalled() {
+    use oxideav_core::PixelFormat;
+    let cases: [(PixelFormat, u8, u8, u8, usize, usize); 12] = [
+        // (format, chroma_format_idc, bit depth, profile idc, w, h)
+        (PixelFormat::Gray8, 0, 8, 4, 37, 21),
+        (PixelFormat::Gray10Le, 0, 10, 4, 18, 14),
+        (PixelFormat::Gray12Le, 0, 12, 4, 16, 16),
+        (PixelFormat::Gray16Le, 0, 16, 4, 20, 17),
+        (PixelFormat::Yuv420P10Le, 1, 10, 2, 33, 19),
+        (PixelFormat::Yuv420P12Le, 1, 12, 4, 32, 32),
+        (PixelFormat::Yuv422P, 2, 8, 4, 35, 17),
+        (PixelFormat::Yuv422P10Le, 2, 10, 4, 34, 18),
+        (PixelFormat::Yuv422P12Le, 2, 12, 4, 16, 16),
+        (PixelFormat::Yuv444P, 3, 8, 4, 31, 23),
+        (PixelFormat::Yuv444P10Le, 3, 10, 4, 17, 15),
+        (PixelFormat::Yuv444P12Le, 3, 12, 4, 40, 24),
+    ];
+    for (pf, cfi, bd, profile, w, h) in cases {
+        let (sw, sh) = match cfi {
+            1 => (2usize, 2usize),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = (w.div_ceil(sw), h.div_ceil(sh));
+        let max = (1u32 << bd) - 1;
+        let sample = |x: usize, y: usize, seed: u32| -> u32 {
+            (x as u32 * 977 + y as u32 * 331 + seed * 7919) % (max + 1)
+        };
+        let wide = bd > 8;
+        let bps = if wide { 2 } else { 1 };
+        let mk = |pw: usize, ph: usize, seed: u32| -> VideoPlane {
+            let mut data = Vec::with_capacity(pw * ph * bps);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let v = sample(x, y, seed);
+                    if wide {
+                        data.extend_from_slice(&(v as u16).to_le_bytes());
+                    } else {
+                        data.push(v as u8);
+                    }
+                }
+            }
+            VideoPlane {
+                stride: pw * bps,
+                data,
+            }
+        };
+        let mut planes = vec![mk(w, h, 1)];
+        if cfi != 0 {
+            planes.push(mk(cw, ch, 2));
+            planes.push(mk(cw, ch, 3));
+        }
+        let src = planes.clone();
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(w as u32);
+        params.height = Some(h as u32);
+        params.pixel_format = Some(pf);
+        params.options.insert("still", "1");
+        let mut enc = oxideav_h265::make_encoder(&params).unwrap_or_else(|e| panic!("{pf:?}: {e}"));
+        assert_eq!(
+            enc.output_params().pixel_format,
+            Some(pf),
+            "{pf:?}: format echo"
+        );
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes,
+        }))
+        .unwrap_or_else(|e| panic!("{pf:?}: send: {e}"));
+        let pkt = enc.receive_packet().expect("one packet");
+        assert!(pkt.flags.keyframe);
+        let stream = pkt.data;
+        if let Ok(dir) = std::env::var("H265_DUMP_DIR") {
+            std::fs::write(format!("{dir}/pcm_{pf:?}_{w}x{h}.hevc"), &stream).expect("dump");
+        }
+        // Signalling.
+        let sps = sps_of(&stream);
+        assert_eq!(sps.chroma_format_idc, cfi, "{pf:?}: chroma_format_idc");
+        assert_eq!(sps.bit_depth_luma(), bd, "{pf:?}: BitDepthY");
+        assert_eq!(sps.bit_depth_chroma(), bd, "{pf:?}: BitDepthC");
+        assert_eq!(sps.ptl.general_profile_idc, profile, "{pf:?}: profile");
+        assert!(
+            sps.ptl.is_still_picture_profile(),
+            "{pf:?}: still signalling"
+        );
+        if profile == 4 {
+            // Table A.2 flags: bits 43..35 of the 48-bit block are the
+            // nine constraint flags in syntax order.
+            let f = sps.ptl.general_constraint_indicator_flags;
+            let flag = |i: u32| (f >> (43 - i)) & 1 == 1;
+            assert_eq!(flag(0), bd <= 12, "{pf:?}: max_12bit");
+            assert_eq!(flag(1), bd <= 10, "{pf:?}: max_10bit");
+            assert_eq!(flag(2), bd <= 8, "{pf:?}: max_8bit");
+            assert_eq!(flag(3), cfi <= 2, "{pf:?}: max_422chroma");
+            assert_eq!(flag(4), cfi <= 1, "{pf:?}: max_420chroma");
+            assert_eq!(flag(5), cfi == 0, "{pf:?}: max_monochrome");
+            assert!(flag(6) && flag(7), "{pf:?}: intra + one_picture_only");
+        }
+        // Lossless round trip through the registry decoder (Annex B
+        // packets), cropped to the caller's size.
+        let mut dparams = CodecParameters::video("h265".into());
+        let mut dec = oxideav_h265::make_decoder(&dparams).expect("decoder");
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), stream.clone()))
+            .expect("send");
+        dec.flush().expect("flush");
+        let out = match dec.receive_frame() {
+            Ok(Frame::Video(v)) => v,
+            other => panic!("{pf:?}: {other:?}"),
+        };
+        dparams.pixel_format = Some(pf);
+        let (ow, oh) = (w.div_ceil(sw) * sw, h.div_ceil(sh) * sh);
+        assert_eq!(out.planes.len(), src.len(), "{pf:?}: plane count");
+        for (i, (o, s)) in out.planes.iter().zip(src.iter()).enumerate() {
+            let (pw, ph) = if i == 0 { (ow, oh) } else { (ow / sw, oh / sh) };
+            assert_eq!(o.stride, pw * bps, "{pf:?}: plane {i} stride");
+            assert_eq!(o.data.len(), pw * ph * bps, "{pf:?}: plane {i} size");
+            // Compare the caller's region; the padding column / row of
+            // an odd size replicates the edge.
+            let (sw_, sh_) = if i == 0 { (w, h) } else { (cw, ch) };
+            for y in 0..sh_ {
+                let a = &o.data[y * o.stride..y * o.stride + sw_ * bps];
+                let b = &s.data[y * s.stride..y * s.stride + sw_ * bps];
+                assert_eq!(a, b, "{pf:?}: plane {i} row {y}");
+            }
+        }
+        assert!(
+            matches!(dec.receive_frame(), Err(Error::Eof)),
+            "{pf:?}: one frame"
+        );
     }
 }
 

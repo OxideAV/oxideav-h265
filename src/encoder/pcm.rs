@@ -38,6 +38,57 @@ const CTB: usize = 1 << CTB_LOG2;
 /// QP only seeds context initialization.
 const SLICE_QP: i32 = 26;
 
+/// The sample layout of a PCM picture: `chroma_format_idc` (0
+/// monochrome, 1 4:2:0, 2 4:2:2, 3 4:4:4) and the bit depth (8..=16,
+/// luma and chroma alike). Selects the Annex A profile signalling
+/// (Main / Main 10 / the Table A.2 format range extensions rows) and
+/// the §7.3.8.7 `pcm_sample_*` widths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcmLayout {
+    /// `chroma_format_idc`.
+    pub chroma_format_idc: u8,
+    /// `BitDepthY == BitDepthC` (8..=16).
+    pub bit_depth: u8,
+}
+
+impl Default for PcmLayout {
+    fn default() -> Self {
+        Self {
+            chroma_format_idc: 1,
+            bit_depth: 8,
+        }
+    }
+}
+
+impl PcmLayout {
+    /// `( SubWidthC, SubHeightC )` (Table 6-1; `(1, 1)` for monochrome,
+    /// whose chroma planes are empty).
+    #[must_use]
+    pub fn sub_wh(&self) -> (usize, usize) {
+        match self.chroma_format_idc {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        }
+    }
+
+    /// Number of samples of one chroma plane of a `width x height`
+    /// picture (0 for monochrome).
+    #[must_use]
+    pub fn chroma_plane_len(&self, width: usize, height: usize) -> usize {
+        if self.chroma_format_idc == 0 {
+            0
+        } else {
+            let (sw, sh) = self.sub_wh();
+            (width / sw) * (height / sh)
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.chroma_format_idc <= 3 && (8..=16).contains(&self.bit_depth)
+    }
+}
+
 /// Per-AU shape options for the PCM encoder.
 #[derive(Debug, Clone)]
 pub struct PcmAuOptions {
@@ -102,6 +153,10 @@ pub struct PcmAuOptions {
     pub video_signal: Option<crate::encoder::intra::VideoSignal>,
     /// The VPS / SPS / PPS ids.
     pub ids: crate::encoder::intra::ParameterSetIds,
+    /// Chroma format + bit depth of the samples (8-bit 4:2:0 by
+    /// default; the `u8` entry points accept only that layout, the
+    /// [`encode_idr_pcm_au_wide`] entry any layout).
+    pub layout: PcmLayout,
 }
 
 impl Default for PcmAuOptions {
@@ -119,6 +174,7 @@ impl Default for PcmAuOptions {
             still: false,
             video_signal: None,
             ids: crate::encoder::intra::ParameterSetIds::default(),
+            layout: PcmLayout::default(),
         }
     }
 }
@@ -280,8 +336,69 @@ fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
 /// `general_one_picture_only_constraint_flag`, then 35 zero bits —
 /// which per A.3.3 also indicates Main 10 Still Picture conformance.
 pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
+    write_ptl_layout(w, level_idc, still, PcmLayout::default());
+}
+
+/// §7.3.3 `profile_tier_level( 1, 0 )` for a sample layout: 8-bit
+/// 4:2:0 is [`write_ptl_cfg`]'s Main / Main Still Picture; 10-bit
+/// 4:2:0 is Main 10 (`general_profile_idc == 2`) — with `still`, the
+/// A.3.3 Main 10 Still Picture indication
+/// (`general_one_picture_only_constraint_flag`); every other layout is
+/// a format range extensions profile (`general_profile_idc == 4`) with
+/// the Table A.2 constraint flags of its row — Monochrome / Monochrome
+/// 10 / 12 / 16, Main 12, Main 4:2:2 10 / 12, Main 4:4:4 / 10 / 12 (or
+/// the 16-bit 4:4:4 Intra row) — plus, for `still`, the
+/// `general_intra_constraint_flag` and
+/// `general_one_picture_only_constraint_flag` (the Main 4:4:4 Still
+/// Picture / Main 4:4:4 16 Still Picture rows; for the other layouts a
+/// strictly tighter indication of the same row).
+pub(crate) fn write_ptl_layout(w: &mut BitWriter, level_idc: u8, still: bool, layout: PcmLayout) {
+    let main_family = layout.chroma_format_idc == 1 && layout.bit_depth == 8;
+    let main10 = layout.chroma_format_idc == 1 && layout.bit_depth == 10;
     w.put_bits(0, 2); // general_profile_space
     w.put_bit(0); // general_tier_flag
+    if main_family {
+        write_ptl_main_tail(w, level_idc, still);
+        return;
+    }
+    let profile_idc: u32 = if main10 { 2 } else { 4 };
+    w.put_bits(profile_idc, 5); // general_profile_idc
+    w.put_bits(1 << (31 - profile_idc), 32); // general_profile_compatibility_flag[ idc ]
+    w.put_bit(1); // general_progressive_source_flag
+    w.put_bit(0); // general_interlaced_source_flag
+    w.put_bit(1); // general_non_packed_constraint_flag
+    w.put_bit(1); // general_frame_only_constraint_flag
+    if main10 {
+        // Compatibility flag 2: general_reserved_zero_7bits,
+        // general_one_picture_only_constraint_flag,
+        // general_reserved_zero_35bits.
+        w.put_bits(0, 7);
+        w.put_bit(u8::from(still));
+        w.put_bits(0, 32);
+        w.put_bits(0, 3);
+    } else {
+        // Profile 4: the nine Table A.2 flags, then
+        // general_reserved_zero_34bits.
+        let bd = layout.bit_depth;
+        w.put_bit(u8::from(bd <= 12)); // general_max_12bit_constraint_flag
+        w.put_bit(u8::from(bd <= 10)); // general_max_10bit_constraint_flag
+        w.put_bit(u8::from(bd <= 8)); // general_max_8bit_constraint_flag
+        w.put_bit(u8::from(layout.chroma_format_idc <= 2)); // general_max_422chroma_constraint_flag
+        w.put_bit(u8::from(layout.chroma_format_idc <= 1)); // general_max_420chroma_constraint_flag
+        w.put_bit(u8::from(layout.chroma_format_idc == 0)); // general_max_monochrome_constraint_flag
+        w.put_bit(u8::from(still)); // general_intra_constraint_flag
+        w.put_bit(u8::from(still)); // general_one_picture_only_constraint_flag
+        w.put_bit(1); // general_lower_bit_rate_constraint_flag
+        w.put_bits(0, 32);
+        w.put_bits(0, 2); // general_reserved_zero_34bits
+    }
+    w.put_bit(0); // general_inbld_flag
+    w.put_bits(u32::from(level_idc), 8); // general_level_idc
+}
+
+/// The Main / Main Still Picture `profile_tier_level( )` body after
+/// `general_profile_space` / `general_tier_flag`.
+fn write_ptl_main_tail(w: &mut BitWriter, level_idc: u8, still: bool) {
     w.put_bits(if still { 3 } else { 1 }, 5); // general_profile_idc
                                               // general_profile_compatibility_flag[0..32]: Main (1) is also
                                               // decodable by Main 10 (2) decoders; a still adds flag 3.
@@ -353,14 +470,18 @@ fn write_sps(
     still: bool,
     video_signal: Option<&crate::encoder::intra::VideoSignal>,
     ids: crate::encoder::intra::ParameterSetIds,
+    layout: PcmLayout,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(u32::from(ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl_cfg(&mut w, level_idc, still);
+    write_ptl_layout(&mut w, level_idc, still, layout);
     w.ue(u32::from(ids.sps)); // sps_seq_parameter_set_id
-    w.ue(1); // chroma_format_idc = 4:2:0
+    w.ue(u32::from(layout.chroma_format_idc)); // chroma_format_idc
+    if layout.chroma_format_idc == 3 {
+        w.put_bit(0); // separate_colour_plane_flag
+    }
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
     match conformance_window {
@@ -373,8 +494,8 @@ fn write_sps(
             w.ue(bottom); // conf_win_bottom_offset
         }
     }
-    w.ue(0); // bit_depth_luma_minus8
-    w.ue(0); // bit_depth_chroma_minus8
+    w.ue(u32::from(layout.bit_depth - 8)); // bit_depth_luma_minus8
+    w.ue(u32::from(layout.bit_depth - 8)); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     w.put_bit(1); // sps_sub_layer_ordering_info_present_flag
     w.ue(u32::from(!still)); // sps_max_dec_pic_buffering_minus1[0] (0 for a still)
@@ -390,8 +511,8 @@ fn write_sps(
     w.put_bit(0); // amp_enabled_flag
     w.put_bit(u8::from(sao_enabled)); // sample_adaptive_offset_enabled_flag
     w.put_bit(1); // pcm_enabled_flag
-    w.put_bits(7, 4); // pcm_sample_bit_depth_luma_minus1 (8-bit)
-    w.put_bits(7, 4); // pcm_sample_bit_depth_chroma_minus1
+    w.put_bits(u32::from(layout.bit_depth - 1), 4); // pcm_sample_bit_depth_luma_minus1
+    w.put_bits(u32::from(layout.bit_depth - 1), 4); // pcm_sample_bit_depth_chroma_minus1
     w.ue(CTB_LOG2 - 3); // log2_min_pcm_luma_coding_block_size_minus3 (16)
     w.ue(0); // log2_diff_max_min_pcm_luma_coding_block_size
     w.put_bit(u8::from(pcm_loop_filter_disabled)); // pcm_loop_filter_disabled_flag
@@ -535,13 +656,14 @@ pub(crate) fn write_pps_grid(
 /// next dependent segment's start) — each segment gets a fresh
 /// §9.3.5.2 arithmetic engine over the shared context state.
 fn write_idr_slice_segments(
-    y: &[u8],
-    cb: &[u8],
-    cr: &[u8],
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
     width: usize,
     height: usize,
     opts: &PcmAuOptions,
 ) -> Vec<Vec<u8>> {
+    let layout = opts.layout;
     let sao = opts.sao_luma_band || opts.sao_luma_eo_vertical;
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
@@ -598,7 +720,9 @@ fn write_idr_slice_segments(
             if sao {
                 // SPS SAO enabled: the slice SAO flags are present.
                 w.put_bit(1); // slice_sao_luma_flag
-                w.put_bit(0); // slice_sao_chroma_flag (4:2:0 present)
+                if layout.chroma_format_idc != 0 {
+                    w.put_bit(0); // slice_sao_chroma_flag (ChromaArrayType != 0)
+                }
             }
             w.se(SLICE_QP - 26); // slice_qp_delta
             if opts.deblocking || sao {
@@ -663,7 +787,9 @@ fn write_idr_slice_segments(
                     cabac.encode_bypass_bits(&mut w, 1, 2);
                 }
             }
-            write_pcm_ctu(&mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0);
+            write_pcm_ctu(
+                &mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0, layout,
+            );
             // end_of_slice_segment_flag: 1 only at the segment's last CTB.
             cabac.encode_terminate(&mut w, u8::from(addr == end - 1));
         }
@@ -686,27 +812,34 @@ fn write_pcm_ctu(
     w: &mut BitWriter,
     cabac: &mut CabacEncoder,
     ctxs: &mut SliceContexts,
-    y: &[u8],
-    cb: &[u8],
-    cr: &[u8],
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
     width: usize,
     x0: usize,
     y0: usize,
+    layout: PcmLayout,
 ) {
-    let cw = width / 2;
+    let bits = layout.bit_depth;
     cabac.encode_decision(w, &mut ctxs.part_mode[0], 1);
     cabac.encode_terminate(w, 1);
     w.align_zero();
     for j in 0..CTB {
         for i in 0..CTB {
-            w.put_bits(u32::from(y[(y0 + j) * width + x0 + i]), 8);
+            w.put_bits(u32::from(y[(y0 + j) * width + x0 + i]), bits);
         }
     }
-    let (cx, cy) = (x0 / 2, y0 / 2);
-    for plane in [cb, cr] {
-        for j in 0..CTB / 2 {
-            for i in 0..CTB / 2 {
-                w.put_bits(u32::from(plane[(cy + j) * cw + cx + i]), 8);
+    if layout.chroma_format_idc != 0 {
+        // §7.3.8.7: chroma blocks of ( CTB / SubWidthC ) x ( CTB /
+        // SubHeightC ), Cb then Cr.
+        let (sw, sh) = layout.sub_wh();
+        let cw = width / sw;
+        let (cx, cy) = (x0 / sw, y0 / sh);
+        for plane in [cb, cr] {
+            for j in 0..CTB / sh {
+                for i in 0..CTB / sw {
+                    w.put_bits(u32::from(plane[(cy + j) * cw + cx + i]), bits);
+                }
             }
         }
     }
@@ -743,14 +876,15 @@ pub(crate) fn escaped_len(bytes: &[u8], mut zero_run: u32) -> (usize, u32) {
 /// `entry_point_offset_minus1[]` block (offsets in CODED bytes,
 /// emulation-prevention included) in the slice header.
 fn write_tiled_idr_slice(
-    y: &[u8],
-    cb: &[u8],
-    cr: &[u8],
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
     width: usize,
     height: usize,
     opts: &PcmAuOptions,
     grid: &TileGrid,
 ) -> Vec<u8> {
+    let layout = opts.layout;
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let total = ctbs_x * ctbs_y;
@@ -774,7 +908,9 @@ fn write_tiled_idr_slice(
         let rs = tiling.ctb_addr_ts_to_rs(ts) as usize;
         let x0 = (rs % ctbs_x) * CTB;
         let y0 = (rs / ctbs_x) * CTB;
-        write_pcm_ctu(&mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0);
+        write_pcm_ctu(
+            &mut w, &mut cabac, &mut ctxs, y, cb, cr, width, x0, y0, layout,
+        );
         let last_of_pic = ts == total as u32 - 1;
         // end_of_slice_segment_flag: 1 only at the picture's last CTB.
         cabac.encode_terminate(&mut w, u8::from(last_of_pic));
@@ -913,6 +1049,46 @@ fn encode_au(
     height: usize,
     opts: PcmAuOptions,
 ) -> Result<Vec<u8>, PcmEncodeError> {
+    // The u8 entry points are the 8-bit 4:2:0 layout; widen and share
+    // the general writer (bit-identical output for that layout).
+    if opts.layout != PcmLayout::default() {
+        return Err(PcmEncodeError::BadDimensions { width, height });
+    }
+    let widen = |p: &[u8]| -> Vec<u16> { p.iter().map(|&v| u16::from(v)).collect() };
+    encode_au_wide(&widen(y), &widen(cb), &widen(cr), width, height, opts)
+}
+
+/// Encode one picture of any [`PcmLayout`] (`opts.layout`) as a
+/// lossless PCM IDR access unit: `y` is `width x height` samples,
+/// `cb` / `cr` are `PcmLayout::chroma_plane_len` samples each (empty
+/// for monochrome), every sample below `1 << bit_depth`.
+///
+/// # Errors
+/// [`PcmEncodeError`] on bad dimensions / plane sizes / layout, or a
+/// sample outside the bit depth.
+pub fn encode_idr_pcm_au_wide(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    opts: PcmAuOptions,
+) -> Result<Vec<u8>, PcmEncodeError> {
+    encode_au_wide(y, cb, cr, width, height, opts)
+}
+
+fn encode_au_wide(
+    y: &[u16],
+    cb: &[u16],
+    cr: &[u16],
+    width: usize,
+    height: usize,
+    opts: PcmAuOptions,
+) -> Result<Vec<u8>, PcmEncodeError> {
+    let layout = opts.layout;
+    if !layout.valid() {
+        return Err(PcmEncodeError::BadDimensions { width, height });
+    }
     let segments = opts.segments;
     if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
         return Err(PcmEncodeError::BadDimensions { width, height });
@@ -974,20 +1150,28 @@ fn encode_au(
         }
         let _ = g;
     }
-    let check = |plane: &'static str, buf: &[u8], expected: usize| {
+    let max_sample = (1u32 << layout.bit_depth) - 1;
+    let check = |plane: &'static str, buf: &[u16], expected: usize| {
         if buf.len() != expected {
-            Err(PcmEncodeError::PlaneSize {
+            return Err(PcmEncodeError::PlaneSize {
                 plane,
                 expected,
                 got: buf.len(),
-            })
-        } else {
-            Ok(())
+            });
         }
+        if buf.iter().any(|&v| u32::from(v) > max_sample) {
+            return Err(PcmEncodeError::PlaneSize {
+                plane,
+                expected,
+                got: usize::MAX,
+            });
+        }
+        Ok(())
     };
     check("y", y, width * height)?;
-    check("cb", cb, width * height / 4)?;
-    check("cr", cr, width * height / 4)?;
+    let chroma_len = layout.chroma_plane_len(width, height);
+    check("cb", cb, chroma_len)?;
+    check("cr", cr, chroma_len)?;
 
     let level_idc = grid.as_ref().map_or_else(
         || level_idc_for_dims(width, height),
@@ -1016,6 +1200,7 @@ fn encode_au(
                 opts.still,
                 opts.video_signal.as_ref(),
                 opts.ids,
+                layout,
             ),
         ), // SPS_NUT
         nal_unit(
