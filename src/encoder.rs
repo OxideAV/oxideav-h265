@@ -38,6 +38,8 @@ mod palette_streams;
 pub mod pcm;
 pub mod rate;
 #[cfg(test)]
+mod layered_streams;
+#[cfg(test)]
 mod rdpcm_streams;
 #[cfg(test)]
 mod scc_streams;
