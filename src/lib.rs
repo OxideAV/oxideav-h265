@@ -274,6 +274,8 @@ pub mod encoder;
 #[doc(hidden)]
 pub mod hrd;
 pub mod hvcc;
+/// Annex H inter-layer reference picture derivation (resampling).
+pub mod ilref;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod inter_pred;

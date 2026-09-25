@@ -196,6 +196,43 @@ impl Dpb {
         self.entries.push(entry);
     }
 
+    /// Remove the entry at `idx` (a temporary Annex H inter-layer
+    /// reference picture once its picture is decoded). Indices above
+    /// `idx` shift down by one.
+    pub fn remove(&mut self, idx: usize) -> Option<DpbEntry> {
+        (idx < self.entries.len()).then(|| self.entries.remove(idx))
+    }
+
+    /// Overwrite the reference marking of the entry at `idx` (the
+    /// G.8.1.3 / H.8.1.3 "used for long-term reference" marking of an
+    /// inter-layer reference picture and its F.8.1.6 restoration).
+    pub fn set_marking(&mut self, idx: usize, marking: Marking) {
+        if let Some(e) = self.entries.get_mut(idx) {
+            e.marking = marking;
+        }
+    }
+
+    /// F.8.3.1 — decrement `PicOrderCntVal` of every stored picture of
+    /// `layer_id` by `delta` (a POC reset's `DeltaPocVal`).
+    pub fn shift_pocs(&mut self, layer_id: u8, delta: i32) {
+        for e in &mut self.entries {
+            if e.layer_id == layer_id {
+                e.poc = e.poc.wrapping_sub(delta);
+            }
+        }
+    }
+
+    /// Mark every stored picture of `layer_id` "unused for reference"
+    /// (the F.8.1.3 `LayerResetFlag` / F.8.3.2 `NoClrasOutputFlag`
+    /// clearing).
+    pub fn unmark_layer(&mut self, layer_id: u8) {
+        for e in &mut self.entries {
+            if e.layer_id == layer_id {
+                e.marking = Marking::Unused;
+            }
+        }
+    }
+
     /// Find a stored picture by exact `PicOrderCntVal` and `nuh_layer_id`.
     #[must_use]
     pub fn find_by_poc(&self, poc: i32, layer_id: u8) -> Option<&DpbEntry> {
@@ -350,9 +387,18 @@ impl Dpb {
         // NumRpsCurrTempList0 entries are produced.
         let active0 = (params.num_ref_idx_l0_active_minus1 + 1) as usize;
         let num_temp0 = active0.max(params.num_pic_total_curr as usize);
+        // F.8.3.4 eq. F-65: StCurrBefore, InterLayer0, StCurrAfter,
+        // LtCurr, InterLayer1 (+ currPic) — the inter-layer sets carry
+        // no `rIdx < NumRpsCurrTempList0` guard.
         let temp0 = build_temp_list(
             num_temp0,
-            &[&rps.st_curr_before, &rps.st_curr_after, &rps.lt_curr],
+            &[
+                (rps.st_curr_before.as_slice(), true),
+                (params.inter_layer0, false),
+                (rps.st_curr_after.as_slice(), true),
+                (rps.lt_curr.as_slice(), true),
+                (params.inter_layer1, false),
+            ],
             params.curr_pic_ref_enabled,
         );
         let mut list0 = apply_list_modification(&temp0, active0, params.list_entry_l0);
@@ -368,9 +414,17 @@ impl Dpb {
             // LtCurr (note the swapped first two sets).
             let active1 = (params.num_ref_idx_l1_active_minus1 + 1) as usize;
             let num_temp1 = active1.max(params.num_pic_total_curr as usize);
+            // Eq. F-67: StCurrAfter, InterLayer1, StCurrBefore, LtCurr,
+            // InterLayer0 (+ currPic).
             let temp1 = build_temp_list(
                 num_temp1,
-                &[&rps.st_curr_after, &rps.st_curr_before, &rps.lt_curr],
+                &[
+                    (rps.st_curr_after.as_slice(), true),
+                    (params.inter_layer1, false),
+                    (rps.st_curr_before.as_slice(), true),
+                    (rps.lt_curr.as_slice(), true),
+                    (params.inter_layer0, false),
+                ],
                 params.curr_pic_ref_enabled,
             );
             Some(apply_list_modification(
@@ -412,6 +466,11 @@ pub struct RefPicListParams<'a> {
     /// `pps_curr_pic_ref_enabled_flag` — appends the [`CURR_PIC`]
     /// sentinel per equations 8-8 / 8-9 / 8-10.
     pub curr_pic_ref_enabled: bool,
+    /// `RefPicSetInterLayer0` (G.8.1.3 / H.8.1.3) as DPB entry indices —
+    /// empty for a single-layer picture.
+    pub inter_layer0: &'a [Option<usize>],
+    /// `RefPicSetInterLayer1`.
+    pub inter_layer1: &'a [Option<usize>],
 }
 
 /// The §8.3.2 RPS resolved to DPB entry indices. A `None` is the spec's
@@ -497,17 +556,20 @@ pub fn no_backward_pred_flag(dpb: &Dpb, lists: &RefPicLists, curr_poc: i32) -> b
 /// 8-8 / 8-10).
 fn build_temp_list(
     len: usize,
-    sets: &[&[Option<usize>]],
+    sets: &[(&[Option<usize>], bool)],
     curr_pic_ref_enabled: bool,
 ) -> Vec<Option<usize>> {
     let mut temp = Vec::with_capacity(len);
-    if sets.iter().all(|s| s.is_empty()) && !curr_pic_ref_enabled {
+    if sets.iter().all(|(s, _)| s.is_empty()) && !curr_pic_ref_enabled {
         return temp;
     }
     while temp.len() < len {
-        for set in sets {
+        for (set, guarded) in sets {
             for &e in *set {
-                if temp.len() >= len {
+                // The temporal sets stop at NumRpsCurrTempListX; the
+                // Annex F inter-layer sets are appended unguarded
+                // (eqs F-65 / F-67).
+                if *guarded && temp.len() >= len {
                     break;
                 }
                 temp.push(e);

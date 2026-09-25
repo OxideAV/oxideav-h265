@@ -69,7 +69,7 @@ pub struct PictureRefState {
 
 /// The per-slice §8.3.4 / §8.3.5 inputs (the reference-list sizing + the
 /// collocated-picture selectors from the slice segment header).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct SliceRefParams {
     /// `true` for a P or B slice (builds reference lists).
     pub is_inter: bool,
@@ -90,12 +90,45 @@ pub struct SliceRefParams {
     /// `pps_curr_pic_ref_enabled_flag` — the §8.3.4 currPic append
     /// (intra block copy).
     pub curr_pic_ref_enabled: bool,
+    /// `list_entry_l0[ ]` when `ref_pic_list_modification_flag_l0`
+    /// (§7.3.6.2) — reorders `RefPicListTemp0` (eq. 8-9 / F-66).
+    pub list_entry_l0: Option<Vec<u32>>,
+    /// `list_entry_l1[ ]` when `ref_pic_list_modification_flag_l1`.
+    pub list_entry_l1: Option<Vec<u32>>,
+}
+
+/// The Annex F per-picture inputs of a `nuh_layer_id > 0` picture (or
+/// of any picture of a multi-layer bitstream): the F.8.3.1 POC form
+/// and the G.8.1.3 / H.8.1.3 inter-layer reference picture sets.
+#[derive(Debug, Clone, Default)]
+pub struct LayeredPictureInputs {
+    /// `true` when the F.8.3.1 POC derivation applies (a multi-layer
+    /// bitstream); `false` keeps the §8.3.1 single-layer form.
+    pub annex_f_poc: bool,
+    /// `FirstPicInLayerDecodedFlag[ nuh_layer_id ]` BEFORE this picture.
+    pub first_pic_in_layer_decoded: bool,
+    /// `poc_msb_cycle_val` when `poc_msb_cycle_val_present_flag`.
+    pub poc_msb_cycle_val: Option<u32>,
+    /// `PicOrderCntVal` computed by the driver for a POC resetting
+    /// picture (F.8.3.1 eq. F-61); overrides the eq. F-62 derivation.
+    pub poc_override: Option<i32>,
+    /// `true` when the picture updates `PrevPicOrderCnt[ nuh_layer_id ]`
+    /// (F.8.3.1: `TemporalId == 0`, not RASL / RADL / SLNR,
+    /// `discardable_flag == 0`).
+    pub prev_poc_anchor: bool,
+    /// `RefPicSetInterLayer0` as DPB entry indices (already marked
+    /// "used for long-term reference" by the driver).
+    pub inter_layer0: Vec<Option<usize>>,
+    /// `RefPicSetInterLayer1`.
+    pub inter_layer1: Vec<Option<usize>>,
 }
 
 /// The cross-picture decode state for one coded video sequence.
 #[derive(Debug, Default)]
 pub struct PictureSequenceState {
-    poc_state: PocState,
+    /// `PrevPicOrderCnt[ nuh_layer_id ]` — one §8.3.1 / F.8.3.1 state
+    /// per layer.
+    poc_states: std::collections::BTreeMap<u8, PocState>,
     dpb: Dpb,
 }
 
@@ -112,6 +145,18 @@ impl PictureSequenceState {
         &self.dpb
     }
 
+    /// Mutably borrow the decoded-picture buffer (the Annex F/G/H
+    /// driver's inter-layer marking, POC resets and temporary
+    /// resampled references).
+    pub fn dpb_mut(&mut self) -> &mut Dpb {
+        &mut self.dpb
+    }
+
+    /// The per-layer POC state (`PrevPicOrderCnt[ layer_id ]`).
+    pub fn poc_state_mut(&mut self, layer_id: u8) -> &mut PocState {
+        self.poc_states.entry(layer_id).or_default()
+    }
+
     /// §8.3.1 → §8.3.2 → §8.3.4 → §8.3.5 — run the per-picture reference
     /// derivation for a picture about to be decoded.
     ///
@@ -125,14 +170,52 @@ impl PictureSequenceState {
         header: &PictureHeaderInfo,
         slice: &SliceRefParams,
     ) -> PictureRefState {
-        // Step 1 — §8.3.1 POC.
-        let poc = self.poc_state.decode_picture_poc(
-            header.nal_kind,
-            header.temporal_id,
-            header.no_rasl_output,
-            header.poc_lsb,
-            header.max_poc_lsb,
-        );
+        self.begin_picture_layered(header, slice, &LayeredPictureInputs::default())
+    }
+
+    /// [`Self::begin_picture`] with the Annex F inputs: the F.8.3.1 POC
+    /// form (per-layer `PrevPicOrderCnt`, eq. F-62) and the inter-layer
+    /// reference picture sets spliced into `RefPicListTemp0/1` per
+    /// eqs F-65 / F-67.
+    pub fn begin_picture_layered(
+        &mut self,
+        header: &PictureHeaderInfo,
+        slice: &SliceRefParams,
+        layered: &LayeredPictureInputs,
+    ) -> PictureRefState {
+        // Step 1 — §8.3.1 / F.8.3.1 POC, per layer.
+        let poc_state = self.poc_states.entry(header.layer_id).or_default();
+        let poc = if layered.annex_f_poc {
+            let poc = match layered.poc_override {
+                Some(val) => PicOrderCnt {
+                    msb: val.wrapping_sub(header.poc_lsb as i32),
+                    lsb: header.poc_lsb,
+                    val,
+                },
+                None => poc_state.derive_f62(
+                    header.nal_kind.is_idr(),
+                    layered.first_pic_in_layer_decoded,
+                    header.poc_lsb,
+                    header.max_poc_lsb,
+                    layered.poc_msb_cycle_val,
+                ),
+            };
+            // F.8.3.1: PrevPicOrderCnt[ lId ] follows a non-RASL /
+            // RADL / SLNR picture with TemporalId 0 and
+            // discardable_flag 0.
+            if layered.prev_poc_anchor {
+                poc_state.update_prev_tid0(poc);
+            }
+            poc
+        } else {
+            poc_state.decode_picture_poc(
+                header.nal_kind,
+                header.temporal_id,
+                header.no_rasl_output,
+                header.poc_lsb,
+                header.max_poc_lsb,
+            )
+        };
 
         // Step 2 — §8.3.2 RPS POC lists + DPB marking.
         let lists = build_rps_poc_lists(
@@ -156,9 +239,11 @@ impl PictureSequenceState {
                     num_ref_idx_l1_active_minus1: slice.num_ref_idx_l1_active_minus1,
                     num_pic_total_curr: slice.num_pic_total_curr,
                     is_b: slice.is_b,
-                    list_entry_l0: None,
-                    list_entry_l1: None,
+                    list_entry_l0: slice.list_entry_l0.as_deref(),
+                    list_entry_l1: slice.list_entry_l1.as_deref(),
                     curr_pic_ref_enabled: slice.curr_pic_ref_enabled,
+                    inter_layer0: &layered.inter_layer0,
+                    inter_layer1: &layered.inter_layer1,
                 },
             ))
         } else {
@@ -248,6 +333,8 @@ mod tests {
             collocated_from_l0_flag: true,
             collocated_ref_idx: 0,
             curr_pic_ref_enabled: false,
+            list_entry_l0: None,
+            list_entry_l1: None,
         }
     }
 

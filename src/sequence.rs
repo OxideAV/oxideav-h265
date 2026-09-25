@@ -20,8 +20,10 @@ use crate::availability::{PictureTiling, TilingParams};
 use crate::bitreader::BitReader;
 use crate::cabac::{init_type, CabacEngine};
 use crate::ctx_init::SliceContexts;
+use crate::decode::LayeredPictureInputs;
 use crate::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
-use crate::dpb::{LongTermEntry, RefPicLists};
+use crate::dpb::{DpbEntry, LongTermEntry, Marking, RefPicLists};
+use crate::ilref::{resample_motion, resample_picture, IlRefGeometry, LayerFormat};
 use crate::inter_pred::WpListWeights;
 use crate::inter_recon::{
     reconstruct_inter_picture, InterSliceContext, PlacedInterCtu, RefListAccess, SliceWpTables,
@@ -32,6 +34,7 @@ use crate::poc::NalKind;
 use crate::pps::{PicParameterSet, PpsError};
 use crate::recon::{ReconError, ReconParams};
 use crate::residual::ResidualCodingError;
+use crate::slice::SliceLayerContext;
 use crate::slice::{SliceError, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType};
 use crate::slice_data::{
     decode_coding_tree_unit_in_picture, end_of_slice_segment_flag, CodingTreeUnit,
@@ -40,6 +43,7 @@ use crate::slice_data::{
 use crate::sps::{
     MaterializedShortTermRefPicSet, SeqParameterSet, ShortTermRefPicSetMaterializeError, SpsError,
 };
+use crate::vps::HevcVps;
 
 /// NAL unit type: video parameter set (Table 7-1).
 const NAL_VPS: u8 = 32;
@@ -154,6 +158,13 @@ pub struct DecodedFrame {
     /// ([`DecodedFrame::output_picture`]). Equal to the whole coded
     /// picture when `conformance_window_flag == 0`.
     pub crop: CropWindow,
+    /// `nuh_layer_id` of the picture (0 for a single-layer stream).
+    pub layer_id: u8,
+    /// `ViewId[ nuh_layer_id ]` from the VPS extension (F.7.4.3.1.1) —
+    /// 0 for a single-layer stream or a non-multiview layer.
+    pub view_id: u16,
+    /// Index of the access unit the picture belongs to (decode order).
+    pub au_index: u64,
 }
 
 /// A §7.4.3.2.1 output cropping rectangle in luma samples: the
@@ -250,10 +261,143 @@ struct SegmentData {
     header: SliceSegmentHeader,
 }
 
+/// Which layers of an Annex F multi-layer bitstream to decode and
+/// output (the F.8.1.2 `TargetOlsIdx` / F.10.1 sub-bitstream selection).
+/// The default decodes every layer of the highest output layer set and
+/// outputs that set's output layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayerTarget {
+    /// The highest output layer set of the VPS (`NumOutputLayerSets − 1`).
+    #[default]
+    HighestOls,
+    /// Output layer set `ols_idx` (0 = the base layer alone).
+    Ols(usize),
+    /// One layer by `nuh_layer_id`: decodes it plus its reference layers,
+    /// outputs it alone.
+    Layer(u8),
+    /// One view by `ViewId` (Annex G): the first layer carrying it, as
+    /// [`Self::Layer`].
+    View(u16),
+}
+
+/// The layers selected by a [`LayerTarget`] against the active VPS.
+#[derive(Debug, Clone, Default)]
+struct LayerPlan {
+    /// Layers to decode (`nuh_layer_id`), sorted.
+    decode: Vec<u8>,
+    /// Layers whose pictures are output.
+    output: Vec<u8>,
+    /// `true` once derived from a VPS with `vps_extension( )` and more
+    /// than one layer — enables the Annex F decoding processes.
+    multi_layer: bool,
+}
+
+impl LayerPlan {
+    fn single() -> Self {
+        Self {
+            decode: vec![0],
+            output: vec![0],
+            multi_layer: false,
+        }
+    }
+
+    fn from_vps(vps: &HevcVps, target: LayerTarget) -> Self {
+        let Some(ext) = vps.extension.as_ref() else {
+            return Self::single();
+        };
+        let m = &ext.layers;
+        if m.layer_id_in_nuh.len() < 2 {
+            return Self::single();
+        }
+        let layer_of_view = |v: u16| {
+            m.layer_id_in_nuh
+                .iter()
+                .copied()
+                .find(|&id| m.view_id_of(id) == v)
+        };
+        let single_layer = match target {
+            LayerTarget::Layer(l) => Some(l),
+            LayerTarget::View(v) => layer_of_view(v),
+            _ => None,
+        };
+        let (mut decode, output) = if let Some(l) = single_layer {
+            let mut d = m
+                .id_ref_layer
+                .get(usize::from(l))
+                .cloned()
+                .unwrap_or_default();
+            d.push(l);
+            (d, vec![l])
+        } else {
+            let ols = match target {
+                LayerTarget::Ols(i) => i.min(m.num_output_layer_sets().saturating_sub(1)),
+                _ => m.num_output_layer_sets().saturating_sub(1),
+            };
+            let ids = m.ols_layer_ids(ols);
+            let necessary: Vec<u8> = ids
+                .iter()
+                .zip(
+                    m.necessary_layer_flag
+                        .get(ols)
+                        .map_or(&[][..], Vec::as_slice)
+                        .iter(),
+                )
+                .filter(|(_, &n)| n)
+                .map(|(&id, _)| id)
+                .collect();
+            let decode = if necessary.is_empty() {
+                ids.to_vec()
+            } else {
+                necessary
+            };
+            (decode, m.ols_output_layer_ids(ols))
+        };
+        decode.sort_unstable();
+        decode.dedup();
+        if decode.is_empty() {
+            return Self::single();
+        }
+        Self {
+            decode,
+            output,
+            multi_layer: true,
+        }
+    }
+}
+
+/// Per-layer Annex F decoding state (F.8.1.3 / F.8.3.1).
+#[derive(Debug, Clone, Copy, Default)]
+struct LayerState {
+    /// `FirstPicInLayerDecodedFlag[ nuh_layer_id ]`.
+    first_pic_decoded: bool,
+    /// `LayerInitializedFlag[ nuh_layer_id ]`.
+    initialized: bool,
+    /// `PocDecrementedInDPBFlag[ nuh_layer_id ]`.
+    poc_decremented: bool,
+}
+
+/// The access unit being assembled (F.7.4.2.4.4).
+#[derive(Debug, Default)]
+struct AccessUnit {
+    /// Decode-order index of the current access unit.
+    index: u64,
+    /// `(nuh_layer_id, DPB index)` of the pictures decoded in it.
+    pictures: Vec<(u8, usize)>,
+    /// Highest `nuh_layer_id` decoded in it (a picture with a lower or
+    /// equal id starts the next access unit).
+    max_layer: Option<u8>,
+    /// A VCL NAL unit has been seen in this access unit.
+    seen_vcl: bool,
+    /// `poc_reset_period_id` of the current POC resetting period.
+    poc_reset_period: Option<u8>,
+}
+
 /// The whole-bitstream decoder: parameter-set activation + per-picture
-/// slice-data decode + the §8.3 reference cycle.
+/// slice-data decode + the §8.3 reference cycle, and the Annex F/G/H
+/// multi-layer processes when the VPS declares more than one layer.
 #[derive(Debug, Default)]
 pub struct SequenceDecoder {
+    vps: BTreeMap<u8, HevcVps>,
     sps: BTreeMap<u8, SeqParameterSet>,
     pps: BTreeMap<u8, PicParameterSet>,
     state: PictureSequenceState,
@@ -264,6 +408,10 @@ pub struct SequenceDecoder {
     /// Debug: tolerate an end_of_slice_segment_flag mismatch (decode
     /// as much as possible instead of erroring).
     tolerant: bool,
+    target: LayerTarget,
+    plan: Option<LayerPlan>,
+    layers: BTreeMap<u8, LayerState>,
+    au: AccessUnit,
 }
 
 impl SequenceDecoder {
@@ -278,6 +426,42 @@ impl SequenceDecoder {
     #[doc(hidden)]
     pub fn set_tolerant(&mut self, tolerant: bool) {
         self.tolerant = tolerant;
+    }
+
+    /// Select the layers / views to decode and output of an Annex F
+    /// multi-layer bitstream (see [`LayerTarget`]). Takes effect for the
+    /// pictures pushed after the call; single-layer bitstreams ignore it.
+    pub fn set_layer_target(&mut self, target: LayerTarget) {
+        self.target = target;
+        self.plan = None;
+    }
+
+    /// The layers this decoder decodes / outputs once a VPS has been
+    /// seen: `(decoded nuh_layer_ids, output nuh_layer_ids)`.
+    #[must_use]
+    pub fn layer_plan(&self) -> (Vec<u8>, Vec<u8>) {
+        self.plan
+            .as_ref()
+            .map_or((vec![0], vec![0]), |p| (p.decode.clone(), p.output.clone()))
+    }
+
+    /// The active VPS (the one the most recently activated SPS refers
+    /// to), if any.
+    fn active_vps(&self) -> Option<&HevcVps> {
+        let vps_id = self.sps.values().next_back().map(|s| s.vps_id)?;
+        self.vps.get(&vps_id)
+    }
+
+    /// Ensure the layer plan is derived from the active VPS.
+    fn plan(&mut self) -> LayerPlan {
+        if let Some(p) = &self.plan {
+            return p.clone();
+        }
+        let p = self
+            .active_vps()
+            .map_or_else(LayerPlan::single, |v| LayerPlan::from_vps(v, self.target));
+        self.plan = Some(p.clone());
+        p
     }
 
     /// Feed a whole Annex B byte stream, decoding every access unit.
@@ -303,11 +487,36 @@ impl SequenceDecoder {
             escaped,
         } = unit;
         if header.is_vcl() {
-            // §7.4.2.4.4: a VCL NAL with first_slice_segment_in_pic_flag
-            // set starts a new access unit.
+            // §7.4.2.4.4 / F.7.4.2.4.4: a VCL NAL with
+            // first_slice_segment_in_pic_flag set starts a new picture;
+            // a picture whose nuh_layer_id does not exceed the highest
+            // layer already in the access unit (or that follows an
+            // AU-starting non-VCL NAL unit) starts a new access unit.
             let first_in_pic = rbsp.first().is_some_and(|b| b & 0x80 != 0);
             if first_in_pic {
                 self.finish_picture()?;
+            }
+            let plan = self.plan();
+            if !plan.decode.contains(&header.nuh_layer_id) {
+                // F.10.1 sub-bitstream extraction: layers outside the
+                // target are dropped.
+                return Ok(());
+            }
+            if first_in_pic {
+                // F.7.4.2.4.4: the pictures of one access unit carry
+                // increasing nuh_layer_id; a first slice whose layer
+                // does not exceed the highest one already decoded in
+                // the access unit starts the next one. (Parameter sets
+                // and SEI between two pictures belong to whichever
+                // access unit the next VCL NAL unit starts — they do
+                // not open one by themselves.)
+                let new_au = self.au.max_layer.map_or(true, |m| header.nuh_layer_id <= m);
+                if new_au && self.au.seen_vcl {
+                    self.au.index += 1;
+                    self.au.pictures.clear();
+                    self.au.max_layer = None;
+                }
+                self.au.seen_vcl = true;
             }
             let pps_id = peek_slice_pps_id(&rbsp, header.nal_unit_type)?;
             let pps = self
@@ -324,7 +533,22 @@ impl SequenceDecoder {
                     kind: "sps",
                     id: pps.sps_id,
                 })?;
-            let parsed = SliceSegmentHeader::parse(&rbsp, header.nal_unit_type, sps, pps)?;
+            // The Annex F header form applies to every picture of a
+            // multi-layer bitstream (the base layer carries the
+            // poc_reset_* extension too); a single-layer stream keeps
+            // the base-specification parse.
+            let layer_ctx = self.vps.get(&sps.vps_id).and_then(|v| {
+                (plan.multi_layer || pps.pps_multilayer_extension.is_some()).then(|| {
+                    SliceLayerContext::from_vps(v, header.nuh_layer_id, header.temporal_id)
+                })
+            });
+            let parsed = SliceSegmentHeader::parse_layered(
+                &rbsp,
+                header.nal_unit_type,
+                sps,
+                pps,
+                layer_ctx.as_ref(),
+            )?;
             self.pending.push(SegmentData {
                 nal_type: header.nal_unit_type,
                 temporal_id: header.temporal_id,
@@ -347,15 +571,25 @@ impl SequenceDecoder {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
-                // The VPS carries no fields the single-layer decode
-                // needs; activation is otherwise a no-op.
+                let vps = HevcVps::parse(&rbsp)
+                    .map_err(|_| SequenceError::Malformed("video parameter set failed to parse"))?;
+                self.vps.insert(vps.vps_id, vps);
+                self.plan = None;
             }
             NAL_SPS => {
                 if header.nuh_layer_id == 0 {
                     self.finish_picture()?;
                 }
-                let sps = SeqParameterSet::parse(&rbsp)?;
+                // F.7.3.2.2.1: the SPS of a non-base layer may infer its
+                // fields from the VPS it names (its leading u(4)).
+                let vps_id = rbsp.first().map(|b| b >> 4).unwrap_or(0);
+                let sps = SeqParameterSet::parse_layered(
+                    &rbsp,
+                    header.nuh_layer_id,
+                    self.vps.get(&vps_id),
+                )?;
                 self.sps.insert(sps.sps_id, sps);
+                self.plan = None;
             }
             NAL_PPS => {
                 if header.nuh_layer_id == 0 {
@@ -408,7 +642,7 @@ impl SequenceDecoder {
         // §C.5.2.2 output order: `PicOrderCntVal` order within each
         // coded video sequence, sequences in decode order.
         let mut frames = self.frames;
-        frames.sort_by_key(|f| (f.cvs_index, f.poc));
+        frames.sort_by_key(|f| (f.cvs_index, f.poc, f.layer_id));
         Ok(frames)
     }
 
@@ -428,6 +662,7 @@ impl SequenceDecoder {
                 "first slice segment of a picture is dependent",
             ));
         }
+        let plan = self.plan();
         let pps = self
             .pps
             .get(&indep.header.slice_pic_parameter_set_id)
@@ -435,25 +670,85 @@ impl SequenceDecoder {
                 kind: "pps",
                 id: indep.header.slice_pic_parameter_set_id,
             })?;
-        let sps = self
+        let sps_raw = self
             .sps
             .get(&pps.sps_id)
             .ok_or(SequenceError::MissingParameterSet {
                 kind: "sps",
                 id: pps.sps_id,
             })?;
+        let layer_id = indep.layer_id;
+        let vps = self.vps.get(&sps_raw.vps_id).filter(|_| plan.multi_layer);
+        let ext = vps.and_then(|v| v.extension.as_ref());
+        // F.7.4.3.2.1: a dependent (non-independent) layer takes its
+        // representation format from the VPS whatever its SPS says.
+        let sps_override = ext.and_then(|e| {
+            (layer_id > 0 && e.layers.num_direct_ref_layers(layer_id) > 0)
+                .then(|| e.rep_format_for_layer(layer_id))
+                .flatten()
+                .map(|rf| sps_raw.with_rep_format(rf))
+        });
+        let sps: &SeqParameterSet = sps_override.as_ref().unwrap_or(sps_raw);
 
         let geom = Geometry::derive(sps, pps)?;
 
         // §7.4.2.4.4 CVS bookkeeping: an IRAP with NoRaslOutputFlag
         // starts a new coded video sequence (for output ordering).
+        // F.8.1.3 for a non-base layer: NoRaslOutputFlag is 1 for an
+        // IDR / BLA, for the first picture of the layer, or for a CRA
+        // whose reference layers are all initialized while this one is
+        // not.
         let nal_kind = NalKind::new(indep.nal_type);
-        let no_rasl_output =
-            nal_kind.is_idr() || nal_kind.is_bla() || (nal_kind.is_irap() && !self.seen_picture);
-        if nal_kind.is_irap() && no_rasl_output && self.seen_picture {
-            self.cvs_index += 1;
+        let lstate = self.layers.get(&layer_id).copied().unwrap_or_default();
+        let ref_layers_initialized = ext.map_or(true, |e| {
+            e.layers
+                .direct_ref_layers(layer_id)
+                .iter()
+                .all(|&r| self.layers.get(&r).is_some_and(|l| l.initialized))
+        });
+        let no_rasl_output = if layer_id == 0 {
+            nal_kind.is_idr() || nal_kind.is_bla() || (nal_kind.is_irap() && !self.seen_picture)
+        } else {
+            nal_kind.is_idr()
+                || nal_kind.is_bla()
+                || (nal_kind.is_irap()
+                    && (!lstate.first_pic_decoded
+                        || (!lstate.initialized && ref_layers_initialized)))
+        };
+        if layer_id == 0 {
+            if nal_kind.is_irap() && no_rasl_output && self.seen_picture {
+                self.cvs_index += 1;
+            }
+            self.seen_picture = true;
         }
-        self.seen_picture = true;
+        // F.8.1.3: LayerInitializedFlag.
+        let mut initialized = lstate.initialized;
+        if nal_kind.is_irap()
+            && no_rasl_output
+            && (layer_id == 0 || (!lstate.initialized && ref_layers_initialized))
+        {
+            initialized = true;
+        }
+        // F.8.3.2: an IRAP of the base layer with NoClrasOutputFlag (the
+        // first picture, a BLA, an IDR with cross_layer_bla_flag) marks
+        // every layer's reference pictures unused.
+        if plan.multi_layer
+            && layer_id == 0
+            && nal_kind.is_irap()
+            && (!lstate.first_pic_decoded
+                || nal_kind.is_bla()
+                || (nal_kind.is_idr() && indep.header.cross_layer_bla_flag()))
+        {
+            for &l in &plan.decode {
+                if l != 0 {
+                    self.state.dpb_mut().unmark_layer(l);
+                    if let Some(st) = self.layers.get_mut(&l) {
+                        st.initialized = false;
+                        st.first_pic_decoded = false;
+                    }
+                }
+            }
+        }
 
         // ---- §7.3.8 slice-data CABAC decode of every slice segment ----
         let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
@@ -516,7 +811,228 @@ impl SequenceDecoder {
         let header_info = self.build_header_info(indep, sps, nal_kind, no_rasl_output)?;
         let slice_ref = build_slice_ref_params(&indep.header, pps, slice_type, &header_info);
 
-        let ref_state = self.state.begin_picture(&header_info, &slice_ref);
+        // ---- G.8.1.3 / H.8.1.3 inter-layer reference picture sets ----
+        let mut layered = LayeredPictureInputs {
+            annex_f_poc: plan.multi_layer,
+            first_pic_in_layer_decoded: lstate.first_pic_decoded,
+            poc_msb_cycle_val: indep
+                .header
+                .poc_msb_cycle_val_present_flag
+                .then_some(indep.header.poc_msb_cycle_val),
+            ..LayeredPictureInputs::default()
+        };
+        // Entries re-marked "used for long-term reference" for this
+        // picture, with their previous marking (restored per F.8.1.6),
+        // and the temporary Annex H resampled entries (removed after).
+        let mut il_marked: Vec<(usize, Marking)> = Vec::new();
+        let mut il_temporary: Vec<usize> = Vec::new();
+        if let Some(e) = ext {
+            let curr_view = e.layers.view_id_of(layer_id);
+            let base_view = e.layers.view_id_of(0);
+            for &ref_layer in &indep.header.ref_pic_layer_id {
+                let ref_view = e.layers.view_id_of(ref_layer);
+                let set0 = (curr_view <= base_view && curr_view <= ref_view)
+                    || (curr_view >= base_view && curr_view >= ref_view);
+                let idx = self
+                    .au
+                    .pictures
+                    .iter()
+                    .find(|(l, _)| *l == ref_layer)
+                    .map(|(_, i)| *i)
+                    .ok_or(SequenceError::Malformed(
+                        "inter-layer reference picture missing from the access unit",
+                    ))?;
+                let entry = &self.state.dpb().entries()[idx];
+                // H.8.1.4: a reference layer of another size / offset /
+                // phase / bit depth / chroma format is resampled into a
+                // temporary ilRefPic entry (removed after the picture).
+                let ml = pps.pps_multilayer_extension.as_ref();
+                let offsets = ml.and_then(|m| m.ref_loc_offset_for(ref_layer));
+                if ml.is_some_and(|m| {
+                    m.colour_mapping_enabled_flag
+                        && m.colour_mapping_table
+                            .as_ref()
+                            .is_some_and(|t| t.cm_ref_layer_id.contains(&ref_layer))
+                }) {
+                    return Err(SequenceError::Malformed(
+                        "inter-layer colour mapping (H.8.1.4.4) is not supported",
+                    ));
+                }
+                let cur_fmt = LayerFormat {
+                    width: geom.width,
+                    height: geom.height,
+                    chroma_array_type: geom.chroma_array_type,
+                    bit_depth_luma: sps.bit_depth_luma(),
+                    bit_depth_chroma: sps.bit_depth_chroma(),
+                };
+                let il_geom =
+                    IlRefGeometry::derive(cur_fmt, LayerFormat::of(&entry.picture), offsets)
+                        .map_err(|_| {
+                            SequenceError::Malformed("inter-layer reference geometry is invalid")
+                        })?;
+                let slot = if il_geom.is_identity() {
+                    il_marked.push((idx, entry.marking));
+                    self.state.dpb_mut().set_marking(idx, Marking::LongTerm);
+                    idx
+                } else {
+                    let sample_pred = e.layers.sample_prediction_enabled(layer_id, ref_layer);
+                    let motion_pred = e.layers.motion_prediction_enabled(layer_id, ref_layer);
+                    let picture = if sample_pred || !il_geom.equal_picture_size_and_offset() {
+                        resample_picture(&il_geom, &entry.picture)
+                    } else {
+                        entry.picture.clone()
+                    };
+                    let motion = if motion_pred && !il_geom.equal_picture_size_and_offset() {
+                        resample_motion(&il_geom, &entry.motion)
+                    } else {
+                        entry.motion.clone()
+                    };
+                    let temp = DpbEntry {
+                        poc: entry.poc,
+                        layer_id: ref_layer,
+                        marking: Marking::LongTerm,
+                        picture,
+                        motion,
+                    };
+                    let new_idx = self.state.dpb().len();
+                    self.state.dpb_mut().insert(temp);
+                    il_temporary.push(new_idx);
+                    new_idx
+                };
+                if set0 {
+                    layered.inter_layer0.push(Some(slot));
+                } else {
+                    layered.inter_layer1.push(Some(slot));
+                }
+            }
+        }
+        // F.8.3.1 POC resetting picture (poc_reset_idc != 0).
+        let max_poc_lsb = header_info.max_poc_lsb;
+        if plan.multi_layer && indep.header.poc_reset_idc != 0 {
+            let aligned = e_aligned(ext);
+            let period = indep.header.poc_reset_period_id;
+            if period.is_some() && period != self.au.poc_reset_period {
+                // First picture of a new POC resetting period.
+                self.au.poc_reset_period = period;
+                for st in self.layers.values_mut() {
+                    st.poc_decremented = false;
+                }
+            }
+            let poc_resetting = !aligned || !lstate.poc_decremented;
+            if poc_resetting {
+                let affected: Vec<u8> = if aligned {
+                    let mut v = vec![layer_id];
+                    if let Some(e) = ext {
+                        v.extend(
+                            e.layers
+                                .id_predicted_layer
+                                .get(usize::from(layer_id))
+                                .into_iter()
+                                .flatten()
+                                .copied(),
+                        );
+                    }
+                    v
+                } else {
+                    vec![layer_id]
+                };
+                if lstate.first_pic_decoded {
+                    let hdr = &indep.header;
+                    let poc_lsb_val = if hdr.poc_reset_idc == 3 {
+                        hdr.poc_lsb_val
+                    } else {
+                        hdr.slice_pic_order_cnt_lsb.unwrap_or(0)
+                    };
+                    let poc_msb_delta = if hdr.poc_msb_cycle_val_present_flag {
+                        (hdr.poc_msb_cycle_val as i32).wrapping_mul(max_poc_lsb as i32)
+                    } else {
+                        let prev = self.state.poc_state_mut(layer_id).prev_pic_order_cnt();
+                        let prev_lsb = (prev as u32) & (max_poc_lsb - 1);
+                        let prev_msb = prev.wrapping_sub(prev_lsb as i32);
+                        crate::poc::get_curr_msb(poc_lsb_val, prev_lsb, prev_msb, max_poc_lsb)
+                    };
+                    let poc_lsb_delta = if hdr.poc_reset_idc == 2
+                        || (hdr.poc_reset_idc == 3 && hdr.full_poc_reset_flag)
+                    {
+                        poc_lsb_val as i32
+                    } else {
+                        0
+                    };
+                    let delta = poc_msb_delta.wrapping_add(poc_lsb_delta);
+                    for &l in &affected {
+                        let st = self.layers.entry(l).or_default();
+                        if !st.poc_decremented {
+                            self.state.dpb_mut().shift_pocs(l, delta);
+                            st.poc_decremented = true;
+                        }
+                    }
+                }
+                let hdr = &indep.header;
+                let lsb = hdr.slice_pic_order_cnt_lsb.unwrap_or(0);
+                let val = match hdr.poc_reset_idc {
+                    1 => lsb as i32,
+                    2 => 0,
+                    _ => {
+                        let anchor = if hdr.full_poc_reset_flag {
+                            0
+                        } else {
+                            hdr.poc_lsb_val
+                        };
+                        crate::poc::get_curr_msb(lsb, anchor, 0, max_poc_lsb)
+                            .wrapping_add(lsb as i32)
+                    }
+                };
+                layered.poc_override = Some(val);
+            }
+        }
+        layered.prev_poc_anchor = indep.temporal_id == 0
+            && !(nal_kind.is_rasl() || nal_kind.is_radl() || nal_kind.is_slnr())
+            && !indep.header.discardable_flag();
+
+        let ref_state = self
+            .state
+            .begin_picture_layered(&header_info, &slice_ref, &layered);
+        // F.8.3.1: PrevPicOrderCnt of the other affected layers and the
+        // poc_reset_idc == 3 anchor.
+        if plan.multi_layer {
+            let hdr = &indep.header;
+            let aligned = e_aligned(ext);
+            let affected: Vec<u8> = if aligned {
+                ext.map(|e| {
+                    e.layers
+                        .id_predicted_layer
+                        .get(usize::from(layer_id))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if layered.prev_poc_anchor {
+                for &l in &affected {
+                    self.state
+                        .poc_state_mut(l)
+                        .set_prev_pic_order_cnt(ref_state.poc.val, max_poc_lsb);
+                }
+            } else if hdr.poc_reset_idc == 3
+                && (!lstate.first_pic_decoded || layered.poc_override.is_some())
+            {
+                let v = if hdr.full_poc_reset_flag {
+                    0
+                } else {
+                    hdr.poc_lsb_val as i32
+                };
+                self.state
+                    .poc_state_mut(layer_id)
+                    .set_prev_pic_order_cnt(v, max_poc_lsb);
+                for &l in &affected {
+                    self.state
+                        .poc_state_mut(l)
+                        .set_prev_pic_order_cnt(v, max_poc_lsb);
+                }
+            }
+        }
         let lists = ref_state.ref_pic_lists.clone().unwrap_or(RefPicLists {
             list0: Vec::new(),
             list1: None,
@@ -587,17 +1103,37 @@ impl SequenceDecoder {
             col_field,
         )?;
 
-        let output = indep.header.pic_output_flag;
+        // F.8.1.6: the inter-layer references go back to their own
+        // layer's marking; the picture is output only when its layer is
+        // an output layer of the target and is initialized.
+        for (idx, marking) in il_marked {
+            self.state.dpb_mut().set_marking(idx, marking);
+        }
+        for idx in il_temporary.into_iter().rev() {
+            self.state.dpb_mut().remove(idx);
+        }
+        let output = indep.header.pic_output_flag
+            && plan.output.contains(&layer_id)
+            && (layer_id == 0 || initialized);
         let poc = ref_state.poc;
+        let view_id = ext.map_or(0, |e| e.layers.view_id_of(layer_id));
         self.frames.push(DecodedFrame {
             cvs_index: self.cvs_index,
             poc: poc.val,
             output,
             picture: picture.clone(),
             crop: CropWindow::from_sps(sps),
+            layer_id,
+            view_id,
+            au_index: self.au.index,
         });
-        self.state
-            .store_picture(poc, indep.layer_id, picture, motion);
+        let dpb_idx = self.state.dpb().len();
+        self.state.store_picture(poc, layer_id, picture, motion);
+        self.au.pictures.push((layer_id, dpb_idx));
+        self.au.max_layer = Some(self.au.max_layer.map_or(layer_id, |m| m.max(layer_id)));
+        let st = self.layers.entry(layer_id).or_default();
+        st.first_pic_decoded = true;
+        st.initialized = initialized;
         Ok(())
     }
 
@@ -998,6 +1534,11 @@ fn materialize_slice_rps(
 /// `NumPicTotalCurr` (§7.4.7.2) from the already-resolved picture
 /// header info (single-layer; `pps_curr_pic_ref_enabled_flag`
 /// contributes the closing `NumPicTotalCurr++`).
+/// `vps_poc_lsb_aligned_flag` of the active VPS extension (0 without one).
+fn e_aligned(ext: Option<&crate::vps_ext::VpsExtension>) -> bool {
+    ext.is_some_and(|e| e.vps_poc_lsb_aligned_flag)
+}
+
 fn num_pic_total_curr(info: &PictureHeaderInfo, curr_pic_ref_enabled: bool) -> u32 {
     let st = info
         .short_term_rps
@@ -1039,11 +1580,25 @@ fn build_slice_ref_params(
                 .num_ref_idx_l1_active_minus1
                 .unwrap_or(pps.num_ref_idx_l1_default_active_minus1),
         ),
-        num_pic_total_curr: num_pic_total_curr(info, curr_pic_ref_enabled),
+        // Eq. F-56: the inter-layer reference pictures count too.
+        num_pic_total_curr: num_pic_total_curr(info, curr_pic_ref_enabled)
+            + header.num_active_ref_layer_pics,
         temporal_mvp_enabled: header.slice_temporal_mvp_enabled_flag,
         collocated_from_l0_flag: header.collocated_from_l0_flag.unwrap_or(true),
         collocated_ref_idx: header.collocated_ref_idx.unwrap_or(0),
         curr_pic_ref_enabled,
+        // §7.3.6.2 ref_pic_lists_modification( ): the explicit
+        // RefPicListTempX entries when signalled.
+        list_entry_l0: header
+            .ref_pic_lists_modification
+            .as_ref()
+            .filter(|m| m.ref_pic_list_modification_flag_l0)
+            .map(|m| m.list_entry_l0.clone()),
+        list_entry_l1: header
+            .ref_pic_lists_modification
+            .as_ref()
+            .filter(|m| m.ref_pic_list_modification_flag_l1 == Some(true))
+            .map(|m| m.list_entry_l1.clone()),
     }
 }
 

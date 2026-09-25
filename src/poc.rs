@@ -213,6 +213,55 @@ impl PocState {
         }
     }
 
+    /// F.8.3.1 eq. F-62 — the multi-layer `PicOrderCntMsb` derivation
+    /// for a picture that is not a POC resetting picture:
+    /// `poc_msb_cycle_val * MaxPicOrderCntLsb` when
+    /// `poc_msb_cycle_val_present_flag`, 0 for an IDR picture or the
+    /// first picture decoded in its layer
+    /// (`FirstPicInLayerDecodedFlag == 0`), otherwise the eq. 8-1 roll
+    /// from `PrevPicOrderCnt[ nuh_layer_id ]`. Unlike §8.3.1, a CRA /
+    /// BLA with `NoRaslOutputFlag` does not reset the MSB by itself.
+    #[must_use]
+    pub fn derive_f62(
+        &self,
+        is_idr: bool,
+        first_pic_in_layer_decoded: bool,
+        poc_lsb: u32,
+        max_poc_lsb: u32,
+        poc_msb_cycle_val: Option<u32>,
+    ) -> PicOrderCnt {
+        let msb = if let Some(cycle) = poc_msb_cycle_val {
+            (cycle as i32).wrapping_mul(max_poc_lsb as i32)
+        } else if !first_pic_in_layer_decoded || is_idr || !self.seen {
+            0
+        } else {
+            poc_msb(poc_lsb, self.prev_poc_lsb, self.prev_poc_msb, max_poc_lsb)
+        };
+        let val = msb.wrapping_add(poc_lsb as i32);
+        PicOrderCnt {
+            msb,
+            lsb: poc_lsb,
+            val,
+        }
+    }
+
+    /// `PrevPicOrderCnt[ lId ]` as a whole value (F.8.3.1): the carried
+    /// `prevPicOrderCntMsb + prevPicOrderCntLsb`.
+    #[must_use]
+    pub fn prev_pic_order_cnt(&self) -> i32 {
+        self.prev_poc_msb.wrapping_add(self.prev_poc_lsb as i32)
+    }
+
+    /// Overwrite `PrevPicOrderCnt[ lId ]` with a whole POC value (the
+    /// F.8.3.1 `poc_reset_idc == 3` anchor, or a decrement after a POC
+    /// reset), splitting it into its `MaxPicOrderCntLsb` LSB / MSB parts.
+    pub fn set_prev_pic_order_cnt(&mut self, poc: i32, max_poc_lsb: u32) {
+        let lsb = (poc as u32) & (max_poc_lsb - 1);
+        self.prev_poc_lsb = lsb;
+        self.prev_poc_msb = poc.wrapping_sub(lsb as i32);
+        self.seen = true;
+    }
+
     /// Update the carried `prevTid0Pic` state after decoding a picture
     /// whose `TemporalId == 0` and that is not a RASL, RADL or SLNR
     /// picture. `poc` is the picture's derived [`PicOrderCnt`].
@@ -239,6 +288,14 @@ impl PocState {
         }
         poc
     }
+}
+
+/// F.8.3.1 `GetCurrMsb( currLsb, prevLsb, prevMsb, maxLsb )` — the
+/// eq. 8-1 MSB roll exposed for the POC-reset arithmetic.
+#[inline]
+#[must_use]
+pub fn get_curr_msb(poc_lsb: u32, prev_poc_lsb: u32, prev_poc_msb: i32, max_poc_lsb: u32) -> i32 {
+    poc_msb(poc_lsb, prev_poc_lsb, prev_poc_msb, max_poc_lsb)
 }
 
 /// §8.3.1 equation 8-1 — `PicOrderCntMsb` from the current LSB and the

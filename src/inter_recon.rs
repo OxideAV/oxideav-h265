@@ -607,7 +607,13 @@ pub fn reconstruct_inter_picture(
         refs.entry(list, ref_idx)
             .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
     };
-    let col_ref_long_term = |_poc: i32| false;
+    // A reference of the collocated picture whose POC equals the
+    // collocated picture's own POC is a same-access-unit reference:
+    // the Annex F/G/H inter-layer reference picture (marked "used for
+    // long-term reference", G.8.1.3) or the SCC current picture (§8.3.1
+    // long-term) — both long-term for the §8.5.3.2.9 scaling gate.
+    let col_poc = slice.col_poc;
+    let col_ref_long_term = move |poc: i32| poc == col_poc;
     let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
 
     let mv_ctx = PuMvContext {
@@ -1860,6 +1866,8 @@ mod tests {
             collocated_from_l0_flag: true,
             collocated_ref_idx: 0,
             curr_pic_ref_enabled: false,
+            list_entry_l0: None,
+            list_entry_l1: None,
         };
         let idr = seq.begin_picture(&idr_header, &i_slice);
         seq.store_picture(idr.poc, 0, flat_ref(110, 128), MotionField::new(32, 32));

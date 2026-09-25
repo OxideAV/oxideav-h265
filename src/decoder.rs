@@ -22,9 +22,11 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
 };
 
-use crate::hvcc::{extradata_is_hvcc, parse_hvcc, split_length_prefixed};
+use crate::hvcc::{
+    extradata_is_hvcc, extradata_is_lhvc, parse_hvcc_with_len, parse_lhvc, split_length_prefixed,
+};
 use crate::picture::{Picture, Plane};
-use crate::sequence::{DecodedFrame, SequenceDecoder};
+use crate::sequence::{DecodedFrame, LayerTarget, SequenceDecoder};
 
 /// The default reorder depth when no SPS has been activated yet (the
 /// §7.4.3.2.1 `sps_max_num_reorder_pics` bound once one has).
@@ -64,23 +66,80 @@ impl std::fmt::Debug for H265Decoder {
 /// The `extradata` form selects the packet framing: an `hvcC`
 /// (`HEVCDecoderConfigurationRecord`) extradata activates its carried
 /// parameter sets and switches packets to length-prefixed NAL runs;
-/// Annex B extradata (or none) keeps start-code framing.
+/// Annex B extradata (or none) keeps start-code framing. An `hvcC`
+/// record may be followed by an `lhvC` (`LHEVCDecoderConfigurationRecord`)
+/// carrying the non-base layers' parameter sets — the extradata a
+/// layered HEIF item (`lhv1`, e.g. a stereo / spatial photo) resolves
+/// to; the packets then carry every layer's NAL units and the decoder
+/// runs the Annex F/G/H multi-layer processes.
+///
+/// Codec options (multi-layer streams only; single-layer streams
+/// ignore them): `layer=<nuh_layer_id>` decodes that layer (plus its
+/// reference layers) and outputs it alone, `view=<ViewId>` selects the
+/// layer carrying that Annex G view, `ols=<idx>` selects an output
+/// layer set. Without any, the highest output layer set is decoded and
+/// every one of its output layers is emitted — the frames of one access
+/// unit come out consecutively in increasing `nuh_layer_id` order (the
+/// base view first, then the second view).
 ///
 /// # Errors
-/// [`Error::InvalidData`] when the `extradata` fails to parse.
+/// [`Error::InvalidData`] when the `extradata` or an option fails to
+/// parse.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut seq = SequenceDecoder::new();
     let mut nal_length_size = None;
+    let parse_u32 = |key: &str| -> Result<Option<u32>> {
+        match params.options.get(key) {
+            None => Ok(None),
+            Some(v) => v.parse::<u32>().map(Some).map_err(|_| {
+                Error::InvalidData(format!("h265 decode: {key} must be an integer, got {v:?}"))
+            }),
+        }
+    };
+    let (layer, view, ols) = (parse_u32("layer")?, parse_u32("view")?, parse_u32("ols")?);
+    let target = match (layer, view, ols) {
+        (Some(l), _, _) if l < 64 => LayerTarget::Layer(l as u8),
+        (Some(l), _, _) => {
+            return Err(Error::InvalidData(format!(
+                "h265 decode: layer must be 0..=63, got {l}"
+            )))
+        }
+        (None, Some(v), _) if v <= u32::from(u16::MAX) => LayerTarget::View(v as u16),
+        (None, Some(v), _) => {
+            return Err(Error::InvalidData(format!(
+                "h265 decode: view must be 0..=65535, got {v}"
+            )))
+        }
+        (None, None, Some(o)) => LayerTarget::Ols(o as usize),
+        (None, None, None) => LayerTarget::HighestOls,
+    };
+    seq.set_layer_target(target);
     if !params.extradata.is_empty() {
         if extradata_is_hvcc(&params.extradata) {
-            // hvcC record: out-of-band VPS/SPS/PPS (+ SEI) arrays.
-            let rec = parse_hvcc(&params.extradata)
+            // hvcC record: out-of-band VPS/SPS/PPS (+ SEI) arrays,
+            // optionally followed by an lhvC record with the non-base
+            // layers' parameter sets.
+            let (rec, end) = parse_hvcc_with_len(&params.extradata)
                 .map_err(|e| Error::InvalidData(format!("h265 hvcC extradata: {e}")))?;
             for unit in rec.nal_units {
                 seq.push_nal_unit(unit)
                     .map_err(|e| Error::InvalidData(format!("h265 hvcC extradata: {e}")))?;
             }
             nal_length_size = Some(rec.length_size);
+            let rest = &params.extradata[end..];
+            if !rest.is_empty() {
+                if !extradata_is_lhvc(rest) {
+                    return Err(Error::InvalidData(
+                        "h265 hvcC extradata: trailing bytes are not an lhvC record".into(),
+                    ));
+                }
+                let (lrec, _) = parse_lhvc(rest)
+                    .map_err(|e| Error::InvalidData(format!("h265 lhvC extradata: {e}")))?;
+                for unit in lrec.nal_units {
+                    seq.push_nal_unit(unit)
+                        .map_err(|e| Error::InvalidData(format!("h265 lhvC extradata: {e}")))?;
+                }
+            }
         } else {
             // Out-of-band parameter sets in Annex B form.
             seq.push_annexb(&params.extradata)
@@ -103,13 +162,20 @@ impl H265Decoder {
     /// frame that is guaranteed next in output order.
     fn drain(&mut self, flush: bool) {
         self.reorder.extend(self.seq.take_decoded());
-        self.reorder.sort_by_key(|f| (f.cvs_index, f.poc));
+        // Output order: POC within a CVS, the layers of one access unit
+        // consecutively by increasing nuh_layer_id.
+        self.reorder
+            .sort_by_key(|f| (f.cvs_index, f.poc, f.layer_id));
+        // The reorder bound counts access units; every output layer
+        // of a multi-layer stream adds one frame per access unit.
+        let layers_out = self.seq.layer_plan().1.len().max(1);
         let depth = if flush {
             0
         } else {
             self.seq
                 .max_num_reorder_pics()
                 .map_or(DEFAULT_REORDER, |n| n as usize)
+                * layers_out
         };
         while self.reorder.len() > depth {
             let f = self.reorder.remove(0);

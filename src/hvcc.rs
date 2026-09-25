@@ -165,6 +165,120 @@ pub fn extradata_is_hvcc(data: &[u8]) -> bool {
     data.len() >= 23 && data[0] == 1
 }
 
+/// The `LHEVCDecoderConfigurationRecord` (`lhvC`, ISO/IEC 14496-15
+/// §9.6): the `hvcC` layout without the profile / tier / level, chroma
+/// and frame-rate mirror — a 6-byte prefix then the same NAL unit
+/// arrays, here carrying the non-base layers' VPS extension / SPS /
+/// PPS (and declarative SEI). A HEIF `lhv1` image item's
+/// `LHEVCConfigurationBox` holds one; the item's base layer comes from
+/// the `hvcC` of the base image item.
+///
+/// ```text
+/// unsigned int(8)  configurationVersion = 1;
+/// bit(4) reserved; unsigned int(12) min_spatial_segmentation_idc;
+/// bit(6) reserved; unsigned int(2)  parallelismType;
+/// bit(2) reserved; unsigned int(3)  numTemporalLayers;
+/// unsigned int(1)  temporalIdNested;
+/// unsigned int(2)  lengthSizeMinusOne;
+/// unsigned int(8)  numOfArrays;
+/// for (j = 0; j < numOfArrays; j++) { … as hvcC … }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LhvcRecord {
+    /// `min_spatial_segmentation_idc` (12 bits).
+    pub min_spatial_segmentation_idc: u16,
+    /// `parallelismType` (2 bits).
+    pub parallelism_type: u8,
+    /// `numTemporalLayers` (3 bits).
+    pub num_temporal_layers: u8,
+    /// `temporalIdNested`.
+    pub temporal_id_nested: bool,
+    /// Byte width of every in-band NAL length prefix (1, 2 or 4).
+    pub length_size: usize,
+    /// The carried parameter-set / SEI NAL units, in array order.
+    pub nal_units: Vec<NalUnit>,
+}
+
+/// `true` when `data` starts with an `lhvC` record (`configurationVersion
+/// == 1`, at least the 6-byte prefix).
+pub fn extradata_is_lhvc(data: &[u8]) -> bool {
+    data.len() >= 6 && data[0] == 1
+}
+
+/// Walk the `numOfArrays` NAL unit arrays shared by `hvcC` and `lhvC`
+/// starting at `pos`, returning the units and the position after them.
+fn parse_nal_arrays(data: &[u8], mut pos: usize) -> Result<(Vec<NalUnit>, usize), HvccError> {
+    let mut nal_units = Vec::new();
+    let num_of_arrays = *data.get(pos).ok_or(HvccError::Truncated)? as usize;
+    pos += 1;
+    for _ in 0..num_of_arrays {
+        if pos + 3 > data.len() {
+            return Err(HvccError::Truncated);
+        }
+        let nal_unit_type = data[pos] & 0x3F;
+        let num_nalus = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos += 3;
+        for _ in 0..num_nalus {
+            if pos + 2 > data.len() {
+                return Err(HvccError::Truncated);
+            }
+            let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > data.len() {
+                return Err(HvccError::Truncated);
+            }
+            if array_type_permitted(nal_unit_type) {
+                nal_units.push(nal_unit_from_coded(&data[pos..pos + len])?);
+            }
+            pos += len;
+        }
+    }
+    Ok((nal_units, pos))
+}
+
+/// Parse an `LHEVCDecoderConfigurationRecord` (`lhvC`), returning the
+/// record and the number of bytes it occupied.
+///
+/// # Errors
+/// [`HvccError`] on truncation, a version other than 1, the reserved
+/// length size, or an undecodable carried NAL unit.
+pub fn parse_lhvc(data: &[u8]) -> Result<(LhvcRecord, usize), HvccError> {
+    if data.len() < 6 {
+        return Err(HvccError::Truncated);
+    }
+    if data[0] != 1 {
+        return Err(HvccError::BadVersion(data[0]));
+    }
+    let length_size_minus_one = (data[4] & 0x03) as usize;
+    if length_size_minus_one == 2 {
+        return Err(HvccError::BadLengthSize);
+    }
+    let (nal_units, end) = parse_nal_arrays(data, 5)?;
+    Ok((
+        LhvcRecord {
+            min_spatial_segmentation_idc: u16::from_be_bytes([data[1] & 0x0F, data[2]]),
+            parallelism_type: data[3] & 0x03,
+            num_temporal_layers: (data[4] >> 3) & 0x07,
+            temporal_id_nested: data[4] & 0x04 != 0,
+            length_size: length_size_minus_one + 1,
+            nal_units,
+        },
+        end,
+    ))
+}
+
+/// [`parse_hvcc`] that also returns the number of bytes the record
+/// occupied — so a trailing `lhvC` record (a layered HEIF item's
+/// extradata = base `hvcC` followed by the item's `lhvC`) can be found.
+///
+/// # Errors
+/// As [`parse_hvcc`].
+pub fn parse_hvcc_with_len(data: &[u8]) -> Result<(HvccRecord, usize), HvccError> {
+    let rec = parse_hvcc(data)?;
+    let (_, end) = parse_nal_arrays(data, 22)?;
+    Ok((rec, end))
+}
+
 /// Parse an `HEVCDecoderConfigurationRecord` per ISO/IEC 14496-15
 /// §8.3.3.1.2.
 ///
