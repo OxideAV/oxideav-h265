@@ -468,6 +468,76 @@ fn rd_levels_select_the_intra_decision() {
     assert!(oxideav_h265::make_encoder(&params).is_err(), "rd needs ctb");
 }
 
+/// A `YuvJ420P` (full-range) frame encodes byte-identically to the
+/// same `Yuv420P` frame with `range=full` — on the pcm, intra and
+/// inter modes — carries the full-range flag by itself, yields to an
+/// explicit `range=limited`, keeps the output pixel format, and the
+/// 4:2:2 / 4:4:4 `YuvJ*` twins stay refused (no such coder yet).
+#[test]
+fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
+    use oxideav_core::PixelFormat;
+
+    let encode = |pf: PixelFormat, opts: &[(&str, &str)]| -> (Vec<u8>, Option<PixelFormat>) {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(64);
+        params.height = Some(48);
+        params.pixel_format = Some(pf);
+        for (k, v) in opts {
+            params.options.insert(*k, *v);
+        }
+        let mut enc = oxideav_h265::make_encoder(&params).expect("factory");
+        let out_pf = enc.output_params().pixel_format;
+        enc.send_frame(&frame(64, 48, &still(64, 48)))
+            .expect("send");
+        (enc.receive_packet().expect("packet").data, out_pf)
+    };
+    let modes: [&[(&str, &str)]; 3] = [
+        &[("mode", "pcm")],
+        &[("mode", "intra"), ("qp", "30"), ("ctb", "32")],
+        &[("mode", "inter"), ("qp", "30"), ("gop", "0")],
+    ];
+    for mode in modes {
+        let full: Vec<(&str, &str)> = mode.iter().copied().chain([("range", "full")]).collect();
+        let (j, j_pf) = encode(PixelFormat::YuvJ420P, mode);
+        let (y_full, y_pf) = encode(PixelFormat::Yuv420P, &full);
+        assert_eq!(j, y_full, "{mode:?}: YuvJ420P == Yuv420P + range=full");
+        assert_eq!(j_pf, Some(PixelFormat::YuvJ420P), "{mode:?}");
+        assert_eq!(y_pf, Some(PixelFormat::Yuv420P), "{mode:?}");
+        let vs = sps_of(&j)
+            .vui_parameters
+            .expect("VUI")
+            .video_signal_type
+            .expect("video_signal_type");
+        assert!(vs.video_full_range_flag && vs.colour_description.is_none());
+        let (y_plain, _) = encode(PixelFormat::Yuv420P, mode);
+        assert_ne!(j, y_plain, "{mode:?}: plain Yuv420P writes no VUI");
+        assert!(sps_of(&y_plain).vui_parameters.is_none());
+        let limited: Vec<(&str, &str)> =
+            mode.iter().copied().chain([("range", "limited")]).collect();
+        let (j_lim, _) = encode(PixelFormat::YuvJ420P, &limited);
+        assert!(
+            !sps_of(&j_lim)
+                .vui_parameters
+                .expect("VUI")
+                .video_signal_type
+                .expect("block")
+                .video_full_range_flag,
+            "{mode:?}: an explicit range wins"
+        );
+    }
+    for pf in [
+        PixelFormat::YuvJ422P,
+        PixelFormat::YuvJ444P,
+        PixelFormat::Yuv444P,
+    ] {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(64);
+        params.height = Some(48);
+        params.pixel_format = Some(pf);
+        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?}");
+    }
+}
+
 /// `still` is refused on the inter GOP modes.
 #[test]
 fn still_rejects_inter_mode() {

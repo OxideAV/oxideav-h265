@@ -190,6 +190,10 @@ use oxideav_core::{
 /// image items carry (each access unit is already a self-contained
 /// `VPS + SPS + PPS + IDR` single-picture CVS in those modes).
 ///
+/// A `YuvJ420P` (full-range) input is accepted as the twin of
+/// `Yuv420P` — same sample path — and, absent an explicit `range`
+/// option, signals `video_full_range_flag == 1` on its own.
+///
 /// The `range` option (`"full"` / `"limited"`) and the H.273 code
 /// points `colorprim` / `transfer` / `matrix` (0..=255; any given one
 /// enables the colour description, the others defaulting to 2 =
@@ -311,8 +315,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             ((coded_height - out_height) / 2) as u32,
         )
     });
+    // `YuvJ420P` is the full-range alias of `Yuv420P` (same planar
+    // layout): accepted as its twin, and its range is preserved in
+    // the VUI unless the caller says otherwise (see `video_signal`).
+    // The 4:2:2 / 4:4:4 `YuvJ*` twins wait for those coders.
+    let full_range_input = params.pixel_format == Some(PixelFormat::YuvJ420P);
     if let Some(pf) = params.pixel_format {
-        if pf != PixelFormat::Yuv420P {
+        if !matches!(pf, PixelFormat::Yuv420P | PixelFormat::YuvJ420P) {
             return Err(Error::InvalidData(format!(
                 "h265 encode: only yuv420p input is supported, got {pf:?}"
             )));
@@ -605,6 +614,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         let (cp, tc, mc) = (code("colorprim")?, code("transfer")?, code("matrix")?);
         let colour = (cp.is_some() || tc.is_some() || mc.is_some())
             .then(|| (cp.unwrap_or(2), tc.unwrap_or(2), mc.unwrap_or(2)));
+        // A `YuvJ420P` frame declares full range by itself: without an
+        // explicit `range` option, the VUI says so.
+        let range = range.or(full_range_input.then_some(true));
         (range.is_some() || colour.is_some()).then(|| intra::VideoSignal {
             full_range: range.unwrap_or(false),
             colour,
@@ -830,7 +842,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
     let mut output_params = params.clone();
     output_params.media_type = oxideav_core::MediaType::Video;
-    output_params.pixel_format = Some(PixelFormat::Yuv420P);
+    output_params.pixel_format = Some(if full_range_input {
+        PixelFormat::YuvJ420P
+    } else {
+        PixelFormat::Yuv420P
+    });
     // Parameter sets ride in band in every access unit; no extradata.
     output_params.extradata.clear();
     Ok(Box::new(H265Encoder {
