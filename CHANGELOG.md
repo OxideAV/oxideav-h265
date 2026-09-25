@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- *(vps)* Annex F `vps_extension( )` decoded in full (`vps_ext`): F.7.3.2.1.1 syntax incl. `rep_format( )`, `dpb_size( )`, `vps_vui( )` (with `video_signal_info( )` and the bitstream-partition HRD walk), and the F.7.4.3.1.1 derived layer model (`LayerModel`: `LayerIdxInVps`, Table F.1 scalability ids / `ViewId` / `NumViews`, direct + transitive dependency matrices, tree partitions, base + additional layer sets, output layer sets with `OutputLayerFlag` / `NecessaryLayerFlag` / `OlsHighestOutputLayerId`, eq. F-14 inter-layer sample / motion prediction gates); `HevcVps` gains `extension` / `vps_extension2_flag` (the opaque tail now holds only the `vps_extension2_flag`-gated data); every loop bounded by the F.7.4.3.1.1 ranges; pinned on a two-view stream from an OS media framework's stereo encoder (Multiview Main second view, VPS VUI) plus a truncation / bit-flip robustness sweep
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-h265/compare/v0.0.10...v0.0.11) - 2026-09-25
 
 ### Added

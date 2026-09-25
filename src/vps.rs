@@ -8,10 +8,11 @@
 //! as a vector of [`crate::hrd::VpsHrdEntry`] values (one per
 //! `vps_num_hrd_parameters`), with the §E.2.3 sub-layer HRD payloads
 //! folded into each entry's [`crate::hrd::SubLayerHrd`]. The
-//! `vps_extension_flag` follows the HRD loop; when 1, the
-//! `vps_extension_data_flag` run + `rbsp_trailing_bits()` are surfaced
-//! as an [`crate::sps::OpaqueTail`] for callers that want the raw
-//! bytes.
+//! `vps_extension_flag` follows the HRD loop; when 1, the Annex F
+//! `vps_extension( )` is decoded in full ([`crate::vps_ext`]) and the
+//! `vps_extension2_flag`-gated `vps_extension_data_flag` run +
+//! `rbsp_trailing_bits()` are surfaced as an
+//! [`crate::sps::OpaqueTail`] for callers that want the raw bytes.
 //!
 //! The profile-tier-level subroutine of §7.3.3 is also parsed
 //! structurally: the bit positions are walked but only the leading
@@ -60,12 +61,18 @@
 //!   }
 //! }
 //! vps_extension_flag                     u(1)
-//! /* extension payload + rbsp_trailing_bits() surfaced as opaque */
+//! if( vps_extension_flag ) {
+//!   vps_extension_alignment_bit_equal_to_one  /* to byte alignment */
+//!   vps_extension( )                     /* crate::vps_ext */
+//!   vps_extension2_flag                  u(1)
+//!   /* vps_extension_data_flag run + rbsp_trailing_bits() opaque */
+//! }
 //! ```
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::hrd::{HrdError, VpsHrdEntry};
 use crate::sps::OpaqueTail;
+use crate::vps_ext::{VpsExtension, VpsExtensionInputs};
 
 /// Maximum number of sub-layers an HEVC stream may declare.
 /// `vps_max_sub_layers_minus1` is u(3), so the count is bounded at 7
@@ -422,7 +429,14 @@ pub struct HevcVps {
     /// bodies are decoded inline; the parser unconditionally reads this
     /// `u(1)` after the HRD loop completes.
     pub vps_extension_flag: bool,
-    /// Opaque suffix of the RBSP. Populated when `vps_extension_flag ==
+    /// The Annex F `vps_extension( )` (F.7.3.2.1.1), decoded in full
+    /// when `vps_extension_flag == 1` — the multi-layer layer model
+    /// (`LayerIdxInVps`, direct-dependency graph, layer / output layer
+    /// sets, representation formats, `dpb_size( )`, VPS VUI).
+    pub extension: Option<VpsExtension>,
+    /// `vps_extension2_flag` (false when `vps_extension_flag == 0`).
+    pub vps_extension2_flag: bool,
+    /// Opaque suffix of the RBSP. Populated when `vps_extension2_flag ==
     /// 1`: the `vps_extension_data_flag` payload and the
     /// `rbsp_trailing_bits()` are surfaced here for callers that want
     /// the raw bytes. `None` otherwise.
@@ -593,13 +607,38 @@ impl HevcVps {
         };
 
         // vps_extension_flag u(1) — always read now that the per-HRD
-        // bodies are decoded inline above. When set, the
+        // bodies are decoded inline above. When set (F.7.3.2.1): align
+        // on vps_extension_alignment_bit_equal_to_one, decode the Annex
+        // F vps_extension( ) in full, then vps_extension2_flag — whose
         // vps_extension_data_flag run plus rbsp_trailing_bits() are
-        // surfaced as the opaque tail (this parser does not interpret
-        // the extension payload).
+        // surfaced as the opaque tail.
         let vps_extension_flag = br.u1()? != 0;
+        let mut extension = None;
+        let mut vps_extension2_flag = false;
         if vps_extension_flag {
-            opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
+            while br.bit_pos() % 8 != 0 {
+                br.u1()?;
+            }
+            let rows: Vec<Vec<bool>> = layer_id_included_flag
+                .iter()
+                .map(|r| r.flags.clone())
+                .collect();
+            let inputs = VpsExtensionInputs {
+                base_layer_internal_flag,
+                base_layer_available_flag,
+                max_layers_minus1,
+                max_sub_layers_minus1: max_sub_layers_minus1_raw,
+                max_layer_id,
+                num_layer_sets_minus1,
+                layer_id_included_flag: &rows,
+                num_hrd_parameters: timing_info.as_ref().map_or(0, |t| t.num_hrd_parameters),
+                base_ptl: &ptl,
+            };
+            extension = Some(VpsExtension::parse(br, &inputs)?);
+            vps_extension2_flag = br.u1()? != 0;
+            if vps_extension2_flag {
+                opaque_tail = Some(OpaqueTail::capture_at(br.bit_pos(), rbsp));
+            }
         }
 
         Ok(Self {
@@ -619,6 +658,8 @@ impl HevcVps {
             timing_info,
             hrd_parameters,
             vps_extension_flag,
+            extension,
+            vps_extension2_flag,
             opaque_tail,
         })
     }

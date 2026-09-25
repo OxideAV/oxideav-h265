@@ -343,6 +343,8 @@ pub mod transform_unit;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod vps;
+/// Annex F `vps_extension( )` — the multi-layer layer model.
+pub mod vps_ext;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod vui;
