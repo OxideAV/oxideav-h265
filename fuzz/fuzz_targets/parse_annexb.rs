@@ -13,27 +13,46 @@
 //! context-dependent §D.2.2 `buffering_period( )` / §D.2.3
 //! `pic_timing( )` parsers against that HRD context.
 //!
+//! Annex F: every VPS is kept by id so an SPS carried in a
+//! `nuh_layer_id > 0` NAL unit runs the multilayer-extension form
+//! (`SeqParameterSet::parse_layered`, VPS-inferred representation
+//! format), and every slice header parses through
+//! `SliceSegmentHeader::parse_layered` with the `SliceLayerContext`
+//! built from the SPS's VPS (inter-layer prediction block, `poc_reset_*`
+//! header extension, eq. F-56 `NumPicTotalCurr`).
+//!
 //! Every path must return `Ok`/`Err` — no panics, no aborts, no
 //! unbounded allocation — regardless of input.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use std::collections::BTreeMap;
+
 use oxideav_h265::nal::NalIter;
 use oxideav_h265::sei::{parse_sei_rbsp, BufferingPeriodSei, PicTimingSei, SeiNalType, SeiPayload};
+use oxideav_h265::slice::SliceLayerContext;
 use oxideav_h265::{HevcVps, PicParameterSet, SeqParameterSet, SliceSegmentHeader};
 
 fuzz_target!(|data: &[u8]| {
+    let mut vps: BTreeMap<u8, HevcVps> = BTreeMap::new();
     let mut sps: Option<SeqParameterSet> = None;
     let mut pps: Option<PicParameterSet> = None;
     for unit in NalIter::new(data) {
         let Ok(unit) = unit else { break };
         match unit.header.nal_unit_type {
             32 => {
-                let _ = HevcVps::parse(&unit.rbsp);
+                if let Ok(parsed) = HevcVps::parse(&unit.rbsp) {
+                    vps.insert(parsed.vps_id, parsed);
+                }
             }
             33 => {
-                if let Ok(parsed) = SeqParameterSet::parse(&unit.rbsp) {
+                let vps_id = unit.rbsp.first().map_or(0, |b| b >> 4);
+                if let Ok(parsed) = SeqParameterSet::parse_layered(
+                    &unit.rbsp,
+                    unit.header.nuh_layer_id,
+                    vps.get(&vps_id),
+                ) {
                     sps = Some(parsed);
                 }
             }
@@ -44,7 +63,14 @@ fuzz_target!(|data: &[u8]| {
             }
             t if t < 32 => {
                 if let (Some(s), Some(p)) = (sps.as_ref(), pps.as_ref()) {
-                    let _ = SliceSegmentHeader::parse(&unit.rbsp, t, s, p);
+                    let ctx = vps.get(&s.vps_id).map(|v| {
+                        SliceLayerContext::from_vps(
+                            v,
+                            unit.header.nuh_layer_id,
+                            unit.header.temporal_id,
+                        )
+                    });
+                    let _ = SliceSegmentHeader::parse_layered(&unit.rbsp, t, s, p, ctx.as_ref());
                 }
             }
             t @ (39 | 40) => {

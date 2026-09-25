@@ -104,7 +104,31 @@ byte-exact. Coverage:
   decoder differs by a single chroma sample per plane while the
   stream's own decoded-picture-hash SEI matches this decoder.
   Twenty-five of them are vendored and CI-pinned on both transport
-  paths (`tests/heic_stills.rs`).
+  paths (`tests/heic_stills.rs`);
+* **multi-layer bitstreams** (round 462): Annex F common syntax in
+  full — the `vps_extension( )` layer model (layer / output layer
+  sets, `rep_format( )`, `dpb_size( )`, VPS VUI), the multilayer SPS
+  / PPS forms (VPS-inferred representation formats,
+  `pps_multilayer_extension( )` with reference layer offsets, phases
+  and the colour mapping table) and the Annex F slice header
+  (inter-layer prediction block, `poc_reset_*` extension) — and the
+  F.8 / G.8 / H.8 decoding processes: access-unit tracking, per-layer
+  `NoRaslOutputFlag` / `LayerInitializedFlag`, the F.8.3.1 POC form
+  with POC resets, the inter-layer reference picture sets spliced
+  into the reference lists (eqs F-65 / F-67), output layer selection.
+  **Annex G MV-HEVC**: both views of a stereo stream written by an OS
+  media framework's MV-HEVC encoder (base view + a Multiview Main
+  second view predicted inter-view, B pictures mixing temporal and
+  inter-view references through `ref_pic_lists_modification( )`)
+  decode **byte-exact against a black-box reference decoder**, on the
+  Annex B path and through the registry with `hvcC` + `lhvC`
+  extradata (`tests/multilayer.rs`). **Annex H SHVC**: the H.8.1.4
+  inter-layer reference derivation — spatial resampling (Tables H.1 /
+  H.2, 16-phase 8-tap luma / 4-tap chroma), bit-depth / chroma-format
+  promotion and motion-field resampling — pinned by a self-built
+  two-layer spatial-scalability stream whose enhancement picture
+  decodes to exactly the resampled base (no third-party SHVC producer
+  exists on this machine, so that path is self-consistency-validated).
 
 **Encoder: recursive coding-quadtree I/P/B coding at CTB 16/32/64
 with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop
@@ -245,6 +269,21 @@ combination is decoder-pinned only. Tiled pictures are decided
 (`with_threads` / `set_execution_context`; serial by default,
 bit-identical for any worker count).
 
+**Every HEIC sample layout** encodes as a lossless PCM still (round
+462, `mode = "pcm"`): grey at 8 / 10 / 12 / 16 bits, 4:2:0 at 10 / 12
+bits, 4:2:2 and 4:4:4 at 8 / 10 / 12 bits (planar little-endian
+16-bit input above 8 bits, the `YuvJ*` twins signalling full range),
+with the Annex A profile the layout calls for — Main 10 Still
+Picture, or a format range extensions profile carrying the Table A.2
+constraint flags of its row (Monochrome 8..16, Main 12, Main 4:2:2
+10 / 12, Main 4:4:4 8 / 10 / 12) plus the intra and one-picture-only
+flags — and the conformance window in the layout's chroma units; the
+registry round trip is lossless on every layout
+(`tests/still_encoder.rs`), 11 of the 12 layouts decode byte-exact
+through a black-box reference decoder (16-bit grey lies outside the
+depths it implements) and all 12, wrapped in a minimal container, open
+in an OS image reader and a third-party HEIF converter.
+
 4:2:0 8-bit input of **any size** (round 460): the coded picture is
 the size rounded up to a multiple of 16 with edge-replicated padding
 and a §7.4.3.2.1 conformance window crops it back (an odd size crops
@@ -296,6 +335,15 @@ distinct VPS / SPS / PPS).
   re-attachment, flush-then-`Eof`); frames in, IDR keyframe packets
   out (`mode = "pcm"` lossless or `mode = "intra"` at a chosen QP).
   `make_decoder` / `make_encoder` are the direct factory endpoints.
+  Multi-layer streams: the extradata may be an `hvcC` record followed
+  by an `lhvC` record (the non-base layers' parameter sets — what a
+  layered HEIF `lhv1` item carries); the decoder options `layer=<id>`
+  (that layer plus its reference layers, output alone), `view=<ViewId>`
+  and `ols=<idx>` pick the operating point, and without any the
+  highest output layer set is decoded with every output layer emitted
+  — the frames of one access unit consecutively, base view first
+  (`DecodedFrame::layer_id` / `view_id` / `au_index` on the direct
+  API; the core `VideoFrame` carries no layer tag yet).
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
   bodies), VUI + HRD (§E.2), SEI (§7.3.5 framing; typed §D.2
   payloads incl. the context-dependent §D.2.2 buffering-period and
@@ -350,10 +398,19 @@ and ~985 unit tests.
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
   path covers that geometry.)
-* Encoder input formats beyond 4:2:0 8-bit: 10-bit (Main 10 Still
-  Picture), 4:2:2 / 4:4:4 (Main 4:4:4 Still Picture) and monochrome
-  stills decode from every producer but cannot be encoded yet; an
-  odd-sized picture crops to its even rounding (the container's
+* Multi-layer corners: Annex H colour-gamut scalability (the
+  H.8.1.4.4 colour mapping process) is parsed but refused at decode;
+  Annex I 3D-HEVC (depth / `sps_3d_extension( )`) stays opaque;
+  `alt_output_layer_flag` and the independent non-base layer rewriting
+  process (F.10.2) are not applied; the SHVC resampling path and the
+  `poc_reset_*` machinery have no black-box oracle on this machine
+  (only the MV-HEVC path is validated against a reference decoder).
+* Lossy encoding beyond 4:2:0 8-bit: 10 / 12-bit, 4:2:2 / 4:4:4 and
+  monochrome stills are written **lossless only** (the PCM path —
+  every HEIC layout, see above); the intra quadtree coder (Main 10 /
+  Main 4:4:4 Still Picture at a QP) is still 8-bit 4:2:0 (its sample
+  path is `u8` throughout; generalising it is the follow-up). An
+  odd-sized 4:2:0 picture crops to its even rounding (the container's
   clean aperture carries the odd last column / row).
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
   level-0 time serially (38 s for a 12 MP still; 8.3 s on 8 workers
