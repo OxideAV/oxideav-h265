@@ -6,6 +6,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-h265/compare/v0.0.10...v0.0.11) - 2026-09-25
+
+### Added
+
+- *(encoder)* accept YuvJ420P as the full-range twin of Yuv420P, signalling video_full_range_flag by default
+- *(encoder)* §E.2.1 video_signal_type VUI (range + H.273 colour description) and parameter-set-id options on every mode
+- *(encoder)* halve the mode-decision λ under rd >= 1 and score the 64x64 search by SATD + bins — the 12 MP still lands −1.4 % BD-rate from the third-party encoder
+- *(encoder)* intra mode-decision effort levels — SATD + signalling-bins rough decision, chroma-mode election, short-list full RD (12 MP still: +6.3 % -> +0.3 % BD-rate vs a third-party encoder)
+- *(encoder)* registry tiles=CxR / wpp options — 12 MP still 17.7 s -> 3.4 s on 8 workers
+- *(encoder)* any-size stills (padding + conformance window), Main Still Picture signalling, Table A.8 side-bound levels; SEI num_sps_ids bound
+- *(decoder)* conformance-window output cropping + HEIF/HEIC still-picture pins (25 vendored real-world stills, both transport paths)
+- *(encoder)* tile-parallel pass 1 under the core ExecutionContext contract
+- *(encoder)* encoder-side WPP and tiles on the quadtree coder (wpp / tiles)
+- *(encoder)* weighted prediction estimation (wp) — §7.3.6.3 pred_weight_table from fade detection
+- *(encoder)* scaling-list-aware quantization (sl) — default + custom §7.3.4 lists
+- *(encoder)* deeper transform hierarchy (tudepth) + 8x4 / 4x8 inter PUs in the quadtree ladder
+- *(encoder)* RDOQ on the quadtree coder (rdoq)
+- *(encoder)* sign data hiding on the quadtree coder (sdh)
+
+### Other
+
+- round-456 status — quantization / hierarchy / weighted-prediction / WPP-tile tools, composed pins, unit-test count
+- *(encoder)* round-456 tool pins — composed RDOQ/SDH/tu2/WP/WPP pyramid + tiles/scaling-list/AQ low-delay streams, black-box validated
+- *(examples)* rd_measure — BD-rate harness over a deterministic synthetic corpus
+
 ### Added
 
 - *(decoder)* §7.4.3.2.1 conformance-window output cropping: `DecodedFrame` carries the active SPS's `CropWindow` (`DecodedFrame::output_picture`, `Picture::cropped`), the registry decoder emits the cropped `VideoFrame` (a 334x218 HEIF still coded as 336x224 comes out 334x218, as a HEIF reader expects) and the `decode_annexb` example writes the cropped planes; `decode_annexb_sequence` keeps returning the coded-size picture beside the window
