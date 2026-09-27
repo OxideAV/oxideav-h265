@@ -291,7 +291,13 @@ filters, RDOQ, tiles and WPP (11 golden pins in
 `tests/still_encoder.rs`, plus decoder-equals-encoder-reconstruction
 unit tests); the one divergence found is the reference decoder's luma
 at `Qp′Y` 74 / 75 (12-bit `qp` 50 / 51), which it reconstructs flat
-while this crate's decode matches the encoder. Wrapped in a minimal
+while this crate's decode matches the encoder. Against a third-party
+encoder at the same QPs on the 10-bit 12 MP still (identical YUV
+input): **−0.55 % luma BD-rate at 4:2:0 10-bit**; at 4:4:4 10-bit
++4.9 % luma-only but **−7.1 % on the 6:1:1-weighted YUV PSNR** (this
+coder spends the extra 4:4:4 bytes on chroma) — `cqpoffset` (−12..=12,
+`pps_cb/cr_qp_offset`) trades that back (+6: +0.7 % luma, −4.6 % YUV).
+Wrapped in a minimal
 HEIF container every layout opens in a third-party HEIF converter;
 the OS image reader renders the 8 / 10-bit layouts and full-range
 12-bit 4:2:0, and renders 12-bit 4:2:2 / 4:4:4 (and limited-range

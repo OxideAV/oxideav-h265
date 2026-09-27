@@ -54,7 +54,9 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for_dims, write_pps_full, write_ptl_layout, write_vps_layout};
+use crate::encoder::pcm::{
+    level_idc_for_dims, write_pps_full_cqp, write_ptl_layout, write_vps_layout,
+};
 use crate::encoder::residual::encode_residual_coding;
 use crate::encoder::sample::SampleFmt;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
@@ -280,6 +282,10 @@ pub(crate) struct SpsCfg {
     /// PTL names). Only the quadtree intra coder codes anything other
     /// than 4:2:0 8-bit.
     pub fmt: crate::encoder::sample::SampleFmt,
+    /// PPS `pps_cb_qp_offset == pps_cr_qp_offset` (−12..=12; the
+    /// quadtree intra coder quantizes and deblocks its chroma at it —
+    /// 0 everywhere else).
+    pub chroma_qp_offset: i32,
 }
 
 impl SpsCfg {
@@ -302,6 +308,7 @@ impl SpsCfg {
             video_signal: None,
             ids: ParameterSetIds::default(),
             fmt: crate::encoder::sample::SampleFmt::YUV420_8,
+            chroma_qp_offset: 0,
         }
     }
 }
@@ -1579,7 +1586,7 @@ pub(crate) fn assemble_idr_au(
             34,
             0,
             0,
-            &write_pps_full(
+            &write_pps_full_cqp(
                 false,
                 false,
                 lf.deblocking,
@@ -1589,6 +1596,7 @@ pub(crate) fn assemble_idr_au(
                 cfg.tree.is_some_and(|t| t.weighted_pred),
                 cfg.tree.is_some_and(|t| t.wpp),
                 cfg.ids,
+                cfg.chroma_qp_offset,
             ),
         ), // PPS_NUT
         nal_unit(20, 0, 0, slice_rbsp), // IDR_N_LP

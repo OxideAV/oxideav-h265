@@ -595,6 +595,7 @@ impl PyramidEncoder {
             video_signal: self.video_signal,
             ids: self.ids,
             fmt: crate::encoder::sample::SampleFmt::YUV420_8,
+            chroma_qp_offset: 0,
         }
     }
 

@@ -917,6 +917,109 @@ fn intra_layout_matrix_is_lossy_signalled_and_pinned() {
     );
 }
 
+/// `cqpoffset` (quadtree intra coder) writes `pps_cb_qp_offset ==
+/// pps_cr_qp_offset` and quantizes / deblocks chroma at it: a 4:4:4
+/// 10-bit still at +6 spends fewer bytes on (and reconstructs a lower
+/// PSNR in) chroma, luma untouched in quality class, and decodes
+/// exactly through the registry decoder; the option needs the
+/// quadtree intra coder.
+#[test]
+fn cqpoffset_signals_and_applies_the_pps_chroma_qp_offsets() {
+    use oxideav_core::PixelFormat;
+    use oxideav_h265::pps::PicParameterSet;
+    let (w, h) = (64usize, 48usize);
+    let plane = |seed: i64| -> VideoPlane {
+        let mut data = Vec::with_capacity(w * h * 2);
+        for y in 0..h {
+            for x in 0..w {
+                let v = 512.0
+                    + 200.0 * ((x as f64 * 0.2 + seed as f64).sin() * (y as f64 * 0.15).cos())
+                    + f64::from(hash_noise(x as i64, y as i64, seed as u64) % 40);
+                data.extend_from_slice(&(v.clamp(0.0, 1023.0) as u16).to_le_bytes());
+            }
+        }
+        VideoPlane {
+            stride: w * 2,
+            data,
+        }
+    };
+    let src = vec![plane(1), plane(2), plane(3)];
+    let encode = |off: Option<&str>| -> (Vec<u8>, Vec<VideoPlane>) {
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(w as u32);
+        params.height = Some(h as u32);
+        params.pixel_format = Some(PixelFormat::Yuv444P10Le);
+        params.options.insert("mode", "intra");
+        params.options.insert("qp", "22");
+        params.options.insert("deblock", "1");
+        if let Some(o) = off {
+            params.options.insert("cqpoffset", o);
+        }
+        let mut enc = oxideav_h265::make_encoder(&params).expect("encoder");
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: src.clone(),
+        }))
+        .expect("send");
+        let stream = enc.receive_packet().expect("packet").data;
+        let mut dec =
+            oxideav_h265::make_decoder(&CodecParameters::video("h265".into())).expect("decoder");
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), stream.clone()))
+            .expect("send");
+        dec.flush().expect("flush");
+        let out = match dec.receive_frame() {
+            Ok(Frame::Video(v)) => v.planes,
+            other => panic!("{other:?}"),
+        };
+        (stream, out)
+    };
+    let sse = |a: &VideoPlane, b: &VideoPlane| -> u64 {
+        a.data
+            .chunks_exact(2)
+            .zip(b.data.chunks_exact(2))
+            .map(|(x, y)| {
+                let d = i64::from(u16::from_le_bytes([x[0], x[1]]))
+                    - i64::from(u16::from_le_bytes([y[0], y[1]]));
+                (d * d) as u64
+            })
+            .sum()
+    };
+    let (s0, o0) = encode(None);
+    let (s6, o6) = encode(Some("6"));
+    let pps = |stream: &[u8]| -> PicParameterSet {
+        let rbsp = NalIter::new(stream)
+            .flatten()
+            .find(|u| u.header.nal_unit_type == 34)
+            .map(|u| u.rbsp)
+            .expect("PPS");
+        PicParameterSet::parse(&rbsp).expect("PPS parses")
+    };
+    assert_eq!(pps(&s0).pps_cb_qp_offset, 0);
+    let p6 = pps(&s6);
+    assert_eq!((p6.pps_cb_qp_offset, p6.pps_cr_qp_offset), (6, 6));
+    assert!(s6.len() < s0.len(), "{} < {}", s6.len(), s0.len());
+    for c in 1..3 {
+        assert!(
+            sse(&o6[c], &src[c]) > sse(&o0[c], &src[c]),
+            "chroma {c} coarser"
+        );
+    }
+    // The option needs the quadtree intra coder.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(64);
+    params.height = Some(64);
+    params.options.insert("mode", "intra");
+    params.options.insert("cqpoffset", "2");
+    assert!(oxideav_h265::make_encoder(&params).is_err(), "legacy coder");
+    params.options.insert("ctb", "32");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_ok(),
+        "quadtree coder"
+    );
+    params.options.insert("cqpoffset", "13");
+    assert!(oxideav_h265::make_encoder(&params).is_err(), "range");
+}
+
 /// `still` is refused on the inter GOP modes.
 #[test]
 fn still_rejects_inter_mode() {

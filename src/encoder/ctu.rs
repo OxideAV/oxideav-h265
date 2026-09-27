@@ -525,6 +525,8 @@ struct SliceCtx<'a> {
     me_refs_l1: &'a [RefPlanes],
     /// Pass-1 worker budget (tiles decided in parallel; 1 = serial).
     threads: usize,
+    /// `pps_cb_qp_offset == pps_cr_qp_offset`.
+    chroma_qp_offset: i32,
 }
 
 impl SliceCtx<'_> {
@@ -566,9 +568,10 @@ impl SliceCtx<'_> {
         self.fmt.luma_qp_prime(qp_y)
     }
 
-    /// The chroma `qP` (`Qp′Cb == Qp′Cr`: no chroma QP offsets) at `QpY`.
+    /// The chroma `qP` (`Qp′Cb == Qp′Cr`: one PPS offset for both) at
+    /// `QpY`.
     fn qp_c_prime(&self, qp_y: i32) -> u32 {
-        self.fmt.chroma_qp_prime(qp_y, 0)
+        self.fmt.chroma_qp_prime(qp_y, self.chroma_qp_offset)
     }
 
     fn ctbs_x(&self) -> usize {
@@ -3015,8 +3018,8 @@ fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], ctb_qps: &[i32], aq_on: bool) -
                 qp_y,
                 beta_offset_div2: 0,
                 tc_offset_div2: 0,
-                cb_qp_offset: 0,
-                cr_qp_offset: 0,
+                cb_qp_offset: ctx.chroma_qp_offset,
+                cr_qp_offset: ctx.chroma_qp_offset,
                 bit_depth_luma: ctx.fmt.bit_depth_luma,
                 bit_depth_chroma: ctx.fmt.bit_depth_chroma,
                 chroma_array_type: ctx.fmt.chroma_format_idc,
@@ -3915,7 +3918,20 @@ fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta:
 
 /// Copy a tile's rectangle of decided state into the picture state.
 fn merge_tile(master: &mut EncState, tile: &EncState, ctx: &SliceCtx<'_>, job: &TileJob) {
-    let (x0, y0, w, h) = (job.x0, job.y0, job.w, job.h);
+    merge_rect(master, tile, ctx, (job.x0, job.y0, job.w, job.h));
+}
+
+/// Copy the luma rectangle `(x0, y0, w, h)` of decided state
+/// (reconstruction, motion / mode fields, `CtDepth` / skip cells) from
+/// `from` into `to`; `x0` / `y0` / `w` / `h` are multiples of 8
+/// (CTB-aligned, clipped by the picture edge).
+fn merge_rect(
+    to: &mut EncState,
+    from: &EncState,
+    ctx: &SliceCtx<'_>,
+    (x0, y0, w, h): (usize, usize, usize, usize),
+) {
+    let (master, tile) = (to, from);
     let (sw, sh) = ctx.fmt.sub_wh();
     let (cw, cx0, cy0) = (ctx.cw(), x0 / sw, y0 / sh);
     let y = rect_copy(&tile.recon.y, ctx.width, x0, y0, w, h);
@@ -4298,6 +4314,7 @@ pub(crate) fn encode_intra_picture_tree_wide(
         me_refs_l0: &[],
         me_refs_l1: &[],
         threads: cfg.threads,
+        chroma_qp_offset: cfg.chroma_qp_offset,
     };
     let cu_qp_delta = aq > 0 || ctu_rc.is_some();
     debug_assert!(
@@ -4496,6 +4513,7 @@ pub(crate) fn encode_inter_slice_tree(
         me_refs_l0,
         me_refs_l1,
         threads: spec.threads,
+        chroma_qp_offset: 0,
     };
     let cu_qp_delta = spec.aq > 0 || spec.ctu_rc.is_some();
     let raw_slice_type: u8 = if spec.b_slice { 0 } else { 1 };

@@ -219,7 +219,10 @@ use oxideav_core::{
 /// depths and the PTL the layout's Annex A row (Main 10 / Main 10
 /// Still Picture, or `general_profile_idc == 4` with the Table A.2
 /// constraint flags — plus the intra / one-picture-only flags under
-/// `still`). The inter modes stay 8-bit 4:2:0.
+/// `still`). The inter modes stay 8-bit 4:2:0. `cqpoffset` (−12..=12,
+/// the quadtree intra coder) writes `pps_cb_qp_offset ==
+/// pps_cr_qp_offset` and quantizes / deblocks chroma at it (default
+/// 0).
 ///
 /// The `range` option (`"full"` / `"limited"`) and the H.273 code
 /// points `colorprim` / `transfer` / `matrix` (0..=255; any given one
@@ -261,6 +264,9 @@ pub struct H265Encoder {
     layout: pcm::PcmLayout,
     /// [`Self::layout`] as the coder's sample format.
     fmt: sample::SampleFmt,
+    /// The `cqpoffset` option (PPS chroma QP offsets, intra mode).
+    chroma_qp_offset: i32,
+
     /// The `still` option: Main Still Picture profile signalling on
     /// every (single-picture) access unit.
     still: bool,
@@ -309,7 +315,7 @@ impl std::fmt::Debug for H265Encoder {
 /// `cu_qp_delta`, strength 1..=3), plus `still` (pcm / intra modes:
 /// Main Still Picture profile signalling), and the quadtree-coder
 /// tools `sdh` / `rdoq` / `tudepth` / `sl` / `wp` / `wpp` / `tiles=CxR`
-/// / `rd` (all require `ctb`; `tiles` is the pass-1 fan-out unit under
+/// / `rd` / `cqpoffset` (all require `ctb`; `tiles` is the pass-1 fan-out unit under
 /// [`oxideav_core::Encoder::set_execution_context`]; `rd` 0..=2 is the
 /// intra mode-decision effort — 0 the historical SAD search, 1 a
 /// SATD + signalling-bins rough decision with chroma-mode election,
@@ -598,6 +604,29 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
         *t = t.with_intra_rd(rd.unwrap_or(u8::from(parse_flag(params, "still")?) * 2));
     }
+    // `cqpoffset` — pps_cb_qp_offset == pps_cr_qp_offset (−12..=12;
+    // the quadtree intra coder).
+    let chroma_qp_offset = match params.options.get("cqpoffset") {
+        None => 0,
+        Some(v) => {
+            let off = v
+                .parse::<i32>()
+                .ok()
+                .filter(|o| (-12..=12).contains(o))
+                .ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "h265 encode: cqpoffset must be -12..=12, got {v:?}"
+                    ))
+                })?;
+            if tree.is_none() || params.options.get("mode") != Some("intra") {
+                return Err(Error::InvalidData(
+                    "h265 encode: cqpoffset requires mode \"intra\" on the quadtree coder (ctb)"
+                        .into(),
+                ));
+            }
+            off
+        }
+    };
     // `cturc` — CTU-level rate feedback (requires bitrate + ctb).
     let ctu_rc = parse_flag(params, "cturc")?;
     if ctu_rc && (params.options.get("bitrate").is_none() || tree.is_none()) {
@@ -962,6 +991,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         ids,
         layout,
         fmt,
+        chroma_qp_offset,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
@@ -980,6 +1010,7 @@ impl H265Encoder {
         let (coded_width, coded_height) = (self.coded_width, self.coded_height);
         let (threads, crop, still) = (self.threads, self.crop, self.still);
         let (video_signal, ids, fmt) = (self.video_signal, self.ids, self.fmt);
+        let chroma_qp_offset = self.chroma_qp_offset;
         let EncodeMode::Intra {
             qp,
             tree,
@@ -1014,6 +1045,7 @@ impl H265Encoder {
             video_signal,
             ids,
             fmt,
+            chroma_qp_offset,
             ..intra::SpsCfg::legacy(u32::from(!still))
         };
         // The HRD SEI prefix: every frame is an IRAP access
@@ -1126,17 +1158,18 @@ impl H265Encoder {
         let layout = self.layout;
         let (sub_w, sub_h) = layout.sub_wh();
         let planes_needed = if layout.chroma_format_idc == 0 { 1 } else { 3 };
-        if v.planes.len() < planes_needed {
+        let image = &v.planes;
+        if image.len() < planes_needed {
             return Err(Error::InvalidData(format!(
                 "h265 encode: expected {planes_needed} planes for {:?}, got {}",
                 self.output_params.pixel_format,
-                v.planes.len()
+                image.len()
             )));
         }
         let wide = layout.bit_depth > 8;
         let bps = if wide { 2 } else { 1 };
         let pack = |idx: usize, w: usize, h: usize, cw: usize, ch: usize| -> Result<Vec<u16>> {
-            let plane = &v.planes[idx];
+            let plane = &image[idx];
             if plane.stride < w * bps || plane.data.len() < plane.stride * (h - 1) + w * bps {
                 return Err(Error::InvalidData(format!(
                     "h265 encode: plane {idx} too small (stride {}, len {})",
@@ -1249,17 +1282,18 @@ impl Encoder for H265Encoder {
         if self.layout != pcm::PcmLayout::default() {
             return self.send_frame_wide(v);
         }
-        if v.planes.len() != 3 {
+        let image = &v.planes;
+        if image.len() != 3 {
             return Err(Error::InvalidData(format!(
                 "h265 encode: expected 3 planes (yuv420p), got {}",
-                v.planes.len()
+                image.len()
             )));
         }
         // Repack each plane row-by-row (strides may exceed the width)
         // into the coded geometry, replicating the last column / row
         // into the padding a conformance window crops away again.
         let pack = |idx: usize, w: usize, h: usize, cw: usize, ch: usize| -> Result<Vec<u8>> {
-            let plane = &v.planes[idx];
+            let plane = &image[idx];
             if plane.stride < w || plane.data.len() < plane.stride * (h - 1) + w {
                 return Err(Error::InvalidData(format!(
                     "h265 encode: plane {idx} too small (stride {}, len {})",

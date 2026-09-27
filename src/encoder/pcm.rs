@@ -567,8 +567,11 @@ fn write_sps(
 /// adaptive-quantization encoders signal per-CTB QP through §7.3.8.10
 /// `cu_qp_delta` (`diff_cu_qp_delta_depth == 0`, one quantization
 /// group per CTB).
+///
+/// `pps_cb_qp_offset == pps_cr_qp_offset == chroma_qp_offset`
+/// (−12..=12).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_pps_full(
+pub(crate) fn write_pps_full_cqp(
     dependent_slice_segments_enabled: bool,
     deblocking_enabled: bool,
     deblocking_override_enabled: bool,
@@ -578,6 +581,7 @@ pub(crate) fn write_pps_full(
     weighted_pred: bool,
     entropy_coding_sync: bool,
     ids: crate::encoder::intra::ParameterSetIds,
+    chroma_qp_offset: i32,
 ) -> Vec<u8> {
     write_pps_grid(
         dependent_slice_segments_enabled,
@@ -592,10 +596,11 @@ pub(crate) fn write_pps_full(
         // across tile boundaries (their filter passes are picture-wide).
         tiles.is_some(),
         ids,
+        chroma_qp_offset,
     )
 }
 
-/// [`write_pps_full`] over an arbitrary [`TileGrid`] (uniform or
+/// [`write_pps_full_cqp`] over an arbitrary [`TileGrid`] (uniform or
 /// explicit `column_width_minus1[]` / `row_height_minus1[]`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_pps_grid(
@@ -609,6 +614,7 @@ pub(crate) fn write_pps_grid(
     entropy_coding_sync: bool,
     loop_filter_across_tiles: bool,
     ids: crate::encoder::intra::ParameterSetIds,
+    chroma_qp_offset: i32,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(u32::from(ids.pps)); // pps_pic_parameter_set_id
@@ -627,8 +633,8 @@ pub(crate) fn write_pps_grid(
     if cu_qp_delta {
         w.ue(0); // diff_cu_qp_delta_depth (QG == CTB)
     }
-    w.se(0); // pps_cb_qp_offset
-    w.se(0); // pps_cr_qp_offset
+    w.se(chroma_qp_offset); // pps_cb_qp_offset
+    w.se(chroma_qp_offset); // pps_cr_qp_offset
     w.put_bit(0); // pps_slice_chroma_qp_offsets_present_flag
     w.put_bit(u8::from(weighted_pred)); // weighted_pred_flag
     w.put_bit(u8::from(weighted_pred)); // weighted_bipred_flag
@@ -1239,6 +1245,7 @@ fn encode_au_wide(
                 false,
                 false,
                 opts.ids,
+                0,
             ),
         ), // PPS_NUT
     ];
