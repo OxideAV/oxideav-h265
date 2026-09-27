@@ -39,7 +39,23 @@ pub(crate) fn ctb_aq_deltas(
     strength: u8,
     ctb: usize,
 ) -> Vec<i32> {
+    ctb_aq_deltas_wide(y, width, height, strength, ctb, 8)
+}
+
+/// [`ctb_aq_deltas`] over a plane of any bit depth: the activity is
+/// measured in 8-bit units (deviations scaled down by `BitDepth − 8`)
+/// so the octave ladder — and the resulting QP offsets — match those
+/// of the same picture at 8 bits.
+pub(crate) fn ctb_aq_deltas_wide<S: crate::encoder::sample::Sample>(
+    y: &[S],
+    width: usize,
+    height: usize,
+    strength: u8,
+    ctb: usize,
+    bit_depth: u8,
+) -> Vec<i32> {
     let (ctbs_x, ctbs_y) = (width.div_ceil(ctb), height.div_ceil(ctb));
+    let depth_shift = u32::from(bit_depth.saturating_sub(8));
     let n = ctbs_x * ctbs_y;
     if strength == 0 {
         return vec![0; n];
@@ -55,7 +71,7 @@ pub(crate) fn ctb_aq_deltas(
         let mut sum = 0u64;
         for j in 0..h {
             for i in 0..w {
-                sum += u64::from(y[(y0 + j) * width + x0 + i]);
+                sum += y[(y0 + j) * width + x0 + i].to_i32() as u64;
             }
         }
         let count = (w * h) as u64;
@@ -63,10 +79,10 @@ pub(crate) fn ctb_aq_deltas(
         let mut dev = 0u64;
         for j in 0..h {
             for i in 0..w {
-                dev += u64::from(y[(y0 + j) * width + x0 + i]).abs_diff(mean);
+                dev += (y[(y0 + j) * width + x0 + i].to_i32() as u64).abs_diff(mean);
             }
         }
-        log_act.push(log2_q3(1 + dev * 256 / count));
+        log_act.push(log2_q3(1 + (dev >> depth_shift) * 256 / count));
     }
     let avg: i64 = log_act.iter().sum::<i64>() / n as i64;
     log_act

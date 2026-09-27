@@ -63,6 +63,7 @@ use crate::encoder::loopfilter::{
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
 use crate::encoder::residual::encode_residual_coding;
+use crate::encoder::sample::SampleFmt;
 use crate::inter_pred::{
     predict_inter_pu_weighted, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
 };
@@ -762,6 +763,7 @@ impl LowDelayPEncoder {
                     still: false,
                     video_signal: self.video_signal,
                     ids: self.ids,
+                    fmt: crate::encoder::sample::SampleFmt::YUV420_8,
                 },
                 &self.filters,
                 self.aq,
@@ -1077,18 +1079,24 @@ pub(crate) fn entry_point_offsets(subsets: &[Vec<u8>]) -> Vec<u32> {
 }
 
 /// Extract an `n`x`n` block of `plane` at `(x0, y0)` as `i32`s.
-pub(crate) fn extract(plane: &[u8], pw: usize, x0: usize, y0: usize, n: usize) -> Vec<i32> {
+pub(crate) fn extract<S: crate::encoder::sample::Sample>(
+    plane: &[S],
+    pw: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+) -> Vec<i32> {
     let mut out = Vec::with_capacity(n * n);
     for j in 0..n {
         for i in 0..n {
-            out.push(i32::from(plane[(y0 + j) * pw + x0 + i]));
+            out.push(plane[(y0 + j) * pw + x0 + i].to_i32());
         }
     }
     out
 }
 
 /// Store an `n`x`n` block back into `plane` at `(x0, y0)`.
-pub(crate) fn store(plane: &mut [u8], pw: usize, x0: usize, y0: usize, n: usize, s: &[u8]) {
+pub(crate) fn store<S: Copy>(plane: &mut [S], pw: usize, x0: usize, y0: usize, n: usize, s: &[S]) {
     for j in 0..n {
         plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + n].copy_from_slice(&s[j * n..(j + 1) * n]);
     }
@@ -2719,6 +2727,7 @@ pub(crate) fn encode_inter_slice(
             &FilterInput {
                 width,
                 height,
+                fmt: SampleFmt::YUV420_8,
                 ctb_qps: &eff_qps,
                 lambda,
                 recon: [&recon.y, &recon.cb, &recon.cr],

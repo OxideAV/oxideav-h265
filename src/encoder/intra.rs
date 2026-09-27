@@ -54,8 +54,9 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{level_idc_for_dims, write_pps_full, write_ptl_cfg, write_vps_cfg};
+use crate::encoder::pcm::{level_idc_for_dims, write_pps_full, write_ptl_layout, write_vps_layout};
 use crate::encoder::residual::encode_residual_coding;
+use crate::encoder::sample::SampleFmt;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
     intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
@@ -146,6 +147,22 @@ pub struct IntraEncodedAu {
     pub recon_cb: Vec<u8>,
     /// Reconstructed Cr plane.
     pub recon_cr: Vec<u8>,
+}
+
+/// [`IntraEncodedAu`] at any sample format: the reconstruction planes
+/// hold `u16` samples at the picture's bit depth, the chroma planes
+/// sized per its chroma format (empty for monochrome).
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct IntraEncodedAuWide {
+    /// The Annex B access unit (`VPS + SPS + PPS + IDR_N_LP`).
+    pub au: Vec<u8>,
+    /// Reconstructed luma plane (`width * height`).
+    pub recon_y: Vec<u16>,
+    /// Reconstructed Cb plane.
+    pub recon_cb: Vec<u16>,
+    /// Reconstructed Cr plane.
+    pub recon_cr: Vec<u16>,
 }
 
 /// The stream-level geometry / buffering knobs of the shared SPS
@@ -258,6 +275,11 @@ pub(crate) struct SpsCfg {
     /// The VPS / SPS / PPS ids the parameter sets and slice headers
     /// carry.
     pub ids: ParameterSetIds,
+    /// The picture's chroma format and bit depths (`chroma_format_idc`,
+    /// `bit_depth_luma/chroma_minus8`, and the Annex A profile row the
+    /// PTL names). Only the quadtree intra coder codes anything other
+    /// than 4:2:0 8-bit.
+    pub fmt: crate::encoder::sample::SampleFmt,
 }
 
 impl SpsCfg {
@@ -279,6 +301,7 @@ impl SpsCfg {
             still: false,
             video_signal: None,
             ids: ParameterSetIds::default(),
+            fmt: crate::encoder::sample::SampleFmt::YUV420_8,
         }
     }
 }
@@ -313,9 +336,12 @@ pub(crate) fn write_sps_cfg(
     w.put_bits(u32::from(cfg.ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl_cfg(&mut w, level_idc, cfg.still);
+    write_ptl_layout(&mut w, level_idc, cfg.still, cfg.fmt.layout());
     w.ue(u32::from(cfg.ids.sps)); // sps_seq_parameter_set_id
-    w.ue(1); // chroma_format_idc = 4:2:0
+    w.ue(u32::from(cfg.fmt.chroma_format_idc)); // chroma_format_idc
+    if cfg.fmt.chroma_format_idc == 3 {
+        w.put_bit(0); // separate_colour_plane_flag
+    }
     w.ue(width as u32); // pic_width_in_luma_samples
     w.ue(height as u32); // pic_height_in_luma_samples
     match cfg.conformance_window {
@@ -328,8 +354,8 @@ pub(crate) fn write_sps_cfg(
             w.ue(bottom); // conf_win_bottom_offset
         }
     }
-    w.ue(0); // bit_depth_luma_minus8
-    w.ue(0); // bit_depth_chroma_minus8
+    w.ue(u32::from(cfg.fmt.bit_depth_luma - 8)); // bit_depth_luma_minus8
+    w.ue(u32::from(cfg.fmt.bit_depth_chroma - 8)); // bit_depth_chroma_minus8
     w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     w.put_bit(1); // sps_sub_layer_ordering_info_present_flag
     w.ue(cfg.max_dec_pic_buffering_minus1); // sps_max_dec_pic_buffering_minus1[0]
@@ -350,6 +376,9 @@ pub(crate) fn write_sps_cfg(
             w.put_bit(1); // scaling_list_enabled_flag
             w.put_bit(u8::from(transmitted)); // sps_scaling_list_data_present_flag
             if transmitted {
+                // §7.3.4 carries the same six lists per size at every
+                // chroma format (the 4:4:4 32x32 chroma factors are
+                // derived from the 16x16 lists, §7.4.5).
                 crate::encoder::quant::write_scaling_list_data(&mut w, &data);
             }
         }
@@ -474,10 +503,15 @@ fn quant_scale(qp_rem: u32) -> i64 {
 /// Forward 2-D DCT-II (the transpose of the §8.6.4 inverse): stage 1
 /// over rows with `shift1 = log2TbS + BitDepth − 9`, stage 2 over
 /// columns with `shift2 = log2TbS + 6` — the normalization that makes
-/// the §8.6.3 dequant + §8.6.4 inverse reproduce the residual.
+/// the §8.6.3 dequant + §8.6.4 inverse reproduce the residual (8-bit).
 pub(crate) fn forward_transform(res: &[i32], n: usize) -> Vec<i32> {
+    forward_transform_bd(res, n, BIT_DEPTH as u8)
+}
+
+/// [`forward_transform`] at any `BitDepth` (the stage-1 shift).
+pub(crate) fn forward_transform_bd(res: &[i32], n: usize, bit_depth: u8) -> Vec<i32> {
     let log2 = n.trailing_zeros();
-    let shift1 = log2 + BIT_DEPTH - 9;
+    let shift1 = log2 + u32::from(bit_depth) - 9;
     let shift2 = log2 + 6;
     let r1 = 1i64 << (shift1 - 1);
     let r2 = 1i64 << (shift2 - 1);
@@ -1103,6 +1137,7 @@ pub(crate) fn encode_idr_intra_au_full(
             &FilterInput {
                 width,
                 height,
+                fmt: SampleFmt::YUV420_8,
                 ctb_qps: &eff_qps,
                 lambda,
                 recon: [&recon_y, &recon_cb, &recon_cr],
@@ -1489,17 +1524,19 @@ pub(crate) fn assemble_idr_au(
     // so every golden pin stays byte-stable; a reordering
     // (hierarchical-B) stream signals its honest DPB bounds, a still
     // its one-picture DPB and profile.
+    let layout = cfg.fmt.layout();
     let vps = if cfg.still {
-        write_vps_cfg(level_idc, 0, 0, true, cfg.ids.vps)
+        write_vps_layout(level_idc, 0, 0, true, cfg.ids.vps, layout)
     } else if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
-        write_vps_cfg(level_idc, 1, 0, false, cfg.ids.vps)
+        write_vps_layout(level_idc, 1, 0, false, cfg.ids.vps, layout)
     } else {
-        write_vps_cfg(
+        write_vps_layout(
             level_idc,
             cfg.max_dec_pic_buffering_minus1,
             cfg.max_num_reorder_pics,
             false,
             cfg.ids.vps,
+            layout,
         )
     };
     let units = vec![

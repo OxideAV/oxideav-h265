@@ -36,18 +36,23 @@
 //! * **Syntax** — [`encode_sao_ctb`] is the bin-exact §7.3.8.3
 //!   `sao( rx, ry )` dual of [`crate::slice_data::decode_sao`].
 //!
-//! Geometry contract (shared with the intra / low-delay encoders):
-//! `CtbSizeY == 16`, one coding unit per CTB, 4:2:0 8-bit, a single
-//! slice and tile per picture, per-CTB QP through
+//! Geometry contract: a single slice per picture, per-CTB QP through
 //! [`FilterInput::ctb_qps`] (constant, or the `cu_qp_delta` effective
-//! values under adaptive quantization), no PCM / transquant-bypass
-//! CUs (so the §8.7 `NoFilterMap` is empty).
+//! values under adaptive quantization) or the quadtree coder's per-CU
+//! descriptors, no PCM / transquant-bypass CUs (so the §8.7
+//! `NoFilterMap` is empty). The legacy coders pass `u8` 4:2:0 8-bit
+//! planes at `CtbSizeY == 16` with one coding unit per CTB; the
+//! quadtree coder passes `u16` planes at any chroma format / bit depth
+//! ([`FilterInput::fmt`]) — the SAO offset range (`sao_offset_abs`
+//! cMax `( 1 << ( Min( bitDepth, 10 ) − 5 ) ) − 1`), the band shift
+//! (`bitDepth − 5`) and the deblocking β / tC scaling follow it.
 
 use crate::binarization::PartMode;
 use crate::ctx_init::SliceContexts;
 use crate::deblock::{deblock_picture_full, DeblockCu, DeblockCuDesc, DeblockCuParams};
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
+use crate::encoder::sample::{Sample, SampleFmt};
 use crate::motion::MotionField;
 use crate::picture::{Picture, Plane};
 use crate::sao::{apply_sao_ctb_full, apply_sao_picture_full, ResolvedSao, ResolvedSaoComponent};
@@ -57,9 +62,6 @@ use crate::slice_data::{SaoComponent, SaoCtbParams};
 const CTB_LOG2: u32 = 4;
 /// The fixed CTB size.
 const CTB: usize = 1 << CTB_LOG2;
-/// §7.3.8.3 `sao_offset_abs` cMax at 8-bit:
-/// `(1 << (Min(bitDepth, 10) − 5)) − 1`.
-const SAO_OFFSET_MAX: i32 = 7;
 
 /// Which in-loop filters the encoder signals and applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -181,20 +183,24 @@ pub(crate) fn ctb_deblock_descs(
 }
 
 /// The borrowed inputs of one frame's filter pass.
-pub(crate) struct FilterInput<'a> {
+pub(crate) struct FilterInput<'a, S: Sample = u8> {
     /// Picture width in luma samples (multiple of 16).
     pub width: usize,
     /// Picture height in luma samples.
     pub height: usize,
+    /// The picture's chroma format and bit depths (the plane geometry,
+    /// the SAO offset range / band shift, the β / tC scaling).
+    pub fmt: SampleFmt,
     /// Per-CTB §8.6.1-derived `QpY` (raster order; the constant-QP
     /// paths repeat the slice QP).
     pub ctb_qps: &'a [i32],
     /// The SSD-per-bin λ of the slice's mode decisions.
     pub lambda: u64,
-    /// Pre-filter reconstruction planes `[y, cb, cr]`.
-    pub recon: [&'a [u8]; 3],
+    /// Pre-filter reconstruction planes `[y, cb, cr]` (chroma empty
+    /// for monochrome).
+    pub recon: [&'a [S]; 3],
     /// Source planes `[y, cb, cr]`.
-    pub src: [&'a [u8]; 3],
+    pub src: [&'a [S]; 3],
     /// The picture's motion / mode field (§8.7.2.4 bS input).
     pub field: &'a MotionField,
     /// Per-CTB coding shapes (raster order) — the legacy one-CU-per-CTB
@@ -226,7 +232,7 @@ pub(crate) struct TreeLayout<'a> {
 }
 
 /// One frame's elected filter signalling + the filtered reconstruction.
-pub(crate) struct FilteredFrame {
+pub(crate) struct FilteredFrame<S: Sample = u8> {
     /// The slice's deblocking election
     /// (`slice_deblocking_filter_disabled_flag == !deblock_on`).
     pub deblock_on: bool,
@@ -244,45 +250,58 @@ pub(crate) struct FilteredFrame {
     pub sao_ctbs: Vec<SaoCtbParams>,
     /// The filtered reconstruction (what a conforming decoder outputs
     /// and stores as a reference).
-    pub y: Vec<u8>,
+    pub y: Vec<S>,
     /// Filtered Cb plane.
-    pub cb: Vec<u8>,
+    pub cb: Vec<S>,
     /// Filtered Cr plane.
-    pub cr: Vec<u8>,
+    pub cr: Vec<S>,
 }
 
-/// Pack three u8 planes into a [`Picture`].
-fn planes_to_picture(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usize) -> Picture {
-    let mut pic = Picture::new(width, height, 1, 8, 8);
+/// Pack three planes into a [`Picture`] of the format.
+fn planes_to_picture<S: Sample>(
+    fmt: &SampleFmt,
+    y: &[S],
+    cb: &[S],
+    cr: &[S],
+    width: usize,
+    height: usize,
+) -> Picture {
+    let mut pic = Picture::new(
+        width,
+        height,
+        fmt.chroma_format_idc,
+        fmt.bit_depth_luma,
+        fmt.bit_depth_chroma,
+    );
     for (plane, data) in [(Plane::Luma, y), (Plane::Cb, cb), (Plane::Cr, cr)] {
         let (buf, _stride) = pic.plane_mut(plane);
         debug_assert_eq!(buf.len(), data.len());
         for (dst, &src) in buf.iter_mut().zip(data.iter()) {
-            *dst = i32::from(src);
+            *dst = src.to_i32();
         }
     }
     pic
 }
 
-/// SSD of one whole plane against a u8 source plane.
-fn plane_ssd(pic: &Picture, plane: Plane, src: &[u8]) -> u64 {
+/// SSD of one whole plane against a source plane.
+fn plane_ssd<S: Sample>(pic: &Picture, plane: Plane, src: &[S]) -> u64 {
     pic.plane(plane)
         .iter()
         .zip(src.iter())
         .map(|(&a, &b)| {
-            let d = a - i32::from(b);
+            let d = i64::from(a - b.to_i32());
             (d * d) as u64
         })
         .sum()
 }
 
 /// SSD of a `w`x`h` region of a picture plane against the matching
-/// region of a u8 source plane (`plane_w` wide).
+/// region of a source plane (`plane_w` wide).
 #[allow(clippy::too_many_arguments)]
-fn region_ssd(
+fn region_ssd<S: Sample>(
     pic: &Picture,
     plane: Plane,
-    src: &[u8],
+    src: &[S],
     plane_w: usize,
     x0: usize,
     y0: usize,
@@ -292,7 +311,9 @@ fn region_ssd(
     let mut acc = 0u64;
     for j in 0..h {
         for i in 0..w {
-            let d = pic.sample(plane, x0 + i, y0 + j) - i32::from(src[(y0 + j) * plane_w + x0 + i]);
+            let d = i64::from(
+                pic.sample(plane, x0 + i, y0 + j) - src[(y0 + j) * plane_w + x0 + i].to_i32(),
+            );
             acc += (d * d) as u64;
         }
     }
@@ -326,10 +347,11 @@ fn round_div(sum: i64, cnt: i64) -> i32 {
     }
 }
 
-/// §9.3.3 TR (cMax 7, bypass) bin count of one `sao_offset_abs` value.
-fn tr7_bins(v: u32) -> u64 {
-    if v as i32 >= SAO_OFFSET_MAX {
-        SAO_OFFSET_MAX as u64
+/// §9.3.3 TR (`cMax = offset_max`, bypass) bin count of one
+/// `sao_offset_abs` value.
+fn tr_bins(v: u32, offset_max: i32) -> u64 {
+    if v as i32 >= offset_max {
+        offset_max as u64
     } else {
         u64::from(v) + 1
     }
@@ -338,17 +360,26 @@ fn tr7_bins(v: u32) -> u64 {
 /// Rate proxy (bins) of one component's §7.3.8.3 fields. `with_shared`
 /// counts the `sao_type_idx_*` (and, for edge offset, `sao_eo_class_*`)
 /// bins — true for cIdx 0 / 1, false for cIdx 2 (which inherits both
-/// per §7.4.9.3).
-fn component_rate(comp: &SaoComponent, with_shared: bool) -> u64 {
+/// per §7.4.9.3). `offset_max` is the component's `sao_offset_abs`
+/// cMax.
+fn component_rate(comp: &SaoComponent, with_shared: bool, offset_max: i32) -> u64 {
     match comp.sao_type_idx {
         0 => u64::from(with_shared),
         1 => {
-            let offs: u64 = comp.offset_abs.iter().map(|&a| tr7_bins(a)).sum();
+            let offs: u64 = comp
+                .offset_abs
+                .iter()
+                .map(|&a| tr_bins(a, offset_max))
+                .sum();
             let signs = comp.offset_abs.iter().filter(|&&a| a != 0).count() as u64;
             u64::from(with_shared) * 2 + offs + signs + 5
         }
         _ => {
-            let offs: u64 = comp.offset_abs.iter().map(|&a| tr7_bins(a)).sum();
+            let offs: u64 = comp
+                .offset_abs
+                .iter()
+                .map(|&a| tr_bins(a, offset_max))
+                .sum();
             u64::from(with_shared) * 2 + offs + u64::from(with_shared) * 2
         }
     }
@@ -359,12 +390,12 @@ fn component_rate(comp: &SaoComponent, with_shared: bool) -> u64 {
 /// [`apply_sao_ctb_full`] into `scratch` (which must equal `base`
 /// outside the region on entry) and restores the region afterwards.
 #[allow(clippy::too_many_arguments)]
-fn eval_component(
+fn eval_component<S: Sample>(
     base: &Picture,
     scratch: &mut Picture,
     plane: Plane,
     comp: &ResolvedSaoComponent,
-    src: &[u8],
+    src: &[S],
     plane_w: usize,
     x0: usize,
     y0: usize,
@@ -383,17 +414,19 @@ fn eval_component(
 /// region: classify every sample against the pre-SAO picture (the
 /// §8.7.3.2 picture-boundary guard included), then derive the four
 /// per-category offsets from the src−rec means (categories 0/1
-/// non-negative, 2/3 non-positive per the §7.4.9.3 inferred signs).
+/// non-negative, 2/3 non-positive per the §7.4.9.3 inferred signs),
+/// clamped to the component's `sao_offset_abs` cMax.
 #[allow(clippy::too_many_arguments)]
-fn edge_candidate(
+fn edge_candidate<S: Sample>(
     base: &Picture,
     plane: Plane,
-    src: &[u8],
+    src: &[S],
     plane_w: usize,
     x0: usize,
     y0: usize,
     (nw, nh): (usize, usize),
     eo_class: u8,
+    offset_max: i32,
 ) -> SaoComponent {
     let (h0, v0, h1, v1) = crate::sao::eo_pos(eo_class);
     let (pw, ph) = base.plane_dims(plane);
@@ -426,7 +459,7 @@ fn edge_candidate(
             }
             cnt[edge_idx as usize] += 1;
             sum[edge_idx as usize] +=
-                i64::from(src[(y as usize) * plane_w + x as usize]) - i64::from(cur);
+                i64::from(src[(y as usize) * plane_w + x as usize].to_i32()) - i64::from(cur);
         }
     }
     let mut offset_abs = [0u32; 4];
@@ -434,9 +467,9 @@ fn edge_candidate(
         let raw = round_div(sum[i + 1], cnt[i + 1]);
         // §7.4.9.3 inferred signs: categories 1/2 add, 3/4 subtract.
         let clamped = if i < 2 {
-            raw.clamp(0, SAO_OFFSET_MAX)
+            raw.clamp(0, offset_max)
         } else {
-            raw.clamp(-SAO_OFFSET_MAX, 0)
+            raw.clamp(-offset_max, 0)
         };
         offset_abs[i] = clamped.unsigned_abs();
     }
@@ -450,32 +483,36 @@ fn edge_candidate(
 }
 
 /// Statistics-driven §8.7.3.2 band-offset candidate: per-band src−rec
-/// means, then the `sao_band_position` whose four consecutive bands
-/// carry the largest estimated SSD gain.
+/// means (32 bands of `bandShift = bitDepth − 5`), then the
+/// `sao_band_position` whose four consecutive bands carry the largest
+/// estimated SSD gain.
 #[allow(clippy::too_many_arguments)]
-fn band_candidate(
+fn band_candidate<S: Sample>(
     base: &Picture,
     plane: Plane,
-    src: &[u8],
+    src: &[S],
     plane_w: usize,
     x0: usize,
     y0: usize,
     (nw, nh): (usize, usize),
+    offset_max: i32,
+    bit_depth: u8,
 ) -> SaoComponent {
+    let band_shift = u32::from(bit_depth) - 5;
     let mut cnt = [0i64; 32];
     let mut sum = [0i64; 32];
     for j in 0..nh {
         for i in 0..nw {
             let cur = base.sample(plane, x0 + i, y0 + j);
-            let band = (cur >> 3) as usize & 31;
+            let band = (cur >> band_shift) as usize & 31;
             cnt[band] += 1;
-            sum[band] += i64::from(src[(y0 + j) * plane_w + x0 + i]) - i64::from(cur);
+            sum[band] += i64::from(src[(y0 + j) * plane_w + x0 + i].to_i32()) - i64::from(cur);
         }
     }
     let mut offset = [0i32; 32];
     let mut gain = [0i64; 32];
     for b in 0..32 {
-        let o = round_div(sum[b], cnt[b]).clamp(-SAO_OFFSET_MAX, SAO_OFFSET_MAX);
+        let o = round_div(sum[b], cnt[b]).clamp(-offset_max, offset_max);
         // Estimated SSD reduction: 2·o·Σdiff − o²·N (clipping ignored —
         // the exact election re-measures with the decode-side apply).
         let g = 2 * i64::from(o) * sum[b] - i64::from(o) * i64::from(o) * cnt[b];
@@ -503,8 +540,9 @@ fn band_candidate(
     }
 }
 
-/// Resolve a syntax component into the applied form (8-bit: no
-/// range-extension offset scale).
+/// Resolve a syntax component into the applied form (no
+/// range-extension `log2_sao_offset_scale_*`: eq. 7-72 with
+/// `log2OffsetScale == 0` at every depth).
 fn resolved(comp: &SaoComponent) -> ResolvedSaoComponent {
     ResolvedSaoComponent::from_decoded(comp, 0)
 }
@@ -514,16 +552,18 @@ fn resolved(comp: &SaoComponent) -> ResolvedSaoComponent {
 /// syntax component and its `dist + λ·rate` cost (rate including the
 /// component's own §7.3.8.3 bins).
 #[allow(clippy::too_many_arguments)]
-fn choose_luma(
+fn choose_luma<S: Sample>(
     base: &Picture,
     scratch: &mut Picture,
-    src: &[u8],
+    src: &[S],
     width: usize,
     x0: usize,
     y0: usize,
     (rw, rh): (usize, usize),
     lambda: u64,
+    fmt: &SampleFmt,
 ) -> (SaoComponent, u64) {
+    let offset_max = fmt.sao_offset_max(0);
     let off = SaoComponent::default();
     let mut best = (
         off,
@@ -541,18 +581,38 @@ fn choose_luma(
             y0,
             (rw, rh),
         );
-        let cost = d + lambda * component_rate(&comp, true);
+        let cost = d + lambda * component_rate(&comp, true, offset_max);
         if cost < best.1 {
             best = (comp, cost);
         }
     };
     consider(
-        band_candidate(base, Plane::Luma, src, width, x0, y0, (rw, rh)),
+        band_candidate(
+            base,
+            Plane::Luma,
+            src,
+            width,
+            x0,
+            y0,
+            (rw, rh),
+            offset_max,
+            fmt.bit_depth_luma,
+        ),
         scratch,
     );
     for eo_class in 0..4u8 {
         consider(
-            edge_candidate(base, Plane::Luma, src, width, x0, y0, (rw, rh), eo_class),
+            edge_candidate(
+                base,
+                Plane::Luma,
+                src,
+                width,
+                x0,
+                y0,
+                (rw, rh),
+                eo_class,
+                offset_max,
+            ),
             scratch,
         );
     }
@@ -563,17 +623,19 @@ fn choose_luma(
 /// type / eo-class rule: one `SaoTypeIdx` (and edge class) for both
 /// Cb and Cr, per-component offsets / band positions.
 #[allow(clippy::too_many_arguments)]
-fn choose_chroma(
+fn choose_chroma<S: Sample>(
     base: &Picture,
     scratch: &mut Picture,
-    src_cb: &[u8],
-    src_cr: &[u8],
+    src_cb: &[S],
+    src_cr: &[S],
     cw: usize,
     cx0: usize,
     cy0: usize,
     n: (usize, usize),
     lambda: u64,
+    fmt: &SampleFmt,
 ) -> ([SaoComponent; 2], u64) {
+    let offset_max = fmt.sao_offset_max(1);
     let dist_pair = |cb: &SaoComponent, cr: &SaoComponent, scratch: &mut Picture| -> u64 {
         eval_component(
             base,
@@ -601,21 +663,42 @@ fn choose_chroma(
     let mut best = ([off, off], dist_pair(&off, &off, scratch) + lambda);
     let mut consider = |cb: SaoComponent, cr: SaoComponent, scratch: &mut Picture| {
         let d = dist_pair(&cb, &cr, scratch);
-        let rate = component_rate(&cb, true) + component_rate(&cr, false);
+        let rate = component_rate(&cb, true, offset_max) + component_rate(&cr, false, offset_max);
         let cost = d + lambda * rate;
         if cost < best.1 {
             best = ([cb, cr], cost);
         }
     };
+    let bd = fmt.bit_depth_chroma;
     consider(
-        band_candidate(base, Plane::Cb, src_cb, cw, cx0, cy0, n),
-        band_candidate(base, Plane::Cr, src_cr, cw, cx0, cy0, n),
+        band_candidate(base, Plane::Cb, src_cb, cw, cx0, cy0, n, offset_max, bd),
+        band_candidate(base, Plane::Cr, src_cr, cw, cx0, cy0, n, offset_max, bd),
         scratch,
     );
     for eo_class in 0..4u8 {
         consider(
-            edge_candidate(base, Plane::Cb, src_cb, cw, cx0, cy0, n, eo_class),
-            edge_candidate(base, Plane::Cr, src_cr, cw, cx0, cy0, n, eo_class),
+            edge_candidate(
+                base,
+                Plane::Cb,
+                src_cb,
+                cw,
+                cx0,
+                cy0,
+                n,
+                eo_class,
+                offset_max,
+            ),
+            edge_candidate(
+                base,
+                Plane::Cr,
+                src_cr,
+                cw,
+                cx0,
+                cy0,
+                n,
+                eo_class,
+                offset_max,
+            ),
             scratch,
         );
     }
@@ -625,18 +708,17 @@ fn choose_chroma(
 /// Distortion of applying a fully-resolved CTB parameter set (all
 /// three components) — the merge-candidate measurement.
 #[allow(clippy::too_many_arguments)]
-fn resolved_ctb_dist(
+fn resolved_ctb_dist<S: Sample>(
     base: &Picture,
     scratch: &mut Picture,
     r: &ResolvedSao,
-    input: &FilterInput<'_>,
+    input: &FilterInput<'_, S>,
     x0: usize,
     y0: usize,
     (rw, rh): (usize, usize),
     sao_luma: bool,
     sao_chroma: bool,
 ) -> u64 {
-    let (cw, cx0, cy0, n) = (input.width / 2, x0 / 2, y0 / 2, (rw / 2, rh / 2));
     let mut d = 0u64;
     let luma = if sao_luma {
         &r.components[0]
@@ -654,6 +736,11 @@ fn resolved_ctb_dist(
         y0,
         (rw, rh),
     );
+    if !input.fmt.has_chroma() {
+        return d;
+    }
+    let (sw, sh) = input.fmt.sub_wh();
+    let (cw, cx0, cy0, n) = (input.width / sw, x0 / sw, y0 / sh, (rw / sw, rh / sh));
     let (cbc, crc) = if sao_chroma {
         (&r.components[1], &r.components[2])
     } else {
@@ -670,9 +757,17 @@ fn resolved_ctb_dist(
 /// slice SAO flags, per-CTB SAO syntax) and the filtered
 /// reconstruction — exactly what a conforming decoder reconstructs
 /// from that signalling.
-pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> FilteredFrame {
+#[allow(clippy::too_many_lines)]
+pub(crate) fn filter_frame<S: Sample>(
+    input: &FilterInput<'_, S>,
+    cfg: &LoopFilterCfg,
+) -> FilteredFrame<S> {
     let (width, height) = (input.width, input.height);
+    let fmt = input.fmt;
+    let has_chroma = fmt.has_chroma();
+    let (sw, sh) = fmt.sub_wh();
     let pre = planes_to_picture(
+        &fmt,
         input.recon[0],
         input.recon[1],
         input.recon[2],
@@ -687,8 +782,11 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
     let base = if cfg.deblocking {
         let ssd = |p: &Picture| {
             plane_ssd(p, Plane::Luma, input.src[0])
-                + plane_ssd(p, Plane::Cb, input.src[1])
-                + plane_ssd(p, Plane::Cr, input.src[2])
+                + if has_chroma {
+                    plane_ssd(p, Plane::Cb, input.src[1]) + plane_ssd(p, Plane::Cr, input.src[2])
+                } else {
+                    0
+                }
         };
         // se(v) bin-length proxy of one slice offset field.
         let se_bits = |v: i32| -> u64 {
@@ -748,6 +846,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
     let ctb = 1usize << input.ctb_log2;
     let ctbs_x = width.div_ceil(ctb);
     let ctbs_y = height.div_ceil(ctb);
+    let sao_chroma_cfg = cfg.sao_chroma && has_chroma;
     let mut sao_ctbs: Vec<SaoCtbParams> = Vec::new();
     let mut grid: Vec<ResolvedSao> = Vec::new();
     if cfg.sao() {
@@ -757,9 +856,10 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         for ctb_idx in 0..ctbs_x * ctbs_y {
             let (rx, ry) = (ctb_idx % ctbs_x, ctb_idx / ctbs_x);
             let (x0, y0) = (rx * ctb, ry * ctb);
-            let (cx0, cy0) = (x0 / 2, y0 / 2);
+            let (cx0, cy0) = (x0 / sw, y0 / sh);
             // The CTB region, clipped by the picture edge.
             let (rw, rh) = ((width - x0).min(ctb), (height - y0).min(ctb));
+            let (cw, nw, nh) = (width / sw, rw / sw, rh / sh);
 
             // Explicit candidate: per-component election.
             let mut comps = [SaoComponent::default(); 3];
@@ -774,6 +874,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     y0,
                     (rw, rh),
                     input.lambda,
+                    &fmt,
                 );
                 comps[0] = c;
                 explicit_cost += cost;
@@ -781,23 +882,23 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                 explicit_cost +=
                     region_ssd(&base, Plane::Luma, input.src[0], width, x0, y0, rw, rh);
             }
-            if cfg.sao_chroma {
+            if sao_chroma_cfg {
                 let ([cb, cr], cost) = choose_chroma(
                     &base,
                     &mut scratch,
                     input.src[1],
                     input.src[2],
-                    width / 2,
+                    cw,
                     cx0,
                     cy0,
-                    (rw / 2, rh / 2),
+                    (nw, nh),
                     input.lambda,
+                    &fmt,
                 );
                 comps[1] = cb;
                 comps[2] = cr;
                 explicit_cost += cost;
-            } else {
-                let (cw, nw, nh) = (width / 2, rw / 2, rh / 2);
+            } else if has_chroma {
                 explicit_cost += region_ssd(&base, Plane::Cb, input.src[1], cw, cx0, cy0, nw, nh)
                     + region_ssd(&base, Plane::Cr, input.src[2], cw, cx0, cy0, nw, nh);
             }
@@ -833,7 +934,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     y0,
                     (rw, rh),
                     cfg.sao_luma,
-                    cfg.sao_chroma,
+                    sao_chroma_cfg,
                 );
                 let cost = d + input.lambda;
                 if cost < best.2 {
@@ -859,7 +960,7 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
                     y0,
                     (rw, rh),
                     cfg.sao_luma,
-                    cfg.sao_chroma,
+                    sao_chroma_cfg,
                 );
                 let cost = d + input.lambda * (1 + u64::from(can_left));
                 if cost < best.2 {
@@ -882,13 +983,13 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
 
     // ---- slice-flag election + the decode-side picture apply ----
     let slice_sao_luma = cfg.sao_luma && grid.iter().any(|r| r.components[0].sao_type_idx != 0);
-    let slice_sao_chroma = cfg.sao_chroma && grid.iter().any(|r| r.components[1].sao_type_idx != 0);
+    let slice_sao_chroma = sao_chroma_cfg && grid.iter().any(|r| r.components[1].sao_type_idx != 0);
     let out = if slice_sao_luma || slice_sao_chroma {
         apply_sao_picture_full(
             &base,
             &grid,
             input.ctb_log2,
-            1,
+            fmt.chroma_format_idc,
             slice_sao_luma,
             slice_sao_chroma,
             None,
@@ -899,11 +1000,21 @@ pub(crate) fn filter_frame(input: &FilterInput<'_>, cfg: &LoopFilterCfg) -> Filt
         base
     };
 
-    let planar = out.to_planar_u8().expect("8-bit planes");
-    let (cw, ch) = (width / 2, height / 2);
-    let y = planar[..width * height].to_vec();
-    let cb = planar[width * height..width * height + cw * ch].to_vec();
-    let cr = planar[width * height + cw * ch..].to_vec();
+    let to_samples = |plane: Plane, max: i32| -> Vec<S> {
+        out.plane(plane)
+            .iter()
+            .map(|&v| S::clipped(v, max))
+            .collect()
+    };
+    let y = to_samples(Plane::Luma, fmt.max_luma());
+    let (cb, cr) = if has_chroma {
+        (
+            to_samples(Plane::Cb, fmt.max_chroma()),
+            to_samples(Plane::Cr, fmt.max_chroma()),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     FilteredFrame {
         deblock_on,
         beta_offset_div2,
@@ -932,6 +1043,34 @@ pub(crate) fn encode_sao_ctb(
     slice_sao_luma: bool,
     slice_sao_chroma: bool,
 ) {
+    encode_sao_ctb_fmt(
+        w,
+        cabac,
+        ctxs,
+        params,
+        can_left,
+        can_up,
+        slice_sao_luma,
+        slice_sao_chroma,
+        &SampleFmt::YUV420_8,
+    );
+}
+
+/// [`encode_sao_ctb`] at a sample format: the `sao_offset_abs` TR
+/// binarization's cMax follows each component's bit depth (Table
+/// 9-52), and a monochrome picture codes no chroma components.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sao_ctb_fmt(
+    w: &mut BitWriter,
+    cabac: &mut CabacEncoder,
+    ctxs: &mut SliceContexts,
+    params: &SaoCtbParams,
+    can_left: bool,
+    can_up: bool,
+    slice_sao_luma: bool,
+    slice_sao_chroma: bool,
+    fmt: &SampleFmt,
+) {
     if can_left {
         cabac.encode_decision(w, &mut ctxs.sao_merge_flag[0], u8::from(params.merge_left));
         if params.merge_left {
@@ -944,11 +1083,13 @@ pub(crate) fn encode_sao_ctb(
             return;
         }
     }
-    for c_idx in 0..3usize {
+    let n_components = if fmt.has_chroma() { 3 } else { 1 };
+    for c_idx in 0..n_components {
         let read = (slice_sao_luma && c_idx == 0) || (slice_sao_chroma && c_idx > 0);
         if !read {
             continue;
         }
+        let offset_max = fmt.sao_offset_max(c_idx as u8);
         let comp = &params.components[c_idx];
         if c_idx < 2 {
             // sao_type_idx_luma / _chroma: TR cMax 2 — bin 0
@@ -969,11 +1110,12 @@ pub(crate) fn encode_sao_ctb(
         }
         if comp.sao_type_idx != 0 {
             for &abs in &comp.offset_abs {
-                // sao_offset_abs: TR cMax 7 (8-bit), all bypass.
-                for _ in 0..abs.min(SAO_OFFSET_MAX as u32) {
+                // sao_offset_abs: TR cMax ( 1 << ( Min( bitDepth, 10 )
+                // − 5 ) ) − 1, all bypass.
+                for _ in 0..abs.min(offset_max as u32) {
                     cabac.encode_bypass(w, 1);
                 }
-                if (abs as i32) < SAO_OFFSET_MAX {
+                if (abs as i32) < offset_max {
                     cabac.encode_bypass(w, 0);
                 }
             }
@@ -1184,7 +1326,7 @@ mod tests {
             }
         }
         let src = vec![104u8; 256];
-        let cand = band_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16));
+        let cand = band_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16), 7, 8);
         assert_eq!(cand.sao_type_idx, 1);
         // Band 12 must be one of the four covered bands, with offset +4.
         let covered: Vec<usize> = (0..4)
@@ -1214,7 +1356,7 @@ mod tests {
         // Source: flatten toward 100 ⇒ minima want +10 (clamped 7),
         // maxima want −10 (clamped −7 ⇒ abs 7).
         let src = vec![100u8; 256];
-        let cand = edge_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16), 0);
+        let cand = edge_candidate(&pic, Plane::Luma, &src, 16, 0, 0, (16, 16), 0, 7);
         assert_eq!(cand.sao_type_idx, 2);
         assert_eq!(cand.eo_class, 0);
         assert_eq!(cand.offset_abs[0], 7, "category 1 (local min) clamped +7");
@@ -1247,6 +1389,7 @@ mod tests {
         let input = FilterInput {
             width: w,
             height: h,
+            fmt: SampleFmt::YUV420_8,
             ctb_qps: &qps,
             lambda: 4,
             recon: [&recon_y, &recon_c, &recon_c],
@@ -1283,7 +1426,7 @@ mod tests {
             let above = (i / ctbs_x > 0).then(|| grid[i - ctbs_x]);
             grid[i] = ResolvedSao::resolve(p, left.as_ref(), above.as_ref(), 0, 0);
         }
-        let pre = planes_to_picture(&recon_y, &recon_c, &recon_c, w, h);
+        let pre = planes_to_picture(&SampleFmt::YUV420_8, &recon_y, &recon_c, &recon_c, w, h);
         let applied = apply_sao_picture_full(
             &pre,
             &grid,
@@ -1329,6 +1472,7 @@ mod tests {
         let input = FilterInput {
             width: w,
             height: h,
+            fmt: SampleFmt::YUV420_8,
             ctb_qps: &qps,
             lambda: 1,
             recon: [&recon_y, &cpl, &cpl],
@@ -1365,7 +1509,7 @@ mod tests {
                 .sum()
         };
         let dist_at = |beta: i32, tc: i32| -> u64 {
-            let mut pic = planes_to_picture(&recon_y, &cpl, &cpl, w, h);
+            let mut pic = planes_to_picture(&SampleFmt::YUV420_8, &recon_y, &cpl, &cpl, w, h);
             let descs = ctb_deblock_descs(&shapes, w, h, &qps, beta, tc);
             deblock_picture_full(&mut pic, &field, &descs, None, None);
             let planar = pic.to_planar_u8().expect("8-bit");

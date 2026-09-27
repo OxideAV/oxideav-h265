@@ -57,15 +57,16 @@ use crate::encoder::inter::{
     SliceLfSignalling, SliceSpec, YuvFrame,
 };
 use crate::encoder::intra::{
-    chroma_qp_420, encode_cu_qp_delta, forward_transform, rate_proxy, IntraEncodeError,
-    IntraEncodedAu, SpsCfg,
+    encode_cu_qp_delta, forward_transform_bd, rate_proxy, IntraEncodeError, IntraEncodedAu,
+    IntraEncodedAuWide, SpsCfg,
 };
 use crate::encoder::loopfilter::{
-    encode_sao_ctb, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
+    encode_sao_ctb_fmt, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
 };
 use crate::encoder::pcm::TileGrid;
 use crate::encoder::quant::{quantize_tb, scaling_lists_for, RdoqModel, TbQuant};
 use crate::encoder::residual::encode_residual_coding;
+use crate::encoder::sample::{Sample, SampleFmt};
 use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
@@ -80,8 +81,6 @@ use crate::scan::ScanIdx;
 use crate::slice_data::SaoCtbParams;
 use crate::transform::{forward_dst4_1d, residual_block, BlockParams, Component, PredMode};
 
-/// Fixed 8-bit depth.
-const BIT_DEPTH: u32 = 8;
 /// `MaxNumMergeCand` (§7.4.7.1) — `five_minus_max_num_merge_cand = 0`.
 const MAX_MERGE: usize = 5;
 /// The z-order offsets of the four quadrants of a split node.
@@ -330,14 +329,17 @@ impl TreeCfg {
 // Coded-tree data model
 // ---------------------------------------------------------------------
 
-/// One residual-quadtree node's coded levels. Leaves at
-/// `log2TrafoSize >= 3` carry their own half-size chroma blocks;
-/// 4x4 luma leaves defer chroma to their parent split node
-/// (§7.3.8.10 `blkIdx == 3`), which carries the CU-quadrant 4x4
-/// chroma blocks itself.
+/// One residual-quadtree node's coded levels. Leaves whose chroma is
+/// coded in place (§7.3.8.10 `log2TrafoSize > 2 || ChromaArrayType ==
+/// 3`) carry their chroma blocks; 4x4 luma leaves of a 4:2:0 / 4:2:2
+/// tree defer chroma to their parent split node (`blkIdx == 3`),
+/// which carries the CU-quadrant 4x4 chroma blocks itself. A chroma
+/// level vector holds the node's `ChromaArrayType == 2 ? 2 : 1`
+/// square blocks back to back (upper half first), each
+/// `(1 << log2TrafoSizeC)²` long; monochrome trees keep them empty.
 enum TuNode {
     /// `split_transform_flag == 0` leaf: the luma levels, plus the
-    /// chroma levels when `log2TrafoSize > 2`.
+    /// chroma levels when coded in place.
     Leaf {
         y: Vec<i32>,
         cb: Vec<i32>,
@@ -345,7 +347,7 @@ enum TuNode {
     },
     /// `split_transform_flag == 1` node: four z-order children, plus
     /// the deferred 4x4 chroma blocks when the children are 4x4 luma
-    /// leaves (`log2TrafoSize == 3` here).
+    /// leaves (`log2TrafoSize == 3` here, 4:2:0 / 4:2:2 only).
     Split {
         children: Box<[TuNode; 4]>,
         cb: Vec<i32>,
@@ -356,6 +358,26 @@ enum TuNode {
 impl TuNode {
     fn any_nonzero(v: &[i32]) -> bool {
         v.iter().any(|&x| x != 0)
+    }
+
+    /// The per-block cbf flags of a chroma level vector holding
+    /// `blocks` stacked square blocks (`[upper, lower]`; the second
+    /// entry is `false` unless `ChromaArrayType == 2`).
+    fn cbf_halves(v: &[i32], blocks: usize) -> [bool; 2] {
+        if blocks == 2 && !v.is_empty() {
+            let half = v.len() / 2;
+            [Self::any_nonzero(&v[..half]), Self::any_nonzero(&v[half..])]
+        } else {
+            [Self::any_nonzero(v), false]
+        }
+    }
+
+    /// This node's own chroma level vectors `(cb, cr)` (empty at a
+    /// split node above the deferred-chroma level).
+    fn own_chroma(&self) -> (&[i32], &[i32]) {
+        match self {
+            TuNode::Leaf { cb, cr, .. } | TuNode::Split { cb, cr, .. } => (cb, cr),
+        }
     }
 
     /// Whether any luma level in the subtree is nonzero.
@@ -416,12 +438,14 @@ enum TreeCuKind {
     /// Two-PU inter partition.
     TwoPu { part: PartMode, pus: [PuSyntax; 2] },
     /// Intra: `PART_2Nx2N` (one PB) or, at `MinCbSizeY`, `PART_NxN`
-    /// (four PBs). `modes[0]` is replicated for 2Nx2N; `chroma` is the
-    /// coded `intra_chroma_pred_mode` (4 = derived from luma).
+    /// (four PBs). `modes[0]` is replicated for 2Nx2N; `chroma` holds
+    /// the coded `intra_chroma_pred_mode` per PB (4 = derived from
+    /// luma) — one value replicated unless `ChromaArrayType == 3`
+    /// `PART_NxN`, where §7.3.8.5 signals four.
     Intra {
         modes: [u8; 4],
         nxn: bool,
-        chroma: u8,
+        chroma: [u8; 4],
     },
 }
 
@@ -467,10 +491,15 @@ impl CuNode {
 /// Everything a slice's CU decisions read (immutable).
 struct SliceCtx<'a> {
     cfg: TreeCfg,
+    /// The picture's chroma format and bit depths (the sample path is
+    /// `u16` at every depth; 8-bit pictures are widened on entry).
+    fmt: SampleFmt,
     amp: bool,
     width: usize,
     height: usize,
-    src: [&'a [u8]; 3],
+    /// Source planes `[Y, Cb, Cr]` (the chroma planes empty for
+    /// monochrome).
+    src: [&'a [u16]; 3],
     qp: i32,
     aq_deltas: &'a [i32],
     /// CTU-level rate feedback: the frame's bit budget. When set, each
@@ -506,13 +535,40 @@ impl SliceCtx<'_> {
     /// −1.0 % BD-rate on the 1024x768 / 4032x3024 stills; the SATD
     /// rough decision and the exact-bin RDOQ leave less for the proxy
     /// bins to guard against).
+    ///
+    /// `q` is the `QpY`; the ladder runs on `Qp′Y = QpY + QpBdOffsetY`
+    /// so that at a higher bit depth — where the same `QpY` quantizes
+    /// `2^(BitDepth − 8)` times coarser in sample units and the SSD
+    /// scales by its square — λ scales by exactly the same
+    /// `2^(QpBdOffsetY / 3) = 4^(BitDepth − 8)` (identity at 8 bits).
     fn lambda_of(&self, q: i32) -> u64 {
+        let q = q + self.fmt.qp_bd_offset_y();
         let base = 1u64 << (q.unsigned_abs().saturating_sub(9) / 3);
         if self.cfg.intra_rd == 0 {
             base
         } else {
             base.div_ceil(2)
         }
+    }
+
+    /// Chroma plane width (0 for monochrome).
+    fn cw(&self) -> usize {
+        self.fmt.chroma_dims(self.width, self.height).0
+    }
+
+    /// Chroma plane height (0 for monochrome).
+    fn ch(&self) -> usize {
+        self.fmt.chroma_dims(self.width, self.height).1
+    }
+
+    /// The luma `qP` (`Qp′Y`) of the §8.6.2 scaling process at `QpY`.
+    fn qp_y_prime(&self, qp_y: i32) -> u32 {
+        self.fmt.luma_qp_prime(qp_y)
+    }
+
+    /// The chroma `qP` (`Qp′Cb == Qp′Cr`: no chroma QP offsets) at `QpY`.
+    fn qp_c_prime(&self, qp_y: i32) -> u32 {
+        self.fmt.chroma_qp_prime(qp_y, 0)
     }
 
     fn ctbs_x(&self) -> usize {
@@ -595,9 +651,47 @@ impl SliceCtx<'_> {
     }
 }
 
+/// The reconstruction planes the quadtree coder writes: `u16` at any
+/// bit depth (an 8-bit picture narrows back on output).
+#[derive(Clone)]
+pub(crate) struct ReconPlanes {
+    pub y: Vec<u16>,
+    /// Empty for monochrome.
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
+}
+
+impl ReconPlanes {
+    fn new(fmt: &SampleFmt, width: usize, height: usize) -> Self {
+        let (cw, ch) = fmt.chroma_dims(width, height);
+        Self {
+            y: vec![0; width * height],
+            cb: vec![0; cw * ch],
+            cr: vec![0; cw * ch],
+        }
+    }
+
+    /// Narrow to the 8-bit [`FrameRecon`] of the inter coders (every
+    /// value is already `<= 255` on an 8-bit picture).
+    fn into_frame_recon(self) -> FrameRecon {
+        let narrow = |v: Vec<u16>| -> Vec<u8> { v.into_iter().map(|s| s as u8).collect() };
+        FrameRecon {
+            y: narrow(self.y),
+            cb: narrow(self.cb),
+            cr: narrow(self.cr),
+            motion_field: None,
+        }
+    }
+}
+
+/// Widen an 8-bit plane to the coder's `u16` sample path.
+pub(crate) fn widen(plane: &[u8]) -> Vec<u16> {
+    plane.iter().map(|&s| u16::from(s)).collect()
+}
+
 /// The picture state the decisions mutate (and snapshots roll back).
 struct EncState {
-    recon: FrameRecon,
+    recon: ReconPlanes,
     field: MotionField,
     modes: IntraModeField,
     /// Per-4x4-cell `CtDepth` (−1 until coded).
@@ -613,17 +707,11 @@ struct EncState {
 }
 
 impl EncState {
-    fn new(width: usize, height: usize, ctb_log2: u32) -> Self {
-        let (cw, ch) = (width / 2, height / 2);
+    fn new(fmt: &SampleFmt, width: usize, height: usize, ctb_log2: u32) -> Self {
         let w_cells = width.div_ceil(4);
         let h_cells = height.div_ceil(4);
         Self {
-            recon: FrameRecon {
-                y: vec![0u8; width * height],
-                cb: vec![0u8; cw * ch],
-                cr: vec![0u8; cw * ch],
-                motion_field: None,
-            },
+            recon: ReconPlanes::new(fmt, width, height),
             field: MotionField::new(width, height),
             modes: IntraModeField::new(width, height, ctb_log2),
             ct_depth: vec![-1; w_cells * h_cells],
@@ -688,9 +776,9 @@ struct Snap {
     x0: usize,
     y0: usize,
     n: usize,
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    y: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
     field: Vec<MotionCell>,
     modes: Vec<u8>,
     depth: Vec<i8>,
@@ -723,7 +811,13 @@ impl EncState {
     fn snapshot(&self, ctx: &SliceCtx<'_>, x0: usize, y0: usize, n: usize) -> Snap {
         let w = (ctx.width - x0).min(n);
         let h = (ctx.height - y0).min(n);
-        let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
+        let (sw, sh) = ctx.fmt.sub_wh();
+        let (cw, cx0, cy0) = (ctx.cw(), x0 / sw, y0 / sh);
+        let (wc, hc) = if ctx.fmt.has_chroma() {
+            (w / sw, h / sh)
+        } else {
+            (0, 0)
+        };
         let bx0 = x0 / 4;
         let by0 = y0 / 4;
         let bx1 = (x0 + w).div_ceil(4).min(self.w_cells);
@@ -741,8 +835,8 @@ impl EncState {
             y0,
             n,
             y: rect_copy(&self.recon.y, ctx.width, x0, y0, w, h),
-            cb: rect_copy(&self.recon.cb, cw, cx0, cy0, w / 2, h / 2),
-            cr: rect_copy(&self.recon.cr, cw, cx0, cy0, w / 2, h / 2),
+            cb: rect_copy(&self.recon.cb, cw, cx0, cy0, wc, hc),
+            cr: rect_copy(&self.recon.cr, cw, cx0, cy0, wc, hc),
             field: self.field.snapshot_rect(x0, y0, n, n),
             modes: self.modes.snapshot_rect(x0, y0, n, n),
             depth,
@@ -754,10 +848,16 @@ impl EncState {
         let (x0, y0, n) = (snap.x0, snap.y0, snap.n);
         let w = (ctx.width - x0).min(n);
         let h = (ctx.height - y0).min(n);
-        let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
+        let (sw, sh) = ctx.fmt.sub_wh();
+        let (cw, cx0, cy0) = (ctx.cw(), x0 / sw, y0 / sh);
+        let (wc, hc) = if ctx.fmt.has_chroma() {
+            (w / sw, h / sh)
+        } else {
+            (0, 0)
+        };
         rect_paste(&mut self.recon.y, ctx.width, x0, y0, w, h, &snap.y);
-        rect_paste(&mut self.recon.cb, cw, cx0, cy0, w / 2, h / 2, &snap.cb);
-        rect_paste(&mut self.recon.cr, cw, cx0, cy0, w / 2, h / 2, &snap.cr);
+        rect_paste(&mut self.recon.cb, cw, cx0, cy0, wc, hc, &snap.cb);
+        rect_paste(&mut self.recon.cr, cw, cx0, cy0, wc, hc, &snap.cr);
         self.field.restore_rect(x0, y0, n, n, &snap.field);
         self.modes.restore_rect(x0, y0, n, n, &snap.modes);
         let bx0 = x0 / 4;
@@ -779,9 +879,10 @@ impl EncState {
 // ---------------------------------------------------------------------
 
 /// Forward DST-VII for the intra-luma 4x4 case (the transpose of the
-/// eq. 8-316 synthesis, at the encoder's DCT normalization shifts).
-fn forward_transform_dst4(res: &[i32]) -> Vec<i32> {
-    let shift1 = 2 + BIT_DEPTH - 9; // log2TbS + BitDepth − 9
+/// eq. 8-316 synthesis, at the encoder's DCT normalization shifts for
+/// `bit_depth`).
+fn forward_transform_dst4(res: &[i32], bit_depth: u8) -> Vec<i32> {
+    let shift1 = 2 + u32::from(bit_depth) - 9; // log2TbS + BitDepth − 9
     let shift2 = 2 + 6;
     let r1 = 1i64 << (shift1 - 1);
     let r2 = 1i64 << (shift2 - 1);
@@ -809,6 +910,9 @@ fn forward_transform_dst4(res: &[i32]) -> Vec<i32> {
 struct TbTools<'a> {
     /// The §7.4.9.11 scan of the block (mode-dependent on intra).
     scan: ScanIdx,
+    /// The component's bit depth (transform normalization, the
+    /// quantizer's `qBits`, the reconstruction clip).
+    bit_depth: u8,
     /// Sample-domain λ.
     lambda: u64,
     /// RDOQ model (`None` = deadzone quantizer).
@@ -842,7 +946,14 @@ impl<'a> TbTools<'a> {
         // and λ/2 is the measured optimum (a {1/8 .. 3/4}·λ sweep on
         // the rd_measure corpus: −9.4 % BD-rate on the pyramid path).
         Self {
-            scan: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, u32::from(mode)),
+            scan: residual_coding_scan_idx(
+                cu_is_intra,
+                log2,
+                c_idx,
+                ctx.fmt.chroma_format_idc,
+                u32::from(mode),
+            ),
+            bit_depth: ctx.fmt.bit_depth(c_idx),
             lambda: lambda / 2,
             model: if ctx.cfg.rdoq { model } else { None },
             sign_hiding: ctx.cfg.sign_hiding,
@@ -862,12 +973,12 @@ fn code_tb(
     component: Component,
     pred_mode: PredMode,
     tools: TbTools<'_>,
-) -> (Vec<i32>, Vec<u8>) {
+) -> (Vec<i32>, Vec<u16>) {
     let res: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
     let coef = if pred_mode == PredMode::Intra && component == Component::Luma && n == 4 {
-        forward_transform_dst4(&res)
+        forward_transform_dst4(&res, tools.bit_depth)
     } else {
-        forward_transform(&res, n)
+        forward_transform_bd(&res, n, tools.bit_depth)
     };
     let levels = quantize_tb(
         &coef,
@@ -875,6 +986,7 @@ fn code_tb(
             log2: n.trailing_zeros(),
             qp,
             is_chroma: component != Component::Luma,
+            bit_depth: tools.bit_depth,
             scan: tools.scan,
             lambda: tools.lambda,
             model: tools.model,
@@ -882,8 +994,9 @@ fn code_tb(
             scaling: tools.scaling,
         },
     );
-    let recon: Vec<u8> = if levels.iter().all(|&v| v == 0) {
-        pred.iter().map(|&p| p.clamp(0, 255) as u8).collect()
+    let max = (1i32 << tools.bit_depth) - 1;
+    let recon: Vec<u16> = if levels.iter().all(|&v| v == 0) {
+        pred.iter().map(|&p| u16::clipped(p, max)).collect()
     } else {
         let r = residual_block(
             &levels,
@@ -893,7 +1006,7 @@ fn code_tb(
                 q_p: qp,
                 component,
                 pred_mode,
-                bit_depth: BIT_DEPTH as u8,
+                bit_depth: tools.bit_depth,
                 extended_precision: false,
                 transquant_bypass: false,
                 transform_skip: false,
@@ -903,35 +1016,48 @@ fn code_tb(
         .expect("legal block params");
         pred.iter()
             .zip(r.iter())
-            .map(|(&p, &d)| (p + d).clamp(0, 255) as u8)
+            .map(|(&p, &d)| u16::clipped(p + d, max))
             .collect()
     };
     (levels, recon)
 }
 
-fn ssd_u8(a: &[u8], b: &[i32]) -> u64 {
+/// Sum of squared differences of a stored block against an `i32` one.
+fn ssd<S: Sample>(a: &[S], b: &[i32]) -> u64 {
     a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| {
-            let d = i64::from(x) - i64::from(y);
+            let d = i64::from(x.to_i32()) - i64::from(y);
             (d * d) as u64
         })
         .sum()
+}
+
+/// Clip a prediction into stored samples at the component ceiling.
+fn clip_to_samples(v: &[i32], max: i32) -> Vec<u16> {
+    v.iter().map(|&p| u16::clipped(p, max)).collect()
 }
 
 // ---------------------------------------------------------------------
 // Intra CU coding
 // ---------------------------------------------------------------------
 
-fn pred_params(mode: u8, cidx: PredComponent) -> IntraPredParams {
+/// The §8.4.4.2 prediction parameters of one component at the
+/// picture's format (`strong_intra_smoothing_enabled_flag == 0`, the
+/// §8.4.4.2.3 filtering gate open for chroma only at 4:4:4).
+fn pred_params(fmt: &SampleFmt, mode: u8, cidx: PredComponent) -> IntraPredParams {
     IntraPredParams {
         pred_mode_intra: mode,
         cidx,
-        bit_depth: BIT_DEPTH as u8,
-        bit_depth_luma: BIT_DEPTH as u8,
+        bit_depth: if cidx == PredComponent::Luma {
+            fmt.bit_depth_luma
+        } else {
+            fmt.bit_depth_chroma
+        },
+        bit_depth_luma: fmt.bit_depth_luma,
         intra_smoothing_disabled: false,
         strong_intra_smoothing_enabled: false,
-        chroma_array_type_3: false,
+        chroma_array_type_3: fmt.chroma_format_idc == 3,
         disable_boundary_filter: false,
     }
 }
@@ -940,7 +1066,7 @@ fn pred_params(mode: u8, cidx: PredComponent) -> IntraPredParams {
 /// `(x0, y0)` from the frame reconstruction, availability per §6.4.1.
 fn gather_luma_refs(
     ctx: &SliceCtx<'_>,
-    recon_y: &[u8],
+    recon_y: &[u16],
     x0: usize,
     y0: usize,
     n: usize,
@@ -965,23 +1091,40 @@ fn gather_luma_refs(
     MarkedReferenceSamples::new(n, corner, left, top).expect("legal TB geometry")
 }
 
+/// A source plane plus the chroma rectangle `(x, y, w, h)` whose
+/// reference reads it substitutes (see [`gather_chroma_refs`]).
+type SrcOverride<'a> = (&'a [u16], (usize, usize, usize, usize));
+
 /// Chroma twin of [`gather_luma_refs`] (`n` chroma samples at chroma
-/// `(cx0, cy0)`; availability tested at the co-located luma).
+/// `(cx0, cy0)`; availability tested at the co-located luma — the
+/// §8.4.4.2.2 `( xTbCmp, yTbCmp )` scaled by `SubWidthC` /
+/// `SubHeightC`, so a 4:2:2 lower block is judged from its own
+/// position). `override` substitutes reads inside a chroma rectangle
+/// (`x, y, w, h`) with the SOURCE plane — the rough mode elections'
+/// stand-in for not-yet-reconstructed samples of the current CU.
 fn gather_chroma_refs(
     ctx: &SliceCtx<'_>,
-    plane: &[u8],
+    plane: &[u16],
     cx0: usize,
     cy0: usize,
     n: usize,
+    override_src: Option<SrcOverride<'_>>,
 ) -> MarkedReferenceSamples {
-    let cw = ctx.width / 2;
-    let ch = ctx.height / 2;
+    let cw = ctx.cw();
+    let ch = ctx.ch();
+    let (sw, sh) = ctx.fmt.sub_wh();
     let get = |x: i64, y: i64| -> (i32, bool) {
         if x < 0 || y < 0 || x >= cw as i64 || y >= ch as i64 {
             return (0, false);
         }
-        if ctx.z_avail(cx0 * 2, cy0 * 2, x * 2, y * 2) {
-            (i32::from(plane[y as usize * cw + x as usize]), true)
+        let (xu, yu) = (x as usize, y as usize);
+        if let Some((src, (rx, ry, rw, rh))) = override_src {
+            if (rx..rx + rw).contains(&xu) && (ry..ry + rh).contains(&yu) {
+                return (i32::from(src[yu * cw + xu]), true);
+            }
+        }
+        if ctx.z_avail(cx0 * sw, cy0 * sh, x * sw as i64, y * sh as i64) {
+            (i32::from(plane[yu * cw + xu]), true)
         } else {
             (0, false)
         }
@@ -999,12 +1142,17 @@ fn gather_chroma_refs(
 /// SAD-search all 35 §8.4.2 modes for a luma TB read from the frame
 /// reconstruction; `override_read` (inside-CU source samples for the
 /// 64x64 multi-TU search) substitutes reference reads when set.
-fn search_best_mode(marked: &MarkedReferenceSamples, src: &[i32]) -> (u8, Vec<i32>) {
+fn search_best_mode(
+    fmt: &SampleFmt,
+    marked: &MarkedReferenceSamples,
+    src: &[i32],
+) -> (u8, Vec<i32>) {
     let mut best = (0u8, Vec::new());
     let mut best_cost = u64::MAX;
     for mode in 0..=34u8 {
-        let pred = intra_predict_with_substitution(marked, &pred_params(mode, PredComponent::Luma))
-            .expect("legal prediction params");
+        let pred =
+            intra_predict_with_substitution(marked, &pred_params(fmt, mode, PredComponent::Luma))
+                .expect("legal prediction params");
         let cost: u64 = src
             .iter()
             .zip(pred.iter())
@@ -1114,6 +1262,7 @@ fn mpm_list(ctx: &SliceCtx<'_>, st: &EncState, x: usize, y: usize) -> [u8; 3] {
 /// mode appended when it did not make the cut — it is the cheapest
 /// to signal and a frequent RD winner).
 fn rough_intra_modes(
+    fmt: &SampleFmt,
     marked: &MarkedReferenceSamples,
     src: &[i32],
     n: usize,
@@ -1123,9 +1272,11 @@ fn rough_intra_modes(
 ) -> Vec<u8> {
     let mut scored: Vec<(u64, u8)> = (0..=34u8)
         .map(|mode| {
-            let pred =
-                intra_predict_with_substitution(marked, &pred_params(mode, PredComponent::Luma))
-                    .expect("legal prediction params");
+            let pred = intra_predict_with_substitution(
+                marked,
+                &pred_params(fmt, mode, PredComponent::Luma),
+            )
+            .expect("legal prediction params");
             (
                 satd(src, &pred, n) + lambda_me * luma_mode_bins(mode, mpm),
                 mode,
@@ -1140,13 +1291,16 @@ fn rough_intra_modes(
     out
 }
 
-/// Rough chroma mode election for the intra CU at luma `(x0, y0)`
-/// size `n` whose luma mode is `luma_mode`: the five
+/// Rough chroma mode election for the intra prediction block at luma
+/// `(x0, y0)` size `n` whose luma mode is `luma_mode`: the five
 /// `intra_chroma_pred_mode` values (Table 8-2: planar / 26 / 10 / 1
-/// with the mode-34 substitution, or 4 = the luma mode) scored by the
-/// SATD of the Cb + Cr predictions from the current reconstruction
-/// plus `λ_me` times the §9.3.3.8 bins (1 for 4, 3 otherwise).
-/// Returns `(intra_chroma_pred_mode, IntraPredModeC)`.
+/// with the mode-34 substitution, or 4 = the luma mode; the Table 8-3
+/// 4:2:2 remap applied) scored by the SATD of the Cb + Cr predictions
+/// from the current reconstruction plus `λ_me` times the §9.3.3.8
+/// bins (1 for 4, 3 otherwise). A 4:2:2 block's lower half is
+/// predicted with the upper half's SOURCE samples standing in for its
+/// not-yet-coded reconstruction. Returns `(intra_chroma_pred_mode,
+/// IntraPredModeC)`; `(4, luma_mode)` for a monochrome picture.
 fn elect_chroma_mode(
     ctx: &SliceCtx<'_>,
     st: &EncState,
@@ -1156,24 +1310,60 @@ fn elect_chroma_mode(
     luma_mode: u8,
     lambda_me: u64,
 ) -> (u8, u8) {
-    let (cx0, cy0, nc) = (x0 / 2, y0 / 2, n / 2);
-    let cw = ctx.width / 2;
-    let src_cb = extract(ctx.src[1], cw, cx0, cy0, nc);
-    let src_cr = extract(ctx.src[2], cw, cx0, cy0, nc);
-    let marked_cb = gather_chroma_refs(ctx, &st.recon.cb, cx0, cy0, nc);
-    let marked_cr = gather_chroma_refs(ctx, &st.recon.cr, cx0, cy0, nc);
+    let fmt = &ctx.fmt;
+    if !fmt.has_chroma() {
+        return (4, luma_mode);
+    }
+    let (sw, sh) = fmt.sub_wh();
+    let (cx0, cy0) = (x0 / sw, y0 / sh);
+    // The chroma block(s) of an n x n luma block: side n / SubWidthC,
+    // stacked `chroma_blocks()` times.
+    let nc = n / sw;
+    let blocks = fmt.chroma_blocks();
+    let cw = ctx.cw();
+    let rect = (cx0, cy0, nc, nc * blocks);
     let mut best = (4u8, luma_mode, u64::MAX);
+    let mut cache: Vec<(u8, u64)> = Vec::with_capacity(5);
     for idx in [4u8, 0, 1, 2, 3] {
-        let mode_c = crate::binarization::derive_intra_pred_mode_c(idx, luma_mode, false);
-        let pred_cb =
-            intra_predict_with_substitution(&marked_cb, &pred_params(mode_c, PredComponent::Cb))
-                .expect("legal prediction params");
-        let pred_cr =
-            intra_predict_with_substitution(&marked_cr, &pred_params(mode_c, PredComponent::Cr))
-                .expect("legal prediction params");
-        let cost = satd(&src_cb, &pred_cb, nc)
-            + satd(&src_cr, &pred_cr, nc)
-            + lambda_me * if idx == 4 { 1 } else { 3 };
+        let mode_c = crate::binarization::derive_intra_pred_mode_c(
+            idx,
+            luma_mode,
+            fmt.chroma_format_idc == 2,
+        );
+        // Distinct indices can map to one mode (idx 4 vs an explicit
+        // one): the SATD is a function of the mode alone.
+        let satd_c = match cache.iter().find(|(m, _)| *m == mode_c) {
+            Some(&(_, d)) => d,
+            None => {
+                let mut d = 0u64;
+                for (plane_idx, pc) in [(1usize, PredComponent::Cb), (2, PredComponent::Cr)] {
+                    let recon_plane = if plane_idx == 1 {
+                        &st.recon.cb
+                    } else {
+                        &st.recon.cr
+                    };
+                    for v in 0..blocks {
+                        let cy = cy0 + v * nc;
+                        let marked = gather_chroma_refs(
+                            ctx,
+                            recon_plane,
+                            cx0,
+                            cy,
+                            nc,
+                            Some((ctx.src[plane_idx], rect)),
+                        );
+                        let pred =
+                            intra_predict_with_substitution(&marked, &pred_params(fmt, mode_c, pc))
+                                .expect("legal prediction params");
+                        let src = extract(ctx.src[plane_idx], cw, cx0, cy, nc);
+                        d += satd(&src, &pred, nc);
+                    }
+                }
+                cache.push((mode_c, d));
+                d
+            }
+        };
+        let cost = satd_c + lambda_me * if idx == 4 { 1 } else { 3 };
         if cost < best.2 {
             best = (idx, mode_c, cost);
         }
@@ -1227,9 +1417,11 @@ fn search_mode_64(
                 .collect();
             let marked =
                 MarkedReferenceSamples::new(32, corner, left, top).expect("legal TB geometry");
-            let pred =
-                intra_predict_with_substitution(&marked, &pred_params(mode, PredComponent::Luma))
-                    .expect("legal prediction params");
+            let pred = intra_predict_with_substitution(
+                &marked,
+                &pred_params(&ctx.fmt, mode, PredComponent::Luma),
+            )
+            .expect("legal prediction params");
             let src = extract(ctx.src[0], ctx.width, tx, ty, 32);
             cost += match rough {
                 Some(_) => satd(&src, &pred, 32),
@@ -1265,8 +1457,9 @@ fn code_intra_luma_tb(
     lambda: u64,
 ) -> (Vec<i32>, u64) {
     let marked = gather_luma_refs(ctx, &st.recon.y, x, y, n);
-    let pred = intra_predict_with_substitution(&marked, &pred_params(mode, PredComponent::Luma))
-        .expect("legal prediction params");
+    let pred =
+        intra_predict_with_substitution(&marked, &pred_params(&ctx.fmt, mode, PredComponent::Luma))
+            .expect("legal prediction params");
     let src = extract(ctx.src[0], ctx.width, x, y, n);
     let tools = TbTools::new(
         ctx,
@@ -1286,51 +1479,74 @@ fn code_intra_luma_tb(
         PredMode::Intra,
         tools,
     );
-    let dist = ssd_u8(&recon, &src);
+    let dist = ssd(&recon, &src);
     store(&mut st.recon.y, ctx.width, x, y, n, &recon);
     (levels, dist)
 }
 
-/// Code one intra chroma TB pair at chroma `(cx, cy)` size `n`.
+/// Code the intra chroma blocks of the transform-tree node at luma
+/// `(x, y)` of luma size `log2` (`log2_c` per §7.3.8.10; the deferred
+/// 4x4 chroma of a `log2TrafoSize == 3` split passes `log2 == 3`):
+/// the `ChromaArrayType == 2 ? 2 : 1` stacked square blocks per
+/// component, each predicted from the reconstruction after the
+/// previous one (§8.4.4.1: the lower 4:2:2 block reads the upper's
+/// reconstructed samples), transformed, reconstructed INTO the frame.
+/// Returns `(cb_levels, cr_levels, dist)` with the blocks' levels
+/// back to back; empty for a monochrome picture.
 #[allow(clippy::too_many_arguments)]
 fn code_intra_chroma_tbs(
     ctx: &SliceCtx<'_>,
     st: &mut EncState,
-    cx: usize,
-    cy: usize,
-    n: usize,
+    x: usize,
+    y: usize,
+    log2: u32,
     mode_c: u8,
     qp_c: u32,
     lambda: u64,
 ) -> (Vec<i32>, Vec<i32>, u64) {
-    let cw = ctx.width / 2;
+    let fmt = ctx.fmt;
+    if !fmt.has_chroma() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let (sw, sh) = fmt.sub_wh();
+    let (cx, cy) = (x / sw, y / sh);
+    let log2_c = fmt.log2_chroma_tb(log2);
+    let n = 1usize << log2_c;
+    let blocks = fmt.chroma_blocks();
+    let cw = ctx.cw();
     let model = st.rdoq_model.clone();
     let mut do_plane = |plane_idx: usize, comp: Component, pc: PredComponent| -> (Vec<i32>, u64) {
-        let recon_plane = match plane_idx {
-            1 => &st.recon.cb,
-            _ => &st.recon.cr,
-        };
-        let marked = gather_chroma_refs(ctx, recon_plane, cx, cy, n);
-        let pred = intra_predict_with_substitution(&marked, &pred_params(mode_c, pc))
-            .expect("legal prediction params");
-        let src = extract(ctx.src[plane_idx], cw, cx, cy, n);
-        let tools = TbTools::new(
-            ctx,
-            model.as_ref(),
-            lambda,
-            true,
-            n.trailing_zeros(),
-            plane_idx as u8,
-            mode_c,
-        );
-        let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra, tools);
-        let dist = ssd_u8(&recon, &src);
-        let recon_plane = match plane_idx {
-            1 => &mut st.recon.cb,
-            _ => &mut st.recon.cr,
-        };
-        store(recon_plane, cw, cx, cy, n, &recon);
-        (levels, dist)
+        let mut all_levels = Vec::with_capacity(n * n * blocks);
+        let mut dist = 0u64;
+        for v in 0..blocks {
+            let cy_v = cy + v * n;
+            let recon_plane = match plane_idx {
+                1 => &st.recon.cb,
+                _ => &st.recon.cr,
+            };
+            let marked = gather_chroma_refs(ctx, recon_plane, cx, cy_v, n, None);
+            let pred = intra_predict_with_substitution(&marked, &pred_params(&fmt, mode_c, pc))
+                .expect("legal prediction params");
+            let src = extract(ctx.src[plane_idx], cw, cx, cy_v, n);
+            let tools = TbTools::new(
+                ctx,
+                model.as_ref(),
+                lambda,
+                true,
+                log2_c,
+                plane_idx as u8,
+                mode_c,
+            );
+            let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra, tools);
+            dist += ssd(&recon, &src);
+            let recon_plane = match plane_idx {
+                1 => &mut st.recon.cb,
+                _ => &mut st.recon.cr,
+            };
+            store(recon_plane, cw, cx, cy_v, n, &recon);
+            all_levels.extend(levels);
+        }
+        (all_levels, dist)
     };
     let (cb, d1) = do_plane(1, Component::Cb, PredComponent::Cb);
     let (cr, d2) = do_plane(2, Component::Cr, PredComponent::Cr);
@@ -1366,19 +1582,22 @@ fn intra_rqt(
     // function at depth 0 (the NxN path codes its forced tree itself).
     let flag_coded = split_allowed;
 
+    // The chroma cbf bins a node codes: one per component per block
+    // (two blocks at 4:2:2).
+    let chroma_cbf_bins = 2 * ctx.fmt.chroma_blocks() as u64;
     let leaf_eval = |st: &mut EncState| -> (TuNode, u64, u64) {
         let n = 1usize << log2;
         let (y_lv, d_y) = code_intra_luma_tb(ctx, st, x, y, n, mode, qp_y, lambda);
-        let (cb, cr, d_c) = if log2 >= 3 {
-            code_intra_chroma_tbs(ctx, st, x / 2, y / 2, n / 2, mode_c, qp_c, lambda)
+        let (cb, cr, d_c) = if ctx.fmt.chroma_in_place(log2) {
+            code_intra_chroma_tbs(ctx, st, x, y, log2, mode_c, qp_c, lambda)
         } else {
             (Vec::new(), Vec::new(), 0)
         };
-        // cbf bins: luma always signalled on intra; chroma pair when
-        // log2 > 2 at this node.
+        // cbf bins: luma always signalled on intra; the chroma flags
+        // when chroma is coded in place at this node.
         let rate = rate_proxy(&y_lv)
-            + if log2 >= 3 {
-                rate_proxy(&cb) + rate_proxy(&cr) + 2
+            + if ctx.fmt.chroma_in_place(log2) {
+                rate_proxy(&cb) + rate_proxy(&cr) + chroma_cbf_bins
             } else {
                 0
             }
@@ -1411,15 +1630,17 @@ fn intra_rqt(
             dist += d;
             rate += r;
         }
-        // Deferred 4x4 chroma at the log2 == 3 split parent.
-        let (cb, cr) = if log2 == 3 {
-            let (cb, cr, d_c) =
-                code_intra_chroma_tbs(ctx, st, x / 2, y / 2, 4, mode_c, qp_c, lambda);
+        // Deferred 4x4 chroma at the log2 == 3 split parent (4:2:0 /
+        // 4:2:2: the children are 4x4 luma leaves without chroma).
+        let (cb, cr) = if log2 == 3 && ctx.fmt.has_chroma() && ctx.fmt.chroma_format_idc != 3 {
+            let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x, y, 3, mode_c, qp_c, lambda);
             dist += d_c;
-            rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
+            rate += rate_proxy(&cb) + rate_proxy(&cr) + chroma_cbf_bins;
             (cb, cr)
         } else {
-            rate += 2; // this node's cbf_cb / cbf_cr pair
+            if ctx.fmt.has_chroma() {
+                rate += 2; // this node's cbf_cb / cbf_cr pair
+            }
             (Vec::new(), Vec::new())
         };
         let children: Box<[TuNode; 4]> = match children.try_into() {
@@ -1474,6 +1695,102 @@ fn code_intra_cu(
     }
 }
 
+/// The `PART_NxN` tail shared by both intra CU coders: the chroma of
+/// a four-4x4-PB CU. At 4:2:0 / 4:2:2 the CU has ONE chroma PB whose
+/// mode derives from PB 0 and whose 4x4 (pair of 4x4) blocks are
+/// deferred to the split node; at 4:4:4 every 4x4 luma leaf carries
+/// its own 4x4 chroma blocks with its OWN `intra_chroma_pred_mode`
+/// (§7.3.8.5 signals four). `elect` picks each chroma PB's index (the
+/// legacy coder passes the derived mode 4). Returns the coded tree,
+/// the per-PB chroma indices and the added `(dist, rate_bins,
+/// chroma_mode_bins)`.
+#[allow(clippy::too_many_arguments)]
+fn code_nxn_chroma(
+    ctx: &SliceCtx<'_>,
+    st: &mut EncState,
+    x0: usize,
+    y0: usize,
+    pb_modes: &[u8; 4],
+    luma_lv: Vec<Vec<i32>>,
+    qp_c: u32,
+    lambda: u64,
+    lambda_me: u64,
+    elect: bool,
+) -> (TuNode, [u8; 4], u64, u64, u64) {
+    let fmt = ctx.fmt;
+    let chroma_bins = |idx: u8| if idx == 4 { 1u64 } else { 3 };
+    let mut dist = 0u64;
+    let mut rate = 0u64;
+    let mut mode_bins = 0u64;
+    let mut chroma_idx = [4u8; 4];
+    if fmt.chroma_format_idc == 3 {
+        // Per-PB chroma, coded in place at each 4x4 leaf.
+        let mut leaves: Vec<TuNode> = Vec::with_capacity(4);
+        for (k, (y, &(zx, zy))) in luma_lv.into_iter().zip(Z_OFFSETS.iter()).enumerate() {
+            let (px, py) = (x0 + zx * 4, y0 + zy * 4);
+            let (idx, mode_c) = if elect {
+                elect_chroma_mode(ctx, st, px, py, 4, pb_modes[k], lambda_me)
+            } else {
+                (4, pb_modes[k])
+            };
+            let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, px, py, 2, mode_c, qp_c, lambda);
+            dist += d_c;
+            rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
+            mode_bins += chroma_bins(idx);
+            chroma_idx[k] = idx;
+            leaves.push(TuNode::Leaf { y, cb, cr });
+        }
+        let children: Box<[TuNode; 4]> =
+            Box::new(leaves.try_into().map_err(|_| ()).expect("four leaves"));
+        return (
+            TuNode::Split {
+                children,
+                cb: Vec::new(),
+                cr: Vec::new(),
+            },
+            chroma_idx,
+            dist,
+            rate,
+            mode_bins,
+        );
+    }
+    let children: Box<[TuNode; 4]> = Box::new(
+        luma_lv
+            .into_iter()
+            .map(|y| TuNode::Leaf {
+                y,
+                cb: Vec::new(),
+                cr: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| ())
+            .expect("four leaves"),
+    );
+    let (cb, cr) = if fmt.has_chroma() {
+        let (idx, mode_c) = if elect {
+            elect_chroma_mode(ctx, st, x0, y0, 8, pb_modes[0], lambda_me)
+        } else {
+            (4, pb_modes[0])
+        };
+        let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x0, y0, 3, mode_c, qp_c, lambda);
+        dist += d_c;
+        rate += rate_proxy(&cb) + rate_proxy(&cr) + 2 * fmt.chroma_blocks() as u64;
+        mode_bins += chroma_bins(idx);
+        chroma_idx = [idx; 4];
+        (cb, cr)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    (
+        TuNode::Split { children, cb, cr },
+        chroma_idx,
+        dist,
+        rate,
+        mode_bins,
+    )
+}
+
 /// The `intra_rd == 0` intra CU coder (byte-stable with the historical
 /// streams): SAD mode search, derived chroma mode. Codes the best
 /// intra CU at `(x0, y0)` size `1 << log2` INTO the
@@ -1491,13 +1808,12 @@ fn code_intra_cu_legacy(
     ctb_qp: i32,
 ) -> CuCoded {
     let n = 1usize << log2;
-    let qp_y = ctb_qp as u32;
-    let qp_c = chroma_qp_420(ctb_qp);
+    let qp_y = ctx.qp_y_prime(ctb_qp);
+    let qp_c = ctx.qp_c_prime(ctb_qp);
     let lambda = ctx.lambda_of(ctb_qp);
     // Per-CU syntax overhead proxy: pred_mode (P/B) + part_mode (at
     // MinCb) + luma mode ~6/PB + chroma mode 1.
     let base_bins = u64::from(!ctx.intra_slice) + u64::from(log2 == ctx.cfg.min_cb_log2());
-
     let before = st.snapshot(ctx, x0, y0, n);
 
     // ---- PART_2Nx2N ----
@@ -1506,8 +1822,12 @@ fn code_intra_cu_legacy(
     } else {
         let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
         let src = extract(ctx.src[0], ctx.width, x0, y0, n);
-        search_best_mode(&marked, &src).0
+        search_best_mode(&ctx.fmt, &marked, &src).0
     };
+    // The derived chroma mode (intra_chroma_pred_mode 4) — Table 8-3
+    // remapped at 4:2:2.
+    let mode_c =
+        crate::binarization::derive_intra_pred_mode_c(4, mode, ctx.fmt.chroma_format_idc == 2);
     // §8.4.2 derivation order: the PB's own recorded mode must be in
     // place before its TUs' neighbours inside the CU are derived? No —
     // the mode field is only consulted by LATER PBs; record after.
@@ -1521,7 +1841,7 @@ fn code_intra_cu_legacy(
         0,
         max_depth_2n,
         mode,
-        mode,
+        mode_c,
         qp_y,
         qp_c,
         lambda,
@@ -1534,7 +1854,7 @@ fn code_intra_cu_legacy(
         kind: TreeCuKind::Intra {
             modes: [mode; 4],
             nxn: false,
-            chroma: 4,
+            chroma: [4; 4],
         },
         motions: Vec::new(),
         tree: Some(tree_2n),
@@ -1554,7 +1874,7 @@ fn code_intra_cu_legacy(
             let (px, py) = (x0 + zx * 4, y0 + zy * 4);
             let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
             let src = extract(ctx.src[0], ctx.width, px, py, 4);
-            let (m, _) = search_best_mode(&marked, &src);
+            let (m, _) = search_best_mode(&ctx.fmt, &marked, &src);
             let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
             // §8.4.2: later PBs' candidate lists see this PB's mode.
             st.modes.record_intra_pb(px, py, 4, m, false);
@@ -1563,25 +1883,12 @@ fn code_intra_cu_legacy(
             dist += d;
             luma_lv.push(lv);
         }
-        let (cb, cr, d_c) =
-            code_intra_chroma_tbs(ctx, st, x0 / 2, y0 / 2, 4, pb_modes[0], qp_c, lambda);
+        let (tree, chroma_idx, d_c, r_c, _) =
+            code_nxn_chroma(ctx, st, x0, y0, &pb_modes, luma_lv, qp_c, lambda, 0, false);
         dist += d_c;
-        rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
+        rate += r_c;
         let cost_nxn = dist + lambda * (rate + base_bins + 4 * 7);
         if cost_nxn < cost_2n {
-            let children: Box<[TuNode; 4]> = Box::new(
-                luma_lv
-                    .into_iter()
-                    .map(|y| TuNode::Leaf {
-                        y,
-                        cb: Vec::new(),
-                        cr: Vec::new(),
-                    })
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .map_err(|_| ())
-                    .expect("four leaves"),
-            );
             CuCoded {
                 x0,
                 y0,
@@ -1589,10 +1896,10 @@ fn code_intra_cu_legacy(
                 kind: TreeCuKind::Intra {
                     modes: pb_modes,
                     nxn: true,
-                    chroma: 4,
+                    chroma: chroma_idx,
                 },
                 motions: Vec::new(),
-                tree: Some(TuNode::Split { children, cb, cr }),
+                tree: Some(tree),
                 cost: cost_nxn,
             }
         } else {
@@ -1637,8 +1944,8 @@ fn code_intra_cu_rd(
     ctb_qp: i32,
 ) -> CuCoded {
     let n = 1usize << log2;
-    let qp_y = ctb_qp as u32;
-    let qp_c = chroma_qp_420(ctb_qp);
+    let qp_y = ctx.qp_y_prime(ctb_qp);
+    let qp_c = ctx.qp_c_prime(ctb_qp);
     let lambda = ctx.lambda_of(ctb_qp);
     let lambda_me = crate::encoder::rate::motion_lambda(lambda);
     // Per-CU syntax overhead proxy: pred_mode (P/B) + part_mode (at
@@ -1664,7 +1971,7 @@ fn code_intra_cu_rd(
             (_, 3) => 3,
             _ => 2,
         };
-        let mut c = rough_intra_modes(&marked, &src, n, &mpm, lambda_me, keep);
+        let mut c = rough_intra_modes(&ctx.fmt, &marked, &src, n, &mpm, lambda_me, keep);
         if ctx.cfg.intra_rd == 1 {
             c.truncate(1);
         }
@@ -1691,8 +1998,13 @@ fn code_intra_cu_rd(
             qp_c,
             lambda,
         );
-        let cost = dist
-            + lambda * (rate + base_bins + luma_mode_bins(mode, &mpm) + chroma_bins(chroma_idx));
+        // A monochrome CU signals no chroma mode.
+        let c_bins = if ctx.fmt.has_chroma() {
+            chroma_bins(chroma_idx)
+        } else {
+            0
+        };
+        let cost = dist + lambda * (rate + base_bins + luma_mode_bins(mode, &mpm) + c_bins);
         if best_2n.as_ref().map_or(true, |b| cost < b.3) {
             best_2n = Some((mode, chroma_idx, tree, cost, st.snapshot(ctx, x0, y0, n)));
         }
@@ -1708,7 +2020,7 @@ fn code_intra_cu_rd(
         kind: TreeCuKind::Intra {
             modes: [mode; 4],
             nxn: false,
-            chroma: chroma_2n,
+            chroma: [chroma_2n; 4],
         },
         motions: Vec::new(),
         tree: Some(tree_2n),
@@ -1731,7 +2043,7 @@ fn code_intra_cu_rd(
             let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
             let src = extract(ctx.src[0], ctx.width, px, py, 4);
             let pb_mpm = mpm_list(ctx, st, px, py);
-            let mut pb_cands = rough_intra_modes(&marked, &src, 4, &pb_mpm, lambda_me, 3);
+            let mut pb_cands = rough_intra_modes(&ctx.fmt, &marked, &src, 4, &pb_mpm, lambda_me, 3);
             if ctx.cfg.intra_rd == 1 {
                 pb_cands.truncate(1);
             }
@@ -1761,25 +2073,13 @@ fn code_intra_cu_rd(
             dist += d;
             luma_lv.push(lv);
         }
-        let (chroma_nxn, mode_c) = elect_chroma_mode(ctx, st, x0, y0, 8, pb_modes[0], lambda_me);
-        let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x0 / 2, y0 / 2, 4, mode_c, qp_c, lambda);
+        let (tree, chroma_nxn, d_c, r_c, c_bins) = code_nxn_chroma(
+            ctx, st, x0, y0, &pb_modes, luma_lv, qp_c, lambda, lambda_me, true,
+        );
         dist += d_c;
-        rate += rate_proxy(&cb) + rate_proxy(&cr) + 2;
-        let cost_nxn = dist + lambda * (rate + base_bins + mode_bins + chroma_bins(chroma_nxn));
+        rate += r_c;
+        let cost_nxn = dist + lambda * (rate + base_bins + mode_bins + c_bins);
         if cost_nxn < cost_2n {
-            let children: Box<[TuNode; 4]> = Box::new(
-                luma_lv
-                    .into_iter()
-                    .map(|y| TuNode::Leaf {
-                        y,
-                        cb: Vec::new(),
-                        cr: Vec::new(),
-                    })
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .map_err(|_| ())
-                    .expect("four leaves"),
-            );
             CuCoded {
                 x0,
                 y0,
@@ -1790,7 +2090,7 @@ fn code_intra_cu_rd(
                     chroma: chroma_nxn,
                 },
                 motions: Vec::new(),
-                tree: Some(TuNode::Split { children, cb, cr }),
+                tree: Some(tree),
                 cost: cost_nxn,
             }
         } else {
@@ -1860,7 +2160,7 @@ fn inter_rqt(
             PredMode::Inter,
             tools(0),
         );
-        let mut dist = ssd_u8(&y_rc, &src_y);
+        let mut dist = ssd(&y_rc, &src_y);
         let mut rate = rate_proxy(&y_lv) + 1;
         let mut local = LocalRecon {
             y: y_rc,
@@ -1893,7 +2193,7 @@ fn inter_rqt(
                 PredMode::Inter,
                 chroma_tools(2),
             );
-            dist += ssd_u8(&cb_rc, &src_cb) + ssd_u8(&cr_rc, &src_cr);
+            dist += ssd(&cb_rc, &src_cb) + ssd(&cr_rc, &src_cr);
             rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
             local.cb = cb_rc;
             local.cr = cr_rc;
@@ -1918,9 +2218,9 @@ fn inter_rqt(
         let n = 1usize << log2;
         let mut children: Vec<TuNode> = Vec::with_capacity(4);
         let mut local = LocalRecon {
-            y: vec![0u8; n * n],
-            cb: vec![0u8; (n / 2) * (n / 2)],
-            cr: vec![0u8; (n / 2) * (n / 2)],
+            y: vec![0u16; n * n],
+            cb: vec![0u16; (n / 2) * (n / 2)],
+            cr: vec![0u16; (n / 2) * (n / 2)],
         };
         let mut dist = 0u64;
         let mut rate = 0u64;
@@ -1991,7 +2291,7 @@ fn inter_rqt(
                 PredMode::Inter,
                 chroma_tools(2),
             );
-            dist += ssd_u8(&cb_rc, &src_cb) + ssd_u8(&cr_rc, &src_cr);
+            dist += ssd(&cb_rc, &src_cb) + ssd(&cr_rc, &src_cr);
             rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
             local.cb = cb_rc;
             local.cr = cr_rc;
@@ -2035,9 +2335,9 @@ fn inter_rqt(
 
 /// One CU node's local reconstruction (luma + chroma half).
 struct LocalRecon {
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    y: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
 }
 
 /// The CU-local buffers an inter residual quadtree reads.
@@ -2074,13 +2374,18 @@ fn code_inter_cu(
     depth: u32,
     ctb_qp: i32,
 ) -> CuCoded {
+    debug_assert!(
+        ctx.fmt.is_yuv420_8(),
+        "the inter coder is 4:2:0 8-bit (the intra quadtree coder is format-general)"
+    );
     let n = 1usize << log2;
-    let qp_y = ctb_qp as u32;
-    let qp_c = chroma_qp_420(ctb_qp);
+    let qp_y = ctx.qp_y_prime(ctb_qp);
+    let qp_c = ctx.qp_c_prime(ctb_qp);
     let lambda = ctx.lambda_of(ctb_qp);
     let lambda_me = crate::encoder::rate::motion_lambda(lambda);
     let mv_ctx = ctx.mv_ctx.expect("inter slice has motion context");
-    let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
+    let (cw, cx0, cy0) = (ctx.cw(), x0 / 2, y0 / 2);
+    let (max_y, max_c) = (ctx.fmt.max_luma(), ctx.fmt.max_chroma());
     let src = [
         extract(ctx.src[0], ctx.width, x0, y0, n),
         extract(ctx.src[1], cw, cx0, cy0, n / 2),
@@ -2143,15 +2448,12 @@ fn code_inter_cu(
             (Some(node), local, dist, rate)
         } else {
             // rqt_root_cbf == 0: prediction-only reconstruction.
-            let clip =
-                |v: &[i32]| -> Vec<u8> { v.iter().map(|&p| p.clamp(0, 255) as u8).collect() };
             let local = LocalRecon {
-                y: clip(&pred.luma),
-                cb: clip(&pred.cb),
-                cr: clip(&pred.cr),
+                y: clip_to_samples(&pred.luma, max_y),
+                cb: clip_to_samples(&pred.cb, max_c),
+                cr: clip_to_samples(&pred.cr, max_c),
             };
-            let dist =
-                ssd_u8(&local.y, &src[0]) + ssd_u8(&local.cb, &src[1]) + ssd_u8(&local.cr, &src[2]);
+            let dist = ssd(&local.y, &src[0]) + ssd(&local.cb, &src[1]) + ssd(&local.cr, &src[2]);
             (None, local, dist, 0)
         }
     };
@@ -2216,15 +2518,14 @@ fn code_inter_cu(
             true,
             ctx.wp,
         );
-        let clip = |v: &[i32]| -> Vec<u8> { v.iter().map(|&p| p.clamp(0, 255) as u8).collect() };
         let skip_recon = LocalRecon {
-            y: clip(&merge_pred.luma),
-            cb: clip(&merge_pred.cb),
-            cr: clip(&merge_pred.cr),
+            y: clip_to_samples(&merge_pred.luma, max_y),
+            cb: clip_to_samples(&merge_pred.cb, max_c),
+            cr: clip_to_samples(&merge_pred.cr, max_c),
         };
-        let skip_dist = ssd_u8(&skip_recon.y, &src[0])
-            + ssd_u8(&skip_recon.cb, &src[1])
-            + ssd_u8(&skip_recon.cr, &src[2]);
+        let skip_dist = ssd(&skip_recon.y, &src[0])
+            + ssd(&skip_recon.cb, &src[1])
+            + ssd(&skip_recon.cr, &src[2]);
         cands.push(InterCand {
             kind: TreeCuKind::Skip {
                 merge_idx: best_merge_idx,
@@ -2416,10 +2717,10 @@ fn code_inter_cu(
         } else {
             let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
             if ctx.cfg.intra_rd == 0 {
-                search_best_mode(&marked, &src[0]).0
+                search_best_mode(&ctx.fmt, &marked, &src[0]).0
             } else {
                 let mpm = mpm_list(ctx, st, x0, y0);
-                rough_intra_modes(&marked, &src[0], n, &mpm, lambda_me, 1)[0]
+                rough_intra_modes(&ctx.fmt, &marked, &src[0], n, &mpm, lambda_me, 1)[0]
             }
         };
         // Predict + code the whole CU as its (possibly forced-split)
@@ -2449,7 +2750,7 @@ fn code_inter_cu(
             kind: TreeCuKind::Intra {
                 modes: [mode; 4],
                 nxn: false,
-                chroma: 4,
+                chroma: [4; 4],
             },
             motions: Vec::new(),
             tree: Some(tree),
@@ -2708,9 +3009,9 @@ fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], ctb_qps: &[i32], aq_on: bool) -
                 tc_offset_div2: 0,
                 cb_qp_offset: 0,
                 cr_qp_offset: 0,
-                bit_depth_luma: 8,
-                bit_depth_chroma: 8,
-                chroma_array_type: 1,
+                bit_depth_luma: ctx.fmt.bit_depth_luma,
+                bit_depth_chroma: ctx.fmt.bit_depth_chroma,
+                chroma_array_type: ctx.fmt.chroma_format_idc,
             };
             let qp_at = |x: i64, y: i64| -> i32 {
                 if x < 0 || y < 0 {
@@ -2979,28 +3280,57 @@ impl Emitter<'_, '_> {
                     }
                 }
                 // intra_chroma_pred_mode (Table 9-46): "0" for 4
-                // (derived from luma), else "1" + two bypass bins.
-                if *chroma == 4 {
-                    self.cabac
-                        .encode_decision(self.w, &mut self.ctxs.intra_chroma_pred_mode[0], 0);
-                } else {
-                    self.cabac
-                        .encode_decision(self.w, &mut self.ctxs.intra_chroma_pred_mode[0], 1);
-                    self.cabac.encode_bypass_bits(self.w, u32::from(*chroma), 2);
+                // (derived from luma), else "1" + two bypass bins —
+                // §7.3.8.5: one per PB at 4:4:4, one per CU otherwise,
+                // none for monochrome.
+                let n_chroma = match self.ctx.fmt.chroma_format_idc {
+                    0 => 0,
+                    3 => n_pb,
+                    _ => 1,
+                };
+                for &c in chroma.iter().take(n_chroma) {
+                    if c == 4 {
+                        self.cabac.encode_decision(
+                            self.w,
+                            &mut self.ctxs.intra_chroma_pred_mode[0],
+                            0,
+                        );
+                    } else {
+                        self.cabac.encode_decision(
+                            self.w,
+                            &mut self.ctxs.intra_chroma_pred_mode[0],
+                            1,
+                        );
+                        self.cabac.encode_bypass_bits(self.w, u32::from(c), 2);
+                    }
                 }
             }
         }
         // ---- transform tree ----
         let cu_is_intra = matches!(cu.kind, TreeCuKind::Intra { .. });
-        let (intra_split, modes4, mode_c) = match &cu.kind {
-            TreeCuKind::Intra { modes, nxn, chroma } => (
-                *nxn,
-                *modes,
-                // §8.4.3 IntraPredModeC from the coded chroma index and
-                // the first PB's luma mode (the chroma TBs' scan).
-                crate::binarization::derive_intra_pred_mode_c(*chroma, modes[0], false),
-            ),
-            _ => (false, [0u8; 4], 0),
+        let (intra_split, modes4, modes_c) = match &cu.kind {
+            TreeCuKind::Intra { modes, nxn, chroma } => {
+                // §8.4.3 IntraPredModeC per PB from the coded chroma
+                // index and the PB's luma mode (the chroma TBs' scan;
+                // the 4:2:2 Table 8-3 remap applied) — one chroma PB
+                // derived from PB 0 unless 4:4:4 PART_NxN.
+                let per_pb = self.ctx.fmt.chroma_format_idc == 3 && *nxn;
+                let mut mc = [0u8; 4];
+                for (k, m) in mc.iter_mut().enumerate() {
+                    let (idx, luma) = if per_pb {
+                        (chroma[k], modes[k])
+                    } else {
+                        (chroma[0], modes[0])
+                    };
+                    *m = crate::binarization::derive_intra_pred_mode_c(
+                        idx,
+                        luma,
+                        self.ctx.fmt.chroma_format_idc == 2,
+                    );
+                }
+                (*nxn, *modes, mc)
+            }
+            _ => (false, [0u8; 4], [0u8; 4]),
         };
         if let Some(tree) = &cu.tree {
             let max_depth = if cu_is_intra {
@@ -3019,11 +3349,11 @@ impl Emitter<'_, '_> {
                 cu_is_intra,
                 intra_split,
                 modes4,
-                mode_c,
+                modes_c,
                 max_depth,
                 inter_split,
             };
-            self.emit_transform_tree(&tt, tree, x0, y0, cu.log2, 0, true, true, qg);
+            self.emit_transform_tree(&tt, tree, x0, y0, cu.log2, 0, true, true, [false; 2], qg);
         }
     }
 
@@ -3062,7 +3392,9 @@ impl Emitter<'_, '_> {
 
     /// Emit one §7.3.8.8 transform-tree node. `parent_cbf_cb` /
     /// `parent_cbf_cr` are the parent node's flags (`true` at the
-    /// root per the depth-0 read rule).
+    /// root per the depth-0 read rule); `parent_lower` the parent's
+    /// `ChromaArrayType == 2` lower-block companions (a 4x4 leaf reads
+    /// them for its deferred chroma).
     #[allow(clippy::too_many_arguments)]
     fn emit_transform_tree(
         &mut self,
@@ -3074,8 +3406,10 @@ impl Emitter<'_, '_> {
         depth: u32,
         parent_cbf_cb: bool,
         parent_cbf_cr: bool,
+        parent_lower: [bool; 2],
         qg: &mut QgState,
     ) {
+        let fmt = self.ctx.fmt;
         let max_tb = self.ctx.cfg.max_tb_log2();
         let split = matches!(node, TuNode::Split { .. });
         // §7.3.8.8 split_transform_flag presence gate.
@@ -3092,28 +3426,65 @@ impl Emitter<'_, '_> {
                 log2 > max_tb || (tt.intra_split && depth == 0) || (tt.inter_split && depth == 0);
             debug_assert_eq!(split, inferred, "unsignallable transform tree");
         }
-        // Chroma cbf pair, present when log2 > 2, gated on the parent.
+        // Chroma cbf block, present per `( log2 > 2 && ChromaArrayType
+        // != 0 ) || ChromaArrayType == 3`, each component gated on the
+        // parent. The node-level flag is the OR over its subtree; at
+        // 4:2:2 a leaf (or the log2 == 3 split parent of deferred
+        // chroma) codes the two stacked blocks' flags instead.
         let cbf_cb = node.cbf_cb();
         let cbf_cr = node.cbf_cr();
-        if log2 > 2 {
+        let blocks = fmt.chroma_blocks();
+        let (own_cb, own_cr) = node.own_chroma();
+        let halves_cb = TuNode::cbf_halves(own_cb, blocks);
+        let halves_cr = TuNode::cbf_halves(own_cr, blocks);
+        let two_flags = fmt.chroma_format_idc == 2 && (!split || log2 == 3);
+        let mut lower = [false; 2];
+        if fmt.chroma_cbf_present(log2) {
             if depth == 0 || parent_cbf_cb {
+                let first = if two_flags { halves_cb[0] } else { cbf_cb };
                 self.cabac.encode_decision(
                     self.w,
                     &mut self.ctxs.cbf_chroma[cbf_cb_ctx_inc(depth) as usize],
-                    u8::from(cbf_cb),
+                    u8::from(first),
                 );
+                if two_flags {
+                    self.cabac.encode_decision(
+                        self.w,
+                        &mut self.ctxs.cbf_chroma[cbf_cb_ctx_inc(depth) as usize],
+                        u8::from(halves_cb[1]),
+                    );
+                    lower[0] = halves_cb[1];
+                }
             }
             if depth == 0 || parent_cbf_cr {
+                let first = if two_flags { halves_cr[0] } else { cbf_cr };
                 self.cabac.encode_decision(
                     self.w,
                     &mut self.ctxs.cbf_chroma[cbf_cr_ctx_inc(depth) as usize],
-                    u8::from(cbf_cr),
+                    u8::from(first),
                 );
+                if two_flags {
+                    self.cabac.encode_decision(
+                        self.w,
+                        &mut self.ctxs.cbf_chroma[cbf_cr_ctx_inc(depth) as usize],
+                        u8::from(halves_cr[1]),
+                    );
+                    lower[1] = halves_cr[1];
+                }
             }
         }
         match node {
             TuNode::Split { children, cb, cr } => {
                 let half = 1usize << (log2 - 1);
+                // The gate the children read is the node-level flag
+                // `cbf_cb[ xBase ][ yBase ]` — at a log2 == 3 split that
+                // is the upper deferred block's flag (its lower
+                // companion rides along for the blkIdx == 3 leaf).
+                let (gate_cb, gate_cr) = if two_flags {
+                    (halves_cb[0], halves_cr[0])
+                } else {
+                    (cbf_cb, cbf_cr)
+                };
                 for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
                     self.emit_transform_tree(
                         tt,
@@ -3122,27 +3493,30 @@ impl Emitter<'_, '_> {
                         y + zy * half,
                         log2 - 1,
                         depth + 1,
-                        cbf_cb,
-                        cbf_cr,
+                        gate_cb,
+                        gate_cr,
+                        lower,
                         qg,
                     );
                     // The blkIdx == 3 deferred chroma rides inside the
                     // last child's transform_unit — emitted right after
                     // its luma residual, below.
-                    if log2 == 3 && k == 3 {
-                        self.emit_deferred_chroma(tt, cb, cr, cbf_cb, cbf_cr, log2, qg);
+                    if log2 == 3 && k == 3 && fmt.has_chroma() && fmt.chroma_format_idc != 3 {
+                        self.emit_deferred_chroma(tt, cb, cr, halves_cb, halves_cr, log2);
                     }
                 }
             }
             TuNode::Leaf { y: y_lv, cb, cr } => {
                 let cbf_luma = TuNode::any_nonzero(y_lv);
-                // For log2 == 2 leaves the chroma state is the parent's.
-                let (eff_cb, eff_cr) = if log2 > 2 {
-                    (cbf_cb, cbf_cr)
+                // Chroma coded in place at this node, else (a 4x4 luma
+                // leaf of a 4:2:0 / 4:2:2 tree) the parent's flags.
+                let in_place = fmt.chroma_in_place(log2);
+                let any_chroma = if in_place {
+                    cbf_cb || cbf_cr
                 } else {
-                    (parent_cbf_cb, parent_cbf_cr)
+                    parent_cbf_cb || parent_cbf_cr || parent_lower[0] || parent_lower[1]
                 };
-                let cbf_luma_present = tt.cu_is_intra || depth != 0 || eff_cb || eff_cr;
+                let cbf_luma_present = tt.cu_is_intra || depth != 0 || any_chroma;
                 if cbf_luma_present {
                     self.cabac.encode_decision(
                         self.w,
@@ -3153,62 +3527,71 @@ impl Emitter<'_, '_> {
                     debug_assert!(cbf_luma, "an all-zero root inter TU must not be coded");
                 }
                 // ---- transform_unit ----
-                let cbf_chroma = eff_cb || eff_cr;
-                if cbf_luma || cbf_chroma {
+                if cbf_luma || any_chroma {
                     self.emit_delta_qp(qg);
                     if cbf_luma {
-                        let pb_idx = if tt.intra_split {
-                            let half = 1usize << (tt.cu.log2 - 1);
-                            (usize::from(y.wrapping_sub(tt.cu.y0) >= half) << 1)
-                                | usize::from(x.wrapping_sub(tt.cu.x0) >= half)
-                        } else {
-                            0
-                        };
+                        let pb_idx = tt.pb_idx(x, y);
                         let mode = tt.modes4[pb_idx];
                         self.emit_residual(y_lv, log2, 0, tt.cu_is_intra, mode);
                     }
-                    if log2 > 2 {
-                        let mode_c = tt.mode_c;
-                        if TuNode::any_nonzero(cb) {
-                            self.emit_residual(cb, log2 - 1, 1, tt.cu_is_intra, mode_c);
-                        }
-                        if TuNode::any_nonzero(cr) {
-                            self.emit_residual(cr, log2 - 1, 2, tt.cu_is_intra, mode_c);
-                        }
+                    if in_place {
+                        let mode_c = tt.modes_c[tt.pb_idx(x, y)];
+                        let log2_c = fmt.log2_chroma_tb(log2);
+                        self.emit_chroma_blocks(cb, halves_cb, log2_c, 1, tt.cu_is_intra, mode_c);
+                        self.emit_chroma_blocks(cr, halves_cr, log2_c, 2, tt.cu_is_intra, mode_c);
                     }
-                    // log2 == 2: chroma deferred to blkIdx 3, handled
+                    // Otherwise chroma is deferred to blkIdx 3, handled
                     // by the parent (emit_deferred_chroma).
                 }
             }
         }
     }
 
+    /// The stacked chroma blocks of one component at a transform unit
+    /// (`residual_coding( )` per coded block, upper first).
+    fn emit_chroma_blocks(
+        &mut self,
+        levels: &[i32],
+        cbf: [bool; 2],
+        log2_c: u32,
+        c_idx: u8,
+        cu_is_intra: bool,
+        mode_c: u8,
+    ) {
+        let blocks = self.ctx.fmt.chroma_blocks();
+        let len = 1usize << (2 * log2_c);
+        for v in 0..blocks {
+            if cbf[v] {
+                self.emit_residual(
+                    &levels[v * len..(v + 1) * len],
+                    log2_c,
+                    c_idx,
+                    cu_is_intra,
+                    mode_c,
+                );
+            }
+        }
+    }
+
     /// The §7.3.8.10 `blkIdx == 3` deferred-chroma tail (invoked right
     /// after the fourth 4x4 luma child of a `log2TrafoSize == 3`
-    /// split node). Also owns the delta_qp when the four luma leaves
-    /// were all uncoded but the parent chroma is not.
-    #[allow(clippy::too_many_arguments)]
+    /// split node): the parent's 4x4 chroma blocks, gated per block.
     fn emit_deferred_chroma(
         &mut self,
         tt: &TtCtx<'_>,
         cb: &[i32],
         cr: &[i32],
-        cbf_cb: bool,
-        cbf_cr: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
         parent_log2: u32,
-        qg: &mut QgState,
     ) {
         // The last luma leaf's transform_unit fired (and consumed
         // delta_qp) iff its own cbf_luma or the parent chroma was set;
         // the deferred chroma is coded in that same transform_unit.
-        let _ = qg;
-        let mode_c = tt.mode_c;
-        if cbf_cb {
-            self.emit_residual(cb, parent_log2 - 1, 1, tt.cu_is_intra, mode_c);
-        }
-        if cbf_cr {
-            self.emit_residual(cr, parent_log2 - 1, 2, tt.cu_is_intra, mode_c);
-        }
+        let mode_c = tt.modes_c[0];
+        let log2_c = self.ctx.fmt.log2_chroma_tb(parent_log2);
+        self.emit_chroma_blocks(cb, cbf_cb, log2_c, 1, tt.cu_is_intra, mode_c);
+        self.emit_chroma_blocks(cr, cbf_cr, log2_c, 2, tt.cu_is_intra, mode_c);
     }
 
     /// §7.3.8.14 `delta_qp( )`, once per quantization group.
@@ -3224,14 +3607,20 @@ impl Emitter<'_, '_> {
         let params = ResidualCodingParams {
             log2_trafo_size: log2,
             is_chroma: c_idx != 0,
-            scan_idx: residual_coding_scan_idx(cu_is_intra, log2, c_idx, 1, u32::from(mode)),
+            scan_idx: residual_coding_scan_idx(
+                cu_is_intra,
+                log2,
+                c_idx,
+                self.ctx.fmt.chroma_format_idc,
+                u32::from(mode),
+            ),
             sign_data_hiding_enabled_flag: self.ctx.cfg.sign_hiding,
             sign_hidden_suppressed: false,
             transform_skip_sig_ctx: false,
             persistent_rice_adaptation_enabled_flag: false,
             cabac_bypass_alignment_enabled_flag: false,
             extended_precision_processing_flag: false,
-            bit_depth: 8,
+            bit_depth: self.ctx.fmt.bit_depth(c_idx),
             rice_stat_transform_skip: false,
         };
         encode_residual_coding(self.w, self.cabac, &mut self.ctxs.residual, &params, levels)
@@ -3245,10 +3634,25 @@ struct TtCtx<'a> {
     cu_is_intra: bool,
     intra_split: bool,
     modes4: [u8; 4],
-    /// `IntraPredModeC` (intra CUs): the chroma TBs' scan selector.
-    mode_c: u8,
+    /// `IntraPredModeC` per PB (intra CUs): the chroma TBs' scan
+    /// selector (all equal outside 4:4:4 `PART_NxN`).
+    modes_c: [u8; 4],
     max_depth: u32,
     inter_split: bool,
+}
+
+impl TtCtx<'_> {
+    /// The prediction block a transform block at luma `(x, y)` lies in
+    /// (`PART_NxN`: the quadrant; else 0).
+    fn pb_idx(&self, x: usize, y: usize) -> usize {
+        if self.intra_split {
+            let half = 1usize << (self.cu.log2 - 1);
+            (usize::from(y.wrapping_sub(self.cu.y0) >= half) << 1)
+                | usize::from(x.wrapping_sub(self.cu.x0) >= half)
+        } else {
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3353,7 +3757,7 @@ struct CodedPicture {
     ctb_qps: Vec<i32>,
     /// The pass-1 cell / field state (pass 2 reads the ctxInc cells).
     st: EncState,
-    recon: FrameRecon,
+    recon: ReconPlanes,
     stats: FrameStats,
     deblock_on: bool,
     beta_offset_div2: i32,
@@ -3415,7 +3819,7 @@ struct TileOut {
 /// never depend on other tiles) and, under CTU-level rate feedback,
 /// the tile's pro-rata share of the frame budget.
 fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta: bool) -> TileOut {
-    let mut st = EncState::new(ctx.width, ctx.height, ctx.cfg.ctb_log2);
+    let mut st = EncState::new(&ctx.fmt, ctx.width, ctx.height, ctx.cfg.ctb_log2);
     let ctbs_x = ctx.ctbs_x();
     let n_ctbs = ctbs_x * ctx.ctbs_y();
     let n_tile = job.ts_end - job.ts_start;
@@ -3468,7 +3872,7 @@ fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta:
             }
             _ => 0,
         };
-        let ctb_qp = (ctx.qp + ctx.aq_deltas[rs] + rc_adj).clamp(0, 51);
+        let ctb_qp = (ctx.qp + ctx.aq_deltas[rs] + rc_adj).clamp(-ctx.fmt.qp_bd_offset_y(), 51);
         if ctx.cfg.rdoq {
             st.rdoq_model = shadow.as_ref().map(|(coder, _)| RdoqModel {
                 contexts: coder.ctxs.residual.clone(),
@@ -3504,13 +3908,16 @@ fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta:
 /// Copy a tile's rectangle of decided state into the picture state.
 fn merge_tile(master: &mut EncState, tile: &EncState, ctx: &SliceCtx<'_>, job: &TileJob) {
     let (x0, y0, w, h) = (job.x0, job.y0, job.w, job.h);
-    let (cw, cx0, cy0) = (ctx.width / 2, x0 / 2, y0 / 2);
+    let (sw, sh) = ctx.fmt.sub_wh();
+    let (cw, cx0, cy0) = (ctx.cw(), x0 / sw, y0 / sh);
     let y = rect_copy(&tile.recon.y, ctx.width, x0, y0, w, h);
     rect_paste(&mut master.recon.y, ctx.width, x0, y0, w, h, &y);
-    let cb = rect_copy(&tile.recon.cb, cw, cx0, cy0, w / 2, h / 2);
-    rect_paste(&mut master.recon.cb, cw, cx0, cy0, w / 2, h / 2, &cb);
-    let cr = rect_copy(&tile.recon.cr, cw, cx0, cy0, w / 2, h / 2);
-    rect_paste(&mut master.recon.cr, cw, cx0, cy0, w / 2, h / 2, &cr);
+    if ctx.fmt.has_chroma() {
+        let cb = rect_copy(&tile.recon.cb, cw, cx0, cy0, w / sw, h / sh);
+        rect_paste(&mut master.recon.cb, cw, cx0, cy0, w / sw, h / sh, &cb);
+        let cr = rect_copy(&tile.recon.cr, cw, cx0, cy0, w / sw, h / sh);
+        rect_paste(&mut master.recon.cr, cw, cx0, cy0, w / sw, h / sh, &cr);
+    }
     let field = tile.field.snapshot_rect(x0, y0, w, h);
     master.field.restore_rect(x0, y0, w, h, &field);
     let modes = tile.modes.snapshot_rect(x0, y0, w, h);
@@ -3582,7 +3989,7 @@ fn code_picture(
         let TileOut { st, plans, ctb_qps } = outs.into_iter().next().expect("one tile");
         (st, plans, ctb_qps)
     } else {
-        let mut st = EncState::new(ctx.width, ctx.height, ctx.cfg.ctb_log2);
+        let mut st = EncState::new(&ctx.fmt, ctx.width, ctx.height, ctx.cfg.ctb_log2);
         let mut plans = Vec::with_capacity(n_ctbs);
         let mut ctb_qps = Vec::with_capacity(n_ctbs);
         for (job, out) in jobs.iter().zip(outs) {
@@ -3660,6 +4067,7 @@ fn code_picture(
             &FilterInput {
                 width: ctx.width,
                 height: ctx.height,
+                fmt: ctx.fmt,
                 ctb_qps: &ctb_qps,
                 lambda: ctx.lambda_of(ctx.qp),
                 recon: [&out.recon.y, &out.recon.cb, &out.recon.cr],
@@ -3721,7 +4129,7 @@ fn emit_slice_data(
             };
             let can_left = rs % ctbs_x > 0 && same_tile(rs - 1);
             let can_up = rs / ctbs_x > 0 && same_tile(rs - ctbs_x);
-            encode_sao_ctb(
+            encode_sao_ctb_fmt(
                 &mut coder.w,
                 &mut coder.cabac,
                 &mut coder.ctxs,
@@ -3730,6 +4138,7 @@ fn emit_slice_data(
                 can_up,
                 coded.sao_luma,
                 coded.sao_chroma,
+                &ctx.fmt,
             );
         }
         let ctb_qp = coded.ctb_qps[ctb_idx];
@@ -3785,17 +4194,53 @@ pub(crate) fn encode_intra_picture_tree(
     aq: u8,
     ctu_rc: Option<u64>,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
+    debug_assert!(
+        cfg.fmt.is_yuv420_8(),
+        "the u8 entry codes 4:2:0 8-bit pictures"
+    );
+    let (wy, wcb, wcr) = (widen(y), widen(cb), widen(cr));
+    let wide =
+        encode_intra_picture_tree_wide([&wy, &wcb, &wcr], width, height, qp, cfg, lf, aq, ctu_rc)?;
+    let narrow = |v: Vec<u16>| -> Vec<u8> { v.into_iter().map(|s| s as u8).collect() };
+    Ok(IntraEncodedAu {
+        au: wide.au,
+        recon_y: narrow(wide.recon_y),
+        recon_cb: narrow(wide.recon_cb),
+        recon_cr: narrow(wide.recon_cr),
+    })
+}
+
+/// Encode one frame of any chroma format / bit depth (`cfg.fmt`) as a
+/// quadtree intra IDR access unit + reconstruction: the planes are
+/// `[Y, Cb, Cr]` at `width x height` luma (chroma per Table 6-1;
+/// empty for monochrome), `qp` the `SliceQpY` in `−QpBdOffsetY ..=
+/// 51`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_intra_picture_tree_wide(
+    planes: [&[u16]; 3],
+    width: usize,
+    height: usize,
+    qp: i32,
+    cfg: &SpsCfg,
+    lf: &LoopFilterCfg,
+    aq: u8,
+    ctu_rc: Option<u64>,
+) -> Result<IntraEncodedAuWide, IntraEncodeError> {
     let tree = cfg.tree.expect("tree config present");
+    let fmt = cfg.fmt;
     if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
         return Err(IntraEncodeError::BadDimensions { width, height });
     }
-    if !(0..=51).contains(&qp) {
+    if !fmt.qp_range().contains(&qp) {
         return Err(IntraEncodeError::BadQp(qp));
     }
     if aq > 3 {
         return Err(IntraEncodeError::BadAq(aq));
     }
-    let check = |plane: &'static str, buf: &[u8], expected: usize| {
+    // Sample VALUES are not range-checked here: an out-of-range source
+    // sample only enters the residual (the reconstruction is clipped),
+    // so the caller owns that validation (the registry encoder does).
+    let check = |plane: &'static str, buf: &[u16], expected: usize| {
         if buf.len() != expected {
             Err(IntraEncodeError::PlaneSize {
                 plane,
@@ -3806,20 +4251,30 @@ pub(crate) fn encode_intra_picture_tree(
             Ok(())
         }
     };
-    check("y", y, width * height)?;
-    check("cb", cb, width * height / 4)?;
-    check("cr", cr, width * height / 4)?;
+    let (cw, ch) = fmt.chroma_dims(width, height);
+    check("y", planes[0], width * height)?;
+    check("cb", planes[1], cw * ch)?;
+    check("cr", planes[2], cw * ch)?;
 
     let ctb = 1usize << tree.ctb_log2;
-    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(y, width, height, aq, ctb);
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas_wide(
+        planes[0],
+        width,
+        height,
+        aq,
+        ctb,
+        fmt.bit_depth_luma,
+    );
     let tiling = make_tiling(width, height, &tree);
-    let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
+    let scaling = scaling_lists_for(tree.scaling_lists)
+        .map(|(d, _)| d.scaling_factors(fmt.chroma_format_idc));
     let ctx = SliceCtx {
         cfg: tree,
+        fmt,
         amp: cfg.amp,
         width,
         height,
-        src: [y, cb, cr],
+        src: planes,
         qp,
         aq_deltas: &aq_deltas,
         ctu_rc,
@@ -3852,7 +4307,9 @@ pub(crate) fn encode_intra_picture_tree(
     w.ue(2); // slice_type = I
     if lf.sao() {
         w.put_bit(u8::from(coded.sao_luma));
-        w.put_bit(u8::from(coded.sao_chroma));
+        if fmt.has_chroma() {
+            w.put_bit(u8::from(coded.sao_chroma));
+        }
     }
     w.se(qp - 26); // slice_qp_delta
     if lf.deblocking {
@@ -3873,7 +4330,7 @@ pub(crate) fn encode_intra_picture_tree(
     append_subsets(&mut w, &subsets);
     let slice_rbsp = w.finish();
     let au = crate::encoder::intra::assemble_idr_au(width, height, cfg, lf, &slice_rbsp);
-    Ok(IntraEncodedAu {
+    Ok(IntraEncodedAuWide {
         au,
         recon_y: coded.recon.y,
         recon_cb: coded.recon.cb,
@@ -4008,12 +4465,14 @@ pub(crate) fn encode_inter_slice_tree(
         two_versions_curr_pic: false,
         is_curr_pic: &|_, _| false,
     };
+    let (wy, wcb, wcr) = (widen(frame.y), widen(frame.cb), widen(frame.cr));
     let ctx = SliceCtx {
         cfg: tree,
+        fmt: SampleFmt::YUV420_8,
         amp: spec.big_cu,
         width,
         height,
-        src: [frame.y, frame.cb, frame.cr],
+        src: [&wy, &wcb, &wcr],
         qp: spec.qp,
         aq_deltas: &aq_deltas,
         ctu_rc: spec.ctu_rc,
@@ -4054,11 +4513,9 @@ pub(crate) fn encode_inter_slice_tree(
     );
     append_subsets(&mut w, &subsets);
     let CodedPicture {
-        mut recon,
-        st,
-        stats,
-        ..
+        recon, st, stats, ..
     } = coded;
+    let mut recon = recon.into_frame_recon();
     recon.motion_field = Some(st.field);
     (w.finish(), recon, stats)
 }

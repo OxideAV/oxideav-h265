@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- *(encoder)* the quadtree coder's sample path is `u16` at every depth and carries the picture's `SampleFmt` (chroma format + luma / chroma bit depths): source and reconstruction planes, rollback snapshots, tile merges; the §8.4.4.2 prediction parameters (component bit depth, the 4:4:4 chroma filtering gate), the forward DCT / DST normalization (`log2 + BitDepth − 9`), the quantizer's `qBits` and RDOQ's coefficient-domain λ lift (`2^(2·(15 − BitDepth − log2))`), the `Qp′Y` / `Qp′C` of §8.6.1 (`QpBdOffset`, Table 8-10 at 4:2:0 and `Min( qPi, 51 )` otherwise), a `Qp′`-based mode-decision λ (identity at 8 bits), the reconstruction clip, the deblocking descriptors' bit depths / `ChromaArrayType`, the SAO estimation (`sao_offset_abs` cMax `( 1 << ( Min( bitDepth, 10 ) − 5 ) ) − 1`, `bandShift = bitDepth − 5`, no chroma for monochrome) and the SPS / VPS PTL + `chroma_format_idc` / `bit_depth_*_minus8` all follow it; the transform-tree model and emitter carry the 4:2:2 stacked chroma blocks (per-block `cbf_cb` / `cbf_cr`, Table 8-3 chroma modes), the 4:4:4 in-place 4x4 chroma and per-PB `intra_chroma_pred_mode` of `PART_NxN`, and the monochrome no-chroma tree. The 8-bit 4:2:0 paths widen on entry and narrow on output: every encoder pin stays byte-identical and a 12 MP still codes in the same CPU time (user time 51.6 s → 50.6 s at `rd=2`, within noise)
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-h265/compare/v0.0.11...v0.0.12) - 2026-09-25
 
 ### Added

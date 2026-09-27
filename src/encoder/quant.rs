@@ -50,8 +50,6 @@ use crate::scaling_list::{ScalingFactorMatrix, ScalingListData, NUM_MATRIX_IDS, 
 use crate::scan::{scan_order, ScanIdx};
 use crate::transform::LEVEL_SCALE;
 
-/// Fixed 8-bit depth.
-const BIT_DEPTH: u32 = 8;
 /// Cost of one bypass bin (1/256-bit units).
 const BYPASS_COST: u64 = 256;
 /// §7.4.9.11 CoeffMax for the non-extended-precision profiles.
@@ -209,6 +207,9 @@ pub struct TbQuant<'a> {
     pub qp: u32,
     /// `cIdx > 0`.
     pub is_chroma: bool,
+    /// The component's `BitDepth` (the `qBits` normalization and the
+    /// coefficient-domain λ lift).
+    pub bit_depth: u8,
     /// The §7.4.9.11 scan.
     pub scan: ScanIdx,
     /// Sample-domain Lagrangian (SSD per bin).
@@ -250,9 +251,11 @@ fn scales_of(req: &TbQuant<'_>, count: usize) -> Vec<u64> {
     }
 }
 
-/// `qBits = 14 + qP / 6 + ( 15 − BitDepth − log2TbS )`.
-fn q_bits(log2: u32, qp: u32) -> u32 {
-    14 + qp / 6 + (15 - BIT_DEPTH - log2)
+/// `qBits = 14 + qP / 6 + ( 15 − BitDepth − log2TbS )` — the inverse
+/// of the §8.6.3 `bdShift` chain at `qP = Qp′` (which carries
+/// `QpBdOffset`, so the sum stays positive at every depth).
+fn q_bits(log2: u32, qp: u32, bit_depth: u8) -> u32 {
+    (14 + qp / 6 + 15).saturating_sub(u32::from(bit_depth) + log2)
 }
 
 /// Coefficient-domain squared error of coding the scaled magnitude
@@ -291,7 +294,7 @@ fn deadzone_level(q: u64, qbits: u32) -> u64 {
 /// when requested.
 #[must_use]
 pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
-    let qbits = q_bits(req.log2, req.qp);
+    let qbits = q_bits(req.log2, req.qp, req.bit_depth);
     let scales = scales_of(req, coef.len());
     let q: Vec<u64> = coef
         .iter()
@@ -313,9 +316,18 @@ pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
 }
 
 /// Sample-domain λ lifted to the coefficient-squared-error domain
-/// (`coef = 2^(7 − log2) · orthonormal`), in 1/256-bit-rate units.
-fn lambda_coef(lambda: u64, log2: u32) -> u64 {
-    lambda << (2 * (7 - log2))
+/// (`coef = 2^(15 − BitDepth − log2) · orthonormal`: the forward
+/// transform's `log2 + BitDepth − 9` / `log2 + 6` shifts against the
+/// §8.6.4 basis gain), in 1/256-bit-rate units. The exponent turns
+/// negative at 12 bits on 32x32 blocks, where the lift is a right
+/// shift.
+fn lambda_coef(lambda: u64, log2: u32, bit_depth: u8) -> u64 {
+    let e = 2 * (15 - i32::from(bit_depth) - log2 as i32);
+    if e >= 0 {
+        lambda << e
+    } else {
+        lambda >> (-e)
+    }
 }
 
 /// One coefficient's RDOQ bookkeeping.
@@ -351,7 +363,7 @@ fn rdoq_levels(
     let size = 1usize << log2;
     let is_chroma = req.is_chroma;
     let scan_idx_num = u32::from(req.scan.index());
-    let lam = lambda_coef(req.lambda, log2);
+    let lam = lambda_coef(req.lambda, log2, req.bit_depth);
     let ctxs = &model.contexts;
     let pos_scan = scan_order(2, req.scan).expect("4x4 scan");
     let sub_scan = scan_order((log2 - 2) as u8, req.scan).expect("sub-block scan");
@@ -671,7 +683,7 @@ fn apply_sign_hiding(
 ) {
     let log2 = req.log2;
     let size = 1usize << log2;
-    let lam = lambda_coef(req.lambda, log2);
+    let lam = lambda_coef(req.lambda, log2, req.bit_depth);
     let pos_scan = scan_order(2, req.scan).expect("4x4 scan");
     let sub_scan = scan_order((log2 - 2) as u8, req.scan).expect("sub-block scan");
     let num_sb_1d = 1usize << (log2 - 2);
@@ -852,6 +864,7 @@ mod tests {
                         log2,
                         qp,
                         is_chroma: false,
+                        bit_depth: 8,
                         scan: ScanIdx::Diagonal,
                         lambda: 1u64 << ((qp - 9) / 3),
                         model: Some(&model),
@@ -860,7 +873,7 @@ mod tests {
                     };
                     let levels = quantize_tb(&coef, &req);
                     let plain = quantize_tb(&coef, &TbQuant { model: None, ..req });
-                    let qbits = q_bits(log2, qp);
+                    let qbits = q_bits(log2, qp, 8);
                     let scale = quant_scale(qp % 6);
                     for (i, (&l, &c)) in levels.iter().zip(&coef).enumerate() {
                         let nearest =
@@ -894,6 +907,7 @@ mod tests {
                             log2,
                             qp: 27,
                             is_chroma: false,
+                            bit_depth: 8,
                             scan,
                             lambda: 64,
                             model: use_model.then_some(&model),
@@ -927,6 +941,7 @@ mod tests {
                     log2,
                     qp: 30,
                     is_chroma: false,
+                    bit_depth: 8,
                     scan: ScanIdx::Diagonal,
                     lambda: 64,
                     model: use_model.then_some(&model),
@@ -1009,6 +1024,7 @@ mod tests {
                     log2,
                     qp,
                     is_chroma: false,
+                    bit_depth: 8,
                     scan: ScanIdx::Diagonal,
                     lambda: 1,
                     model: None,

@@ -335,6 +335,7 @@ fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
 /// out as `general_reserved_zero_7bits`, then
 /// `general_one_picture_only_constraint_flag`, then 35 zero bits —
 /// which per A.3.3 also indicates Main 10 Still Picture conformance.
+#[cfg_attr(not(test), allow(dead_code))] // the layered self-built streams use it
 pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
     write_ptl_layout(w, level_idc, still, PcmLayout::default());
 }
@@ -437,6 +438,26 @@ pub(crate) fn write_vps_cfg(
     still: bool,
     vps_id: u8,
 ) -> Vec<u8> {
+    write_vps_layout(
+        level_idc,
+        max_dec_pic_buffering_minus1,
+        max_num_reorder_pics,
+        still,
+        vps_id,
+        PcmLayout::default(),
+    )
+}
+
+/// [`write_vps_cfg`] whose PTL names the Annex A profile row of a
+/// sample layout ([`write_ptl_layout`]).
+pub(crate) fn write_vps_layout(
+    level_idc: u8,
+    max_dec_pic_buffering_minus1: u32,
+    max_num_reorder_pics: u32,
+    still: bool,
+    vps_id: u8,
+    layout: PcmLayout,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.put_bits(u32::from(vps_id.min(15)), 4); // vps_video_parameter_set_id
     w.put_bit(1); // vps_base_layer_internal_flag
@@ -445,7 +466,7 @@ pub(crate) fn write_vps_cfg(
     w.put_bits(0, 3); // vps_max_sub_layers_minus1
     w.put_bit(1); // vps_temporal_id_nesting_flag
     w.put_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
-    write_ptl_cfg(&mut w, level_idc, still);
+    write_ptl_layout(&mut w, level_idc, still, layout);
     w.put_bit(1); // vps_sub_layer_ordering_info_present_flag
     w.ue(max_dec_pic_buffering_minus1); // vps_max_dec_pic_buffering_minus1[0]
     w.ue(max_num_reorder_pics); // vps_max_num_reorder_pics[0]

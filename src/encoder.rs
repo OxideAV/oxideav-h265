@@ -41,6 +41,8 @@ pub mod pcm;
 pub mod rate;
 #[cfg(test)]
 mod rdpcm_streams;
+// internal — the sample-format plumbing of the widened coders
+pub(crate) mod sample;
 #[cfg(test)]
 mod scc_streams;
 // internal — exposed for tests/fuzz; not part of the stable API

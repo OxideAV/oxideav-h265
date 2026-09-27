@@ -594,6 +594,7 @@ impl PyramidEncoder {
             still: false,
             video_signal: self.video_signal,
             ids: self.ids,
+            fmt: crate::encoder::sample::SampleFmt::YUV420_8,
         }
     }
 
