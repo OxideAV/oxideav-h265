@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-h265/compare/v0.0.11...v0.0.12) - 2026-09-25
+
+### Added
+
+- *(encoder)* lossless PCM stills in every HEIC sample layout — grey 8..16, 4:2:0 10/12, 4:2:2 and 4:4:4 at 8/10/12 bits
+- *(decoder)* Annex F/G/H multi-layer decoding — MV-HEVC both views byte-exact, SHVC resampling, lhvC extradata and layer/view/ols selection
+- *(annex-f)* multilayer SPS / PPS / slice header syntax — inferred rep formats, pps_multilayer_extension, inter-layer prediction and poc_reset fields
+- *(vps)* Annex F vps_extension( ) — layer model, rep formats, dpb_size, VPS VUI
+
+### Other
+
+- *(annex-f)* layered parameter-set and slice-header parsing in parse_annexb; round-462 status
+- *(shvc)* self-built two-layer spatial-scalability stream pins the Annex H path
+
 ### Added
 
 - *(encoder)* **every HEIC sample layout as a lossless PCM still**: `PcmLayout` (`chroma_format_idc` 0..=3, bit depth 8..=16) on `PcmAuOptions` and the `encode_idr_pcm_au_wide` entry (`u16` planes); the registry `mode = "pcm"` accepts `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le`, `Yuv420P10Le` / `Yuv420P12Le`, `Yuv422P` / `YuvJ422P` / `Yuv422P10Le` / `Yuv422P12Le`, `Yuv444P` / `YuvJ444P` / `Yuv444P10Le` / `Yuv444P12Le` (little-endian 16-bit planes above 8 bits, one plane for grey; the `YuvJ*` twins signal full range) with the conformance window in the layout's chroma units and the input format echoed; Annex A signalling per layout — Main / Main Still Picture, Main 10 / Main 10 Still Picture (`general_one_picture_only_constraint_flag`), or `general_profile_idc == 4` with the Table A.2 row's constraint flags (Monochrome / Monochrome 10 / 12 / 16, Main 12, Main 4:2:2 10 / 12, Main 4:4:4 / 10 / 12, plus the intra + one-picture-only flags of the Still Picture rows); the 8-bit 4:2:0 `u8` entry points stay byte-identical (they widen into the same writer). The intra / inter coders remain 8-bit 4:2:0 and refuse the other formats explicitly
