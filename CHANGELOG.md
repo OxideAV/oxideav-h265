@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-h265/compare/v0.0.12...v0.0.13) - 2026-09-27
+
+### Added
+
+- *(encoder)* WPP-parallel pass 1 — wavefront-scheduled CTB rows on the ExecutionContext workers
+- *(encoder)* cqpoffset — PPS chroma QP offsets on the quadtree intra coder
+- *(encoder)* lossy intra coding in every HEIC sample layout — 4:2:0 10/12, 4:2:2 and 4:4:4 at 8/10/12, grey 8/10/12
+
+### Fixed
+
+- *(registry)* read image_planes() — side-channel records are not picture planes; ColorSignal defaults the VUI range
+
+### Other
+
+- *(encoder)* u16 sample path and a sample format through the quadtree coder
+
 ### Added
 
 - *(encoder)* **WPP-parallel pass 1**: a single-tile `wpp` picture decides its CTB rows in a wavefront on up to the `ExecutionContext` worker count (`set_execution_context` / `SpsCfg::threads`) — the CTB at column `c` starts once the row above finished column `c + 1`, each worker deciding into its own state after pulling that above-row neighbourhood from the shared picture state and publishing each finished CTB back; the RDOQ shadow coder of a row starts from the row above's §9.3.2.2 storage, so the bytes equal the serial pass for any worker count (pinned for a P / B GOP and a 4:4:4 10-bit intra still). CTU-level rate feedback (a serial running-size dependency) and tiled pictures keep their previous fan-out — the 12 MP 8-bit still at level 2: 42.1 s serial → 7.5 s on 8 workers (bytes identical; 13.3 s on 4), the 10-bit one 8.1 s
