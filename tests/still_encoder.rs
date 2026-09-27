@@ -1020,6 +1020,80 @@ fn cqpoffset_signals_and_applies_the_pps_chroma_qp_offsets() {
     assert!(oxideav_h265::make_encoder(&params).is_err(), "range");
 }
 
+/// A frame carrying core's colour-signal side-channel record (a fourth
+/// `planes` entry) encodes byte-identically to the same frame without
+/// it on every mode — the encoder reads `image_planes()` — and, absent
+/// an explicit `range` option, the record's range (per frame, on the
+/// per-picture-SPS modes) or the stream's `ColorSignal` (any mode)
+/// becomes the VUI `video_full_range_flag`; an explicit option wins.
+#[test]
+fn color_signal_side_channel_is_ignored_as_a_plane_and_defaults_the_vui_range() {
+    use oxideav_core::{ColorRange, ColorSignal};
+    let (w, h) = (64usize, 48usize);
+    let planes = still(w, h);
+    let with_signal = |signal: ColorSignal| -> Frame {
+        match frame(w, h, &planes) {
+            Frame::Video(v) => Frame::Video(v.with_color_signal(signal)),
+            _ => unreachable!(),
+        }
+    };
+    let unspecified = ColorSignal::default();
+    assert!(unspecified.is_unspecified());
+    let full = ColorSignal::default().with_range(ColorRange::Full);
+    let encode =
+        |mode: &[(&str, &str)], stream_signal: Option<ColorSignal>, frame: &Frame| -> Vec<u8> {
+            let mut params = CodecParameters::video("h265".into());
+            params.width = Some(w as u32);
+            params.height = Some(h as u32);
+            if let Some(sig) = stream_signal {
+                params.color_signal = sig;
+            }
+            for (k, v) in mode {
+                params.options.insert(*k, *v);
+            }
+            let mut enc = oxideav_h265::make_encoder(&params).expect("factory");
+            enc.send_frame(frame).expect("send");
+            enc.receive_packet().expect("packet").data
+        };
+    let range_flag = |stream: &[u8]| -> Option<bool> {
+        sps_of(stream)
+            .vui_parameters
+            .and_then(|v| v.video_signal_type)
+            .map(|t| t.video_full_range_flag)
+    };
+    let modes: [&[(&str, &str)]; 4] = [
+        &[("mode", "pcm")],
+        &[("mode", "intra"), ("qp", "30")],
+        &[
+            ("mode", "intra"),
+            ("qp", "30"),
+            ("ctb", "32"),
+            ("deblock", "1"),
+        ],
+        &[("mode", "inter"), ("qp", "30")],
+    ];
+    let plain = frame(w, h, &planes);
+    for mode in modes {
+        // Byte-identical with an unspecified record attached.
+        let a = encode(mode, None, &plain);
+        let b = encode(mode, None, &with_signal(unspecified));
+        assert_eq!(a, b, "{mode:?}: side-channel record ignored");
+        assert_eq!(range_flag(&a), None, "{mode:?}: no VUI without a signal");
+        // The stream-level signal defaults the VUI range on every mode.
+        let c = encode(mode, Some(full), &plain);
+        assert_eq!(range_flag(&c), Some(true), "{mode:?}: stream ColorSignal");
+        // An explicit option wins over both.
+        let opts: Vec<(&str, &str)> = mode.iter().copied().chain([("range", "limited")]).collect();
+        let d = encode(&opts, Some(full), &with_signal(full));
+        assert_eq!(range_flag(&d), Some(false), "{mode:?}: explicit range wins");
+    }
+    // The per-frame record refines the per-picture-SPS modes.
+    for mode in &modes[..3] {
+        let e = encode(mode, None, &with_signal(full));
+        assert_eq!(range_flag(&e), Some(true), "{mode:?}: frame ColorSignal");
+    }
+}
+
 /// `still` is refused on the inter GOP modes.
 #[test]
 fn still_rejects_inter_mode() {

@@ -205,7 +205,14 @@ use oxideav_core::{
 ///
 /// A `YuvJ420P` (full-range) input is accepted as the twin of
 /// `Yuv420P` — same sample path — and, absent an explicit `range`
-/// option, signals `video_full_range_flag == 1` on its own.
+/// option, signals `video_full_range_flag == 1` on its own. The
+/// frames' trailing side-channel records (a colour signal, palette,
+/// significant bits, layer identity) are not picture planes
+/// (`VideoFrame::image_planes`); absent explicit options
+/// the stream's [`CodecParameters::color_signal`] range and colour
+/// code points default the VUI block, and on the `pcm` / `intra`
+/// modes (an SPS per picture) a frame's own colour-signal record
+/// refines them.
 ///
 /// Every other HEIC sample layout — `Yuv420P10Le` / `Yuv420P12Le`,
 /// `Yuv422P(J)` / `Yuv422P10Le` / `Yuv422P12Le`, `Yuv444P(J)` /
@@ -266,7 +273,12 @@ pub struct H265Encoder {
     fmt: sample::SampleFmt,
     /// The `cqpoffset` option (PPS chroma QP offsets, intra mode).
     chroma_qp_offset: i32,
-
+    /// `true` when the caller fixed the `range` option (a per-frame
+    /// colour-signal record then never overrides the VUI range).
+    range_explicit: bool,
+    /// `true` when the caller gave any `colorprim` / `transfer` /
+    /// `matrix` code point.
+    colour_explicit: bool,
     /// The `still` option: Main Still Picture profile signalling on
     /// every (single-picture) access unit.
     still: bool,
@@ -743,14 +755,40 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         let (cp, tc, mc) = (code("colorprim")?, code("transfer")?, code("matrix")?);
         let colour = (cp.is_some() || tc.is_some() || mc.is_some())
             .then(|| (cp.unwrap_or(2), tc.unwrap_or(2), mc.unwrap_or(2)));
-        // A `YuvJ420P` frame declares full range by itself: without an
-        // explicit `range` option, the VUI says so.
-        let range = range.or(full_range_input.then_some(true));
+        // Without explicit options the stream's `ColorSignal` (the
+        // container-level description) supplies the range and, when
+        // any code point is specified, the colour description; a
+        // `YuvJ*` frame declares full range by itself. An explicit
+        // option always wins; a per-frame record refines these on the
+        // per-picture-SPS modes (see `send_frame`).
+        let stream_signal = &params.color_signal;
+        let range = range
+            .or(stream_signal.range.full_range_flag())
+            .or(full_range_input.then_some(true));
+        let colour = colour.or_else(|| {
+            let any = !stream_signal.primaries.is_unspecified()
+                || !stream_signal.transfer.is_unspecified()
+                || !stream_signal.matrix.is_unspecified();
+            any.then(|| {
+                (
+                    stream_signal.primaries.code_point(),
+                    stream_signal.transfer.code_point(),
+                    stream_signal.matrix.code_point(),
+                )
+            })
+        });
         (range.is_some() || colour.is_some()).then(|| intra::VideoSignal {
             full_range: range.unwrap_or(false),
             colour,
         })
     };
+    // Whether the `range` option was given: a per-frame `ColorSignal`
+    // record may otherwise refine the VUI range on the modes that
+    // write an SPS per picture.
+    let range_explicit = params.options.get("range").is_some();
+    let colour_explicit = ["colorprim", "transfer", "matrix"]
+        .iter()
+        .any(|k| params.options.get(k).is_some());
     // `vpsid` / `spsid` / `ppsid` — the parameter-set ids (0..=15 /
     // 0..=15 / 0..=63).
     let ids = {
@@ -992,6 +1030,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         layout,
         fmt,
         chroma_qp_offset,
+        range_explicit,
+        colour_explicit,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
@@ -1139,6 +1179,45 @@ impl H265Encoder {
         Ok(au)
     }
 
+    /// A per-frame colour-signal record refines the VUI
+    /// `video_signal_type` block on the modes whose every access unit
+    /// carries its own SPS (`pcm` / `intra`): its range unless the
+    /// caller fixed the `range` option, its colour description unless
+    /// the caller gave any code point (the inter GOP coders keep the
+    /// stream-level description they were built with).
+    fn refine_video_signal(&mut self, v: &oxideav_core::VideoFrame) {
+        if !matches!(self.mode, EncodeMode::Pcm | EncodeMode::Intra { .. }) {
+            return;
+        }
+        let Some(signal) = v.color_signal() else {
+            return;
+        };
+        let mut vs = self.video_signal.unwrap_or_default();
+        let mut touched = false;
+        if !self.range_explicit {
+            if let Some(full) = signal.range.full_range_flag() {
+                vs.full_range = full;
+                touched = true;
+            }
+        }
+        if !self.colour_explicit {
+            let any = !signal.primaries.is_unspecified()
+                || !signal.transfer.is_unspecified()
+                || !signal.matrix.is_unspecified();
+            if any {
+                vs.colour = Some((
+                    signal.primaries.code_point(),
+                    signal.transfer.code_point(),
+                    signal.matrix.code_point(),
+                ));
+                touched = true;
+            }
+        }
+        if touched {
+            self.video_signal = Some(vs);
+        }
+    }
+
     /// Queue one keyframe packet for the frame.
     fn push_keyframe(&mut self, v: &oxideav_core::VideoFrame, au: Vec<u8>) {
         let mut pkt = Packet::new(0, self.time_base, au);
@@ -1158,7 +1237,7 @@ impl H265Encoder {
         let layout = self.layout;
         let (sub_w, sub_h) = layout.sub_wh();
         let planes_needed = if layout.chroma_format_idc == 0 { 1 } else { 3 };
-        let image = &v.planes;
+        let image = v.image_planes();
         if image.len() < planes_needed {
             return Err(Error::InvalidData(format!(
                 "h265 encode: expected {planes_needed} planes for {:?}, got {}",
@@ -1279,10 +1358,11 @@ impl Encoder for H265Encoder {
             Frame::Video(v) => v,
             _ => return Err(Error::InvalidData("h265 encode: video frames only".into())),
         };
+        self.refine_video_signal(v);
         if self.layout != pcm::PcmLayout::default() {
             return self.send_frame_wide(v);
         }
-        let image = &v.planes;
+        let image = v.image_planes();
         if image.len() != 3 {
             return Err(Error::InvalidData(format!(
                 "h265 encode: expected 3 planes (yuv420p), got {}",
