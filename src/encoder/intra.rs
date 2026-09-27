@@ -1512,6 +1512,34 @@ pub(crate) fn encode_idr_intra_au_full(
 /// Wrap one coded IDR slice RBSP into its Annex B access unit
 /// (`VPS + SPS + PPS + IDR_N_LP`), shared by the fixed-geometry and
 /// quadtree intra coders.
+/// Encode one quadtree intra IDR access unit at any sample format
+/// (`cfg.fmt`; `cfg.tree` must be set — the fixed-geometry coder is
+/// 8-bit 4:2:0): `planes` are `[Y, Cb, Cr]` `u16` samples (chroma per
+/// Table 6-1, empty for monochrome), `qp` the `SliceQpY` in
+/// `−QpBdOffsetY ..= 51`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_idr_intra_au_wide(
+    planes: [&[u16]; 3],
+    width: usize,
+    height: usize,
+    qp: i32,
+    cfg: &SpsCfg,
+    lf: &LoopFilterCfg,
+    aq: u8,
+    ctu_rc: Option<u64>,
+) -> Result<IntraEncodedAuWide, IntraEncodeError> {
+    if cfg.tree.is_none() {
+        return Err(IntraEncodeError::BadDimensions { width, height });
+    }
+    debug_assert!(
+        aq == 0 || cfg.cu_qp_delta,
+        "AQ needs the PPS cu_qp_delta_enabled_flag"
+    );
+    crate::encoder::ctu::encode_intra_picture_tree_wide(
+        planes, width, height, qp, cfg, lf, aq, ctu_rc,
+    )
+}
+
 pub(crate) fn assemble_idr_au(
     width: usize,
     height: usize,

@@ -269,7 +269,37 @@ combination is decoder-pinned only. Tiled pictures are decided
 (`with_threads` / `set_execution_context`; serial by default,
 bit-identical for any worker count).
 
-**Every HEIC sample layout** encodes as a lossless PCM still (round
+**Every HEIC sample layout codes LOSSY on `mode = "intra"`** (round
+463): 4:2:0 at 10 / 12 bits, 4:2:2 and 4:4:4 at 8 / 10 / 12 bits and
+monochrome at 8 / 10 / 12 bits (`Yuv420P10Le` / `12Le`, `Yuv422P(J)` /
+`10Le` / `12Le`, `Yuv444P(J)` / `10Le` / `12Le`, `Gray8` / `10Le` /
+`12Le`) run through the quadtree coder (`ctb` defaulting to 64) with
+its whole tool set — RD mode decision, RQTs, RDOQ / sign hiding /
+scaling lists (the 4:4:4 32x32 chroma matrices), AQ, rate control,
+tiles / WPP, deblocking and SAO — on a `u16` sample path: §8.6.1
+`Qp′ = QpY + QpBdOffset` (`qp` down to −12 / −24), Table 8-10 or
+`Min( qPi, 51 )` chroma QPs, the `BitDepth`-dependent transform /
+quantizer shifts, the 4:2:2 stacked chroma blocks with their own cbfs
+and the Table 8-3 chroma modes, 4:4:4 in-place 4x4 chroma with four
+`intra_chroma_pred_mode` per `PART_NxN` CU, monochrome trees without
+chroma syntax, the SAO offset range of `Min( bitDepth, 10 )`. The SPS
+names the layout's Annex A row (Main 10 [Still Picture], or the Table
+A.2 format range extensions rows with the intra / one-picture-only
+flags under `still`). Every layout decodes **byte-exact through a
+black-box reference decoder** across odd sizes, CTB 16 / 32 / 64,
+filters, RDOQ, tiles and WPP (11 golden pins in
+`tests/still_encoder.rs`, plus decoder-equals-encoder-reconstruction
+unit tests); the one divergence found is the reference decoder's luma
+at `Qp′Y` 74 / 75 (12-bit `qp` 50 / 51), which it reconstructs flat
+while this crate's decode matches the encoder. Wrapped in a minimal
+HEIF container every layout opens in a third-party HEIF converter;
+the OS image reader renders the 8 / 10-bit layouts and full-range
+12-bit 4:2:0, and renders 12-bit 4:2:2 / 4:4:4 (and limited-range
+12-bit 4:2:0) black — for the lossless PCM streams and a third-party
+encoder's 12-bit 4:4:4 / 4:2:2 output alike (a reader limit, not a
+stream defect).
+
+**Every HEIC sample layout** also encodes as a lossless PCM still (round
 462, `mode = "pcm"`): grey at 8 / 10 / 12 / 16 bits, 4:2:0 at 10 / 12
 bits, 4:2:2 and 4:4:4 at 8 / 10 / 12 bits (planar little-endian
 16-bit input above 8 bits, the `YuvJ*` twins signalling full range),
@@ -405,13 +435,13 @@ and ~985 unit tests.
   process (F.10.2) are not applied; the SHVC resampling path and the
   `poc_reset_*` machinery have no black-box oracle on this machine
   (only the MV-HEVC path is validated against a reference decoder).
-* Lossy encoding beyond 4:2:0 8-bit: 10 / 12-bit, 4:2:2 / 4:4:4 and
-  monochrome stills are written **lossless only** (the PCM path —
-  every HEIC layout, see above); the intra quadtree coder (Main 10 /
-  Main 4:4:4 Still Picture at a QP) is still 8-bit 4:2:0 (its sample
-  path is `u8` throughout; generalising it is the follow-up). An
-  odd-sized 4:2:0 picture crops to its even rounding (the container's
-  clean aperture carries the odd last column / row).
+* Deep layouts on the inter modes: 10 / 12-bit, 4:2:2 / 4:4:4 and
+  monochrome code intra-only (`pcm` / `intra`); the low-delay and
+  pyramid coders stay 8-bit 4:2:0. 16-bit grey is PCM-only (the 16-bit
+  RExt rows need the extended-precision tools). An odd-sized 4:2:0 /
+  4:2:2 picture crops to its even rounding in the subsampled
+  dimension (the container's clean aperture carries the odd last
+  column / row).
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
   level-0 time serially (38 s for a 12 MP still; 8.3 s on 8 workers
   with `tiles=4x4`) against ~1 s for the third-party encoder's

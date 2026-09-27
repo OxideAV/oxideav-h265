@@ -1317,11 +1317,15 @@ fn elect_chroma_mode(
     let (sw, sh) = fmt.sub_wh();
     let (cx0, cy0) = (x0 / sw, y0 / sh);
     // The chroma block(s) of an n x n luma block: side n / SubWidthC,
-    // stacked `chroma_blocks()` times.
-    let nc = n / sw;
+    // stacked `chroma_blocks()` times — each scored as square blocks
+    // of at most the 32x32 maximum TB (a 4:4:4 64x64 CU is predicted
+    // as four 32x32 chroma TBs).
+    let side = n / sw;
+    let nc = side.min(32);
+    let per_row = side / nc;
     let blocks = fmt.chroma_blocks();
     let cw = ctx.cw();
-    let rect = (cx0, cy0, nc, nc * blocks);
+    let rect = (cx0, cy0, side, side * blocks);
     let mut best = (4u8, luma_mode, u64::MAX);
     let mut cache: Vec<(u8, u64)> = Vec::with_capacity(5);
     for idx in [4u8, 0, 1, 2, 3] {
@@ -1342,21 +1346,25 @@ fn elect_chroma_mode(
                     } else {
                         &st.recon.cr
                     };
-                    for v in 0..blocks {
-                        let cy = cy0 + v * nc;
-                        let marked = gather_chroma_refs(
-                            ctx,
-                            recon_plane,
-                            cx0,
-                            cy,
-                            nc,
-                            Some((ctx.src[plane_idx], rect)),
-                        );
-                        let pred =
-                            intra_predict_with_substitution(&marked, &pred_params(fmt, mode_c, pc))
-                                .expect("legal prediction params");
-                        let src = extract(ctx.src[plane_idx], cw, cx0, cy, nc);
-                        d += satd(&src, &pred, nc);
+                    for v in 0..blocks * per_row {
+                        for u in 0..per_row {
+                            let (cx, cy) = (cx0 + u * nc, cy0 + v * nc);
+                            let marked = gather_chroma_refs(
+                                ctx,
+                                recon_plane,
+                                cx,
+                                cy,
+                                nc,
+                                Some((ctx.src[plane_idx], rect)),
+                            );
+                            let pred = intra_predict_with_substitution(
+                                &marked,
+                                &pred_params(fmt, mode_c, pc),
+                            )
+                            .expect("legal prediction params");
+                            let src = extract(ctx.src[plane_idx], cw, cx, cy, nc);
+                            d += satd(&src, &pred, nc);
+                        }
                     }
                 }
                 cache.push((mode_c, d));
@@ -4607,6 +4615,166 @@ mod tests {
         let planar = f.picture.to_planar_u8().unwrap();
         assert_eq!(planar[w * h..w * h + w * h / 4], au.recon_cb[..]);
         assert_eq!(planar[w * h + w * h / 4..], au.recon_cr[..]);
+    }
+
+    /// Deterministic textured planes of a sample format (u16 samples
+    /// at the format's depths; chroma empty for monochrome).
+    fn planes_fmt(fmt: &SampleFmt, w: usize, h: usize) -> [Vec<u16>; 3] {
+        let tex = |x: usize, y: usize, seed: usize, bd: u8| -> u16 {
+            let v = (x * 3 + y * 5 + seed * 7) % 256;
+            let block = if (x / 20 + y / 14) % 3 == 0 { 40 } else { 0 };
+            let ripple = ((x * y + seed) % 9) as u32;
+            let s8 = (v / 2 + block) as u32;
+            // Scale to the depth and add sub-8-bit detail.
+            ((s8 << (bd - 8)) + ripple * ((1u32 << (bd - 8)) - 1) / 8) as u16
+        };
+        let y: Vec<u16> = (0..w * h)
+            .map(|i| tex(i % w, i / w, 3, fmt.bit_depth_luma))
+            .collect();
+        let (cw, ch) = fmt.chroma_dims(w, h);
+        let cb: Vec<u16> = (0..cw * ch)
+            .map(|i| tex(i % cw.max(1), i / cw.max(1), 11, fmt.bit_depth_chroma))
+            .collect();
+        let cr: Vec<u16> = (0..cw * ch)
+            .map(|i| tex(i / ch.max(1), i % ch.max(1), 17, fmt.bit_depth_chroma))
+            .collect();
+        [y, cb, cr]
+    }
+
+    /// Encode a picture of any format through the quadtree intra coder
+    /// and check the crate's decoder reconstructs the encoder's own
+    /// reconstruction exactly, plane by plane; returns the AU size.
+    fn assert_intra_roundtrip_fmt(
+        fmt: SampleFmt,
+        (w, h): (usize, usize),
+        qp: i32,
+        tree: TreeCfg,
+        lf: LoopFilterCfg,
+    ) -> usize {
+        let planes = planes_fmt(&fmt, w, h);
+        let cfg = SpsCfg {
+            min_cb_log2: 3,
+            tree: Some(tree),
+            fmt,
+            ..SpsCfg::legacy(1)
+        };
+        let au = crate::encoder::intra::encode_idr_intra_au_wide(
+            [&planes[0], &planes[1], &planes[2]],
+            w,
+            h,
+            qp,
+            &cfg,
+            &lf,
+            0,
+            None,
+        )
+        .expect("encode");
+        let frames = decode_annexb_sequence(&au.au).expect("decode");
+        assert_eq!(frames.len(), 1);
+        let pic = &frames[0].picture;
+        assert_eq!(pic.chroma_array_type(), fmt.chroma_format_idc);
+        let as_u16 = |p: crate::picture::Plane| -> Vec<u16> {
+            pic.plane(p).iter().map(|&v| v as u16).collect()
+        };
+        let what = format!("{fmt:?} {w}x{h} qp {qp}");
+        assert_eq!(
+            as_u16(crate::picture::Plane::Luma),
+            au.recon_y,
+            "{what}: luma"
+        );
+        if fmt.has_chroma() {
+            assert_eq!(as_u16(crate::picture::Plane::Cb), au.recon_cb, "{what}: cb");
+            assert_eq!(as_u16(crate::picture::Plane::Cr), au.recon_cr, "{what}: cr");
+        } else {
+            assert!(au.recon_cb.is_empty() && au.recon_cr.is_empty());
+        }
+        // Lossy but faithful: the luma PSNR against the source stays
+        // well above a broken reconstruction's.
+        let peak = f64::from(fmt.max_luma());
+        let mse = planes[0]
+            .iter()
+            .zip(&au.recon_y)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>()
+            / (w * h) as f64;
+        let psnr = 10.0 * (peak * peak / mse.max(1e-9)).log10();
+        assert!(psnr > 30.0, "{what}: luma PSNR {psnr:.2}");
+        au.au.len()
+    }
+
+    #[test]
+    fn deep_layout_intra_roundtrips_every_format() {
+        // 4:2:0 10 / 12-bit, 4:2:2, 4:4:4 and monochrome at 8 / 10 /
+        // 12 bits: CTB 32 so both a forced-split 32x32 and the 8x8
+        // NxN / 4x4 leaves (4:4:4 in-place chroma, 4:2:2 stacked
+        // deferred blocks) are exercised on a small picture.
+        for (cfi, bd) in [
+            (1u8, 10u8),
+            (1, 12),
+            (2, 8),
+            (2, 10),
+            (2, 12),
+            (3, 8),
+            (3, 10),
+            (3, 12),
+            (0, 8),
+            (0, 10),
+            (0, 12),
+        ] {
+            let fmt = SampleFmt::new(cfi, bd).expect("format");
+            let tree = TreeCfg::new(32).expect("ctb").with_intra_rd(2);
+            assert_intra_roundtrip_fmt(fmt, (48, 32), 24, tree, LoopFilterCfg::off());
+        }
+    }
+
+    #[test]
+    fn deep_layout_intra_roundtrips_with_filters_and_quant_tools() {
+        // Deblocking + SAO (the 10-bit offset range, band shift, the
+        // 4:2:2 / 4:4:4 chroma CTB geometry, no chroma for monochrome),
+        // RDOQ + sign hiding + scaling lists (the 4:4:4 32x32 chroma
+        // matrices), a CTB-64 picture whose 64x64 CUs split to 32x32
+        // TBs (4:4:4 chroma TBs at 32x32).
+        for (cfi, bd) in [(1u8, 10u8), (2, 10), (3, 10), (0, 12), (3, 12)] {
+            let fmt = SampleFmt::new(cfi, bd).expect("format");
+            let tree = TreeCfg::new(64)
+                .expect("ctb")
+                .with_rdoq(true)
+                .with_sign_hiding(true)
+                .with_scaling_lists(1)
+                .with_tu_depth(2, 2)
+                .with_intra_rd(1);
+            assert_intra_roundtrip_fmt(fmt, (64, 48), 20, tree, LoopFilterCfg::all());
+        }
+    }
+
+    #[test]
+    fn deep_layout_intra_accepts_the_extended_qp_range() {
+        // SliceQpY −QpBdOffsetY (−12 at 10 bits, −24 at 12) up to 51.
+        let fmt10 = SampleFmt::new(1, 10).expect("format");
+        let tree = TreeCfg::new(16).expect("ctb");
+        let fine = assert_intra_roundtrip_fmt(fmt10, (32, 32), -12, tree, LoopFilterCfg::off());
+        let coarse = assert_intra_roundtrip_fmt(fmt10, (32, 32), 20, tree, LoopFilterCfg::off());
+        assert!(fine > coarse, "QP −12 spends more bits than QP 20");
+        let fmt12 = SampleFmt::new(3, 12).expect("format");
+        assert_intra_roundtrip_fmt(fmt12, (32, 32), -24, tree, LoopFilterCfg::off());
+        let planes = planes_fmt(&fmt12, 32, 32);
+        let cfg = SpsCfg {
+            min_cb_log2: 3,
+            tree: Some(tree),
+            fmt: fmt12,
+            ..SpsCfg::legacy(1)
+        };
+        let bad = crate::encoder::intra::encode_idr_intra_au_wide(
+            [&planes[0], &planes[1], &planes[2]],
+            32,
+            32,
+            -25,
+            &cfg,
+            &LoopFilterCfg::off(),
+            0,
+            None,
+        );
+        assert!(matches!(bad, Err(IntraEncodeError::BadQp(-25))));
     }
 
     #[test]

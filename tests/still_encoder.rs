@@ -525,8 +525,8 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
             "{mode:?}: an explicit range wins"
         );
     }
-    // The 4:2:2 / 4:4:4 twins are lossless PCM layouts: accepted on
-    // the pcm mode (full range signalled), refused by the intra / inter
+    // The 4:2:2 / 4:4:4 twins: accepted on the pcm mode (lossless)
+    // and the intra mode (the quadtree coder), refused by the inter
     // coders.
     for pf in [
         PixelFormat::YuvJ422P,
@@ -539,7 +539,9 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
         params.pixel_format = Some(pf);
         assert!(oxideav_h265::make_encoder(&params).is_ok(), "{pf:?} pcm");
         params.options.insert("mode", "intra");
-        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?} intra");
+        assert!(oxideav_h265::make_encoder(&params).is_ok(), "{pf:?} intra");
+        params.options.insert("mode", "inter");
+        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?} inter");
     }
 }
 
@@ -682,6 +684,237 @@ fn pcm_still_layout_matrix_is_lossless_and_signalled() {
             "{pf:?}: one frame"
         );
     }
+}
+
+/// Golden digests of the lossy deep-layout intra matrix below:
+/// `(stream MD5, cropped-decode MD5)` per case. Every stream was
+/// decoded OUT OF BAND at pin time by a black-box reference decoder,
+/// whose cropped output was byte-identical to this crate's.
+const INTRA_LAYOUT_PINS: [(&str, &str); 11] = [
+    (
+        "b8332323f6ce64cd930a4745088c35e3",
+        "7056e5caa1d880a397e033294a52c58b",
+    ), // Yuv420P10Le 67x45
+    (
+        "5212339ac50dbd6bb1b4af4ddbe9cdc5",
+        "cbbdbfeace33e9c999c246f9396c6dfd",
+    ), // Yuv420P12Le 80x48
+    (
+        "72414f667be8c42a19298e58863ffdf2",
+        "c6f12c9e40108871fdbb61ee4123197d",
+    ), // Yuv422P 70x33
+    (
+        "05fea9ca84a91a7adfaa3961eb33012e",
+        "e5836dac34b7f84f5a15e5927c3f360c",
+    ), // Yuv422P10Le 64x64
+    (
+        "88b2f8645df5850e9d0865c4322ab201",
+        "3dbefb0b12a9f68778d7bf941c96f6d6",
+    ), // Yuv422P12Le 51x40
+    (
+        "de4c739e10ab5dcd43a16b903770c479",
+        "b794b1e37930eb48f03a515a447d006e",
+    ), // Yuv444P 45x37
+    (
+        "fc491953b7f5952111b4fc475527c400",
+        "6837399185d0570639dfdf2903825e88",
+    ), // Yuv444P10Le 96x64
+    (
+        "6f53ff3da6080f426e3cdde168f95155",
+        "262063bde36dbe98080070952f8860ef",
+    ), // Yuv444P12Le 33x31
+    (
+        "c38deb7864c90e21b3af2cfd6af241ca",
+        "fa6af6563000d78ff8a97a41e37839e7",
+    ), // Gray8 65x47
+    (
+        "89cd99037d8037f44b6f41d7c751780e",
+        "a47061245c19809ce52e04448354ccf6",
+    ), // Gray10Le 48x48
+    (
+        "fb01bf5a136636b097739a3d0e8d137b",
+        "16df649c9cfbe9a65f273dfaa7e86c8a",
+    ), // Gray12Le 39x50
+];
+
+/// Every HEIC sample layout the quadtree intra coder takes — 4:2:0 at
+/// 10 / 12 bits, 4:2:2 / 4:4:4 at 8 / 10 / 12 bits, monochrome at 8 /
+/// 10 / 12 bits — encodes LOSSY through the registry (`mode = intra`,
+/// `still`, both loop filters, RDOQ): the SPS carries the chroma
+/// format and bit depths, the PTL names the layout's Annex A row
+/// (Main 10 Still Picture, or a format range extensions profile with
+/// the Table A.2 flags plus intra / one-picture-only), the odd size
+/// crops per the layout's chroma units, every plane decodes at a
+/// faithful PSNR, and the bytes + decode match the black-box-validated
+/// golden digests. The 16-bit grey layout stays PCM-only.
+#[test]
+fn intra_layout_matrix_is_lossy_signalled_and_pinned() {
+    use oxideav_core::PixelFormat;
+    let cases: [(PixelFormat, u8, u8, u8, usize, usize); 11] = [
+        // (format, chroma_format_idc, bit depth, profile idc, w, h)
+        (PixelFormat::Yuv420P10Le, 1, 10, 2, 67, 45),
+        (PixelFormat::Yuv420P12Le, 1, 12, 4, 80, 48),
+        (PixelFormat::Yuv422P, 2, 8, 4, 70, 33),
+        (PixelFormat::Yuv422P10Le, 2, 10, 4, 64, 64),
+        (PixelFormat::Yuv422P12Le, 2, 12, 4, 51, 40),
+        (PixelFormat::Yuv444P, 3, 8, 4, 45, 37),
+        (PixelFormat::Yuv444P10Le, 3, 10, 4, 96, 64),
+        (PixelFormat::Yuv444P12Le, 3, 12, 4, 33, 31),
+        (PixelFormat::Gray8, 0, 8, 4, 65, 47),
+        (PixelFormat::Gray10Le, 0, 10, 4, 48, 48),
+        (PixelFormat::Gray12Le, 0, 12, 4, 39, 50),
+    ];
+    let mut report = Vec::new();
+    for (case, (pf, cfi, bd, profile, w, h)) in cases.into_iter().enumerate() {
+        let (sw, sh) = match cfi {
+            1 => (2usize, 2usize),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let (cw, ch) = (w.div_ceil(sw), h.div_ceil(sh));
+        let max = (1i64 << bd) - 1;
+        // A smooth photograph-like field plus texture, in 8-bit units
+        // scaled to the depth with sub-8-bit detail.
+        let sample = |x: usize, y: usize, seed: i64| -> u32 {
+            let (xf, yf) = (x as f64, y as f64);
+            let v8 = 128.0
+                + 60.0 * ((xf * 0.11 + seed as f64).sin() * (yf * 0.07).cos())
+                + 20.0 * ((xf + yf) * 0.31).sin()
+                + f64::from(hash_noise(x as i64, y as i64, seed as u64) % 7);
+            let v = (v8 * f64::from(1u32 << (bd - 8))).round() as i64;
+            v.clamp(0, max) as u32
+        };
+        let wide = bd > 8;
+        let bps = if wide { 2 } else { 1 };
+        let mk = |pw: usize, ph: usize, seed: i64| -> VideoPlane {
+            let mut data = Vec::with_capacity(pw * ph * bps);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let v = sample(x, y, seed);
+                    if wide {
+                        data.extend_from_slice(&(v as u16).to_le_bytes());
+                    } else {
+                        data.push(v as u8);
+                    }
+                }
+            }
+            VideoPlane {
+                stride: pw * bps,
+                data,
+            }
+        };
+        let mut planes = vec![mk(w, h, 1)];
+        if cfi != 0 {
+            planes.push(mk(cw, ch, 2));
+            planes.push(mk(cw, ch, 3));
+        }
+        let src = planes.clone();
+        let mut params = CodecParameters::video("h265".into());
+        params.width = Some(w as u32);
+        params.height = Some(h as u32);
+        params.pixel_format = Some(pf);
+        for (k, v) in [
+            ("mode", "intra"),
+            ("still", "1"),
+            ("qp", "24"),
+            ("ctb", "32"),
+            ("deblock", "1"),
+            ("sao", "1"),
+            ("rdoq", "1"),
+        ] {
+            params.options.insert(k, v);
+        }
+        let mut enc = oxideav_h265::make_encoder(&params).unwrap_or_else(|e| panic!("{pf:?}: {e}"));
+        assert_eq!(enc.output_params().pixel_format, Some(pf), "{pf:?}: echo");
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes,
+        }))
+        .unwrap_or_else(|e| panic!("{pf:?}: send: {e}"));
+        let stream = enc.receive_packet().expect("one packet").data;
+        if let Ok(dir) = std::env::var("H265_DUMP_DIR") {
+            std::fs::write(format!("{dir}/intra_{pf:?}_{w}x{h}.hevc"), &stream).expect("dump");
+        }
+        let sps = sps_of(&stream);
+        assert_eq!(sps.chroma_format_idc, cfi, "{pf:?}: chroma_format_idc");
+        assert_eq!(sps.bit_depth_luma(), bd, "{pf:?}: BitDepthY");
+        assert_eq!(sps.bit_depth_chroma(), bd, "{pf:?}: BitDepthC");
+        assert_eq!(sps.ptl.general_profile_idc, profile, "{pf:?}: profile");
+        assert!(sps.ptl.is_still_picture_profile(), "{pf:?}: still");
+        assert!(sps.pcm.is_none(), "{pf:?}: lossy coding, not PCM");
+        // Decode through the registry, crop-checked against the source.
+        let dparams = CodecParameters::video("h265".into());
+        let mut dec = oxideav_h265::make_decoder(&dparams).expect("decoder");
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 1), stream.clone()))
+            .expect("send");
+        dec.flush().expect("flush");
+        let out = match dec.receive_frame() {
+            Ok(Frame::Video(v)) => v,
+            other => panic!("{pf:?}: {other:?}"),
+        };
+        let (ow, oh) = (w.div_ceil(sw) * sw, h.div_ceil(sh) * sh);
+        assert_eq!(out.planes.len(), src.len(), "{pf:?}: plane count");
+        let mut decoded = Vec::new();
+        for (i, (o, s)) in out.planes.iter().zip(src.iter()).enumerate() {
+            let (pw, ph) = if i == 0 { (ow, oh) } else { (ow / sw, oh / sh) };
+            assert_eq!(o.data.len(), pw * ph * bps, "{pf:?}: plane {i} size");
+            decoded.extend_from_slice(&o.data);
+            let (rw, rh) = if i == 0 { (w, h) } else { (cw, ch) };
+            let val = |d: &[u8], stride: usize, x: usize, y: usize| -> f64 {
+                if wide {
+                    f64::from(u16::from_le_bytes([
+                        d[y * stride + 2 * x],
+                        d[y * stride + 2 * x + 1],
+                    ]))
+                } else {
+                    f64::from(d[y * stride + x])
+                }
+            };
+            let mut se = 0.0;
+            for y in 0..rh {
+                for x in 0..rw {
+                    se += (val(&o.data, o.stride, x, y) - val(&s.data, s.stride, x, y)).powi(2);
+                }
+            }
+            let mse = se / (rw * rh) as f64;
+            let psnr = 10.0 * ((max * max) as f64 / mse.max(1e-9)).log10();
+            assert!(psnr > 36.0, "{pf:?}: plane {i} PSNR {psnr:.2}");
+        }
+        let got = (md5::hex(&stream), md5::hex(&decoded));
+        report.push(format!(
+            "    (\"{}\", \"{}\"), // {pf:?} {w}x{h}",
+            got.0, got.1
+        ));
+        if std::env::var("H265_PRINT_PINS").is_err() {
+            assert_eq!(
+                (got.0.as_str(), got.1.as_str()),
+                INTRA_LAYOUT_PINS[case],
+                "{pf:?}: golden digests"
+            );
+        }
+    }
+    if std::env::var("H265_PRINT_PINS").is_ok() {
+        println!("{}", report.join("\n"));
+    }
+    // 16-bit grey: PCM only.
+    let mut params = CodecParameters::video("h265".into());
+    params.width = Some(16);
+    params.height = Some(16);
+    params.pixel_format = Some(PixelFormat::Gray16Le);
+    params.options.insert("mode", "intra");
+    assert!(oxideav_h265::make_encoder(&params).is_err(), "16-bit intra");
+    // The deep layouts take SliceQpY down to −QpBdOffsetY.
+    params.pixel_format = Some(PixelFormat::Yuv420P10Le);
+    params.options.insert("qp", "-12");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_ok(),
+        "qp −12 at 10 bits"
+    );
+    params.options.insert("qp", "-13");
+    assert!(
+        oxideav_h265::make_encoder(&params).is_err(),
+        "qp −13 at 10 bits"
+    );
 }
 
 /// `still` is refused on the inter GOP modes.

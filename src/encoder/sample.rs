@@ -80,7 +80,6 @@ impl SampleFmt {
 
     /// The format of a PCM layout (equal depths).
     #[must_use]
-    #[allow(dead_code)] // the registry's deep-layout intra path (next commit)
     pub fn from_layout(layout: PcmLayout) -> Self {
         Self {
             chroma_format_idc: layout.chroma_format_idc,

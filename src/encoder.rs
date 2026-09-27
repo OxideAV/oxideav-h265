@@ -110,6 +110,15 @@ enum EncodeMode {
     },
 }
 
+/// The planes of one `mode = "intra"` frame.
+#[derive(Clone, Copy)]
+enum IntraPlanes<'a> {
+    /// 8-bit 4:2:0 `[Y, Cb, Cr]` (the historical coders' input).
+    Narrow([&'a [u8]; 3]),
+    /// Any other layout, `u16` samples (chroma empty for monochrome).
+    Wide([&'a [u16]; 3]),
+}
+
 use std::collections::VecDeque;
 
 use oxideav_core::{
@@ -198,6 +207,20 @@ use oxideav_core::{
 /// `Yuv420P` — same sample path — and, absent an explicit `range`
 /// option, signals `video_full_range_flag == 1` on its own.
 ///
+/// Every other HEIC sample layout — `Yuv420P10Le` / `Yuv420P12Le`,
+/// `Yuv422P(J)` / `Yuv422P10Le` / `Yuv422P12Le`, `Yuv444P(J)` /
+/// `Yuv444P10Le` / `Yuv444P12Le`, `Gray8` / `Gray10Le` / `Gray12Le`
+/// (little-endian 16-bit planes above 8 bits, one plane for grey) —
+/// codes on the `"pcm"` mode (lossless; `Gray16Le` too) AND the
+/// `"intra"` mode: lossy through the quadtree coder (`ctb` defaults
+/// to 64 there; every quadtree tool, filter, rate-control and VUI
+/// option applies), `qp` reaching down to `−QpBdOffsetY` (−12 at 10
+/// bits, −24 at 12), the SPS carrying the chroma format and bit
+/// depths and the PTL the layout's Annex A row (Main 10 / Main 10
+/// Still Picture, or `general_profile_idc == 4` with the Table A.2
+/// constraint flags — plus the intra / one-picture-only flags under
+/// `still`). The inter modes stay 8-bit 4:2:0.
+///
 /// The `range` option (`"full"` / `"limited"`) and the H.273 code
 /// points `colorprim` / `transfer` / `matrix` (0..=255; any given one
 /// enables the colour description, the others defaulting to 2 =
@@ -231,9 +254,13 @@ pub struct H265Encoder {
     /// caller's size (right / bottom offsets in chroma units), `None`
     /// when no padding was needed.
     crop: Option<(u32, u32)>,
-    /// The PCM still layout (8-bit 4:2:0 unless another planar input
-    /// format selected a lossless PCM layout).
+    /// The input sample layout (8-bit 4:2:0 unless another planar
+    /// input format was declared): a PCM still layout under `mode =
+    /// "pcm"`, the quadtree intra coder's [`sample::SampleFmt`] under
+    /// `mode = "intra"`.
     layout: pcm::PcmLayout,
+    /// [`Self::layout`] as the coder's sample format.
+    fmt: sample::SampleFmt,
     /// The `still` option: Main Still Picture profile signalling on
     /// every (single-picture) access unit.
     still: bool,
@@ -291,8 +318,9 @@ impl std::fmt::Debug for H265Encoder {
 ///
 /// # Errors
 /// [`Error::InvalidData`] when width / height are missing or zero,
-/// the pixel format is declared and is not
-/// 4:2:0 8-bit planar, or a codec option is malformed.
+/// the pixel format is not one of the planar layouts above (or is
+/// not 8-bit 4:2:0 on the inter modes, or is 16-bit grey on the intra
+/// mode), or a codec option is malformed.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -316,7 +344,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P)
     );
     // Every other planar layout — monochrome, 4:2:2, 4:4:4, 10 / 12 /
-    // 16-bit — is a lossless PCM still (`mode = "pcm"`): the intra /
+    // 16-bit — codes as a lossless PCM still (`mode = "pcm"`) or through
+    // the quadtree intra coder (`mode = "intra"`, 8..=12 bits); the
     // inter coders are 8-bit 4:2:0 only.
     let layout = match params.pixel_format {
         None | Some(PixelFormat::Yuv420P | PixelFormat::YuvJ420P) => pcm::PcmLayout::default(),
@@ -341,10 +370,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 )))
                 }
             };
-            if params.options.get("mode").unwrap_or("pcm") != "pcm" {
+            if params.options.get("mode") == Some("inter") {
                 return Err(Error::InvalidData(format!(
-                    "h265 encode: {pf:?} input is supported by mode \"pcm\" only (the intra / inter \
-                     coders take yuv420p)"
+                    "h265 encode: {pf:?} input is supported by modes \"pcm\" and \"intra\" (the \
+                     inter coders take yuv420p)"
                 )));
             }
             pcm::PcmLayout {
@@ -370,15 +399,22 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             ((coded_height - out_height) / sub_h) as u32,
         )
     });
+    // `qp` — SliceQpY: 0..=51, or −QpBdOffsetY..=51 on a deep layout
+    // coded by the intra mode (e.g. −12..=51 at 10 bits).
+    let qp_min = if params.options.get("mode") == Some("intra") {
+        -6 * (i32::from(layout.bit_depth.min(12)) - 8)
+    } else {
+        0
+    };
     let parse_qp = |params: &CodecParameters| -> Result<i32> {
         match params.options.get("qp") {
             None => Ok(26),
             Some(v) => v
                 .parse::<i32>()
                 .ok()
-                .filter(|q| (0..=51).contains(q))
+                .filter(|q| (qp_min..=51).contains(q))
                 .ok_or_else(|| {
-                    Error::InvalidData(format!("h265 encode: qp must be 0..=51, got {v:?}"))
+                    Error::InvalidData(format!("h265 encode: qp must be {qp_min}..=51, got {v:?}"))
                 }),
         }
     };
@@ -463,6 +499,27 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
     let mut tree = parse_ctb(params)?;
+    // Deep layouts (anything but 8-bit 4:2:0) code lossy through the
+    // quadtree coder only (the fixed-geometry bootstrap coder is
+    // 8-bit 4:2:0): `ctb` defaults to 64 there, and the depth is
+    // capped at 12 bits (the format range extensions profiles above
+    // are the 16-bit Intra / Still Picture rows, which need the
+    // extended-precision tools).
+    let deep_intra =
+        layout != pcm::PcmLayout::default() && params.options.get("mode") == Some("intra");
+    if deep_intra {
+        if layout.bit_depth > 12 {
+            return Err(Error::InvalidData(format!(
+                "h265 encode: {:?} input is supported by mode \"pcm\" only (the intra coder \
+                 codes 8..=12-bit samples)",
+                params.pixel_format.unwrap_or(PixelFormat::Gray16Le)
+            )));
+        }
+        if tree.is_none() {
+            tree = ctu::TreeCfg::new(64);
+        }
+    }
+    let fmt = sample::SampleFmt::from_layout(layout);
     // Quadtree-coder tools (each requires `ctb`): `sdh` — sign data
     // hiding; `rdoq` — rate-distortion optimised quantization.
     let sdh = parse_flag(params, "sdh")?;
@@ -904,6 +961,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         video_signal,
         ids,
         layout,
+        fmt,
         mode,
         ready: VecDeque::new(),
         frame_index: 0,
@@ -913,10 +971,157 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 impl H265Encoder {
-    /// The lossless PCM path for every layout other than 8-bit 4:2:0:
-    /// the planes (one byte per sample at 8 bits, little-endian 16-bit
-    /// otherwise; one plane for monochrome) are edge-padded to the
-    /// coded size and written through [`pcm::encode_idr_pcm_au_wide`].
+    /// One `mode = "intra"` frame: the (ABR-elected) QP, the VBV / HRD
+    /// re-encode loop and the HRD SEI / filler splicing around the
+    /// intra coder — the 8-bit 4:2:0 planes through the historical
+    /// entry, every other layout through the quadtree coder's wide
+    /// entry.
+    fn intra_frame(&mut self, planes: IntraPlanes<'_>) -> Result<Vec<u8>> {
+        let (coded_width, coded_height) = (self.coded_width, self.coded_height);
+        let (threads, crop, still) = (self.threads, self.crop, self.still);
+        let (video_signal, ids, fmt) = (self.video_signal, self.ids, self.fmt);
+        let EncodeMode::Intra {
+            qp,
+            tree,
+            ctu_rc,
+            lf,
+            rc,
+            aq,
+            timing,
+            hrd,
+        } = &mut self.mode
+        else {
+            unreachable!("intra_frame on an intra encoder")
+        };
+        let mut frame_qp = match rc {
+            Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
+            None => *qp,
+        };
+        let budget = if *ctu_rc && tree.is_some() {
+            rc.as_ref().and_then(|r| r.last_budget_bits())
+        } else {
+            None
+        };
+        let cfg = intra::SpsCfg {
+            cu_qp_delta: *aq > 0 || budget.is_some(),
+            timing: *timing,
+            hrd: hrd.as_ref().map(|(signal, _)| *signal),
+            min_cb_log2: if tree.is_some() { 3 } else { 4 },
+            tree: *tree,
+            threads,
+            conformance_window: crop,
+            still,
+            video_signal,
+            ids,
+            fmt,
+            ..intra::SpsCfg::legacy(u32::from(!still))
+        };
+        // The HRD SEI prefix: every frame is an IRAP access
+        // unit, so each carries a §D.2.2 buffering period
+        // beside its §D.2.3 pic timing (no output delay:
+        // decode order == display order).
+        let sei = hrd.as_mut().map(|(_, clock)| {
+            let (delay, offset) = clock.begin_buffering_period();
+            let payloads = [
+                (
+                    hrd::SEI_BUFFERING_PERIOD,
+                    hrd::buffering_period_payload(delay, offset),
+                ),
+                (
+                    hrd::SEI_PIC_TIMING,
+                    hrd::pic_timing_payload(clock.au_cpb_removal_delay_minus1(), 0),
+                ),
+            ];
+            let mut framed = vec![0, 0, 0, 1];
+            framed.extend(hrd::sei_prefix_nal(&payloads));
+            framed
+        });
+        let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
+        let code = |frame_qp: i32| -> Result<Vec<u8>> {
+            match planes {
+                IntraPlanes::Narrow([y, cb, cr]) => intra::encode_idr_intra_au_full(
+                    y,
+                    cb,
+                    cr,
+                    coded_width,
+                    coded_height,
+                    frame_qp,
+                    &cfg,
+                    lf,
+                    *aq,
+                    budget,
+                )
+                .map(|a| a.au),
+                IntraPlanes::Wide(p) => intra::encode_idr_intra_au_wide(
+                    p,
+                    coded_width,
+                    coded_height,
+                    frame_qp,
+                    &cfg,
+                    lf,
+                    *aq,
+                    budget,
+                )
+                .map(|a| a.au),
+            }
+            .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))
+        };
+        let mut au = code(frame_qp)?;
+        // VBV (`bufsize`) / HRD constraint: re-encode at a
+        // higher QP until the whole AU (SEI included) fits
+        // the modelled decoder buffer and the Annex C
+        // arrival window.
+        let cbr = hrd.as_ref().is_some_and(|(signal, _)| signal.cbr);
+        let cap = match (
+            rc.as_ref().and_then(|r| r.vbv_frame_cap()),
+            hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
+        ) {
+            (Some(v), Some(h)) => Some(v.min(h)),
+            (v, h) => v.or(h),
+        }
+        // CBR: reserve the filler quantum under the cap.
+        .map(|c| if cbr { c.saturating_sub(56) } else { c });
+        if let Some(cap) = cap {
+            let ceiling = rc.as_ref().map_or(51, |r| r.max_qp());
+            while au.len() as u64 * 8 + sei_bits > cap && frame_qp < ceiling {
+                frame_qp = (frame_qp + 3).min(ceiling);
+                au = code(frame_qp)?;
+            }
+        }
+        if let Some(sei) = &sei {
+            hrd::splice_sei_before_vcl(&mut au, sei);
+        }
+        if let Some((_, clock)) = &*hrd {
+            // CBR underrun padding after the VCL NAL.
+            let pad_bits = clock.cbr_filler_bits(au.len() as u64 * 8);
+            if pad_bits > 0 {
+                au.extend(hrd::filler_data_nal_framed((pad_bits as usize).div_ceil(8)));
+            }
+        }
+        if let Some(rc) = rc {
+            rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);
+        }
+        if let Some((_, clock)) = hrd {
+            clock.push_au(au.len() as u64 * 8);
+        }
+        Ok(au)
+    }
+
+    /// Queue one keyframe packet for the frame.
+    fn push_keyframe(&mut self, v: &oxideav_core::VideoFrame, au: Vec<u8>) {
+        let mut pkt = Packet::new(0, self.time_base, au);
+        pkt.pts = v.pts.or(Some(self.frame_index));
+        pkt.dts = pkt.pts;
+        pkt.flags.keyframe = true;
+        self.frame_index += 1;
+        self.ready.push_back(pkt);
+    }
+
+    /// Every layout other than 8-bit 4:2:0: the planes (one byte per
+    /// sample at 8 bits, little-endian 16-bit otherwise; one plane for
+    /// monochrome) are edge-padded to the coded size and written
+    /// through [`pcm::encode_idr_pcm_au_wide`] (`mode = "pcm"`,
+    /// lossless) or the quadtree intra coder (`mode = "intra"`).
     fn send_frame_wide(&mut self, v: &oxideav_core::VideoFrame) -> Result<()> {
         let layout = self.layout;
         let (sub_w, sub_h) = layout.sub_wh();
@@ -984,6 +1189,23 @@ impl H265Encoder {
                 )?,
             )
         };
+        if matches!(self.mode, EncodeMode::Intra { .. }) {
+            // The intra coder does not range-check sample values (an
+            // out-of-range source sample would only skew the residual):
+            // refuse them here, as the PCM writer does.
+            let max = (1u32 << layout.bit_depth) - 1;
+            for (name, plane) in [("y", &y), ("cb", &cb), ("cr", &cr)] {
+                if plane.iter().any(|&s| u32::from(s) > max) {
+                    return Err(Error::InvalidData(format!(
+                        "h265 encode: {name} plane holds samples above {max} ({}-bit input)",
+                        layout.bit_depth
+                    )));
+                }
+            }
+            let au = self.intra_frame(IntraPlanes::Wide([&y, &cb, &cr]))?;
+            self.push_keyframe(v, au);
+            return Ok(());
+        }
         let au = pcm::encode_idr_pcm_au_wide(
             &y,
             &cb,
@@ -1064,6 +1286,11 @@ impl Encoder for H265Encoder {
         )?;
         let cb = pack(1, cw, ch, self.coded_width / 2, self.coded_height / 2)?;
         let cr = pack(2, cw, ch, self.coded_width / 2, self.coded_height / 2)?;
+        if matches!(self.mode, EncodeMode::Intra { .. }) {
+            let au = self.intra_frame(IntraPlanes::Narrow([&y, &cb, &cr]))?;
+            self.push_keyframe(v, au);
+            return Ok(());
+        }
 
         let (au, keyframe) = match &mut self.mode {
             EncodeMode::Pcm => (
@@ -1084,115 +1311,7 @@ impl Encoder for H265Encoder {
                 .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?,
                 true,
             ),
-            EncodeMode::Intra {
-                qp,
-                tree,
-                ctu_rc,
-                lf,
-                rc,
-                aq,
-                timing,
-                hrd,
-            } => {
-                let mut frame_qp = match rc {
-                    Some(rc) => rc.pick_qp(rate::FrameClass::Intra),
-                    None => *qp,
-                };
-                let budget = if *ctu_rc && tree.is_some() {
-                    rc.as_ref().and_then(|r| r.last_budget_bits())
-                } else {
-                    None
-                };
-                let cfg = intra::SpsCfg {
-                    cu_qp_delta: *aq > 0 || budget.is_some(),
-                    timing: *timing,
-                    hrd: hrd.as_ref().map(|(signal, _)| *signal),
-                    min_cb_log2: if tree.is_some() { 3 } else { 4 },
-                    tree: *tree,
-                    threads: self.threads,
-                    conformance_window: self.crop,
-                    still: self.still,
-                    video_signal: self.video_signal,
-                    ids: self.ids,
-                    ..intra::SpsCfg::legacy(u32::from(!self.still))
-                };
-                // The HRD SEI prefix: every frame is an IRAP access
-                // unit, so each carries a §D.2.2 buffering period
-                // beside its §D.2.3 pic timing (no output delay:
-                // decode order == display order).
-                let sei = hrd.as_mut().map(|(_, clock)| {
-                    let (delay, offset) = clock.begin_buffering_period();
-                    let payloads = [
-                        (
-                            hrd::SEI_BUFFERING_PERIOD,
-                            hrd::buffering_period_payload(delay, offset),
-                        ),
-                        (
-                            hrd::SEI_PIC_TIMING,
-                            hrd::pic_timing_payload(clock.au_cpb_removal_delay_minus1(), 0),
-                        ),
-                    ];
-                    let mut framed = vec![0, 0, 0, 1];
-                    framed.extend(hrd::sei_prefix_nal(&payloads));
-                    framed
-                });
-                let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
-                let code = |frame_qp: i32| -> Result<Vec<u8>> {
-                    Ok(intra::encode_idr_intra_au_full(
-                        &y,
-                        &cb,
-                        &cr,
-                        self.coded_width,
-                        self.coded_height,
-                        frame_qp,
-                        &cfg,
-                        lf,
-                        *aq,
-                        budget,
-                    )
-                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                    .au)
-                };
-                let mut au = code(frame_qp)?;
-                // VBV (`bufsize`) / HRD constraint: re-encode at a
-                // higher QP until the whole AU (SEI included) fits
-                // the modelled decoder buffer and the Annex C
-                // arrival window.
-                let cbr = hrd.as_ref().is_some_and(|(signal, _)| signal.cbr);
-                let cap = match (
-                    rc.as_ref().and_then(|r| r.vbv_frame_cap()),
-                    hrd.as_ref().map(|(_, clock)| clock.frame_cap()),
-                ) {
-                    (Some(v), Some(h)) => Some(v.min(h)),
-                    (v, h) => v.or(h),
-                }
-                // CBR: reserve the filler quantum under the cap.
-                .map(|c| if cbr { c.saturating_sub(56) } else { c });
-                if let Some(cap) = cap {
-                    let ceiling = rc.as_ref().map_or(51, |r| r.max_qp());
-                    while au.len() as u64 * 8 + sei_bits > cap && frame_qp < ceiling {
-                        frame_qp = (frame_qp + 3).min(ceiling);
-                        au = code(frame_qp)?;
-                    }
-                }
-                if let Some(sei) = &sei {
-                    hrd::splice_sei_before_vcl(&mut au, sei);
-                }
-                if let Some((_, clock)) = &*hrd {
-                    // CBR underrun padding after the VCL NAL.
-                    let pad_bits = clock.cbr_filler_bits(au.len() as u64 * 8);
-                    if pad_bits > 0 {
-                        au.extend(hrd::filler_data_nal_framed((pad_bits as usize).div_ceil(8)));
-                    }
-                }
-                if let Some(rc) = rc {
-                    rc.update(rate::FrameClass::Intra, frame_qp, au.len() as u64 * 8);
-                }
-                if let Some((_, clock)) = hrd {
-                    clock.push_au(au.len() as u64 * 8);
-                }
-                (au, true)
-            }
+            EncodeMode::Intra { .. } => unreachable!("intra frames take intra_frame"),
             EncodeMode::Inter(enc) => {
                 let f = enc
                     .encode_frame(&inter::YuvFrame {
