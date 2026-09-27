@@ -267,7 +267,16 @@ streams) but the surveyed black-box reference decoder diverges on it
 combination is decoder-pinned only. Tiled pictures are decided
 **tile-parallel** under the core `ExecutionContext` budget
 (`with_threads` / `set_execution_context`; serial by default,
-bit-identical for any worker count).
+bit-identical for any worker count), and a single-tile `wpp` picture
+**wavefront-parallel** (round 463): its CTB rows go to the workers
+with the CTB at column `c` starting once the row above finished
+column `c + 1`, each worker deciding into its own state after pulling
+the above-row neighbourhood from the shared picture and publishing
+each finished CTB back, the RDOQ shadow contexts of a row seeded from
+the row above's §9.3.2.2 storage — bytes identical to the serial pass
+for any worker count; the 12 MP still at level 2 goes from 42 s
+serial to 7.5 s on 8 workers (tiles=4x4 on 8 workers: 8.1 s at +0.3 %
+bytes).
 
 **Every HEIC sample layout codes LOSSY on `mode = "intra"`** (round
 463): 4:2:0 at 10 / 12 bits, 4:2:2 and 4:4:4 at 8 / 10 / 12 bits and
@@ -345,8 +354,8 @@ search. Against a third-party HEIF encoder's default preset on the
 same photographs (identical YUV input, luma PSNR), level 2 — with
 its halved mode-decision λ — stands at **−1.4 % BD-rate on the 12 MP
 still** (+4.3 % on the 1024x768 one);
-the 12 MP still codes in 8.3 s on 8 workers with `tiles=4x4` at
-level 2 (38 s serial; 3.4 s / 17.7 s at level 0). Two container-facing knobs
+the 12 MP still codes in 7.5 s on 8 workers with `wpp` (8.3 s with
+`tiles=4x4`) at level 2 (38 s serial; 3.4 s / 17.7 s at level 0). Two container-facing knobs
 ride every mode: the §E.2.1 `video_signal_type` VUI block (`range`,
 `colorprim` / `transfer` / `matrix` — the field an OS image reader
 takes the sample range from) and the parameter-set ids (`vpsid` /
@@ -428,9 +437,10 @@ and ~985 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: SCC-tool (palette / IBC /
-  ACT) encoding, and a WPP-parallel (row-pipelined) pass 1 — only
-  tiles fan out today; CTU-level rate feedback and the quantization /
-  hierarchy tools ride only the quadtree coder. (Intra `PART_NxN`
+  ACT) encoding; the WPP wavefront fans out single-tile pictures only
+  (tiled pictures fan out per tile) and not under CTU-level rate
+  feedback; CTU-level rate feedback and the quantization / hierarchy
+  tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
   path covers that geometry.)
@@ -449,9 +459,9 @@ and ~985 unit tests.
   dimension (the container's clean aperture carries the odd last
   column / row).
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
-  level-0 time serially (38 s for a 12 MP still; 8.3 s on 8 workers
-  with `tiles=4x4`) against ~1 s for the third-party encoder's
-  multi-threaded default preset — no WPP fan-out, no SIMD.
+  level-0 time serially (38 s for a 12 MP still; 7.5 s on 8 workers
+  with `wpp`) against ~1 s for the third-party encoder's
+  multi-threaded default preset — no SIMD.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both
