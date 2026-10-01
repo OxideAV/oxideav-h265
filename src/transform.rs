@@ -320,6 +320,7 @@ const DCT32: [[i32; 32]; 32] = [
 /// `input` is the length-`n_tbs` list `x[ j ]`; the return is the
 /// length-`n_tbs` list `y[ i ]`. Products accumulate in `i64`.
 #[must_use]
+#[cfg(test)]
 fn transform_1d(input: &[i64], n_tbs: usize, tr_type: bool) -> Vec<i64> {
     let mut out = vec![0i64; n_tbs];
     if tr_type {
@@ -451,37 +452,192 @@ pub fn inverse_transform(
     // §8.6.4 eqs. 8-310..8-313: the intermediate-clip coeffMin/coeffMax.
     let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
 
-    // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y].
-    // d is row-major by y; a column is the fixed-x slice.
-    let mut e = vec![0i64; count];
-    for x in 0..n_tbs {
-        let col: Vec<i64> = (0..n_tbs).map(|y| d[y * n_tbs + x] as i64).collect();
-        let te = transform_1d(&col, n_tbs, tr_type);
-        for (y, &v) in te.iter().enumerate() {
-            e[y * n_tbs + x] = v;
-        }
-    }
-
-    // §8.6.4 step 2 (eq. 8-314): g[x][y] = clip( (e + 64) >> 7 ).
-    let mut g = vec![0i64; count];
-    for (gv, &ev) in g.iter_mut().zip(e.iter()) {
-        *gv = clip3(coeff_min as i64, coeff_max as i64, (ev + 64) >> 7);
-    }
-
-    // §8.6.4 step 3: row transform g[x][y] over x -> r[x][y].
-    let mut r = vec![0i32; count];
+    // The coded coefficients are sparse: the §7.3.8.11 scan never
+    // places a level past the last significant position, so the rows
+    // below the last non-zero row and the columns right of the last
+    // non-zero column are all zero. Zero inputs contribute nothing to
+    // either matrix product, so the passes run over the non-zero extent
+    // only (an all-zero block synthesizes to all zeros).
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut any = false;
     for y in 0..n_tbs {
-        let row: Vec<i64> = (0..n_tbs).map(|x| g[y * n_tbs + x]).collect();
-        let tr = transform_1d(&row, n_tbs, tr_type);
-        for (x, &v) in tr.iter().enumerate() {
-            // r stays i64-valued through here; equation 8-299's bdShift
-            // round (in residual_block) is what reduces it. Per the
-            // spec the §8.6.4 row output is not itself clipped, so keep
-            // full precision and narrow at the final offset-round.
-            r[y * n_tbs + x] = v as i32;
+        let row = &d[y * n_tbs..(y + 1) * n_tbs];
+        if let Some(last) = row.iter().rposition(|&v| v != 0) {
+            any = true;
+            max_x = max_x.max(last);
+            max_y = y;
         }
+    }
+    let mut r = vec![0i32; count];
+    if !any {
+        return Ok(r);
+    }
+    if extended_precision {
+        inverse_transform_passes::<i64>(
+            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
+        );
+    } else {
+        inverse_transform_passes::<i32>(
+            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, &mut r,
+        );
     }
     Ok(r)
+}
+
+/// The arithmetic type of the two §8.6.4 passes: `i32` holds every
+/// intermediate when `extended_precision_processing_flag == 0` (inputs
+/// clipped to 16 bits, 32 products of magnitude ≤ 90 · 2^15 per sum),
+/// `i64` covers the extended-precision coefficient range.
+trait TransformAcc:
+    Copy
+    + Default
+    + core::ops::Add<Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::Mul<Output = Self>
+    + From<i32>
+{
+    fn to_i64(self) -> i64;
+    fn from_i64(v: i64) -> Self;
+}
+
+impl TransformAcc for i32 {
+    #[inline]
+    fn to_i64(self) -> i64 {
+        i64::from(self)
+    }
+    #[inline]
+    fn from_i64(v: i64) -> Self {
+        v as i32
+    }
+}
+
+impl TransformAcc for i64 {
+    #[inline]
+    fn to_i64(self) -> i64 {
+        self
+    }
+    #[inline]
+    fn from_i64(v: i64) -> Self {
+        v
+    }
+}
+
+/// §8.6.4 steps 1 .. 3 over the non-zero extent `[0, max_x] × [0,
+/// max_y]` of `d`: the column pass (eq. 8-313), the eq. 8-314
+/// intermediate clip and the row pass, writing the pre-`bdShift`
+/// residual into `r`.
+#[allow(clippy::too_many_arguments)]
+fn inverse_transform_passes<T: TransformAcc>(
+    d: &[i32],
+    n_tbs: usize,
+    tr_type: bool,
+    coeff_min: i32,
+    coeff_max: i32,
+    max_x: usize,
+    max_y: usize,
+    r: &mut [i32],
+) {
+    let count = n_tbs * n_tbs;
+    // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y], then
+    // step 2 (eq. 8-314): g[x][y] = clip( (e + 64) >> 7 ). Columns past
+    // the last non-zero one stay zero.
+    let mut g = vec![T::default(); count];
+    let mut col = [T::default(); 32];
+    let mut out = [T::default(); 32];
+    let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
+    for x in 0..=max_x {
+        for (y, c) in col.iter_mut().enumerate().take(n_tbs) {
+            *c = T::from(d[y * n_tbs + x]);
+        }
+        synthesize_1d(&col[..n_tbs], max_y + 1, tr_type, &mut out[..n_tbs]);
+        for (y, &v) in out.iter().enumerate().take(n_tbs) {
+            g[y * n_tbs + x] = T::from_i64(clip3(lo, hi, (v.to_i64() + 64) >> 7));
+        }
+    }
+    // §8.6.4 step 3: row transform g[x][y] over x -> r[x][y]. The row
+    // output is not clipped here; equation 8-299's bdShift round (in
+    // residual_block) narrows it.
+    for y in 0..n_tbs {
+        let row = &g[y * n_tbs..(y + 1) * n_tbs];
+        synthesize_1d(row, max_x + 1, tr_type, &mut out[..n_tbs]);
+        for (x, &v) in out.iter().enumerate().take(n_tbs) {
+            r[y * n_tbs + x] = v.to_i64() as i32;
+        }
+    }
+}
+
+/// §8.6.4.2 for one row / column: `y[ i ] = Σ_j transMatrix[ i ][ j ·
+/// stride ] · x[ j ]` over the first `nz` inputs (the rest are zero).
+/// The DCT-II case is evaluated as the even / odd regrouping of that
+/// sum — the §8.6.4.2 basis has `transMatrix[ n − 1 − i ][ j ] =
+/// (−1)^j · transMatrix[ i ][ j ]` for the `n`-point subsampling, so
+/// every output pair `(i, n − 1 − i)` shares the even-`j` partial sum
+/// and differs by the sign of the odd-`j` one, and the even-`j` sum is
+/// itself the `n / 2`-point synthesis of the even coefficients. The
+/// regrouping only re-associates integer additions (no intermediate
+/// rounding), so the result is the matrix product bit for bit.
+#[inline]
+fn synthesize_1d<T: TransformAcc>(x: &[T], nz: usize, tr_type: bool, y: &mut [T]) {
+    let n = x.len();
+    let nz = nz.min(n);
+    if tr_type {
+        // eq. 8-316 DST-VII (4-point only; see `transform_1d`).
+        for (i, yi) in y.iter_mut().enumerate().take(4) {
+            let mut acc = T::default();
+            for (j, &xj) in x.iter().enumerate().take(nz) {
+                acc = acc + T::from(DST4[j][i]) * xj;
+            }
+            *yi = acc;
+        }
+        return;
+    }
+    idct_even_odd(x, nz, y);
+}
+
+/// The even / odd DCT-II synthesis of [`synthesize_1d`]; `x.len()` is
+/// the point count `n` (4 / 8 / 16 / 32), reading the §8.6.4.2 basis at
+/// stride `32 / n`.
+fn idct_even_odd<T: TransformAcc>(x: &[T], nz: usize, y: &mut [T]) {
+    let n = x.len();
+    let stride = 32 / n;
+    if n == 4 {
+        // Base case written out: rows 0 / 8 / 16 / 24 of the basis.
+        let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
+        let b = |j: usize, i: usize| T::from(DCT32[j * stride][i]);
+        let e0 = b(0, 0) * x0 + b(2, 0) * x2;
+        let e1 = b(0, 1) * x0 + b(2, 1) * x2;
+        let (o0, o1) = if nz > 1 {
+            (b(1, 0) * x1 + b(3, 0) * x3, b(1, 1) * x1 + b(3, 1) * x3)
+        } else {
+            (T::default(), T::default())
+        };
+        y[0] = e0 + o0;
+        y[1] = e1 + o1;
+        y[2] = e1 - o1;
+        y[3] = e0 - o0;
+        return;
+    }
+    let half = n / 2;
+    // Even part: the n/2-point synthesis of x[0], x[2], ... (the same
+    // basis rows at twice the stride).
+    let mut even_in = [T::default(); 16];
+    for (m, e) in even_in.iter_mut().enumerate().take(half) {
+        *e = x[2 * m];
+    }
+    let mut even_out = [T::default(); 16];
+    idct_even_odd(&even_in[..half], nz.div_ceil(2), &mut even_out[..half]);
+    // Odd part over the odd inputs that may be non-zero.
+    let odd_n = nz / 2;
+    for i in 0..half {
+        let mut o = T::default();
+        for m in 0..odd_n {
+            let j = 2 * m + 1;
+            o = o + T::from(DCT32[j * stride][i]) * x[j];
+        }
+        y[i] = even_out[i] + o;
+        y[n - 1 - i] = even_out[i] - o;
+    }
 }
 
 /// Inputs to the §8.6.2 scaling-and-transformation orchestration that
@@ -1025,6 +1181,72 @@ mod tests {
         let y2 = transform_1d(&x2, 8, false);
         assert_eq!(y2[0], DCT32[4][0] as i64); // 89
         assert_eq!(y2[1], DCT32[4][1] as i64); // 75
+    }
+
+    /// The even / odd synthesis equals the literal eq. 8-317 / 8-316
+    /// matrix product on every basis vector (both are linear, so this
+    /// pins them equal on every input) at every block size, for both
+    /// accumulator types.
+    #[test]
+    fn even_odd_synthesis_matches_matrix_product_on_the_basis() {
+        for &n in &[4usize, 8, 16, 32] {
+            for tr_type in [false, true] {
+                if tr_type && n != 4 {
+                    continue;
+                }
+                for j in 0..n {
+                    let mut x = vec![0i64; n];
+                    x[j] = 7;
+                    let direct = transform_1d(&x, n, tr_type);
+                    let mut fast64 = vec![0i64; n];
+                    synthesize_1d(&x, n, tr_type, &mut fast64);
+                    assert_eq!(fast64, direct, "n {n} tr {tr_type} basis {j}");
+                    // With the non-zero extent declared exactly.
+                    let mut fast_nz = vec![0i64; n];
+                    synthesize_1d(&x, j + 1, tr_type, &mut fast_nz);
+                    assert_eq!(fast_nz, direct, "nz n {n} tr {tr_type} basis {j}");
+                    let x32: Vec<i32> = x.iter().map(|&v| v as i32).collect();
+                    let mut fast32 = vec![0i32; n];
+                    synthesize_1d(&x32, n, tr_type, &mut fast32);
+                    let fast32: Vec<i64> = fast32.iter().map(|&v| i64::from(v)).collect();
+                    assert_eq!(fast32, direct, "i32 n {n} tr {tr_type} basis {j}");
+                }
+            }
+        }
+    }
+
+    /// The sparse two-pass inverse equals the dense matrix form on a
+    /// pseudo-random 32x32 block with a short non-zero extent.
+    #[test]
+    fn sparse_inverse_matches_dense_passes() {
+        let n = 32usize;
+        let mut d = vec![0i32; n * n];
+        let mut seed = 0x1234_5678u32;
+        for y in 0..5 {
+            for x in 0..7 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                d[y * n + x] = ((seed >> 8) as i32 % 2001) - 1000;
+            }
+        }
+        let fast = inverse_transform(&d, n, PredMode::Inter, Component::Luma, 8, false).unwrap();
+        // Dense reference: literal column then row products.
+        let mut e = vec![0i64; n * n];
+        for x in 0..n {
+            let col: Vec<i64> = (0..n).map(|y| i64::from(d[y * n + x])).collect();
+            let te = transform_1d(&col, n, false);
+            for (y, &v) in te.iter().enumerate() {
+                e[y * n + x] = clip3(-32768, 32767, (v + 64) >> 7);
+            }
+        }
+        let mut dense = vec![0i32; n * n];
+        for y in 0..n {
+            let row: Vec<i64> = (0..n).map(|x| e[y * n + x]).collect();
+            let tr = transform_1d(&row, n, false);
+            for (x, &v) in tr.iter().enumerate() {
+                dense[y * n + x] = v as i32;
+            }
+        }
+        assert_eq!(fast, dense);
     }
 
     /// §8.6.5 eq. 8-322 — horizontal RDPCM is a running sum along each
