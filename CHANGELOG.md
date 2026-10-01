@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
+
+### Added
+
+- *(decoder)* tile-parallel decoding under the ExecutionContext budget — 4x4-tiled 12 MP still 0.23 s -> 0.064 s on 8 workers
+- *(decoder)* wavefront decode of WPP pictures and row-parallel in-loop filters under the ExecutionContext budget — 12 MP still 0.24 s -> 0.063 s on 8 workers
+
+### Other
+
+- *(readme)* round-464 decoder profile after the per-min-block availability change
+- *(decoder)* per-min-block intra reference availability, zero-level scaling skip, in-place bdShift round
+- *(decoder)* even/odd inverse transform over the non-zero coefficient extent — 12 MP still 0.46 s -> 0.25 s
+- *(decoder)* lean decode memory for HEIF stills — u16 copy-on-write planes, CTU-streamed reconstruction, in-place SAO, edge-map deblocking, DPB eviction
+
 ### Added
 
 - *(decoder)* **parallel decoding of a single picture under the core thread budget** (`SequenceDecoder::set_threads`; the registry decoder's `set_execution_context` — serial until told otherwise, bit-identical for any budget): a picture coded with `entropy_coding_sync_enabled_flag` and no tiles decodes its CTB rows in a **wavefront** — the CTB at column `c` of row `r` starts once row `r − 1` finished column `c + 1` — each row parsed *and* reconstructed by one worker into its own band structures (a `Picture` / motion field / intra-mode field / parse state band of the CTB row plus a four-line halo; `Picture::new_band`, `row` / `row_mut`, `MotionField::new_band`, …), the §9.3.2.4 context storage, bottom sample lines, bottom cell rows, slice identity and SAO parameters of every CTB published to the row below, the finished rows copied into disjoint row chunks of the whole-picture structures (`sequence::wavefront`); multi-slice / dependent-segment WPP pictures follow the §9.3.2.5 synchronization rules per row part. For every picture under a budget the §8.7 filters run **row-parallel** (`inter_recon::filter_picture`: vertical edges by CTB row, horizontal edges by CTB row with the chunk split four rows early, SAO by CTB row from a band whose halo lines were saved after deblocking). Gated off for tiles, SCC palette / current-picture referencing, chroma QP offset lists, multi-layer and the tolerant debug mode (those fall back to serial parse + parallel filters, or serial). Measured on the M4 Max (registry path, best of 5): the 12 MP 8-bit WPP still 0.239 s serial → 0.143 / 0.086 / **0.063 s** at 2 / 4 / 8 workers (RSS 77 → 80 / 84 / 103 MiB), a third-party encoder's 12 MP WPP still 0.50 → 0.105 s, the 10-bit WPP still 0.255 → 0.083 s, the 48-tile Apple grid (WPP tiles, decoded one after the other) 0.46 → 0.17 s at 4, a plain still without WPP or tiles 0.223 → 0.208 s (filters only — never slower). `tests/threaded_decode.rs` pins every embedded fixture, the 25 real-world stills and the official `WPP_HIGH_TP` stream byte-identical at budgets 1 / 2 / 3 / 5, the registry pins under a budget, and a budgeted still decode never slower than serial (ratio bound)
