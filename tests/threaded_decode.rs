@@ -5,8 +5,8 @@
 //!
 //! * every embedded conformance / tool-axis / real-world still fixture
 //!   decodes identically through `SequenceDecoder` at budgets 1 / 2 / 3
-//!   / 5 (WPP streams take the wavefront, the rest the row-parallel
-//!   filters only);
+//!   / 5 (WPP streams take the wavefront, tiled ones the tile-parallel
+//!   path, the rest the row-parallel filters only);
 //! * the registry decoder honours `set_execution_context` and keeps the
 //!   HEIC still pins;
 //! * the official `WPP_HIGH_TP_444_8BIT` stream (when the corpus is
@@ -105,6 +105,15 @@ fn tool_axis_fixtures_decode_identically_under_any_budget() {
     assert_budget_invariant(
         include_bytes!("fixture_bytes/r456-pyramid-rdoq-sdh-tu2-wp-wpp-qp30.hevc"),
         "pyramid-wpp",
+    );
+    // Tiled pictures take the tile-parallel path.
+    assert_budget_invariant(
+        include_bytes!("fixture_bytes/r456-lowdelay-tiles-sl-rdoq-aq-qp29.hevc"),
+        "lowdelay-tiles",
+    );
+    assert_budget_invariant(
+        include_bytes!("fixture_bytes/r453-pcm-tiles-explicit-96x64.hevc"),
+        "pcm-tiles-explicit",
     );
 }
 

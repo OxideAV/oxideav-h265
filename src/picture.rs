@@ -45,12 +45,14 @@ pub struct Picture {
     bit_depth_luma: u8,
     /// `BitDepthC`.
     bit_depth_chroma: u8,
-    /// First stored luma row (0 for a whole picture; a row band of the
-    /// wavefront decoder stores rows `y_origin_luma ..` only).
-    y_origin_luma: usize,
-    /// First stored chroma row.
-    y_origin_chroma: usize,
-    /// `SL[ x ][ y ]`, row-major (`luma[(y - y_origin_luma) * width_luma + x]`).
+    /// The stored rectangle of each plane (`(x0, y0, width)` in plane
+    /// samples): the whole plane for a picture, a CTB row or tile for a
+    /// band of the parallel decoders. Sample `(x, y)` of a plane lives at
+    /// `(y - y0) * width + (x - x0)` of its buffer.
+    band_luma: (usize, usize, usize),
+    /// See [`Self::band_luma`].
+    band_chroma: (usize, usize, usize),
+    /// `SL[ x ][ y ]`, row-major.
     luma: Arc<Vec<u16>>,
     /// `SCb[ x ][ y ]`, row-major; empty when monochrome.
     cb: Arc<Vec<u16>>,
@@ -117,8 +119,8 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            y_origin_luma: 0,
-            y_origin_chroma: 0,
+            band_luma: (0, 0, width_luma),
+            band_chroma: (0, 0, width_chroma),
             luma,
             cb,
             cr,
@@ -147,23 +149,54 @@ impl Picture {
         y_origin_luma: usize,
         band_rows_luma: usize,
     ) -> Self {
+        Self::new_rect_band(
+            width_luma,
+            height_luma,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+            (0, y_origin_luma, width_luma, band_rows_luma),
+        )
+    }
+
+    /// A rectangular **band**: only the luma rectangle `rect = (x0, y0,
+    /// w, h)` (and the chroma samples covering it) is stored — a tile of
+    /// the tile-parallel decoder. As [`Self::new_band`], every accessor
+    /// takes absolute picture coordinates; `plane` / `plane_mut` hand
+    /// out the band's `w`-wide storage.
+    ///
+    /// # Panics
+    /// Panics if the rectangle does not lie inside the picture or its
+    /// origin is not on a chroma sample.
+    #[must_use]
+    pub fn new_rect_band(
+        width_luma: usize,
+        height_luma: usize,
+        chroma_array_type: u8,
+        bit_depth_luma: u8,
+        bit_depth_chroma: u8,
+        rect: (usize, usize, usize, usize),
+    ) -> Self {
+        let (x0, y0, w, h) = rect;
         assert!(
-            y_origin_luma + band_rows_luma <= height_luma,
+            x0 + w <= width_luma && y0 + h <= height_luma,
             "band past the picture"
         );
         let (sw, sh) = sub_wh_c(chroma_array_type);
-        assert_eq!(y_origin_luma % sh, 0, "band origin on a chroma row");
-        let (width_chroma, height_chroma, y_origin_chroma, band_rows_chroma) =
-            if chroma_array_type == 0 {
-                (0, 0, 0, 0)
-            } else {
-                (
-                    width_luma / sw,
-                    height_luma / sh,
-                    y_origin_luma / sh,
-                    band_rows_luma.div_ceil(sh),
-                )
-            };
+        assert!(
+            x0 % sw == 0 && y0 % sh == 0,
+            "band origin on a chroma sample"
+        );
+        let (width_chroma, height_chroma, band_chroma, rows_chroma) = if chroma_array_type == 0 {
+            (0, 0, (0, 0, 0), 0)
+        } else {
+            (
+                width_luma / sw,
+                height_luma / sh,
+                (x0 / sw, y0 / sh, w.div_ceil(sw)),
+                h.div_ceil(sh),
+            )
+        };
         Self {
             width_luma,
             height_luma,
@@ -172,11 +205,11 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            y_origin_luma,
-            y_origin_chroma,
-            luma: Arc::new(vec![0u16; width_luma * band_rows_luma]),
-            cb: Arc::new(vec![0u16; width_chroma * band_rows_chroma]),
-            cr: Arc::new(vec![0u16; width_chroma * band_rows_chroma]),
+            band_luma: (x0, y0, w),
+            band_chroma,
+            luma: Arc::new(vec![0u16; w * h]),
+            cb: Arc::new(vec![0u16; band_chroma.2 * rows_chroma]),
+            cr: Arc::new(vec![0u16; band_chroma.2 * rows_chroma]),
         }
     }
 
@@ -191,14 +224,30 @@ impl Picture {
         )
     }
 
+    /// The stored rectangle of `plane` as `(x0, y0, width)` (the whole
+    /// plane unless this is a band).
+    #[inline]
+    #[must_use]
+    pub fn band(&self, plane: Plane) -> (usize, usize, usize) {
+        match plane {
+            Plane::Luma => self.band_luma,
+            Plane::Cb | Plane::Cr => self.band_chroma,
+        }
+    }
+
     /// The first stored row of `plane` (0 unless this is a band).
     #[inline]
     #[must_use]
     pub fn y_origin(&self, plane: Plane) -> usize {
-        match plane {
-            Plane::Luma => self.y_origin_luma,
-            Plane::Cb | Plane::Cr => self.y_origin_chroma,
-        }
+        self.band(plane).1
+    }
+
+    /// The first stored column of `plane` (0 unless this is a
+    /// rectangular band).
+    #[inline]
+    #[must_use]
+    pub fn x_origin(&self, plane: Plane) -> usize {
+        self.band(plane).0
     }
 
     /// Number of stored rows of `plane` (the plane height unless this
@@ -210,7 +259,8 @@ impl Picture {
         buf.len().checked_div(stride).unwrap_or(0)
     }
 
-    /// Row `y` (absolute picture row) of `plane`.
+    /// The stored part of row `y` (absolute picture row) of `plane`:
+    /// the samples from column [`Self::x_origin`] on.
     ///
     /// # Panics
     /// Panics if the row is not stored.
@@ -223,16 +273,17 @@ impl Picture {
     }
 
     /// The plane's buffer for writing (copied first if shared) with its
-    /// stride and the picture row its first stored row is — block
-    /// writers take this once and index rows as `(y - origin) * stride`.
+    /// stride and the stored rectangle's origin `(x0, y0)` — block
+    /// writers take this once and index as `(y - y0) * stride + (x - x0)`.
     #[inline]
-    pub fn plane_mut_origin(&mut self, plane: Plane) -> (&mut [u16], usize, usize) {
-        let origin = self.y_origin(plane);
+    pub fn plane_mut_origin(&mut self, plane: Plane) -> (&mut [u16], usize, (usize, usize)) {
+        let (x0, y0, _) = self.band(plane);
         let (buf, stride) = self.plane_slice_mut(plane);
-        (buf, stride, origin)
+        (buf, stride, (x0, y0))
     }
 
-    /// Row `y` (absolute picture row) of `plane`, for writing.
+    /// The stored part of row `y` (absolute picture row) of `plane`, for
+    /// writing (from column [`Self::x_origin`] on).
     ///
     /// # Panics
     /// Panics if the row is not stored.
@@ -283,8 +334,8 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            y_origin_luma: 0,
-            y_origin_chroma: 0,
+            band_luma: (0, 0, width_luma),
+            band_chroma: (0, 0, width_chroma),
             luma: Arc::new(luma),
             cb: Arc::new(cb),
             cr: Arc::new(cr),
@@ -319,7 +370,11 @@ impl Picture {
     /// covering the whole picture returns an identical copy.
     #[must_use]
     pub fn cropped(&self, x0: usize, y0: usize, width: usize, height: usize) -> Self {
-        assert_eq!(self.y_origin_luma, 0, "cropping a band picture");
+        assert_eq!(
+            self.band_luma,
+            (0, 0, self.width_luma),
+            "cropping a band picture"
+        );
         let x0 = x0.min(self.width_luma);
         let y0 = y0.min(self.height_luma);
         let width = width.min(self.width_luma - x0);
@@ -348,8 +403,8 @@ impl Picture {
             chroma_array_type: self.chroma_array_type,
             bit_depth_luma: self.bit_depth_luma,
             bit_depth_chroma: self.bit_depth_chroma,
-            y_origin_luma: 0,
-            y_origin_chroma: 0,
+            band_luma: (0, 0, width),
+            band_chroma: (0, 0, cw),
             luma: cut(&self.luma, self.width_luma, x0, y0, width, height),
             cb: cut(&self.cb, self.width_chroma, cx0, cy0, cw, ch),
             cr: cut(&self.cr, self.width_chroma, cx0, cy0, cw, ch),
@@ -412,9 +467,9 @@ impl Picture {
     #[inline]
     fn plane_slice(&self, plane: Plane) -> (&[u16], usize) {
         match plane {
-            Plane::Luma => (&self.luma, self.width_luma),
-            Plane::Cb => (&self.cb, self.width_chroma),
-            Plane::Cr => (&self.cr, self.width_chroma),
+            Plane::Luma => (&self.luma, self.band_luma.2),
+            Plane::Cb => (&self.cb, self.band_chroma.2),
+            Plane::Cr => (&self.cr, self.band_chroma.2),
         }
     }
 
@@ -425,15 +480,15 @@ impl Picture {
         match plane {
             Plane::Luma => (
                 Arc::make_mut(&mut self.luma).as_mut_slice(),
-                self.width_luma,
+                self.band_luma.2,
             ),
             Plane::Cb => (
                 Arc::make_mut(&mut self.cb).as_mut_slice(),
-                self.width_chroma,
+                self.band_chroma.2,
             ),
             Plane::Cr => (
                 Arc::make_mut(&mut self.cr).as_mut_slice(),
-                self.width_chroma,
+                self.band_chroma.2,
             ),
         }
     }
@@ -445,8 +500,9 @@ impl Picture {
     #[inline]
     #[must_use]
     pub fn sample(&self, plane: Plane, x: usize, y: usize) -> i32 {
+        let (x0, y0, _) = self.band(plane);
         let (buf, stride) = self.plane_slice(plane);
-        i32::from(buf[(y - self.y_origin(plane)) * stride + x])
+        i32::from(buf[(y - y0) * stride + (x - x0)])
     }
 
     /// Write one sample at `(x, y)` of `plane`. `v` must already be
@@ -458,9 +514,9 @@ impl Picture {
     /// # Panics
     /// Panics if `(x, y)` lies outside the plane.
     pub fn set_sample(&mut self, plane: Plane, x: usize, y: usize, v: i32) {
-        let r = y - self.y_origin(plane);
+        let (x0, y0, _) = self.band(plane);
         let (buf, stride) = self.plane_slice_mut(plane);
-        buf[r * stride + x] = v as u16;
+        buf[(y - y0) * stride + (x - x0)] = v as u16;
     }
 
     /// Borrow the raw row-major plane buffer (read-only). For a band
@@ -602,6 +658,14 @@ mod tests {
         assert_eq!(b.plane(Plane::Luma)[3], 77);
         assert_eq!(b.sample(Plane::Cb, 2, 8), 5);
         assert_eq!(b.row(Plane::Luma, 32)[3], 0);
+        // A tile band: columns from 32 on.
+        let mut t = Picture::new_rect_band(64, 64, 1, 8, 8, (32, 16, 32, 48));
+        assert_eq!(t.band(Plane::Luma), (32, 16, 32));
+        assert_eq!(t.band(Plane::Cb), (16, 8, 16));
+        t.set_sample(Plane::Luma, 40, 20, 9);
+        assert_eq!(t.row(Plane::Luma, 20)[8], 9);
+        assert_eq!(t.sample(Plane::Luma, 40, 20), 9);
+        assert_eq!(t.stored_rows(Plane::Cb), 24);
     }
 
     #[test]

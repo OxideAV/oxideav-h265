@@ -1060,10 +1060,14 @@ impl SequenceDecoder {
         }
         // ---- §7.3.8 CABAC decode + §8.4/§8.5 reconstruction, CTU by CTU ----
         let workers = self.threads.max(1);
-        let wavefront_plan = (workers > 1 && !self.tolerant && !plan.multi_layer)
+        let parallel = workers > 1 && !self.tolerant && !plan.multi_layer;
+        let wavefront_plan = parallel
             .then(|| wavefront::WavefrontPlan::build(segs, sps, pps, &geom))
             .flatten();
-        let (picture, motion) = if let Some(wplan) = wavefront_plan {
+        let tile_plan = (parallel && wavefront_plan.is_none())
+            .then(|| wavefront::TilePlan::build(segs, sps, pps, &geom))
+            .flatten();
+        let (picture, motion) = if wavefront_plan.is_some() || tile_plan.is_some() {
             let inputs = wavefront::WavefrontInputs {
                 segs,
                 sps,
@@ -1075,7 +1079,12 @@ impl SequenceDecoder {
                 across_of_slice: &across_of_slice,
                 tolerant: self.tolerant,
             };
-            let merged = wavefront::decode_rows(&wplan, &inputs, &recon_params, workers)?;
+            let merged = if let Some(wplan) = &wavefront_plan {
+                wavefront::decode_rows(wplan, &inputs, &recon_params, workers)?
+            } else {
+                let tplan = tile_plan.as_ref().expect("a tile plan");
+                wavefront::decode_tiles(tplan, &inputs, &recon_params, workers)?
+            };
             let tiling = geom.tiling()?;
             let pic = crate::inter_recon::filter_picture(
                 merged.pic,

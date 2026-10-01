@@ -76,6 +76,9 @@ pub struct IntraModeField {
     origin_blocks: usize,
     /// Number of stored min-block rows.
     rows_blocks: usize,
+    /// First stored min-block column and stored width (a tile band).
+    origin_blocks_x: usize,
+    cols_blocks: usize,
     /// Width / height of the grid in 4×4 min blocks.
     w_blocks: usize,
     h_blocks: usize,
@@ -114,6 +117,8 @@ impl IntraModeField {
         Self {
             origin_blocks: 0,
             rows_blocks: h_blocks,
+            origin_blocks_x: 0,
+            cols_blocks: w_blocks,
             w_blocks,
             h_blocks,
             ctb_log2_size_y,
@@ -135,21 +140,46 @@ impl IntraModeField {
         y_origin_luma: usize,
         band_rows_luma: usize,
     ) -> Self {
+        Self::new_rect_band(
+            pic_width_luma,
+            pic_height_luma,
+            ctb_log2_size_y,
+            (0, y_origin_luma, pic_width_luma, band_rows_luma),
+        )
+    }
+
+    /// A rectangular band storing the min-block cells covering the luma
+    /// rectangle `(x0, y0, w, h)` (multiples of 4).
+    ///
+    /// # Panics
+    /// Panics if the rectangle lies outside the picture.
+    #[must_use]
+    pub fn new_rect_band(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        ctb_log2_size_y: u32,
+        rect: (usize, usize, usize, usize),
+    ) -> Self {
+        let (x0, y0, w, h) = rect;
         let w_blocks = pic_width_luma.div_ceil(MIN_BLOCK_SIZE);
         let h_blocks = pic_height_luma.div_ceil(MIN_BLOCK_SIZE);
-        let origin_blocks = y_origin_luma >> MIN_BLOCK_LOG2;
-        let rows_blocks = band_rows_luma.div_ceil(MIN_BLOCK_SIZE);
+        let origin_blocks = y0 >> MIN_BLOCK_LOG2;
+        let rows_blocks = h.div_ceil(MIN_BLOCK_SIZE);
+        let origin_blocks_x = x0 >> MIN_BLOCK_LOG2;
+        let cols_blocks = w.div_ceil(MIN_BLOCK_SIZE);
         assert!(
-            origin_blocks + rows_blocks <= h_blocks,
+            origin_blocks + rows_blocks <= h_blocks && origin_blocks_x + cols_blocks <= w_blocks,
             "band past the picture"
         );
         Self {
             origin_blocks,
             rows_blocks,
+            origin_blocks_x,
+            cols_blocks,
             w_blocks,
             h_blocks,
             ctb_log2_size_y,
-            cells: vec![Cell::default(); w_blocks * rows_blocks],
+            cells: vec![Cell::default(); cols_blocks * rows_blocks],
         }
     }
 
@@ -165,6 +195,20 @@ impl IntraModeField {
     #[must_use]
     pub fn rows_blocks(&self) -> usize {
         self.rows_blocks
+    }
+
+    /// First stored min-block column.
+    #[inline]
+    #[must_use]
+    pub fn origin_blocks_x(&self) -> usize {
+        self.origin_blocks_x
+    }
+
+    /// Number of stored min-block columns.
+    #[inline]
+    #[must_use]
+    pub fn cols_blocks(&self) -> usize {
+        self.cols_blocks
     }
 
     /// The packed cells of min-block row `by` (absolute), columns `bx0
@@ -200,10 +244,14 @@ impl IntraModeField {
     fn cell_at(&self, x_luma: usize, y_luma: usize) -> Cell {
         let bx = x_luma >> MIN_BLOCK_LOG2;
         let by = y_luma >> MIN_BLOCK_LOG2;
-        if by < self.origin_blocks || by >= self.origin_blocks + self.rows_blocks {
+        if by < self.origin_blocks
+            || by >= self.origin_blocks + self.rows_blocks
+            || bx < self.origin_blocks_x
+            || bx >= self.origin_blocks_x + self.cols_blocks
+        {
             return Cell::default();
         }
-        self.cells[(by - self.origin_blocks) * self.w_blocks + bx]
+        self.cells[(by - self.origin_blocks) * self.cols_blocks + (bx - self.origin_blocks_x)]
     }
 
     /// Record an intra prediction block's `IntraPredModeY` across the
@@ -270,7 +318,7 @@ impl IntraModeField {
         let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0) * 3);
         for by in by0..by1 {
             for bx in bx0..bx1 {
-                let c = self.cells[by * self.w_blocks + bx];
+                let c = self.cells[by * self.cols_blocks + bx];
                 out.push(c.intra_pred_mode_y);
                 out.push(match c.pred_mode {
                     CuPredMode::Intra => 0,
@@ -290,7 +338,7 @@ impl IntraModeField {
         for by in by0..by1 {
             for bx in bx0..bx1 {
                 let c = it.next().expect("snapshot geometry");
-                self.cells[by * self.w_blocks + bx] = Cell {
+                self.cells[by * self.cols_blocks + bx] = Cell {
                     intra_pred_mode_y: c[0],
                     pred_mode: match c[1] {
                         0 => CuPredMode::Intra,
@@ -307,21 +355,27 @@ impl IntraModeField {
     /// The stored cell rectangle covering the luma rectangle, as
     /// `(bx0, by0, bx1, by1)` in **stored** rows (band-relative).
     fn rect_cells(&self, x: usize, y: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
-        let bx0 = x >> MIN_BLOCK_LOG2;
-        let bx1 = ((x + w).min(self.w_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
-        let by0 = (y >> MIN_BLOCK_LOG2).max(self.origin_blocks) - self.origin_blocks;
+        let (ox, cols) = (self.origin_blocks_x, self.cols_blocks);
+        let bx0 = (x >> MIN_BLOCK_LOG2).clamp(ox, ox + cols) - ox;
+        let bx1 = ((x + w).min(self.w_blocks << MIN_BLOCK_LOG2))
+            .div_ceil(MIN_BLOCK_SIZE)
+            .clamp(ox, ox + cols)
+            - ox;
+        let by0 = (y >> MIN_BLOCK_LOG2)
+            .clamp(self.origin_blocks, self.origin_blocks + self.rows_blocks)
+            - self.origin_blocks;
         let by1 = ((y + h).min(self.h_blocks << MIN_BLOCK_LOG2))
             .div_ceil(MIN_BLOCK_SIZE)
             .clamp(self.origin_blocks, self.origin_blocks + self.rows_blocks)
             - self.origin_blocks;
-        (bx0, by0, bx1, by1)
+        (bx0, by0, bx1.max(bx0), by1.max(by0))
     }
 
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, cell: Cell) {
         let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
         for by in by0..by1 {
             for bx in bx0..bx1 {
-                self.cells[by * self.w_blocks + bx] = cell;
+                self.cells[by * self.cols_blocks + bx] = cell;
             }
         }
     }

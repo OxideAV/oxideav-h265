@@ -370,11 +370,12 @@ which includes the ~3 MiB process baseline and the input stream):
 
 | 12 MP still (4032x3024) | wall, serial | wall, 2 / 4 / 8 workers | peak RSS serial → 8 workers |
 | --- | --- | --- | --- |
-| 8-bit 4:2:0, this encoder, WPP | 0.24 s | 0.14 / 0.086 / 0.063 s | 77 → 103 MiB |
-| 10-bit 4:2:0, this encoder, WPP | 0.26 s | 0.16 / 0.11 / 0.083 s | 83 → 108 MiB |
-| 8-bit 4:2:0, third-party encoder (x265 defaults, WPP) | 0.50 s | 0.28 / 0.16 / 0.105 s | 84 → 94 MiB |
-| 8-bit 4:2:0, this encoder, no WPP / tiles | 0.22 s | 0.21 / 0.21 / 0.21 s (filters only) | 63 → 74 MiB |
-| Apple grid: 48 × 512x512 WPP tiles, one after the other | 0.46 s | 0.17 s at 4 | 7 MiB |
+| 8-bit 4:2:0, this encoder, WPP | 0.23 s | 0.14 / 0.09 / 0.065 s | 74 → 106 MiB |
+| 10-bit 4:2:0, this encoder, WPP | 0.25 s | 0.17 / 0.11 / 0.087 s | 83 → 107 MiB |
+| 8-bit 4:2:0, third-party encoder (x265 defaults, WPP, 1.4 MB) | 0.50 s | 0.29 / 0.17 / 0.11 s | 83 → 102 MiB |
+| 8-bit 4:2:0, this encoder, 4x4 tile grid (no WPP) | 0.24 s | 0.15 / 0.09 / 0.068 s | 67 → 107 MiB |
+| 8-bit 4:2:0, this encoder, no WPP / tiles | 0.23 s | 0.21 / 0.21 / 0.20 s (filters only) | 63 → 69 MiB |
+| Apple grid: 48 × 512x512 WPP tiles, one after the other | 0.47 s | 0.19 s at 4 | 8 MiB |
 
 At the start of the round the 8-bit still took 0.51 s at **326 MiB**
 (the 10-bit one 0.58 s / 321 MiB). Where the memory went, and goes:
@@ -401,9 +402,12 @@ per-sample §6.4.1 availability test ~10 %, prediction + residual add
 Under a thread budget (`set_execution_context` / `SequenceDecoder::
 set_threads`), a WPP picture decodes its CTB rows in a wavefront (each
 row parsed and reconstructed by one worker into a row band with a
-four-line halo; the row below imports what each CTB publishes), every
-picture's deblocking and SAO run row-parallel, and the bytes equal the
-serial decode for any budget (`tests/threaded_decode.rs`).
+four-line halo; the row below imports what each CTB publishes), a tiled
+picture decodes its tiles independently into rectangular bands (the
+tile-boundary CUs' deblocking strengths derived again over the merged
+motion field), every picture's deblocking and SAO run row-parallel, and
+the bytes equal the serial decode for any budget
+(`tests/threaded_decode.rs`).
 
 ## What's implemented
 
@@ -509,10 +513,10 @@ and ~985 unit tests.
   777 / 579 at the start of round 464) — every worker still holds a
   whole-picture `EncState` whose untouched rows stay unmapped; a
   row-window state per worker is the next step.
-* Decoder parallelism covers WPP pictures (wavefront) and the in-loop
-  filters of every picture; tiled pictures without WPP parse serially
-  (tile-parallel parsing is a follow-up), as do pictures using SCC
-  palette / current-picture referencing or chroma QP offset lists.
+* Decoder parallelism covers WPP pictures (wavefront), tiled pictures
+  (per tile) and the in-loop filters of every picture; pictures with
+  WPP inside tiles, SCC palette / current-picture referencing or
+  chroma QP offset lists parse serially (parallel filters only).
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

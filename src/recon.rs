@@ -603,9 +603,9 @@ fn predict_add_store(
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
     // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
-    let (buf, stride, origin) = pic.plane_mut_origin(plane);
+    let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
     for y in 0..n_tbs {
-        let o = (yb + y - origin) * stride + xb;
+        let o = (yb + y - oy) * stride + (xb - ox);
         let row = &mut buf[o..o + n_tbs];
         let prow = &pred[y * n_tbs..(y + 1) * n_tbs];
         match res {
@@ -802,9 +802,9 @@ fn write_inter_plane(
     residual: Option<&[i32]>,
 ) {
     let bit_depth = pic.bit_depth(plane);
-    let (buf, stride, origin) = pic.plane_mut_origin(plane);
+    let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
     for y in 0..h {
-        let o = (y0 + y - origin) * stride + x0;
+        let o = (y0 + y - oy) * stride + (x0 - ox);
         let row = &mut buf[o..o + w];
         let prow = &pred[y * w..(y + 1) * w];
         match residual {
@@ -1328,6 +1328,9 @@ struct QpState {
     /// reads are same-CTB gated, so a band needs no halo.
     origin_cells: usize,
     rows_cells: usize,
+    /// First stored cell column and stored width (a tile band).
+    origin_cells_x: usize,
+    cols_cells: usize,
     /// `Log2MinCuQpDeltaSize`.
     qg_log2: u32,
     /// `CtbLog2SizeY` (the §8.6.1 same-CTB gate on `qPY_A` / `qPY_B`).
@@ -1353,13 +1356,28 @@ struct QpState {
 }
 
 impl QpState {
-    fn cell(&self, x: usize, y: usize) -> usize {
-        ((y >> 2).min(self.h_cells - 1) - self.origin_cells) * self.w_cells
-            + (x >> 2).min(self.w_cells - 1)
+    /// Stored index of the cell covering a luma location, `None`
+    /// outside a band's stored rectangle.
+    fn cell(&self, x: usize, y: usize) -> Option<usize> {
+        let by = (y >> 2).min(self.h_cells - 1);
+        let bx = (x >> 2).min(self.w_cells - 1);
+        if by < self.origin_cells
+            || by >= self.origin_cells + self.rows_cells
+            || bx < self.origin_cells_x
+            || bx >= self.origin_cells_x + self.cols_cells
+        {
+            return None;
+        }
+        Some((by - self.origin_cells) * self.cols_cells + (bx - self.origin_cells_x))
     }
 
+    /// `QpY` of the cell covering a luma location (`SliceQpY` outside a
+    /// band's stored rectangle — such a neighbour is in another tile /
+    /// row and never a §8.6.1 predictor; the deblocking p-side QP comes
+    /// from the merged map).
     fn qp_at(&self, x: usize, y: usize) -> i32 {
-        i32::from(self.map[self.cell(x, y)])
+        self.cell(x, y)
+            .map_or(self.slice_qp_y, |c| i32::from(self.map[c]))
     }
 }
 
@@ -1418,6 +1436,29 @@ impl ReconCtx {
         y_origin_luma: usize,
         band_rows_luma: usize,
     ) -> Result<Self, ReconError> {
+        Self::new_rect_band(
+            pic_width_luma,
+            pic_height_luma,
+            ctb_log2_size_y,
+            min_tb_log2_size_y,
+            tiles,
+            (0, y_origin_luma, pic_width_luma, band_rows_luma),
+        )
+    }
+
+    /// [`Self::new_band`] for a rectangle (a tile of the tile-parallel
+    /// decoder): the cell maps store the luma rectangle `rect`.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_rect_band(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        ctb_log2_size_y: u32,
+        min_tb_log2_size_y: u32,
+        tiles: &crate::availability::TilingParams,
+        rect: (usize, usize, usize, usize),
+    ) -> Result<Self, ReconError> {
         let ctb_size = 1usize << ctb_log2_size_y;
         let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size) as u32;
         let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size) as u32;
@@ -1432,12 +1473,11 @@ impl ReconCtx {
         )
         .map_err(ReconError::Tiling)?;
         Ok(Self {
-            field: IntraModeField::new_band(
+            field: IntraModeField::new_rect_band(
                 pic_width_luma,
                 pic_height_luma,
                 ctb_log2_size_y,
-                y_origin_luma,
-                band_rows_luma,
+                rect,
             ),
             tiling,
             slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
@@ -1461,7 +1501,7 @@ impl ReconCtx {
     pub(crate) fn qp_row(&self, by: usize) -> Option<&[i8]> {
         self.qp.as_ref().map(|q| {
             let r = by - q.origin_cells;
-            &q.map[r * q.w_cells..(r + 1) * q.w_cells]
+            &q.map[r * q.cols_cells..(r + 1) * q.cols_cells]
         })
     }
 
@@ -1488,12 +1528,16 @@ impl ReconCtx {
         let h_cells = self.field.h_blocks();
         let origin_cells = self.field.origin_blocks();
         let rows_cells = self.field.rows_blocks();
+        let origin_cells_x = self.field.origin_blocks_x();
+        let cols_cells = self.field.cols_blocks();
         self.qp = Some(QpState {
-            map: vec![slice_qp_y as i8; w_cells * rows_cells],
+            map: vec![slice_qp_y as i8; cols_cells * rows_cells],
             w_cells,
             h_cells,
             origin_cells,
             rows_cells,
+            origin_cells_x,
+            cols_cells,
             qg_log2,
             ctb_log2: self.field.ctb_log2(),
             slice_qp_y,
@@ -1595,10 +1639,14 @@ impl ReconCtx {
         let y_end = (y_cb + n)
             .min(q.h_cells * 4)
             .min((q.origin_cells + q.rows_cells) * 4);
+        let x_end = (x_cb + n)
+            .min(q.w_cells * 4)
+            .min((q.origin_cells_x + q.cols_cells) * 4);
         for y in (y_cb.max(q.origin_cells * 4)..y_end).step_by(4) {
-            for x in (x_cb..(x_cb + n).min(q.w_cells * 4)).step_by(4) {
-                let idx = q.cell(x, y);
-                q.map[idx] = qp_y as i8;
+            for x in (x_cb.max(q.origin_cells_x * 4)..x_end).step_by(4) {
+                if let Some(idx) = q.cell(x, y) {
+                    q.map[idx] = qp_y as i8;
+                }
             }
         }
         q.last_cu_qp = Some(qp_y);
@@ -2124,9 +2172,8 @@ fn write_palette_cu(
         u32::from(params.bit_depth_luma),
         transquant_bypass,
         {
-            let origin = pic.y_origin(Plane::Luma);
-            let (buf, stride) = pic.plane_mut(Plane::Luma);
-            move |x, y, v| buf[(y_cb + y - origin) * stride + x_cb + x] = v as u16
+            let (buf, stride, (ox, oy)) = pic.plane_mut_origin(Plane::Luma);
+            move |x, y, v| buf[(y_cb + y - oy) * stride + x_cb + x - ox] = v as u16
         },
     );
     if params.chroma_array_type != 0 {
@@ -2146,9 +2193,8 @@ fn write_palette_cu(
                 u32::from(params.bit_depth_chroma),
                 transquant_bypass,
                 {
-                    let origin = pic.y_origin(plane);
-                    let (buf, stride) = pic.plane_mut(plane);
-                    move |x, y, v| buf[(cy + y - origin) * stride + cx + x] = v as u16
+                    let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
+                    move |x, y, v| buf[(cy + y - oy) * stride + cx + x - ox] = v as u16
                 },
             );
         }
@@ -2163,8 +2209,9 @@ fn write_pcm_cu(
     n_cb: usize,
     pcm: &crate::slice_data::PcmSamples,
 ) {
+    let ox = pic.x_origin(Plane::Luma);
     for j in 0..n_cb {
-        pic.row_mut(Plane::Luma, y_cb + j)[x_cb..x_cb + n_cb]
+        pic.row_mut(Plane::Luma, y_cb + j)[x_cb - ox..x_cb - ox + n_cb]
             .copy_from_slice(&pcm.luma[n_cb * j..n_cb * (j + 1)]);
     }
     if chroma_array_type != 0 {
@@ -2172,8 +2219,9 @@ fn write_pcm_cu(
         let (cw, ch) = (n_cb / sub_w, n_cb / sub_h);
         let (cx, cy) = (x_cb / sub_w, y_cb / sub_h);
         for (plane, samples) in [(Plane::Cb, &pcm.cb), (Plane::Cr, &pcm.cr)] {
+            let ox = pic.x_origin(plane);
             for j in 0..ch {
-                pic.row_mut(plane, cy + j)[cx..cx + cw]
+                pic.row_mut(plane, cy + j)[cx - ox..cx - ox + cw]
                     .copy_from_slice(&samples[cw * j..cw * (j + 1)]);
             }
         }

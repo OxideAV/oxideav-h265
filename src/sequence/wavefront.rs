@@ -227,6 +227,8 @@ struct RowSink<'a> {
 
 /// The merged whole-picture structures the §8.7 filters consume.
 pub(super) struct MergedPicture {
+    /// Tile-boundary CUs whose edges wait for the merged motion field.
+    pub deferred_cus: Vec<crate::deblock::DeblockCuDesc>,
     pub pic: Picture,
     pub field: MotionField,
     pub qp_cells: Vec<i8>,
@@ -395,6 +397,7 @@ pub(super) fn decode_rows(
         return Err(e);
     }
     Ok(MergedPicture {
+        deferred_cus: Vec::new(),
         pic,
         field,
         qp_cells,
@@ -417,6 +420,9 @@ fn merge_band(
         y0,
         rows,
         pic,
+        x0: _,
+        width: _,
+        boundary_cus: _,
         field,
         qp_cells,
         no_filter,
@@ -967,4 +973,483 @@ type HaloLines = (Option<Vec<u16>>, Option<Vec<u16>>);
 /// Luma row `r * ctb` clamped to the picture.
 fn bounds_at(r: usize, ctb: usize, ph: usize) -> usize {
     (r * ctb).min(ph)
+}
+
+/// The per-picture plan of a tiled picture (no `entropy_coding_sync`):
+/// each tile is a self-contained CTB run in tile scan — fresh contexts
+/// at its first CTB, no neighbour outside it available — so the tiles
+/// decode on the workers independently.
+pub(super) struct TilePlan {
+    /// Per tile: its luma rectangle `(x0, y0, w, h)`.
+    rects: Vec<(usize, usize, usize, usize)>,
+    /// Per tile: the parts (segment / substream / CTB run) in tile scan.
+    parts: Vec<Vec<RowPart>>,
+    /// Per segment: `(first CTB, one past the last)` in tile-scan
+    /// addresses.
+    seg_range: Vec<(u32, u32)>,
+    substreams: Vec<Vec<(usize, usize)>>,
+    indep_of: Vec<usize>,
+}
+
+impl TilePlan {
+    /// Lay the segments out over the tiles; `None` when the picture is
+    /// not a tile-parallel candidate (single tile, WPP, the decode-order
+    /// tools of [`WavefrontPlan::build`], a non-monotone layout).
+    pub(super) fn build(
+        segs: &[SegmentData],
+        sps: &SeqParameterSet,
+        pps: &PicParameterSet,
+        geom: &Geometry,
+    ) -> Option<Self> {
+        if !pps.tiles_enabled_flag
+            || pps.entropy_coding_sync_enabled_flag
+            || pps
+                .pps_range_extension
+                .as_ref()
+                .is_some_and(|e| e.chroma_qp_offset_list_enabled_flag)
+            || pps
+                .pps_scc_extension
+                .as_ref()
+                .is_some_and(|e| e.pps_curr_pic_ref_enabled_flag)
+            || sps
+                .sps_scc_extension
+                .as_ref()
+                .is_some_and(|e| e.palette_mode_enabled_flag)
+        {
+            return None;
+        }
+        let tiling = geom.tiling().ok()?;
+        let ctb = 1usize << geom.ctb_log2;
+        let (col_bd, row_bd) = (tiling.col_bd(), tiling.row_bd());
+        let n_tiles = (col_bd.len() - 1) * (row_bd.len() - 1);
+        if n_tiles < 2 {
+            return None;
+        }
+        let (width, height) = (geom.width as usize, geom.height as usize);
+        let w = geom.pic_w_ctbs;
+        let pic_size = w * geom.pic_h_ctbs;
+        // Tile rectangles and their tile-scan CTB ranges (tiles are
+        // numbered in raster order of the grid, which is tile scan).
+        let mut rects = Vec::with_capacity(n_tiles);
+        let mut ranges = Vec::with_capacity(n_tiles);
+        let mut ts = 0u32;
+        for r in 0..row_bd.len() - 1 {
+            for c in 0..col_bd.len() - 1 {
+                let x0 = col_bd[c] as usize * ctb;
+                let y0 = row_bd[r] as usize * ctb;
+                let x1 = (col_bd[c + 1] as usize * ctb).min(width);
+                let y1 = (row_bd[r + 1] as usize * ctb).min(height);
+                rects.push((x0, y0, x1 - x0, y1 - y0));
+                let n = (col_bd[c + 1] - col_bd[c]) * (row_bd[r + 1] - row_bd[r]);
+                ranges.push((ts, ts + n));
+                ts += n;
+            }
+        }
+        let mut seg_range = Vec::with_capacity(segs.len());
+        let mut indep_of = Vec::with_capacity(segs.len());
+        let mut substreams = Vec::with_capacity(segs.len());
+        let mut last_indep = None;
+        let tile_of_ts = |ts: u32| ranges.iter().position(|&(a, b)| ts >= a && ts < b);
+        for (k, seg) in segs.iter().enumerate() {
+            let start = tiling.ctb_addr_rs_to_ts(seg.header.slice_segment_address);
+            let end = segs.get(k + 1).map_or(pic_size, |n| {
+                tiling.ctb_addr_rs_to_ts(n.header.slice_segment_address)
+            });
+            if (k == 0 && start != 0) || end <= start || end > pic_size {
+                return None;
+            }
+            if seg.header.dependent_slice_segment_flag {
+                indep_of.push(last_indep?);
+            } else {
+                last_indep = Some(k);
+                indep_of.push(k);
+            }
+            seg_range.push((start, end));
+            let data_offset = seg.header.byte_offset_to_slice_data?;
+            if data_offset >= seg.rbsp.len() {
+                return None;
+            }
+            let subs = split_substreams(
+                &seg.escaped,
+                seg.rbsp.len(),
+                data_offset,
+                seg.header.entry_point_offsets.as_ref(),
+            )
+            .ok()?;
+            // One substream per tile the segment touches.
+            let tiles_touched = tile_of_ts(end - 1)? - tile_of_ts(start)? + 1;
+            if subs.len() != tiles_touched {
+                return None;
+            }
+            substreams.push(subs);
+        }
+        let mut parts = vec![Vec::new(); n_tiles];
+        for (k, &(start, end)) in seg_range.iter().enumerate() {
+            let t0 = tile_of_ts(start)?;
+            let t1 = tile_of_ts(end - 1)?;
+            for t in t0..=t1 {
+                let (a, b) = ranges[t];
+                parts[t].push(RowPart {
+                    seg: k,
+                    sub: t - t0,
+                    start: start.max(a),
+                    end: end.min(b),
+                });
+            }
+        }
+        Some(Self {
+            rects,
+            parts,
+            seg_range,
+            substreams,
+            indep_of,
+        })
+    }
+}
+
+/// Decode the picture's tiles on up to `workers` threads and merge them
+/// (pre-filter). Bytes equal the serial decode.
+pub(super) fn decode_tiles(
+    plan: &TilePlan,
+    inputs: &WavefrontInputs<'_>,
+    params: &ReconParams,
+    workers: usize,
+) -> Result<MergedPicture, SequenceError> {
+    let geom = inputs.geom;
+    let (width, height) = (geom.width as usize, geom.height as usize);
+    let w_ctbs = geom.pic_w_ctbs as usize;
+    let h_ctbs = geom.pic_h_ctbs as usize;
+    let w4 = width.div_ceil(4);
+    let with_motion = inputs
+        .segs
+        .iter()
+        .any(|s| !matches!(s.header.slice_type, Some(SliceType::I)));
+    let merged = Mutex::new(MergedPicture {
+        deferred_cus: Vec::new(),
+        pic: Picture::new(
+            width,
+            height,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        ),
+        field: MotionField::new(width, height),
+        qp_cells: vec![0i8; w4 * height.div_ceil(4)],
+        no_filter: vec![false; w4 * height.div_ceil(4)],
+        edges: crate::deblock::DeblockEdgeMap::new(width, height),
+        sao: vec![crate::sao::ResolvedSao::off(); w_ctbs * h_ctbs],
+        slice_addr: vec![0u32; w_ctbs * h_ctbs],
+        filter_across: vec![true; w_ctbs * h_ctbs],
+    });
+    let error: Mutex<Option<SequenceError>> = Mutex::new(None);
+    let abort = AtomicBool::new(false);
+    let next = AtomicUsize::new(0);
+    let n_tiles = plan.rects.len();
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(n_tiles) {
+            let my_params = params.clone();
+            let (merged, error, abort, next) = (&merged, &error, &abort, &next);
+            scope.spawn(move || loop {
+                let t = next.fetch_add(1, Ordering::AcqRel);
+                if t >= n_tiles || abort.load(Ordering::Acquire) {
+                    break;
+                }
+                match decode_tile(plan, inputs, &my_params, t) {
+                    Ok(band) => {
+                        merged.lock().unwrap_or_else(|e| e.into_inner()).merge_rect(
+                            band,
+                            with_motion,
+                            w_ctbs,
+                            1usize << geom.ctb_log2,
+                        );
+                    }
+                    Err(e) => {
+                        let mut slot = error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        abort.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = error.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(e);
+    }
+    let mut merged = merged.into_inner().unwrap_or_else(|e| e.into_inner());
+    // §8.7.2.4 across tile boundaries: the p side of a tile's left /
+    // top edge belongs to another tile — derive those CUs' strengths
+    // over the whole picture's motion field.
+    let deferred = std::mem::take(&mut merged.deferred_cus);
+    for desc in &deferred {
+        merged.edges.add_cu(&merged.field, desc);
+    }
+    Ok(merged)
+}
+
+impl MergedPicture {
+    /// Copy a finished tile band into the whole-picture structures.
+    fn merge_rect(&mut self, band: BandOutput, with_motion: bool, w_ctbs: usize, ctb: usize) {
+        let BandOutput {
+            x0,
+            y0,
+            width: bw,
+            rows,
+            pic,
+            field,
+            qp_cells,
+            no_filter,
+            edges,
+            boundary_cus,
+            sao,
+            slice_addr,
+            filter_across,
+        } = band;
+        self.deferred_cus.extend(boundary_cus);
+        let (pw, ph) = self.pic.plane_dims(Plane::Luma);
+        let rows = rows.min(ph - y0);
+        let (ly, cbp, crp) = self.pic.planes_mut();
+        for y in 0..rows {
+            ly[(y0 + y) * pw + x0..(y0 + y) * pw + x0 + bw]
+                .copy_from_slice(&pic.row(Plane::Luma, y0 + y)[..bw]);
+        }
+        if pic.chroma_array_type() != 0 {
+            let (cw, ch) = pic.plane_dims(Plane::Cb);
+            let (sw, sh) = crate::picture::sub_wh_c(pic.chroma_array_type());
+            let (cx0, cy0) = (x0 / sw, y0 / sh);
+            let cbw = bw.div_ceil(sw);
+            let crows = rows.div_ceil(sh).min(ch - cy0);
+            for y in 0..crows {
+                cbp[(cy0 + y) * cw + cx0..(cy0 + y) * cw + cx0 + cbw]
+                    .copy_from_slice(&pic.row(Plane::Cb, cy0 + y)[..cbw]);
+                crp[(cy0 + y) * cw + cx0..(cy0 + y) * cw + cx0 + cbw]
+                    .copy_from_slice(&pic.row(Plane::Cr, cy0 + y)[..cbw]);
+            }
+        }
+        let w4 = pw.div_ceil(4);
+        let cols4 = bw.div_ceil(4);
+        let (bx0, by0) = (x0 / 4, y0 / 4);
+        let cell_rows = rows.div_ceil(4);
+        for r in 0..cell_rows {
+            let dst = (by0 + r) * w4 + bx0;
+            self.qp_cells[dst..dst + cols4].copy_from_slice(&qp_cells[r * cols4..(r + 1) * cols4]);
+            self.no_filter[dst..dst + cols4]
+                .copy_from_slice(&no_filter[r * cols4..(r + 1) * cols4]);
+        }
+        {
+            let (flags, mut motion) = self.field.storage_mut(with_motion);
+            for r in 0..cell_rows {
+                let dst = (by0 + r) * w4 + bx0;
+                let (f, m) = field.row_cells(by0 + r);
+                flags[dst..dst + cols4].copy_from_slice(&f[..cols4]);
+                if let Some(mo) = motion.as_deref_mut() {
+                    match m {
+                        Some(m) => mo[dst..dst + cols4].copy_from_slice(&m[..cols4]),
+                        None => mo[dst..dst + cols4].fill(crate::motion::NO_MOTION),
+                    }
+                }
+            }
+        }
+        self.edges.merge_band(&edges);
+        // Per-CTB maps: the band's CTB grid.
+        let (rx0, ry0) = (x0 / ctb, y0 / ctb);
+        let cols_ctb = bw.div_ceil(ctb);
+        let rows_ctb = rows.div_ceil(ctb);
+        for r in 0..rows_ctb {
+            let dst = (ry0 + r) * w_ctbs + rx0;
+            self.sao[dst..dst + cols_ctb].copy_from_slice(&sao[r * cols_ctb..(r + 1) * cols_ctb]);
+            self.slice_addr[dst..dst + cols_ctb]
+                .copy_from_slice(&slice_addr[r * cols_ctb..(r + 1) * cols_ctb]);
+            self.filter_across[dst..dst + cols_ctb]
+                .copy_from_slice(&filter_across[r * cols_ctb..(r + 1) * cols_ctb]);
+        }
+    }
+}
+
+/// Parse and reconstruct tile `t` into a band.
+fn decode_tile(
+    plan: &TilePlan,
+    inputs: &WavefrontInputs<'_>,
+    params: &ReconParams,
+    t: usize,
+) -> Result<BandOutput, SequenceError> {
+    let geom = inputs.geom;
+    let (width, height) = (geom.width as usize, geom.height as usize);
+    let w = geom.pic_w_ctbs as usize;
+    let ctb = 1usize << geom.ctb_log2;
+    let tiling = geom.tiling()?;
+    let rect = plan.rects[t];
+    let pps = inputs.pps;
+    let sps = inputs.sps;
+    let segs = inputs.segs;
+
+    let mut recon = PictureReconstructor::new_rect_band(
+        width,
+        height,
+        params,
+        inputs.slice_ctx,
+        &geom.tiles,
+        inputs.refs,
+        inputs.col_field,
+        rect,
+        false,
+    )?;
+    let first_part = plan.parts[t]
+        .first()
+        .ok_or(SequenceError::Malformed("tile without slice data"))?;
+    let first_header = &segs[plan.indep_of[first_part.seg]].header;
+    let first_type = first_header
+        .slice_type
+        .ok_or(SequenceError::Malformed("independent slice without type"))?;
+    let mut parse_state = PictureParseState::new_rect_band(
+        &build_slice_data_params(first_header, sps, pps, geom, first_type),
+        rect,
+    );
+    let mut slice_addr_of: Vec<Option<u32>> = vec![None; w * geom.pic_h_ctbs as usize];
+    let (tx0, ty0) = (rect.0 / ctb, rect.1 / ctb);
+    let tile_id = tiling.tile_id(tiling.ctb_addr_rs_to_ts((ty0 * w + tx0) as u32));
+
+    let num_comps = if geom.chroma_array_type == 0 { 1 } else { 3 };
+    let base_palette_predictor = pps
+        .pps_scc_extension
+        .as_ref()
+        .filter(|e| e.pps_palette_predictor_initializers_present_flag)
+        .map(|e| {
+            crate::palette::PalettePredictor::from_initializers(
+                &e.pps_palette_predictor_initializer,
+                num_comps,
+            )
+        })
+        .or_else(|| {
+            sps.sps_scc_extension
+                .as_ref()
+                .filter(|e| e.sps_palette_predictor_initializers_present_flag)
+                .map(|e| {
+                    crate::palette::PalettePredictor::from_initializers(
+                        &e.sps_palette_predictor_initializer,
+                        num_comps,
+                    )
+                })
+        })
+        .unwrap_or_default();
+
+    let mut ds_stored: Option<SliceContexts> = None;
+    let parts = plan.parts[t].clone();
+    let tile_start_ts = parts[0].start;
+    for part in parts {
+        let seg = &segs[part.seg];
+        let header = &segs[plan.indep_of[part.seg]].header;
+        let slice_type = header
+            .slice_type
+            .ok_or(SequenceError::Malformed("independent slice without type"))?;
+        let sd_params = build_slice_data_params(header, sps, pps, geom, slice_type);
+        let slice_qp_y = header
+            .slice_qp_y(pps)
+            .ok_or(SequenceError::Malformed("slice header without slice_qp"))?;
+        let raw_slice_type = match slice_type {
+            SliceType::B => 0,
+            SliceType::P => 1,
+            SliceType::I => 2,
+        };
+        let it = init_type(raw_slice_type, header.cabac_init_flag.unwrap_or(false));
+        let fresh_contexts = || {
+            let mut c = SliceContexts::init(it, slice_qp_y);
+            c.palette_predictor = base_palette_predictor.clone();
+            c
+        };
+        let slice_addr_rs = header.slice_segment_address;
+        let filter_across_slices = inputs
+            .across_of_slice
+            .get(&slice_addr_rs)
+            .copied()
+            .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag);
+        let &(a, b) = plan.substreams[part.seg]
+            .get(part.sub)
+            .ok_or(SequenceError::Malformed("more tiles than substreams"))?;
+        let bytes = seg
+            .rbsp
+            .get(a..b)
+            .ok_or(SequenceError::Malformed("substream range out of RBSP"))?;
+        let mut engine = CabacEngine::new(BitReader::new(bytes))
+            .map_err(|_| SequenceError::Malformed("substream too short for CABAC init"))?;
+        // §9.3.2.1: fresh contexts at the first CTB of a tile (whatever
+        // segment it starts), at an independent segment start; a
+        // dependent segment starting inside the tile continues from
+        // TableStateIdxDs.
+        let seg_start = part.start == plan.seg_range[part.seg].0;
+        let mut ctx = if part.start == tile_start_ts
+            || (seg_start && !seg.header.dependent_slice_segment_flag)
+        {
+            fresh_contexts()
+        } else {
+            ds_stored.take().ok_or(SequenceError::Malformed(
+                "dependent segment without Ds state",
+            ))?
+        };
+
+        for ts in part.start..part.end {
+            let rs = tiling.ctb_addr_ts_to_rs(ts) as usize;
+            let (rx, ry) = (rs % w, rs / w);
+            let x_ctb = (rx * ctb) as u32;
+            let y_ctb = (ry * ctb) as u32;
+            slice_addr_of[rs] = Some(slice_addr_rs);
+            // §7.3.8.3 SAO merge candidates: same slice and same tile.
+            let merge_left = rx > tx0 && slice_addr_of[rs - 1] == Some(slice_addr_rs);
+            let merge_up = ry > ty0 && slice_addr_of[rs - w] == Some(slice_addr_rs);
+            let ctu = decode_coding_tree_unit_in_picture(
+                &mut engine,
+                &mut ctx,
+                &sd_params,
+                &mut parse_state,
+                x_ctb,
+                y_ctb,
+                slice_addr_rs,
+                tile_id,
+                merge_left,
+                merge_up,
+            )?;
+            let placed = PlacedInterCtu {
+                x_ctb,
+                y_ctb,
+                slice_addr_rs,
+                filter_across_slices,
+                ctu: &ctu,
+            };
+            recon.push_ctu(&placed)?;
+            drop(ctu);
+
+            let eos = end_of_slice_segment_flag(&mut engine)
+                .map_err(|_| SequenceError::Malformed("CABAC underrun at end_of_slice_segment"))?;
+            let last_of_part = ts + 1 == part.end;
+            let last_of_seg = ts + 1 == plan.seg_range[part.seg].1;
+            if eos {
+                if !last_of_seg {
+                    return Err(SequenceError::Malformed(
+                        "slice segment ended before its successor's address",
+                    ));
+                }
+                if pps.dependent_slice_segments_enabled_flag {
+                    ds_stored = Some(ctx.clone());
+                }
+            } else if last_of_seg {
+                if !inputs.tolerant {
+                    return Err(SequenceError::Malformed(
+                        "end_of_slice_segment_flag not set on the last CTB",
+                    ));
+                }
+            } else if last_of_part {
+                // §7.3.8.1 — the segment continues in the next tile:
+                // end_of_subset_one_bit + byte_alignment( ).
+                let one = end_of_slice_segment_flag(&mut engine).map_err(|_| {
+                    SequenceError::Malformed("CABAC underrun at end_of_subset_one_bit")
+                })?;
+                if !one && !inputs.tolerant {
+                    return Err(SequenceError::Malformed("end_of_subset_one_bit not set"));
+                }
+            }
+        }
+    }
+    Ok(recon.finish_band())
 }

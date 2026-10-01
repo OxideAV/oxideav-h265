@@ -862,6 +862,9 @@ pub struct MotionField {
     origin_4: usize,
     /// Number of stored cell rows.
     rows_4: usize,
+    /// First stored cell column and stored width (a tile band).
+    origin_4x: usize,
+    cols_4: usize,
     /// Per-cell mode bits ([`FLAG_INTRA`] / [`FLAG_NONZERO`] /
     /// [`FLAG_PRED_L0`] / [`FLAG_PRED_L1`]).
     flags: Vec<u8>,
@@ -888,7 +891,7 @@ pub struct CellMotion {
     mv_l1: [i16; 2],
 }
 
-const NO_MOTION: CellMotion = CellMotion {
+pub(crate) const NO_MOTION: CellMotion = CellMotion {
     ref_poc_l0: i32::MIN,
     ref_poc_l1: i32::MIN,
     mv_l0: [0; 2],
@@ -978,6 +981,8 @@ impl MotionField {
             height_4,
             origin_4: 0,
             rows_4: height_4,
+            origin_4x: 0,
+            cols_4: width_4,
             flags: vec![FLAG_INTRA; width_4 * height_4],
             motion: Vec::new(),
         }
@@ -997,12 +1002,34 @@ impl MotionField {
         y_origin_luma: usize,
         band_rows_luma: usize,
     ) -> Self {
+        Self::new_rect_band(
+            width_luma,
+            height_luma,
+            (0, y_origin_luma, width_luma, band_rows_luma),
+        )
+    }
+
+    /// A rectangular band storing the cells covering the luma rectangle
+    /// `(x0, y0, w, h)` (multiples of 4) of a `width_luma × height_luma`
+    /// field.
+    ///
+    /// # Panics
+    /// Panics if the rectangle lies outside the picture.
+    #[must_use]
+    pub fn new_rect_band(
+        width_luma: usize,
+        height_luma: usize,
+        rect: (usize, usize, usize, usize),
+    ) -> Self {
+        let (x0, y0, w, h) = rect;
         let width_4 = width_luma.div_ceil(4);
         let height_4 = height_luma.div_ceil(4);
-        let origin_4 = y_origin_luma / 4;
-        let rows_4 = band_rows_luma.div_ceil(4);
+        let origin_4 = y0 / 4;
+        let rows_4 = h.div_ceil(4);
+        let origin_4x = x0 / 4;
+        let cols_4 = w.div_ceil(4);
         assert!(
-            origin_4 + rows_4 <= height_4,
+            origin_4 + rows_4 <= height_4 && origin_4x + cols_4 <= width_4,
             "motion band past the picture"
         );
         Self {
@@ -1010,7 +1037,9 @@ impl MotionField {
             height_4,
             origin_4,
             rows_4,
-            flags: vec![FLAG_INTRA; width_4 * rows_4],
+            origin_4x,
+            cols_4,
+            flags: vec![FLAG_INTRA; cols_4 * rows_4],
             motion: Vec::new(),
         }
     }
@@ -1034,11 +1063,18 @@ impl MotionField {
     #[must_use]
     pub(crate) fn row_cells(&self, by: usize) -> (&[u8], Option<&[CellMotion]>) {
         let r = by - self.origin_4;
-        let w = self.width_4;
+        let w = self.cols_4;
         (
             &self.flags[r * w..(r + 1) * w],
             (!self.motion.is_empty()).then(|| &self.motion[r * w..(r + 1) * w]),
         )
+    }
+
+    /// First stored cell column.
+    #[inline]
+    #[must_use]
+    pub fn origin_4x(&self) -> usize {
+        self.origin_4x
     }
 
     /// Overwrite cells `bx0 ..` of cell row `by` (absolute) from another
@@ -1051,7 +1087,8 @@ impl MotionField {
         motion: Option<&[CellMotion]>,
     ) {
         let r = by - self.origin_4;
-        let w = self.width_4;
+        let w = self.cols_4;
+        let bx0 = bx0 - self.origin_4x;
         let n = flags.len();
         self.flags[r * w + bx0..r * w + bx0 + n].copy_from_slice(flags);
         match motion {
@@ -1077,7 +1114,7 @@ impl MotionField {
         flags_out: &mut [u8],
         motion_out: Option<&mut [CellMotion]>,
     ) {
-        let w = self.width_4;
+        let w = self.cols_4;
         let (r0, r1) = (by0 - self.origin_4, by1 - self.origin_4);
         flags_out[..(r1 - r0) * w].copy_from_slice(&self.flags[r0 * w..r1 * w]);
         if let Some(out) = motion_out {
@@ -1097,7 +1134,7 @@ impl MotionField {
         with_motion: bool,
     ) -> (&mut [u8], Option<&mut [CellMotion]>) {
         if with_motion && self.motion.is_empty() {
-            self.motion = vec![NO_MOTION; self.width_4 * self.rows_4];
+            self.motion = vec![NO_MOTION; self.cols_4 * self.rows_4];
         }
         (
             &mut self.flags,
@@ -1123,7 +1160,7 @@ impl MotionField {
     #[inline]
     fn motion_mut(&mut self) -> &mut [CellMotion] {
         if self.motion.is_empty() {
-            self.motion = vec![NO_MOTION; self.width_4 * self.rows_4];
+            self.motion = vec![NO_MOTION; self.cols_4 * self.rows_4];
         }
         &mut self.motion
     }
@@ -1145,10 +1182,14 @@ impl MotionField {
         // A band reports the unwritten background (an intra cell with
         // no motion) outside its stored rows — the §6.4.2 availability
         // denies every such neighbour (a later CTB row) anyway.
-        if by < self.origin_4 || by >= self.origin_4 + self.rows_4 {
+        if by < self.origin_4
+            || by >= self.origin_4 + self.rows_4
+            || bx < self.origin_4x
+            || bx >= self.origin_4x + self.cols_4
+        {
             return MotionCell::compose(FLAG_INTRA, NO_MOTION);
         }
-        self.cell_index((by - self.origin_4) * self.width_4 + bx)
+        self.cell_index((by - self.origin_4) * self.cols_4 + (bx - self.origin_4x))
     }
 
     /// Whether any cell is inter-coded (the field carries motion).
@@ -1160,16 +1201,28 @@ impl MotionField {
     /// Set every 4×4 cell covering the luma rectangle `[(x0, y0),
     /// (x0 + w, y0 + h))` to `cell`. Coordinates and dimensions are in
     /// luma samples; the rectangle is clipped to the field.
-    pub fn fill_rect(&mut self, x0: usize, y0: usize, w: usize, h: usize, cell: MotionCell) {
-        let bx0 = x0 / 4;
-        let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
-        let by0 = (y0 / 4).max(self.origin_4) - self.origin_4;
+    /// The stored cell rectangle covering a luma rectangle, as
+    /// `(bx0, by0, bx1, by1)` in band-relative cells (empty when the
+    /// rectangle misses the band).
+    #[inline]
+    fn band_rect(&self, x0: usize, y0: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let bx0 = (x0 / 4).clamp(self.origin_4x, self.origin_4x + self.cols_4) - self.origin_4x;
+        let bx1 = ((x0 + w).min(self.width_4 * 4))
+            .div_ceil(4)
+            .clamp(self.origin_4x, self.origin_4x + self.cols_4)
+            - self.origin_4x;
+        let by0 = (y0 / 4).clamp(self.origin_4, self.origin_4 + self.rows_4) - self.origin_4;
         let by1 = ((y0 + h).min(self.height_4 * 4))
             .div_ceil(4)
             .clamp(self.origin_4, self.origin_4 + self.rows_4)
             - self.origin_4;
+        (bx0, by0, bx1.max(bx0), by1.max(by0))
+    }
+
+    pub fn fill_rect(&mut self, x0: usize, y0: usize, w: usize, h: usize, cell: MotionCell) {
+        let (bx0, by0, bx1, by1) = self.band_rect(x0, y0, w, h);
         let flags = cell.flags();
-        let w4 = self.width_4;
+        let w4 = self.cols_4;
         for by in by0..by1 {
             self.flags[by * w4 + bx0..by * w4 + bx1].fill(flags);
         }
@@ -1196,17 +1249,11 @@ impl MotionField {
         w: usize,
         h: usize,
     ) -> Vec<MotionCell> {
-        let bx0 = x0 / 4;
-        let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
-        let by0 = (y0 / 4).max(self.origin_4) - self.origin_4;
-        let by1 = ((y0 + h).min(self.height_4 * 4))
-            .div_ceil(4)
-            .clamp(self.origin_4, self.origin_4 + self.rows_4)
-            - self.origin_4;
+        let (bx0, by0, bx1, by1) = self.band_rect(x0, y0, w, h);
         let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
         for by in by0..by1 {
             for bx in bx0..bx1 {
-                out.push(self.cell_index(by * self.width_4 + bx));
+                out.push(self.cell_index(by * self.cols_4 + bx));
             }
         }
         out
@@ -1221,15 +1268,9 @@ impl MotionField {
         h: usize,
         cells: &[MotionCell],
     ) {
-        let bx0 = x0 / 4;
-        let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
-        let by0 = (y0 / 4).max(self.origin_4) - self.origin_4;
-        let by1 = ((y0 + h).min(self.height_4 * 4))
-            .div_ceil(4)
-            .clamp(self.origin_4, self.origin_4 + self.rows_4)
-            - self.origin_4;
+        let (bx0, by0, bx1, by1) = self.band_rect(x0, y0, w, h);
         let row = bx1 - bx0;
-        let w4 = self.width_4;
+        let w4 = self.cols_4;
         let any_inter = cells.iter().any(|c| !c.is_intra);
         if any_inter || !self.motion.is_empty() {
             let motion = self.motion_mut();
@@ -1252,15 +1293,9 @@ impl MotionField {
     /// without disturbing the cell's motion. Coordinates are in luma
     /// samples; the rectangle is clipped to the field.
     pub fn mark_nonzero_coeff(&mut self, x0: usize, y0: usize, w: usize, h: usize) {
-        let bx0 = x0 / 4;
-        let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
-        let by0 = (y0 / 4).max(self.origin_4) - self.origin_4;
-        let by1 = ((y0 + h).min(self.height_4 * 4))
-            .div_ceil(4)
-            .clamp(self.origin_4, self.origin_4 + self.rows_4)
-            - self.origin_4;
+        let (bx0, by0, bx1, by1) = self.band_rect(x0, y0, w, h);
         for by in by0..by1 {
-            for f in &mut self.flags[by * self.width_4 + bx0..by * self.width_4 + bx1] {
+            for f in &mut self.flags[by * self.cols_4 + bx0..by * self.cols_4 + bx1] {
                 *f |= FLAG_NONZERO;
             }
         }

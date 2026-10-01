@@ -1431,6 +1431,10 @@ pub struct DeblockEdgeMap {
     y_origin: usize,
     /// Number of stored luma rows.
     rows: usize,
+    /// First stored luma column (a multiple of 8; a tile band) and the
+    /// stored width.
+    x_origin: usize,
+    cols: usize,
     /// The picture-wide filter parameters (offsets, chroma QP offsets,
     /// bit depths, `ChromaArrayType`); `qp_y` is unused — the QP map
     /// supplies every position's `QpY`.
@@ -1452,6 +1456,8 @@ impl DeblockEdgeMap {
             w4,
             y_origin: 0,
             rows: height_luma,
+            x_origin: 0,
+            cols: width_luma,
             params: None,
         }
     }
@@ -1463,16 +1469,29 @@ impl DeblockEdgeMap {
     /// Panics if `y_origin` is not 8-aligned.
     #[must_use]
     pub fn new_band(width_luma: usize, y_origin: usize, rows: usize) -> Self {
-        assert_eq!(y_origin % 8, 0, "edge band origin");
-        let w8 = width_luma.div_ceil(8);
-        let w4 = width_luma.div_ceil(4);
+        Self::new_rect_band((0, y_origin, width_luma, rows))
+    }
+
+    /// A band of the map for the luma rectangle `(x0, y0, w, h)` (`x0`
+    /// and `y0` multiples of 8).
+    ///
+    /// # Panics
+    /// Panics if the origin is not 8-aligned.
+    #[must_use]
+    pub fn new_rect_band(rect: (usize, usize, usize, usize)) -> Self {
+        let (x0, y0, w, h) = rect;
+        assert!(x0 % 8 == 0 && y0 % 8 == 0, "edge band origin");
+        let w8 = w.div_ceil(8);
+        let w4 = w.div_ceil(4);
         Self {
-            bs_v: vec![0; w8 * rows.div_ceil(4)],
+            bs_v: vec![0; w8 * h.div_ceil(4)],
             w8,
-            bs_h: vec![0; w4 * rows.div_ceil(8)],
+            bs_h: vec![0; w4 * h.div_ceil(8)],
             w4,
-            y_origin,
-            rows,
+            y_origin: y0,
+            rows: h,
+            x_origin: x0,
+            cols: w,
             params: None,
         }
     }
@@ -1482,10 +1501,17 @@ impl DeblockEdgeMap {
         if self.params.is_none() {
             self.params = band.params;
         }
-        let v0 = (band.y_origin / 4) * self.w8;
-        self.bs_v[v0..v0 + band.bs_v.len()].copy_from_slice(&band.bs_v);
-        let h0 = (band.y_origin / 8) * self.w4;
-        self.bs_h[h0..h0 + band.bs_h.len()].copy_from_slice(&band.bs_h);
+        let (x8, x4) = (band.x_origin / 8, band.x_origin / 4);
+        for r in 0..band.rows.div_ceil(4) {
+            let dst = (band.y_origin / 4 + r) * self.w8 + x8;
+            self.bs_v[dst..dst + band.w8]
+                .copy_from_slice(&band.bs_v[r * band.w8..(r + 1) * band.w8]);
+        }
+        for r in 0..band.rows.div_ceil(8) {
+            let dst = (band.y_origin / 8 + r) * self.w4 + x4;
+            self.bs_h[dst..dst + band.w4]
+                .copy_from_slice(&band.bs_h[r * band.w4..(r + 1) * band.w4]);
+        }
     }
 
     /// Whether any edge carries a non-zero strength.
@@ -1499,11 +1525,11 @@ impl DeblockEdgeMap {
     #[inline]
     #[must_use]
     pub fn bs_vertical(&self, x: usize, y: usize) -> u8 {
-        if y < self.y_origin {
+        if y < self.y_origin || x < self.x_origin || x >= self.x_origin + self.cols {
             return 0;
         }
         self.bs_v
-            .get(((y - self.y_origin) >> 2) * self.w8 + (x >> 3))
+            .get(((y - self.y_origin) >> 2) * self.w8 + ((x - self.x_origin) >> 3))
             .copied()
             .unwrap_or(0)
     }
@@ -1513,11 +1539,11 @@ impl DeblockEdgeMap {
     #[inline]
     #[must_use]
     pub fn bs_horizontal(&self, x: usize, y: usize) -> u8 {
-        if y < self.y_origin {
+        if y < self.y_origin || x < self.x_origin || x >= self.x_origin + self.cols {
             return 0;
         }
         self.bs_h
-            .get(((y - self.y_origin) >> 3) * self.w4 + (x >> 2))
+            .get(((y - self.y_origin) >> 3) * self.w4 + ((x - self.x_origin) >> 2))
             .copied()
             .unwrap_or(0)
     }
@@ -1568,10 +1594,14 @@ impl DeblockEdgeMap {
                         continue;
                     }
                     let (x, y) = (x_cb + x_dk, y_cb + y_dm);
-                    if y < self.y_origin || y >= self.y_origin + self.rows {
+                    if y < self.y_origin
+                        || y >= self.y_origin + self.rows
+                        || x < self.x_origin
+                        || x >= self.x_origin + self.cols
+                    {
                         continue;
                     }
-                    let y = y - self.y_origin;
+                    let (x, y) = (x - self.x_origin, y - self.y_origin);
                     match edge_type {
                         EdgeType::Vertical => {
                             if let Some(c) = self.bs_v.get_mut((y >> 2) * self.w8 + (x >> 3)) {
