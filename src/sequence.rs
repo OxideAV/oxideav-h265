@@ -26,7 +26,8 @@ use crate::dpb::{DpbEntry, LongTermEntry, Marking, RefPicLists};
 use crate::ilref::{resample_motion, resample_picture, IlRefGeometry, LayerFormat};
 use crate::inter_pred::WpListWeights;
 use crate::inter_recon::{
-    reconstruct_inter_picture, InterSliceContext, PlacedInterCtu, RefListAccess, SliceWpTables,
+    reconstruct_inter_picture, InterSliceContext, PictureReconstructor, PlacedInterCtu,
+    RefListAccess, SliceWpTables,
 };
 use crate::nal::{NalError, NalIter, NalUnit};
 use crate::picture::Picture;
@@ -692,6 +693,16 @@ impl SequenceDecoder {
 
         let geom = Geometry::derive(sps, pps)?;
 
+        // §C.5.2.2 — pictures the previous picture's RPS left "unused
+        // for reference" leave the DPB (output goes through
+        // `DecodedFrame`, which shares the sample planes, so nothing is
+        // lost). Deferred to the first picture of an access unit for a
+        // multi-layer stream: the same-AU inter-layer references are
+        // held by DPB index.
+        if !plan.multi_layer || self.au.pictures.is_empty() {
+            self.state.dpb_mut().evict_unused();
+        }
+
         // §7.4.2.4.4 CVS bookkeeping: an IRAP with NoRaslOutputFlag
         // starts a new coded video sequence (for output ordering).
         // F.8.1.3 for a non-base layer: NoRaslOutputFlag is 1 for an
@@ -750,60 +761,7 @@ impl SequenceDecoder {
             }
         }
 
-        // ---- §7.3.8 slice-data CABAC decode of every slice segment ----
-        let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
-        let mut decoded: Vec<(u32, u32, CodingTreeUnit)> = Vec::new();
-        let mut slice_addr_of: Vec<Option<u32>> = vec![None; pic_size_in_ctbs];
-        let first_slice_type = segs[0]
-            .header
-            .slice_type
-            .ok_or(SequenceError::Malformed("independent slice without type"))?;
-        let mut parse_state = PictureParseState::new(&build_slice_data_params(
-            &segs[0].header,
-            sps,
-            pps,
-            &geom,
-            first_slice_type,
-        ));
-
-        // §7.4.7.1 — a dependent slice segment inherits the slice-level
-        // header values (and SliceAddrRs) from the preceding independent
-        // slice segment; §9.3.2.2 restores its CABAC context variables
-        // from the state stored at the end of the previous segment
-        // (TableStateIdxDs, §9.3.2.4).
-        let mut cur_indep: &SegmentData = indep;
-        let mut ds_stored: Option<SliceContexts> = None;
-        // §9.3.2.4 WPP snapshot — ONE picture-wide storage: a CTU row
-        // started by a later slice segment of the same slice
-        // synchronizes from the state stored while an earlier segment
-        // decoded the row above (§9.3.2.5, T-availability gated).
-        let mut wpp_stored: Option<SliceContexts> = None;
-        for seg in segs {
-            if seg.header.dependent_slice_segment_flag {
-                if ds_stored.is_none() {
-                    return Err(SequenceError::Malformed(
-                        "dependent slice segment without a preceding segment's context state",
-                    ));
-                }
-            } else {
-                cur_indep = seg;
-            }
-            decode_slice_segment_data(
-                seg,
-                &cur_indep.header,
-                sps,
-                pps,
-                &geom,
-                &mut parse_state,
-                &mut decoded,
-                &mut slice_addr_of,
-                &mut ds_stored,
-                &mut wpp_stored,
-                self.tolerant,
-            )?;
-        }
-
-        // ---- §8.3 reference cycle + §8.4/§8.5/§8.7 reconstruction ----
+        // ---- §8.3 reference cycle ----
         let slice_type = indep
             .header
             .slice_type
@@ -1074,34 +1032,82 @@ impl SequenceDecoder {
                 );
             }
         }
-        let placed: Vec<PlacedInterCtu<'_>> = decoded
-            .iter()
-            .map(|(x, y, ctu)| {
-                let rs = (y >> geom.ctb_log2) * geom.pic_w_ctbs + (x >> geom.ctb_log2);
-                let slice_addr_rs = slice_addr_of[rs as usize].unwrap_or(0);
-                PlacedInterCtu {
-                    x_ctb: *x,
-                    y_ctb: *y,
-                    slice_addr_rs,
-                    filter_across_slices: across_of_slice
-                        .get(&slice_addr_rs)
-                        .copied()
-                        .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
-                    ctu,
-                }
-            })
-            .collect();
-
-        let (picture, motion) = reconstruct_inter_picture(
+        // ---- §7.3.8 CABAC decode + §8.4/§8.5 reconstruction, CTU by CTU ----
+        let mut reconstructor = PictureReconstructor::new(
             geom.width as usize,
             geom.height as usize,
             &recon_params,
             &slice_ctx,
             &geom.tiles,
-            &placed,
             &refs,
             col_field,
         )?;
+        let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
+        let mut slice_addr_of: Vec<Option<u32>> = vec![None; pic_size_in_ctbs];
+        let mut sink = |x_ctb: u32, y_ctb: u32, ctu: CodingTreeUnit, slice_addr_rs: u32| {
+            let placed = PlacedInterCtu {
+                x_ctb,
+                y_ctb,
+                slice_addr_rs,
+                filter_across_slices: across_of_slice
+                    .get(&slice_addr_rs)
+                    .copied()
+                    .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
+                ctu: &ctu,
+            };
+            reconstructor.push_ctu(&placed)?;
+            Ok(())
+        };
+        let first_slice_type = segs[0]
+            .header
+            .slice_type
+            .ok_or(SequenceError::Malformed("independent slice without type"))?;
+        let mut parse_state = PictureParseState::new(&build_slice_data_params(
+            &segs[0].header,
+            sps,
+            pps,
+            &geom,
+            first_slice_type,
+        ));
+
+        // §7.4.7.1 — a dependent slice segment inherits the slice-level
+        // header values (and SliceAddrRs) from the preceding independent
+        // slice segment; §9.3.2.2 restores its CABAC context variables
+        // from the state stored at the end of the previous segment
+        // (TableStateIdxDs, §9.3.2.4).
+        let mut cur_indep: &SegmentData = indep;
+        let mut ds_stored: Option<SliceContexts> = None;
+        // §9.3.2.4 WPP snapshot — ONE picture-wide storage: a CTU row
+        // started by a later slice segment of the same slice
+        // synchronizes from the state stored while an earlier segment
+        // decoded the row above (§9.3.2.5, T-availability gated).
+        let mut wpp_stored: Option<SliceContexts> = None;
+        for seg in segs {
+            if seg.header.dependent_slice_segment_flag {
+                if ds_stored.is_none() {
+                    return Err(SequenceError::Malformed(
+                        "dependent slice segment without a preceding segment's context state",
+                    ));
+                }
+            } else {
+                cur_indep = seg;
+            }
+            decode_slice_segment_data(
+                seg,
+                &cur_indep.header,
+                sps,
+                pps,
+                &geom,
+                &mut parse_state,
+                &mut sink,
+                &mut slice_addr_of,
+                &mut ds_stored,
+                &mut wpp_stored,
+                self.tolerant,
+            )?;
+        }
+
+        let (picture, motion) = reconstructor.finish()?;
 
         // F.8.1.6: the inter-layer references go back to their own
         // layer's marking; the picture is output only when its layer is
@@ -1127,8 +1133,20 @@ impl SequenceDecoder {
             view_id,
             au_index: self.au.index,
         });
+        // A one-picture DPB (`sps_max_dec_pic_buffering_minus1 == 0`:
+        // every still, and any intra-only sequence signalling it) must
+        // be empty before the next picture decodes, so this picture can
+        // never be referenced — the output frame keeps the only copy of
+        // the planes and the DPB stays empty.
         let dpb_idx = self.state.dpb().len();
-        self.state.store_picture(poc, layer_id, picture, motion);
+        let referenceable = plan.multi_layer || {
+            let idx =
+                usize::from(sps.max_sub_layers_minus1).min(sps.sub_layer_ordering_info.len() - 1);
+            sps.sub_layer_ordering_info[idx].max_dec_pic_buffering_minus1 > 0
+        };
+        if referenceable {
+            self.state.store_picture(poc, layer_id, picture, motion);
+        }
         self.au.pictures.push((layer_id, dpb_idx));
         self.au.max_layer = Some(self.au.max_layer.map_or(layer_id, |m| m.max(layer_id)));
         let st = self.layers.entry(layer_id).or_default();
@@ -1261,7 +1279,10 @@ pub fn decode_annexb_sequence_debug(
         pps,
         &geom,
         &mut parse_state,
-        &mut decoded,
+        &mut |x, y, ctu, _| {
+            decoded.push((x, y, ctu));
+            Ok(())
+        },
         &mut slice_addr_of,
         &mut ds_stored,
         &mut wpp_stored,
@@ -1331,7 +1352,10 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
         &pps,
         &geom,
         &mut parse_state,
-        &mut decoded,
+        &mut |x, y, ctu, _| {
+            decoded.push((x, y, ctu));
+            Ok(())
+        },
         &mut slice_addr_of,
         &mut ds_stored,
         &mut wpp_stored,
@@ -1953,6 +1977,11 @@ fn build_slice_data_params(
 /// segment's `end_of_slice_segment_flag == 1` while
 /// `dependent_slice_segments_enabled_flag` is set.
 #[allow(clippy::too_many_arguments)]
+/// CABAC-decode one slice segment's `slice_segment_data( )`, handing
+/// every coding tree unit to `sink` as `(x_ctb, y_ctb, ctu,
+/// SliceAddrRs)` the moment it is parsed (the streaming reconstruction
+/// consumes it right away, so a picture's syntax tree never has to be
+/// held whole).
 fn decode_slice_segment_data(
     seg: &SegmentData,
     effective_header: &SliceSegmentHeader,
@@ -1960,7 +1989,7 @@ fn decode_slice_segment_data(
     pps: &PicParameterSet,
     geom: &Geometry,
     state: &mut PictureParseState,
-    decoded: &mut Vec<(u32, u32, CodingTreeUnit)>,
+    sink: &mut dyn FnMut(u32, u32, CodingTreeUnit, u32) -> Result<(), SequenceError>,
     slice_addr_of: &mut [Option<u32>],
     ds_stored: &mut Option<SliceContexts>,
     wpp_stored: &mut Option<SliceContexts>,
@@ -2199,7 +2228,7 @@ fn decode_slice_segment_data(
             merge_left,
             merge_up,
         )?;
-        decoded.push((x_ctb, y_ctb, ctu));
+        sink(x_ctb, y_ctb, ctu, slice_addr_rs)?;
 
         // §9.3.1 / §9.3.2.4 — store the context state after the SECOND
         // CTB of a CTU row of a tile: CtbAddrInRs % PicWidthInCtbsY

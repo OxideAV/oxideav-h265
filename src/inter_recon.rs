@@ -547,182 +547,252 @@ pub fn reconstruct_inter_picture(
     refs: &RefListAccess,
     col_field: Option<&MotionField>,
 ) -> Result<(Picture, MotionField), ReconError> {
-    let mut pic = Picture::new(
+    let mut rec = PictureReconstructor::new(
         pic_width_luma,
         pic_height_luma,
-        params.chroma_array_type,
-        params.bit_depth_luma,
-        params.bit_depth_chroma,
-    );
-    let mut ctx = crate::recon::ReconCtx::new(
-        pic_width_luma,
-        pic_height_luma,
-        slice.ctb_log2_size_y,
-        slice.min_tb_log2_size_y,
+        params,
+        slice,
         tiles,
+        refs,
+        col_field,
     )?;
-    // §8.6.1 QP-derivation state (QpBdOffsetY = 6 * bit_depth_minus8).
-    ctx.init_qp_state(
-        slice.slice_qp_y,
-        slice.log2_min_cu_qp_delta_size,
-        6 * (i32::from(params.bit_depth_luma) - 8),
-    );
-    ctx.set_constrained_intra(slice.constrained_intra_pred);
-    let mut field = MotionField::new(pic_width_luma, pic_height_luma);
-
-    let ctb_size = 1usize << slice.ctb_log2_size_y;
-    let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
-    let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
-    let mut slice_addr_map = vec![0u32; pic_w_ctbs * pic_h_ctbs];
-    // Per-CTB slice_loop_filter_across_slices_enabled_flag (§7.4.7.1 —
-    // a per-slice value; the §8.7.2.1 / §8.7.3.2 boundary gates consult
-    // the owning slice's flag, not a picture-level one).
-    let mut filter_across_map = vec![true; pic_w_ctbs * pic_h_ctbs];
     for placed in ctus {
+        rec.push_ctu(placed)?;
+    }
+    rec.finish()
+}
+
+/// The streaming form of [`reconstruct_inter_picture`]: the picture is
+/// reconstructed one coding tree unit at a time as the CABAC walk
+/// produces them ([`Self::push_ctu`], in decode order), and
+/// [`Self::finish`] runs the §8.7 in-loop filters. A whole picture's
+/// syntax tree never has to exist at once — a CTU's coefficient levels
+/// are dropped as soon as its samples are written.
+#[derive(Debug)]
+pub struct PictureReconstructor<'a> {
+    pic: Picture,
+    ctx: crate::recon::ReconCtx,
+    field: MotionField,
+    params: &'a ReconParams,
+    slice: &'a InterSliceContext,
+    refs: &'a RefListAccess<'a>,
+    col_field: Option<&'a MotionField>,
+    pic_w_ctbs: usize,
+    pic_h_ctbs: usize,
+    /// Per-CTB `SliceAddrRs` (raster order), filled as CTUs arrive.
+    slice_addr_map: Vec<u32>,
+    /// Per-CTB `slice_loop_filter_across_slices_enabled_flag` (§7.4.7.1 —
+    /// a per-slice value; the §8.7.2.1 / §8.7.3.2 boundary gates consult
+    /// the owning slice's flag, not a picture-level one).
+    filter_across_map: Vec<bool>,
+    /// The current CTU's deblocking descriptors (folded into `edges`
+    /// once the CTU is reconstructed).
+    deblock_cus: Vec<crate::deblock::DeblockCuDesc>,
+    /// The picture's §8.7.2.4 boundary strengths, filled per CTU.
+    edges: crate::deblock::DeblockEdgeMap,
+    /// §8.7.2.5.4 / §8.7.3.1 — per-4×4-cell loop-filter suppression for
+    /// PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
+    no_filter_cells: Vec<bool>,
+    w4: usize,
+    prev_slice_addr: Option<u32>,
+    prev_tile: Option<u32>,
+    sao_grid: Vec<crate::sao::ResolvedSao>,
+}
+
+impl<'a> PictureReconstructor<'a> {
+    /// Allocate the picture, motion field and per-picture maps.
+    ///
+    /// # Errors
+    /// Propagates the [`crate::recon::ReconCtx`] construction error.
+    pub fn new(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        params: &'a ReconParams,
+        slice: &'a InterSliceContext,
+        tiles: &crate::availability::TilingParams,
+        refs: &'a RefListAccess<'a>,
+        col_field: Option<&'a MotionField>,
+    ) -> Result<Self, ReconError> {
+        let pic = Picture::new(
+            pic_width_luma,
+            pic_height_luma,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        );
+        let mut ctx = crate::recon::ReconCtx::new(
+            pic_width_luma,
+            pic_height_luma,
+            slice.ctb_log2_size_y,
+            slice.min_tb_log2_size_y,
+            tiles,
+        )?;
+        // §8.6.1 QP-derivation state (QpBdOffsetY = 6 * bit_depth_minus8).
+        ctx.init_qp_state(
+            slice.slice_qp_y,
+            slice.log2_min_cu_qp_delta_size,
+            6 * (i32::from(params.bit_depth_luma) - 8),
+        );
+        ctx.set_constrained_intra(slice.constrained_intra_pred);
+        let field = MotionField::new(pic_width_luma, pic_height_luma);
+        let ctb_size = 1usize << slice.ctb_log2_size_y;
+        let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
+        let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
+        let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
+        Ok(Self {
+            pic,
+            ctx,
+            field,
+            params,
+            slice,
+            refs,
+            col_field,
+            pic_w_ctbs,
+            pic_h_ctbs,
+            slice_addr_map: vec![0u32; pic_w_ctbs * pic_h_ctbs],
+            filter_across_map: vec![true; pic_w_ctbs * pic_h_ctbs],
+            deblock_cus: Vec::new(),
+            edges: crate::deblock::DeblockEdgeMap::new(pic_width_luma, pic_height_luma),
+            no_filter_cells: vec![false; w4 * h4],
+            w4,
+            prev_slice_addr: None,
+            prev_tile: None,
+            sao_grid: vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs],
+        })
+    }
+
+    /// The picture reconstructed so far (pre-filter samples).
+    #[must_use]
+    pub fn picture(&self) -> &Picture {
+        &self.pic
+    }
+
+    /// Reconstruct one coding tree unit (decode order) and resolve its
+    /// §7.4.9.3 SAO parameters.
+    ///
+    /// # Errors
+    /// Propagates [`ReconError`] from the per-CU reconstruction.
+    pub fn push_ctu(&mut self, placed: &PlacedInterCtu<'_>) -> Result<(), ReconError> {
+        let slice = self.slice;
+        let params = self.params;
+        let refs = self.refs;
         let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
         let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
-        slice_addr_map[ry * pic_w_ctbs + rx] = placed.slice_addr_rs;
-        filter_across_map[ry * pic_w_ctbs + rx] = placed.filter_across_slices;
-    }
-    ctx.set_slice_addr_rs(slice_addr_map.clone());
+        let rs = ry * self.pic_w_ctbs + rx;
+        self.slice_addr_map[rs] = placed.slice_addr_rs;
+        self.filter_across_map[rs] = placed.filter_across_slices;
+        self.ctx
+            .set_slice_addr_rs_at(rs as u32, placed.slice_addr_rs);
 
-    // §8.5.3.2 reference-picture resolvers, bound to the §8.3.4 ref lists.
-    // The CURR_PIC sentinel resolves to the current POC and — per the
-    // §8.3.1 "the current decoded picture is marked as used for
-    // long-term reference" clause — reads as a long-term reference.
-    let ref_poc = |list: usize, ref_idx: i32| {
-        if refs.is_curr_pic(list, ref_idx) {
-            slice.curr_poc
-        } else {
-            refs.ref_poc(list, ref_idx)
-        }
-    };
-    let ref_long_term = |list: usize, ref_idx: i32| {
-        refs.is_curr_pic(list, ref_idx)
-            || refs
-                .entry(list, ref_idx)
-                .is_some_and(|e| e.marking == crate::dpb::Marking::LongTerm)
-    };
-    let ref_short_term = |list: usize, ref_idx: i32| {
-        refs.entry(list, ref_idx)
-            .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
-    };
-    // A reference of the collocated picture whose POC equals the
-    // collocated picture's own POC is a same-access-unit reference:
-    // the Annex F/G/H inter-layer reference picture (marked "used for
-    // long-term reference", G.8.1.3) or the SCC current picture (§8.3.1
-    // long-term) — both long-term for the §8.5.3.2.9 scaling gate.
-    let col_poc = slice.col_poc;
-    let col_ref_long_term = move |poc: i32| poc == col_poc;
-    let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
+        // §8.5.3.2 reference-picture resolvers, bound to the §8.3.4 ref
+        // lists. The CURR_PIC sentinel resolves to the current POC and —
+        // per the §8.3.1 "the current decoded picture is marked as used
+        // for long-term reference" clause — reads as a long-term
+        // reference.
+        let ref_poc = |list: usize, ref_idx: i32| {
+            if refs.is_curr_pic(list, ref_idx) {
+                slice.curr_poc
+            } else {
+                refs.ref_poc(list, ref_idx)
+            }
+        };
+        let ref_long_term = |list: usize, ref_idx: i32| {
+            refs.is_curr_pic(list, ref_idx)
+                || refs
+                    .entry(list, ref_idx)
+                    .is_some_and(|e| e.marking == crate::dpb::Marking::LongTerm)
+        };
+        let ref_short_term = |list: usize, ref_idx: i32| {
+            refs.entry(list, ref_idx)
+                .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
+        };
+        // A reference of the collocated picture whose POC equals the
+        // collocated picture's own POC is a same-access-unit reference:
+        // the Annex F/G/H inter-layer reference picture (marked "used for
+        // long-term reference", G.8.1.3) or the SCC current picture
+        // (§8.3.1 long-term) — both long-term for the §8.5.3.2.9 scaling
+        // gate.
+        let col_poc = slice.col_poc;
+        let col_ref_long_term = move |poc: i32| poc == col_poc;
+        let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
+        let mv_ctx = PuMvContext {
+            curr_poc: slice.curr_poc,
+            slice_is_b: slice.slice_is_b,
+            ctb_log2_size_y: slice.ctb_log2_size_y,
+            pic_width_luma: slice.pic_width_luma,
+            pic_height_luma: slice.pic_height_luma,
+            max_num_merge_cand: slice.max_num_merge_cand,
+            num_ref_idx_l0_active: slice.num_ref_idx_l0_active,
+            num_ref_idx_l1_active: slice.num_ref_idx_l1_active,
+            log2_par_mrg_level: slice.log2_par_mrg_level,
+            temporal_mvp_enabled: slice.temporal_mvp_enabled,
+            collocated_from_l0_flag: slice.collocated_from_l0_flag,
+            col_poc: slice.col_poc,
+            no_backward_pred: slice.no_backward_pred,
+            ref_poc: &ref_poc,
+            ref_long_term: &ref_long_term,
+            ref_short_term: &ref_short_term,
+            col_field: self.col_field,
+            col_ref_long_term: &col_ref_long_term,
+            use_integer_mv: slice.use_integer_mv,
+            two_versions_curr_pic: slice.two_versions_curr_pic,
+            is_curr_pic: &is_curr_pic,
+        };
 
-    let mv_ctx = PuMvContext {
-        curr_poc: slice.curr_poc,
-        slice_is_b: slice.slice_is_b,
-        ctb_log2_size_y: slice.ctb_log2_size_y,
-        pic_width_luma: slice.pic_width_luma,
-        pic_height_luma: slice.pic_height_luma,
-        max_num_merge_cand: slice.max_num_merge_cand,
-        num_ref_idx_l0_active: slice.num_ref_idx_l0_active,
-        num_ref_idx_l1_active: slice.num_ref_idx_l1_active,
-        log2_par_mrg_level: slice.log2_par_mrg_level,
-        temporal_mvp_enabled: slice.temporal_mvp_enabled,
-        collocated_from_l0_flag: slice.collocated_from_l0_flag,
-        col_poc: slice.col_poc,
-        no_backward_pred: slice.no_backward_pred,
-        ref_poc: &ref_poc,
-        ref_long_term: &ref_long_term,
-        ref_short_term: &ref_short_term,
-        col_field,
-        col_ref_long_term: &col_ref_long_term,
-        use_integer_mv: slice.use_integer_mv,
-        two_versions_curr_pic: slice.two_versions_curr_pic,
-        is_curr_pic: &is_curr_pic,
-    };
-
-    let mut deblock_cus: Vec<crate::deblock::DeblockCuDesc> = Vec::new();
-    // §8.7.2.5.4 / §8.7.3.1 — per-4×4-cell loop-filter suppression for
-    // PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
-    let (w4, h4) = (pic_width_luma.div_ceil(4), pic_height_luma.div_ceil(4));
-    let mut no_filter_cells = vec![false; w4 * h4];
-    let mut prev_slice_addr: Option<u32> = None;
-    let mut prev_tile: Option<u32> = None;
-    for placed in ctus {
         // §8.6.1 step-1 — qPY_PREV resets to SliceQpY at the first
         // quantization group of a slice, of a tile, and (with
         // entropy_coding_sync) of each CTB row of a tile.
-        let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
-        let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
-        let rs = (ry * pic_w_ctbs + rx) as u32;
-        let tiling = ctx.tiling();
-        let tile = tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs));
-        let tile_row_start = rx == 0 || tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs - 1)) != tile;
-        if prev_slice_addr != Some(placed.slice_addr_rs)
-            || prev_tile != Some(tile)
+        let tiling = self.ctx.tiling();
+        let tile = tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs as u32));
+        let tile_row_start =
+            rx == 0 || tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs as u32 - 1)) != tile;
+        if self.prev_slice_addr != Some(placed.slice_addr_rs)
+            || self.prev_tile != Some(tile)
             || (slice.wpp_qp_row_reset && tile_row_start)
         {
-            ctx.reset_qp_prev();
+            self.ctx.reset_qp_prev();
         }
         // §7.4.7.1 — CuQpOffsetCb / CuQpOffsetCr reset to 0 at each
         // slice start (unlike qPY_PREV they do NOT reset at tile /
         // WPP-row boundaries).
-        if prev_slice_addr != Some(placed.slice_addr_rs) {
+        if self.prev_slice_addr != Some(placed.slice_addr_rs) {
             params.cu_qp_offset_c.set((0, 0));
         }
-        prev_slice_addr = Some(placed.slice_addr_rs);
-        prev_tile = Some(tile);
+        self.prev_slice_addr = Some(placed.slice_addr_rs);
+        self.prev_tile = Some(tile);
         reconstruct_inter_quadtree(
-            &mut pic,
-            &mut ctx,
-            &mut field,
+            &mut self.pic,
+            &mut self.ctx,
+            &mut self.field,
             params,
             &mv_ctx,
             refs,
             slice,
-            &mut deblock_cus,
-            &mut no_filter_cells,
-            w4,
-            &filter_across_map,
+            &mut self.deblock_cus,
+            &mut self.no_filter_cells,
+            self.w4,
+            &self.filter_across_map,
             &placed.ctu.quadtree,
         )?;
-    }
-    let no_filter_map = no_filter_cells
-        .iter()
-        .any(|&b| b)
-        .then_some(crate::deblock::NoFilterMap {
-            cells: &no_filter_cells,
-            w_cells: w4,
-        });
+        // §8.7.2.2 .. §8.7.2.4 — the CTU's edges and strengths are final
+        // now (its left / above neighbours are reconstructed).
+        if slice.deblock_enabled {
+            for desc in &self.deblock_cus {
+                self.edges.add_cu(&self.field, desc);
+            }
+        }
+        self.deblock_cus.clear();
 
-    // §8.7.2 — in-loop deblocking (all vertical edges, then horizontal),
-    // ahead of the §8.7.3 SAO pass.
-    if slice.deblock_enabled {
-        let qp_map = ctx
-            .qp_cells()
-            .map(|(cells, w_cells)| crate::deblock::QpMap { cells, w_cells });
-        crate::deblock::deblock_picture_full(
-            &mut pic,
-            &field,
-            &deblock_cus,
-            qp_map,
-            no_filter_map.as_ref(),
-        );
-    }
-
-    // §8.7.3 — sample-adaptive offset (on the deblocked samples). Resolve
-    // each CTB's §7.4.9.3 SAO parameters with left / above merge (denied
-    // across slice boundaries), then run the picture-level filter.
-    let mut sao_grid = vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs];
-    for placed in ctus {
-        let rx = (placed.x_ctb as usize) >> slice.ctb_log2_size_y;
-        let ry = (placed.y_ctb as usize) >> slice.ctb_log2_size_y;
-        let here = slice_addr_map[ry * pic_w_ctbs + rx];
+        // §7.4.9.3 SAO parameters with left / above merge (denied across
+        // slice boundaries).
         if let Some(sao_params) = &placed.ctu.sao {
-            let left = (rx > 0 && slice_addr_map[ry * pic_w_ctbs + (rx - 1)] == here)
-                .then(|| sao_grid[ry * pic_w_ctbs + (rx - 1)]);
-            let above = (ry > 0 && slice_addr_map[(ry - 1) * pic_w_ctbs + rx] == here)
-                .then(|| sao_grid[(ry - 1) * pic_w_ctbs + rx]);
-            sao_grid[ry * pic_w_ctbs + rx] = crate::sao::ResolvedSao::resolve(
+            let here = placed.slice_addr_rs;
+            let w = self.pic_w_ctbs;
+            let left =
+                (rx > 0 && self.slice_addr_map[rs - 1] == here).then(|| self.sao_grid[rs - 1]);
+            let above =
+                (ry > 0 && self.slice_addr_map[rs - w] == here).then(|| self.sao_grid[rs - w]);
+            self.sao_grid[rs] = crate::sao::ResolvedSao::resolve(
                 sao_params,
                 left.as_ref(),
                 above.as_ref(),
@@ -730,38 +800,89 @@ pub fn reconstruct_inter_picture(
                 slice.log2_sao_offset_scale_chroma,
             );
         }
+        Ok(())
     }
-    let sao_boundaries = crate::sao::SaoBoundaries {
-        slice_addr_of_ctb: slice_addr_map.clone(),
-        tile_id_of_ctb: (0..(pic_w_ctbs * pic_h_ctbs) as u32)
-            .map(|rs| {
-                let tiling = ctx.tiling();
-                tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs))
-            })
-            .collect(),
-        pic_w_ctbs,
-        ctb_log2_size_y: slice.ctb_log2_size_y,
-        across_slices: slice.filter_across_slices,
-        across_tiles: slice.filter_across_tiles,
-        filter_across_of_ctb: Some(filter_across_map.clone()),
-        ctb_ts_of_rs: Some(
-            (0..(pic_w_ctbs * pic_h_ctbs) as u32)
-                .map(|rs| ctx.tiling().ctb_addr_rs_to_ts(rs))
-                .collect(),
-        ),
-    };
-    let filtered = crate::sao::apply_sao_picture_full(
-        &pic,
-        &sao_grid,
-        slice.ctb_log2_size_y,
-        params.chroma_array_type,
-        slice.slice_sao_luma_flag,
-        slice.slice_sao_chroma_flag,
-        Some(&sao_boundaries),
-        no_filter_map.as_ref(),
-    );
 
-    Ok((filtered, field))
+    /// Run the §8.7.2 deblocking and §8.7.3 SAO passes and return the
+    /// picture with its motion field.
+    ///
+    /// # Errors
+    /// None today; the signature mirrors [`Self::push_ctu`].
+    pub fn finish(self) -> Result<(Picture, MotionField), ReconError> {
+        let Self {
+            mut pic,
+            ctx,
+            field,
+            params,
+            slice,
+            pic_w_ctbs,
+            pic_h_ctbs,
+            slice_addr_map,
+            filter_across_map,
+            edges,
+            no_filter_cells,
+            w4,
+            sao_grid,
+            ..
+        } = self;
+        let no_filter_map =
+            no_filter_cells
+                .iter()
+                .any(|&b| b)
+                .then_some(crate::deblock::NoFilterMap {
+                    cells: &no_filter_cells,
+                    w_cells: w4,
+                });
+
+        // §8.7.2 — in-loop deblocking (all vertical edges, then
+        // horizontal), ahead of the §8.7.3 SAO pass.
+        if slice.deblock_enabled {
+            let (cells, w_cells) = ctx
+                .qp_cells()
+                .expect("the picture reconstructor initializes the QP map");
+            crate::deblock::deblock_picture_edges(
+                &mut pic,
+                &edges,
+                crate::deblock::QpMap { cells, w_cells },
+                no_filter_map.as_ref(),
+            );
+        }
+        drop(edges);
+
+        // §8.7.3 — sample-adaptive offset (on the deblocked samples).
+        let n_ctbs = pic_w_ctbs * pic_h_ctbs;
+        let sao_boundaries = crate::sao::SaoBoundaries {
+            slice_addr_of_ctb: slice_addr_map,
+            tile_id_of_ctb: (0..n_ctbs as u32)
+                .map(|rs| {
+                    let tiling = ctx.tiling();
+                    tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs))
+                })
+                .collect(),
+            pic_w_ctbs,
+            ctb_log2_size_y: slice.ctb_log2_size_y,
+            across_slices: slice.filter_across_slices,
+            across_tiles: slice.filter_across_tiles,
+            filter_across_of_ctb: Some(filter_across_map),
+            ctb_ts_of_rs: Some(
+                (0..n_ctbs as u32)
+                    .map(|rs| ctx.tiling().ctb_addr_rs_to_ts(rs))
+                    .collect(),
+            ),
+        };
+        crate::sao::apply_sao_picture_in_place(
+            &mut pic,
+            &sao_grid,
+            slice.ctb_log2_size_y,
+            params.chroma_array_type,
+            slice.slice_sao_luma_flag,
+            slice.slice_sao_chroma_flag,
+            Some(&sao_boundaries),
+            no_filter_map.as_ref(),
+        );
+
+        Ok((pic, field))
+    }
 }
 
 /// Walk one §7.3.8.4 coding quadtree, dispatching each leaf coding unit to

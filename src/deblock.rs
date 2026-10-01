@@ -770,8 +770,9 @@ pub fn filter_chroma_sample(p: [i32; 2], q: [i32; 2], tc: i32, bit_depth: u8) ->
 /// this plane in place. Callers wrap their reconstructed luma / chroma
 /// component buffer (as `i32` samples) in a [`SamplePlane`].
 pub struct SamplePlane<'a> {
-    /// Row-major sample storage, `width * height` long.
-    pub samples: &'a mut [i32],
+    /// Row-major sample storage, `width * height` long (`u16`, already
+    /// clipped to the bit depth).
+    pub samples: &'a mut [u16],
     /// Plane width in samples.
     pub width: usize,
     /// Row stride in samples (usually equal to `width`).
@@ -791,11 +792,11 @@ impl core::fmt::Debug for SamplePlane<'_> {
 impl SamplePlane<'_> {
     #[inline]
     fn get(&self, x: usize, y: usize) -> i32 {
-        self.samples[y * self.stride + x]
+        i32::from(self.samples[y * self.stride + x])
     }
     #[inline]
     fn set(&mut self, x: usize, y: usize, v: i32) {
-        self.samples[y * self.stride + x] = v;
+        self.samples[y * self.stride + x] = v as u16;
     }
     /// `(x, y)` plane coordinates for the `i`-th sample on the p (`pi`,
     /// negative side) or q (`qi`, positive side) of an edge at `(ex, ey)`
@@ -1395,6 +1396,350 @@ pub fn deblock_picture_full(
     // Pass 2: all horizontal edges (on the vertically-filtered samples).
     for desc in cus {
         apply_cu_direction(pic, field, desc, EdgeType::Horizontal, qp_map, no_filter);
+    }
+}
+
+/// The §8.7.2.4 boundary strengths of a whole picture on the §8.7.2
+/// sampling grid: every vertical edge segment (an 8-aligned column, four
+/// luma rows) and every horizontal one (an 8-aligned row, four luma
+/// columns) carries its `bS` — 0 where no transform / prediction block
+/// boundary falls or the §8.7.2.1 boundary gates cleared it.
+///
+/// The streaming reconstruction fills it CU by CU ([`Self::add_cu`]) as
+/// the motion field around each CU becomes final, so the picture-level
+/// filter ([`deblock_picture_edges`]) walks a fixed-size map instead of
+/// a per-CU descriptor list; a vertical-pass row band and a
+/// horizontal-pass row band touch disjoint samples, which is what the
+/// row-parallel filter builds on.
+#[derive(Debug, Clone)]
+pub struct DeblockEdgeMap {
+    /// Vertical edges: `bs_v[y4 * w8 + x8]` is the strength of the edge
+    /// at luma column `8 * x8`, rows `4 * y4 ..+ 4`.
+    bs_v: Vec<u8>,
+    w8: usize,
+    /// Horizontal edges: `bs_h[y8 * w4 + x4]` is the strength of the edge
+    /// at luma row `8 * y8`, columns `4 * x4 ..+ 4`.
+    bs_h: Vec<u8>,
+    w4: usize,
+    /// The picture-wide filter parameters (offsets, chroma QP offsets,
+    /// bit depths, `ChromaArrayType`); `qp_y` is unused — the QP map
+    /// supplies every position's `QpY`.
+    params: Option<DeblockCuParams>,
+}
+
+impl DeblockEdgeMap {
+    /// An all-zero map for a `width_luma × height_luma` picture.
+    #[must_use]
+    pub fn new(width_luma: usize, height_luma: usize) -> Self {
+        let w8 = width_luma.div_ceil(8);
+        let h4 = height_luma.div_ceil(4);
+        let w4 = width_luma.div_ceil(4);
+        let h8 = height_luma.div_ceil(8);
+        Self {
+            bs_v: vec![0; w8 * h4],
+            w8,
+            bs_h: vec![0; w4 * h8],
+            w4,
+            params: None,
+        }
+    }
+
+    /// Whether any edge carries a non-zero strength.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.params.is_none()
+    }
+
+    /// `bS` of the vertical edge at luma `(x, y)` (`x` 8-aligned, `y`
+    /// 4-aligned).
+    #[inline]
+    #[must_use]
+    pub fn bs_vertical(&self, x: usize, y: usize) -> u8 {
+        self.bs_v
+            .get((y >> 2) * self.w8 + (x >> 3))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `bS` of the horizontal edge at luma `(x, y)` (`x` 4-aligned, `y`
+    /// 8-aligned).
+    #[inline]
+    #[must_use]
+    pub fn bs_horizontal(&self, x: usize, y: usize) -> u8 {
+        self.bs_h
+            .get((y >> 3) * self.w4 + (x >> 2))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Derive one coding unit's §8.7.2.2 / .3 edge flags and §8.7.2.4
+    /// strengths in both directions from `field` (which must already
+    /// hold the CU and its left / above neighbours) and record them.
+    pub fn add_cu(&mut self, field: &MotionField, desc: &DeblockCuDesc) {
+        let DeblockCu {
+            x_cb,
+            y_cb,
+            log2_cb_size,
+            ..
+        } = desc.cu;
+        if self.params.is_none() {
+            self.params = Some(desc.cu.params);
+        }
+        let n_d = 1usize << (log2_cb_size - 3);
+        for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
+            let filter_edge_flag = match edge_type {
+                EdgeType::Vertical => desc.filter_left,
+                EdgeType::Horizontal => desc.filter_top,
+            };
+            let ef = derive_edge_flags(
+                &desc.transform_split,
+                desc.part_mode,
+                log2_cb_size,
+                edge_type,
+                filter_edge_flag,
+            );
+            let bs = derive_boundary_strength(
+                field,
+                x_cb,
+                y_cb,
+                log2_cb_size,
+                edge_type,
+                ef.edge_flags(),
+                ef.tb_edge(),
+            );
+            for e in 0..n_d {
+                for s_idx in 0..2 * n_d {
+                    let (x_dk, y_dm) = match edge_type {
+                        EdgeType::Vertical => (e << 3, s_idx << 2),
+                        EdgeType::Horizontal => (s_idx << 2, e << 3),
+                    };
+                    let v = bs.at(x_dk, y_dm);
+                    if v == 0 {
+                        continue;
+                    }
+                    let (x, y) = (x_cb + x_dk, y_cb + y_dm);
+                    match edge_type {
+                        EdgeType::Vertical => {
+                            if let Some(c) = self.bs_v.get_mut((y >> 2) * self.w8 + (x >> 3)) {
+                                *c = v;
+                            }
+                        }
+                        EdgeType::Horizontal => {
+                            if let Some(c) = self.bs_h.get_mut((y >> 3) * self.w4 + (x >> 2)) {
+                                *c = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §8.7.2.1 — the picture-level deblocking driver over a
+/// [`DeblockEdgeMap`]: every vertical edge of the picture, then every
+/// horizontal one (on the vertically-filtered samples), luma and chroma
+/// per §8.7.2.5.1 / .2, with per-position `QpQ` / `QpP` from `qp_map`
+/// and the §8.7.2.5.4 / .5 suppression map.
+pub fn deblock_picture_edges(
+    pic: &mut Picture,
+    map: &DeblockEdgeMap,
+    qp_map: QpMap<'_>,
+    no_filter: Option<&NoFilterMap<'_>>,
+) {
+    let Some(params) = map.params else {
+        return;
+    };
+    let (_, h) = pic.plane_dims(Plane::Luma);
+    deblock_rows_edges(
+        pic,
+        map,
+        &params,
+        qp_map,
+        no_filter,
+        EdgeType::Vertical,
+        0,
+        h,
+    );
+    deblock_rows_edges(
+        pic,
+        map,
+        &params,
+        qp_map,
+        no_filter,
+        EdgeType::Horizontal,
+        0,
+        h,
+    );
+}
+
+/// One direction of [`deblock_picture_edges`] over the luma rows
+/// `y_start .. y_end` (4-aligned; an edge segment belongs to the row of
+/// its `q0,0` sample — for a horizontal edge that is the edge row
+/// itself). The chroma edges whose `q0,0` luma position falls in the
+/// range come along. Vertical-pass bands never touch each other's
+/// samples; horizontal-pass bands touch the three rows above their
+/// first edge, so a band split for that pass starts 4 rows early.
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_rows_edges(
+    pic: &mut Picture,
+    map: &DeblockEdgeMap,
+    params: &DeblockCuParams,
+    qp_map: QpMap<'_>,
+    no_filter: Option<&NoFilterMap<'_>>,
+    edge_type: EdgeType,
+    y_start: usize,
+    y_end: usize,
+) {
+    let (pw, ph) = pic.plane_dims(Plane::Luma);
+    let y_end = y_end.min(ph);
+    let align_up = |v: usize, a: usize| v.div_ceil(a) * a;
+    // ----- luma -----
+    {
+        let (buf, stride) = pic.plane_mut(Plane::Luma);
+        let mut plane = SamplePlane {
+            samples: buf,
+            width: stride,
+            stride,
+        };
+        match edge_type {
+            EdgeType::Vertical => {
+                for y in (align_up(y_start, 4)..y_end).step_by(4) {
+                    for x in (8..pw).step_by(8) {
+                        let s = map.bs_vertical(x, y);
+                        if s == 0 {
+                            continue;
+                        }
+                        let qp = EdgeQp {
+                            qp_q: qp_map.qp_at(x, y),
+                            qp_p: qp_map.qp_at(x - 1, y),
+                            beta_offset_div2: params.beta_offset_div2,
+                            tc_offset_div2: params.tc_offset_div2,
+                            bit_depth: params.bit_depth_luma,
+                        };
+                        let pos = EdgePos {
+                            ex: x,
+                            ey: y,
+                            edge: edge_type,
+                        };
+                        filter_luma_block_edge_gated(&mut plane, pos, s, qp, no_filter);
+                    }
+                }
+            }
+            EdgeType::Horizontal => {
+                for y in (align_up(y_start.max(8), 8)..y_end).step_by(8) {
+                    for x in (0..pw).step_by(4) {
+                        let s = map.bs_horizontal(x, y);
+                        if s == 0 {
+                            continue;
+                        }
+                        let qp = EdgeQp {
+                            qp_q: qp_map.qp_at(x, y),
+                            qp_p: qp_map.qp_at(x, y - 1),
+                            beta_offset_div2: params.beta_offset_div2,
+                            tc_offset_div2: params.tc_offset_div2,
+                            bit_depth: params.bit_depth_luma,
+                        };
+                        let pos = EdgePos {
+                            ex: x,
+                            ey: y,
+                            edge: edge_type,
+                        };
+                        filter_luma_block_edge_gated(&mut plane, pos, s, qp, no_filter);
+                    }
+                }
+            }
+        }
+    }
+    // ----- chroma (§8.7.2.5.1 / .2 chroma steps) -----
+    if params.chroma_array_type == 0 {
+        return;
+    }
+    let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
+    let (cw, ch) = pic.plane_dims(Plane::Cb);
+    for plane in [Plane::Cb, Plane::Cr] {
+        let c_qp_offset = if plane == Plane::Cb {
+            params.cb_qp_offset
+        } else {
+            params.cr_qp_offset
+        };
+        let (buf, stride) = pic.plane_mut(plane);
+        let mut cplane = SamplePlane {
+            samples: buf,
+            width: stride,
+            stride,
+        };
+        match edge_type {
+            EdgeType::Vertical => {
+                // Chroma edges at 8-aligned chroma columns; a segment is
+                // four chroma rows, its bS read at the luma position of
+                // its first row.
+                let yc_start = align_up(y_start.div_ceil(sub_h), 4);
+                let yc_end = y_end.div_ceil(sub_h).min(ch);
+                for yc in (yc_start..yc_end).step_by(4) {
+                    let y = yc * sub_h;
+                    for xc in (8..cw).step_by(8) {
+                        let x = xc * sub_w;
+                        if map.bs_vertical(x, y) != 2 {
+                            continue;
+                        }
+                        let qp = EdgeQp {
+                            qp_q: qp_map.qp_at(x, y),
+                            qp_p: qp_map.qp_at(x - 1, y),
+                            beta_offset_div2: params.beta_offset_div2,
+                            tc_offset_div2: params.tc_offset_div2,
+                            bit_depth: params.bit_depth_chroma,
+                        };
+                        let pos = EdgePos {
+                            ex: xc,
+                            ey: yc,
+                            edge: edge_type,
+                        };
+                        filter_chroma_block_edge_gated(
+                            &mut cplane,
+                            pos,
+                            qp,
+                            c_qp_offset,
+                            params.chroma_array_type,
+                            no_filter,
+                        );
+                    }
+                }
+            }
+            EdgeType::Horizontal => {
+                let yc_start = align_up(y_start.div_ceil(sub_h).max(8), 8);
+                let yc_end = y_end.div_ceil(sub_h).min(ch);
+                for yc in (yc_start..yc_end).step_by(8) {
+                    let y = yc * sub_h;
+                    for xc in (0..cw).step_by(4) {
+                        let x = xc * sub_w;
+                        if map.bs_horizontal(x, y) != 2 {
+                            continue;
+                        }
+                        let qp = EdgeQp {
+                            qp_q: qp_map.qp_at(x, y),
+                            qp_p: qp_map.qp_at(x, y - 1),
+                            beta_offset_div2: params.beta_offset_div2,
+                            tc_offset_div2: params.tc_offset_div2,
+                            bit_depth: params.bit_depth_chroma,
+                        };
+                        let pos = EdgePos {
+                            ex: xc,
+                            ey: yc,
+                            edge: edge_type,
+                        };
+                        filter_chroma_block_edge_gated(
+                            &mut cplane,
+                            pos,
+                            qp,
+                            c_qp_offset,
+                            params.chroma_array_type,
+                            no_filter,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2017,11 +2362,11 @@ mod tests {
 
     /// Build a `w×h` plane filled with a constant value plus a single
     /// vertical step at column `step_x` (left = `lo`, right = `hi`).
-    fn vstep_plane(w: usize, h: usize, step_x: usize, lo: i32, hi: i32) -> Vec<i32> {
-        let mut v = vec![0i32; w * h];
+    fn vstep_plane(w: usize, h: usize, step_x: usize, lo: i32, hi: i32) -> Vec<u16> {
+        let mut v = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
-                v[y * w + x] = if x < step_x { lo } else { hi };
+                v[y * w + x] = if x < step_x { lo as u16 } else { hi as u16 };
             }
         }
         v
@@ -2036,8 +2381,8 @@ mod tests {
         // Step of 8 at column 8: left=120, right=128. With low QP the
         // strong/weak decision fires (flat halves ⇒ d=0 < β).
         let mut buf = vstep_plane(w, h, 8, 120, 128);
-        let before_p0 = buf[7]; // column 7, row 0 (p0)
-        let before_q0 = buf[8]; // column 8, row 0 (q0)
+        let before_p0 = i32::from(buf[7]); // column 7, row 0 (p0)
+        let before_q0 = i32::from(buf[8]); // column 8, row 0 (q0)
         let mut plane = SamplePlane {
             samples: &mut buf,
             width: w,
@@ -2078,7 +2423,7 @@ mod tests {
     #[test]
     fn luma_block_edge_hor_smooths_small_step() {
         let (w, h) = (8usize, 16usize);
-        let mut buf = vec![0i32; w * h];
+        let mut buf = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 buf[y * w + x] = if y < 8 { 120 } else { 128 };
@@ -2438,7 +2783,7 @@ mod tests {
                 pic.set_sample(Plane::Luma, x, y, if x < 8 { 0 } else { 255 });
             }
         }
-        let snapshot: Vec<i32> = pic.plane(Plane::Luma).to_vec();
+        let snapshot: Vec<u16> = pic.plane(Plane::Luma).to_vec();
         let field = MotionField::new(16, 16);
         let cus = vec![DeblockCuDesc {
             cu: cu16(0, 0),

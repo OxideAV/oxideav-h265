@@ -442,7 +442,8 @@ pub use recon::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use sao::{
-    apply_sao_ctb, apply_sao_picture, apply_sao_picture_full, ResolvedSao, ResolvedSaoComponent,
+    apply_sao_ctb, apply_sao_picture, apply_sao_picture_full, apply_sao_picture_in_place,
+    ResolvedSao, ResolvedSaoComponent,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

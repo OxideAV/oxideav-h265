@@ -183,13 +183,18 @@ impl H265Decoder {
                 continue;
             }
             let pts = self.pts_queue.pop().map(|r| r.0);
-            // §7.4.3.2.1 — output the conformance-cropped picture.
-            let frame = if f.crop.is_whole(&f.picture) {
-                video_frame(&f.picture, pts)
+            // §7.4.3.2.1 — output the conformance-cropped picture. The
+            // frame owns its planes when the DPB no longer shares them
+            // (a still, or a picture already unmarked), so the packing
+            // consumes them plane by plane instead of holding a second
+            // whole-picture copy.
+            let picture = if f.crop.is_whole(&f.picture) {
+                f.picture
             } else {
-                video_frame(&f.output_picture(), pts)
+                f.output_picture()
             };
-            self.ready.push_back(Frame::Video(frame));
+            self.ready
+                .push_back(Frame::Video(video_frame_owned(picture, pts)));
         }
     }
 }
@@ -253,32 +258,35 @@ impl Decoder for H265Decoder {
 
 /// Pack a reconstructed [`Picture`] into a [`VideoFrame`] (8-bit planes
 /// as one byte per sample; higher bit depths as little-endian 16-bit,
-/// the planar `p010le`-family layout).
-fn video_frame(pic: &Picture, pts: Option<i64>) -> VideoFrame {
-    let planes = if pic.chroma_array_type() == 0 {
-        vec![Plane::Luma]
+/// the planar `p010le`-family layout), consuming the picture so each
+/// source plane is freed as soon as it is packed.
+fn video_frame_owned(pic: Picture, pts: Option<i64>) -> VideoFrame {
+    let chroma = pic.chroma_array_type() != 0;
+    let wide = pic.bit_depth(Plane::Luma) > 8 || (chroma && pic.bit_depth(Plane::Cb) > 8);
+    let dims = [
+        pic.plane_dims(Plane::Luma),
+        pic.plane_dims(Plane::Cb),
+        pic.plane_dims(Plane::Cr),
+    ];
+    let (y, cb, cr) = pic.into_planes();
+    let sources = if chroma {
+        vec![(y, dims[0]), (cb, dims[1]), (cr, dims[2])]
     } else {
-        vec![Plane::Luma, Plane::Cb, Plane::Cr]
+        vec![(y, dims[0])]
     };
-    let wide = pic.bit_depth(Plane::Luma) > 8
-        || (pic.chroma_array_type() != 0 && pic.bit_depth(Plane::Cb) > 8);
-    let mut out = Vec::with_capacity(planes.len());
-    for plane in planes {
-        let (w, h) = pic.plane_dims(plane);
-        let buf = pic.plane(plane);
-        let mut data;
-        let stride;
-        if wide {
-            stride = w * 2;
-            data = Vec::with_capacity(w * h * 2);
-            for &v in buf.iter().take(w * h) {
-                data.extend_from_slice(&(v as u16).to_le_bytes());
+    let mut out = Vec::with_capacity(sources.len());
+    for (buf, (w, h)) in sources {
+        let n = w * h;
+        let (stride, data) = if wide {
+            let mut data = Vec::with_capacity(n * 2);
+            for &v in buf.iter().take(n) {
+                data.extend_from_slice(&v.to_le_bytes());
             }
+            (w * 2, data)
         } else {
-            stride = w;
-            data = Vec::with_capacity(w * h);
-            data.extend(buf.iter().take(w * h).map(|&v| v as u8));
-        }
+            (w, buf.iter().take(n).map(|&v| v as u8).collect())
+        };
+        drop(buf);
         out.push(VideoPlane { stride, data });
     }
     VideoFrame { pts, planes: out }

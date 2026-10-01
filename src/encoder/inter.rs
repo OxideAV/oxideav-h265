@@ -1339,9 +1339,9 @@ fn uni_l0(mv: Mv) -> PuMotion {
 /// The previous frame's reconstruction as `i32` planes (the
 /// §8.5.3.3.3 interpolation input).
 pub(crate) struct RefPlanes {
-    pub(crate) y: Vec<i32>,
-    pub(crate) cb: Vec<i32>,
-    pub(crate) cr: Vec<i32>,
+    pub(crate) y: Vec<u16>,
+    pub(crate) cb: Vec<u16>,
+    pub(crate) cr: Vec<u16>,
     pub(crate) width: usize,
     pub(crate) height: usize,
 }
@@ -1437,7 +1437,7 @@ fn integer_me(
             for i in 0..w {
                 let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
                 let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
-                let r = refp.y[ry as usize * refp.width + rx as usize];
+                let r = i32::from(refp.y[ry as usize * refp.width + rx as usize]);
                 acc += u64::from(r.abs_diff(src_y[j * w + i]));
             }
         }
@@ -1525,7 +1525,7 @@ fn integer_me(
             for i in (0..w).step_by(sub) {
                 let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
                 let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
-                let r = refp.y[ry as usize * refp.width + rx as usize];
+                let r = i32::from(refp.y[ry as usize * refp.width + rx as usize]);
                 acc += u64::from(r.abs_diff(src_y[j * w + i]));
             }
         }
@@ -2067,13 +2067,13 @@ pub(crate) fn encode_inter_slice(
     // at `spec.aq == 0`); signalled through cu_qp_delta.
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, CTB);
 
-    let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
+    let to_u16 = |p: &[u8]| -> Vec<u16> { p.iter().map(|&v| u16::from(v)).collect() };
     let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
         list.iter()
             .map(|&(_, rec)| RefPlanes {
-                y: to_i32(&rec.y),
-                cb: to_i32(&rec.cb),
-                cr: to_i32(&rec.cr),
+                y: to_u16(&rec.y),
+                cb: to_u16(&rec.cb),
+                cr: to_u16(&rec.cr),
                 width,
                 height,
             })

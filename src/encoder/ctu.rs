@@ -4584,13 +4584,13 @@ pub(crate) fn encode_inter_slice_tree(
     let tiling = make_tiling(width, height, &tree);
     let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
 
-    let to_i32 = |p: &[u8]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
+    let to_u16 = |p: &[u8]| -> Vec<u16> { p.iter().map(|&v| u16::from(v)).collect() };
     let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
         list.iter()
             .map(|&(_, rec)| RefPlanes {
-                y: to_i32(&rec.y),
-                cb: to_i32(&rec.cb),
-                cr: to_i32(&rec.cr),
+                y: to_u16(&rec.y),
+                cb: to_u16(&rec.cb),
+                cr: to_u16(&rec.cr),
                 width,
                 height,
             })
@@ -4864,9 +4864,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let pic = &frames[0].picture;
         assert_eq!(pic.chroma_array_type(), fmt.chroma_format_idc);
-        let as_u16 = |p: crate::picture::Plane| -> Vec<u16> {
-            pic.plane(p).iter().map(|&v| v as u16).collect()
-        };
+        let as_u16 = |p: crate::picture::Plane| -> Vec<u16> { pic.plane(p).to_vec() };
         let what = format!("{fmt:?} {w}x{h} qp {qp}");
         assert_eq!(
             as_u16(crate::picture::Plane::Luma),

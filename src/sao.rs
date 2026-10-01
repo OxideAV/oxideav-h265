@@ -319,55 +319,141 @@ pub fn apply_sao_ctb_full(
     if comp.sao_type_idx == 0 {
         return;
     }
-    let (nf_sw, nf_sh) = match plane {
-        Plane::Luma => (1, 1),
-        _ => crate::picture::sub_wh_c(rec.chroma_array_type()),
+    let geom = SaoPlaneGeom::of(rec, plane);
+    let src = SaoSource {
+        buf: rec.plane(plane),
+        stride: geom.pw,
+        y_origin: 0,
     };
+    let (dst, dst_stride) = sao_out.plane_mut(plane);
+    sao_ctb_core(
+        src, dst, dst_stride, &geom, comp, x_ctb, y_ctb, n_w, n_h, boundaries, no_filter,
+    );
+}
+
+/// One component plane's geometry for the §8.7.3.2 modification.
+#[derive(Debug, Clone, Copy)]
+struct SaoPlaneGeom {
+    pw: usize,
+    ph: usize,
+    bit_depth: u8,
+    /// `(SubWidthC, SubHeightC)` of the plane (`(1, 1)` for luma) — the
+    /// factor mapping plane positions to luma positions for the CTB-grid
+    /// boundary / suppression lookups.
+    sub: (usize, usize),
+}
+
+impl SaoPlaneGeom {
+    fn of(pic: &Picture, plane: Plane) -> Self {
+        let (pw, ph) = pic.plane_dims(plane);
+        let sub = match plane {
+            Plane::Luma => (1, 1),
+            _ => sub_wh_c(pic.chroma_array_type()),
+        };
+        Self {
+            pw,
+            ph,
+            bit_depth: pic.bit_depth(plane),
+            sub,
+        }
+    }
+}
+
+/// The pre-SAO `recPicture` samples the classification reads: a plane
+/// (or a horizontal band of one) whose first stored row is plane row
+/// `y_origin`.
+#[derive(Debug, Clone, Copy)]
+struct SaoSource<'a> {
+    buf: &'a [u16],
+    stride: usize,
+    y_origin: usize,
+}
+
+impl SaoSource<'_> {
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> i32 {
+        i32::from(self.buf[(y - self.y_origin) * self.stride + x])
+    }
+}
+
+/// §8.7.3.2 for one CTB of one component: classify from `src` (the
+/// pre-SAO samples), write the offset samples into `dst`.
+#[allow(clippy::too_many_arguments)]
+fn sao_ctb_core(
+    src: SaoSource<'_>,
+    dst: &mut [u16],
+    dst_stride: usize,
+    geom: &SaoPlaneGeom,
+    comp: &ResolvedSaoComponent,
+    x_ctb: usize,
+    y_ctb: usize,
+    n_w: usize,
+    n_h: usize,
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) {
+    if comp.sao_type_idx == 0 {
+        return;
+    }
+    let (nf_sw, nf_sh) = geom.sub;
     let suppressed =
         |x: usize, y: usize| -> bool { no_filter.is_some_and(|m| m.at_luma(x * nf_sw, y * nf_sh)) };
-    let bit_depth = rec.bit_depth(plane);
-    let max = (1i32 << bit_depth) - 1;
-    let (pw, ph) = rec.plane_dims(plane);
+    let max = (1i32 << geom.bit_depth) - 1;
+    let (pw, ph) = (geom.pw, geom.ph);
     let w = n_w.min(pw.saturating_sub(x_ctb));
     let h = n_h.min(ph.saturating_sub(y_ctb));
 
     if comp.sao_type_idx == 2 {
         // §8.7.3.2 edge offset (equations 8-409..8-413).
         let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
+        let (sw, sh) = geom.sub;
+        // A neighbour leaves the CTB only from its border rows (when
+        // the class has a vertical component) / border columns (a
+        // horizontal one); interior samples skip the picture / slice /
+        // tile tests entirely.
+        let vertical = v0 != 0 || v1 != 0;
+        let horizontal = h0 != 0 || h1 != 0;
         for j in 0..h {
-            for i in 0..w {
-                let xsi = (x_ctb + i) as i32;
-                let ysj = (y_ctb + j) as i32;
-                let n0x = xsi + h0;
-                let n0y = ysj + v0;
-                let n1x = xsi + h1;
-                let n1y = ysj + v1;
-                // §8.7.3.2: a neighbour outside the picture forces
-                // edgeIdx = 0 (no offset).
-                let in_pic =
-                    |x: i32, y: i32| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
-                if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
-                    continue;
-                }
-                // §8.7.3.2: a neighbour in a different slice / tile with
-                // loop filtering across that boundary disabled also
-                // forces edgeIdx = 0. Positions map to luma space for
-                // the CTB-grid lookup.
-                if let Some(b) = boundaries {
-                    let (sw, sh) = match plane {
-                        Plane::Luma => (1, 1),
-                        _ => crate::picture::sub_wh_c(rec.chroma_array_type()),
-                    };
-                    let (lx, ly) = (xsi as usize * sw, ysj as usize * sh);
-                    if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
-                        || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
-                    {
+            let ysj = y_ctb + j;
+            let border_row = vertical && (j == 0 || j + 1 == h);
+            let drow = &mut dst[ysj * dst_stride + x_ctb..ysj * dst_stride + x_ctb + w];
+            for (i, d) in drow.iter_mut().enumerate() {
+                let xsi = x_ctb + i;
+                let border_col = horizontal && (i == 0 || i + 1 == w);
+                if border_row || border_col {
+                    let n0x = xsi as i64 + i64::from(h0);
+                    let n0y = ysj as i64 + i64::from(v0);
+                    let n1x = xsi as i64 + i64::from(h1);
+                    let n1y = ysj as i64 + i64::from(v1);
+                    // §8.7.3.2: a neighbour outside the picture forces
+                    // edgeIdx = 0 (no offset).
+                    let in_pic =
+                        |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
+                    if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
                         continue;
                     }
+                    // §8.7.3.2: a neighbour in a different slice / tile
+                    // with loop filtering across that boundary disabled
+                    // also forces edgeIdx = 0. Positions map to luma
+                    // space for the CTB-grid lookup.
+                    if let Some(b) = boundaries {
+                        let (lx, ly) = (xsi * sw, ysj * sh);
+                        if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
+                            || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
+                        {
+                            continue;
+                        }
+                    }
                 }
-                let cur = rec.sample(plane, xsi as usize, ysj as usize);
-                let s0 = rec.sample(plane, n0x as usize, n0y as usize);
-                let s1 = rec.sample(plane, n1x as usize, n1y as usize);
+                let cur = src.at(xsi, ysj);
+                let s0 = src.at(
+                    (xsi as i64 + i64::from(h0)) as usize,
+                    (ysj as i64 + i64::from(v0)) as usize,
+                );
+                let s1 = src.at(
+                    (xsi as i64 + i64::from(h1)) as usize,
+                    (ysj as i64 + i64::from(v1)) as usize,
+                );
                 // equation 8-411.
                 let mut edge_idx = 2 + sign(cur - s0) + sign(cur - s1);
                 // equation 8-412.
@@ -375,17 +461,16 @@ pub fn apply_sao_ctb_full(
                     edge_idx = if edge_idx == 2 { 0 } else { edge_idx + 1 };
                 }
                 // equation 8-413.
-                if suppressed(xsi as usize, ysj as usize) {
+                if no_filter.is_some() && suppressed(xsi, ysj) {
                     continue; // §8.7.3.1 PCM / bypass suppression
                 }
                 let off = comp.offset_val[edge_idx as usize];
-                let v = (cur + off).clamp(0, max);
-                sao_out.set_sample(plane, xsi as usize, ysj as usize, v);
+                *d = (cur + off).clamp(0, max) as u16;
             }
         }
     } else {
         // §8.7.3.2 band offset (equations 8-414..8-415).
-        let band_shift = i32::from(bit_depth) - 5;
+        let band_shift = i32::from(geom.bit_depth) - 5;
         let sao_left_class = i32::from(comp.band_position);
         // equation 8-414: bandTable maps four consecutive bands to 1..=4.
         let mut band_table = [0usize; 32];
@@ -393,18 +478,18 @@ pub fn apply_sao_ctb_full(
             band_table[((k + sao_left_class) & 31) as usize] = (k + 1) as usize;
         }
         for j in 0..h {
-            for i in 0..w {
+            let ysj = y_ctb + j;
+            let drow = &mut dst[ysj * dst_stride + x_ctb..ysj * dst_stride + x_ctb + w];
+            for (i, d) in drow.iter_mut().enumerate() {
                 let xsi = x_ctb + i;
-                let ysj = y_ctb + j;
-                if suppressed(xsi, ysj) {
+                if no_filter.is_some() && suppressed(xsi, ysj) {
                     continue; // §8.7.3.1 PCM / bypass suppression
                 }
-                let cur = rec.sample(plane, xsi, ysj);
+                let cur = src.at(xsi, ysj);
                 let band_idx = band_table[(cur >> band_shift) as usize];
                 // equation 8-415.
                 let off = comp.offset_val[band_idx];
-                let v = (cur + off).clamp(0, max);
-                sao_out.set_sample(plane, xsi, ysj, v);
+                *d = (cur + off).clamp(0, max) as u16;
             }
         }
     }
@@ -482,69 +567,124 @@ pub fn apply_sao_picture_full(
     boundaries: Option<&SaoBoundaries>,
     no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
 ) -> Picture {
+    let mut out = pic.clone();
+    apply_sao_picture_in_place(
+        &mut out,
+        ctb_sao,
+        ctb_log2_size_y,
+        chroma_array_type,
+        slice_sao_luma_flag,
+        slice_sao_chroma_flag,
+        boundaries,
+        no_filter,
+    );
+    out
+}
+
+/// [`apply_sao_picture_full`] on the picture itself: the §8.7.3.1
+/// `saoPicture` replaces `recPicture` in place. The classification still
+/// reads the pre-SAO samples — each CTB row is applied from a band copy
+/// of its own rows plus the one line above and below, with the above
+/// line taken before the previous row overwrote it — so the result is
+/// identical to the two-picture form at a (CTB height + 2)-line
+/// working set per plane instead of two whole-picture copies.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_picture_in_place(
+    pic: &mut Picture,
+    ctb_sao: &[ResolvedSao],
+    ctb_log2_size_y: u32,
+    chroma_array_type: u8,
+    slice_sao_luma_flag: bool,
+    slice_sao_chroma_flag: bool,
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) {
     let ctb_size_y = 1usize << ctb_log2_size_y;
     let pic_width_in_ctbs = pic.width_luma().div_ceil(ctb_size_y);
     let pic_height_in_ctbs = pic.height_luma().div_ceil(ctb_size_y);
-    // §8.7.3.1: saoPicture starts equal to recPicture; the edge / band
-    // classification reads recPicture (the snapshot below), the write
-    // targets saoPicture.
-    let rec = pic.clone();
-    let mut out = pic.clone();
-
     let (sw, sh) = if chroma_array_type == 0 {
         (1, 1)
     } else {
         sub_wh_c(chroma_array_type)
     };
-    let n_ctb_chroma_w = ctb_size_y / sw;
-    let n_ctb_chroma_h = ctb_size_y / sh;
-
-    for ry in 0..pic_height_in_ctbs {
-        for rx in 0..pic_width_in_ctbs {
-            let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
-            if slice_sao_luma_flag {
-                apply_sao_ctb_full(
-                    &rec,
-                    &mut out,
-                    Plane::Luma,
-                    &resolved.components[0],
-                    rx * ctb_size_y,
-                    ry * ctb_size_y,
-                    ctb_size_y,
-                    ctb_size_y,
-                    boundaries,
-                    no_filter,
-                );
+    let planes: &[(Plane, usize, usize, usize)] = if chroma_array_type != 0 && slice_sao_chroma_flag
+    {
+        &[
+            (Plane::Luma, 0, ctb_size_y, ctb_size_y),
+            (Plane::Cb, 1, ctb_size_y / sw, ctb_size_y / sh),
+            (Plane::Cr, 2, ctb_size_y / sw, ctb_size_y / sh),
+        ]
+    } else {
+        &[(Plane::Luma, 0, ctb_size_y, ctb_size_y)]
+    };
+    for &(plane, cidx, n_w, n_h) in planes {
+        if cidx == 0 && !slice_sao_luma_flag {
+            continue;
+        }
+        let any = (0..pic_height_in_ctbs * pic_width_in_ctbs).any(|i| {
+            ctb_sao
+                .get(i)
+                .is_some_and(|r| r.components[cidx].sao_type_idx != 0)
+        });
+        if !any {
+            continue;
+        }
+        let geom = SaoPlaneGeom::of(pic, plane);
+        let (pw, ph) = (geom.pw, geom.ph);
+        // The band: rows [y0 − 1, y0 + n_h] of the pre-SAO plane. Its
+        // first line (the row above) is kept from the previous band
+        // before that row was overwritten.
+        let mut band = vec![0u16; (n_h + 2) * pw];
+        let mut above_line: Vec<u16> = Vec::new();
+        for ry in 0..pic_height_in_ctbs {
+            let y0 = ry * n_h;
+            if y0 >= ph {
+                break;
             }
-            if chroma_array_type != 0 && slice_sao_chroma_flag {
-                apply_sao_ctb_full(
-                    &rec,
-                    &mut out,
-                    Plane::Cb,
-                    &resolved.components[1],
-                    rx * n_ctb_chroma_w,
-                    ry * n_ctb_chroma_h,
-                    n_ctb_chroma_w,
-                    n_ctb_chroma_h,
-                    boundaries,
-                    no_filter,
-                );
-                apply_sao_ctb_full(
-                    &rec,
-                    &mut out,
-                    Plane::Cr,
-                    &resolved.components[2],
-                    rx * n_ctb_chroma_w,
-                    ry * n_ctb_chroma_h,
-                    n_ctb_chroma_w,
-                    n_ctb_chroma_h,
+            let h = n_h.min(ph - y0);
+            let y_origin = y0.saturating_sub(1);
+            {
+                let (buf, stride) = pic.plane_mut(plane);
+                let band_rows = (y0 + h + 1).min(ph) - y_origin;
+                // Rows y0 .. min(y0 + h + 1, ph) come from the picture
+                // (not yet modified); the row above from the saved line.
+                let first_fresh = if y0 == 0 { 0 } else { 1 };
+                for r in first_fresh..band_rows {
+                    let y = y_origin + r;
+                    band[r * pw..(r + 1) * pw].copy_from_slice(&buf[y * stride..y * stride + pw]);
+                }
+                if y0 > 0 {
+                    band[..pw].copy_from_slice(&above_line);
+                }
+                // Save the pre-SAO last line of this row for the next.
+                above_line.clear();
+                above_line
+                    .extend_from_slice(&band[(h + first_fresh - 1) * pw..(h + first_fresh) * pw]);
+            }
+            let src = SaoSource {
+                buf: &band,
+                stride: pw,
+                y_origin,
+            };
+            let (dst, dst_stride) = pic.plane_mut(plane);
+            for rx in 0..pic_width_in_ctbs {
+                let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
+                sao_ctb_core(
+                    src,
+                    dst,
+                    dst_stride,
+                    &geom,
+                    &resolved.components[cidx],
+                    rx * n_w,
+                    y0,
+                    n_w,
+                    n_h,
                     boundaries,
                     no_filter,
                 );
             }
         }
     }
-    out
 }
 
 #[cfg(test)]

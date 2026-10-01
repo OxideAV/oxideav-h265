@@ -55,7 +55,7 @@
 pub struct RefPlane<'a> {
     /// Row-major samples, `width * height` of them. `sample[ y * width + x ]`
     /// is the plane sample at full-sample location `( x, y )`.
-    samples: &'a [i32],
+    samples: &'a [u16],
     /// Plane width in samples (`pic_width_in_luma_samples` for luma, or
     /// `pic_width_in_luma_samples / SubWidthC` for chroma).
     width: usize,
@@ -71,7 +71,7 @@ impl<'a> RefPlane<'a> {
     /// [`InterPredError::PlaneLengthMismatch`] if `samples.len()` is not
     /// exactly `width * height`, or [`InterPredError::EmptyPlane`] if
     /// either dimension is zero.
-    pub fn new(samples: &'a [i32], width: usize, height: usize) -> Result<Self, InterPredError> {
+    pub fn new(samples: &'a [u16], width: usize, height: usize) -> Result<Self, InterPredError> {
         if width == 0 || height == 0 {
             return Err(InterPredError::EmptyPlane);
         }
@@ -113,7 +113,7 @@ impl<'a> RefPlane<'a> {
     pub fn at(&self, x: i32, y: i32) -> i32 {
         let xc = x.clamp(0, self.width as i32 - 1) as usize;
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
-        self.samples[yc * self.width + xc]
+        i32::from(self.samples[yc * self.width + xc])
     }
 }
 
@@ -947,7 +947,7 @@ mod tests {
     /// the `v << shift3` (`shift3 == 6`) full-pel value.
     #[test]
     fn luma_flat_plane_constant() {
-        let plane_samples = vec![100i32; 16 * 16];
+        let plane_samples = vec![100u16; 16 * 16];
         let plane = RefPlane::new(&plane_samples, 16, 16).unwrap();
         for xf in 0..=3 {
             for yf in 0..=3 {
@@ -962,9 +962,9 @@ mod tests {
     /// Full-pel luma is `A << shift3`; at 8-bit `shift3 == 6`.
     #[test]
     fn luma_full_pel_shift3() {
-        let mut s = vec![0i32; 8 * 8];
+        let mut s = vec![0u16; 8 * 8];
         for (i, v) in s.iter_mut().enumerate() {
-            *v = i as i32;
+            *v = i as u16;
         }
         let plane = RefPlane::new(&s, 8, 8).unwrap();
         let blk = interp_luma_block(&plane, 2, 3, 0, 0, 2, 2, 8).unwrap();
@@ -980,7 +980,7 @@ mod tests {
     fn luma_a_kernel_hand_value() {
         // A row of samples; pick a center so the 8 taps land inside.
         // Coords x = −3..4 around x_int = 5 -> indices 2..9.
-        let mut s = vec![0i32; 16];
+        let mut s = vec![0u16; 16];
         let vals = [
             10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
         ];
@@ -997,7 +997,7 @@ mod tests {
     /// kernel sums to 64) for all 8x8 eighth-pel phases.
     #[test]
     fn chroma_flat_plane_constant() {
-        let plane_samples = vec![77i32; 12 * 12];
+        let plane_samples = vec![77u16; 12 * 12];
         let plane = RefPlane::new(&plane_samples, 12, 12).unwrap();
         for xf in 0..=7 {
             for yf in 0..=7 {
@@ -1150,7 +1150,7 @@ mod tests {
     /// 10-bit full-pel luma uses shift3 = Max(2, 4) = 4.
     #[test]
     fn luma_full_pel_10bit() {
-        let s = vec![500i32; 8 * 8];
+        let s = vec![500u16; 8 * 8];
         let plane = RefPlane::new(&s, 8, 8).unwrap();
         let blk = interp_luma_block(&plane, 2, 2, 0, 0, 1, 1, 10).unwrap();
         assert_eq!(blk[0], 500 << 4);
@@ -1159,7 +1159,7 @@ mod tests {
     /// Error surface: zero block, bad fraction, bad bit depth, bad plane.
     #[test]
     fn errors() {
-        let s = vec![0i32; 4];
+        let s = vec![0u16; 4];
         let plane = RefPlane::new(&s, 2, 2).unwrap();
         assert_eq!(
             interp_luma_block(&plane, 0, 0, 0, 0, 0, 1, 8),
@@ -1195,8 +1195,8 @@ mod tests {
     /// End-to-end: interpolate two reference blocks and bi-combine.
     #[test]
     fn pipeline_luma_bi() {
-        let a = vec![80i32; 16 * 16];
-        let b = vec![120i32; 16 * 16];
+        let a = vec![80u16; 16 * 16];
+        let b = vec![120u16; 16 * 16];
         let pa = RefPlane::new(&a, 16, 16).unwrap();
         let pb = RefPlane::new(&b, 16, 16).unwrap();
         let l0 = interp_luma_block(&pa, 4, 4, 2, 2, 4, 4, 8).unwrap();
@@ -1216,9 +1216,9 @@ mod tests {
     /// `(p + offset1) >> shift1` recovers `A`).
     #[test]
     fn driver_uni_l0_full_pel_flat() {
-        let luma = vec![130i32; 32 * 32];
-        let cb = vec![70i32; 16 * 16];
-        let cr = vec![200i32; 16 * 16];
+        let luma = vec![130u16; 32 * 32];
+        let cb = vec![70u16; 16 * 16];
+        let cr = vec![200u16; 16 * 16];
         let lp = RefPlane::new(&luma, 32, 32).unwrap();
         let cbp = RefPlane::new(&cb, 16, 16).unwrap();
         let crp = RefPlane::new(&cr, 16, 16).unwrap();
@@ -1231,7 +1231,7 @@ mod tests {
             mv_c: [0, 0],
         };
         // Unused L1: a dummy (1x1) plane that is never read.
-        let dummy = vec![0i32; 1];
+        let dummy = vec![0u16; 1];
         let dp = RefPlane::new(&dummy, 1, 1).unwrap();
         let l1 = ListPrediction {
             pred_flag: false,
@@ -1265,14 +1265,14 @@ mod tests {
     #[test]
     fn driver_full_pel_mv_shifts_window() {
         // 16-wide luma ramp where sample(x,y) == x.
-        let mut luma = vec![0i32; 16 * 16];
+        let mut luma = vec![0u16; 16 * 16];
         for y in 0..16 {
             for x in 0..16 {
-                luma[y * 16 + x] = x as i32;
+                luma[y * 16 + x] = x as u16;
             }
         }
         let lp = RefPlane::new(&luma, 16, 16).unwrap();
-        let dummy = vec![0i32; 1];
+        let dummy = vec![0u16; 1];
         let dp = RefPlane::new(&dummy, 1, 1).unwrap();
         let l0 = ListPrediction {
             pred_flag: true,
@@ -1312,8 +1312,8 @@ mod tests {
     /// Bi-prediction on two flat planes averages the two reference values.
     #[test]
     fn driver_bi_averages() {
-        let a = vec![60i32; 16 * 16];
-        let b = vec![100i32; 16 * 16];
+        let a = vec![60u16; 16 * 16];
+        let b = vec![100u16; 16 * 16];
         let pa = RefPlane::new(&a, 16, 16).unwrap();
         let pb = RefPlane::new(&b, 16, 16).unwrap();
         let l0 = ListPrediction {
@@ -1349,7 +1349,7 @@ mod tests {
     /// The driver rejects a PU with no list selected and a zero block.
     #[test]
     fn driver_errors() {
-        let dummy = vec![0i32; 1];
+        let dummy = vec![0u16; 1];
         let dp = RefPlane::new(&dummy, 1, 1).unwrap();
         let none = ListPrediction {
             pred_flag: false,

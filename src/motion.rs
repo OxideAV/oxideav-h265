@@ -857,7 +857,46 @@ pub fn derive_mvp_candidate(
 pub struct MotionField {
     width_4: usize,
     height_4: usize,
-    cells: Vec<MotionCell>,
+    /// Per-cell mode bits ([`FLAG_INTRA`] / [`FLAG_NONZERO`] /
+    /// [`FLAG_PRED_L0`] / [`FLAG_PRED_L1`]).
+    flags: Vec<u8>,
+    /// Per-cell reference identities + motion vectors, allocated on the
+    /// first inter cell (an intra-only picture — every still — carries
+    /// the flags alone).
+    motion: Vec<CellMotion>,
+}
+
+const FLAG_INTRA: u8 = 1;
+const FLAG_NONZERO: u8 = 2;
+const FLAG_PRED_L0: u8 = 4;
+const FLAG_PRED_L1: u8 = 8;
+
+/// The motion part of a cell: the §8.5.3.2 motion vectors are 16-bit
+/// by construction (equations 8-94 .. 8-101 wrap them to `[−2^15,
+/// 2^15 − 1]`), so each is stored as two `i16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellMotion {
+    ref_poc_l0: i32,
+    ref_poc_l1: i32,
+    mv_l0: [i16; 2],
+    mv_l1: [i16; 2],
+}
+
+const NO_MOTION: CellMotion = CellMotion {
+    ref_poc_l0: i32::MIN,
+    ref_poc_l1: i32::MIN,
+    mv_l0: [0; 2],
+    mv_l1: [0; 2],
+};
+
+#[inline]
+fn mv16(mv: Mv) -> [i16; 2] {
+    debug_assert!(
+        (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&mv[0])
+            && (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&mv[1]),
+        "motion vector outside the §8.5.3.2 16-bit range: {mv:?}"
+    );
+    [mv[0] as i16, mv[1] as i16]
 }
 
 /// One 4×4 block's motion / mode record in a [`MotionField`].
@@ -884,6 +923,40 @@ pub struct MotionCell {
     pub mv_l1: Mv,
 }
 
+impl MotionCell {
+    #[inline]
+    fn flags(&self) -> u8 {
+        (u8::from(self.is_intra) * FLAG_INTRA)
+            | (u8::from(self.has_nonzero_coeff) * FLAG_NONZERO)
+            | (u8::from(self.pred_flag_l0) * FLAG_PRED_L0)
+            | (u8::from(self.pred_flag_l1) * FLAG_PRED_L1)
+    }
+
+    #[inline]
+    fn motion(&self) -> CellMotion {
+        CellMotion {
+            ref_poc_l0: self.ref_poc_l0,
+            ref_poc_l1: self.ref_poc_l1,
+            mv_l0: mv16(self.mv_l0),
+            mv_l1: mv16(self.mv_l1),
+        }
+    }
+
+    #[inline]
+    fn compose(flags: u8, m: CellMotion) -> Self {
+        Self {
+            is_intra: flags & FLAG_INTRA != 0,
+            has_nonzero_coeff: flags & FLAG_NONZERO != 0,
+            pred_flag_l0: flags & FLAG_PRED_L0 != 0,
+            pred_flag_l1: flags & FLAG_PRED_L1 != 0,
+            ref_poc_l0: m.ref_poc_l0,
+            ref_poc_l1: m.ref_poc_l1,
+            mv_l0: [i32::from(m.mv_l0[0]), i32::from(m.mv_l0[1])],
+            mv_l1: [i32::from(m.mv_l1[0]), i32::from(m.mv_l1[1])],
+        }
+    }
+}
+
 impl MotionField {
     /// Allocate a motion field covering a `width_luma × height_luma`
     /// picture, rounded up to whole 4×4 blocks. Every cell starts as an
@@ -894,16 +967,11 @@ impl MotionField {
         let height_4 = height_luma.div_ceil(4);
         // The unwritten background is an intra cell with no reference
         // pictures (the §8.7.2.4 intra test reads `is_intra`).
-        let background = MotionCell {
-            is_intra: true,
-            ref_poc_l0: i32::MIN,
-            ref_poc_l1: i32::MIN,
-            ..MotionCell::default()
-        };
         Self {
             width_4,
             height_4,
-            cells: vec![background; width_4 * height_4],
+            flags: vec![FLAG_INTRA; width_4 * height_4],
+            motion: Vec::new(),
         }
     }
 
@@ -921,6 +989,21 @@ impl MotionField {
         self.height_4
     }
 
+    /// The per-cell motion store, allocated on first use.
+    #[inline]
+    fn motion_mut(&mut self) -> &mut [CellMotion] {
+        if self.motion.is_empty() {
+            self.motion = vec![NO_MOTION; self.width_4 * self.height_4];
+        }
+        &mut self.motion
+    }
+
+    #[inline]
+    fn cell_index(&self, idx: usize) -> MotionCell {
+        let m = self.motion.get(idx).copied().unwrap_or(NO_MOTION);
+        MotionCell::compose(self.flags[idx], m)
+    }
+
     /// The motion cell covering luma sample `(x, y)`.
     ///
     /// # Panics
@@ -929,7 +1012,13 @@ impl MotionField {
     pub fn cell_at(&self, x: usize, y: usize) -> MotionCell {
         let bx = x / 4;
         let by = y / 4;
-        self.cells[by * self.width_4 + bx]
+        self.cell_index(by * self.width_4 + bx)
+    }
+
+    /// Whether any cell is inter-coded (the field carries motion).
+    #[must_use]
+    pub fn has_motion(&self) -> bool {
+        !self.motion.is_empty()
     }
 
     /// Set every 4×4 cell covering the luma rectangle `[(x0, y0),
@@ -940,9 +1029,18 @@ impl MotionField {
         let by0 = y0 / 4;
         let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
         let by1 = ((y0 + h).min(self.height_4 * 4)).div_ceil(4);
+        let flags = cell.flags();
+        let w4 = self.width_4;
         for by in by0..by1 {
-            for bx in bx0..bx1 {
-                self.cells[by * self.width_4 + bx] = cell;
+            self.flags[by * w4 + bx0..by * w4 + bx1].fill(flags);
+        }
+        // An intra cell without motion needs no payload — unless the
+        // store already exists (then its stale motion must be cleared).
+        if !cell.is_intra || !self.motion.is_empty() {
+            let m = cell.motion();
+            let motion = self.motion_mut();
+            for by in by0..by1 {
+                motion[by * w4 + bx0..by * w4 + bx1].fill(m);
             }
         }
     }
@@ -965,7 +1063,9 @@ impl MotionField {
         let by1 = ((y0 + h).min(self.height_4 * 4)).div_ceil(4);
         let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
         for by in by0..by1 {
-            out.extend_from_slice(&self.cells[by * self.width_4 + bx0..by * self.width_4 + bx1]);
+            for bx in bx0..bx1 {
+                out.push(self.cell_index(by * self.width_4 + bx));
+            }
         }
         out
     }
@@ -984,9 +1084,20 @@ impl MotionField {
         let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
         let by1 = ((y0 + h).min(self.height_4 * 4)).div_ceil(4);
         let row = bx1 - bx0;
+        let w4 = self.width_4;
+        let any_inter = cells.iter().any(|c| !c.is_intra);
+        if any_inter || !self.motion.is_empty() {
+            let motion = self.motion_mut();
+            for (i, by) in (by0..by1).enumerate() {
+                for (j, c) in cells[i * row..(i + 1) * row].iter().enumerate() {
+                    motion[by * w4 + bx0 + j] = c.motion();
+                }
+            }
+        }
         for (i, by) in (by0..by1).enumerate() {
-            self.cells[by * self.width_4 + bx0..by * self.width_4 + bx1]
-                .copy_from_slice(&cells[i * row..(i + 1) * row]);
+            for (j, c) in cells[i * row..(i + 1) * row].iter().enumerate() {
+                self.flags[by * w4 + bx0 + j] = c.flags();
+            }
         }
     }
 
@@ -1001,8 +1112,8 @@ impl MotionField {
         let bx1 = ((x0 + w).min(self.width_4 * 4)).div_ceil(4);
         let by1 = ((y0 + h).min(self.height_4 * 4)).div_ceil(4);
         for by in by0..by1 {
-            for bx in bx0..bx1 {
-                self.cells[by * self.width_4 + bx].has_nonzero_coeff = true;
+            for f in &mut self.flags[by * self.width_4 + bx0..by * self.width_4 + bx1] {
+                *f |= FLAG_NONZERO;
             }
         }
     }

@@ -578,12 +578,22 @@ fn predict_add_store(
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
     // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
+    let (buf, stride) = pic.plane_mut(plane);
     for y in 0..n_tbs {
-        for x in 0..n_tbs {
-            let p = pred[y * n_tbs + x];
-            let r = res.map_or(0, |r| r[y * n_tbs + x]);
-            let v = clip1(p + r, bit_depth);
-            pic.set_sample(plane, xb + x, yb + y, v);
+        let row = &mut buf[(yb + y) * stride + xb..(yb + y) * stride + xb + n_tbs];
+        let prow = &pred[y * n_tbs..(y + 1) * n_tbs];
+        match res {
+            Some(r) => {
+                let rrow = &r[y * n_tbs..(y + 1) * n_tbs];
+                for ((d, &p), &r) in row.iter_mut().zip(prow).zip(rrow) {
+                    *d = clip1(p + r, bit_depth) as u16;
+                }
+            }
+            None => {
+                for (d, &p) in row.iter_mut().zip(prow) {
+                    *d = clip1(p, bit_depth) as u16;
+                }
+            }
         }
     }
     Ok(())
@@ -766,11 +776,22 @@ fn write_inter_plane(
     residual: Option<&[i32]>,
 ) {
     let bit_depth = pic.bit_depth(plane);
+    let (buf, stride) = pic.plane_mut(plane);
     for y in 0..h {
-        for x in 0..w {
-            let p = pred[y * w + x];
-            let r = residual.map_or(0, |r| r[y * w + x]);
-            pic.set_sample(plane, x0 + x, y0 + y, clip1(p + r, bit_depth));
+        let row = &mut buf[(y0 + y) * stride + x0..(y0 + y) * stride + x0 + w];
+        let prow = &pred[y * w..(y + 1) * w];
+        match residual {
+            Some(r) => {
+                let rrow = &r[y * w..(y + 1) * w];
+                for ((d, &p), &r) in row.iter_mut().zip(prow).zip(rrow) {
+                    *d = clip1(p + r, bit_depth) as u16;
+                }
+            }
+            None => {
+                for (d, &p) in row.iter_mut().zip(prow) {
+                    *d = clip1(p, bit_depth) as u16;
+                }
+            }
         }
     }
 }
@@ -1549,6 +1570,14 @@ impl ReconCtx {
         self.slice_addr_rs = map;
     }
 
+    /// Record `SliceAddrRs[ ctb_rs ]` for one CTB (the streaming driver
+    /// fills the map as the CTUs arrive in decode order).
+    pub fn set_slice_addr_rs_at(&mut self, ctb_rs: u32, slice_addr_rs: u32) {
+        if let Some(e) = self.slice_addr_rs.get_mut(ctb_rs as usize) {
+            *e = slice_addr_rs;
+        }
+    }
+
     /// `SliceAddrRs[ ctbAddrRs ]` for the CTB raster address.
     #[inline]
     fn slice_addr_of(&self, ctb_rs: u32) -> u32 {
@@ -1889,15 +1918,17 @@ pub fn reconstruct_intra_picture(
 
     // §8.7.3.1 — apply SAO across the whole picture (no-op when both slice
     // SAO flags are clear or every CTB resolved to type 0).
-    let filtered = crate::sao::apply_sao_picture(
-        &pic,
+    crate::sao::apply_sao_picture_in_place(
+        &mut pic,
         &sao_grid,
         pic_params.ctb_log2_size_y,
         params.chroma_array_type,
         pic_params.slice_sao_luma_flag,
         pic_params.slice_sao_chroma_flag,
+        None,
+        None,
     );
-    Ok(filtered)
+    Ok(pic)
 }
 
 fn reconstruct_quadtree(
@@ -1987,7 +2018,10 @@ fn write_palette_cu(
         qp_luma,
         u32::from(params.bit_depth_luma),
         transquant_bypass,
-        |x, y, v| pic.set_sample(Plane::Luma, x_cb + x, y_cb + y, v),
+        {
+            let (buf, stride) = pic.plane_mut(Plane::Luma);
+            move |x, y, v| buf[(y_cb + y) * stride + x_cb + x] = v as u16
+        },
     );
     if params.chroma_array_type != 0 {
         let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
@@ -2005,7 +2039,10 @@ fn write_palette_cu(
                 qp_c,
                 u32::from(params.bit_depth_chroma),
                 transquant_bypass,
-                |x, y, v| pic.set_sample(plane, cx + x, cy + y, v),
+                {
+                    let (buf, stride) = pic.plane_mut(plane);
+                    move |x, y, v| buf[(cy + y) * stride + cx + x] = v as u16
+                },
             );
         }
     }
@@ -2019,14 +2056,11 @@ fn write_pcm_cu(
     n_cb: usize,
     pcm: &crate::slice_data::PcmSamples,
 ) {
-    for j in 0..n_cb {
-        for i in 0..n_cb {
-            pic.set_sample(
-                Plane::Luma,
-                x_cb + i,
-                y_cb + j,
-                i32::from(pcm.luma[n_cb * j + i]),
-            );
+    {
+        let (buf, stride) = pic.plane_mut(Plane::Luma);
+        for j in 0..n_cb {
+            let o = (y_cb + j) * stride + x_cb;
+            buf[o..o + n_cb].copy_from_slice(&pcm.luma[n_cb * j..n_cb * (j + 1)]);
         }
     }
     if chroma_array_type != 0 {
@@ -2034,10 +2068,10 @@ fn write_pcm_cu(
         let (cw, ch) = (n_cb / sub_w, n_cb / sub_h);
         let (cx, cy) = (x_cb / sub_w, y_cb / sub_h);
         for (plane, samples) in [(Plane::Cb, &pcm.cb), (Plane::Cr, &pcm.cr)] {
+            let (buf, stride) = pic.plane_mut(plane);
             for j in 0..ch {
-                for i in 0..cw {
-                    pic.set_sample(plane, cx + i, cy + j, i32::from(samples[cw * j + i]));
-                }
+                let o = (cy + j) * stride + cx;
+                buf[o..o + cw].copy_from_slice(&samples[cw * j..cw * (j + 1)]);
             }
         }
     }

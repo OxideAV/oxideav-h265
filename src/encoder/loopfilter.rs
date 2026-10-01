@@ -277,7 +277,7 @@ fn planes_to_picture<S: Sample>(
         let (buf, _stride) = pic.plane_mut(plane);
         debug_assert_eq!(buf.len(), data.len());
         for (dst, &src) in buf.iter_mut().zip(data.iter()) {
-            *dst = src.to_i32();
+            *dst = src.to_i32() as u16;
         }
     }
     pic
@@ -289,7 +289,7 @@ fn plane_ssd<S: Sample>(pic: &Picture, plane: Plane, src: &[S]) -> u64 {
         .iter()
         .zip(src.iter())
         .map(|(&a, &b)| {
-            let d = i64::from(a - b.to_i32());
+            let d = i64::from(i32::from(a) - b.to_i32());
             (d * d) as u64
         })
         .sum()
@@ -330,10 +330,11 @@ fn restore_region(
     w: usize,
     h: usize,
 ) {
+    let src = from.plane(plane);
+    let (dst, stride) = to.plane_mut(plane);
     for j in 0..h {
-        for i in 0..w {
-            to.set_sample(plane, x0 + i, y0 + j, from.sample(plane, x0 + i, y0 + j));
-        }
+        let o = (y0 + j) * stride + x0;
+        dst[o..o + w].copy_from_slice(&src[o..o + w]);
     }
 }
 
@@ -1003,7 +1004,7 @@ pub(crate) fn filter_frame<S: Sample>(
     let to_samples = |plane: Plane, max: i32| -> Vec<S> {
         out.plane(plane)
             .iter()
-            .map(|&v| S::clipped(v, max))
+            .map(|&v| S::clipped(i32::from(v), max))
             .collect()
     };
     let y = to_samples(Plane::Luma, fmt.max_luma());

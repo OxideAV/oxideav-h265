@@ -196,6 +196,14 @@ impl Dpb {
         self.entries.push(entry);
     }
 
+    /// Drop every picture marked "unused for reference" (§C.5.2.2 — a
+    /// picture that is neither needed for output, which this store does
+    /// not track, nor used for reference is emptied from the DPB). Entry
+    /// indices shift down; callers hold none across this call.
+    pub fn evict_unused(&mut self) {
+        self.entries.retain(|e| e.marking != Marking::Unused);
+    }
+
     /// Remove the entry at `idx` (a temporary Annex H inter-layer
     /// reference picture once its picture is decoded). Indices above
     /// `idx` shift down by one.

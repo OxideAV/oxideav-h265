@@ -109,7 +109,7 @@ fn sps_of(stream: &[u8]) -> SeqParameterSet {
 }
 
 /// PSNR of the top-left `w x h` of `out` (stride `ow`) against `src`.
-fn psnr(src: &[u8], w: usize, h: usize, out: &[i32], ow: usize) -> f64 {
+fn psnr(src: &[u8], w: usize, h: usize, out: &[u16], ow: usize) -> f64 {
     let mut sse = 0f64;
     for j in 0..h {
         for i in 0..w {
@@ -249,7 +249,7 @@ fn still_pcm_odd_size_is_lossless_after_crop() {
     for j in 0..218 {
         for i in 0..334 {
             let expect = y[j.min(H - 1) * W + i.min(W - 1)];
-            assert_eq!(luma[j * 334 + i], i32::from(expect), "luma ({i},{j})");
+            assert_eq!(luma[j * 334 + i], u16::from(expect), "luma ({i},{j})");
         }
     }
     let (cw, ch) = (W.div_ceil(2), H.div_ceil(2));
@@ -262,7 +262,7 @@ fn still_pcm_odd_size_is_lossless_after_crop() {
             for i in 0..167 {
                 assert_eq!(
                     p[j * 167 + i],
-                    i32::from(src[j.min(ch - 1) * cw + i.min(cw - 1)])
+                    u16::from(src[j.min(ch - 1) * cw + i.min(cw - 1)])
                 );
             }
         }

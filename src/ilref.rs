@@ -292,7 +292,7 @@ impl IlRefGeometry {
 /// process over the whole current plane.
 #[allow(clippy::too_many_arguments)]
 fn resample_plane(
-    src: &[i32],
+    src: &[u16],
     src_w: usize,
     src_h: usize,
     dst_w: usize,
@@ -301,7 +301,7 @@ fn resample_plane(
     bd_cur: u8,
     chroma: bool,
     geom: &IlRefGeometry,
-) -> Vec<i32> {
+) -> Vec<u16> {
     let taps: usize = if chroma { 4 } else { 8 };
     let half: i32 = if chroma { 1 } else { 3 };
     let coef = |phase: usize, k: usize| -> i32 {
@@ -340,7 +340,7 @@ fn resample_plane(
         }
     }
     // Vertical pass (H-39 / H-51).
-    let mut out = vec![0i32; dst_w * dst_h];
+    let mut out = vec![0u16; dst_w * dst_h];
     for y in 0..dst_h as i32 {
         let (_, y16) = geom.ref16(chroma, 0, y);
         let y_ref = (y16 >> 4) as i32;
@@ -352,7 +352,7 @@ fn resample_plane(
                 let ys = (y_ref + n as i32 - half).clamp(0, sh - 1) as usize;
                 acc += i64::from(coef(phase, n)) * temp[ys * dst_w + x];
             }
-            orow[x] = (acc >> shift2).clamp(0, max_val) as i32;
+            orow[x] = (acc >> shift2).clamp(0, max_val) as u16;
         }
     }
     out
@@ -389,7 +389,7 @@ pub fn resample_picture(geom: &IlRefGeometry, rl: &Picture) -> Picture {
             let (scw, sch) = rl.plane_dims(plane);
             let res = if geom.rl.chroma_array_type == 0 {
                 // A monochrome reference: chroma at mid-grey.
-                vec![1i32 << (cur.bit_depth_chroma - 1); dst_cw * dst_ch]
+                vec![1u16 << (cur.bit_depth_chroma - 1); dst_cw * dst_ch]
             } else {
                 resample_plane(
                     rl.plane(plane),
@@ -545,7 +545,7 @@ mod tests {
     fn bit_depth_only_resampling_is_a_left_shift() {
         let mut rl = Picture::new(16, 16, 1, 8, 8);
         for (i, v) in rl.plane_mut(Plane::Luma).0.iter_mut().enumerate() {
-            *v = (i % 256) as i32;
+            *v = (i % 256) as u16;
         }
         let g = IlRefGeometry::derive(fmt(16, 16, 1, 10), LayerFormat::of(&rl), None).unwrap();
         assert!(g.equal_picture_size_and_offset());
@@ -565,13 +565,13 @@ mod tests {
             let (p, stride) = rl.plane_mut(Plane::Luma);
             for y in 0..4 {
                 for x in 0..16 {
-                    p[y * stride + x] = (x * 8) as i32;
+                    p[y * stride + x] = (x * 8) as u16;
                 }
             }
         }
         let g = IlRefGeometry::derive(fmt(32, 4, 0, 8), LayerFormat::of(&rl), None).unwrap();
         let out = resample_picture(&g, &rl);
-        let row: Vec<i32> = out.plane(Plane::Luma)[..32].to_vec();
+        let row: Vec<u16> = out.plane(Plane::Luma)[..32].to_vec();
         assert!(row.windows(2).all(|w| w[0] <= w[1]), "{row:?}");
         // 2:1 with phase 0: eq. H-63 gives xRef16 = 8 * x, so even
         // outputs reproduce the reference samples and odd ones (phase

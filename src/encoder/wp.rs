@@ -203,7 +203,10 @@ pub(crate) fn weighted_ref_planes(refs: &[RefPlanes], entries: &[WpRefEntry]) ->
                 Some((dw, o)) => {
                     let w = (1 << LOG2_WEIGHT_DENOM) + dw;
                     r.y.iter()
-                        .map(|&v| (((v * w + 32) >> LOG2_WEIGHT_DENOM) + o).clamp(0, 255))
+                        .map(|&v| {
+                            (((i32::from(v) * w + 32) >> LOG2_WEIGHT_DENOM) + o).clamp(0, 255)
+                                as u16
+                        })
                         .collect()
                 }
                 None => r.y.clone(),

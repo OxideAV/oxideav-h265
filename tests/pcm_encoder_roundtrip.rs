@@ -110,7 +110,7 @@ fn encoder_pads_unaligned_dimensions_and_rejects_zero() {
     assert!(luma
         .iter()
         .enumerate()
-        .all(|(i, &v)| v == i32::from((i % 251) as u8)));
+        .all(|(i, &v)| v == u16::from((i % 251) as u8)));
 
     for (w, h) in [(0u32, 32u32), (50, 0)] {
         let mut params = CodecParameters::video("h265".into());

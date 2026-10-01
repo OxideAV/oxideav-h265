@@ -7,11 +7,24 @@
 //! writes into these planes; the DPB and any output cropping read out of
 //! them.
 //!
-//! Samples are stored one `i32` per pixel so the prediction + residual
-//! arithmetic of §8.4.4 / §8.6.2 (which works in the full `i32` range
-//! before the final `Clip1Y` / `Clip1C` clip) can write the clipped
-//! result without an intermediate type change. The stored values are
-//! always already clipped to `[0, (1 << bitDepth) − 1]`.
+//! Samples are stored one `u16` per pixel — every bit depth the
+//! Recommendation allows (8..=16) fits, and the stored values are
+//! always already clipped to `[0, (1 << bitDepth) − 1]` by the
+//! §8.6.7 / §8.7 clips. The sample accessors widen to `i32` so the
+//! prediction + residual arithmetic of §8.4.4 / §8.6.2 (which works in
+//! the full `i32` range before the final `Clip1Y` / `Clip1C` clip)
+//! stays in one type.
+//!
+//! Each plane lives behind a shared, copy-on-write handle: cloning a
+//! `Picture` shares the sample buffers (the DPB's reference copy and
+//! the output frame of the same decoded picture are one allocation),
+//! and the first mutation of a shared plane copies it. A plane handed
+//! out through [`Picture::plane_mut`] is therefore unique for the
+//! duration of the borrow; hot reconstruction loops take the plane
+//! once and index it rather than calling [`Picture::set_sample`] per
+//! sample.
+
+use std::sync::Arc;
 
 /// One reconstructed picture: the luma plane and (unless monochrome) the
 /// two chroma planes, each row-major.
@@ -33,11 +46,11 @@ pub struct Picture {
     /// `BitDepthC`.
     bit_depth_chroma: u8,
     /// `SL[ x ][ y ]`, row-major (`luma[y * width_luma + x]`).
-    luma: Vec<i32>,
+    luma: Arc<Vec<u16>>,
     /// `SCb[ x ][ y ]`, row-major; empty when monochrome.
-    cb: Vec<i32>,
+    cb: Arc<Vec<u16>>,
     /// `SCr[ x ][ y ]`, row-major; empty when monochrome.
-    cr: Vec<i32>,
+    cr: Arc<Vec<u16>>,
 }
 
 /// The three colour components addressable in a [`Picture`].
@@ -88,9 +101,9 @@ impl Picture {
             let (sw, sh) = sub_wh_c(chroma_array_type);
             (width_luma / sw, height_luma / sh)
         };
-        let luma = vec![0i32; width_luma * height_luma];
-        let cb = vec![0i32; width_chroma * height_chroma];
-        let cr = vec![0i32; width_chroma * height_chroma];
+        let luma = Arc::new(vec![0u16; width_luma * height_luma]);
+        let cb = Arc::new(vec![0u16; width_chroma * height_chroma]);
+        let cr = Arc::new(vec![0u16; width_chroma * height_chroma]);
         Self {
             width_luma,
             height_luma,
@@ -103,6 +116,72 @@ impl Picture {
             cb,
             cr,
         }
+    }
+
+    /// Build a picture around already-reconstructed planes (row-major,
+    /// `width * height` samples each; the chroma vectors are ignored
+    /// for a monochrome picture).
+    ///
+    /// # Panics
+    /// Panics if a plane's length does not match the geometry.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_planes(
+        width_luma: usize,
+        height_luma: usize,
+        chroma_array_type: u8,
+        bit_depth_luma: u8,
+        bit_depth_chroma: u8,
+        luma: Vec<u16>,
+        cb: Vec<u16>,
+        cr: Vec<u16>,
+    ) -> Self {
+        let (width_chroma, height_chroma) = if chroma_array_type == 0 {
+            (0, 0)
+        } else {
+            let (sw, sh) = sub_wh_c(chroma_array_type);
+            (width_luma / sw, height_luma / sh)
+        };
+        assert_eq!(luma.len(), width_luma * height_luma, "luma plane length");
+        let (cb, cr) = if chroma_array_type == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            assert_eq!(cb.len(), width_chroma * height_chroma, "cb plane length");
+            assert_eq!(cr.len(), width_chroma * height_chroma, "cr plane length");
+            (cb, cr)
+        };
+        Self {
+            width_luma,
+            height_luma,
+            width_chroma,
+            height_chroma,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+            luma: Arc::new(luma),
+            cb: Arc::new(cb),
+            cr: Arc::new(cr),
+        }
+    }
+
+    /// Take the three planes out (row-major `u16`, `Y` / `Cb` / `Cr`;
+    /// the chroma vectors are empty for monochrome). A plane still
+    /// shared with another `Picture` is copied; a uniquely held one is
+    /// moved without a copy — the ownership hand-off a consumer uses
+    /// to wrap the decoded samples in its own frame type.
+    #[must_use]
+    pub fn into_planes(self) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let take = |a: Arc<Vec<u16>>| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone());
+        (take(self.luma), take(self.cb), take(self.cr))
+    }
+
+    /// Whether the sample planes are shared with another `Picture`
+    /// (a clone that has not been written since).
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.luma) > 1
+            || Arc::strong_count(&self.cb) > 1
+            || Arc::strong_count(&self.cr) > 1
     }
 
     /// The §7.4.3.2.1 output-cropped copy of this picture: the luma
@@ -126,12 +205,12 @@ impl Picture {
         } else {
             (x0 / sw, y0 / sh, width / sw, height / sh)
         };
-        let cut = |src: &[i32], stride: usize, x0: usize, y0: usize, w: usize, h: usize| {
+        let cut = |src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize| {
             let mut out = Vec::with_capacity(w * h);
             for y in y0..y0 + h {
                 out.extend_from_slice(&src[y * stride + x0..y * stride + x0 + w]);
             }
-            out
+            Arc::new(out)
         };
         Self {
             width_luma: width,
@@ -201,7 +280,7 @@ impl Picture {
     }
 
     #[inline]
-    fn plane_slice(&self, plane: Plane) -> (&[i32], usize) {
+    fn plane_slice(&self, plane: Plane) -> (&[u16], usize) {
         match plane {
             Plane::Luma => (&self.luma, self.width_luma),
             Plane::Cb => (&self.cb, self.width_chroma),
@@ -209,12 +288,23 @@ impl Picture {
         }
     }
 
+    /// The plane's buffer for writing: copies it first when another
+    /// `Picture` still shares it (copy-on-write).
     #[inline]
-    fn plane_slice_mut(&mut self, plane: Plane) -> (&mut [i32], usize) {
+    fn plane_slice_mut(&mut self, plane: Plane) -> (&mut [u16], usize) {
         match plane {
-            Plane::Luma => (&mut self.luma, self.width_luma),
-            Plane::Cb => (&mut self.cb, self.width_chroma),
-            Plane::Cr => (&mut self.cr, self.width_chroma),
+            Plane::Luma => (
+                Arc::make_mut(&mut self.luma).as_mut_slice(),
+                self.width_luma,
+            ),
+            Plane::Cb => (
+                Arc::make_mut(&mut self.cb).as_mut_slice(),
+                self.width_chroma,
+            ),
+            Plane::Cr => (
+                Arc::make_mut(&mut self.cr).as_mut_slice(),
+                self.width_chroma,
+            ),
         }
     }
 
@@ -222,32 +312,40 @@ impl Picture {
     ///
     /// # Panics
     /// Panics if `(x, y)` lies outside the plane.
+    #[inline]
     #[must_use]
     pub fn sample(&self, plane: Plane, x: usize, y: usize) -> i32 {
         let (buf, stride) = self.plane_slice(plane);
-        buf[y * stride + x]
+        i32::from(buf[y * stride + x])
     }
 
-    /// Write one sample at `(x, y)` of `plane`.
+    /// Write one sample at `(x, y)` of `plane`. `v` must already be
+    /// clipped to the plane's bit depth (it is stored as `u16`).
+    ///
+    /// This is the convenience path: every call checks the plane's
+    /// sharing state. Block writers take [`Self::plane_mut`] once.
     ///
     /// # Panics
     /// Panics if `(x, y)` lies outside the plane.
     pub fn set_sample(&mut self, plane: Plane, x: usize, y: usize, v: i32) {
         let (buf, stride) = self.plane_slice_mut(plane);
-        buf[y * stride + x] = v;
+        buf[y * stride + x] = v as u16;
     }
 
     /// Borrow the raw row-major plane buffer (read-only).
+    #[inline]
     #[must_use]
-    pub fn plane(&self, plane: Plane) -> &[i32] {
+    pub fn plane(&self, plane: Plane) -> &[u16] {
         self.plane_slice(plane).0
     }
 
-    /// Borrow the raw row-major plane buffer + its row stride (mutable).
+    /// Borrow the raw row-major plane buffer + its row stride (mutable;
+    /// a plane shared with another `Picture` is copied first).
     ///
     /// Used by the §8.7.2 deblocking driver to wrap a component plane in a
-    /// [`crate::deblock::SamplePlane`] for in-place edge filtering.
-    pub fn plane_mut(&mut self, plane: Plane) -> (&mut [i32], usize) {
+    /// [`crate::deblock::SamplePlane`] for in-place edge filtering, and by
+    /// every block-writing reconstruction step.
+    pub fn plane_mut(&mut self, plane: Plane) -> (&mut [u16], usize) {
         self.plane_slice_mut(plane)
     }
 
@@ -267,9 +365,9 @@ impl Picture {
             return None;
         }
         let mut out = Vec::with_capacity(self.luma.len() + self.cb.len() + self.cr.len());
-        out.extend(self.luma.iter().map(|&v| v as u8));
-        out.extend(self.cb.iter().map(|&v| v as u8));
-        out.extend(self.cr.iter().map(|&v| v as u8));
+        for plane in [&self.luma, &self.cb, &self.cr] {
+            out.extend(plane.iter().map(|&v| v as u8));
+        }
         Some(out)
     }
 
@@ -285,7 +383,7 @@ impl Picture {
         let mut out = Vec::with_capacity(n * 2);
         for plane in [&self.luma, &self.cb, &self.cr] {
             for &v in plane.iter() {
-                out.extend_from_slice(&(v as u16).to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
             }
         }
         out
@@ -339,6 +437,32 @@ mod tests {
         p.set_sample(Plane::Luma, 3, 4, 200);
         assert_eq!(p.sample(Plane::Luma, 3, 4), 200);
         assert_eq!(p.sample(Plane::Luma, 0, 0), 0);
+    }
+
+    #[test]
+    fn clone_shares_planes_until_written() {
+        let mut a = Picture::new(8, 8, 1, 8, 8);
+        a.set_sample(Plane::Luma, 1, 1, 7);
+        let b = a.clone();
+        assert!(a.is_shared() && b.is_shared());
+        // Writing one copy detaches it; the other keeps its samples.
+        a.set_sample(Plane::Luma, 1, 1, 9);
+        assert_eq!(a.sample(Plane::Luma, 1, 1), 9);
+        assert_eq!(b.sample(Plane::Luma, 1, 1), 7);
+        assert!(!b.is_shared() || a.is_shared());
+        let (y, cb, cr) = b.into_planes();
+        assert_eq!((y.len(), cb.len(), cr.len()), (64, 16, 16));
+        assert_eq!(y[9], 7);
+    }
+
+    #[test]
+    fn from_planes_wraps_without_copying() {
+        let luma: Vec<u16> = (0..16).collect();
+        let p = Picture::from_planes(4, 4, 0, 8, 8, luma, Vec::new(), Vec::new());
+        assert_eq!(p.sample(Plane::Luma, 3, 3), 15);
+        assert!(p.plane(Plane::Cb).is_empty());
+        let (y, _, _) = p.into_planes();
+        assert_eq!(y.len(), 16);
     }
 
     #[test]
