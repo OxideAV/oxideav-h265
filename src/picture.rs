@@ -45,7 +45,12 @@ pub struct Picture {
     bit_depth_luma: u8,
     /// `BitDepthC`.
     bit_depth_chroma: u8,
-    /// `SL[ x ][ y ]`, row-major (`luma[y * width_luma + x]`).
+    /// First stored luma row (0 for a whole picture; a row band of the
+    /// wavefront decoder stores rows `y_origin_luma ..` only).
+    y_origin_luma: usize,
+    /// First stored chroma row.
+    y_origin_chroma: usize,
+    /// `SL[ x ][ y ]`, row-major (`luma[(y - y_origin_luma) * width_luma + x]`).
     luma: Arc<Vec<u16>>,
     /// `SCb[ x ][ y ]`, row-major; empty when monochrome.
     cb: Arc<Vec<u16>>,
@@ -112,10 +117,120 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
+            y_origin_luma: 0,
+            y_origin_chroma: 0,
             luma,
             cb,
             cr,
         }
+    }
+
+    /// A horizontal **band** of a `width_luma × height_luma` picture:
+    /// only luma rows `y_origin_luma .. y_origin_luma + band_rows_luma`
+    /// (and the chroma rows covering them) are stored, but the picture
+    /// reports the full geometry and every accessor takes absolute
+    /// picture coordinates — the wavefront decoder reconstructs one CTB
+    /// row (plus the line above it) into such a band. `plane` /
+    /// `plane_mut` hand out the band's storage, whose first row is
+    /// picture row `y_origin`.
+    ///
+    /// # Panics
+    /// Panics if the band does not lie inside the picture or
+    /// `y_origin_luma` is not a multiple of `SubHeightC`.
+    #[must_use]
+    pub fn new_band(
+        width_luma: usize,
+        height_luma: usize,
+        chroma_array_type: u8,
+        bit_depth_luma: u8,
+        bit_depth_chroma: u8,
+        y_origin_luma: usize,
+        band_rows_luma: usize,
+    ) -> Self {
+        assert!(
+            y_origin_luma + band_rows_luma <= height_luma,
+            "band past the picture"
+        );
+        let (sw, sh) = sub_wh_c(chroma_array_type);
+        assert_eq!(y_origin_luma % sh, 0, "band origin on a chroma row");
+        let (width_chroma, height_chroma, y_origin_chroma, band_rows_chroma) =
+            if chroma_array_type == 0 {
+                (0, 0, 0, 0)
+            } else {
+                (
+                    width_luma / sw,
+                    height_luma / sh,
+                    y_origin_luma / sh,
+                    band_rows_luma.div_ceil(sh),
+                )
+            };
+        Self {
+            width_luma,
+            height_luma,
+            width_chroma,
+            height_chroma,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+            y_origin_luma,
+            y_origin_chroma,
+            luma: Arc::new(vec![0u16; width_luma * band_rows_luma]),
+            cb: Arc::new(vec![0u16; width_chroma * band_rows_chroma]),
+            cr: Arc::new(vec![0u16; width_chroma * band_rows_chroma]),
+        }
+    }
+
+    /// All three plane buffers for writing at once (each copied first
+    /// if shared) — the row-parallel paths split them into disjoint row
+    /// chunks.
+    pub fn planes_mut(&mut self) -> (&mut [u16], &mut [u16], &mut [u16]) {
+        (
+            Arc::make_mut(&mut self.luma).as_mut_slice(),
+            Arc::make_mut(&mut self.cb).as_mut_slice(),
+            Arc::make_mut(&mut self.cr).as_mut_slice(),
+        )
+    }
+
+    /// The first stored row of `plane` (0 unless this is a band).
+    #[inline]
+    #[must_use]
+    pub fn y_origin(&self, plane: Plane) -> usize {
+        match plane {
+            Plane::Luma => self.y_origin_luma,
+            Plane::Cb | Plane::Cr => self.y_origin_chroma,
+        }
+    }
+
+    /// Number of stored rows of `plane` (the plane height unless this
+    /// is a band).
+    #[inline]
+    #[must_use]
+    pub fn stored_rows(&self, plane: Plane) -> usize {
+        let (buf, stride) = self.plane_slice(plane);
+        buf.len().checked_div(stride).unwrap_or(0)
+    }
+
+    /// Row `y` (absolute picture row) of `plane`.
+    ///
+    /// # Panics
+    /// Panics if the row is not stored.
+    #[inline]
+    #[must_use]
+    pub fn row(&self, plane: Plane, y: usize) -> &[u16] {
+        let (buf, stride) = self.plane_slice(plane);
+        let r = y - self.y_origin(plane);
+        &buf[r * stride..(r + 1) * stride]
+    }
+
+    /// Row `y` (absolute picture row) of `plane`, for writing.
+    ///
+    /// # Panics
+    /// Panics if the row is not stored.
+    #[inline]
+    pub fn row_mut(&mut self, plane: Plane, y: usize) -> &mut [u16] {
+        let r = y - self.y_origin(plane);
+        let (buf, stride) = self.plane_slice_mut(plane);
+        &mut buf[r * stride..(r + 1) * stride]
     }
 
     /// Build a picture around already-reconstructed planes (row-major,
@@ -158,6 +273,8 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
+            y_origin_luma: 0,
+            y_origin_chroma: 0,
             luma: Arc::new(luma),
             cb: Arc::new(cb),
             cr: Arc::new(cr),
@@ -192,6 +309,7 @@ impl Picture {
     /// covering the whole picture returns an identical copy.
     #[must_use]
     pub fn cropped(&self, x0: usize, y0: usize, width: usize, height: usize) -> Self {
+        assert_eq!(self.y_origin_luma, 0, "cropping a band picture");
         let x0 = x0.min(self.width_luma);
         let y0 = y0.min(self.height_luma);
         let width = width.min(self.width_luma - x0);
@@ -220,6 +338,8 @@ impl Picture {
             chroma_array_type: self.chroma_array_type,
             bit_depth_luma: self.bit_depth_luma,
             bit_depth_chroma: self.bit_depth_chroma,
+            y_origin_luma: 0,
+            y_origin_chroma: 0,
             luma: cut(&self.luma, self.width_luma, x0, y0, width, height),
             cb: cut(&self.cb, self.width_chroma, cx0, cy0, cw, ch),
             cr: cut(&self.cr, self.width_chroma, cx0, cy0, cw, ch),
@@ -316,7 +436,7 @@ impl Picture {
     #[must_use]
     pub fn sample(&self, plane: Plane, x: usize, y: usize) -> i32 {
         let (buf, stride) = self.plane_slice(plane);
-        i32::from(buf[y * stride + x])
+        i32::from(buf[(y - self.y_origin(plane)) * stride + x])
     }
 
     /// Write one sample at `(x, y)` of `plane`. `v` must already be
@@ -328,11 +448,14 @@ impl Picture {
     /// # Panics
     /// Panics if `(x, y)` lies outside the plane.
     pub fn set_sample(&mut self, plane: Plane, x: usize, y: usize, v: i32) {
+        let r = y - self.y_origin(plane);
         let (buf, stride) = self.plane_slice_mut(plane);
-        buf[y * stride + x] = v as u16;
+        buf[r * stride + x] = v as u16;
     }
 
-    /// Borrow the raw row-major plane buffer (read-only).
+    /// Borrow the raw row-major plane buffer (read-only). For a band
+    /// (see [`Self::new_band`]) the first stored row is picture row
+    /// [`Self::y_origin`].
     #[inline]
     #[must_use]
     pub fn plane(&self, plane: Plane) -> &[u16] {
@@ -453,6 +576,22 @@ mod tests {
         let (y, cb, cr) = b.into_planes();
         assert_eq!((y.len(), cb.len(), cr.len()), (64, 16, 16));
         assert_eq!(y[9], 7);
+    }
+
+    #[test]
+    fn band_addresses_absolute_rows() {
+        let mut b = Picture::new_band(16, 64, 1, 8, 8, 16, 17);
+        assert_eq!(b.plane_dims(Plane::Luma), (16, 64));
+        assert_eq!(b.plane_dims(Plane::Cb), (8, 32));
+        assert_eq!(b.y_origin(Plane::Luma), 16);
+        assert_eq!(b.y_origin(Plane::Cb), 8);
+        assert_eq!(b.stored_rows(Plane::Luma), 17);
+        assert_eq!(b.stored_rows(Plane::Cb), 9);
+        b.set_sample(Plane::Luma, 3, 16, 77);
+        b.row_mut(Plane::Cb, 8)[2] = 5;
+        assert_eq!(b.plane(Plane::Luma)[3], 77);
+        assert_eq!(b.sample(Plane::Cb, 2, 8), 5);
+        assert_eq!(b.row(Plane::Luma, 32)[3], 0);
     }
 
     #[test]

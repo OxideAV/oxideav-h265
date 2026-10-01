@@ -327,24 +327,24 @@ pub fn apply_sao_ctb_full(
     };
     let (dst, dst_stride) = sao_out.plane_mut(plane);
     sao_ctb_core(
-        src, dst, dst_stride, &geom, comp, x_ctb, y_ctb, n_w, n_h, boundaries, no_filter,
+        src, dst, dst_stride, 0, &geom, comp, x_ctb, y_ctb, n_w, n_h, boundaries, no_filter,
     );
 }
 
 /// One component plane's geometry for the §8.7.3.2 modification.
 #[derive(Debug, Clone, Copy)]
-struct SaoPlaneGeom {
-    pw: usize,
-    ph: usize,
-    bit_depth: u8,
+pub(crate) struct SaoPlaneGeom {
+    pub(crate) pw: usize,
+    pub(crate) ph: usize,
+    pub(crate) bit_depth: u8,
     /// `(SubWidthC, SubHeightC)` of the plane (`(1, 1)` for luma) — the
     /// factor mapping plane positions to luma positions for the CTB-grid
     /// boundary / suppression lookups.
-    sub: (usize, usize),
+    pub(crate) sub: (usize, usize),
 }
 
 impl SaoPlaneGeom {
-    fn of(pic: &Picture, plane: Plane) -> Self {
+    pub(crate) fn of(pic: &Picture, plane: Plane) -> Self {
         let (pw, ph) = pic.plane_dims(plane);
         let sub = match plane {
             Plane::Luma => (1, 1),
@@ -363,10 +363,10 @@ impl SaoPlaneGeom {
 /// (or a horizontal band of one) whose first stored row is plane row
 /// `y_origin`.
 #[derive(Debug, Clone, Copy)]
-struct SaoSource<'a> {
-    buf: &'a [u16],
-    stride: usize,
-    y_origin: usize,
+pub(crate) struct SaoSource<'a> {
+    pub(crate) buf: &'a [u16],
+    pub(crate) stride: usize,
+    pub(crate) y_origin: usize,
 }
 
 impl SaoSource<'_> {
@@ -383,6 +383,7 @@ fn sao_ctb_core(
     src: SaoSource<'_>,
     dst: &mut [u16],
     dst_stride: usize,
+    dst_y_origin: usize,
     geom: &SaoPlaneGeom,
     comp: &ResolvedSaoComponent,
     x_ctb: usize,
@@ -416,7 +417,8 @@ fn sao_ctb_core(
         for j in 0..h {
             let ysj = y_ctb + j;
             let border_row = vertical && (j == 0 || j + 1 == h);
-            let drow = &mut dst[ysj * dst_stride + x_ctb..ysj * dst_stride + x_ctb + w];
+            let dr = ysj - dst_y_origin;
+            let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
             for (i, d) in drow.iter_mut().enumerate() {
                 let xsi = x_ctb + i;
                 let border_col = horizontal && (i == 0 || i + 1 == w);
@@ -479,7 +481,8 @@ fn sao_ctb_core(
         }
         for j in 0..h {
             let ysj = y_ctb + j;
-            let drow = &mut dst[ysj * dst_stride + x_ctb..ysj * dst_stride + x_ctb + w];
+            let dr = ysj - dst_y_origin;
+            let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
             for (i, d) in drow.iter_mut().enumerate() {
                 let xsi = x_ctb + i;
                 if no_filter.is_some() && suppressed(xsi, ysj) {
@@ -667,23 +670,59 @@ pub fn apply_sao_picture_in_place(
                 y_origin,
             };
             let (dst, dst_stride) = pic.plane_mut(plane);
-            for rx in 0..pic_width_in_ctbs {
-                let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
-                sao_ctb_core(
-                    src,
-                    dst,
-                    dst_stride,
-                    &geom,
-                    &resolved.components[cidx],
-                    rx * n_w,
-                    y0,
-                    n_w,
-                    n_h,
-                    boundaries,
-                    no_filter,
-                );
-            }
+            sao_ctb_row_core(
+                src,
+                dst,
+                dst_stride,
+                0,
+                &geom,
+                ctb_sao,
+                pic_width_in_ctbs,
+                ry,
+                cidx,
+                (n_w, n_h),
+                boundaries,
+                no_filter,
+            );
         }
+    }
+}
+
+/// One CTB row of one component: every CTB of row `ry` classified from
+/// `src` (the pre-SAO band) and written into `dst` (a plane or a row
+/// chunk of it starting at plane row `dst_y_origin`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sao_ctb_row_core(
+    src: SaoSource<'_>,
+    dst: &mut [u16],
+    dst_stride: usize,
+    dst_y_origin: usize,
+    geom: &SaoPlaneGeom,
+    ctb_sao: &[ResolvedSao],
+    pic_width_in_ctbs: usize,
+    ry: usize,
+    cidx: usize,
+    ctb_dims: (usize, usize),
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) {
+    let (n_w, n_h) = ctb_dims;
+    for rx in 0..pic_width_in_ctbs {
+        let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
+        sao_ctb_core(
+            src,
+            dst,
+            dst_stride,
+            dst_y_origin,
+            geom,
+            &resolved.components[cidx],
+            rx * n_w,
+            ry * n_h,
+            n_w,
+            n_h,
+            boundaries,
+            no_filter,
+        );
     }
 }
 

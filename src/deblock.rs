@@ -777,6 +777,9 @@ pub struct SamplePlane<'a> {
     pub width: usize,
     /// Row stride in samples (usually equal to `width`).
     pub stride: usize,
+    /// The plane row the first stored row is (0 for a whole plane; a
+    /// row chunk of the row-parallel filter starts lower).
+    pub y_origin: usize,
 }
 
 impl core::fmt::Debug for SamplePlane<'_> {
@@ -792,11 +795,11 @@ impl core::fmt::Debug for SamplePlane<'_> {
 impl SamplePlane<'_> {
     #[inline]
     fn get(&self, x: usize, y: usize) -> i32 {
-        i32::from(self.samples[y * self.stride + x])
+        i32::from(self.samples[(y - self.y_origin) * self.stride + x])
     }
     #[inline]
     fn set(&mut self, x: usize, y: usize, v: i32) {
-        self.samples[y * self.stride + x] = v as u16;
+        self.samples[(y - self.y_origin) * self.stride + x] = v as u16;
     }
     /// `(x, y)` plane coordinates for the `i`-th sample on the p (`pi`,
     /// negative side) or q (`qi`, positive side) of an edge at `(ex, ey)`
@@ -1174,6 +1177,7 @@ pub fn filter_cu_edges_full(
                 samples: buf,
                 width: stride,
                 stride,
+                y_origin: 0,
             };
             let pos = EdgePos {
                 ex: x_cb + x_dk,
@@ -1255,6 +1259,7 @@ pub fn filter_cu_edges_full(
                     samples: buf,
                     width: stride,
                     stride,
+                    y_origin: 0,
                 };
                 let pos = EdgePos {
                     ex: xc_cb + x_dk,
@@ -1421,6 +1426,11 @@ pub struct DeblockEdgeMap {
     /// at luma row `8 * y8`, columns `4 * x4 ..+ 4`.
     bs_h: Vec<u8>,
     w4: usize,
+    /// First stored luma row (a multiple of 8; a wavefront row band
+    /// stores one CTB row of edges).
+    y_origin: usize,
+    /// Number of stored luma rows.
+    rows: usize,
     /// The picture-wide filter parameters (offsets, chroma QP offsets,
     /// bit depths, `ChromaArrayType`); `qp_y` is unused — the QP map
     /// supplies every position's `QpY`.
@@ -1440,8 +1450,42 @@ impl DeblockEdgeMap {
             w8,
             bs_h: vec![0; w4 * h8],
             w4,
+            y_origin: 0,
+            rows: height_luma,
             params: None,
         }
+    }
+
+    /// A band of the map for luma rows `y_origin .. y_origin + rows`
+    /// (`y_origin` a multiple of 8).
+    ///
+    /// # Panics
+    /// Panics if `y_origin` is not 8-aligned.
+    #[must_use]
+    pub fn new_band(width_luma: usize, y_origin: usize, rows: usize) -> Self {
+        assert_eq!(y_origin % 8, 0, "edge band origin");
+        let w8 = width_luma.div_ceil(8);
+        let w4 = width_luma.div_ceil(4);
+        Self {
+            bs_v: vec![0; w8 * rows.div_ceil(4)],
+            w8,
+            bs_h: vec![0; w4 * rows.div_ceil(8)],
+            w4,
+            y_origin,
+            rows,
+            params: None,
+        }
+    }
+
+    /// Copy a band's strengths into this whole-picture map.
+    pub fn merge_band(&mut self, band: &Self) {
+        if self.params.is_none() {
+            self.params = band.params;
+        }
+        let v0 = (band.y_origin / 4) * self.w8;
+        self.bs_v[v0..v0 + band.bs_v.len()].copy_from_slice(&band.bs_v);
+        let h0 = (band.y_origin / 8) * self.w4;
+        self.bs_h[h0..h0 + band.bs_h.len()].copy_from_slice(&band.bs_h);
     }
 
     /// Whether any edge carries a non-zero strength.
@@ -1455,8 +1499,11 @@ impl DeblockEdgeMap {
     #[inline]
     #[must_use]
     pub fn bs_vertical(&self, x: usize, y: usize) -> u8 {
+        if y < self.y_origin {
+            return 0;
+        }
         self.bs_v
-            .get((y >> 2) * self.w8 + (x >> 3))
+            .get(((y - self.y_origin) >> 2) * self.w8 + (x >> 3))
             .copied()
             .unwrap_or(0)
     }
@@ -1466,8 +1513,11 @@ impl DeblockEdgeMap {
     #[inline]
     #[must_use]
     pub fn bs_horizontal(&self, x: usize, y: usize) -> u8 {
+        if y < self.y_origin {
+            return 0;
+        }
         self.bs_h
-            .get((y >> 3) * self.w4 + (x >> 2))
+            .get(((y - self.y_origin) >> 3) * self.w4 + (x >> 2))
             .copied()
             .unwrap_or(0)
     }
@@ -1518,6 +1568,10 @@ impl DeblockEdgeMap {
                         continue;
                     }
                     let (x, y) = (x_cb + x_dk, y_cb + y_dm);
+                    if y < self.y_origin || y >= self.y_origin + self.rows {
+                        continue;
+                    }
+                    let y = y - self.y_origin;
                     match edge_type {
                         EdgeType::Vertical => {
                             if let Some(c) = self.bs_v.get_mut((y >> 2) * self.w8 + (x >> 3)) {
@@ -1592,82 +1646,122 @@ pub fn deblock_rows_edges(
     y_end: usize,
 ) {
     let (pw, ph) = pic.plane_dims(Plane::Luma);
+    let (cw, ch) = pic.plane_dims(Plane::Cb);
+    let chroma = params.chroma_array_type != 0;
+    let (ly, cbp, crp) = pic.planes_mut();
+    let mut luma = SamplePlane {
+        samples: ly,
+        width: pw,
+        stride: pw,
+        y_origin: 0,
+    };
+    let mut cb = SamplePlane {
+        samples: cbp,
+        width: cw,
+        stride: cw,
+        y_origin: 0,
+    };
+    let mut cr = SamplePlane {
+        samples: crp,
+        width: cw,
+        stride: cw,
+        y_origin: 0,
+    };
+    deblock_rows_planes(
+        &mut luma,
+        chroma.then_some((&mut cb, &mut cr)),
+        (pw, ph, cw, ch),
+        map,
+        params,
+        qp_map,
+        no_filter,
+        edge_type,
+        y_start,
+        y_end,
+    );
+}
+
+/// [`deblock_rows_edges`] on sample planes (or row chunks of them, with
+/// their `y_origin` set): `dims` is `(luma width, luma height, chroma
+/// width, chroma height)` of the whole picture. Every edge whose `q0,0`
+/// luma row lies in `y_start .. y_end` is filtered, so the chunks must
+/// hold the rows those edges touch (the three rows above the first
+/// horizontal edge included).
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_rows_planes<'p>(
+    luma: &mut SamplePlane<'p>,
+    chroma: Option<(&mut SamplePlane<'p>, &mut SamplePlane<'p>)>,
+    dims: (usize, usize, usize, usize),
+    map: &DeblockEdgeMap,
+    params: &DeblockCuParams,
+    qp_map: QpMap<'_>,
+    no_filter: Option<&NoFilterMap<'_>>,
+    edge_type: EdgeType,
+    y_start: usize,
+    y_end: usize,
+) {
+    let (pw, ph, cw, ch) = dims;
     let y_end = y_end.min(ph);
     let align_up = |v: usize, a: usize| v.div_ceil(a) * a;
     // ----- luma -----
-    {
-        let (buf, stride) = pic.plane_mut(Plane::Luma);
-        let mut plane = SamplePlane {
-            samples: buf,
-            width: stride,
-            stride,
-        };
-        match edge_type {
-            EdgeType::Vertical => {
-                for y in (align_up(y_start, 4)..y_end).step_by(4) {
-                    for x in (8..pw).step_by(8) {
-                        let s = map.bs_vertical(x, y);
-                        if s == 0 {
-                            continue;
-                        }
-                        let qp = EdgeQp {
-                            qp_q: qp_map.qp_at(x, y),
-                            qp_p: qp_map.qp_at(x - 1, y),
-                            beta_offset_div2: params.beta_offset_div2,
-                            tc_offset_div2: params.tc_offset_div2,
-                            bit_depth: params.bit_depth_luma,
-                        };
-                        let pos = EdgePos {
-                            ex: x,
-                            ey: y,
-                            edge: edge_type,
-                        };
-                        filter_luma_block_edge_gated(&mut plane, pos, s, qp, no_filter);
+    match edge_type {
+        EdgeType::Vertical => {
+            for y in (align_up(y_start, 4)..y_end).step_by(4) {
+                for x in (8..pw).step_by(8) {
+                    let s = map.bs_vertical(x, y);
+                    if s == 0 {
+                        continue;
                     }
+                    let qp = EdgeQp {
+                        qp_q: qp_map.qp_at(x, y),
+                        qp_p: qp_map.qp_at(x - 1, y),
+                        beta_offset_div2: params.beta_offset_div2,
+                        tc_offset_div2: params.tc_offset_div2,
+                        bit_depth: params.bit_depth_luma,
+                    };
+                    let pos = EdgePos {
+                        ex: x,
+                        ey: y,
+                        edge: edge_type,
+                    };
+                    filter_luma_block_edge_gated(luma, pos, s, qp, no_filter);
                 }
             }
-            EdgeType::Horizontal => {
-                for y in (align_up(y_start.max(8), 8)..y_end).step_by(8) {
-                    for x in (0..pw).step_by(4) {
-                        let s = map.bs_horizontal(x, y);
-                        if s == 0 {
-                            continue;
-                        }
-                        let qp = EdgeQp {
-                            qp_q: qp_map.qp_at(x, y),
-                            qp_p: qp_map.qp_at(x, y - 1),
-                            beta_offset_div2: params.beta_offset_div2,
-                            tc_offset_div2: params.tc_offset_div2,
-                            bit_depth: params.bit_depth_luma,
-                        };
-                        let pos = EdgePos {
-                            ex: x,
-                            ey: y,
-                            edge: edge_type,
-                        };
-                        filter_luma_block_edge_gated(&mut plane, pos, s, qp, no_filter);
+        }
+        EdgeType::Horizontal => {
+            for y in (align_up(y_start.max(8), 8)..y_end).step_by(8) {
+                for x in (0..pw).step_by(4) {
+                    let s = map.bs_horizontal(x, y);
+                    if s == 0 {
+                        continue;
                     }
+                    let qp = EdgeQp {
+                        qp_q: qp_map.qp_at(x, y),
+                        qp_p: qp_map.qp_at(x, y - 1),
+                        beta_offset_div2: params.beta_offset_div2,
+                        tc_offset_div2: params.tc_offset_div2,
+                        bit_depth: params.bit_depth_luma,
+                    };
+                    let pos = EdgePos {
+                        ex: x,
+                        ey: y,
+                        edge: edge_type,
+                    };
+                    filter_luma_block_edge_gated(luma, pos, s, qp, no_filter);
                 }
             }
         }
     }
     // ----- chroma (§8.7.2.5.1 / .2 chroma steps) -----
-    if params.chroma_array_type == 0 {
+    let Some((cb, cr)) = chroma else {
         return;
-    }
+    };
     let (sub_w, sub_h) = sub_wh_c(params.chroma_array_type);
-    let (cw, ch) = pic.plane_dims(Plane::Cb);
-    for plane in [Plane::Cb, Plane::Cr] {
+    for (plane, cplane) in [(Plane::Cb, cb), (Plane::Cr, cr)] {
         let c_qp_offset = if plane == Plane::Cb {
             params.cb_qp_offset
         } else {
             params.cr_qp_offset
-        };
-        let (buf, stride) = pic.plane_mut(plane);
-        let mut cplane = SamplePlane {
-            samples: buf,
-            width: stride,
-            stride,
         };
         match edge_type {
             EdgeType::Vertical => {
@@ -1696,7 +1790,7 @@ pub fn deblock_rows_edges(
                             edge: edge_type,
                         };
                         filter_chroma_block_edge_gated(
-                            &mut cplane,
+                            cplane,
                             pos,
                             qp,
                             c_qp_offset,
@@ -1729,7 +1823,7 @@ pub fn deblock_rows_edges(
                             edge: edge_type,
                         };
                         filter_chroma_block_edge_gated(
-                            &mut cplane,
+                            cplane,
                             pos,
                             qp,
                             c_qp_offset,
@@ -1740,6 +1834,15 @@ pub fn deblock_rows_edges(
                 }
             }
         }
+    }
+}
+
+impl DeblockEdgeMap {
+    /// The picture-wide filter parameters recorded by the first CU
+    /// (`None` while no CU was added).
+    #[must_use]
+    pub fn params(&self) -> Option<DeblockCuParams> {
+        self.params
     }
 }
 
@@ -2387,6 +2490,7 @@ mod tests {
             samples: &mut buf,
             width: w,
             stride: w,
+            y_origin: 0,
         };
         // QP 37 both sides ⇒ β=36, tC=5 (bS=2) at 8-bit; step 8 < β.
         let dec = filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(37, 37));
@@ -2412,6 +2516,7 @@ mod tests {
             samples: &mut buf,
             width: w,
             stride: w,
+            y_origin: 0,
         };
         // Low QP (β=10, tC=1): the weak filter is rejected by the δ guard.
         filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(20, 20));
@@ -2433,6 +2538,7 @@ mod tests {
             samples: &mut buf,
             width: w,
             stride: w,
+            y_origin: 0,
         };
         // Boundary at row 8 (q0,0 row): filter the EDGE_HOR segment at x=0.
         let pos = EdgePos {
@@ -2456,6 +2562,7 @@ mod tests {
             samples: &mut buf,
             width: w,
             stride: w,
+            y_origin: 0,
         };
         // 4:2:0, QpY 37 both sides ⇒ tC=4 (8-bit). Step 4 ⇒ δ clamped.
         filter_chroma_block_edge(&mut plane, vpos(8, 0), qp8(37, 37), 0, 1);
@@ -2478,6 +2585,7 @@ mod tests {
             samples: &mut buf,
             width: w,
             stride: w,
+            y_origin: 0,
         };
         let dec = filter_luma_block_edge(&mut plane, vpos(8, 0), 2, qp8(40, 40));
         assert_ne!(dec.de, 0);

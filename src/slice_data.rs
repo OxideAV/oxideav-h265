@@ -332,6 +332,10 @@ pub struct PictureParseState {
     cu_skip: Vec<u8>,
     w_cells: usize,
     h_cells: usize,
+    /// First stored cell row of `ct_depth` / `cu_skip` (a wavefront
+    /// band: one CTB row of cells plus the row above it).
+    origin_cells: usize,
+    rows_cells: usize,
 }
 
 impl PictureParseState {
@@ -359,12 +363,98 @@ impl PictureParseState {
             cu_skip: vec![0; w_cells * h_cells],
             w_cells,
             h_cells,
+            origin_cells: 0,
+            rows_cells: h_cells,
         }
     }
 
+    /// [`Self::new`] for a wavefront row band: the per-4×4 neighbour
+    /// state stores only the cells covering luma rows `y_origin_luma ..
+    /// y_origin_luma + band_rows_luma` (the halo min-block row above the
+    /// CTB row included — the §9.3.4.2.2 `split_cu_flag` / `cu_skip_flag`
+    /// ctxInc reads the above neighbour); the per-CTB slice / tile
+    /// identities stay picture-wide and are imported as the rows above
+    /// publish them.
+    #[must_use]
+    pub fn new_band(params: &SliceDataParams, y_origin_luma: usize, band_rows_luma: usize) -> Self {
+        let ctb = 1u32 << params.ctb_log2_size_y;
+        let w_ctbs = params.pic_width_in_luma_samples.div_ceil(ctb);
+        let h_ctbs = params.pic_height_in_luma_samples.div_ceil(ctb);
+        let w_cells = (params.pic_width_in_luma_samples as usize).div_ceil(4);
+        let h_cells = (params.pic_height_in_luma_samples as usize).div_ceil(4);
+        let origin_cells = y_origin_luma / 4;
+        let rows_cells = band_rows_luma.div_ceil(4);
+        Self {
+            field: IntraModeField::new_band(
+                params.pic_width_in_luma_samples as usize,
+                params.pic_height_in_luma_samples as usize,
+                params.ctb_log2_size_y,
+                y_origin_luma,
+                band_rows_luma,
+            ),
+            ctb_log2: params.ctb_log2_size_y,
+            pic_width: params.pic_width_in_luma_samples,
+            pic_height: params.pic_height_in_luma_samples,
+            pic_w_ctbs: w_ctbs,
+            ctb_info: vec![None; (w_ctbs * h_ctbs) as usize],
+            cur: (0, 0),
+            ct_depth: vec![-1; w_cells * rows_cells],
+            cu_skip: vec![0; w_cells * rows_cells],
+            w_cells,
+            h_cells,
+            origin_cells,
+            rows_cells,
+        }
+    }
+
+    /// Record another CTU's `(SliceAddrRs, TileId)` (one decoded by a
+    /// different wavefront worker) without making it current.
+    pub fn note_ctu(&mut self, ctb_rs: u32, slice_addr_rs: u32, tile_id: u32) {
+        if let Some(slot) = self.ctb_info.get_mut(ctb_rs as usize) {
+            *slot = Some((slice_addr_rs, tile_id));
+        }
+    }
+
+    /// The per-cell state of cell row `by` (absolute), columns `bx0 ..
+    /// bx1`: `(CtDepth, cu_skip_flag, packed intra-mode cells)` — the
+    /// wavefront halo export.
+    #[must_use]
+    pub fn row_cells(&self, by: usize, bx0: usize, bx1: usize) -> (Vec<i8>, Vec<u8>, Vec<u8>) {
+        let r = by - self.origin_cells;
+        let w = self.w_cells;
+        (
+            self.ct_depth[r * w + bx0..r * w + bx1].to_vec(),
+            self.cu_skip[r * w + bx0..r * w + bx1].to_vec(),
+            self.field.row_cells(by, bx0, bx1),
+        )
+    }
+
+    /// Write cells from [`Self::row_cells`] into cell row `by`
+    /// (absolute) at columns `bx0 ..`.
+    pub fn import_row_cells(
+        &mut self,
+        by: usize,
+        bx0: usize,
+        ct_depth: &[i8],
+        cu_skip: &[u8],
+        modes: &[u8],
+    ) {
+        let r = by - self.origin_cells;
+        let w = self.w_cells;
+        let n = ct_depth.len();
+        self.ct_depth[r * w + bx0..r * w + bx0 + n].copy_from_slice(ct_depth);
+        self.cu_skip[r * w + bx0..r * w + bx0 + n].copy_from_slice(cu_skip);
+        self.field.import_row_cells(by, bx0, modes);
+    }
+
+    /// Stored-cell index of a luma location (past the end for a row a
+    /// band does not store — callers treat that as unavailable).
     fn cell(&self, x: u32, y: u32) -> usize {
-        ((y as usize) >> 2).min(self.h_cells - 1) * self.w_cells
-            + ((x as usize) >> 2).min(self.w_cells - 1)
+        ((y as usize) >> 2)
+            .min(self.h_cells - 1)
+            .wrapping_sub(self.origin_cells)
+            .wrapping_mul(self.w_cells)
+            .wrapping_add(((x as usize) >> 2).min(self.w_cells - 1))
     }
 
     /// Record a coding block's `CtDepth` + `cu_skip_flag` over its area
@@ -372,8 +462,10 @@ impl PictureParseState {
     fn record_cu_depth(&mut self, x0: u32, y0: u32, log2_cb_size: u32, depth: u8, skip: u8) {
         let n = 1u32 << log2_cb_size;
         let x1 = (x0 + n).min(self.pic_width);
-        let y1 = (y0 + n).min(self.pic_height);
-        for y in (y0..y1).step_by(4) {
+        let y1 = (y0 + n)
+            .min(self.pic_height)
+            .min(((self.origin_cells + self.rows_cells) * 4) as u32);
+        for y in (y0.max((self.origin_cells * 4) as u32)..y1).step_by(4) {
             for x in (x0..x1).step_by(4) {
                 let c = self.cell(x, y);
                 self.ct_depth[c] = depth as i8;
@@ -393,7 +485,9 @@ impl PictureParseState {
         if !self.neighbour_available(x0, y0, neighbour) {
             return (0, false);
         }
-        let d = self.ct_depth[self.cell(x_nb, y_nb)];
+        let Some(d) = self.ct_depth.get(self.cell(x_nb, y_nb)).copied() else {
+            return (0, false);
+        };
         if d < 0 {
             return (0, false);
         }
@@ -411,7 +505,7 @@ impl PictureParseState {
             return (0, false);
         }
         let c = self.cell(x_nb, y_nb);
-        if self.ct_depth[c] < 0 {
+        if self.ct_depth.get(c).map_or(true, |&d| d < 0) {
             return (0, false);
         }
         (self.cu_skip[c], true)

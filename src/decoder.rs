@@ -245,11 +245,20 @@ impl Decoder for H265Decoder {
         Err(Error::NeedMore)
     }
 
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Bounded through the core contract: at most `threads` workers
+        // for the per-picture wavefront / row-parallel filters.
+        self.seq.set_threads(ctx.threads);
+    }
+
     fn flush(&mut self) -> Result<()> {
         // Decode any pending picture and release the reorder queue.
         self.seq
             .flush()
             .map_err(|e| Error::InvalidData(format!("h265 flush: {e}")))?;
+        // End of stream: the reference pictures go, so the frames
+        // drained below own their planes outright.
+        self.seq.release_references();
         self.flushed = true;
         self.drain(true);
         Ok(())

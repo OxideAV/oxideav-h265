@@ -204,6 +204,12 @@ impl Dpb {
         self.entries.retain(|e| e.marking != Marking::Unused);
     }
 
+    /// Drop every stored picture (the end of the bitstream: nothing can
+    /// reference them any more).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Remove the entry at `idx` (a temporary Annex H inter-layer
     /// reference picture once its picture is decoded). Indices above
     /// `idx` shift down by one.

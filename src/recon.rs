@@ -578,9 +578,8 @@ fn predict_add_store(
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
     // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
-    let (buf, stride) = pic.plane_mut(plane);
     for y in 0..n_tbs {
-        let row = &mut buf[(yb + y) * stride + xb..(yb + y) * stride + xb + n_tbs];
+        let row = &mut pic.row_mut(plane, yb + y)[xb..xb + n_tbs];
         let prow = &pred[y * n_tbs..(y + 1) * n_tbs];
         match res {
             Some(r) => {
@@ -776,9 +775,8 @@ fn write_inter_plane(
     residual: Option<&[i32]>,
 ) {
     let bit_depth = pic.bit_depth(plane);
-    let (buf, stride) = pic.plane_mut(plane);
     for y in 0..h {
-        let row = &mut buf[(y0 + y) * stride + x0..(y0 + y) * stride + x0 + w];
+        let row = &mut pic.row_mut(plane, y0 + y)[x0..x0 + w];
         let prow = &pred[y * w..(y + 1) * w];
         match residual {
             Some(r) => {
@@ -1293,10 +1291,14 @@ pub struct ReconCtx {
 /// quantization group.
 #[derive(Debug)]
 struct QpState {
-    /// Per-4×4-cell `QpY`.
+    /// Per-4×4-cell `QpY` (the stored rows `origin_cells ..`).
     map: Vec<i8>,
     w_cells: usize,
     h_cells: usize,
+    /// First stored cell row (a wavefront band) — the §8.6.1 neighbour
+    /// reads are same-CTB gated, so a band needs no halo.
+    origin_cells: usize,
+    rows_cells: usize,
     /// `Log2MinCuQpDeltaSize`.
     qg_log2: u32,
     /// `CtbLog2SizeY` (the §8.6.1 same-CTB gate on `qPY_A` / `qPY_B`).
@@ -1323,7 +1325,8 @@ struct QpState {
 
 impl QpState {
     fn cell(&self, x: usize, y: usize) -> usize {
-        (y >> 2).min(self.h_cells - 1) * self.w_cells + (x >> 2).min(self.w_cells - 1)
+        ((y >> 2).min(self.h_cells - 1) - self.origin_cells) * self.w_cells
+            + (x >> 2).min(self.w_cells - 1)
     }
 
     fn qp_at(&self, x: usize, y: usize) -> i32 {
@@ -1368,6 +1371,71 @@ impl ReconCtx {
         })
     }
 
+    /// [`Self::new`] for a wavefront row band: the intra-mode field and
+    /// the QP map store only the min-block rows covering luma rows
+    /// `y_origin_luma .. y_origin_luma + band_rows_luma` (the band
+    /// includes the four-line halo above the CTB row the §8.4.4.2.1
+    /// constrained-intra gate reads); the slice-address map stays
+    /// picture-wide.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_band(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        ctb_log2_size_y: u32,
+        min_tb_log2_size_y: u32,
+        tiles: &crate::availability::TilingParams,
+        y_origin_luma: usize,
+        band_rows_luma: usize,
+    ) -> Result<Self, ReconError> {
+        let ctb_size = 1usize << ctb_log2_size_y;
+        let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size) as u32;
+        let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size) as u32;
+        let tiling = PictureTiling::new(
+            pic_w_ctbs,
+            pic_h_ctbs,
+            pic_width_luma as u32,
+            pic_height_luma as u32,
+            ctb_log2_size_y,
+            min_tb_log2_size_y,
+            tiles,
+        )
+        .map_err(ReconError::Tiling)?;
+        Ok(Self {
+            field: IntraModeField::new_band(
+                pic_width_luma,
+                pic_height_luma,
+                ctb_log2_size_y,
+                y_origin_luma,
+                band_rows_luma,
+            ),
+            tiling,
+            slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
+            qp: None,
+            constrained_intra: false,
+        })
+    }
+
+    /// The intra-mode field (the wavefront halo exchange reads / writes
+    /// its min-block rows).
+    pub(crate) fn intra_field_mut(&mut self) -> &mut IntraModeField {
+        &mut self.field
+    }
+
+    /// The intra-mode field, read-only.
+    pub(crate) fn intra_field(&self) -> &IntraModeField {
+        &self.field
+    }
+
+    /// The stored `QpY` cells of cell row `by` (absolute).
+    pub(crate) fn qp_row(&self, by: usize) -> Option<&[i8]> {
+        self.qp.as_ref().map(|q| {
+            let r = by - q.origin_cells;
+            &q.map[r * q.w_cells..(r + 1) * q.w_cells]
+        })
+    }
+
     /// Enable the §8.4.4.2.1 `constrained_intra_pred_flag` gate:
     /// reference samples whose covering coding unit is not
     /// `MODE_INTRA` are treated as "not available for intra
@@ -1385,13 +1453,18 @@ impl ReconCtx {
     /// the per-CU derivation falls back to the `qPY_PRED == SliceQpY`
     /// single-QG shortcut.
     pub fn init_qp_state(&mut self, slice_qp_y: i32, qg_log2: u32, qp_bd_offset_y: i32) {
-        // The 4×4 cell grid matches the intra-mode field's min-block grid.
+        // The 4×4 cell grid matches the intra-mode field's min-block grid
+        // (and its band, for a wavefront row).
         let w_cells = self.field.w_blocks();
         let h_cells = self.field.h_blocks();
+        let origin_cells = self.field.origin_blocks();
+        let rows_cells = self.field.rows_blocks();
         self.qp = Some(QpState {
-            map: vec![slice_qp_y as i8; w_cells * h_cells],
+            map: vec![slice_qp_y as i8; w_cells * rows_cells],
             w_cells,
             h_cells,
+            origin_cells,
+            rows_cells,
             qg_log2,
             ctb_log2: self.field.ctb_log2(),
             slice_qp_y,
@@ -1490,7 +1563,10 @@ impl ReconCtx {
             - q.qp_bd_offset_y;
         // Stamp the CU area for later qPY_A / qPY_B reads + deblocking.
         let n = 1usize << log2_cb_size;
-        for y in (y_cb..(y_cb + n).min(q.h_cells * 4)).step_by(4) {
+        let y_end = (y_cb + n)
+            .min(q.h_cells * 4)
+            .min((q.origin_cells + q.rows_cells) * 4);
+        for y in (y_cb.max(q.origin_cells * 4)..y_end).step_by(4) {
             for x in (x_cb..(x_cb + n).min(q.w_cells * 4)).step_by(4) {
                 let idx = q.cell(x, y);
                 q.map[idx] = qp_y as i8;
@@ -2019,8 +2095,9 @@ fn write_palette_cu(
         u32::from(params.bit_depth_luma),
         transquant_bypass,
         {
+            let origin = pic.y_origin(Plane::Luma);
             let (buf, stride) = pic.plane_mut(Plane::Luma);
-            move |x, y, v| buf[(y_cb + y) * stride + x_cb + x] = v as u16
+            move |x, y, v| buf[(y_cb + y - origin) * stride + x_cb + x] = v as u16
         },
     );
     if params.chroma_array_type != 0 {
@@ -2040,8 +2117,9 @@ fn write_palette_cu(
                 u32::from(params.bit_depth_chroma),
                 transquant_bypass,
                 {
+                    let origin = pic.y_origin(plane);
                     let (buf, stride) = pic.plane_mut(plane);
-                    move |x, y, v| buf[(cy + y) * stride + cx + x] = v as u16
+                    move |x, y, v| buf[(cy + y - origin) * stride + cx + x] = v as u16
                 },
             );
         }
@@ -2056,22 +2134,18 @@ fn write_pcm_cu(
     n_cb: usize,
     pcm: &crate::slice_data::PcmSamples,
 ) {
-    {
-        let (buf, stride) = pic.plane_mut(Plane::Luma);
-        for j in 0..n_cb {
-            let o = (y_cb + j) * stride + x_cb;
-            buf[o..o + n_cb].copy_from_slice(&pcm.luma[n_cb * j..n_cb * (j + 1)]);
-        }
+    for j in 0..n_cb {
+        pic.row_mut(Plane::Luma, y_cb + j)[x_cb..x_cb + n_cb]
+            .copy_from_slice(&pcm.luma[n_cb * j..n_cb * (j + 1)]);
     }
     if chroma_array_type != 0 {
         let (sub_w, sub_h) = sub_wh_c(chroma_array_type);
         let (cw, ch) = (n_cb / sub_w, n_cb / sub_h);
         let (cx, cy) = (x_cb / sub_w, y_cb / sub_h);
         for (plane, samples) in [(Plane::Cb, &pcm.cb), (Plane::Cr, &pcm.cr)] {
-            let (buf, stride) = pic.plane_mut(plane);
             for j in 0..ch {
-                let o = (cy + j) * stride + cx;
-                buf[o..o + cw].copy_from_slice(&samples[cw * j..cw * (j + 1)]);
+                pic.row_mut(plane, cy + j)[cx..cx + cw]
+                    .copy_from_slice(&samples[cw * j..cw * (j + 1)]);
             }
         }
     }

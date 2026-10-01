@@ -71,6 +71,11 @@ pub enum Neighbour {
 /// neighbour lookups always see already-decoded state.
 #[derive(Debug, Clone)]
 pub struct IntraModeField {
+    /// First stored min-block row (0 for a whole picture; a wavefront
+    /// band stores one CTB row of cells plus the row above it).
+    origin_blocks: usize,
+    /// Number of stored min-block rows.
+    rows_blocks: usize,
     /// Width / height of the grid in 4×4 min blocks.
     w_blocks: usize,
     h_blocks: usize,
@@ -107,6 +112,8 @@ impl IntraModeField {
         let w_blocks = pic_width_luma.div_ceil(MIN_BLOCK_SIZE);
         let h_blocks = pic_height_luma.div_ceil(MIN_BLOCK_SIZE);
         Self {
+            origin_blocks: 0,
+            rows_blocks: h_blocks,
             w_blocks,
             h_blocks,
             ctb_log2_size_y,
@@ -114,11 +121,89 @@ impl IntraModeField {
         }
     }
 
+    /// A band of the field storing only the min-block rows covering
+    /// luma rows `y_origin_luma .. y_origin_luma + band_rows_luma`
+    /// (multiples of 4); accessors take absolute coordinates.
+    ///
+    /// # Panics
+    /// Panics if the band lies outside the picture.
+    #[must_use]
+    pub fn new_band(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        ctb_log2_size_y: u32,
+        y_origin_luma: usize,
+        band_rows_luma: usize,
+    ) -> Self {
+        let w_blocks = pic_width_luma.div_ceil(MIN_BLOCK_SIZE);
+        let h_blocks = pic_height_luma.div_ceil(MIN_BLOCK_SIZE);
+        let origin_blocks = y_origin_luma >> MIN_BLOCK_LOG2;
+        let rows_blocks = band_rows_luma.div_ceil(MIN_BLOCK_SIZE);
+        assert!(
+            origin_blocks + rows_blocks <= h_blocks,
+            "band past the picture"
+        );
+        Self {
+            origin_blocks,
+            rows_blocks,
+            w_blocks,
+            h_blocks,
+            ctb_log2_size_y,
+            cells: vec![Cell::default(); w_blocks * rows_blocks],
+        }
+    }
+
+    /// First stored min-block row.
     #[inline]
-    fn cell_index(&self, x_luma: usize, y_luma: usize) -> usize {
+    #[must_use]
+    pub fn origin_blocks(&self) -> usize {
+        self.origin_blocks
+    }
+
+    /// Number of stored min-block rows.
+    #[inline]
+    #[must_use]
+    pub fn rows_blocks(&self) -> usize {
+        self.rows_blocks
+    }
+
+    /// The packed cells of min-block row `by` (absolute), columns `bx0
+    /// .. bx1`, in the [`Self::snapshot_rect`] layout (the wavefront
+    /// halo export).
+    #[must_use]
+    pub(crate) fn row_cells(&self, by: usize, bx0: usize, bx1: usize) -> Vec<u8> {
+        self.snapshot_rect(
+            bx0 << MIN_BLOCK_LOG2,
+            by << MIN_BLOCK_LOG2,
+            (bx1 - bx0) << MIN_BLOCK_LOG2,
+            MIN_BLOCK_SIZE,
+        )
+    }
+
+    /// Write packed cells from [`Self::row_cells`] into min-block row
+    /// `by` (absolute) at columns `bx0 ..` (the wavefront halo import).
+    pub(crate) fn import_row_cells(&mut self, by: usize, bx0: usize, packed: &[u8]) {
+        let n = packed.len() / 3;
+        self.restore_rect(
+            bx0 << MIN_BLOCK_LOG2,
+            by << MIN_BLOCK_LOG2,
+            n << MIN_BLOCK_LOG2,
+            MIN_BLOCK_SIZE,
+            packed,
+        );
+    }
+
+    /// The stored cell covering a luma location, or the unwritten
+    /// default outside a band's stored rows (such neighbours are never
+    /// available by the §6.4.1 z-scan order).
+    #[inline]
+    fn cell_at(&self, x_luma: usize, y_luma: usize) -> Cell {
         let bx = x_luma >> MIN_BLOCK_LOG2;
         let by = y_luma >> MIN_BLOCK_LOG2;
-        by * self.w_blocks + bx
+        if by < self.origin_blocks || by >= self.origin_blocks + self.rows_blocks {
+            return Cell::default();
+        }
+        self.cells[(by - self.origin_blocks) * self.w_blocks + bx]
     }
 
     /// Record an intra prediction block's `IntraPredModeY` across the
@@ -152,7 +237,7 @@ impl IntraModeField {
     /// z-scan availability independently denies those.
     #[must_use]
     pub fn is_intra_at(&self, x_luma: usize, y_luma: usize) -> bool {
-        let c = &self.cells[self.cell_index(x_luma, y_luma)];
+        let c = self.cell_at(x_luma, y_luma);
         c.written && matches!(c.pred_mode, CuPredMode::Intra)
     }
 
@@ -219,19 +304,21 @@ impl IntraModeField {
         }
     }
 
+    /// The stored cell rectangle covering the luma rectangle, as
+    /// `(bx0, by0, bx1, by1)` in **stored** rows (band-relative).
     fn rect_cells(&self, x: usize, y: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
         let bx0 = x >> MIN_BLOCK_LOG2;
-        let by0 = y >> MIN_BLOCK_LOG2;
         let bx1 = ((x + w).min(self.w_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
-        let by1 = ((y + h).min(self.h_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
+        let by0 = (y >> MIN_BLOCK_LOG2).max(self.origin_blocks) - self.origin_blocks;
+        let by1 = ((y + h).min(self.h_blocks << MIN_BLOCK_LOG2))
+            .div_ceil(MIN_BLOCK_SIZE)
+            .clamp(self.origin_blocks, self.origin_blocks + self.rows_blocks)
+            - self.origin_blocks;
         (bx0, by0, bx1, by1)
     }
 
     fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, cell: Cell) {
-        let bx0 = x >> MIN_BLOCK_LOG2;
-        let by0 = y >> MIN_BLOCK_LOG2;
-        let bx1 = ((x + w).min(self.w_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
-        let by1 = ((y + h).min(self.h_blocks << MIN_BLOCK_LOG2)).div_ceil(MIN_BLOCK_SIZE);
+        let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
         for by in by0..by1 {
             for bx in bx0..bx1 {
                 self.cells[by * self.w_blocks + bx] = cell;
@@ -274,7 +361,7 @@ impl IntraModeField {
         if x_nb >= (self.w_blocks << MIN_BLOCK_LOG2) || y_nb >= (self.h_blocks << MIN_BLOCK_LOG2) {
             return INTRA_DC;
         }
-        let cell = self.cells[self.cell_index(x_nb, y_nb)];
+        let cell = self.cell_at(x_nb, y_nb);
         // An unwritten neighbour cannot have been decoded → INTRA_DC. (The
         // z-scan availability test should already exclude it, but a
         // single-slice driver that passes `available = true` for all
@@ -301,7 +388,7 @@ impl IntraModeField {
     /// no block covering it has been written yet).
     #[must_use]
     pub fn recorded_mode(&self, x_luma: usize, y_luma: usize) -> Option<u8> {
-        let cell = self.cells[self.cell_index(x_luma, y_luma)];
+        let cell = self.cell_at(x_luma, y_luma);
         cell.written.then_some(cell.intra_pred_mode_y)
     }
 }

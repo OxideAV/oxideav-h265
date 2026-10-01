@@ -362,6 +362,49 @@ takes the sample range from) and the parameter-set ids (`vpsid` /
 `spsid` / `ppsid`, so sibling streams in one container can carry
 distinct VPS / SPS / PPS).
 
+## Decoder performance (round 464)
+
+Measured on an M4 Max, release profile, through the registry decoder
+(`examples/decode_bench`, best of 5; peak RSS from `/usr/bin/time -l`,
+which includes the ~3 MiB process baseline and the input stream):
+
+| 12 MP still (4032x3024) | wall, serial | wall, 2 / 4 / 8 workers | peak RSS serial → 8 workers |
+| --- | --- | --- | --- |
+| 8-bit 4:2:0, this encoder, WPP | 0.24 s | 0.14 / 0.086 / 0.063 s | 77 → 103 MiB |
+| 10-bit 4:2:0, this encoder, WPP | 0.26 s | 0.16 / 0.11 / 0.083 s | 83 → 108 MiB |
+| 8-bit 4:2:0, third-party encoder (x265 defaults, WPP) | 0.50 s | 0.28 / 0.16 / 0.105 s | 84 → 94 MiB |
+| 8-bit 4:2:0, this encoder, no WPP / tiles | 0.22 s | 0.21 / 0.21 / 0.21 s (filters only) | 63 → 74 MiB |
+| Apple grid: 48 × 512x512 WPP tiles, one after the other | 0.46 s | 0.17 s at 4 | 7 MiB |
+
+At the start of the round the 8-bit still took 0.51 s at **326 MiB**
+(the 10-bit one 0.58 s / 321 MiB). Where the memory went, and goes:
+
+| allocation | before (12 MP 8-bit) | now |
+| --- | --- | --- |
+| reconstructed picture (`i32` samples) | 73 MiB | 37 MiB (`u16`) |
+| SAO: two whole-picture copies (`recPicture` + `saoPicture`) | 146 MiB | 0.5 MiB band (CTB height + 2 lines) per plane, in place |
+| whole-picture syntax tree (every TB's `levels: Vec<i32>`) | ~40–70 MiB, QP-dependent | one CTU at a time |
+| motion field (28-byte cells, every picture) | 21 MiB | 0.8 MiB (mode byte per cell; the 16-byte motion payload only once an inter cell is written) |
+| deblocking descriptors (per CU + boxed transform splits) | ~5–10 MiB | 0.8 MiB edge map (`bS` per 4-sample edge segment) |
+| output copy (`DecodedFrame` clone) + DPB reference copy | 73 + 73 MiB | shared planes; a one-picture DPB (every still) stores nothing, the frame owns the planes and is packed plane by plane |
+| intra-mode / QP / depth / skip / suppression cell maps | ~8 MiB | ~8 MiB (unchanged; 1–4 bytes per 4x4 cell) |
+| `VideoFrame` output planes (`u8` / LE16) | 18 MiB | 18 MiB |
+
+Where the time went (serial, 8-bit WPP still): the §8.6.4 inverse
+transform was 43 % of the decode as a dense 32x32 matrix product; it is
+now the even / odd regrouping over the block's non-zero extent (same
+integer sums, bit-identical) — 0.46 → 0.25 s. The remaining profile:
+CABAC residual decoding ~25 %, intra reference-sample gathering with a
+per-sample §6.4.1 availability test ~10 %, prediction + residual add
+~8 %, deblocking ~6 %, SAO ~4 %.
+
+Under a thread budget (`set_execution_context` / `SequenceDecoder::
+set_threads`), a WPP picture decodes its CTB rows in a wavefront (each
+row parsed and reconstructed by one worker into a row band with a
+four-line halo; the row below imports what each CTB publishes), every
+picture's deblocking and SAO run row-parallel, and the bytes equal the
+serial decode for any budget (`tests/threaded_decode.rs`).
+
 ## What's implemented
 
 * **Whole-bitstream decode driver** (`sequence`) — Annex B demux →
@@ -461,7 +504,15 @@ and ~985 unit tests.
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
   level-0 time serially (38 s for a 12 MP still; 7.5 s on 8 workers
   with `wpp`) against ~1 s for the third-party encoder's
-  multi-threaded default preset — no SIMD.
+  multi-threaded default preset — no SIMD. Encoder memory: the 12 MP
+  wavefront encode peaks at 459 MiB on 8 workers (391 MiB serial;
+  777 / 579 at the start of round 464) — every worker still holds a
+  whole-picture `EncState` whose untouched rows stay unmapped; a
+  row-window state per worker is the next step.
+* Decoder parallelism covers WPP pictures (wavefront) and the in-loop
+  filters of every picture; tiled pictures without WPP parse serially
+  (tile-parallel parsing is a follow-up), as do pictures using SCC
+  palette / current-picture referencing or chroma QP offset lists.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

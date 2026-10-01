@@ -46,6 +46,9 @@ use crate::sps::{
 };
 use crate::vps::HevcVps;
 
+mod wavefront;
+pub(crate) use wavefront::filter_picture_parallel;
+
 /// NAL unit type: video parameter set (Table 7-1).
 const NAL_VPS: u8 = 32;
 /// NAL unit type: sequence parameter set.
@@ -413,6 +416,9 @@ pub struct SequenceDecoder {
     plan: Option<LayerPlan>,
     layers: BTreeMap<u8, LayerState>,
     au: AccessUnit,
+    /// Worker budget for the per-picture wavefront / row-parallel
+    /// filters (0 or 1 = serial).
+    threads: usize,
 }
 
 impl SequenceDecoder {
@@ -420,6 +426,17 @@ impl SequenceDecoder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bound the decoder's internal parallelism (the core
+    /// [`oxideav_core::ExecutionContext`] contract — serial until told
+    /// otherwise). With a budget above one, a picture coded with
+    /// `entropy_coding_sync_enabled_flag` (and no tiles) decodes its CTB
+    /// rows in a wavefront on up to that many workers, and every
+    /// picture's §8.7 deblocking / SAO passes run row-parallel; the
+    /// output is bit-identical for any budget.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
     }
 
     /// Debug: keep decoding past an `end_of_slice_segment_flag`
@@ -612,6 +629,15 @@ impl SequenceDecoder {
     /// Any decode error from the pending picture.
     pub fn flush(&mut self) -> Result<(), SequenceError> {
         self.finish_picture()
+    }
+
+    /// Release every reference picture: the bitstream has ended, so no
+    /// later picture can reference them, and the decoded frames still
+    /// to be taken become the sole owners of their planes (a consumer
+    /// taking a still then packs it without a copy).
+    pub fn release_references(&mut self) {
+        self.state.dpb_mut().clear();
+        self.au.pictures.clear();
     }
 
     /// Drain the pictures decoded so far, in decode order. The caller
@@ -1033,81 +1059,55 @@ impl SequenceDecoder {
             }
         }
         // ---- §7.3.8 CABAC decode + §8.4/§8.5 reconstruction, CTU by CTU ----
-        let mut reconstructor = PictureReconstructor::new(
-            geom.width as usize,
-            geom.height as usize,
-            &recon_params,
-            &slice_ctx,
-            &geom.tiles,
-            &refs,
-            col_field,
-        )?;
-        let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
-        let mut slice_addr_of: Vec<Option<u32>> = vec![None; pic_size_in_ctbs];
-        let mut sink = |x_ctb: u32, y_ctb: u32, ctu: CodingTreeUnit, slice_addr_rs: u32| {
-            let placed = PlacedInterCtu {
-                x_ctb,
-                y_ctb,
-                slice_addr_rs,
-                filter_across_slices: across_of_slice
-                    .get(&slice_addr_rs)
-                    .copied()
-                    .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
-                ctu: &ctu,
+        let workers = self.threads.max(1);
+        let wavefront_plan = (workers > 1 && !self.tolerant && !plan.multi_layer)
+            .then(|| wavefront::WavefrontPlan::build(segs, sps, pps, &geom))
+            .flatten();
+        let (picture, motion) = if let Some(wplan) = wavefront_plan {
+            let inputs = wavefront::WavefrontInputs {
+                segs,
+                sps,
+                pps,
+                geom: &geom,
+                slice_ctx: &slice_ctx,
+                refs: &refs,
+                col_field,
+                across_of_slice: &across_of_slice,
+                tolerant: self.tolerant,
             };
-            reconstructor.push_ctu(&placed)?;
-            Ok(())
-        };
-        let first_slice_type = segs[0]
-            .header
-            .slice_type
-            .ok_or(SequenceError::Malformed("independent slice without type"))?;
-        let mut parse_state = PictureParseState::new(&build_slice_data_params(
-            &segs[0].header,
-            sps,
-            pps,
-            &geom,
-            first_slice_type,
-        ));
-
-        // §7.4.7.1 — a dependent slice segment inherits the slice-level
-        // header values (and SliceAddrRs) from the preceding independent
-        // slice segment; §9.3.2.2 restores its CABAC context variables
-        // from the state stored at the end of the previous segment
-        // (TableStateIdxDs, §9.3.2.4).
-        let mut cur_indep: &SegmentData = indep;
-        let mut ds_stored: Option<SliceContexts> = None;
-        // §9.3.2.4 WPP snapshot — ONE picture-wide storage: a CTU row
-        // started by a later slice segment of the same slice
-        // synchronizes from the state stored while an earlier segment
-        // decoded the row above (§9.3.2.5, T-availability gated).
-        let mut wpp_stored: Option<SliceContexts> = None;
-        for seg in segs {
-            if seg.header.dependent_slice_segment_flag {
-                if ds_stored.is_none() {
-                    return Err(SequenceError::Malformed(
-                        "dependent slice segment without a preceding segment's context state",
-                    ));
-                }
-            } else {
-                cur_indep = seg;
-            }
-            decode_slice_segment_data(
-                seg,
-                &cur_indep.header,
+            let merged = wavefront::decode_rows(&wplan, &inputs, &recon_params, workers)?;
+            let tiling = geom.tiling()?;
+            let pic = crate::inter_recon::filter_picture(
+                merged.pic,
+                &crate::inter_recon::FilterInputs {
+                    params: &recon_params,
+                    slice: &slice_ctx,
+                    tiling: &tiling,
+                    edges: &merged.edges,
+                    qp_cells: &merged.qp_cells,
+                    no_filter_cells: &merged.no_filter,
+                    slice_addr_map: &merged.slice_addr,
+                    filter_across_map: &merged.filter_across,
+                    sao_grid: &merged.sao,
+                },
+                workers,
+            );
+            (pic, merged.field)
+        } else {
+            self.decode_picture_serial(
+                segs,
+                indep,
                 sps,
                 pps,
                 &geom,
-                &mut parse_state,
-                &mut sink,
-                &mut slice_addr_of,
-                &mut ds_stored,
-                &mut wpp_stored,
-                self.tolerant,
-            )?;
-        }
-
-        let (picture, motion) = reconstructor.finish()?;
+                &recon_params,
+                &slice_ctx,
+                &refs,
+                col_field,
+                &across_of_slice,
+                workers,
+            )?
+        };
 
         // F.8.1.6: the inter-layer references go back to their own
         // layer's marking; the picture is output only when its layer is
@@ -1153,6 +1153,122 @@ impl SequenceDecoder {
         st.first_pic_decoded = true;
         st.initialized = initialized;
         Ok(())
+    }
+
+    /// The serial per-picture path: CABAC-decode every slice segment in
+    /// order, reconstructing each CTU as it is parsed, then filter.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_picture_serial(
+        &self,
+        segs: &[SegmentData],
+        indep: &SegmentData,
+        sps: &SeqParameterSet,
+        pps: &PicParameterSet,
+        geom: &Geometry,
+        recon_params: &ReconParams,
+        slice_ctx: &InterSliceContext,
+        refs: &RefListAccess<'_>,
+        col_field: Option<&crate::motion::MotionField>,
+        across_of_slice: &BTreeMap<u32, bool>,
+        workers: usize,
+    ) -> Result<(Picture, crate::motion::MotionField), SequenceError> {
+        let mut reconstructor = PictureReconstructor::new(
+            geom.width as usize,
+            geom.height as usize,
+            recon_params,
+            slice_ctx,
+            &geom.tiles,
+            refs,
+            col_field,
+        )?;
+        let pic_size_in_ctbs = (geom.pic_w_ctbs * geom.pic_h_ctbs) as usize;
+        let mut slice_addr_of: Vec<Option<u32>> = vec![None; pic_size_in_ctbs];
+        let mut sink = |x_ctb: u32, y_ctb: u32, ctu: CodingTreeUnit, slice_addr_rs: u32| {
+            let placed = PlacedInterCtu {
+                x_ctb,
+                y_ctb,
+                slice_addr_rs,
+                filter_across_slices: across_of_slice
+                    .get(&slice_addr_rs)
+                    .copied()
+                    .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
+                ctu: &ctu,
+            };
+            reconstructor.push_ctu(&placed)?;
+            Ok(())
+        };
+        let first_slice_type = segs[0]
+            .header
+            .slice_type
+            .ok_or(SequenceError::Malformed("independent slice without type"))?;
+        let mut parse_state = PictureParseState::new(&build_slice_data_params(
+            &segs[0].header,
+            sps,
+            pps,
+            geom,
+            first_slice_type,
+        ));
+
+        // §7.4.7.1 — a dependent slice segment inherits the slice-level
+        // header values (and SliceAddrRs) from the preceding independent
+        // slice segment; §9.3.2.2 restores its CABAC context variables
+        // from the state stored at the end of the previous segment
+        // (TableStateIdxDs, §9.3.2.4).
+        let mut cur_indep: &SegmentData = indep;
+        let mut ds_stored: Option<SliceContexts> = None;
+        // §9.3.2.4 WPP snapshot — ONE picture-wide storage: a CTU row
+        // started by a later slice segment of the same slice
+        // synchronizes from the state stored while an earlier segment
+        // decoded the row above (§9.3.2.5, T-availability gated).
+        let mut wpp_stored: Option<SliceContexts> = None;
+        for seg in segs {
+            if seg.header.dependent_slice_segment_flag {
+                if ds_stored.is_none() {
+                    return Err(SequenceError::Malformed(
+                        "dependent slice segment without a preceding segment's context state",
+                    ));
+                }
+            } else {
+                cur_indep = seg;
+            }
+            decode_slice_segment_data(
+                seg,
+                &cur_indep.header,
+                sps,
+                pps,
+                geom,
+                &mut parse_state,
+                &mut sink,
+                &mut slice_addr_of,
+                &mut ds_stored,
+                &mut wpp_stored,
+                self.tolerant,
+            )?;
+        }
+
+        if workers > 1 {
+            // Row-parallel §8.7 filters on the serially reconstructed
+            // picture (a non-wavefront stream under a thread budget).
+            let (picture, field, inputs) = reconstructor.into_filter_inputs();
+            let tiling = geom.tiling()?;
+            let pic = crate::inter_recon::filter_picture(
+                picture,
+                &crate::inter_recon::FilterInputs {
+                    params: recon_params,
+                    slice: slice_ctx,
+                    tiling: &tiling,
+                    edges: &inputs.edges,
+                    qp_cells: &inputs.qp_cells,
+                    no_filter_cells: &inputs.no_filter,
+                    slice_addr_map: &inputs.slice_addr,
+                    filter_across_map: &inputs.filter_across,
+                    sao_grid: &inputs.sao,
+                },
+                workers,
+            );
+            return Ok((pic, field));
+        }
+        Ok(reconstructor.finish()?)
     }
 
     /// Assemble the §8.3 [`PictureHeaderInfo`] from the independent

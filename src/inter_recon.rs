@@ -27,7 +27,7 @@
 use crate::dpb::{DpbEntry, RefPicLists};
 use crate::inter_pred::{PuWeights, WpListWeights};
 use crate::motion::{derive_chroma_mv, MotionField};
-use crate::picture::{sub_wh_c, Picture};
+use crate::picture::{sub_wh_c, Picture, Plane};
 use crate::pu_mv::{resolve_cu_motion, InterCuDesc, PuMotion, PuMvContext, PuRect};
 use crate::recon::{
     extract_cu_residual, reconstruct_inter_pu_weighted, CuResidual, ReconError, ReconParams,
@@ -578,7 +578,6 @@ pub struct PictureReconstructor<'a> {
     refs: &'a RefListAccess<'a>,
     col_field: Option<&'a MotionField>,
     pic_w_ctbs: usize,
-    pic_h_ctbs: usize,
     /// Per-CTB `SliceAddrRs` (raster order), filled as CTUs arrive.
     slice_addr_map: Vec<u32>,
     /// Per-CTB `slice_loop_filter_across_slices_enabled_flag` (§7.4.7.1 —
@@ -594,9 +593,77 @@ pub struct PictureReconstructor<'a> {
     /// PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
     no_filter_cells: Vec<bool>,
     w4: usize,
+    /// First stored cell row of `no_filter_cells` (a band).
+    no_filter_origin: usize,
     prev_slice_addr: Option<u32>,
     prev_tile: Option<u32>,
     sao_grid: Vec<crate::sao::ResolvedSao>,
+    /// The band this reconstructor covers: `(first luma row of the CTB
+    /// row, luma rows of the CTB row)`; the whole picture when `None`.
+    band: Option<(usize, usize)>,
+}
+
+/// Everything one CTB publishes to the wavefront row below it: the
+/// samples of its bottom line, the mode / motion / intra-mode cells of
+/// its bottom cell row, its slice identity and resolved SAO parameters,
+/// and — after the second CTB of a row — the §9.3.2.4 context storage.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct CtbHalo {
+    /// Luma raster address of the CTB.
+    pub ctb_rs: u32,
+    /// Bottom luma line of the CTB (`x_ctb .. x_ctb + w`).
+    pub luma: Vec<u16>,
+    /// Bottom chroma lines (`Cb`, `Cr`), empty for monochrome.
+    pub cb: Vec<u16>,
+    /// See [`Self::cb`].
+    pub cr: Vec<u16>,
+    /// Motion-field flags of the bottom cell row.
+    pub motion_flags: Vec<u8>,
+    /// Motion-field payload of the bottom cell row (`None` when the
+    /// band carries no inter cell).
+    pub motion: Option<Vec<crate::motion::CellMotion>>,
+    /// Reconstruction-side intra-mode cells of the bottom cell row
+    /// (packed as `IntraModeField::row_cells`).
+    pub recon_modes: Vec<u8>,
+    /// Parse-side `(CtDepth, cu_skip_flag, packed intra-mode cells)` of
+    /// the bottom cell row.
+    pub parse_cells: (Vec<i8>, Vec<u8>, Vec<u8>),
+    /// `SliceAddrRs` of the CTB.
+    pub slice_addr_rs: u32,
+    /// `slice_loop_filter_across_slices_enabled_flag` of its slice.
+    pub filter_across_slices: bool,
+    /// The CTB's resolved SAO parameters (the merge-up source).
+    pub sao: crate::sao::ResolvedSao,
+    /// §9.3.2.4 storage after the second CTB of the row (`None`
+    /// elsewhere).
+    pub wpp_contexts: Option<Box<crate::ctx_init::SliceContexts>>,
+}
+
+/// A finished wavefront row band: the structures the picture-level
+/// merge copies into their whole-picture counterparts.
+#[derive(Debug)]
+pub struct BandOutput {
+    /// First luma row of the CTB row and its row count.
+    pub y0: usize,
+    /// See [`Self::y0`].
+    pub rows: usize,
+    /// The band picture (halo line + CTB row).
+    pub pic: Picture,
+    /// The band motion field.
+    pub field: MotionField,
+    /// `QpY` cells of the CTB row (`rows / 4` cell rows, picture width).
+    pub qp_cells: Vec<i8>,
+    /// Loop-filter suppression cells of the CTB row.
+    pub no_filter: Vec<bool>,
+    /// The CTB row's deblocking edge strengths.
+    pub edges: crate::deblock::DeblockEdgeMap,
+    /// Per-CTB resolved SAO parameters of the row.
+    pub sao: Vec<crate::sao::ResolvedSao>,
+    /// Per-CTB `SliceAddrRs` of the row.
+    pub slice_addr: Vec<u32>,
+    /// Per-CTB loop-filter-across-slices flags of the row.
+    pub filter_across: Vec<bool>,
 }
 
 impl<'a> PictureReconstructor<'a> {
@@ -648,17 +715,208 @@ impl<'a> PictureReconstructor<'a> {
             refs,
             col_field,
             pic_w_ctbs,
-            pic_h_ctbs,
             slice_addr_map: vec![0u32; pic_w_ctbs * pic_h_ctbs],
             filter_across_map: vec![true; pic_w_ctbs * pic_h_ctbs],
             deblock_cus: Vec::new(),
             edges: crate::deblock::DeblockEdgeMap::new(pic_width_luma, pic_height_luma),
             no_filter_cells: vec![false; w4 * h4],
             w4,
+            no_filter_origin: 0,
             prev_slice_addr: None,
             prev_tile: None,
             sao_grid: vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs],
+            band: None,
         })
+    }
+
+    /// The luma halo a band keeps above its CTB row: one min-block row
+    /// (the §8.4.4.2.1 / §9.3.4.2.2 neighbour reads need the cells; the
+    /// §8.4.4.2 reference samples need its last line).
+    pub const BAND_HALO: usize = 4;
+
+    /// [`Self::new`] for one wavefront CTB row: luma rows `y0 .. y0 +
+    /// rows` plus the [`Self::BAND_HALO`]-line halo above (none for the
+    /// first row). The row's neighbours arrive through
+    /// [`Self::import_halo`]; the finished row leaves through
+    /// [`Self::export_halo`] (per CTB) and [`Self::finish_band`].
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_band(
+        pic_width_luma: usize,
+        pic_height_luma: usize,
+        params: &'a ReconParams,
+        slice: &'a InterSliceContext,
+        tiles: &crate::availability::TilingParams,
+        refs: &'a RefListAccess<'a>,
+        col_field: Option<&'a MotionField>,
+        y0: usize,
+        rows: usize,
+    ) -> Result<Self, ReconError> {
+        let halo = if y0 == 0 { 0 } else { Self::BAND_HALO };
+        let y_origin = y0 - halo;
+        let band_rows = halo + rows;
+        let pic = Picture::new_band(
+            pic_width_luma,
+            pic_height_luma,
+            params.chroma_array_type,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+            y_origin,
+            band_rows,
+        );
+        let mut ctx = crate::recon::ReconCtx::new_band(
+            pic_width_luma,
+            pic_height_luma,
+            slice.ctb_log2_size_y,
+            slice.min_tb_log2_size_y,
+            tiles,
+            y_origin,
+            band_rows,
+        )?;
+        ctx.init_qp_state(
+            slice.slice_qp_y,
+            slice.log2_min_cu_qp_delta_size,
+            6 * (i32::from(params.bit_depth_luma) - 8),
+        );
+        ctx.set_constrained_intra(slice.constrained_intra_pred);
+        let field = MotionField::new_band(pic_width_luma, pic_height_luma, y_origin, band_rows);
+        let ctb_size = 1usize << slice.ctb_log2_size_y;
+        let pic_w_ctbs = pic_width_luma.div_ceil(ctb_size);
+        let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
+        let w4 = pic_width_luma.div_ceil(4);
+        Ok(Self {
+            pic,
+            ctx,
+            field,
+            params,
+            slice,
+            refs,
+            col_field,
+            pic_w_ctbs,
+            slice_addr_map: vec![0u32; pic_w_ctbs * pic_h_ctbs],
+            filter_across_map: vec![true; pic_w_ctbs * pic_h_ctbs],
+            deblock_cus: Vec::new(),
+            edges: crate::deblock::DeblockEdgeMap::new_band(pic_width_luma, y0, rows),
+            no_filter_cells: vec![false; w4 * rows.div_ceil(4)],
+            w4,
+            no_filter_origin: y0 / 4,
+            prev_slice_addr: None,
+            prev_tile: None,
+            sao_grid: vec![crate::sao::ResolvedSao::off(); pic_w_ctbs * pic_h_ctbs],
+            band: Some((y0, rows)),
+        })
+    }
+
+    /// Publish what the CTB at raster address `ctb_rs` (in this band's
+    /// row) hands to the row below. `parse_cells` is the parse state's
+    /// bottom cell row of the CTB; `wpp_contexts` the §9.3.2.4 storage
+    /// when this is the row's second CTB.
+    #[must_use]
+    pub fn export_halo(
+        &self,
+        ctb_rs: u32,
+        parse_cells: (Vec<i8>, Vec<u8>, Vec<u8>),
+        wpp_contexts: Option<Box<crate::ctx_init::SliceContexts>>,
+    ) -> CtbHalo {
+        let (y0, rows) = self.band.expect("export_halo on a band");
+        let ctb = 1usize << self.slice.ctb_log2_size_y;
+        let rx = ctb_rs as usize % self.pic_w_ctbs;
+        let (pw, ph) = self.pic.plane_dims(Plane::Luma);
+        let x0 = rx * ctb;
+        let x1 = (x0 + ctb).min(pw);
+        let y_last = (y0 + rows).min(ph) - 1;
+        let luma = self.pic.row(Plane::Luma, y_last)[x0..x1].to_vec();
+        let (cb, cr) = if self.params.chroma_array_type == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let (sw, sh) = sub_wh_c(self.params.chroma_array_type);
+            let (cx0, cx1) = (x0 / sw, x1.div_ceil(sw));
+            let cy_last = (y0 + rows)
+                .div_ceil(sh)
+                .min(self.pic.plane_dims(Plane::Cb).1)
+                - 1;
+            (
+                self.pic.row(Plane::Cb, cy_last)[cx0..cx1].to_vec(),
+                self.pic.row(Plane::Cr, cy_last)[cx0..cx1].to_vec(),
+            )
+        };
+        let by = y_last / 4;
+        let (bx0, bx1) = (x0 / 4, x1.div_ceil(4));
+        let (flags, motion) = self.field.row_cells(by);
+        CtbHalo {
+            ctb_rs,
+            luma,
+            cb,
+            cr,
+            motion_flags: flags[bx0..bx1].to_vec(),
+            motion: motion.map(|m| m[bx0..bx1].to_vec()),
+            recon_modes: self.ctx.intra_field().row_cells(by, bx0, bx1),
+            parse_cells,
+            slice_addr_rs: self.slice_addr_map[ctb_rs as usize],
+            filter_across_slices: self.filter_across_map[ctb_rs as usize],
+            sao: self.sao_grid[ctb_rs as usize],
+            wpp_contexts,
+        }
+    }
+
+    /// Take a CTB of the row above into this band's halo (its bottom
+    /// samples / cells, slice identity and SAO parameters).
+    pub fn import_halo(&mut self, halo: &CtbHalo) {
+        let (y0, _) = self.band.expect("import_halo on a band");
+        debug_assert!(y0 > 0, "the first row has no halo");
+        let ctb = 1usize << self.slice.ctb_log2_size_y;
+        let rs = halo.ctb_rs as usize;
+        let rx = rs % self.pic_w_ctbs;
+        let x0 = rx * ctb;
+        let x1 = x0 + halo.luma.len();
+        self.pic.row_mut(Plane::Luma, y0 - 1)[x0..x1].copy_from_slice(&halo.luma);
+        if self.params.chroma_array_type != 0 {
+            let (sw, sh) = sub_wh_c(self.params.chroma_array_type);
+            let cy = y0 / sh - 1;
+            let cx0 = x0 / sw;
+            self.pic.row_mut(Plane::Cb, cy)[cx0..cx0 + halo.cb.len()].copy_from_slice(&halo.cb);
+            self.pic.row_mut(Plane::Cr, cy)[cx0..cx0 + halo.cr.len()].copy_from_slice(&halo.cr);
+        }
+        let by = y0 / 4 - 1;
+        let bx0 = x0 / 4;
+        self.field
+            .import_row_cells(by, bx0, &halo.motion_flags, halo.motion.as_deref());
+        self.ctx
+            .intra_field_mut()
+            .import_row_cells(by, bx0, &halo.recon_modes);
+        self.slice_addr_map[rs] = halo.slice_addr_rs;
+        self.filter_across_map[rs] = halo.filter_across_slices;
+        self.ctx
+            .set_slice_addr_rs_at(halo.ctb_rs, halo.slice_addr_rs);
+        self.sao_grid[rs] = halo.sao;
+    }
+
+    /// Finish a band: hand its structures to the picture-level merge
+    /// (no in-loop filtering — the merged picture is filtered whole).
+    #[must_use]
+    pub fn finish_band(self) -> BandOutput {
+        let (y0, rows) = self.band.expect("finish_band on a band");
+        let w = self.pic_w_ctbs;
+        let ry = y0 >> self.slice.ctb_log2_size_y;
+        let mut qp_cells = Vec::with_capacity(self.w4 * rows.div_ceil(4));
+        let (_, ph) = self.pic.plane_dims(Plane::Luma);
+        for by in y0 / 4..(y0 + rows).min(ph).div_ceil(4) {
+            qp_cells.extend_from_slice(self.ctx.qp_row(by).expect("band QP map"));
+        }
+        BandOutput {
+            y0,
+            rows,
+            pic: self.pic,
+            field: self.field,
+            qp_cells,
+            no_filter: self.no_filter_cells,
+            edges: self.edges,
+            sao: self.sao_grid[ry * w..(ry + 1) * w].to_vec(),
+            slice_addr: self.slice_addr_map[ry * w..(ry + 1) * w].to_vec(),
+            filter_across: self.filter_across_map[ry * w..(ry + 1) * w].to_vec(),
+        }
     }
 
     /// The picture reconstructed so far (pre-filter samples).
@@ -771,6 +1029,7 @@ impl<'a> PictureReconstructor<'a> {
             &mut self.deblock_cus,
             &mut self.no_filter_cells,
             self.w4,
+            self.no_filter_origin,
             &self.filter_across_map,
             &placed.ctu.quadtree,
         )?;
@@ -810,79 +1069,194 @@ impl<'a> PictureReconstructor<'a> {
     /// None today; the signature mirrors [`Self::push_ctu`].
     pub fn finish(self) -> Result<(Picture, MotionField), ReconError> {
         let Self {
-            mut pic,
+            pic,
             ctx,
             field,
             params,
             slice,
-            pic_w_ctbs,
-            pic_h_ctbs,
             slice_addr_map,
             filter_across_map,
             edges,
             no_filter_cells,
-            w4,
             sao_grid,
             ..
         } = self;
-        let no_filter_map =
-            no_filter_cells
-                .iter()
-                .any(|&b| b)
-                .then_some(crate::deblock::NoFilterMap {
-                    cells: &no_filter_cells,
-                    w_cells: w4,
-                });
-
-        // §8.7.2 — in-loop deblocking (all vertical edges, then
-        // horizontal), ahead of the §8.7.3 SAO pass.
-        if slice.deblock_enabled {
-            let (cells, w_cells) = ctx
-                .qp_cells()
-                .expect("the picture reconstructor initializes the QP map");
-            crate::deblock::deblock_picture_edges(
-                &mut pic,
-                &edges,
-                crate::deblock::QpMap { cells, w_cells },
-                no_filter_map.as_ref(),
-            );
-        }
-        drop(edges);
-
-        // §8.7.3 — sample-adaptive offset (on the deblocked samples).
-        let n_ctbs = pic_w_ctbs * pic_h_ctbs;
-        let sao_boundaries = crate::sao::SaoBoundaries {
-            slice_addr_of_ctb: slice_addr_map,
-            tile_id_of_ctb: (0..n_ctbs as u32)
-                .map(|rs| {
-                    let tiling = ctx.tiling();
-                    tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs))
-                })
-                .collect(),
-            pic_w_ctbs,
-            ctb_log2_size_y: slice.ctb_log2_size_y,
-            across_slices: slice.filter_across_slices,
-            across_tiles: slice.filter_across_tiles,
-            filter_across_of_ctb: Some(filter_across_map),
-            ctb_ts_of_rs: Some(
-                (0..n_ctbs as u32)
-                    .map(|rs| ctx.tiling().ctb_addr_rs_to_ts(rs))
-                    .collect(),
-            ),
-        };
-        crate::sao::apply_sao_picture_in_place(
-            &mut pic,
-            &sao_grid,
-            slice.ctb_log2_size_y,
-            params.chroma_array_type,
-            slice.slice_sao_luma_flag,
-            slice.slice_sao_chroma_flag,
-            Some(&sao_boundaries),
-            no_filter_map.as_ref(),
+        let (qp_cells, _) = ctx
+            .qp_cells()
+            .expect("the picture reconstructor initializes the QP map");
+        let pic = filter_picture(
+            pic,
+            &FilterInputs {
+                params,
+                slice,
+                tiling: ctx.tiling(),
+                edges: &edges,
+                qp_cells,
+                no_filter_cells: &no_filter_cells,
+                slice_addr_map: &slice_addr_map,
+                filter_across_map: &filter_across_map,
+                sao_grid: &sao_grid,
+            },
+            1,
         );
-
         Ok((pic, field))
     }
+}
+
+/// The owned per-picture maps of a finished (pre-filter) reconstruction
+/// — what [`PictureReconstructor::into_filter_inputs`] hands to a
+/// [`filter_picture`] call that runs the filters row-parallel.
+#[derive(Debug)]
+pub struct OwnedFilterInputs {
+    /// §8.7.2.4 strengths.
+    pub edges: crate::deblock::DeblockEdgeMap,
+    /// Per-4×4 `QpY`.
+    pub qp_cells: Vec<i8>,
+    /// Per-4×4 §8.7.2.5.4 / §8.7.3.1 suppression.
+    pub no_filter: Vec<bool>,
+    /// Per-CTB `SliceAddrRs`.
+    pub slice_addr: Vec<u32>,
+    /// Per-CTB loop-filter-across-slices flag.
+    pub filter_across: Vec<bool>,
+    /// Per-CTB resolved SAO parameters.
+    pub sao: Vec<crate::sao::ResolvedSao>,
+}
+
+impl PictureReconstructor<'_> {
+    /// Take the pre-filter picture, its motion field and the filter
+    /// maps apart (the caller filters through [`filter_picture`]).
+    #[must_use]
+    pub fn into_filter_inputs(self) -> (Picture, MotionField, OwnedFilterInputs) {
+        let Self {
+            pic,
+            ctx,
+            field,
+            slice_addr_map,
+            filter_across_map,
+            edges,
+            no_filter_cells,
+            sao_grid,
+            ..
+        } = self;
+        let (qp_cells, _) = ctx
+            .qp_cells()
+            .expect("the picture reconstructor initializes the QP map");
+        (
+            pic,
+            field,
+            OwnedFilterInputs {
+                edges,
+                qp_cells: qp_cells.to_vec(),
+                no_filter: no_filter_cells,
+                slice_addr: slice_addr_map,
+                filter_across: filter_across_map,
+                sao: sao_grid,
+            },
+        )
+    }
+}
+
+/// The per-picture maps the §8.7 in-loop filters read.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterInputs<'a> {
+    /// The picture's reconstruction parameters.
+    pub params: &'a ReconParams,
+    /// The slice-level filter switches / offsets.
+    pub slice: &'a InterSliceContext,
+    /// The picture tiling (slice / tile identities of the SAO gates).
+    pub tiling: &'a crate::availability::PictureTiling,
+    /// §8.7.2.4 strengths.
+    pub edges: &'a crate::deblock::DeblockEdgeMap,
+    /// Per-4×4 `QpY`.
+    pub qp_cells: &'a [i8],
+    /// Per-4×4 §8.7.2.5.4 / §8.7.3.1 suppression.
+    pub no_filter_cells: &'a [bool],
+    /// Per-CTB `SliceAddrRs`.
+    pub slice_addr_map: &'a [u32],
+    /// Per-CTB loop-filter-across-slices flag.
+    pub filter_across_map: &'a [bool],
+    /// Per-CTB resolved SAO parameters.
+    pub sao_grid: &'a [crate::sao::ResolvedSao],
+}
+
+/// §8.7 — deblock then SAO the reconstructed picture in place; with
+/// `workers > 1` the passes run row-parallel ([`filter_picture_parallel`]).
+#[must_use]
+pub fn filter_picture(mut pic: Picture, inputs: &FilterInputs<'_>, workers: usize) -> Picture {
+    let FilterInputs {
+        params,
+        slice,
+        tiling,
+        edges,
+        qp_cells,
+        no_filter_cells,
+        slice_addr_map,
+        filter_across_map,
+        sao_grid,
+    } = *inputs;
+    let (pw, _) = pic.plane_dims(Plane::Luma);
+    let w4 = pw.div_ceil(4);
+    let no_filter_map = no_filter_cells
+        .iter()
+        .any(|&b| b)
+        .then_some(crate::deblock::NoFilterMap {
+            cells: no_filter_cells,
+            w_cells: w4,
+        });
+    let pic_w_ctbs = tiling.pic_width_in_ctbs_y() as usize;
+    let n_ctbs = slice_addr_map.len();
+    let sao_boundaries = crate::sao::SaoBoundaries {
+        slice_addr_of_ctb: slice_addr_map.to_vec(),
+        tile_id_of_ctb: (0..n_ctbs as u32)
+            .map(|rs| tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs)))
+            .collect(),
+        pic_w_ctbs,
+        ctb_log2_size_y: slice.ctb_log2_size_y,
+        across_slices: slice.filter_across_slices,
+        across_tiles: slice.filter_across_tiles,
+        filter_across_of_ctb: Some(filter_across_map.to_vec()),
+        ctb_ts_of_rs: Some(
+            (0..n_ctbs as u32)
+                .map(|rs| tiling.ctb_addr_rs_to_ts(rs))
+                .collect(),
+        ),
+    };
+    if workers > 1 {
+        return crate::sequence::filter_picture_parallel(
+            pic,
+            inputs,
+            &sao_boundaries,
+            no_filter_map.as_ref(),
+            workers,
+        );
+    }
+
+    // §8.7.2 — in-loop deblocking (all vertical edges, then
+    // horizontal), ahead of the §8.7.3 SAO pass.
+    if slice.deblock_enabled {
+        crate::deblock::deblock_picture_edges(
+            &mut pic,
+            edges,
+            crate::deblock::QpMap {
+                cells: qp_cells,
+                w_cells: w4,
+            },
+            no_filter_map.as_ref(),
+        );
+    }
+
+    // §8.7.3 — sample-adaptive offset (on the deblocked samples).
+    crate::sao::apply_sao_picture_in_place(
+        &mut pic,
+        sao_grid,
+        slice.ctb_log2_size_y,
+        params.chroma_array_type,
+        slice.slice_sao_luma_flag,
+        slice.slice_sao_chroma_flag,
+        Some(&sao_boundaries),
+        no_filter_map.as_ref(),
+    );
+    pic
 }
 
 /// Walk one §7.3.8.4 coding quadtree, dispatching each leaf coding unit to
@@ -899,6 +1273,7 @@ fn reconstruct_inter_quadtree(
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
     no_filter_cells: &mut [bool],
     w4: usize,
+    no_filter_origin: usize,
     filter_across_of_ctb: &[bool],
     qt: &crate::slice_data::CodingQuadtree,
 ) -> Result<(), ReconError> {
@@ -917,6 +1292,7 @@ fn reconstruct_inter_quadtree(
                     deblock_cus,
                     no_filter_cells,
                     w4,
+                    no_filter_origin,
                     filter_across_of_ctb,
                     child,
                 )?;
@@ -931,7 +1307,12 @@ fn reconstruct_inter_quadtree(
                 for j in (0..n).step_by(4) {
                     for i in (0..n).step_by(4) {
                         let (gx, gy) = ((cu.x0 as usize + i) >> 2, (cu.y0 as usize + j) >> 2);
-                        if let Some(cell) = no_filter_cells.get_mut(gy * w4 + gx) {
+                        if gy < no_filter_origin {
+                            continue;
+                        }
+                        if let Some(cell) =
+                            no_filter_cells.get_mut((gy - no_filter_origin) * w4 + gx)
+                        {
                             *cell = true;
                         }
                     }
