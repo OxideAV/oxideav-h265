@@ -243,6 +243,13 @@ pub fn scale_coefficients(
     for y in 0..n_tbs {
         for x in 0..n_tbs {
             let idx = y * n_tbs + x;
+            // A zero level scales to ( round >> bdShift ) == 0 (the
+            // offset is 1 << ( bdShift − 1 )), so only coded positions
+            // need the product.
+            let level = levels[idx];
+            if level == 0 {
+                continue;
+            }
             // §8.6.3 m[ x ][ y ]: flat 16 unless an explicit
             // ScalingFactor matrix is supplied (the caller folds the
             // "transform_skip && nTbS > 4 ⇒ 16" exception into the
@@ -250,7 +257,7 @@ pub fn scale_coefficients(
             let m = scaling.map_or(16i64, |sf| sf.at(x, y) as i64);
             // §8.6.3 eq. 8-309: clip( (TransCoeffLevel * m * levelScale
             // << (qP/6)) + round ) >> bdShift.
-            let prod = (levels[idx] as i64) * m * level_scale;
+            let prod = (level as i64) * m * level_scale;
             let shifted = (prod << qp_div6) + round;
             let scaled = clip3(coeff_min as i64, coeff_max as i64, shifted >> bd_shift);
             d[idx] = scaled as i32;
@@ -777,19 +784,17 @@ pub fn residual_block(
         )?
     };
 
-    // §8.6.2 ordered step 3 (eq. 8-299): r = (r + (1 << (bdShift-1))) >> bdShift.
-    let mut r = vec![0i32; count];
+    // §8.6.2 ordered step 3 (eq. 8-299): r = (r + (1 << (bdShift-1))) >> bdShift,
+    // in place over the transform output.
+    let mut r = pre;
     if bd_shift > 0 {
         let round = 1i64 << (bd_shift - 1);
-        for (rv, &pv) in r.iter_mut().zip(pre.iter()) {
-            *rv = (((pv as i64) + round) >> bd_shift) as i32;
+        for rv in r.iter_mut() {
+            *rv = (((*rv as i64) + round) >> bd_shift) as i32;
         }
-    } else {
-        // bdShift == 0 only under extended-precision with bitDepth == 20
-        // (out of our 8..=16 domain) — but keep the no-shift identity
-        // for completeness.
-        r.copy_from_slice(&pre);
     }
+    // bdShift == 0 only under extended-precision with bitDepth == 20
+    // (out of our 8..=16 domain): the no-shift identity.
     Ok(r)
 }
 

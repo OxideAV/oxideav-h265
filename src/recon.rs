@@ -328,6 +328,13 @@ fn gather_reference_samples(
         Plane::Luma => (1, 1),
         Plane::Cb | Plane::Cr => sub_wh_c(pic.chroma_array_type()),
     };
+    // The §6.4.1 availability (and the §8.4.4.2.1 constrained-intra
+    // gate) is a property of the neighbour's 4x4 luma min block, so one
+    // test per run of `unit` plane samples covers the run: a 4-luma
+    // unit is 4 / SubWidthC chroma samples along the top row and
+    // 4 / SubHeightC down the left column. A plane width / height is a
+    // multiple of the min coding block, so a unit never straddles the
+    // picture edge.
     let avail = |x: i64, y: i64| -> bool {
         x >= 0
             && y >= 0
@@ -335,24 +342,42 @@ fn gather_reference_samples(
             && (y as usize) < ph
             && ctx.ref_sample_available(xb, yb, x, y, sub_w, sub_h)
     };
-    let read = |x: i64, y: i64| -> (i32, bool) {
-        if avail(x, y) {
+    let read = |x: i64, y: i64, ok: bool| -> (i32, bool) {
+        if ok {
             (pic.sample(plane, x as usize, y as usize), true)
         } else {
             (0, false)
         }
     };
     // Corner p[−1][−1].
-    let corner = read(xb as i64 - 1, yb as i64 - 1);
+    let corner = read(
+        xb as i64 - 1,
+        yb as i64 - 1,
+        avail(xb as i64 - 1, yb as i64 - 1),
+    );
     // Left column p[−1][0 .. 2*nTbS−1].
+    let unit_v = (4 / sub_h).max(1);
     let mut left = Vec::with_capacity(2 * n_tbs);
-    for y in 0..(2 * n_tbs) {
-        left.push(read(xb as i64 - 1, yb as i64 + y as i64));
+    let mut y = 0usize;
+    while y < 2 * n_tbs {
+        let ok = avail(xb as i64 - 1, (yb + y) as i64);
+        let run = unit_v.min(2 * n_tbs - y);
+        for k in 0..run {
+            left.push(read(xb as i64 - 1, (yb + y + k) as i64, ok));
+        }
+        y += run;
     }
     // Top row p[0 .. 2*nTbS−1][−1].
+    let unit_h = (4 / sub_w).max(1);
     let mut top = Vec::with_capacity(2 * n_tbs);
-    for x in 0..(2 * n_tbs) {
-        top.push(read(xb as i64 + x as i64, yb as i64 - 1));
+    let mut x = 0usize;
+    while x < 2 * n_tbs {
+        let ok = avail((xb + x) as i64, yb as i64 - 1);
+        let run = unit_h.min(2 * n_tbs - x);
+        for k in 0..run {
+            top.push(read((xb + x + k) as i64, yb as i64 - 1, ok));
+        }
+        x += run;
     }
     MarkedReferenceSamples::new(n_tbs, corner, left, top)
         .expect("reference array dimensions match n_tbs")
@@ -578,8 +603,10 @@ fn predict_add_store(
     let pred = intra_predict_with_substitution(&marked, &ip_params)?;
 
     // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
+    let (buf, stride, origin) = pic.plane_mut_origin(plane);
     for y in 0..n_tbs {
-        let row = &mut pic.row_mut(plane, yb + y)[xb..xb + n_tbs];
+        let o = (yb + y - origin) * stride + xb;
+        let row = &mut buf[o..o + n_tbs];
         let prow = &pred[y * n_tbs..(y + 1) * n_tbs];
         match res {
             Some(r) => {
@@ -775,8 +802,10 @@ fn write_inter_plane(
     residual: Option<&[i32]>,
 ) {
     let bit_depth = pic.bit_depth(plane);
+    let (buf, stride, origin) = pic.plane_mut_origin(plane);
     for y in 0..h {
-        let row = &mut pic.row_mut(plane, y0 + y)[x0..x0 + w];
+        let o = (y0 + y - origin) * stride + x0;
+        let row = &mut buf[o..o + w];
         let prow = &pred[y * w..(y + 1) * w];
         match residual {
             Some(r) => {

@@ -222,6 +222,16 @@ impl Picture {
         &buf[r * stride..(r + 1) * stride]
     }
 
+    /// The plane's buffer for writing (copied first if shared) with its
+    /// stride and the picture row its first stored row is — block
+    /// writers take this once and index rows as `(y - origin) * stride`.
+    #[inline]
+    pub fn plane_mut_origin(&mut self, plane: Plane) -> (&mut [u16], usize, usize) {
+        let origin = self.y_origin(plane);
+        let (buf, stride) = self.plane_slice_mut(plane);
+        (buf, stride, origin)
+    }
+
     /// Row `y` (absolute picture row) of `plane`, for writing.
     ///
     /// # Panics
