@@ -394,10 +394,12 @@ At the start of the round the 8-bit still took 0.51 s at **326 MiB**
 Where the time went (serial, 8-bit WPP still): the §8.6.4 inverse
 transform was 43 % of the decode as a dense 32x32 matrix product; it is
 now the even / odd regrouping over the block's non-zero extent (same
-integer sums, bit-identical) — 0.46 → 0.25 s. The remaining profile:
-CABAC residual decoding ~25 %, intra reference-sample gathering with a
-per-sample §6.4.1 availability test ~10 %, prediction + residual add
-~8 %, deblocking ~6 %, SAO ~4 %.
+integer sums, bit-identical) — 0.46 → 0.25 s; the §8.4.4.2
+reference-sample gathering then tested the §6.4.1 availability per
+sample (10 % of the decode), now once per 4x4 min block — 0.22 s. The
+remaining profile: the even / odd transform ~13 %, CABAC residual
+decoding ~20 %, intra prediction ~6 %, prediction + residual add ~4 %,
+deblocking ~6 %, SAO ~3 %, allocation ~6 %.
 
 Under a thread budget (`set_execution_context` / `SequenceDecoder::
 set_threads`), a WPP picture decodes its CTB rows in a wavefront (each
