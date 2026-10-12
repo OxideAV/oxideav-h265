@@ -1465,9 +1465,13 @@ pub fn decode_coding_quadtree(
         let inc = split_cu_flag_ctx_inc(l_depth, l_avail, a_depth, a_avail, cqt_depth) as usize;
         decode_split_cu_flag(engine, &mut ctx.split_cu_flag[inc])? != 0
     } else {
-        // §7.4.9.4 inference: 1 when the block extends past the picture
-        // boundary OR log2CbSize > MinCbLog2SizeY, else 0.
-        (!fits_w || !fits_h) || log2_cb_size > params.min_cb_log2_size_y
+        // §7.4.9.4 inference: 1 when log2CbSize > MinCbLog2SizeY (a
+        // block past the picture boundary keeps splitting down to the
+        // minimum coding block), else 0. A minimum-size block that
+        // still crosses the boundary only exists when the SPS breaks
+        // the §7.4.3.2.1 multiple-of-MinCbSizeY rule, which the SPS
+        // parse rejects; the inference never splits below MinCbSizeY.
+        log2_cb_size > params.min_cb_log2_size_y
     };
 
     // §6.5.1 quantization-group resets at the QG threshold.

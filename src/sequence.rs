@@ -1557,6 +1557,33 @@ impl Geometry {
         if width == 0 || height == 0 {
             return Err(SequenceError::Malformed("zero picture dimensions"));
         }
+        // §7.4.3.3.1 / §7.4.3.3.2 bounds that tie the PPS to the SPS it
+        // refers to — neither parse can check them alone, and every
+        // one feeds a `CtbLog2SizeY − x` / `MaxTbLog2SizeY` derivation
+        // that must not underflow.
+        let log2_diff_cb = u32::from(sps.log2_diff_max_min_luma_coding_block_size);
+        if pps.diff_cu_qp_delta_depth > log2_diff_cb {
+            return Err(SequenceError::Malformed(
+                "diff_cu_qp_delta_depth exceeds log2_diff_max_min_luma_coding_block_size",
+            ));
+        }
+        if pps.log2_parallel_merge_level_minus2 + 2 > ctb_log2 {
+            return Err(SequenceError::Malformed(
+                "log2_parallel_merge_level_minus2 exceeds CtbLog2SizeY - 2",
+            ));
+        }
+        if let Some(range) = pps.pps_range_extension.as_ref() {
+            if range.diff_cu_chroma_qp_offset_depth > log2_diff_cb {
+                return Err(SequenceError::Malformed(
+                    "diff_cu_chroma_qp_offset_depth exceeds log2_diff_max_min_luma_coding_block_size",
+                ));
+            }
+            if range.log2_max_transform_skip_block_size_minus2 + 2 > max_tb_log2 {
+                return Err(SequenceError::Malformed(
+                    "log2_max_transform_skip_block_size_minus2 exceeds MaxTbLog2SizeY - 2",
+                ));
+            }
+        }
         let ctb = 1u32 << ctb_log2;
         let chroma_array_type = if sps.separate_colour_plane_flag {
             0
@@ -1760,6 +1787,14 @@ fn build_recon_params(
     let slice_qp_y = header
         .slice_qp_y(pps)
         .ok_or(SequenceError::Malformed("slice header without slice_qp"))?;
+    // §7.4.7.1 eq. 7-54: SliceQpY lies in −QpBdOffsetY .. 51; every QP
+    // table the reconstruction indexes is sized for that range.
+    let qp_bd_offset_y = 6 * i32::from(sps.bit_depth_luma_minus8);
+    if slice_qp_y < -qp_bd_offset_y || slice_qp_y > 51 {
+        return Err(SequenceError::Malformed(
+            "SliceQpY outside -QpBdOffsetY ..= 51",
+        ));
+    }
     let range = sps.sps_range_extension.as_ref();
     // §7.4.5: when scaling_list_enabled_flag == 1 the active
     // scaling-list data is the PPS body if present, else the SPS body

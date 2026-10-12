@@ -115,8 +115,8 @@
 //!   range 0..=15.
 //! * `chroma_format_idc` range 0..=3.
 //! * `pic_width_in_luma_samples` and `pic_height_in_luma_samples` not
-//!   equal to zero (the modulo-`MinCbSizeY` check is deferred — it
-//!   depends on the not-yet-validated `log2_min_cb_size`).
+//!   equal to zero; the modulo-`MinCbSizeY` check runs once
+//!   `log2_min_luma_coding_block_size_minus3` is known.
 //! * `bit_depth_luma_minus8` and `bit_depth_chroma_minus8` range
 //!   0..=8 (§7.4.3.2 caps the encoded bit depth at 16).
 //! * `log2_max_pic_order_cnt_lsb_minus4` range 0..=12.
@@ -1423,6 +1423,20 @@ impl SeqParameterSet {
         let log2_diff_max_min_luma_coding_block_size =
             log2_diff_max_min_luma_coding_block_size_raw as u8;
         let min_cb_log2_size_y = u32::from(log2_min_luma_coding_block_size_minus3) + 3;
+        // §7.4.3.2.1: both picture dimensions "shall be an integer
+        // multiple of MinCbSizeY" (F.7.4.3.1.1 says the same of the VPS
+        // representation format). The coding quadtree relies on it: a
+        // minimum-size coding block never crosses the picture boundary,
+        // so the §7.4.9.4 split inference never has to go below it.
+        let min_cb_size_y = 1u32 << min_cb_log2_size_y;
+        for (field, got) in [
+            ("pic_width_in_luma_samples", pic_width_in_luma_samples),
+            ("pic_height_in_luma_samples", pic_height_in_luma_samples),
+        ] {
+            if got % min_cb_size_y != 0 {
+                return Err(SpsError::ValueOutOfRange { field, got });
+            }
+        }
 
         let log2_min_luma_transform_block_size_minus2_raw = br.ue()?;
         // §7.4.3.2.1: "The CVS shall not contain data that result in

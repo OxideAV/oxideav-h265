@@ -438,6 +438,30 @@ the bytes equal the serial decode for any budget
   — the frames of one access unit consecutively, base view first
   (`DecodedFrame::layer_id` / `view_id` / `au_index` on the direct
   API; the core `VideoFrame` carries no layer tag yet).
+* **Hostile input never panics** (round 474, from a crash a HEIF
+  container fuzzer handed this crate): the §9.3.3.3 Exp-Golomb reader
+  reports a runaway prefix or a value past `u32` as
+  `CabacError::ValueOutOfRange` (a one-byte `RangedElement` names the
+  syntax element) instead of saturating; `cu_qp_delta_abs` is bounded
+  by the §7.4.9.14 `CuQpDeltaVal` range, `abs_mvd_minus2` by the
+  §7.4.9.9 `MvdLX` range, `coeff_abs_level_remaining` and
+  `num_palette_indices_minus1` use checked `cMax + suffix` sums, the
+  §8.5.3.2.1 motion-vector wrap is wrapping arithmetic; the SPS parse
+  enforces the §7.4.3.2.1 multiple-of-`MinCbSizeY` picture dimensions
+  (the §7.4.9.4 `split_cu_flag` inference never splits below the
+  minimum coding block), the PPS parse bounds
+  `log2_sao_offset_scale_*`, and activation checks the PPS against its
+  SPS (`diff_cu_qp_delta_depth`, `diff_cu_chroma_qp_offset_depth`,
+  `log2_parallel_merge_level_minus2`,
+  `log2_max_transform_skip_block_size_minus2`, `SliceQpY`). The
+  registry decoder reaches its flushed state even when the last
+  picture fails, so `receive_frame` answers `Eof` rather than
+  `NeedMore` forever. Three fuzz targets run nightly: `parse_annexb`
+  (parameter sets, slice headers, SEI), `decode_residual` (§7.3.8.11
+  on a bin stream) and `hvcc_decode` (the HEIF / ISO-BMFF carriage —
+  `hvcC` record + length-prefixed access unit — through the registry
+  decoder, seeded with real-world stills and inter-coded GOPs);
+  `tests/hostile_cabac.rs` pins every input they found.
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
   bodies), VUI + HRD (§E.2), SEI (§7.3.5 framing; typed §D.2
   payloads incl. the context-dependent §D.2.2 buffering-period and
