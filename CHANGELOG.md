@@ -13,6 +13,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - *(decoder)* `DiffPicOrderCnt` (eq. 8-4, `poc::diff_pic_order_cnt`) saturates and the §8.5.3.2.7 / §8.5.3.2.9 temporal scaling distances go through it — a P-slice run whose picture order counts were more than `i32` apart overflowed `currPic − neighRefPic` in the motion-vector scaling (the third `hvcc_decode` input); the `PicOrderCntMsb` accumulation wraps like the derivation's modular arithmetic
 - *(decoder)* the registry decoder reaches its flushed state even when the pending picture fails to decode: `receive_frame` after an erroring `flush` drains the pictures decoded before it and then answers `Eof` instead of `NeedMore` forever (every consumer's drain loop would spin)
 
+### Other
+
+- *(tests)* `budgeted_still_decode_is_not_slower_than_serial` interleaves its two arms (best of seven each) and asserts the ratio only on machines with four or more cores — the sibling tests of the binary decode under their own budgets at the same time, which starved the 4-worker arm on a 4-vCPU runner (0.88 s serial vs 1.89 s)
+
 ### Added
 
 - `CabacError::ValueOutOfRange(RangedElement)` naming the offending syntax element (a one-byte enum, so the error stays register-sized on the bin-decode path); `CabacError` and `RangedElement` are `#[non_exhaustive]`
