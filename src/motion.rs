@@ -559,8 +559,8 @@ pub struct RefPicId {
 #[must_use]
 fn scale_temporal_mv(mv: Mv, curr_poc: i32, neigh_ref_poc: i32, cur_ref_poc: i32) -> Mv {
     // eqs 8-182 / 8-196 and 8-183 / 8-197.
-    let td = (curr_poc - neigh_ref_poc).clamp(-128, 127);
-    let tb = (curr_poc - cur_ref_poc).clamp(-128, 127);
+    let td = crate::poc::diff_pic_order_cnt(curr_poc, neigh_ref_poc).clamp(-128, 127);
+    let tb = crate::poc::diff_pic_order_cnt(curr_poc, cur_ref_poc).clamp(-128, 127);
     if td == 0 {
         // td == 0 means same picture; the caller only scales when the
         // POCs differ, so this guard is defensive (avoids /0).
@@ -1401,8 +1401,8 @@ fn collocated_mv(col: MotionCell, ctx: &TemporalMvContext) -> Option<Mv> {
     }
 
     // colPocDiff / currPocDiff (eqs 8-202 / 8-203).
-    let col_poc_diff = ctx.col_poc - ref_poc_col;
-    let curr_poc_diff = ctx.curr_poc - ctx.curr_ref_poc;
+    let col_poc_diff = crate::poc::diff_pic_order_cnt(ctx.col_poc, ref_poc_col);
+    let curr_poc_diff = crate::poc::diff_pic_order_cnt(ctx.curr_poc, ctx.curr_ref_poc);
 
     // eq 8-204 vs 8-205..8-209: copy when long-term or equal POC diffs,
     // else scale via the td=colPocDiff / tb=currPocDiff distances.

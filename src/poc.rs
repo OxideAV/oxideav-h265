@@ -205,7 +205,7 @@ impl PocState {
         } else {
             poc_msb(poc_lsb, self.prev_poc_lsb, self.prev_poc_msb, max_poc_lsb)
         };
-        let val = msb + poc_lsb as i32;
+        let val = msb.wrapping_add(poc_lsb as i32);
         PicOrderCnt {
             msb,
             lsb: poc_lsb,
@@ -306,20 +306,30 @@ fn poc_msb(poc_lsb: u32, prev_poc_lsb: u32, prev_poc_msb: i32, max_poc_lsb: u32)
     let lsb = poc_lsb as i32;
     let prev_lsb = prev_poc_lsb as i32;
     let max = max_poc_lsb as i32;
+    // PicOrderCntVal is a 32-bit quantity (§8.3.1); the accumulation
+    // wraps like the derivation's own modular arithmetic rather than
+    // overflowing on a hostile run of LSB jumps.
     if lsb < prev_lsb && (prev_lsb - lsb) >= half {
-        prev_poc_msb + max
+        prev_poc_msb.wrapping_add(max)
     } else if lsb > prev_lsb && (lsb - prev_lsb) > half {
-        prev_poc_msb - max
+        prev_poc_msb.wrapping_sub(max)
     } else {
         prev_poc_msb
     }
 }
 
 /// §8.3.1 equation 8-4 — `DiffPicOrderCnt( picA, picB )`.
+///
+/// §8.3.1 requires every `DiffPicOrderCnt` the decoding process uses to
+/// lie in `−2^15 .. 2^15 − 1`; the subtraction saturates so a stream
+/// that breaks the requirement (two pictures whose `PicOrderCntVal`
+/// are more than `i32` apart) yields a bounded distance instead of
+/// overflowing — every consumer clips the distance further
+/// (`[−128, 127]` in the §8.5.3.2.7 scaling) or only tests its sign.
 #[inline]
 #[must_use]
 pub fn diff_pic_order_cnt(poc_a: i32, poc_b: i32) -> i32 {
-    poc_a - poc_b
+    poc_a.saturating_sub(poc_b)
 }
 
 #[cfg(test)]

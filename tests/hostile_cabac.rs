@@ -18,7 +18,10 @@
 //! drove the coding quadtree below the minimum coding block (the
 //! §7.4.9.4 `split_cu_flag` inference at `MinCbLog2SizeY` is 0, not
 //! "split because the block crosses the boundary") and a transform
-//! unit to `log2TrafoSize − 1` at size 1.
+//! unit to `log2TrafoSize − 1` at size 1; `hvcc-fuzz-4cef6c` a P-slice
+//! run whose picture order counts are far enough apart that the
+//! §8.5.3.2.7 `DiffPicOrderCnt` (`currPic − neighRefPic`) overflowed
+//! `i32` in the temporal motion-vector scaling.
 
 use oxideav_core::{CodecParameters, Error, Packet, TimeBase};
 use oxideav_h265::sequence::SequenceDecoder;
@@ -110,6 +113,10 @@ const SEEDS: &[(&str, &[u8])] = &[
     (
         "hvcc-fuzz-8e2cdb",
         include_bytes!("fixture_bytes/r474/hvcc-fuzz-8e2cdb.seed"),
+    ),
+    (
+        "hvcc-fuzz-4cef6c",
+        include_bytes!("fixture_bytes/r474/hvcc-fuzz-4cef6c.seed"),
     ),
 ];
 
