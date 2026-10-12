@@ -458,7 +458,7 @@
 //! [`intra_pred_mode_c_chroma_422`] (Table 8-3), and
 //! [`derive_intra_pred_mode_c`] (the full §8.4.3 output).
 
-use crate::cabac::{CabacEngine, CabacError, ContextModel};
+use crate::cabac::{CabacEngine, CabacError, ContextModel, RangedElement};
 
 // ---------------------------------------------------------------------
 // Truncated-rice helper — §9.3.3.10
@@ -548,7 +548,7 @@ where
         if prefix_ones >= EG_K_MAX_PREFIX_ONES {
             // 32 leading ones encode a value of at least 2^32 − 1
             // (k = 0) — past every §7.4 range by orders of magnitude.
-            return Err(CabacError::ValueOutOfRange("EGk prefix"));
+            return Err(CabacError::ValueOutOfRange(RangedElement::EgkPrefix));
         }
         if read_bin()? == 0 {
             break;
@@ -566,7 +566,7 @@ where
     }
     let base = ((1u64 << prefix_ones) - 1) << k.min(32);
     let value = base + suffix;
-    u32::try_from(value).map_err(|_| CabacError::ValueOutOfRange("EGk value"))
+    u32::try_from(value).map_err(|_| CabacError::ValueOutOfRange(RangedElement::EgkValue))
 }
 
 /// Longest EGk unary prefix the decoders accept (§9.3.3.3): 32 leading
@@ -664,7 +664,7 @@ pub fn decode_cu_qp_delta(
         prefix
             .checked_add(decode_eg_k0(engine)?)
             .filter(|&abs| abs <= CU_QP_DELTA_ABS_MAX)
-            .ok_or(CabacError::ValueOutOfRange("cu_qp_delta_abs"))?
+            .ok_or(CabacError::ValueOutOfRange(RangedElement::CuQpDeltaAbs))?
     } else {
         prefix
     };
@@ -3973,7 +3973,7 @@ where
     }
     let base = ((1u64 << prefix_extension_length.min(32)) - 1) << rice_param.min(31);
     u32::try_from(base + escape)
-        .map_err(|_| CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
+        .map_err(|_| CabacError::ValueOutOfRange(RangedElement::CoeffAbsLevelRemaining))
 }
 
 /// §9.3.3.11 eq. 9-26 — `cMax = 4 << cRiceParam`.
@@ -4048,7 +4048,9 @@ where
     let suffix = read_eg_k_with(c_rice_param + 1, read_bin)?;
     coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param)
         .checked_add(suffix)
-        .ok_or(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
+        .ok_or(CabacError::ValueOutOfRange(
+            RangedElement::CoeffAbsLevelRemaining,
+        ))
 }
 
 /// §9.3.3.11, `extended_precision_processing_flag == 1` variant of
@@ -4080,7 +4082,9 @@ where
     let suffix = decode_limited_egk_suffix_with(c_rice_param + 1, log2_transform_range, read_bin)?;
     coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param)
         .checked_add(suffix)
-        .ok_or(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
+        .ok_or(CabacError::ValueOutOfRange(
+            RangedElement::CoeffAbsLevelRemaining,
+        ))
 }
 
 /// §9.3.3.11 — full bypass-coded decode of `coeff_abs_level_remaining[
@@ -4252,7 +4256,7 @@ pub const ABS_MVD_MINUS2_MAX: u32 = (1 << 15) - 2;
 fn decode_abs_mvd_minus2(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
     let minus2 = decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?;
     if minus2 > ABS_MVD_MINUS2_MAX {
-        return Err(CabacError::ValueOutOfRange("abs_mvd_minus2"));
+        return Err(CabacError::ValueOutOfRange(RangedElement::AbsMvdMinus2));
     }
     Ok(minus2)
 }
@@ -4364,7 +4368,7 @@ where
     let minus2 = if greater1_flag == 1 {
         let minus2 = read_eg_k_with(ABS_MVD_MINUS2_EG_K, &mut read_bypass_bin)?;
         if minus2 > ABS_MVD_MINUS2_MAX {
-            return Err(CabacError::ValueOutOfRange("abs_mvd_minus2"));
+            return Err(CabacError::ValueOutOfRange(RangedElement::AbsMvdMinus2));
         }
         Some(minus2)
     } else {
@@ -6301,7 +6305,7 @@ mod tests {
         bins.extend([1u8; 32]); // would-be suffix payload
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
-            Err(CabacError::ValueOutOfRange("EGk prefix"))
+            Err(CabacError::ValueOutOfRange(RangedElement::EgkPrefix))
         );
     }
 
@@ -6317,7 +6321,7 @@ mod tests {
         bins.extend([1u8, 0]); // … spelling 2
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
-            Err(CabacError::ValueOutOfRange("EGk value"))
+            Err(CabacError::ValueOutOfRange(RangedElement::EgkValue))
         );
         // A suffix of 0 fits the EGk value (2^32 − 2); the eq. 9-28
         // `cMax + suffixVal` sum is what overflows then.
@@ -6327,7 +6331,9 @@ mod tests {
         bins.extend([0u8; 32]);
         assert_eq!(
             decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
-            Err(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
+            Err(CabacError::ValueOutOfRange(
+                RangedElement::CoeffAbsLevelRemaining
+            ))
         );
     }
 
@@ -6344,7 +6350,7 @@ mod tests {
         let bins = [1u8; 32];
         assert_eq!(
             read_eg_k_with(0, bin_queue(&bins)),
-            Err(CabacError::ValueOutOfRange("EGk prefix"))
+            Err(CabacError::ValueOutOfRange(RangedElement::EgkPrefix))
         );
     }
 
@@ -6361,7 +6367,7 @@ mod tests {
         let ctx = [1u8, 1];
         assert_eq!(
             decode_mvd_component_with(bin_queue(&ctx), bin_queue(&bypass)),
-            Err(CabacError::ValueOutOfRange("abs_mvd_minus2"))
+            Err(CabacError::ValueOutOfRange(RangedElement::AbsMvdMinus2))
         );
         // The largest legal magnitude decodes: suffix 0 ⇒ 32766 =
         // ABS_MVD_MINUS2_MAX, lMvd = −(32766 + 2) = −2^15.

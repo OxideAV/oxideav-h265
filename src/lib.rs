@@ -359,7 +359,7 @@ pub use availability::{AvailabilityError, PictureTiling, TilingParams};
 pub use bitreader::{BitReader, BitReaderError};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use cabac::{init_type, CabacEngine, CabacError, ContextModel};
+pub use cabac::{init_type, CabacEngine, CabacError, ContextModel, RangedElement};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use ctx_init::SliceContexts;

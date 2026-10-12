@@ -25,7 +25,7 @@ use crate::binarization::{
     decode_cu_chroma_qp_offset, decode_cu_qp_delta, decode_eg_k, palette_run_prefix_ctx_inc,
     palette_run_prefix_tr_cmax, read_truncated_rice_prefix, CuChromaQpOffset, CuQpDelta,
 };
-use crate::cabac::{CabacEngine, CabacError};
+use crate::cabac::{CabacEngine, CabacError, RangedElement};
 use crate::ctx_init::SliceContexts;
 use crate::scan::traverse;
 
@@ -200,7 +200,9 @@ fn decode_num_palette_indices_minus1(
         // area, so a sum past `u32` is a corrupt stream.
         c_max
             .checked_add(decode_eg_k(engine, k + 1)?)
-            .ok_or(CabacError::ValueOutOfRange("num_palette_indices_minus1"))
+            .ok_or(CabacError::ValueOutOfRange(
+                RangedElement::NumPaletteIndicesMinus1,
+            ))
     }
 }
 

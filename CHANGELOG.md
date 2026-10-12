@@ -13,7 +13,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `CabacError::ValueOutOfRange(&'static str)` naming the offending syntax element; `CabacError` is `#[non_exhaustive]`
+- `CabacError::ValueOutOfRange(RangedElement)` naming the offending syntax element (a one-byte enum, so the error stays register-sized on the bin-decode path); `CabacError` and `RangedElement` are `#[non_exhaustive]`
 - `EG_K_MAX_PREFIX_ONES`, `CU_QP_DELTA_ABS_MAX`, `ABS_MVD_MINUS2_MAX` (`binarization`)
 - `fuzz/fuzz_targets/hvcc_decode.rs`: the HEIF / ISO-BMFF carriage (`hvcC` record + length-prefixed access unit) through the registry decoder, seeded with the container fuzzer's items and five real-world stills; `tests/hostile_cabac.rs` pins the two items (`tests/fixture_bytes/r474/`) on the `SequenceDecoder` and registry paths
 

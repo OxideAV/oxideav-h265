@@ -68,7 +68,52 @@ pub enum CabacError {
     /// (`cu_qp_delta_abs` beyond the §7.4.9.14 `CuQpDeltaVal` bound,
     /// `abs_mvd_minus2` beyond the §7.4.9.9 `MvdLX` bound, …). The
     /// payload names the syntax element.
-    ValueOutOfRange(&'static str),
+    ValueOutOfRange(RangedElement),
+}
+
+/// The syntax element (or binarization stage) a
+/// [`CabacError::ValueOutOfRange`] names. One byte, so the error — and
+/// the `Result<u8, CabacError>` every bin decode returns — stays in
+/// registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RangedElement {
+    /// A §9.3.3.3 EGk unary prefix of 32 `1` bins that never
+    /// terminated.
+    EgkPrefix,
+    /// A §9.3.3.3 EGk value past `u32`.
+    EgkValue,
+    /// `cu_qp_delta_abs` past the §7.4.9.14 `CuQpDeltaVal` bound.
+    CuQpDeltaAbs,
+    /// `abs_mvd_minus2` past the §7.4.9.9 `MvdLX` bound.
+    AbsMvdMinus2,
+    /// `coeff_abs_level_remaining` whose `cMax + suffixVal` sum
+    /// (eq. 9-28) or §9.3.3.4 limited-EGk escape passes `u32`.
+    CoeffAbsLevelRemaining,
+    /// `num_palette_indices_minus1` whose `cMax + suffix` sum
+    /// (§9.3.3.14) passes `u32`.
+    NumPaletteIndicesMinus1,
+}
+
+impl RangedElement {
+    /// The syntax element's name as the specification spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EgkPrefix => "EGk prefix",
+            Self::EgkValue => "EGk value",
+            Self::CuQpDeltaAbs => "cu_qp_delta_abs",
+            Self::AbsMvdMinus2 => "abs_mvd_minus2",
+            Self::CoeffAbsLevelRemaining => "coeff_abs_level_remaining",
+            Self::NumPaletteIndicesMinus1 => "num_palette_indices_minus1",
+        }
+    }
+}
+
+impl core::fmt::Display for RangedElement {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl core::fmt::Display for CabacError {
@@ -828,5 +873,13 @@ mod tests {
         }
         // transIdxMps ladder from 0: 1, 2, 3, 4, 5.
         assert_eq!(states, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// The error stays register-sized: every bin decode returns
+    /// `Result<u8, CabacError>` on the hottest path of the decoder.
+    #[test]
+    fn cabac_error_stays_small() {
+        assert!(core::mem::size_of::<CabacError>() <= 4);
+        assert!(core::mem::size_of::<Result<u8, CabacError>>() <= 8);
     }
 }
