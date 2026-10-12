@@ -196,8 +196,11 @@ fn decode_num_palette_indices_minus1(
         Ok((q << k) + rem)
     } else {
         // Prefix all-ones (prefixVal == cMax): EGk suffix with order
-        // k + 1 (eq. 9-33).
-        Ok(c_max + decode_eg_k(engine, k + 1)?)
+        // k + 1 (eq. 9-33). §7.4.9.6 bounds the count by the block
+        // area, so a sum past `u32` is a corrupt stream.
+        c_max
+            .checked_add(decode_eg_k(engine, k + 1)?)
+            .ok_or(CabacError::ValueOutOfRange("num_palette_indices_minus1"))
     }
 }
 

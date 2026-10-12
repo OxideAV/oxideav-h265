@@ -13,6 +13,9 @@ libfuzzer-sys = "0.4"
 [dependencies.oxideav-h265]
 path = ".."
 
+[dependencies.oxideav-core]
+version = "0.1"
+
 [[bin]]
 name = "parse_annexb"
 path = "fuzz_targets/parse_annexb.rs"
@@ -23,6 +26,13 @@ bench = false
 [[bin]]
 name = "decode_residual"
 path = "fuzz_targets/decode_residual.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hvcc_decode"
+path = "fuzz_targets/hvcc_decode.rs"
 test = false
 doc = false
 bench = false

@@ -60,10 +60,16 @@ fn reconstruct_component(mvp: i32, mvd: i32, integer_mv: bool) -> i32 {
     // eq 8-94 / 8-98: uLX = (mvpLX + mvdLX + 2^16) % 2^16, with the
     // integer path first quantizing the predictor to full-sample units
     // ( (mvp >> 2) + mvd ) << 2.
+    // The derivation is modulo 2^16, so wrapping i32 arithmetic (modulo
+    // 2^32, a multiple of 2^16) is exact for any predictor / delta pair
+    // — including the out-of-range deltas a corrupt stream can carry.
     let sum = if integer_mv {
-        (((mvp >> 2) + mvd) << 2) + MV_WRAP
+        (mvp >> 2)
+            .wrapping_add(mvd)
+            .wrapping_shl(2)
+            .wrapping_add(MV_WRAP)
     } else {
-        mvp + mvd + MV_WRAP
+        mvp.wrapping_add(mvd).wrapping_add(MV_WRAP)
     };
     let u = sum.rem_euclid(MV_WRAP);
     // eq 8-95 / 8-99: fold the upper half to the negative range.

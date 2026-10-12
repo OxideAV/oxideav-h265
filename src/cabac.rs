@@ -47,8 +47,10 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 
-/// Errors that can arise while running the CABAC decode engine.
+/// Errors that can arise while running the CABAC decode engine or
+/// the §9.3.3 binarizations layered on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CabacError {
     /// The bit reader ran out of bits (a `read_bits()` past the end of
     /// the slice-segment-data buffer). A conforming bitstream never
@@ -60,6 +62,13 @@ pub enum CabacError {
     /// that result in a value of ivlOffset being equal to 510 or
     /// 511.").
     InvalidInitOffset(u16),
+    /// A bypass-coded binarization decoded a value no conforming
+    /// bitstream can carry — an Exp-Golomb (§9.3.3.3) prefix that
+    /// never terminates, or a syntax element past its §7.4 range
+    /// (`cu_qp_delta_abs` beyond the §7.4.9.14 `CuQpDeltaVal` bound,
+    /// `abs_mvd_minus2` beyond the §7.4.9.9 `MvdLX` bound, …). The
+    /// payload names the syntax element.
+    ValueOutOfRange(&'static str),
 }
 
 impl core::fmt::Display for CabacError {
@@ -68,6 +77,9 @@ impl core::fmt::Display for CabacError {
             Self::EndOfBuffer => f.write_str("CABAC engine read past end of slice-data buffer"),
             Self::InvalidInitOffset(v) => {
                 write!(f, "CABAC init ivlOffset {v} is forbidden (must be < 510)")
+            }
+            Self::ValueOutOfRange(element) => {
+                write!(f, "{element} decoded outside its conformance range")
             }
         }
     }

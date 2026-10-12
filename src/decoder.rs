@@ -253,15 +253,17 @@ impl Decoder for H265Decoder {
 
     fn flush(&mut self) -> Result<()> {
         // Decode any pending picture and release the reorder queue.
-        self.seq
-            .flush()
-            .map_err(|e| Error::InvalidData(format!("h265 flush: {e}")))?;
+        // A pending picture that fails to decode (a corrupt last slice)
+        // is reported, but the decoder still reaches the flushed state:
+        // the pictures decoded before it drain, and `receive_frame`
+        // then answers `Eof` instead of asking for more input forever.
+        let flushed = self.seq.flush();
         // End of stream: the reference pictures go, so the frames
         // drained below own their planes outright.
         self.seq.release_references();
         self.flushed = true;
         self.drain(true);
-        Ok(())
+        flushed.map_err(|e| Error::InvalidData(format!("h265 flush: {e}")))
     }
 }
 

@@ -519,10 +519,12 @@ where
 /// `<< 0` factor disappears) — preserved as
 /// [`decode_eg_k0`] for callers that only need the `k = 0` case.
 ///
-/// `leading_zeros` is capped at 32 to keep the decoder defensive
-/// against runaway encodings; the cap is comfortably above any legal
-/// HEVC bypass-coded suffix value (§7.4.9.11 puts the practical
-/// ceiling well below `2^31`).
+/// # Errors
+/// [`CabacError::ValueOutOfRange`] when the unary prefix runs to 32
+/// `1` bins without terminating or the decoded value does not fit
+/// `u32` — no conforming syntax element comes near either (every EGk
+/// element's §7.4 range stays below `2^23`); such a bin string is a
+/// corrupt or hostile stream, never a value to saturate.
 pub(crate) fn decode_eg_k(engine: &mut CabacEngine<'_>, k: u32) -> Result<u32, CabacError> {
     read_eg_k_with(k, || engine.decode_bypass())
 }
@@ -542,28 +544,35 @@ where
     F: FnMut() -> Result<u8, CabacError>,
 {
     let mut prefix_ones: u32 = 0;
-    while prefix_ones < 32 {
-        let bin = read_bin()?;
-        if bin == 0 {
+    loop {
+        if prefix_ones >= EG_K_MAX_PREFIX_ONES {
+            // 32 leading ones encode a value of at least 2^32 − 1
+            // (k = 0) — past every §7.4 range by orders of magnitude.
+            return Err(CabacError::ValueOutOfRange("EGk prefix"));
+        }
+        if read_bin()? == 0 {
             break;
         }
         prefix_ones += 1;
     }
-    // Guard against accidental >32-bit reads (cap `prefix_ones` at
-    // 32 already bounds this; the saturate keeps the read width inside
-    // a single `u32` if `k` is unusually large).
-    let suffix_bits = (prefix_ones + k).min(32);
-    let mut suffix: u32 = 0;
+    // `prefix_ones <= 31` and every caller's `k` is a small Rice /
+    // Exp-Golomb order (`<= 25`), so the suffix is at most 56 bits
+    // wide; it is composed in `u64` and the result checked into the
+    // `u32` return type.
+    let suffix_bits = prefix_ones + k.min(32);
+    let mut suffix: u64 = 0;
     for _ in 0..suffix_bits {
-        suffix = (suffix << 1) | u32::from(read_bin()?);
+        suffix = (suffix << 1) | u64::from(read_bin()?);
     }
-    let base = ((1u64 << prefix_ones) - 1) << k;
-    let value = base + u64::from(suffix);
-    // The defensive cap above keeps `value` inside `u32`; the
-    // saturate keeps us inside the public return type if the
-    // pathological 32-bit edge is ever reached.
-    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+    let base = ((1u64 << prefix_ones) - 1) << k.min(32);
+    let value = base + suffix;
+    u32::try_from(value).map_err(|_| CabacError::ValueOutOfRange("EGk value"))
 }
+
+/// Longest EGk unary prefix the decoders accept (§9.3.3.3): 32 leading
+/// `1` bins would already encode `2^32 − 1` at `k = 0`, beyond every
+/// syntax element's §7.4 range.
+pub const EG_K_MAX_PREFIX_ONES: u32 = 32;
 
 /// §9.3.3.11 — decode an EGk-coded value with `k = 0` from the bypass
 /// stream. Preserved as a named alias for the `cu_qp_delta_abs` /
@@ -595,6 +604,14 @@ pub fn cu_qp_delta_abs_ctx_inc(bin_idx: u32) -> u32 {
 /// row).
 pub const CU_QP_DELTA_ABS_TR_CMAX: u32 = 5;
 
+/// Largest `cu_qp_delta_abs` any conforming bitstream carries. §7.4.9.14
+/// bounds `CuQpDeltaVal` to `−( 26 + QpBdOffsetY / 2 ) .. +( 25 +
+/// QpBdOffsetY / 2 )` and `QpBdOffsetY = 6 * bit_depth_luma_minus8`
+/// tops out at 48 (`BitDepthY = 16`), so the magnitude never exceeds
+/// `26 + 24 = 50`. [`decode_cu_qp_delta`] rejects anything larger
+/// with [`CabacError::ValueOutOfRange`].
+pub const CU_QP_DELTA_ABS_MAX: u32 = 50;
+
 /// Decoded `cu_qp_delta` pair plus the §7.4.9.14 derived
 /// `CuQpDeltaVal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,6 +638,11 @@ pub struct CuQpDelta {
 ///
 /// Returns the decoded [`CuQpDelta`] including the §7.4.9.14
 /// `CuQpDeltaVal` derivation.
+///
+/// # Errors
+/// [`CabacError::ValueOutOfRange`] when `cu_qp_delta_abs` exceeds
+/// [`CU_QP_DELTA_ABS_MAX`] (the widest §7.4.9.14 bound) or its EGk
+/// suffix is malformed; the engine's own errors otherwise.
 pub fn decode_cu_qp_delta(
     engine: &mut CabacEngine<'_>,
     ctx_bin0: &mut ContextModel,
@@ -639,7 +661,10 @@ pub fn decode_cu_qp_delta(
     // §9.3.3.10: if the prefix is the all-ones escape (== cMax), an
     // EGk(k=0) suffix follows; the decoded value is prefix + suffix.
     let abs = if is_escape {
-        prefix + decode_eg_k0(engine)?
+        prefix
+            .checked_add(decode_eg_k0(engine)?)
+            .filter(|&abs| abs <= CU_QP_DELTA_ABS_MAX)
+            .ok_or(CabacError::ValueOutOfRange("cu_qp_delta_abs"))?
     } else {
         prefix
     };
@@ -3937,14 +3962,18 @@ where
     } else {
         prefix_extension_length + rice_param
     };
+    // `escape_length <= maxPrefixExtensionLength + riceParam` (at most
+    // 13 + 25 with the Rice ceiling) or `log2TransformRange <= 22`: it
+    // always fits a `u64` read, composed exactly and checked into the
+    // `u32` return type. The §7.4.9.11 `CoeffMax` bound keeps every
+    // conforming value far below that edge.
     let mut escape: u64 = 0;
-    for _ in 0..escape_length.min(32) {
+    for _ in 0..escape_length.min(63) {
         escape = (escape << 1) | u64::from(read_bin()?);
     }
-    // Compose in u64 and saturate: the §7.4.9.11 conformance bound
-    // keeps every conforming value far below u32 saturation.
     let base = ((1u64 << prefix_extension_length.min(32)) - 1) << rice_param.min(31);
-    Ok(u32::try_from(base + escape).unwrap_or(u32::MAX))
+    u32::try_from(base + escape)
+        .map_err(|_| CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
 }
 
 /// §9.3.3.11 eq. 9-26 — `cMax = 4 << cRiceParam`.
@@ -4010,37 +4039,16 @@ where
         }
         prefix_len += 1;
     }
-    // Escape: all-ones prefix. EGk(cRiceParam + 1) suffix follows.
-    let k = c_rice_param + 1;
-    // §9.3.3.3 eq. 9-13: the EGk unary prefix is a run of `1` bins
-    // terminated by a single `0` bin (the loop emits `put( 1 )` while
-    // `absV >= ( 1 << k )`, then `put( 0 )` to stop). The decoded prefix
-    // length is the count of leading `1` bins before that terminating
-    // `0`.
-    let mut prefix_ones: u32 = 0;
-    while prefix_ones < 32 {
-        let bin = read_bin()?;
-        if bin == 0 {
-            break;
-        }
-        prefix_ones += 1;
-    }
-    let suffix_bits = (prefix_ones + k).min(32);
-    let mut suffix: u32 = 0;
-    for _ in 0..suffix_bits {
-        suffix = (suffix << 1) | u32::from(read_bin()?);
-    }
-    // Compose in u64: `prefix_ones` can reach 32 on a non-conformant
-    // bin stream, where `base` alone exceeds u32::MAX. The §7.4.9.11
-    // conformance requirement bounds the corresponding TransCoeffLevel
-    // to [CoeffMin, CoeffMax] (eqs. 7-27 .. 7-30), far below the
-    // saturation point, so the clamp only fires on bin streams the
-    // spec already rejects — the decode stays total instead of
-    // overflowing.
-    let base = ((1u64 << prefix_ones) - 1) << k;
-    let c_max = u64::from(coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param));
-    let value = c_max + base + u64::from(suffix);
-    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+    // Escape: all-ones prefix. The §9.3.3.3 EGk(cRiceParam + 1)
+    // suffix follows (eq. 9-13: a run of `1` bins terminated by a `0`,
+    // then `prefix_ones + k` suffix bins). `suffixVal + cMax` is the
+    // level (eq. 9-28); the §7.4.9.11 conformance requirement bounds
+    // it through TransCoeffLevel to [CoeffMin, CoeffMax] (eqs. 7-27 ..
+    // 7-30), so a sum past `u32` is a corrupt stream, not a value.
+    let suffix = read_eg_k_with(c_rice_param + 1, read_bin)?;
+    coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param)
+        .checked_add(suffix)
+        .ok_or(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
 }
 
 /// §9.3.3.11, `extended_precision_processing_flag == 1` variant of
@@ -4070,8 +4078,9 @@ where
         prefix_len += 1;
     }
     let suffix = decode_limited_egk_suffix_with(c_rice_param + 1, log2_transform_range, read_bin)?;
-    let c_max = coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param);
-    Ok(c_max.saturating_add(suffix))
+    coeff_abs_level_remaining_c_max_eq_9_26(c_rice_param)
+        .checked_add(suffix)
+        .ok_or(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
 }
 
 /// §9.3.3.11 — full bypass-coded decode of `coeff_abs_level_remaining[
@@ -4230,6 +4239,24 @@ pub const ABS_MVD_GREATER_FLAG_FL_CMAX: u32 = 1;
 /// with `k = 1`), fully bypass-coded per Table 9-48.
 pub const ABS_MVD_MINUS2_EG_K: u32 = 1;
 
+/// Largest `abs_mvd_minus2[ ]` any conforming bitstream carries:
+/// §7.4.9.9 bounds `MvdLX` to `−2^15 .. 2^15 − 1`, and eq. 7-73 makes
+/// its magnitude `abs_mvd_minus2 + 2`, so `abs_mvd_minus2 <= 2^15 −
+/// 2` (the sign is not yet known when the magnitude is decoded, so
+/// the negative-side bound applies). The mvd decoders reject anything
+/// larger with [`CabacError::ValueOutOfRange`].
+pub const ABS_MVD_MINUS2_MAX: u32 = (1 << 15) - 2;
+
+/// Read the §7.3.8.9 `abs_mvd_minus2[ ]` EG1 escape from the bypass
+/// stream and apply the §7.4.9.9 `MvdLX` bound.
+fn decode_abs_mvd_minus2(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
+    let minus2 = decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?;
+    if minus2 > ABS_MVD_MINUS2_MAX {
+        return Err(CabacError::ValueOutOfRange("abs_mvd_minus2"));
+    }
+    Ok(minus2)
+}
+
 /// Table 9-43 — `mvd_sign_flag[ ]` is FL with `cMax = 1`; the single
 /// bin (bypass-coded per Table 9-48) is the sign bit itself.
 pub const MVD_SIGN_FLAG_FL_CMAX: u32 = 1;
@@ -4281,8 +4308,11 @@ pub fn mvd_component_value(greater0_flag: u8, minus2: Option<u32>, sign_flag: Op
     // abs_mvd_minus2 inferred −1 when absent ⇒ magnitude (minus2 + 2):
     //   absent  → −1 + 2 = 1
     //   present → minus2 + 2  (>= 2)
+    // Total for any `u32` (the decoders bound `minus2` to
+    // `ABS_MVD_MINUS2_MAX`; a direct caller's larger value saturates
+    // instead of overflowing).
     let magnitude = match minus2 {
-        Some(m) => m as i32 + 2,
+        Some(m) => i32::try_from(m).unwrap_or(i32::MAX).saturating_add(2),
         None => 1,
     };
     // mvd_sign_flag inferred 0 when absent ⇒ positive.
@@ -4329,9 +4359,14 @@ where
         });
     }
     let greater1_flag = read_ctx_bin()?;
-    // abs_mvd_minus2 is present only when greater1_flag == 1.
+    // abs_mvd_minus2 is present only when greater1_flag == 1; §7.4.9.9
+    // bounds it through MvdLX.
     let minus2 = if greater1_flag == 1 {
-        Some(read_eg_k_with(ABS_MVD_MINUS2_EG_K, &mut read_bypass_bin)?)
+        let minus2 = read_eg_k_with(ABS_MVD_MINUS2_EG_K, &mut read_bypass_bin)?;
+        if minus2 > ABS_MVD_MINUS2_MAX {
+            return Err(CabacError::ValueOutOfRange("abs_mvd_minus2"));
+        }
+        Some(minus2)
     } else {
         None
     };
@@ -4380,7 +4415,7 @@ pub fn decode_mvd_component(
     }
     let greater1_flag = engine.decode_decision(ctx_greater1)?;
     let minus2 = if greater1_flag == 1 {
-        Some(decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?)
+        Some(decode_abs_mvd_minus2(engine)?)
     } else {
         None
     };
@@ -4442,7 +4477,7 @@ pub fn decode_mvd_pair(
             continue;
         }
         let minus2 = if g1 == Some(1) {
-            Some(decode_eg_k(engine, ABS_MVD_MINUS2_EG_K)?)
+            Some(decode_abs_mvd_minus2(engine)?)
         } else {
             None
         };
@@ -6254,20 +6289,97 @@ mod tests {
     }
 
     #[test]
-    fn decode_coeff_abs_level_remaining_escape_saturates_instead_of_overflowing() {
-        // Fuzz regression (r282 `decode_residual`): a non-conformant
-        // bypass-bin stream can drive the EGk escape to its maximal
-        // shape — 4 TR escape ones, then 32 leading prefix ones (the
-        // loop cap), then 32 all-ones suffix bits — whose composed value
-        // exceeds u32. The decode must saturate, not overflow.
-        // §7.4.9.11 conformance (eqs. 7-27 .. 7-30) keeps every legal
-        // stream far below the saturation point.
+    fn decode_coeff_abs_level_remaining_escape_rejects_runaway_prefix() {
+        // Fuzz regression (r282 `decode_residual`, re-pinned r474): a
+        // non-conformant bypass-bin stream can drive the EGk escape
+        // past any value — 4 TR escape ones, then 32 leading prefix
+        // ones. §7.4.9.11 conformance (eqs. 7-27 .. 7-30) keeps every
+        // legal level below 2^22, so the decode reports the stream as
+        // out of range instead of saturating or overflowing.
         let mut bins = vec![1u8, 1, 1, 1]; // TR escape prefix
-        bins.extend([1u8; 32]); // EGk prefix ones (loop cap)
-        bins.extend([1u8; 32]); // suffix payload
+        bins.extend([1u8; 32]); // EGk prefix ones, never terminated
+        bins.extend([1u8; 32]); // would-be suffix payload
         assert_eq!(
-            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)).unwrap(),
-            u32::MAX
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
+            Err(CabacError::ValueOutOfRange("EGk prefix"))
+        );
+    }
+
+    #[test]
+    fn decode_coeff_abs_level_remaining_escape_rejects_u32_overflow() {
+        // 31 prefix ones terminate legally but the composed suffix
+        // value `((2^31 − 1) << k) + suffix` exceeds u32 for k = 1 as
+        // soon as `suffix >= 2`.
+        let mut bins = vec![1u8, 1, 1, 1];
+        bins.extend([1u8; 31]);
+        bins.push(0);
+        bins.extend([0u8; 30]); // prefix_ones + k = 32 suffix bits …
+        bins.extend([1u8, 0]); // … spelling 2
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
+            Err(CabacError::ValueOutOfRange("EGk value"))
+        );
+        // A suffix of 0 fits the EGk value (2^32 − 2); the eq. 9-28
+        // `cMax + suffixVal` sum is what overflows then.
+        let mut bins = vec![1u8, 1, 1, 1];
+        bins.extend([1u8; 31]);
+        bins.push(0);
+        bins.extend([0u8; 32]);
+        assert_eq!(
+            decode_coeff_abs_level_remaining_with(0, bin_queue(&bins)),
+            Err(CabacError::ValueOutOfRange("coeff_abs_level_remaining"))
+        );
+    }
+
+    #[test]
+    fn read_eg_k_with_longest_legal_prefix_is_exact() {
+        // 31 ones + terminator at k = 0: value = 2^31 − 1 + suffix, a
+        // 31-bit suffix of all ones ⇒ 2^32 − 2, which still fits.
+        let mut bins = vec![1u8; 31];
+        bins.push(0);
+        bins.extend([1u8; 31]);
+        assert_eq!(read_eg_k_with(0, bin_queue(&bins)), Ok(u32::MAX - 1));
+        // One more leading one is the §9.3.3.3 runaway: rejected before
+        // any suffix bin is consumed.
+        let bins = [1u8; 32];
+        assert_eq!(
+            read_eg_k_with(0, bin_queue(&bins)),
+            Err(CabacError::ValueOutOfRange("EGk prefix"))
+        );
+    }
+
+    #[test]
+    fn mvd_component_with_rejects_abs_mvd_minus2_past_mvd_range() {
+        // greater0 = greater1 = 1, then an EG1 escape of 2^15 − 1
+        // (one past ABS_MVD_MINUS2_MAX): prefix_ones = 14 gives base
+        // (2^14 − 1) << 1 = 32766, suffix (15 bits) = 1 ⇒ 32767.
+        let mut bypass = vec![1u8; 14];
+        bypass.push(0);
+        bypass.extend([0u8; 14]);
+        bypass.push(1);
+        bypass.push(0); // sign
+        let ctx = [1u8, 1];
+        assert_eq!(
+            decode_mvd_component_with(bin_queue(&ctx), bin_queue(&bypass)),
+            Err(CabacError::ValueOutOfRange("abs_mvd_minus2"))
+        );
+        // The largest legal magnitude decodes: suffix 0 ⇒ 32766 =
+        // ABS_MVD_MINUS2_MAX, lMvd = −(32766 + 2) = −2^15.
+        let mut bypass = vec![1u8; 14];
+        bypass.push(0);
+        bypass.extend([0u8; 15]);
+        bypass.push(1); // sign
+        let c = decode_mvd_component_with(bin_queue(&ctx), bin_queue(&bypass)).unwrap();
+        assert_eq!(c.minus2, Some(ABS_MVD_MINUS2_MAX));
+        assert_eq!(c.value, -(1 << 15));
+    }
+
+    #[test]
+    fn mvd_component_value_is_total_for_any_magnitude() {
+        assert_eq!(mvd_component_value(1, Some(u32::MAX), Some(0)), i32::MAX);
+        assert_eq!(
+            mvd_component_value(1, Some(i32::MAX as u32), Some(1)),
+            -i32::MAX
         );
     }
 

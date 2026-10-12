@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(decoder)* **hostile-input hardening of the CABAC binarizations** (round 474), from a crash a HEIF container fuzzer surfaced in `cu_qp_delta_abs`: the §9.3.3.3 Exp-Golomb reader (`cu_qp_delta_abs` / `coeff_abs_level_remaining` / `abs_mvd_minus2` / palette escapes and runs) now reports a prefix of 32 ones or a value past `u32` as `CabacError::ValueOutOfRange` instead of saturating and letting the caller's `prefix + suffix` overflow; `cu_qp_delta_abs` is bounded by the §7.4.9.14 `CuQpDeltaVal` range (`CU_QP_DELTA_ABS_MAX = 50`), `abs_mvd_minus2` by the §7.4.9.9 `MvdLX` range (`ABS_MVD_MINUS2_MAX`), the §9.3.3.4 limited-EGk escape is composed exactly, `num_palette_indices_minus1`'s `cMax + suffix` and both `coeff_abs_level_remaining` escapes use checked sums, `mvd_component_value` is total, the §8.5.3.2.1 motion-vector wrap uses wrapping arithmetic (exact modulo 2^16), and the PPS parse bounds `log2_sao_offset_scale_{luma,chroma}` to the §7.4.3.3.2 ceiling (6) so the eq. 7-72 shift is sound
+- *(decoder)* the registry decoder reaches its flushed state even when the pending picture fails to decode: `receive_frame` after an erroring `flush` drains the pictures decoded before it and then answers `Eof` instead of `NeedMore` forever (every consumer's drain loop would spin)
+
+### Added
+
+- `CabacError::ValueOutOfRange(&'static str)` naming the offending syntax element; `CabacError` is `#[non_exhaustive]`
+- `EG_K_MAX_PREFIX_ONES`, `CU_QP_DELTA_ABS_MAX`, `ABS_MVD_MINUS2_MAX` (`binarization`)
+- `fuzz/fuzz_targets/hvcc_decode.rs`: the HEIF / ISO-BMFF carriage (`hvcC` record + length-prefixed access unit) through the registry decoder, seeded with the container fuzzer's items and five real-world stills; `tests/hostile_cabac.rs` pins the two items (`tests/fixture_bytes/r474/`) on the `SequenceDecoder` and registry paths
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-h265/compare/v0.0.13...v0.0.14) - 2026-10-01
 
 ### Added

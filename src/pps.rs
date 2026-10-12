@@ -745,6 +745,12 @@ pub struct PpsRangeExtension {
 impl PpsRangeExtension {
     /// Maximum permitted `chroma_qp_offset_list_len_minus1` (§7.4.3.3.2).
     const MAX_CHROMA_QP_OFFSET_LIST_LEN_MINUS1: u32 = 5;
+    /// §7.4.3.3.2: `log2_sao_offset_scale_{luma,chroma}` lie in
+    /// `0 .. Max( 0, BitDepth − 10 )`; with `BitDepth <= 16` the
+    /// widest bound is 6. The PPS does not know the SPS bit depth, so
+    /// the parse applies the widest bound (it is also what keeps the
+    /// eq. 7-72 `<< log2OffsetScale` shift sound).
+    const MAX_LOG2_SAO_OFFSET_SCALE: u32 = 6;
 
     /// Decode `pps_range_extension()` (§7.3.2.3.2). The leading
     /// `log2_max_transform_skip_block_size_minus2` is present only when
@@ -790,6 +796,17 @@ impl PpsRangeExtension {
         }
         let log2_sao_offset_scale_luma = br.ue()?;
         let log2_sao_offset_scale_chroma = br.ue()?;
+        for (field, v) in [
+            ("log2_sao_offset_scale_luma", log2_sao_offset_scale_luma),
+            ("log2_sao_offset_scale_chroma", log2_sao_offset_scale_chroma),
+        ] {
+            if v > Self::MAX_LOG2_SAO_OFFSET_SCALE {
+                return Err(PpsError::ValueOutOfRange {
+                    field,
+                    got: i64::from(v),
+                });
+            }
+        }
         Ok(Self {
             log2_max_transform_skip_block_size_minus2,
             cross_component_prediction_enabled_flag,
