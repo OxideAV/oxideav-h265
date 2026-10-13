@@ -2896,7 +2896,17 @@ fn parse_long_term_ref_pic_block(
         };
         let delta_poc_msb_present_flag = br.u1()? != 0;
         let delta_poc_msb_cycle_lt = if delta_poc_msb_present_flag {
-            br.ue()?
+            // §7.4.7.1: 0 .. 2^( 32 − log2_max_pic_order_cnt_lsb_minus4
+            // − 4 ), so one cycle step stays inside the 32-bit
+            // PicOrderCntVal.
+            let v = br.ue()?;
+            if u64::from(v) > 1u64 << (32 - u32::from(poc_lsb_bits)) {
+                return Err(SliceError::ValueOutOfRange {
+                    field: "delta_poc_msb_cycle_lt",
+                    got: i64::from(v),
+                });
+            }
+            v
         } else {
             0
         };

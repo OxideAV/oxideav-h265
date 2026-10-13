@@ -138,12 +138,19 @@ pub fn build_rps_poc_lists(
     }
     // Long-term — equation 8-5 third loop.
     for e in lt_entries {
-        let mut poc_lt = e.poc_lsb_lt as i32;
+        // pocLt = PocLsbLt + PicOrderCntVal − DeltaPocMsbCycleLt *
+        // MaxPicOrderCntLsb − ( PicOrderCntVal & ( MaxPicOrderCntLsb − 1 ) ).
+        // Composed in i64 (a hostile DeltaPocMsbCycleLt can push the
+        // product past i32) and folded back into the 32-bit
+        // PicOrderCntVal space: a value no conforming stream can carry
+        // simply matches no picture in the DPB.
+        let mut poc_lt = i64::from(e.poc_lsb_lt);
         if e.delta_poc_msb_present {
-            poc_lt += poc
-                - (e.delta_poc_msb_cycle_lt as i32) * (max_poc_lsb as i32)
-                - (poc & (max_poc_lsb as i32 - 1));
+            poc_lt += i64::from(poc)
+                - i64::from(e.delta_poc_msb_cycle_lt) * i64::from(max_poc_lsb)
+                - i64::from(poc & (max_poc_lsb as i32 - 1));
         }
+        let poc_lt = poc_lt as i32;
         if e.used_by_curr_pic_lt {
             out.lt_curr.push(poc_lt);
             out.curr_delta_poc_msb_present.push(e.delta_poc_msb_present);

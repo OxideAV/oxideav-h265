@@ -22,6 +22,9 @@
 //! run whose picture order counts are far enough apart that the
 //! §8.5.3.2.7 `DiffPicOrderCnt` (`currPic − neighRefPic`) overflowed
 //! `i32` in the temporal motion-vector scaling.
+//! `hvcc-fuzz-bc777e` a slice whose long-term `delta_poc_msb_cycle_lt`
+//! made `DeltaPocMsbCycleLt * MaxPicOrderCntLsb` overflow in the eq. 8-5
+//! `pocLt` derivation.
 
 use oxideav_core::{CodecParameters, Error, Packet, TimeBase};
 use oxideav_h265::sequence::SequenceDecoder;
@@ -117,6 +120,10 @@ const SEEDS: &[(&str, &[u8])] = &[
     (
         "hvcc-fuzz-4cef6c",
         include_bytes!("fixture_bytes/r474/hvcc-fuzz-4cef6c.seed"),
+    ),
+    (
+        "hvcc-fuzz-bc777e",
+        include_bytes!("fixture_bytes/r474/hvcc-fuzz-bc777e.seed"),
     ),
 ];
 

@@ -1292,7 +1292,21 @@ impl SequenceDecoder {
         let max_poc_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
         let short_term_rps = materialize_slice_rps(&seg.header, sps)?;
         let mut long_term = Vec::new();
-        for lt in &seg.header.long_term_ref_pics {
+        // §7.4.7.1 eq. 7-52: DeltaPocMsbCycleLt[ i ] accumulates
+        // delta_poc_msb_cycle_lt over the entries, restarting at i == 0
+        // and at i == num_long_term_sps (the first in-slice entry).
+        let mut delta_poc_msb_cycle_lt_acc: u32 = 0;
+        let num_long_term_sps = seg.header.num_long_term_sps.unwrap_or(0) as usize;
+        for (i, lt) in seg.header.long_term_ref_pics.iter().enumerate() {
+            delta_poc_msb_cycle_lt_acc = if i == 0 || i == num_long_term_sps {
+                lt.delta_poc_msb_cycle_lt
+            } else {
+                delta_poc_msb_cycle_lt_acc
+                    .checked_add(lt.delta_poc_msb_cycle_lt)
+                    .ok_or(SequenceError::Malformed(
+                        "DeltaPocMsbCycleLt accumulates past u32",
+                    ))?
+            };
             let poc_lsb_lt = match lt.source {
                 SliceLongTermRefPicSource::Sps { lt_idx_sps } => {
                     sps.long_term_ref_pics
@@ -1311,7 +1325,7 @@ impl SequenceDecoder {
                 poc_lsb_lt,
                 used_by_curr_pic_lt: used,
                 delta_poc_msb_present: lt.delta_poc_msb_present_flag,
-                delta_poc_msb_cycle_lt: lt.delta_poc_msb_cycle_lt,
+                delta_poc_msb_cycle_lt: delta_poc_msb_cycle_lt_acc,
             });
         }
         Ok(PictureHeaderInfo {
