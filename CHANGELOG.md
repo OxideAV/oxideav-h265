@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-h265/compare/v0.0.14...v0.0.15) - 2026-10-13
+
+### Fixed
+
+- *(decoder)* long-term reference POCs — delta_poc_msb_cycle_lt bounded, DeltaPocMsbCycleLt per eq. 7-52, pocLt composed in 64-bit arithmetic
+- *(decoder)* DiffPicOrderCnt saturates — temporal motion-vector scaling no longer overflows on hostile picture order counts
+- *(decoder)* enforce the parameter-set bounds no single parse can check — SPS dimensions vs MinCbSizeY, PPS vs SPS at activation, SliceQpY range; §7.4.9.4 split inference never splits below the minimum coding block
+- *(decoder)* hostile-input hardening of the CABAC binarizations — bounded EGk, ranged cu_qp_delta_abs / abs_mvd_minus2, flushed state on a failing last picture, hvcC fuzz target
+
+### Other
+
+- *(threaded)* contention-robust budgeted-vs-serial timing — interleaved best of seven, ratio asserted only with four or more cores
+- *(fuzz)* seed hvcc_decode with two inter-coded GOPs (low-delay P, B pyramid + TMVP)
+- *(cabac)* keep CabacError register-sized — ValueOutOfRange names its element through a one-byte RangedElement
+
 ### Fixed
 
 - *(decoder)* **hostile-input hardening of the CABAC binarizations** (round 474), from a crash a HEIF container fuzzer surfaced in `cu_qp_delta_abs`: the §9.3.3.3 Exp-Golomb reader (`cu_qp_delta_abs` / `coeff_abs_level_remaining` / `abs_mvd_minus2` / palette escapes and runs) now reports a prefix of 32 ones or a value past `u32` as `CabacError::ValueOutOfRange` instead of saturating and letting the caller's `prefix + suffix` overflow; `cu_qp_delta_abs` is bounded by the §7.4.9.14 `CuQpDeltaVal` range (`CU_QP_DELTA_ABS_MAX = 50`), `abs_mvd_minus2` by the §7.4.9.9 `MvdLX` range (`ABS_MVD_MINUS2_MAX`), the §9.3.3.4 limited-EGk escape is composed exactly, `num_palette_indices_minus1`'s `cMax + suffix` and both `coeff_abs_level_remaining` escapes use checked sums, `mvd_component_value` is total, the §8.5.3.2.1 motion-vector wrap uses wrapping arithmetic (exact modulo 2^16), and the PPS parse bounds `log2_sao_offset_scale_{luma,chroma}` to the §7.4.3.3.2 ceiling (6) so the eq. 7-72 shift is sound
