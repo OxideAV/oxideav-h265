@@ -1553,14 +1553,27 @@ fn reconstruct_inter_leaf_cu(
     // intra-flag grid up front. A neighbour outside the current CU was
     // decoded before it, so its intra flag is already final; positions
     // inside the current CU are excluded by the §6.4.2 z-scan test.
+    //
+    // Only the cells bordering the CU are ever asked about: every PU lies
+    // inside the CU, and the §8.5.3.2.3 / §8.5.3.2.7 spatial neighbours
+    // A0 / A1 / B0 / B1 / B2 of a PU at (xPb, yPb) of size nPbW × nPbH sit
+    // at xPb − 1 ..= xPb + nPbW and yPb − 1 ..= yPb + nPbH. So the snapshot
+    // covers the CU plus a one-cell border, not the whole picture.
     let x_cb = cu.x0;
     let y_cb = cu.y0;
     let w4 = field.width_4();
     let h4 = field.height_4();
-    let mut intra_grid = vec![false; w4 * h4];
-    for (gy, row) in intra_grid.chunks_mut(w4).enumerate() {
-        for (gx, cell) in row.iter_mut().enumerate() {
-            *cell = field.cell_at(gx * 4, gy * 4).is_intra;
+    let gx0 = (x_cb as usize / 4).saturating_sub(1);
+    let gy0 = (y_cb as usize / 4).saturating_sub(1);
+    let gx1 = ((x_cb as usize + n_cb_s) / 4 + 1).min(w4);
+    let gy1 = ((y_cb as usize + n_cb_s) / 4 + 1).min(h4);
+    let win_w = gx1.saturating_sub(gx0);
+    let mut intra_grid = vec![false; win_w * gy1.saturating_sub(gy0)];
+    if win_w > 0 {
+        for (row, gy) in intra_grid.chunks_mut(win_w).zip(gy0..gy1) {
+            for (cell, gx) in row.iter_mut().zip(gx0..gx1) {
+                *cell = field.cell_at(gx * 4, gy * 4).is_intra;
+            }
         }
     }
     let tiling = ctx.tiling();
@@ -1581,7 +1594,14 @@ fn reconstruct_inter_leaf_cu(
                 return 0;
             }
             let (gx, gy) = ((x as usize) / 4, (y as usize) / 4);
-            if gx < w4 && gy < h4 && intra_grid[gy * w4 + gx] {
+            debug_assert!(
+                gx >= gx0 && gy >= gy0 && (gx < gx1 || gx >= w4) && (gy < gy1 || gy >= h4),
+                "CuPredMode query ({x}, {y}) outside the CU's border"
+            );
+            if (gx0..gx1).contains(&gx)
+                && (gy0..gy1).contains(&gy)
+                && intra_grid[(gy - gy0) * win_w + (gx - gx0)]
+            {
                 crate::availability::MODE_INTRA
             } else {
                 0
