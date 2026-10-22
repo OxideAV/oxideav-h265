@@ -252,3 +252,35 @@ fn mvhevc_registry_hvcc_lhvc_extradata_emits_both_views() {
     params.options = params.options.set("layer", "64");
     assert!(oxideav_h265::make_decoder(&params).is_err());
 }
+
+/// A non-base-layer SPS that arrives BEFORE the VPS its F.7.3.2.2.1
+/// inference reads (an `lhvC` record may order its arrays SPS, PPS,
+/// VPS — the HEIF conformance suite's `multilayer00x.heic` items do)
+/// is parked and parsed when the VPS arrives: §7.4.2.4.2 only
+/// requires a parameter set to be available before its activation.
+/// Both views decode exactly as from the stream's own order.
+#[test]
+fn non_base_sps_before_its_vps_is_deferred_not_refused() {
+    let units = collect_nal_units(STREAM).expect("nal walk");
+    let is_ps = |u: &NalUnit| matches!(u.header.nal_unit_type, 32..=34);
+    let mut reordered: Vec<NalUnit> = Vec::with_capacity(units.len());
+    // SPSs first (base, then layer 1), then PPSs, then the VPS last.
+    for t in [33u8, 34, 32] {
+        reordered.extend(units.iter().filter(|u| u.header.nal_unit_type == t).cloned());
+    }
+    reordered.extend(units.iter().filter(|u| !is_ps(u)).cloned());
+    let mut dec = SequenceDecoder::new();
+    for u in reordered {
+        dec.push_nal_unit(u).expect("push");
+    }
+    let frames = dec.finish().expect("finish");
+    assert_eq!(frames.len(), 6, "three access units x two views");
+    let mut views: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    for (i, f) in frames.iter().enumerate() {
+        assert!(f.output);
+        assert_eq!(f.layer_id, (i % 2) as u8);
+        views[i % 2].extend_from_slice(&planar(&f.output_picture()));
+    }
+    assert_eq!(md5::hex(&views[0]), VIEW0_MD5, "base view digest");
+    assert_eq!(md5::hex(&views[1]), VIEW1_MD5, "second view digest");
+}

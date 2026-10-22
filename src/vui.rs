@@ -68,14 +68,25 @@
 //!     tiles_fixed_structure_flag                    u(1)
 //!     motion_vectors_over_pic_boundaries_flag       u(1)
 //!     restricted_ref_pic_lists_flag                 u(1)
-//!     min_spatial_segmentation_idc                 ue(v)   // 0..=4095
-//!     max_bytes_per_pic_denom                      ue(v)   // 0..=16
-//!     max_bits_per_min_cu_denom                    ue(v)   // 0..=16
-//!     log2_max_mv_length_horizontal                ue(v)   // 0..=15
-//!     log2_max_mv_length_vertical                  ue(v)   // 0..=15
+//!     min_spatial_segmentation_idc                 ue(v)   // 0..=4095 (carried as coded)
+//!     max_bytes_per_pic_denom                      ue(v)   // 0..=16   (carried as coded)
+//!     max_bits_per_min_cu_denom                    ue(v)   // 0..=16   (carried as coded)
+//!     log2_max_mv_length_horizontal                ue(v)   // 0..=15   (carried as coded)
+//!     log2_max_mv_length_vertical                  ue(v)   // 0..=15   (carried as coded)
 //!   }
 //! }
 //! ```
+//!
+//! Range policy: a bounded value that feeds a derivation the decoder
+//! performs (`vui_num_units_in_tick` / `vui_time_scale` of zero,
+//! `chroma_sample_loc_type_*` beyond Figure E.1 / Table E.6) is refused as
+//! `VuiError::ValueOutOfRange`; the `bitstream_restriction` block's
+//! bounds are the producer's conformance declarations (§E.1: VUI
+//! parameters are not required for constructing the luma or chroma
+//! samples), so they are carried as coded and reported through
+//! `BitstreamRestriction::range_violation` instead — real still
+//! pictures (the HEIF conformance suite's `iff_hevc_single_item*`
+//! items) carry `max_bytes_per_pic_denom` of 26 and 66.
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::hrd::{HrdError, HrdParameters};
@@ -202,6 +213,13 @@ pub struct VuiTimingInfo {
 }
 
 /// `bitstream_restriction_flag` block from §E.2.1.
+///
+/// The five `ue(v)` values are carried exactly as coded, including
+/// values outside their §E.3.1 bounds: they are the producer's own
+/// bitstream-conformance declarations, not inputs to the decoding
+/// process (§E.1), so the parser does not refuse a picture over
+/// them. [`BitstreamRestriction::range_violation`] names the first
+/// field whose value breaks its bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BitstreamRestriction {
     /// `tiles_fixed_structure_flag` (`u(1)`).
@@ -221,6 +239,67 @@ pub struct BitstreamRestriction {
     pub log2_max_mv_length_horizontal: u32,
     /// `log2_max_mv_length_vertical` (`ue(v)`, range 0..=15).
     pub log2_max_mv_length_vertical: u32,
+}
+
+impl BitstreamRestriction {
+    /// §E.3.1 bound of `min_spatial_segmentation_idc`.
+    pub const MIN_SPATIAL_SEGMENTATION_IDC_MAX: u32 = 4095;
+    /// §E.3.1 bound of `max_bytes_per_pic_denom`.
+    pub const MAX_BYTES_PER_PIC_DENOM_MAX: u32 = 16;
+    /// §E.3.1 bound of `max_bits_per_min_cu_denom`.
+    pub const MAX_BITS_PER_MIN_CU_DENOM_MAX: u32 = 16;
+    /// §E.3.1 bound of `log2_max_mv_length_horizontal` /
+    /// `log2_max_mv_length_vertical`.
+    pub const LOG2_MAX_MV_LENGTH_MAX: u32 = 15;
+
+    /// The first field whose coded value breaks its §E.3.1 bound, as
+    /// `(syntax element name, coded value)`; `None` when the block is
+    /// conformant.
+    ///
+    /// A violation marks the *producer* non-conformant (the values
+    /// are declarations about the bitstream, §E.1) — the parser
+    /// carries the block regardless, and the decoding process never
+    /// consumes these fields. Callers that re-emit the block (an
+    /// `hvcC` writer copying `min_spatial_segmentation_idc`, a
+    /// transcoder) should consult this before trusting a value.
+    pub fn range_violation(&self) -> Option<(&'static str, u32)> {
+        let checks = [
+            (
+                "min_spatial_segmentation_idc",
+                self.min_spatial_segmentation_idc,
+                Self::MIN_SPATIAL_SEGMENTATION_IDC_MAX,
+            ),
+            (
+                "max_bytes_per_pic_denom",
+                self.max_bytes_per_pic_denom,
+                Self::MAX_BYTES_PER_PIC_DENOM_MAX,
+            ),
+            (
+                "max_bits_per_min_cu_denom",
+                self.max_bits_per_min_cu_denom,
+                Self::MAX_BITS_PER_MIN_CU_DENOM_MAX,
+            ),
+            (
+                "log2_max_mv_length_horizontal",
+                self.log2_max_mv_length_horizontal,
+                Self::LOG2_MAX_MV_LENGTH_MAX,
+            ),
+            (
+                "log2_max_mv_length_vertical",
+                self.log2_max_mv_length_vertical,
+                Self::LOG2_MAX_MV_LENGTH_MAX,
+            ),
+        ];
+        checks
+            .into_iter()
+            .find(|&(_, got, max)| got > max)
+            .map(|(field, got, _)| (field, got))
+    }
+
+    /// `true` when every field sits inside its §E.3.1 bound.
+    pub fn is_conformant(&self) -> bool {
+        self.range_violation().is_none()
+    }
 }
 
 /// Parsed `vui_parameters()` body per §E.2.1.
@@ -430,54 +509,24 @@ impl VuiParameters {
             let tiles_fixed_structure_flag = br.u1()? != 0;
             let motion_vectors_over_pic_boundaries_flag = br.u1()? != 0;
             let restricted_ref_pic_lists_flag = br.u1()? != 0;
-            let min_spatial_segmentation_idc = br.ue()?;
-            // §E.3.1: range 0..=4095, inclusive.
-            if min_spatial_segmentation_idc > 4095 {
-                return Err(VuiError::ValueOutOfRange {
-                    field: "min_spatial_segmentation_idc",
-                    got: min_spatial_segmentation_idc,
-                });
-            }
-            let max_bytes_per_pic_denom = br.ue()?;
-            // §E.3.1: range 0..=16, inclusive.
-            if max_bytes_per_pic_denom > 16 {
-                return Err(VuiError::ValueOutOfRange {
-                    field: "max_bytes_per_pic_denom",
-                    got: max_bytes_per_pic_denom,
-                });
-            }
-            let max_bits_per_min_cu_denom = br.ue()?;
-            // §E.3.1: range 0..=16, inclusive.
-            if max_bits_per_min_cu_denom > 16 {
-                return Err(VuiError::ValueOutOfRange {
-                    field: "max_bits_per_min_cu_denom",
-                    got: max_bits_per_min_cu_denom,
-                });
-            }
-            let log2_max_mv_length_horizontal = br.ue()?;
-            // §E.3.1: range 0..=15, inclusive.
-            if log2_max_mv_length_horizontal > 15 {
-                return Err(VuiError::ValueOutOfRange {
-                    field: "log2_max_mv_length_horizontal",
-                    got: log2_max_mv_length_horizontal,
-                });
-            }
-            let log2_max_mv_length_vertical = br.ue()?;
-            if log2_max_mv_length_vertical > 15 {
-                return Err(VuiError::ValueOutOfRange {
-                    field: "log2_max_mv_length_vertical",
-                    got: log2_max_mv_length_vertical,
-                });
-            }
+            // The five `ue(v)` values are carried as coded. §E.3.1
+            // bounds each of them (0..=4095, 0..=16, 0..=16, 0..=15,
+            // 0..=15), but they are bitstream-conformance
+            // declarations the producer makes about itself, not
+            // inputs to the decoding process (§E.1: VUI parameters
+            // are not required for constructing the luma or chroma
+            // samples), so a value outside its bound marks the
+            // producer non-conformant without refusing the picture —
+            // `BitstreamRestriction::range_violation` reports it.
             Some(BitstreamRestriction {
                 tiles_fixed_structure_flag,
                 motion_vectors_over_pic_boundaries_flag,
                 restricted_ref_pic_lists_flag,
-                min_spatial_segmentation_idc,
-                max_bytes_per_pic_denom,
-                max_bits_per_min_cu_denom,
-                log2_max_mv_length_horizontal,
-                log2_max_mv_length_vertical,
+                min_spatial_segmentation_idc: br.ue()?,
+                max_bytes_per_pic_denom: br.ue()?,
+                max_bits_per_min_cu_denom: br.ue()?,
+                log2_max_mv_length_horizontal: br.ue()?,
+                log2_max_mv_length_vertical: br.ue()?,
             })
         } else {
             None
@@ -916,9 +965,11 @@ mod tests {
         assert_eq!(bsr.log2_max_mv_length_vertical, 15);
     }
 
-    /// `min_spatial_segmentation_idc > 4095` is rejected per §E.3.1.
+    /// `min_spatial_segmentation_idc > 4095` breaks its §E.3.1 bound but
+    /// is carried as coded (§E.1: not an input to the decoding
+    /// process) and named by `range_violation`.
     #[test]
-    fn rejects_min_spatial_segmentation_above_4095() {
+    fn carries_min_spatial_segmentation_above_4095() {
         let bytes = bits_to_bytes(&[
             "0",
             "0",
@@ -933,17 +984,60 @@ mod tests {
             "0",       // tiles_fixed_structure_flag
             "0",       // motion_vectors_over_pic_boundaries_flag
             "0",       // restricted_ref_pic_lists_flag
-            &ue(4096), // min_spatial_segmentation_idc = 4096 → reject
+            &ue(4096), // min_spatial_segmentation_idc = 4096 → carried
+            &ue(0),    // max_bytes_per_pic_denom
+            &ue(0),    // max_bits_per_min_cu_denom
+            &ue(0),    // log2_max_mv_length_horizontal
+            &ue(0),    // log2_max_mv_length_vertical
         ]);
         let mut br = BitReader::new(&bytes);
-        let err = VuiParameters::parse(&mut br, 0).unwrap_err();
+        let vui = VuiParameters::parse(&mut br, 0).expect("parse");
+        let bsr = vui.bitstream_restriction.expect("bitstream restriction");
+        assert_eq!(bsr.min_spatial_segmentation_idc, 4096);
+        assert!(!bsr.is_conformant());
         assert_eq!(
-            err,
-            VuiError::ValueOutOfRange {
-                field: "min_spatial_segmentation_idc",
-                got: 4096,
-            }
+            bsr.range_violation(),
+            Some(("min_spatial_segmentation_idc", 4096))
         );
+    }
+
+    /// The HEIF conformance suite's `iff_hevc_single_item` /
+    /// `iff_hevc_single_item_main10` items code
+    /// `max_bytes_per_pic_denom` = 26 / 66 (bound 16) — the block is
+    /// carried, the violation is reported, the picture decodes.
+    #[test]
+    fn carries_max_bytes_per_pic_denom_above_16() {
+        for got in [26u32, 66] {
+            let bytes = bits_to_bytes(&[
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",
+                "0",      // eight present flags off
+                "0",      // vui_timing_info_present_flag
+                "1",      // bitstream_restriction_flag
+                "1",      // tiles_fixed_structure_flag
+                "1",      // motion_vectors_over_pic_boundaries_flag
+                "1",      // restricted_ref_pic_lists_flag
+                &ue(17),  // min_spatial_segmentation_idc
+                &ue(got), // max_bytes_per_pic_denom → carried
+                &ue(0),   // max_bits_per_min_cu_denom
+                &ue(13),  // log2_max_mv_length_horizontal
+                &ue(12),  // log2_max_mv_length_vertical
+            ]);
+            let mut br = BitReader::new(&bytes);
+            let vui = VuiParameters::parse(&mut br, 0).expect("parse");
+            let bsr = vui.bitstream_restriction.expect("bitstream restriction");
+            assert_eq!(bsr.max_bytes_per_pic_denom, got);
+            assert_eq!(
+                bsr.range_violation(),
+                Some(("max_bytes_per_pic_denom", got))
+            );
+            assert_eq!(bsr.log2_max_mv_length_vertical, 12);
+        }
     }
 
     /// `chroma_sample_loc_type_top_field > 5` is rejected per §E.3.1.
@@ -967,9 +1061,10 @@ mod tests {
         );
     }
 
-    /// `log2_max_mv_length_vertical > 15` is rejected per §E.3.1.
+    /// `log2_max_mv_length_vertical > 15` is carried as coded and
+    /// reported; the in-range fields before it are untouched.
     #[test]
-    fn rejects_log2_max_mv_length_above_15() {
+    fn carries_log2_max_mv_length_above_15() {
         let bytes = bits_to_bytes(&[
             "0",
             "0",
@@ -988,17 +1083,33 @@ mod tests {
             &ue(0),  // max_bytes_per_pic_denom
             &ue(0),  // max_bits_per_min_cu_denom
             &ue(0),  // log2_max_mv_length_horizontal
-            &ue(16), // log2_max_mv_length_vertical = 16 → reject
+            &ue(16), // log2_max_mv_length_vertical = 16 → carried
         ]);
         let mut br = BitReader::new(&bytes);
-        let err = VuiParameters::parse(&mut br, 0).unwrap_err();
+        let vui = VuiParameters::parse(&mut br, 0).expect("parse");
+        let bsr = vui.bitstream_restriction.expect("bitstream restriction");
+        assert_eq!(bsr.log2_max_mv_length_vertical, 16);
         assert_eq!(
-            err,
-            VuiError::ValueOutOfRange {
-                field: "log2_max_mv_length_vertical",
-                got: 16,
-            }
+            bsr.range_violation(),
+            Some(("log2_max_mv_length_vertical", 16))
         );
+    }
+
+    /// A conformant block reports no violation.
+    #[test]
+    fn conformant_block_has_no_violation() {
+        let bsr = BitstreamRestriction {
+            tiles_fixed_structure_flag: false,
+            motion_vectors_over_pic_boundaries_flag: true,
+            restricted_ref_pic_lists_flag: false,
+            min_spatial_segmentation_idc: 4095,
+            max_bytes_per_pic_denom: 16,
+            max_bits_per_min_cu_denom: 16,
+            log2_max_mv_length_horizontal: 15,
+            log2_max_mv_length_vertical: 15,
+        };
+        assert!(bsr.is_conformant());
+        assert_eq!(bsr.range_violation(), None);
     }
 
     /// Truncation mid-body surfaces `VuiError::Truncated`.

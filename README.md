@@ -105,6 +105,41 @@ byte-exact. Coverage:
   stream's own decoded-picture-hash SEI matches this decoder.
   Twenty-five of them are vendored and CI-pinned on both transport
   paths (`tests/heic_stills.rs`);
+* **the HEIF conformance suite + device samples** (round 479): every
+  `.heic` under `docs/image/heif/{conformance,device-samples}` swept
+  through this decoder's standalone API on the payloads the HEIF
+  container yields (black-box extraction; the two refusals the
+  container crate reported — `iff_hevc_single_item*`, whose SPS codes
+  `max_bytes_per_pic_denom` 26 / 66 against the §E.3.1 bound — are
+  fixed by the §E.1 VUI policy below and CI-pinned,
+  `tests/heif_conformance_stills.rs`):
+
+  | files | HEVC payloads | result |
+  |---|---|---|
+  | `heic/C001–C025, C034, C039, C040, C042, C045–C053` (single items, grids, bursts, thumbnails, `iden` / `iovl` sources) | 118 `hvc1` items | all byte-exact vs the black-box decoder |
+  | `heic/C043, C044` (`pred`-referenced items: P pictures predicting from another item) | 5 items (2 inter-coded) | all byte-exact, the referenced item's access unit decoded first |
+  | `heic/MIAF001–007` (incl. 2048x2048 Main 10 and 4:4:4) | 12 items | all byte-exact |
+  | `heic/iff_hevc_single_item`, `_main10` | 2 items | byte-exact (the round-479 fix) |
+  | `heic/C026–C032, C036–C038, C041` (image sequences, `hevc` / `msf1` tracks) | 13 tracks, 8..16 pictures each (incl. a 1920x1080 run) | all byte-exact, every picture |
+  | `heic/multilayer001, 002, 003, 005` base items (`hvc1` items whose sample also carries the `nuh_layer_id` 1 slices) | 8 items | 7 byte-exact with the base layer targeted (`LayerTarget::Layer(0)`, the §8.1.2 default `TargetDecLayerIdList`); 1 (`multilayer002` item 20013, a `TRAIL_R` item) decodes but the black-box decoder refuses to start at a non-IRAP picture — no oracle |
+  | `heic/multilayer001, 002, 005` `lhv1` items (`lhvC` carrying both layers' parameter sets, SPS before VPS) | 6 items | decode (two output layers, 1024x512 / 512x256) — the black-box decoder refuses the SPS-before-VPS order and the scalability type, so no oracle; the SPS deferral below is what makes them decode |
+  | `heic/multilayer004` `lhv1` item (`exbl` external base layer: the base is an `avc1` item, Annex F hybrid scalability) | 1 item | not decodable by an HEVC decoder alone (the base layer is AVC) — refused as "inter-layer reference picture missing" |
+  | `cenc/*` (13 files) | 13 items | encrypted sample data (Common Encryption) — refused at the first CABAC read, a container-level reason |
+  | `heic/iff_hevc_tile_multiple_items_tbas` | — | the container crate refuses the file (`ipma` rows not strictly increasing) and so does the black-box demuxer; no payload extracted |
+  | `device-samples/IMG_5195.HEIC` (42 grid tiles 512x512) | 42 items | all byte-exact |
+  | `device-samples/iphone_13_pro_max.HEIC` (48 grid tiles, a 320x240 thumbnail, a 2016x1512 monochrome auxiliary) | 50 items | all byte-exact |
+
+  Two decoder changes came out of the sweep: a `bitstream_restriction`
+  block whose `ue(v)` values break their §E.3.1 bounds is **carried
+  as coded and reported** (`BitstreamRestriction::range_violation`)
+  instead of refusing the picture — §E.1: VUI parameters are not
+  required for constructing the luma or chroma samples, and the
+  bounded values are the producer's declarations about its own
+  bitstream, not inputs to the decoding process; and a non-base-layer
+  SPS arriving before the VPS its F.7.3.2.2.1 inference reads is
+  **parked and parsed when that VPS arrives** (§7.4.2.4.2 requires a
+  parameter set to be available before its activation, not to follow
+  the VPS in arrival order; `tests/multilayer.rs`);
 * **multi-layer bitstreams** (round 462): Annex F common syntax in
   full — the `vps_extension( )` layer model (layer / output layer
   sets, `rep_format( )`, `dpb_size( )`, VPS VUI), the multilayer SPS

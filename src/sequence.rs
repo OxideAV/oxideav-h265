@@ -404,6 +404,12 @@ pub struct SequenceDecoder {
     vps: BTreeMap<u8, HevcVps>,
     sps: BTreeMap<u8, SeqParameterSet>,
     pps: BTreeMap<u8, PicParameterSet>,
+    /// Non-base-layer SPS RBSPs (`(nuh_layer_id, rbsp)`) that arrived
+    /// before the VPS their F.7.3.2.2.1 inference reads — parsed when
+    /// that VPS arrives (§7.4.2.4.2 only requires a parameter set to
+    /// be AVAILABLE before its activation, not to arrive after the
+    /// VPS; an `lhvC` record may order its arrays SPS before VPS).
+    deferred_sps: Vec<(u8, Vec<u8>)>,
     state: PictureSequenceState,
     frames: Vec<DecodedFrame>,
     pending: Vec<SegmentData>,
@@ -591,8 +597,19 @@ impl SequenceDecoder {
                 }
                 let vps = HevcVps::parse(&rbsp)
                     .map_err(|_| SequenceError::Malformed("video parameter set failed to parse"))?;
-                self.vps.insert(vps.vps_id, vps);
+                let vps_id = vps.vps_id;
+                self.vps.insert(vps_id, vps);
                 self.plan = None;
+                // The SPSs parked on this VPS parse now.
+                let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_sps)
+                    .into_iter()
+                    .partition(|(_, rbsp)| rbsp.first().map(|b| b >> 4) == Some(vps_id));
+                self.deferred_sps = waiting;
+                for (layer_id, rbsp) in ready {
+                    let sps =
+                        SeqParameterSet::parse_layered(&rbsp, layer_id, self.vps.get(&vps_id))?;
+                    self.sps.insert(sps.sps_id, sps);
+                }
             }
             NAL_SPS => {
                 if header.nuh_layer_id == 0 {
@@ -601,11 +618,21 @@ impl SequenceDecoder {
                 // F.7.3.2.2.1: the SPS of a non-base layer may infer its
                 // fields from the VPS it names (its leading u(4)).
                 let vps_id = rbsp.first().map(|b| b >> 4).unwrap_or(0);
-                let sps = SeqParameterSet::parse_layered(
+                let sps = match SeqParameterSet::parse_layered(
                     &rbsp,
                     header.nuh_layer_id,
                     self.vps.get(&vps_id),
-                )?;
+                ) {
+                    Ok(sps) => sps,
+                    Err(crate::sps::SpsError::MissingVps) if !self.vps.contains_key(&vps_id) => {
+                        // Parked until its VPS arrives.
+                        self.deferred_sps
+                            .retain(|(l, r)| !(*l == header.nuh_layer_id && r[..] == rbsp[..]));
+                        self.deferred_sps.push((header.nuh_layer_id, rbsp.to_vec()));
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 self.sps.insert(sps.sps_id, sps);
                 self.plan = None;
             }

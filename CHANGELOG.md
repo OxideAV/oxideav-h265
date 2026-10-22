@@ -6,6 +6,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(decoder)* **the HEIF conformance suite's `iff_hevc_single_item` / `iff_hevc_single_item_main10` items decode** (round 479): their SPS codes `max_bytes_per_pic_denom` 26 / 66 against the §E.3.1 bound of 16, and the VUI parse refused the picture. A `bitstream_restriction` block whose five `ue(v)` values break their bounds is now carried as coded — §E.1: VUI parameters are not required for constructing the luma or chroma samples, and these values are the producer's bitstream-conformance declarations, not inputs to the decoding process — and reported through the new `BitstreamRestriction::range_violation` / `is_conformant` (the `*_MAX` bound constants alongside). Both pictures are CI-pinned byte-exact against a black-box decoder on the Annex B and `hvcC` paths (`tests/heif_conformance_stills.rs`); the whole corpus sweep (81 files: 257 image items + 13 image-sequence tracks, 236 items and every track byte-exact, the rest tabulated by reason) is tabulated in the README
+- *(decoder)* a non-base-layer SPS arriving before the VPS its F.7.3.2.2.1 inference reads is parked and parsed when that VPS arrives (§7.4.2.4.2 requires a parameter set to be available before its activation, not to follow the VPS) — the HEIF conformance suite's `lhv1` items carry an `lhvC` whose arrays run SPS, PPS, VPS and were refused with `MissingVps`
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-h265/compare/v0.0.14...v0.0.15) - 2026-10-13
 
 ### Fixed
