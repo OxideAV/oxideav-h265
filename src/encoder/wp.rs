@@ -20,7 +20,8 @@
 //! take the decoder's own [`SliceWpTables::resolve_pu`] combine.
 
 use crate::encoder::bitwriter::BitWriter;
-use crate::encoder::inter::{FrameRecon, RefPlanes, YuvFrame};
+use crate::encoder::inter::{FrameRecon, RefPlanes, WideRecon, YuvFrame, YuvFrameWide};
+use crate::encoder::sample::SampleFmt;
 use crate::inter_pred::WpListWeights;
 use crate::inter_recon::SliceWpTables;
 
@@ -94,12 +95,22 @@ fn isqrt(v: u128) -> u128 {
 /// as a contrast loss). `Some((w, o))` when the pair moves the picture
 /// meaningfully: the gain differs from unity by >= 4/64 or the mean
 /// shifts by >= 2 levels.
-fn fit_plane(src: &[u8], reference: &[u8], width: usize, height: usize) -> Option<(i32, i32)> {
+/// `shift` is `BitDepth − 8`: the fit runs in 8-bit sample units
+/// (the weight is scale-free; the coded offset is the sample-domain
+/// offset divided by `1 << WpOffsetBdShift`, §7.4.7.3).
+fn fit_plane(
+    src: &[u16],
+    reference: &[u16],
+    width: usize,
+    height: usize,
+    shift: u32,
+) -> Option<(i32, i32)> {
     let (mut n, mut ss, mut sr, mut sss, mut srr) = (0i128, 0i128, 0i128, 0i128, 0i128);
+    let half = if shift > 0 { 1i128 << (shift - 1) } else { 0 };
     for y in (0..height).step_by(2) {
         for x in (0..width).step_by(2) {
-            let s = i128::from(src[y * width + x]);
-            let r = i128::from(reference[y * width + x]);
+            let s = (i128::from(src[y * width + x]) + half) >> shift;
+            let r = (i128::from(reference[y * width + x]) + half) >> shift;
             n += 1;
             ss += s;
             sr += r;
@@ -112,7 +123,6 @@ fn fit_plane(src: &[u8], reference: &[u8], width: usize, height: usize) -> Optio
     if var_r <= 0 || n == 0 {
         return None;
     }
-    // w = round( 64 · sqrt( var_s / var_r ) ).
     let ratio_q = (4096u128 * 4 * var_s.max(0) as u128) / var_r as u128;
     let w = isqrt(ratio_q).div_ceil(2) as i128;
     let w = w.clamp(64 - 128, 64 + 127) as i32;
@@ -124,17 +134,28 @@ fn fit_plane(src: &[u8], reference: &[u8], width: usize, height: usize) -> Optio
     ((w, o) != (64, 0)).then_some((w, o))
 }
 
-/// Fit one reference picture: the luma and chroma entries.
-fn fit_reference(frame: &YuvFrame<'_>, r: &FrameRecon, width: usize, height: usize) -> WpRefEntry {
-    let luma = fit_plane(frame.y, &r.y, width, height).map(|(w, o)| (w - 64, o));
-    let (cw, ch) = (width / 2, height / 2);
-    let cb = fit_plane(frame.cb, &r.cb, cw, ch);
-    let cr = fit_plane(frame.cr, &r.cr, cw, ch);
+fn fit_reference(
+    frame: &YuvFrameWide<'_>,
+    r: &WideRecon,
+    width: usize,
+    height: usize,
+    fmt: SampleFmt,
+) -> WpRefEntry {
+    let shift_y = u32::from(fmt.bit_depth_luma.saturating_sub(8));
+    let shift_c = u32::from(fmt.bit_depth_chroma.saturating_sub(8));
+    let luma = fit_plane(frame.y, &r.y, width, height, shift_y).map(|(w, o)| (w - 64, o));
+    let (cw, ch) = fmt.chroma_dims(width, height);
+    let (cb, cr) = if fmt.has_chroma() {
+        (
+            fit_plane(frame.cb, &r.cb, cw, ch, shift_c),
+            fit_plane(frame.cr, &r.cr, cw, ch, shift_c),
+        )
+    } else {
+        (None, None)
+    };
     let chroma = (cb.is_some() || cr.is_some()).then(|| {
         [cb, cr].map(|c| {
             let (w, o) = c.unwrap_or((64, 0));
-            // eq. 7-58 inverted: delta_chroma_offset = ChromaOffset −
-            // WpOffsetHalfRangeC + ( ( WpOffsetHalfRangeC · w ) >> denom ).
             let delta_o =
                 o - WP_OFFSET_HALF_RANGE_C + ((WP_OFFSET_HALF_RANGE_C * w) >> LOG2_WEIGHT_DENOM);
             (w - 64, delta_o)
@@ -143,8 +164,13 @@ fn fit_reference(frame: &YuvFrame<'_>, r: &FrameRecon, width: usize, height: usi
     WpRefEntry { luma, chroma }
 }
 
-/// The §7.4.7.3-resolved [`WpListWeights`] of one entry.
-fn resolve_entry(e: &WpRefEntry) -> WpListWeights {
+/// The decode-side resolution: §7.4.7.3 eqs 7-56 .. 7-59 for the
+/// chroma offset, then the `<< WpOffsetBdShiftY` / `<<
+/// WpOffsetBdShiftC` of eqs 8-268 / 8-273 that the §8.5.3.3.4.3
+/// combine reads (identity at 8 bits).
+fn resolve_entry(e: &WpRefEntry, fmt: SampleFmt) -> WpListWeights {
+    let shift_y = fmt.bit_depth_luma.saturating_sub(8);
+    let shift_c = fmt.bit_depth_chroma.saturating_sub(8);
     let (dw, o) = e.luma.unwrap_or((0, 0));
     let [(dwb, dob), (dwr, dor)] = e.chroma.unwrap_or([(0, 0), (0, 0)]);
     let chroma_o = |dw: i32, delta_o: i32, present: bool| -> i32 {
@@ -154,11 +180,11 @@ fn resolve_entry(e: &WpRefEntry) -> WpListWeights {
         let w = (1 << LOG2_WEIGHT_DENOM) + dw;
         (WP_OFFSET_HALF_RANGE_C + delta_o - ((WP_OFFSET_HALF_RANGE_C * w) >> LOG2_WEIGHT_DENOM))
             .clamp(-WP_OFFSET_HALF_RANGE_C, WP_OFFSET_HALF_RANGE_C - 1)
+            << shift_c
     };
-    // 8-bit: WpOffsetBdShiftY == WpOffsetBdShiftC == 0.
     WpListWeights {
         w_luma: (1 << LOG2_WEIGHT_DENOM) + dw,
-        o_luma: o,
+        o_luma: o << shift_y,
         w_cb: (1 << LOG2_WEIGHT_DENOM) + dwb,
         o_cb: chroma_o(dwb, dob, e.chroma.is_some()),
         w_cr: (1 << LOG2_WEIGHT_DENOM) + dwr,
@@ -166,8 +192,10 @@ fn resolve_entry(e: &WpRefEntry) -> WpListWeights {
     }
 }
 
-/// Estimate the slice's weighted-prediction tables against its
-/// reference lists.
+/// Fit one `pred_weight_table( )` for a frame against its 8-bit
+/// 4:2:0 references: per reference and component a least-squares
+/// weight / offset over the 2x2-subsampled picture, kept only when
+/// it differs materially from identity. See [`estimate_wide`].
 #[must_use]
 pub fn estimate(
     frame: &YuvFrame<'_>,
@@ -176,9 +204,36 @@ pub fn estimate(
     width: usize,
     height: usize,
 ) -> WpTables {
-    let fit = |list: &[&FrameRecon]| -> Vec<WpRefEntry> {
+    let (y, cb, cr) = crate::encoder::inter::widen_frame(frame);
+    let widen = |r: &FrameRecon| WideRecon::from_narrow(r.y.clone(), r.cb.clone(), r.cr.clone());
+    let l0w: Vec<WideRecon> = l0.iter().map(|r| widen(r)).collect();
+    let l1w: Vec<WideRecon> = l1.iter().map(|r| widen(r)).collect();
+    estimate_wide(
+        &YuvFrameWide::new(&y, &cb, &cr),
+        &l0w.iter().collect::<Vec<_>>(),
+        &l1w.iter().collect::<Vec<_>>(),
+        width,
+        height,
+        SampleFmt::YUV420_8,
+    )
+}
+
+/// [`estimate`] at any sample format: the fit runs in 8-bit units
+/// (the coded `luma_offset_lX` / `delta_chroma_offset_lX` are 8-bit
+/// quantities under `high_precision_offsets_enabled_flag == 0`), the
+/// resolved tables carry the `WpOffsetBdShift`-scaled offsets.
+#[must_use]
+pub(crate) fn estimate_wide(
+    frame: &YuvFrameWide<'_>,
+    l0: &[&WideRecon],
+    l1: &[&WideRecon],
+    width: usize,
+    height: usize,
+    fmt: SampleFmt,
+) -> WpTables {
+    let fit = |list: &[&WideRecon]| -> Vec<WpRefEntry> {
         list.iter()
-            .map(|r| fit_reference(frame, r, width, height))
+            .map(|r| fit_reference(frame, r, width, height, fmt))
             .collect()
     };
     let l0 = fit(l0);
@@ -186,45 +241,57 @@ pub fn estimate(
     let resolved = SliceWpTables {
         luma_log2_weight_denom: LOG2_WEIGHT_DENOM,
         chroma_log2_weight_denom: LOG2_WEIGHT_DENOM,
-        l0: l0.iter().map(resolve_entry).collect(),
-        l1: l1.iter().map(resolve_entry).collect(),
+        l0: l0.iter().map(|e| resolve_entry(e, fmt)).collect(),
+        l1: l1.iter().map(|e| resolve_entry(e, fmt)).collect(),
     };
     WpTables { l0, l1, resolved }
 }
 
-/// Reference planes with the luma weights applied (motion-search
-/// inputs); references without a luma entry are copied unchanged.
+/// The luma planes the motion search reads under explicit weighted
+/// prediction: each reference's luma through its fitted weight /
+/// offset (the §8.5.3.3.4.3 uni-prediction formula at full-sample
+/// positions, the offset in sample units), clipped to the picture's
+/// depth; a reference without a luma entry is copied.
 #[must_use]
-pub(crate) fn weighted_ref_planes(refs: &[RefPlanes], entries: &[WpRefEntry]) -> Vec<RefPlanes> {
+pub(crate) fn weighted_luma_planes(
+    refs: &[RefPlanes<'_>],
+    entries: &[WpRefEntry],
+) -> Vec<Vec<u16>> {
     refs.iter()
         .zip(entries)
-        .map(|(r, e)| {
-            let y = match e.luma {
-                Some((dw, o)) => {
-                    let w = (1 << LOG2_WEIGHT_DENOM) + dw;
-                    r.y.iter()
-                        .map(|&v| {
-                            (((i32::from(v) * w + 32) >> LOG2_WEIGHT_DENOM) + o).clamp(0, 255)
-                                as u16
-                        })
-                        .collect()
-                }
-                None => r.y.clone(),
-            };
-            RefPlanes {
-                y,
-                cb: r.cb.clone(),
-                cr: r.cr.clone(),
-                width: r.width,
-                height: r.height,
+        .map(|(r, e)| match e.luma {
+            Some((dw, o)) => {
+                let w = (1 << LOG2_WEIGHT_DENOM) + dw;
+                let o = o << r.fmt.bit_depth_luma.saturating_sub(8);
+                let max = r.fmt.max_luma();
+                r.y.iter()
+                    .map(|&v| {
+                        (((i32::from(v) * w + 32) >> LOG2_WEIGHT_DENOM) + o).clamp(0, max) as u16
+                    })
+                    .collect()
             }
+            None => r.y.to_vec(),
         })
         .collect()
 }
 
-/// §7.3.6.3 `pred_weight_table( )` (4:2:0, single layer: every
-/// reference differs from the current picture, so every per-i flag
-/// is present).
+/// Reference planes whose luma is replaced by the weighted copies of
+/// [`weighted_luma_planes`] (chroma stays the reference's own).
+pub(crate) fn with_luma<'r>(planes: &'r [Vec<u16>], refs: &[RefPlanes<'r>]) -> Vec<RefPlanes<'r>> {
+    planes
+        .iter()
+        .zip(refs)
+        .map(|(y, r)| RefPlanes {
+            y,
+            cb: r.cb,
+            cr: r.cr,
+            width: r.width,
+            height: r.height,
+            fmt: r.fmt,
+        })
+        .collect()
+}
+
 pub fn write_pred_weight_table(w: &mut BitWriter, t: &WpTables, b_slice: bool) {
     w.ue(u32::from(LOG2_WEIGHT_DENOM)); // luma_log2_weight_denom
     w.se(0); // delta_chroma_log2_weight_denom
@@ -316,7 +383,7 @@ mod tests {
                     luma: None,
                     chroma: Some([(w - 64, delta_o); 2]),
                 };
-                let r = resolve_entry(&e);
+                let r = resolve_entry(&e, SampleFmt::YUV420_8);
                 assert_eq!((r.w_cb, r.o_cb), (w, o));
             }
         }

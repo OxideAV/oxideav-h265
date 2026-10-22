@@ -525,9 +525,10 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
             "{mode:?}: an explicit range wins"
         );
     }
-    // The 4:2:2 / 4:4:4 twins: accepted on the pcm mode (lossless)
-    // and the intra mode (the quadtree coder), refused by the inter
-    // coders.
+    // The 4:2:2 / 4:4:4 twins: accepted on the pcm mode (lossless),
+    // the intra mode and — since round 479 — the inter coders (every
+    // lossy layout rides the quadtree coder;
+    // `tests/deep_inter_interop.rs` pins the pictures).
     for pf in [
         PixelFormat::YuvJ422P,
         PixelFormat::YuvJ444P,
@@ -541,7 +542,7 @@ fn yuvj420p_input_is_the_full_range_twin_of_yuv420p() {
         params.options.insert("mode", "intra");
         assert!(oxideav_h265::make_encoder(&params).is_ok(), "{pf:?} intra");
         params.options.insert("mode", "inter");
-        assert!(oxideav_h265::make_encoder(&params).is_err(), "{pf:?} inter");
+        assert!(oxideav_h265::make_encoder(&params).is_ok(), "{pf:?} inter");
     }
 }
 

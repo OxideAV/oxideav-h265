@@ -388,10 +388,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 )))
                 }
             };
-            if params.options.get("mode") == Some("inter") {
+            // 16-bit grey is PCM-only: the lossy coders code 8..=12-bit
+            // samples (the check below names the limit).
+            if params.options.get("mode") == Some("inter") && bit_depth > 12 {
                 return Err(Error::InvalidData(format!(
-                    "h265 encode: {pf:?} input is supported by modes \"pcm\" and \"intra\" (the \
-                     inter coders take yuv420p)"
+                    "h265 encode: {pf:?} input is supported by mode \"pcm\" only (the intra and \
+                     inter coders code 8..=12-bit samples)"
                 )));
             }
             pcm::PcmLayout {
@@ -523,13 +525,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // capped at 12 bits (the format range extensions profiles above
     // are the 16-bit Intra / Still Picture rows, which need the
     // extended-precision tools).
-    let deep_intra =
-        layout != pcm::PcmLayout::default() && params.options.get("mode") == Some("intra");
-    if deep_intra {
+    let deep_lossy = layout != pcm::PcmLayout::default()
+        && matches!(params.options.get("mode"), Some("intra") | Some("inter"));
+    if deep_lossy {
         if layout.bit_depth > 12 {
             return Err(Error::InvalidData(format!(
-                "h265 encode: {:?} input is supported by mode \"pcm\" only (the intra coder \
-                 codes 8..=12-bit samples)",
+                "h265 encode: {:?} input is supported by mode \"pcm\" only (the intra and \
+                 inter coders code 8..=12-bit samples)",
                 params.pixel_format.unwrap_or(PixelFormat::Gray16Le)
             )));
         }
@@ -924,12 +926,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                             ))
                         })?,
                 };
-                let mut enc = pyramid::PyramidEncoder::new(coded_width, coded_height, qp, g)
-                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                    .with_layer_qp_step(step)
-                    .with_amp(parse_flag(params, "amp")?)
-                    .with_loop_filters(parse_lf(params)?)
-                    .with_aq(parse_aq(params)?);
+                let mut enc = if layout == pcm::PcmLayout::default() {
+                    pyramid::PyramidEncoder::new(coded_width, coded_height, qp, g)
+                } else {
+                    pyramid::PyramidEncoder::new_fmt(coded_width, coded_height, qp, g, layout)
+                }
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                .with_layer_qp_step(step)
+                .with_amp(parse_flag(params, "amp")?)
+                .with_loop_filters(parse_lf(params)?)
+                .with_aq(parse_aq(params)?);
                 if let Some(t) = tree {
                     enc = enc.with_tree(t);
                 }
@@ -971,12 +977,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                     })?,
                 };
                 let b_slices = parse_flag(params, "bslices")?;
-                let mut enc = inter::LowDelayPEncoder::new(coded_width, coded_height, qp, gop)
-                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
-                    .with_b_slices(b_slices)
-                    .with_amp(parse_flag(params, "amp")?)
-                    .with_loop_filters(parse_lf(params)?)
-                    .with_aq(parse_aq(params)?);
+                let mut enc = if layout == pcm::PcmLayout::default() {
+                    inter::LowDelayPEncoder::new(coded_width, coded_height, qp, gop)
+                } else {
+                    inter::LowDelayPEncoder::new_fmt(coded_width, coded_height, qp, gop, layout)
+                }
+                .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?
+                .with_b_slices(b_slices)
+                .with_amp(parse_flag(params, "amp")?)
+                .with_loop_filters(parse_lf(params)?)
+                .with_aq(parse_aq(params)?);
                 if let Some(t) = tree {
                     enc = enc.with_tree(t);
                 }
@@ -1301,8 +1311,8 @@ impl H265Encoder {
                 )?,
             )
         };
-        if matches!(self.mode, EncodeMode::Intra { .. }) {
-            // The intra coder does not range-check sample values (an
+        if !matches!(self.mode, EncodeMode::Pcm) {
+            // The lossy coders do not range-check sample values (an
             // out-of-range source sample would only skew the residual):
             // refuse them here, as the PCM writer does.
             let max = (1u32 << layout.bit_depth) - 1;
@@ -1314,9 +1324,50 @@ impl H265Encoder {
                     )));
                 }
             }
-            let au = self.intra_frame(IntraPlanes::Wide([&y, &cb, &cr]))?;
-            self.push_keyframe(v, au);
-            return Ok(());
+        }
+        match &mut self.mode {
+            EncodeMode::Intra { .. } => {
+                let au = self.intra_frame(IntraPlanes::Wide([&y, &cb, &cr]))?;
+                self.push_keyframe(v, au);
+                return Ok(());
+            }
+            EncodeMode::Inter(enc) => {
+                let f = enc
+                    .encode_frame_wide(&inter::YuvFrameWide::new(&y, &cb, &cr))
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+                let mut pkt = Packet::new(0, self.time_base, f.au);
+                pkt.pts = v.pts.or(Some(self.frame_index));
+                pkt.dts = pkt.pts;
+                pkt.flags.keyframe = f.keyframe;
+                self.frame_index += 1;
+                self.ready.push_back(pkt);
+                return Ok(());
+            }
+            EncodeMode::Pyramid {
+                enc,
+                delay,
+                pts_by_display,
+                decode_count,
+            } => {
+                pts_by_display.push(v.pts);
+                let aus = enc
+                    .encode_frame_wide(&inter::YuvFrameWide::new(&y, &cb, &cr))
+                    .map_err(|e| Error::InvalidData(format!("h265 encode: {e}")))?;
+                self.frame_index += 1;
+                let (delay, decode_count) = (*delay, decode_count);
+                let time_base = self.time_base;
+                let items: Vec<(Vec<u8>, usize, bool)> = aus
+                    .into_iter()
+                    .map(|au| (au.au, au.display_order, au.keyframe))
+                    .collect();
+                let mut packets =
+                    Self::pyramid_packets(items, pts_by_display, delay, decode_count, time_base);
+                for pkt in packets.drain(..) {
+                    self.ready.push_back(pkt);
+                }
+                return Ok(());
+            }
+            EncodeMode::Pcm => {}
         }
         let au = pcm::encode_idr_pcm_au_wide(
             &y,
@@ -1453,8 +1504,12 @@ impl Encoder for H265Encoder {
                 self.frame_index += 1;
                 let (delay, decode_count) = (*delay, decode_count);
                 let time_base = self.time_base;
+                let items: Vec<(Vec<u8>, usize, bool)> = aus
+                    .into_iter()
+                    .map(|au| (au.au, au.display_order, au.keyframe))
+                    .collect();
                 let mut packets =
-                    Self::pyramid_packets(aus, pts_by_display, delay, decode_count, time_base);
+                    Self::pyramid_packets(items, pts_by_display, delay, decode_count, time_base);
                 for pkt in packets.drain(..) {
                     self.ready.push_back(pkt);
                 }
@@ -1492,11 +1547,15 @@ impl Encoder for H265Encoder {
             decode_count,
         } = &mut self.mode
         {
-            let aus = enc.flush();
+            let items: Vec<(Vec<u8>, usize, bool)> = enc
+                .flush_wide()
+                .into_iter()
+                .map(|au| (au.au, au.display_order, au.keyframe))
+                .collect();
             let (delay, decode_count) = (*delay, decode_count);
             let time_base = self.time_base;
             let mut packets =
-                Self::pyramid_packets(aus, pts_by_display, delay, decode_count, time_base);
+                Self::pyramid_packets(items, pts_by_display, delay, decode_count, time_base);
             for pkt in packets.drain(..) {
                 self.ready.push_back(pkt);
             }
@@ -1510,26 +1569,29 @@ impl H265Encoder {
     /// packets: pts = the pushed frame's pts (default: its display
     /// index), dts = the decode counter minus the reorder delay (a
     /// dts never after its pts on the dyadic schedule).
+    /// Packets for coded pyramid access units `(au, display_order,
+    /// keyframe)`: pts from the display-order frame's input pts, dts
+    /// from the decode counter minus the reorder delay.
     fn pyramid_packets(
-        aus: Vec<pyramid::PyramidAu>,
+        aus: Vec<(Vec<u8>, usize, bool)>,
         pts_by_display: &[Option<i64>],
         delay: i64,
         decode_count: &mut i64,
         time_base: TimeBase,
     ) -> Vec<Packet> {
         aus.into_iter()
-            .map(|au| {
-                let mut pkt = Packet::new(0, time_base, au.au);
+            .map(|(au, display_order, keyframe)| {
+                let mut pkt = Packet::new(0, time_base, au);
                 pkt.pts = Some(
                     pts_by_display
-                        .get(au.display_order)
+                        .get(display_order)
                         .copied()
                         .flatten()
-                        .unwrap_or(au.display_order as i64),
+                        .unwrap_or(display_order as i64),
                 );
                 pkt.dts = Some(*decode_count - delay);
                 *decode_count += 1;
-                pkt.flags.keyframe = au.keyframe;
+                pkt.flags.keyframe = keyframe;
                 pkt
             })
             .collect()

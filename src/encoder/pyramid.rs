@@ -52,7 +52,8 @@ use crate::encoder::hrd::{
     HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
 };
 use crate::encoder::inter::{
-    build_ref_lists, encode_inter_slice, FrameRecon, FrameStats, SliceSpec, TmvpSpec, YuvFrame,
+    build_ref_lists, encode_inter_slice, narrow_frame, widen_frame, FrameRecon, FrameStats,
+    SliceSpec, TmvpSpec, WideRecon, YuvFrame, YuvFrameWide,
 };
 use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
 use crate::encoder::loopfilter::LoopFilterCfg;
@@ -86,20 +87,51 @@ pub struct PyramidAu {
 }
 
 /// An owned 4:2:0 frame buffered until its mini-GOP completes.
+/// [`PyramidAu`] at any sample format (the output of
+/// [`PyramidEncoder::encode_frame_wide`] / [`PyramidEncoder::flush_wide`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PyramidAuWide {
+    /// The Annex B access unit.
+    pub au: Vec<u8>,
+    /// `true` for an IDR access unit.
+    pub keyframe: bool,
+    /// The frame's index in display (input) order.
+    pub display_order: usize,
+    /// The temporal layer (0 = anchors / IDR).
+    pub layer: u8,
+    /// The frame's reconstruction at the picture's depth.
+    pub recon: WideRecon,
+    /// The frame's CU mode-decision counters.
+    pub stats: FrameStats,
+    /// The `SliceQpY` this frame was coded at.
+    pub qp: i32,
+}
+
+impl PyramidAuWide {
+    fn narrow(self, fmt: crate::encoder::sample::SampleFmt) -> PyramidAu {
+        PyramidAu {
+            au: self.au,
+            keyframe: self.keyframe,
+            display_order: self.display_order,
+            layer: self.layer,
+            recon: self.recon.narrow(fmt),
+            stats: self.stats,
+            qp: self.qp,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OwnedFrame {
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    y: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
 }
 
 impl OwnedFrame {
-    fn as_yuv(&self) -> YuvFrame<'_> {
-        YuvFrame {
-            y: &self.y,
-            cb: &self.cb,
-            cr: &self.cr,
-        }
+    fn as_yuv(&self) -> YuvFrameWide<'_> {
+        YuvFrameWide::new(&self.y, &self.cb, &self.cr)
     }
 }
 
@@ -180,7 +212,10 @@ pub struct PyramidEncoder {
     /// Frames after the last anchor, awaiting their mini-GOP.
     pending: Vec<OwnedFrame>,
     /// The retained reference reconstructions, keyed by POC.
-    refs: BTreeMap<i32, FrameRecon>,
+    refs: BTreeMap<i32, WideRecon>,
+    /// The picture's chroma format and bit depths (8-bit 4:2:0 from
+    /// [`Self::new`]; any other layout from [`Self::new_fmt`]).
+    fmt: crate::encoder::sample::SampleFmt,
     /// POC of the last coded anchor (`None` before the IDR).
     anchor: Option<i32>,
     /// ABR rate controller: when set, it elects the base QP of each
@@ -265,6 +300,7 @@ impl PyramidEncoder {
             next_display: 0,
             pending: Vec::new(),
             refs: BTreeMap::new(),
+            fmt: crate::encoder::sample::SampleFmt::YUV420_8,
             anchor: None,
             rc: None,
             aq: 0,
@@ -288,6 +324,50 @@ impl PyramidEncoder {
 
     /// CTU-level rate feedback inside every picture — see
     /// [`crate::encoder::inter::LowDelayPEncoder::with_ctu_rate_control`].
+    /// [`Self::new`] for any HEIC sample layout (chroma format + bit
+    /// depth, 8..=12 bits): the pictures go through the quadtree
+    /// coder (`ctb` 64 unless [`Self::with_tree`] sets another), the
+    /// anchors through its wide intra entry, the B slices through
+    /// the same §8.5 machinery at the layout's depth. `qp` is the
+    /// `SliceQpY` in `−QpBdOffsetY ..= 51`. Frames go in through
+    /// [`Self::encode_frame_wide`] and out through
+    /// [`Self::flush_wide`].
+    ///
+    /// # Errors
+    /// As [`Self::new`], plus [`IntraEncodeError::BadDimensions`]
+    /// for a layout deeper than 12 bits.
+    pub fn new_fmt(
+        width: usize,
+        height: usize,
+        qp: i32,
+        gop: usize,
+        layout: crate::encoder::pcm::PcmLayout,
+    ) -> Result<Self, PyramidError> {
+        let fmt = crate::encoder::sample::SampleFmt::from_layout(layout);
+        if layout.bit_depth > 12 {
+            return Err(PyramidError::Encode(IntraEncodeError::BadDimensions {
+                width,
+                height,
+            }));
+        }
+        if !fmt.qp_range().contains(&qp) {
+            return Err(PyramidError::Encode(IntraEncodeError::BadQp(qp)));
+        }
+        let mut enc = Self::new(width, height, qp.max(0), gop)?;
+        enc.qp = qp;
+        enc.fmt = fmt;
+        if !fmt.is_yuv420_8() {
+            enc.tree = crate::encoder::ctu::TreeCfg::new(64);
+        }
+        Ok(enc)
+    }
+
+    /// The picture's sample format.
+    #[must_use]
+    pub fn sample_layout(&self) -> crate::encoder::pcm::PcmLayout {
+        self.fmt.layout()
+    }
+
     #[must_use]
     pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
         self.ctu_rc = on;
@@ -594,15 +674,17 @@ impl PyramidEncoder {
             still: false,
             video_signal: self.video_signal,
             ids: self.ids,
-            fmt: crate::encoder::sample::SampleFmt::YUV420_8,
+            fmt: self.fmt,
             chroma_qp_offset: 0,
         }
     }
 
     /// The layer-`l` slice QP over `base` (the constructor QP, or
-    /// the rate controller's per-mini-GOP election).
+    /// the rate controller's per-mini-GOP election), within the
+    /// layout's `SliceQpY` range.
     fn layer_qp(&self, base: i32, layer: u8) -> i32 {
-        (base + i32::from(layer) * self.layer_qp_step).clamp(0, 51)
+        let range = self.fmt.qp_range();
+        (base + i32::from(layer) * self.layer_qp_step).clamp(*range.start(), *range.end())
     }
 
     /// Push the next DISPLAY-order frame; returns every access unit
@@ -612,7 +694,26 @@ impl PyramidEncoder {
     /// # Errors
     /// [`PyramidError::Encode`] on plane-size mismatches.
     pub fn encode_frame(&mut self, frame: &YuvFrame<'_>) -> Result<Vec<PyramidAu>, PyramidError> {
-        let (cw, ch) = (self.width / 2, self.height / 2);
+        let (y, cb, cr) = widen_frame(frame);
+        let fmt = self.fmt;
+        Ok(self
+            .encode_frame_wide(&YuvFrameWide::new(&y, &cb, &cr))?
+            .into_iter()
+            .map(|au| au.narrow(fmt))
+            .collect())
+    }
+
+    /// [`Self::encode_frame`] at the encoder's sample format
+    /// ([`Self::new_fmt`]): `u16` planes at the picture's depth,
+    /// chroma per its chroma format (empty for monochrome).
+    ///
+    /// # Errors
+    /// As [`Self::encode_frame`].
+    pub fn encode_frame_wide(
+        &mut self,
+        frame: &YuvFrameWide<'_>,
+    ) -> Result<Vec<PyramidAuWide>, PyramidError> {
+        let (cw, ch) = self.fmt.chroma_dims(self.width, self.height);
         for (plane, buf, expected) in [
             ("y", frame.y, self.width * self.height),
             ("cb", frame.cb, cw * ch),
@@ -636,19 +737,52 @@ impl PyramidEncoder {
             };
             let sei = self.sei_prefix(true, 0);
             let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
-            let code = |qp: i32| {
-                encode_idr_intra_au_full(
-                    frame.y,
-                    frame.cb,
-                    frame.cr,
-                    self.width,
-                    self.height,
-                    qp,
-                    &self.sps_cfg(),
-                    &self.filters,
-                    self.aq,
-                    self.ctu_budget(),
-                )
+            // The 8-bit 4:2:0 anchor keeps the historical entry (its
+            // streams are byte-pinned); every other layout codes
+            // through the quadtree coder's wide entry.
+            let narrow = self.fmt.is_yuv420_8().then(|| narrow_frame(frame));
+            let code = |qp: i32| -> Result<(Vec<u8>, WideRecon), IntraEncodeError> {
+                match &narrow {
+                    Some((y, cb, cr)) => {
+                        let idr = encode_idr_intra_au_full(
+                            y,
+                            cb,
+                            cr,
+                            self.width,
+                            self.height,
+                            qp,
+                            &self.sps_cfg(),
+                            &self.filters,
+                            self.aq,
+                            self.ctu_budget(),
+                        )?;
+                        Ok((
+                            idr.au,
+                            WideRecon::from_narrow(idr.recon_y, idr.recon_cb, idr.recon_cr),
+                        ))
+                    }
+                    None => {
+                        let idr = crate::encoder::intra::encode_idr_intra_au_wide(
+                            [frame.y, frame.cb, frame.cr],
+                            self.width,
+                            self.height,
+                            qp,
+                            &self.sps_cfg(),
+                            &self.filters,
+                            self.aq,
+                            self.ctu_budget(),
+                        )?;
+                        Ok((
+                            idr.au,
+                            WideRecon {
+                                y: idr.recon_y,
+                                cb: idr.recon_cb,
+                                cr: idr.recon_cr,
+                                motion_field: None,
+                            },
+                        ))
+                    }
+                }
             };
             let mut idr = code(idr_qp)?;
             // VBV / HRD constraint: re-encode at a higher QP until
@@ -658,33 +792,29 @@ impl PyramidEncoder {
             // the low-delay arm.
             if let Some(cap) = self.au_cap() {
                 let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
-                while idr.au.len() as u64 * 8 + sei_bits > cap && idr_qp < ceiling {
+                while idr.0.len() as u64 * 8 + sei_bits > cap && idr_qp < ceiling {
                     idr_qp = (idr_qp + 3).min(ceiling);
                     idr = code(idr_qp)?;
                 }
             }
             if let Some(sei) = &sei {
-                crate::encoder::hrd::splice_sei_before_vcl(&mut idr.au, sei);
+                crate::encoder::hrd::splice_sei_before_vcl(&mut idr.0, sei);
             }
-            self.append_cbr_filler(&mut idr.au);
-            let recon = FrameRecon {
-                y: idr.recon_y,
-                cb: idr.recon_cb,
-                cr: idr.recon_cr,
-                // An IDR's motion field is all-intra.
-                motion_field: Some(crate::motion::MotionField::new(self.width, self.height)),
-            };
+            self.append_cbr_filler(&mut idr.0);
+            let mut recon = idr.1;
+            // An IDR's motion field is all-intra.
+            recon.motion_field = Some(crate::motion::MotionField::new(self.width, self.height));
             self.refs.insert(0, recon.clone());
             self.anchor = Some(0);
             self.next_display = 1;
             if let Some(rc) = &mut self.rc {
-                rc.update(FrameClass::Intra, idr_qp, idr.au.len() as u64 * 8);
+                rc.update(FrameClass::Intra, idr_qp, idr.0.len() as u64 * 8);
             }
             if let Some((_, clock)) = &mut self.hrd {
-                clock.push_au(idr.au.len() as u64 * 8);
+                clock.push_au(idr.0.len() as u64 * 8);
             }
-            return Ok(vec![PyramidAu {
-                au: idr.au,
+            return Ok(vec![PyramidAuWide {
+                au: idr.0,
                 keyframe: true,
                 display_order: 0,
                 layer: 0,
@@ -703,7 +833,13 @@ impl PyramidEncoder {
         // first frame of a mini-GOP is never a cut candidate).
         let cut = self.adaptive
             && self.pending.last().is_some_and(|prev| {
-                let mad = luma_mad_q4(frame.y, &prev.y, self.width, self.height);
+                let mad = luma_mad_q4(
+                    frame.y,
+                    &prev.y,
+                    self.width,
+                    self.height,
+                    u32::from(self.fmt.bit_depth_luma.saturating_sub(8)),
+                );
                 let is_cut = match self.mad_avg_q4 {
                     Some(avg) => mad > avg.saturating_mul(4) && mad > 16 << 4,
                     None => mad > 40 << 4,
@@ -738,7 +874,7 @@ impl PyramidEncoder {
     /// Code the first `g` buffered frames (displays `a+1 ..= a+g`) as
     /// one mini-GOP in decode order and drain them; any later pending
     /// frames stay buffered for the next mini-GOP.
-    fn code_mini_gop(&mut self, g: usize) -> Vec<PyramidAu> {
+    fn code_mini_gop(&mut self, g: usize) -> Vec<PyramidAuWide> {
         let a = self.anchor.expect("mini-GOP needs an anchor");
         let g = g as i32;
         let sched = build_schedule(a, g);
@@ -783,7 +919,12 @@ impl PyramidEncoder {
     /// buffer), and feed the rate model back — the per-temporal-layer
     /// buffer accounting: every access unit drains the model at its
     /// own decode instant, whatever pyramid layer it sits on.
-    fn code_slice_vbv(&mut self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32]) -> PyramidAu {
+    fn code_slice_vbv(
+        &mut self,
+        frame: YuvFrameWide<'_>,
+        s: &Sched,
+        retained: &[i32],
+    ) -> PyramidAuWide {
         // Per-slice base election: the controller tracks every access
         // unit at its own decode instant (the once-per-mini-GOP
         // election under-tracked at low rates — the r451 accuracy
@@ -809,6 +950,7 @@ impl PyramidEncoder {
             crate::encoder::hrd::splice_sei_before_vcl(&mut au.au, sei);
         }
         self.append_cbr_filler(&mut au.au);
+        let fed_qp = self.layer_qp(base + bump, 0);
         if let Some(rc) = &mut self.rc {
             // Feed back at the BASE QP (not the slice's layer QP) plus
             // any VBV bump: the model then learns the layer-offset
@@ -816,11 +958,7 @@ impl PyramidEncoder {
             // the next base election is unbiased — while a bumped
             // slice reports the QP its bits were really coded at
             // relative to the layer shape.
-            rc.update(
-                FrameClass::Inter,
-                (base + bump).clamp(0, 51),
-                au.au.len() as u64 * 8,
-            );
+            rc.update(FrameClass::Inter, fed_qp, au.au.len() as u64 * 8);
         }
         if let Some((_, clock)) = &mut self.hrd {
             clock.push_au(au.au.len() as u64 * 8);
@@ -830,9 +968,15 @@ impl PyramidEncoder {
 
     /// Encode one scheduled P / B slice against the retained
     /// reconstructions at slice QP `qp`.
-    fn code_slice(&self, frame: YuvFrame<'_>, s: &Sched, retained: &[i32], qp: i32) -> PyramidAu {
+    fn code_slice(
+        &self,
+        frame: YuvFrameWide<'_>,
+        s: &Sched,
+        retained: &[i32],
+        qp: i32,
+    ) -> PyramidAuWide {
         let b_slice = s.l1.is_some();
-        let rec_of = |p: i32| -> &FrameRecon { self.refs.get(&p).expect("retained recon") };
+        let rec_of = |p: i32| -> &WideRecon { self.refs.get(&p).expect("retained recon") };
         // The used short-term sets (§8.3.4 StCurrBefore / StCurrAfter,
         // closest first): the schedule's boundaries first, then the
         // nearest other retained pictures on each side up to `refs`.
@@ -860,8 +1004,8 @@ impl PyramidEncoder {
         let n_l0 = self.num_refs.min(total);
         let n_l1 = if b_slice { self.num_refs.min(total) } else { 0 };
         let (l0_pocs, l1_pocs) = build_ref_lists(&before, &after, n_l0, n_l1);
-        let l0: Vec<(i32, &FrameRecon)> = l0_pocs.iter().map(|&p| (p, rec_of(p))).collect();
-        let l1: Vec<(i32, &FrameRecon)> = l1_pocs.iter().map(|&p| (p, rec_of(p))).collect();
+        let l0: Vec<(i32, &WideRecon)> = l0_pocs.iter().map(|&p| (p, rec_of(p))).collect();
+        let l1: Vec<(i32, &WideRecon)> = l1_pocs.iter().map(|&p| (p, rec_of(p))).collect();
         // Inline §7.4.8 RPS: negative pics closest-first, positive
         // pics closest-first; used flags mark the used sets.
         let rps_neg: Vec<(u32, bool)> = retained
@@ -897,9 +1041,10 @@ impl PyramidEncoder {
             },
             ctu_rc: self.ctu_budget(),
             threads: self.threads,
+            fmt: self.fmt,
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
-        PyramidAu {
+        PyramidAuWide {
             au: annexb(&[nal_unit(1, 0, 0, &rbsp)]), // TRAIL_R
             keyframe: false,
             display_order: s.poc as usize,
@@ -916,6 +1061,15 @@ impl PyramidEncoder {
     /// encoder is ready for more input afterwards (the last flushed
     /// frame becomes the new anchor).
     pub fn flush(&mut self) -> Vec<PyramidAu> {
+        let fmt = self.fmt;
+        self.flush_wide()
+            .into_iter()
+            .map(|au| au.narrow(fmt))
+            .collect()
+    }
+
+    /// [`Self::flush`] at the encoder's sample format.
+    pub fn flush_wide(&mut self) -> Vec<PyramidAuWide> {
         if self.anchor.is_none() || self.pending.is_empty() {
             return Vec::new();
         }
@@ -926,12 +1080,13 @@ impl PyramidEncoder {
 
 /// Mean absolute luma difference between two frames in Q4 (per
 /// sample, on a 4x-subsampled grid — the scene-cut statistic).
-fn luma_mad_q4(a: &[u8], b: &[u8], width: usize, height: usize) -> u64 {
+/// `shift` = `BitDepthY − 8` keeps the statistic in 8-bit units.
+fn luma_mad_q4(a: &[u16], b: &[u16], width: usize, height: usize, shift: u32) -> u64 {
     let mut sum = 0u64;
     let mut n = 0u64;
     for j in (0..height).step_by(2) {
         for i in (0..width).step_by(2) {
-            sum += u64::from(a[j * width + i].abs_diff(b[j * width + i]));
+            sum += u64::from(a[j * width + i].abs_diff(b[j * width + i])) >> shift;
             n += 1;
         }
     }

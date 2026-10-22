@@ -52,9 +52,9 @@ use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::inter::{
     amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx, encode_pu_syntax_at,
-    entry_point_offsets, extract, merge_pu, part_is_amp, part_is_horizontal, predict_block_wp,
-    store, sub_block, write_entry_points, FrameRecon, FrameStats, PuChooseCtx, PuSyntax, RefPlanes,
-    SliceLfSignalling, SliceSpec, YuvFrame,
+    entry_point_offsets, extract, extract_rect, merge_pu, part_is_amp, part_is_horizontal,
+    predict_block_wp, store, store_rect, sub_block, write_entry_points, FrameStats, PuChooseCtx,
+    PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, WideRecon, YuvFrameWide,
 };
 use crate::encoder::intra::{
     encode_cu_qp_delta, forward_transform_bd, rate_proxy, IntraEncodeError, IntraEncodedAu,
@@ -509,8 +509,8 @@ struct SliceCtx<'a> {
     ctu_rc: Option<u64>,
     b_slice: bool,
     intra_slice: bool,
-    refs_l0: &'a [RefPlanes],
-    refs_l1: &'a [RefPlanes],
+    refs_l0: &'a [RefPlanes<'a>],
+    refs_l1: &'a [RefPlanes<'a>],
     mv_ctx: Option<&'a PuMvContext<'a>>,
     two_sided: bool,
     tiling: &'a PictureTiling,
@@ -521,8 +521,8 @@ struct SliceCtx<'a> {
     wp: Option<&'a SliceWpTables>,
     /// Motion-search reference planes (luma-weighted copies under
     /// weighted prediction; else the reference planes themselves).
-    me_refs_l0: &'a [RefPlanes],
-    me_refs_l1: &'a [RefPlanes],
+    me_refs_l0: &'a [RefPlanes<'a>],
+    me_refs_l1: &'a [RefPlanes<'a>],
     /// Pass-1 worker budget (tiles decided in parallel; 1 = serial).
     threads: usize,
     /// `pps_cb_qp_offset == pps_cr_qp_offset`.
@@ -674,14 +674,12 @@ impl ReconPlanes {
         }
     }
 
-    /// Narrow to the 8-bit [`FrameRecon`] of the inter coders (every
-    /// value is already `<= 255` on an 8-bit picture).
-    fn into_frame_recon(self) -> FrameRecon {
-        let narrow = |v: Vec<u16>| -> Vec<u8> { v.into_iter().map(|s| s as u8).collect() };
-        FrameRecon {
-            y: narrow(self.y),
-            cb: narrow(self.cb),
-            cr: narrow(self.cr),
+    /// The inter coders' [`WideRecon`] (no motion field yet).
+    fn into_wide_recon(self) -> WideRecon {
+        WideRecon {
+            y: self.y,
+            cb: self.cb,
+            cr: self.cr,
             motion_field: None,
         }
     }
@@ -1782,7 +1780,17 @@ fn code_nxn_chroma(
         let (idx, mode_c) = if elect {
             elect_chroma_mode(ctx, st, x0, y0, 8, pb_modes[0], lambda_me)
         } else {
-            (4, pb_modes[0])
+            // The derived mode (intra_chroma_pred_mode 4) is PB 0's
+            // luma mode through the Table 8-3 remap at 4:2:2 — what
+            // the emitter signals and the decoder derives.
+            (
+                4,
+                crate::binarization::derive_intra_pred_mode_c(
+                    4,
+                    pb_modes[0],
+                    fmt.chroma_format_idc == 2,
+                ),
+            )
         };
         let (cb, cr, d_c) = code_intra_chroma_tbs(ctx, st, x0, y0, 3, mode_c, qp_c, lambda);
         dist += d_c;
@@ -2133,11 +2141,88 @@ fn code_intra_cu_rd(
 // Inter CU coding
 // ---------------------------------------------------------------------
 
-/// The recursive inter residual quadtree over a fixed CU-wide
-/// prediction. Pure: codes nothing into the state. `x`/`y` are
-/// CU-relative; `pred`/`src` are CU-local buffers (luma `n_cb`x`n_cb`,
-/// chroma half). Returns `(node, recon_local, dist, rate_bins)` where
-/// `recon_local` holds the node's luma + chroma reconstructions.
+/// The chroma transform blocks of one luma transform block of size
+/// `1 << log2` at CU-local `(x, y)`: `blocks` square `n_c`-sample
+/// blocks stacked vertically (two at 4:2:2), the first at chroma
+/// `(cx, cy)` in the CU-local chroma buffers of width `cw_cu`.
+struct ChromaTbs {
+    n_c: usize,
+    blocks: usize,
+    cx: usize,
+    cy: usize,
+    cw_cu: usize,
+}
+
+impl ChromaTbs {
+    fn of(fmt: &SampleFmt, n_cb: usize, x: usize, y: usize, log2: u32) -> Self {
+        let (sw, sh) = fmt.sub_wh();
+        Self {
+            n_c: 1usize << fmt.log2_chroma_tb(log2),
+            blocks: fmt.chroma_blocks(),
+            cx: x / sw,
+            cy: y / sh,
+            cw_cu: n_cb / sw,
+        }
+    }
+}
+
+/// Code the stacked chroma blocks of one inter transform block for
+/// both components: `(cb_levels, cr_levels, cb_recon, cr_recon,
+/// dist, rate)` — the level vectors concatenate the blocks (upper
+/// first, the [`TuNode::cbf_halves`] layout), the reconstructions
+/// are the blocks pasted into one `n_c x (blocks * n_c)` buffer.
+#[allow(clippy::type_complexity)]
+fn code_inter_chroma_tbs(
+    ctx: &SliceCtx<'_>,
+    bufs: &InterCuBufs<'_>,
+    tbs: &ChromaTbs,
+    log2_c: u32,
+    qp_c: u32,
+    lambda: u64,
+) -> (Vec<i32>, Vec<i32>, Vec<u16>, Vec<u16>, u64, u64) {
+    let n = tbs.n_c;
+    let mut out_lv = [Vec::new(), Vec::new()];
+    let mut out_rc = [Vec::new(), Vec::new()];
+    let mut dist = 0u64;
+    let mut rate = 0u64;
+    for (k, (src_p, pred_p, comp)) in [
+        (bufs.src_cb, bufs.pred_cb, Component::Cb),
+        (bufs.src_cr, bufs.pred_cr, Component::Cr),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let c_idx = k as u8 + 1;
+        let mut levels = Vec::with_capacity(n * n * tbs.blocks);
+        let mut recon = Vec::with_capacity(n * n * tbs.blocks);
+        for v in 0..tbs.blocks {
+            let cy = tbs.cy + v * n;
+            let src = sub_block(src_p, tbs.cw_cu, tbs.cx, cy, n);
+            let pred = sub_block(pred_p, tbs.cw_cu, tbs.cx, cy, n);
+            let tools = TbTools::new(ctx, bufs.model, lambda, false, log2_c, c_idx, 0);
+            let (lv, rc) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Inter, tools);
+            dist += ssd(&rc, &src);
+            rate += rate_proxy(&lv) + 1;
+            levels.extend(lv);
+            recon.extend(rc);
+        }
+        out_lv[k] = levels;
+        out_rc[k] = recon;
+    }
+    let [cb_lv, cr_lv] = out_lv;
+    let [cb_rc, cr_rc] = out_rc;
+    (cb_lv, cr_lv, cb_rc, cr_rc, dist, rate)
+}
+
+/// The §7.3.8.8 inter residual quadtree under a prediction: at each
+/// node the unsplit TU competes against the four-child split under
+/// SSD + λ·bins (`inter_split` forces the depth-0 split of a
+/// non-2Nx2N CU with `max_transform_hierarchy_depth_inter == 0`).
+/// Chroma follows the picture's chroma format: coded in place at
+/// every node that has chroma blocks (`SampleFmt::chroma_in_place`),
+/// two stacked blocks per component at 4:2:2, and — at 4:2:0 / 4:2:2
+/// — the 4x4 chroma of a `log2 == 3` split deferred to the parent.
+/// Returns `(node, node-local recon, dist, rate_bins)`.
 #[allow(clippy::too_many_arguments)]
 fn inter_rqt(
     ctx: &SliceCtx<'_>,
@@ -2152,9 +2237,12 @@ fn inter_rqt(
     qp_c: u32,
     lambda: u64,
 ) -> (TuNode, LocalRecon, u64, u64) {
+    let fmt = ctx.fmt;
+    let (sw, sh) = fmt.sub_wh();
     let max_tb = ctx.cfg.max_tb_log2();
     let split_forced = log2 > max_tb || (inter_split && depth == 0);
     let split_allowed = log2 <= max_tb && log2 > 2 && depth < max_depth && !split_forced;
+    let has_chroma = fmt.has_chroma();
 
     let leaf_eval = || -> (TuNode, LocalRecon, u64, u64) {
         let n = 1usize << log2;
@@ -2178,34 +2266,12 @@ fn inter_rqt(
             cb: Vec::new(),
             cr: Vec::new(),
         };
-        let (cb_lv, cr_lv) = if log2 >= 3 {
-            let hc = n / 2;
-            let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, hc);
-            let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, hc);
-            let chroma_tools =
-                |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, log2 - 1, c_idx, 0);
-            let (cb_lv, cb_rc) = code_tb(
-                &src_cb,
-                &pred_cb,
-                hc,
-                qp_c,
-                Component::Cb,
-                PredMode::Inter,
-                chroma_tools(1),
-            );
-            let src_cr = sub_block(bufs.src_cr, n_cb / 2, x / 2, y / 2, hc);
-            let pred_cr = sub_block(bufs.pred_cr, n_cb / 2, x / 2, y / 2, hc);
-            let (cr_lv, cr_rc) = code_tb(
-                &src_cr,
-                &pred_cr,
-                hc,
-                qp_c,
-                Component::Cr,
-                PredMode::Inter,
-                chroma_tools(2),
-            );
-            dist += ssd(&cb_rc, &src_cb) + ssd(&cr_rc, &src_cr);
-            rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
+        let (cb_lv, cr_lv) = if has_chroma && fmt.chroma_in_place(log2) {
+            let tbs = ChromaTbs::of(&fmt, n_cb, x, y, log2);
+            let (cb_lv, cr_lv, cb_rc, cr_rc, d, r) =
+                code_inter_chroma_tbs(ctx, bufs, &tbs, fmt.log2_chroma_tb(log2), qp_c, lambda);
+            dist += d;
+            rate += r;
             local.cb = cb_rc;
             local.cr = cr_rc;
             (cb_lv, cr_lv)
@@ -2227,14 +2293,19 @@ fn inter_rqt(
     let split_eval = || -> (TuNode, LocalRecon, u64, u64) {
         let half = 1usize << (log2 - 1);
         let n = 1usize << log2;
+        let (ncw, nch) = (n / sw, n / sh);
         let mut children: Vec<TuNode> = Vec::with_capacity(4);
         let mut local = LocalRecon {
             y: vec![0u16; n * n],
-            cb: vec![0u16; (n / 2) * (n / 2)],
-            cr: vec![0u16; (n / 2) * (n / 2)],
+            cb: vec![0u16; if has_chroma { ncw * nch } else { 0 }],
+            cr: vec![0u16; if has_chroma { ncw * nch } else { 0 }],
         };
         let mut dist = 0u64;
         let mut rate = 0u64;
+        // The children carry their own chroma when a `half` luma block
+        // has chroma blocks of its own (every size at 4:4:4; above 4x4
+        // luma at 4:2:0 / 4:2:2).
+        let children_own_chroma = has_chroma && fmt.chroma_in_place(log2 - 1);
         for &(zx, zy) in &Z_OFFSETS {
             let (node, child, d, r) = inter_rqt(
                 ctx,
@@ -2251,59 +2322,22 @@ fn inter_rqt(
             );
             // Paste the child's luma into the node-local recon.
             rect_paste(&mut local.y, n, zx * half, zy * half, half, half, &child.y);
-            if log2 > 3 {
-                rect_paste(
-                    &mut local.cb,
-                    n / 2,
-                    zx * half / 2,
-                    zy * half / 2,
-                    half / 2,
-                    half / 2,
-                    &child.cb,
-                );
-                rect_paste(
-                    &mut local.cr,
-                    n / 2,
-                    zx * half / 2,
-                    zy * half / 2,
-                    half / 2,
-                    half / 2,
-                    &child.cr,
-                );
+            if children_own_chroma {
+                let (hcw, hch) = (half / sw, half / sh);
+                rect_paste(&mut local.cb, ncw, zx * hcw, zy * hch, hcw, hch, &child.cb);
+                rect_paste(&mut local.cr, ncw, zx * hcw, zy * hch, hcw, hch, &child.cr);
             }
             children.push(node);
             dist += d;
             rate += r;
         }
-        // Deferred 4x4 chroma at a log2 == 3 split parent.
-        let (cb_lv, cr_lv) = if log2 == 3 {
-            let n_cb = bufs.n_cb;
-            let src_cb = sub_block(bufs.src_cb, n_cb / 2, x / 2, y / 2, 4);
-            let pred_cb = sub_block(bufs.pred_cb, n_cb / 2, x / 2, y / 2, 4);
-            let chroma_tools =
-                |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, 2, c_idx, 0);
-            let (cb_lv, cb_rc) = code_tb(
-                &src_cb,
-                &pred_cb,
-                4,
-                qp_c,
-                Component::Cb,
-                PredMode::Inter,
-                chroma_tools(1),
-            );
-            let src_cr = sub_block(bufs.src_cr, n_cb / 2, x / 2, y / 2, 4);
-            let pred_cr = sub_block(bufs.pred_cr, n_cb / 2, x / 2, y / 2, 4);
-            let (cr_lv, cr_rc) = code_tb(
-                &src_cr,
-                &pred_cr,
-                4,
-                qp_c,
-                Component::Cr,
-                PredMode::Inter,
-                chroma_tools(2),
-            );
-            dist += ssd(&cb_rc, &src_cb) + ssd(&cr_rc, &src_cr);
-            rate += rate_proxy(&cb_lv) + rate_proxy(&cr_lv) + 2;
+        // Deferred 4x4 chroma at a log2 == 3 split parent (4:2:0 / 4:2:2).
+        let (cb_lv, cr_lv) = if has_chroma && !children_own_chroma {
+            let tbs = ChromaTbs::of(&fmt, bufs.n_cb, x, y, log2);
+            let (cb_lv, cr_lv, cb_rc, cr_rc, d, r) =
+                code_inter_chroma_tbs(ctx, bufs, &tbs, fmt.log2_chroma_tb(log2), qp_c, lambda);
+            dist += d;
+            rate += r;
             local.cb = cb_rc;
             local.cr = cr_rc;
             (cb_lv, cr_lv)
@@ -2385,22 +2419,28 @@ fn code_inter_cu(
     depth: u32,
     ctb_qp: i32,
 ) -> CuCoded {
-    debug_assert!(
-        ctx.fmt.is_yuv420_8(),
-        "the inter coder is 4:2:0 8-bit (the intra quadtree coder is format-general)"
-    );
     let n = 1usize << log2;
     let qp_y = ctx.qp_y_prime(ctb_qp);
     let qp_c = ctx.qp_c_prime(ctb_qp);
     let lambda = ctx.lambda_of(ctb_qp);
     let lambda_me = crate::encoder::rate::motion_lambda(lambda);
     let mv_ctx = ctx.mv_ctx.expect("inter slice has motion context");
-    let (cw, cx0, cy0) = (ctx.cw(), x0 / 2, y0 / 2);
+    // Chroma geometry per the picture's chroma format: the CU's
+    // chroma block is `n / SubWidthC` x `n / SubHeightC` (empty for
+    // monochrome).
+    let (sub_w, sub_h) = ctx.fmt.sub_wh();
+    let has_chroma = ctx.fmt.has_chroma();
+    let (cw, cx0, cy0) = (ctx.cw(), x0 / sub_w, y0 / sub_h);
+    let (ncw, nch) = if has_chroma {
+        (n / sub_w, n / sub_h)
+    } else {
+        (0, 0)
+    };
     let (max_y, max_c) = (ctx.fmt.max_luma(), ctx.fmt.max_chroma());
     let src = [
         extract(ctx.src[0], ctx.width, x0, y0, n),
-        extract(ctx.src[1], cw, cx0, cy0, n / 2),
-        extract(ctx.src[2], cw, cx0, cy0, n / 2),
+        extract_rect(ctx.src[1], cw, cx0, cy0, ncw, nch),
+        extract_rect(ctx.src[2], cw, cx0, cy0, ncw, nch),
     ];
 
     let geom = PuGeometry {
@@ -2610,8 +2650,8 @@ fn code_inter_cu(
             let mut pus = [PuSyntax::Merge { merge_idx: 0 }; 2];
             let mut motions_r: Vec<PuMotion> = Vec::with_capacity(2);
             let mut pred_y = vec![0i32; n * n];
-            let mut pred_cb = vec![0i32; (n / 2) * (n / 2)];
-            let mut pred_cr = vec![0i32; (n / 2) * (n / 2)];
+            let mut pred_cb = vec![0i32; ncw * nch];
+            let mut pred_cr = vec![0i32; ncw * nch];
             let mut motion_rate = if part_is_amp(part) { 5u64 } else { 3u64 };
             for (k, r) in rects.iter().enumerate() {
                 let g = PuGeometry {
@@ -2682,24 +2722,26 @@ fn code_inter_cu(
                     r.n_pb_w,
                     r.n_pb_h,
                 );
-                blit(
-                    &mut pred_cb,
-                    n / 2,
-                    (r.x_pb - x0) / 2,
-                    (r.y_pb - y0) / 2,
-                    &p.cb,
-                    r.n_pb_w / 2,
-                    r.n_pb_h / 2,
-                );
-                blit(
-                    &mut pred_cr,
-                    n / 2,
-                    (r.x_pb - x0) / 2,
-                    (r.y_pb - y0) / 2,
-                    &p.cr,
-                    r.n_pb_w / 2,
-                    r.n_pb_h / 2,
-                );
+                if has_chroma {
+                    blit(
+                        &mut pred_cb,
+                        ncw,
+                        (r.x_pb - x0) / sub_w,
+                        (r.y_pb - y0) / sub_h,
+                        &p.cb,
+                        r.n_pb_w / sub_w,
+                        r.n_pb_h / sub_h,
+                    );
+                    blit(
+                        &mut pred_cr,
+                        ncw,
+                        (r.x_pb - x0) / sub_w,
+                        (r.y_pb - y0) / sub_h,
+                        &p.cr,
+                        r.n_pb_w / sub_w,
+                        r.n_pb_h / sub_h,
+                    );
+                }
                 pus[k] = pu_syntax;
                 motions_r.push(motion);
                 motion_rate += rate_k;
@@ -2737,6 +2779,10 @@ fn code_inter_cu(
         // Predict + code the whole CU as its (possibly forced-split)
         // intra transform tree, on a scratch copy of the recon rect.
         let before = st.snapshot(ctx, x0, y0, n);
+        // The derived chroma mode (intra_chroma_pred_mode 4): the luma
+        // mode through the Table 8-3 remap at 4:2:2.
+        let mode_c =
+            crate::binarization::derive_intra_pred_mode_c(4, mode, ctx.fmt.chroma_format_idc == 2);
         let (tree, dist, rate) = intra_rqt(
             ctx,
             st,
@@ -2746,15 +2792,15 @@ fn code_inter_cu(
             0,
             ctx.cfg.th_depth_intra,
             mode,
-            mode,
+            mode_c,
             qp_y,
             qp_c,
             lambda,
         );
         let recon = LocalRecon {
             y: rect_copy(&st.recon.y, ctx.width, x0, y0, n, n),
-            cb: rect_copy(&st.recon.cb, cw, cx0, cy0, n / 2, n / 2),
-            cr: rect_copy(&st.recon.cr, cw, cx0, cy0, n / 2, n / 2),
+            cb: rect_copy(&st.recon.cb, cw, cx0, cy0, ncw, nch),
+            cr: rect_copy(&st.recon.cr, cw, cx0, cy0, ncw, nch),
         };
         st.restore(ctx, &before);
         cands.push(InterCand {
@@ -2777,8 +2823,10 @@ fn code_inter_cu(
 
     // ---- commit ----
     store(&mut st.recon.y, ctx.width, x0, y0, n, &chosen.recon.y);
-    store(&mut st.recon.cb, cw, cx0, cy0, n / 2, &chosen.recon.cb);
-    store(&mut st.recon.cr, cw, cx0, cy0, n / 2, &chosen.recon.cr);
+    if has_chroma {
+        store_rect(&mut st.recon.cb, cw, cx0, cy0, ncw, nch, &chosen.recon.cb);
+        store_rect(&mut st.recon.cr, cw, cx0, cy0, ncw, nch, &chosen.recon.cr);
+    }
     let is_skip = matches!(chosen.kind, TreeCuKind::Skip { .. });
     match &chosen.kind {
         TreeCuKind::Intra { modes, nxn, .. } => {
@@ -3521,8 +3569,16 @@ impl Emitter<'_, '_> {
                 let cbf_luma = TuNode::any_nonzero(y_lv);
                 // Chroma coded in place at this node, else (a 4x4 luma
                 // leaf of a 4:2:0 / 4:2:2 tree) the parent's flags.
+                // The root call opens the parent gates (`true, true`)
+                // so that a depth-0 node's own flags are signalled; a
+                // picture without chroma has no chroma flags at all, so
+                // its leaves never inherit "chroma coded" from them —
+                // §7.3.8.10 `cbfChroma` is 0 when ChromaArrayType == 0
+                // and a depth-0 inter `cbf_luma` is then inferred.
                 let in_place = fmt.chroma_in_place(log2);
-                let any_chroma = if in_place {
+                let any_chroma = if !fmt.has_chroma() {
+                    false
+                } else if in_place {
                     cbf_cb || cbf_cr
                 } else {
                     parent_cbf_cb || parent_cbf_cr || parent_lower[0] || parent_lower[1]
@@ -4573,45 +4629,48 @@ fn make_tiling(width: usize, height: usize, cfg: &TreeCfg) -> PictureTiling {
 /// Encode one P / B frame as a quadtree TRAIL_R slice (the tree twin
 /// of [`crate::encoder::inter::encode_inter_slice`]).
 pub(crate) fn encode_inter_slice_tree(
-    frame: &YuvFrame<'_>,
+    frame: &YuvFrameWide<'_>,
     spec: &SliceSpec<'_>,
     width: usize,
     height: usize,
-) -> (Vec<u8>, FrameRecon, FrameStats) {
+) -> (Vec<u8>, WideRecon, FrameStats) {
     let tree = spec.tree.expect("tree config present");
+    let fmt = spec.fmt;
     let ctb = 1usize << tree.ctb_log2;
-    let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, ctb);
+    let aq_deltas = crate::encoder::aq::ctb_aq_deltas_wide(
+        frame.y,
+        width,
+        height,
+        spec.aq,
+        ctb,
+        fmt.bit_depth_luma,
+    );
     let tiling = make_tiling(width, height, &tree);
     let scaling = scaling_lists_for(tree.scaling_lists).map(|(d, _)| d.scaling_factors(1));
 
-    let to_u16 = |p: &[u8]| -> Vec<u16> { p.iter().map(|&v| u16::from(v)).collect() };
-    let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
-        list.iter()
-            .map(|&(_, rec)| RefPlanes {
-                y: to_u16(&rec.y),
-                cb: to_u16(&rec.cb),
-                cr: to_u16(&rec.cr),
-                width,
-                height,
-            })
-            .collect()
-    };
-    let refs_l0 = to_planes(&spec.l0);
-    let refs_l1 = to_planes(&spec.l1);
+    let refs_l0 = crate::encoder::inter::ref_planes(&spec.l0, width, height, fmt);
+    let refs_l1 = crate::encoder::inter::ref_planes(&spec.l1, width, height, fmt);
     // Explicit weighted prediction: fade-fitted tables per reference,
     // luma-weighted reference copies for the motion search.
     let wp_tables = tree.weighted_pred.then(|| {
-        let l0: Vec<&FrameRecon> = spec.l0.iter().map(|&(_, r)| r).collect();
-        let l1: Vec<&FrameRecon> = spec.l1.iter().map(|&(_, r)| r).collect();
-        crate::encoder::wp::estimate(frame, &l0, &l1, width, height)
+        let l0: Vec<&WideRecon> = spec.l0.iter().map(|&(_, r)| r).collect();
+        let l1: Vec<&WideRecon> = spec.l1.iter().map(|&(_, r)| r).collect();
+        crate::encoder::wp::estimate_wide(frame, &l0, &l1, width, height, fmt)
     });
     let me_planes = wp_tables.as_ref().map(|t| {
         (
-            crate::encoder::wp::weighted_ref_planes(&refs_l0, &t.l0),
-            crate::encoder::wp::weighted_ref_planes(&refs_l1, &t.l1),
+            crate::encoder::wp::weighted_luma_planes(&refs_l0, &t.l0),
+            crate::encoder::wp::weighted_luma_planes(&refs_l1, &t.l1),
         )
     });
-    let (me_refs_l0, me_refs_l1): (&[RefPlanes], &[RefPlanes]) = match &me_planes {
+    let me_owned: Option<(Vec<RefPlanes<'_>>, Vec<RefPlanes<'_>>)> =
+        me_planes.as_ref().map(|(a, b)| {
+            (
+                crate::encoder::wp::with_luma(a, &refs_l0),
+                crate::encoder::wp::with_luma(b, &refs_l1),
+            )
+        });
+    let (me_refs_l0, me_refs_l1): (&[RefPlanes<'_>], &[RefPlanes<'_>]) = match &me_owned {
         Some((a, b)) => (a, b),
         None => (&refs_l0, &refs_l1),
     };
@@ -4663,14 +4722,13 @@ pub(crate) fn encode_inter_slice_tree(
         two_versions_curr_pic: false,
         is_curr_pic: &|_, _| false,
     };
-    let (wy, wcb, wcr) = (widen(frame.y), widen(frame.cb), widen(frame.cr));
     let ctx = SliceCtx {
         cfg: tree,
-        fmt: SampleFmt::YUV420_8,
+        fmt,
         amp: spec.big_cu,
         width,
         height,
-        src: [&wy, &wcb, &wcr],
+        src: [frame.y, frame.cb, frame.cr],
         qp: spec.qp,
         aq_deltas: &aq_deltas,
         ctu_rc: spec.ctu_rc,
@@ -4714,7 +4772,7 @@ pub(crate) fn encode_inter_slice_tree(
     let CodedPicture {
         recon, st, stats, ..
     } = coded;
-    let mut recon = recon.into_frame_recon();
+    let mut recon = recon.into_wide_recon();
     recon.motion_field = Some(st.field);
     (w.finish(), recon, stats)
 }
@@ -4759,7 +4817,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::encoder::inter::YuvFrame;
+    use crate::encoder::inter::{FrameRecon, YuvFrame};
     use crate::sequence::decode_annexb_sequence;
 
     fn planes(w: usize, h: usize, seed: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

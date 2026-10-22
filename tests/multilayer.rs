@@ -266,7 +266,12 @@ fn non_base_sps_before_its_vps_is_deferred_not_refused() {
     let mut reordered: Vec<NalUnit> = Vec::with_capacity(units.len());
     // SPSs first (base, then layer 1), then PPSs, then the VPS last.
     for t in [33u8, 34, 32] {
-        reordered.extend(units.iter().filter(|u| u.header.nal_unit_type == t).cloned());
+        reordered.extend(
+            units
+                .iter()
+                .filter(|u| u.header.nal_unit_type == t)
+                .cloned(),
+        );
     }
     reordered.extend(units.iter().filter(|u| !is_ps(u)).cloned());
     let mut dec = SequenceDecoder::new();

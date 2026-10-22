@@ -81,7 +81,6 @@ const CTB_LOG2: u32 = 4;
 /// The fixed CTB size.
 const CTB: usize = 1 << CTB_LOG2;
 /// Fixed 8-bit depth.
-const BIT_DEPTH: u8 = 8;
 /// `MaxNumMergeCand` (§7.4.7.1) — `five_minus_max_num_merge_cand = 0`.
 const MAX_MERGE: usize = 5;
 /// The greedy integer-search iteration cap (diamond steps).
@@ -103,6 +102,90 @@ pub struct YuvFrame<'a> {
     pub cb: &'a [u8],
     /// Cr plane.
     pub cr: &'a [u8],
+}
+
+/// One input frame of ANY chroma format / bit depth (borrowed `u16`
+/// planes at the picture's depth; the chroma planes sized per
+/// Table 6-1 and empty for monochrome) — the wide twin of
+/// [`YuvFrame`], for [`LowDelayPEncoder::encode_frame_wide`] /
+/// [`crate::encoder::pyramid::PyramidEncoder::encode_frame_wide`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct YuvFrameWide<'a> {
+    /// Luma plane, `width * height` samples.
+    pub y: &'a [u16],
+    /// Cb plane (`SubWidthC` / `SubHeightC` subsampled; empty for
+    /// monochrome).
+    pub cb: &'a [u16],
+    /// Cr plane.
+    pub cr: &'a [u16],
+}
+
+impl<'a> YuvFrameWide<'a> {
+    /// Borrow three planes.
+    #[must_use]
+    pub fn new(y: &'a [u16], cb: &'a [u16], cr: &'a [u16]) -> Self {
+        Self { y, cb, cr }
+    }
+}
+
+/// [`FrameRecon`] at any sample format: `u16` samples at the
+/// picture's bit depth, chroma per its chroma format (empty for
+/// monochrome).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct WideRecon {
+    /// Reconstructed luma plane.
+    pub y: Vec<u16>,
+    /// Reconstructed Cb plane.
+    pub cb: Vec<u16>,
+    /// Reconstructed Cr plane.
+    pub cr: Vec<u16>,
+    /// The picture's decoded motion field (see
+    /// [`FrameRecon::motion_field`]).
+    pub motion_field: Option<MotionField>,
+}
+
+impl WideRecon {
+    /// The 8-bit view: on an 8-bit picture the samples themselves; on
+    /// a deeper picture the top eight bits of every sample.
+    pub(crate) fn narrow(&self, fmt: SampleFmt) -> FrameRecon {
+        let narrow = |v: &[u16], bd: u8| -> Vec<u8> {
+            let shift = u32::from(bd.saturating_sub(8));
+            v.iter().map(|&s| (s >> shift) as u8).collect()
+        };
+        FrameRecon {
+            y: narrow(&self.y, fmt.bit_depth_luma),
+            cb: narrow(&self.cb, fmt.bit_depth_chroma),
+            cr: narrow(&self.cr, fmt.bit_depth_chroma),
+            motion_field: self.motion_field.clone(),
+        }
+    }
+
+    /// Widen an 8-bit reconstruction.
+    pub(crate) fn from_narrow(y: Vec<u8>, cb: Vec<u8>, cr: Vec<u8>) -> Self {
+        Self {
+            y: crate::encoder::ctu::widen(&y),
+            cb: crate::encoder::ctu::widen(&cb),
+            cr: crate::encoder::ctu::widen(&cr),
+            motion_field: None,
+        }
+    }
+}
+
+/// The owned `u16` planes of an 8-bit [`YuvFrame`].
+pub(crate) fn widen_frame(frame: &YuvFrame<'_>) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    (
+        crate::encoder::ctu::widen(frame.y),
+        crate::encoder::ctu::widen(frame.cb),
+        crate::encoder::ctu::widen(frame.cr),
+    )
+}
+
+/// The owned `u8` planes of a wide frame whose samples are 8-bit.
+pub(crate) fn narrow_frame(frame: &YuvFrameWide<'_>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let n = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+    (n(frame.y), n(frame.cb), n(frame.cr))
 }
 
 /// One frame's reconstruction (what a conforming decoder outputs).
@@ -257,6 +340,23 @@ pub struct EncodedPFrame {
     pub qp: i32,
 }
 
+/// [`EncodedPFrame`] at any sample format (the output of
+/// [`LowDelayPEncoder::encode_frame_wide`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct EncodedWideFrame {
+    /// The Annex B access unit.
+    pub au: Vec<u8>,
+    /// `true` for an IDR access unit.
+    pub keyframe: bool,
+    /// The frame's reconstruction at the picture's depth.
+    pub recon: WideRecon,
+    /// The frame's CU mode-decision counters.
+    pub stats: FrameStats,
+    /// The `SliceQpY` this frame was coded at.
+    pub qp: i32,
+}
+
 /// The streaming low-delay encoder: one frame in, one access unit
 /// out. The first frame (and every `gop`-th frame when `gop > 0`)
 /// becomes a self-contained IDR access unit; every other frame is a
@@ -284,7 +384,11 @@ pub struct LowDelayPEncoder {
     poc: i32,
     /// The most recent reconstructions, newest first (up to two — the
     /// active references POC − 1 and POC − 2).
-    prevs: Vec<FrameRecon>,
+    prevs: Vec<WideRecon>,
+    /// The picture's chroma format and bit depths (8-bit 4:2:0 from
+    /// [`Self::new`]; any other layout from [`Self::new_fmt`], which
+    /// routes every picture through the quadtree coder).
+    fmt: SampleFmt,
     /// ABR rate controller: when set, it elects each frame's
     /// `SliceQpY` and the constructor `qp` is unused (pass it as
     /// [`RateControlCfg::initial_qp`] to seed the starting point).
@@ -352,6 +456,7 @@ impl LowDelayPEncoder {
             amp: false,
             poc: 0,
             prevs: Vec::new(),
+            fmt: SampleFmt::YUV420_8,
             rc: None,
             aq: 0,
             timing: None,
@@ -375,6 +480,56 @@ impl LowDelayPEncoder {
     /// up to ±3 through §7.3.8.14 `cu_qp_delta`, tracking a shadow
     /// CABAC count of the picture's coded size against the
     /// controller's pro-rata frame budget. Composes with spatial AQ.
+    /// [`Self::new`] for any HEIC sample layout (`layout`: chroma
+    /// format + bit depth, 8..=12 bits): the pictures go through the
+    /// quadtree coder (`ctb` 64 unless [`Self::with_tree`] sets
+    /// another), the IDR through its wide intra entry, the P / B
+    /// slices through the same §8.5 machinery at the layout's depth
+    /// (§8.5.3.3.3 interpolation shifts, chroma motion vectors per
+    /// `SubWidthC` / `SubHeightC`, weighted prediction offsets per
+    /// `WpOffsetBdShift`) — the SPS carries the layout's Annex A
+    /// profile. `qp` is the `SliceQpY` in `−QpBdOffsetY ..= 51`.
+    /// Frames go in through [`Self::encode_frame_wide`].
+    ///
+    /// # Errors
+    /// [`IntraEncodeError::BadDimensions`] when a side is not a
+    /// multiple of 16 or the layout is deeper than 12 bits;
+    /// [`IntraEncodeError::BadQp`] when `qp` is outside the layout's
+    /// range.
+    pub fn new_fmt(
+        width: usize,
+        height: usize,
+        qp: i32,
+        gop: usize,
+        layout: crate::encoder::pcm::PcmLayout,
+    ) -> Result<Self, IntraEncodeError> {
+        let fmt = SampleFmt::from_layout(layout);
+        if width == 0
+            || height == 0
+            || width % CTB != 0
+            || height % CTB != 0
+            || layout.bit_depth > 12
+        {
+            return Err(IntraEncodeError::BadDimensions { width, height });
+        }
+        if !fmt.qp_range().contains(&qp) {
+            return Err(IntraEncodeError::BadQp(qp));
+        }
+        let mut enc = Self::new(width, height, qp.max(0), gop)?;
+        enc.qp = qp;
+        enc.fmt = fmt;
+        if !fmt.is_yuv420_8() {
+            enc.tree = crate::encoder::ctu::TreeCfg::new(64);
+        }
+        Ok(enc)
+    }
+
+    /// The picture's sample format.
+    #[must_use]
+    pub fn sample_layout(&self) -> crate::encoder::pcm::PcmLayout {
+        self.fmt.layout()
+    }
+
     #[must_use]
     pub fn with_ctu_rate_control(mut self, on: bool) -> Self {
         self.ctu_rc = on;
@@ -607,7 +762,31 @@ impl LowDelayPEncoder {
         &mut self,
         frame: &YuvFrame<'_>,
     ) -> Result<EncodedPFrame, IntraEncodeError> {
-        let (cw, ch) = (self.width / 2, self.height / 2);
+        let (y, cb, cr) = widen_frame(frame);
+        let fmt = self.fmt;
+        let f = self.encode_frame_wide(&YuvFrameWide::new(&y, &cb, &cr))?;
+        Ok(EncodedPFrame {
+            au: f.au,
+            keyframe: f.keyframe,
+            recon: f.recon.narrow(fmt),
+            stats: f.stats,
+            qp: f.qp,
+        })
+    }
+
+    /// [`Self::encode_frame`] at the encoder's sample format
+    /// ([`Self::new_fmt`]): `u16` planes at the picture's depth,
+    /// chroma per its chroma format (empty for monochrome). An 8-bit
+    /// 4:2:0 encoder accepts 8-bit samples here too.
+    ///
+    /// # Errors
+    /// [`IntraEncodeError::PlaneSize`] on a plane of the wrong size;
+    /// otherwise as [`Self::encode_frame`].
+    pub fn encode_frame_wide(
+        &mut self,
+        frame: &YuvFrameWide<'_>,
+    ) -> Result<EncodedWideFrame, IntraEncodeError> {
+        let (cw, ch) = self.fmt.chroma_dims(self.width, self.height);
         for (plane, buf, expected) in [
             ("y", frame.y, self.width * self.height),
             ("cb", frame.cb, cw * ch),
@@ -714,7 +893,7 @@ impl LowDelayPEncoder {
         if self.gop > 0 && self.poc >= self.gop as i32 {
             self.poc = 0;
         }
-        Ok(EncodedPFrame {
+        Ok(EncodedWideFrame {
             au,
             keyframe,
             recon,
@@ -728,58 +907,84 @@ impl LowDelayPEncoder {
     #[allow(clippy::type_complexity)]
     fn code_frame_at(
         &self,
-        frame: &YuvFrame<'_>,
+        frame: &YuvFrameWide<'_>,
         idr_now: bool,
         qp: i32,
-    ) -> Result<(Vec<u8>, bool, FrameRecon, FrameStats), IntraEncodeError> {
+    ) -> Result<(Vec<u8>, bool, WideRecon, FrameStats), IntraEncodeError> {
         if idr_now {
             // sps_max_dec_pic_buffering_minus1 = 2: the current picture
             // plus the two short-term references the P/B slices keep.
-            let idr = encode_idr_intra_au_full(
-                frame.y,
-                frame.cb,
-                frame.cr,
-                self.width,
-                self.height,
-                qp,
-                &SpsCfg {
-                    // The current picture plus every short-term
-                    // reference the P / B slices keep.
-                    max_dec_pic_buffering_minus1: self.refs.max(2) as u32,
-                    max_num_reorder_pics: 0,
-                    min_cb_log2: if self.amp || self.tree.is_some() {
-                        3
-                    } else {
-                        4
+            let cfg = SpsCfg {
+                // The current picture plus every short-term
+                // reference the P / B slices keep.
+                max_dec_pic_buffering_minus1: self.refs.max(2) as u32,
+                max_num_reorder_pics: 0,
+                min_cb_log2: if self.amp || self.tree.is_some() {
+                    3
+                } else {
+                    4
+                },
+                amp: self.amp,
+                cu_qp_delta: self.aq > 0 || self.ctu_budget().is_some(),
+                timing: self.timing,
+                hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
+                temporal_mvp: self.tmvp,
+                tree: self.tree,
+                threads: self.threads,
+                conformance_window: self.conformance_window,
+                still: false,
+                video_signal: self.video_signal,
+                ids: self.ids,
+                fmt: self.fmt,
+                chroma_qp_offset: 0,
+            };
+            // The 8-bit 4:2:0 picture keeps the historical entry (its
+            // streams are byte-pinned); every other layout codes
+            // through the quadtree coder's wide entry.
+            let mut recon = if self.fmt.is_yuv420_8() {
+                let (y, cb, cr) = narrow_frame(frame);
+                let idr = encode_idr_intra_au_full(
+                    &y,
+                    &cb,
+                    &cr,
+                    self.width,
+                    self.height,
+                    qp,
+                    &cfg,
+                    &self.filters,
+                    self.aq,
+                    self.ctu_budget(),
+                )?;
+                let mut r = WideRecon::from_narrow(idr.recon_y, idr.recon_cb, idr.recon_cr);
+                r.motion_field = None;
+                (idr.au, r)
+            } else {
+                let idr = crate::encoder::intra::encode_idr_intra_au_wide(
+                    [frame.y, frame.cb, frame.cr],
+                    self.width,
+                    self.height,
+                    qp,
+                    &cfg,
+                    &self.filters,
+                    self.aq,
+                    self.ctu_budget(),
+                )?;
+                (
+                    idr.au,
+                    WideRecon {
+                        y: idr.recon_y,
+                        cb: idr.recon_cb,
+                        cr: idr.recon_cr,
+                        motion_field: None,
                     },
-                    amp: self.amp,
-                    cu_qp_delta: self.aq > 0 || self.ctu_budget().is_some(),
-                    timing: self.timing,
-                    hrd: self.hrd.as_ref().map(|(signal, _)| *signal),
-                    temporal_mvp: self.tmvp,
-                    tree: self.tree,
-                    threads: self.threads,
-                    conformance_window: self.conformance_window,
-                    still: false,
-                    video_signal: self.video_signal,
-                    ids: self.ids,
-                    fmt: crate::encoder::sample::SampleFmt::YUV420_8,
-                    chroma_qp_offset: 0,
-                },
-                &self.filters,
-                self.aq,
-                self.ctu_budget(),
-            )?;
+                )
+            };
+            // An IDR's motion field is all-intra.
+            recon.1.motion_field = Some(MotionField::new(self.width, self.height));
             Ok((
-                idr.au,
+                recon.0,
                 true,
-                FrameRecon {
-                    y: idr.recon_y,
-                    cb: idr.recon_cb,
-                    cr: idr.recon_cr,
-                    // An IDR's motion field is all-intra.
-                    motion_field: Some(MotionField::new(self.width, self.height)),
-                },
+                recon.1,
                 FrameStats {
                     intra: (self.width / CTB) * (self.height / CTB),
                     ..FrameStats::default()
@@ -789,7 +994,7 @@ impl LowDelayPEncoder {
             // The active references: RefPicListX[i] = the
             // reconstruction of POC − 1 − i (newest first, up to two),
             // and a low-delay B slice holds the same set on both lists.
-            let l0: Vec<(i32, &FrameRecon)> = self
+            let l0: Vec<(i32, &WideRecon)> = self
                 .prevs
                 .iter()
                 .take(self.refs)
@@ -821,6 +1026,7 @@ impl LowDelayPEncoder {
                 },
                 ctu_rc: self.ctu_budget(),
                 threads: self.threads,
+                fmt: self.fmt,
             };
             let (rbsp, recon, stats) = encode_inter_slice(frame, &spec, self.width, self.height);
             Ok((annexb(&[nal_unit(1, 0, 0, &rbsp)]), false, recon, stats))
@@ -895,9 +1101,9 @@ pub(crate) struct SliceSpec<'a> {
     /// Positive RPS entries closest-first: `(entry POC − poc, used)`.
     pub rps_pos: Vec<(u32, bool)>,
     /// `RefPicList0`: active references, `(POC, reconstruction)`.
-    pub l0: Vec<(i32, &'a FrameRecon)>,
+    pub l0: Vec<(i32, &'a WideRecon)>,
     /// `RefPicList1` (B slices; empty on P slices).
-    pub l1: Vec<(i32, &'a FrameRecon)>,
+    pub l1: Vec<(i32, &'a WideRecon)>,
     /// The stream's §8.7 in-loop filter configuration.
     pub lf: &'a LoopFilterCfg,
     /// Stream geometry: `log2CbSize > MinCbLog2SizeY` (MinCb 8, one
@@ -924,6 +1130,9 @@ pub(crate) struct SliceSpec<'a> {
     pub ctu_rc: Option<u64>,
     /// Pass-1 worker budget (tiles decided in parallel; 1 = serial).
     pub threads: usize,
+    /// The picture's chroma format and bit depths (every reference
+    /// and the source share it).
+    pub fmt: SampleFmt,
 }
 
 /// The §7.3.6.1 temporal-MVP fields of one P / B slice.
@@ -1098,8 +1307,40 @@ pub(crate) fn extract<S: crate::encoder::sample::Sample>(
 
 /// Store an `n`x`n` block back into `plane` at `(x0, y0)`.
 pub(crate) fn store<S: Copy>(plane: &mut [S], pw: usize, x0: usize, y0: usize, n: usize, s: &[S]) {
-    for j in 0..n {
-        plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + n].copy_from_slice(&s[j * n..(j + 1) * n]);
+    store_rect(plane, pw, x0, y0, n, n, s);
+}
+
+/// Extract a `w`x`h` block of `plane` (row stride `pw`) at `(x0, y0)`
+/// as `i32` samples.
+pub(crate) fn extract_rect<S: crate::encoder::sample::Sample>(
+    plane: &[S],
+    pw: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> Vec<i32> {
+    let mut out = Vec::with_capacity(w * h);
+    for j in 0..h {
+        for i in 0..w {
+            out.push(plane[(y0 + j) * pw + x0 + i].to_i32());
+        }
+    }
+    out
+}
+
+/// Store a `w`x`h` block back into `plane` at `(x0, y0)`.
+pub(crate) fn store_rect<S: Copy>(
+    plane: &mut [S],
+    pw: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    s: &[S],
+) {
+    for j in 0..h {
+        plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + w].copy_from_slice(&s[j * w..(j + 1) * w]);
     }
 }
 
@@ -1200,12 +1441,12 @@ fn amvp_pu_list(list: usize, ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUn
 /// Select the plane set a list prediction reads: the used list's
 /// `refs[refIdxLX]`, or (for an unused list, whose planes are never
 /// read) any legal plane set from either list.
-fn pick_ref<'r>(
-    refs: &'r [RefPlanes],
-    other: &'r [RefPlanes],
+fn pick_ref<'r, 'p>(
+    refs: &'r [RefPlanes<'p>],
+    other: &'r [RefPlanes<'p>],
     pred_flag: bool,
     ref_idx: i32,
-) -> &'r RefPlanes {
+) -> &'r RefPlanes<'p> {
     if pred_flag {
         &refs[ref_idx.max(0) as usize]
     } else {
@@ -1222,8 +1463,8 @@ fn pick_ref<'r>(
 /// search runs luma-only).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_block(
-    refs_l0: &[RefPlanes],
-    refs_l1: &[RefPlanes],
+    refs_l0: &[RefPlanes<'_>],
+    refs_l1: &[RefPlanes<'_>],
     x0: usize,
     y0: usize,
     w: usize,
@@ -1239,8 +1480,8 @@ pub(crate) fn predict_block(
 /// combine).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_block_wp(
-    refs_l0: &[RefPlanes],
-    refs_l1: &[RefPlanes],
+    refs_l0: &[RefPlanes<'_>],
+    refs_l1: &[RefPlanes<'_>],
     x0: usize,
     y0: usize,
     w: usize,
@@ -1249,16 +1490,14 @@ pub(crate) fn predict_block_wp(
     chroma: bool,
     wp: Option<&SliceWpTables>,
 ) -> InterPrediction {
-    fn list(refp: &RefPlanes, pred_flag: bool, mv: Mv, chroma: bool) -> ListPrediction<'_> {
-        let luma = RefPlane::new(&refp.y, refp.width, refp.height).expect("legal ref plane");
-        let (cb, cr) = if chroma {
+    fn list<'r>(refp: &RefPlanes<'r>, pred_flag: bool, mv: Mv, chroma: bool) -> ListPrediction<'r> {
+        let luma = RefPlane::new(refp.y, refp.width, refp.height).expect("legal ref plane");
+        let (sub_w, sub_h) = refp.fmt.sub_wh();
+        let (cw, ch) = refp.fmt.chroma_dims(refp.width, refp.height);
+        let (cb, cr) = if chroma && refp.fmt.has_chroma() {
             (
-                Some(
-                    RefPlane::new(&refp.cb, refp.width / 2, refp.height / 2).expect("legal plane"),
-                ),
-                Some(
-                    RefPlane::new(&refp.cr, refp.width / 2, refp.height / 2).expect("legal plane"),
-                ),
+                Some(RefPlane::new(refp.cb, cw, ch).expect("legal plane")),
+                Some(RefPlane::new(refp.cr, cw, ch).expect("legal plane")),
             )
         } else {
             (None, None)
@@ -1269,8 +1508,10 @@ pub(crate) fn predict_block_wp(
             cb,
             cr,
             mv_l: mv,
-            // §8.5.3.2.10: 4:2:0 chroma MV = luma MV (eighth-pel units).
-            mv_c: derive_chroma_mv(mv, 2, 2),
+            // §8.5.3.2.10: mvCLX = mvLX * 2 / SubWidthC, * 2 / SubHeightC
+            // (eighth-sample chroma units: identity at 4:2:0, doubled
+            // on the full-resolution axes of 4:2:2 / 4:4:4).
+            mv_c: derive_chroma_mv(mv, sub_w as i32, sub_h as i32),
         }
     }
     let l0 = list(
@@ -1285,14 +1526,15 @@ pub(crate) fn predict_block_wp(
         motion.mv_l1,
         chroma,
     );
+    let fmt = pick_ref(refs_l0, refs_l1, motion.pred_flag_l0, motion.ref_idx_l0).fmt;
     let geom = InterPredGeometry {
         x_pb: x0 as i32,
         y_pb: y0 as i32,
         n_pb_w: w,
         n_pb_h: h,
-        chroma_array_type: if chroma { 1 } else { 0 },
-        bit_depth_luma: BIT_DEPTH,
-        bit_depth_chroma: BIT_DEPTH,
+        chroma_array_type: if chroma { fmt.chroma_format_idc } else { 0 },
+        bit_depth_luma: fmt.bit_depth_luma,
+        bit_depth_chroma: fmt.bit_depth_chroma,
     };
     let weights = wp.map(|t| t.resolve_pu(motion));
     predict_inter_pu_weighted(&l0, &l1, &geom, weights.as_ref()).expect("legal prediction geometry")
@@ -1338,12 +1580,41 @@ fn uni_l0(mv: Mv) -> PuMotion {
 
 /// The previous frame's reconstruction as `i32` planes (the
 /// §8.5.3.3.3 interpolation input).
-pub(crate) struct RefPlanes {
-    pub(crate) y: Vec<u16>,
-    pub(crate) cb: Vec<u16>,
-    pub(crate) cr: Vec<u16>,
+pub(crate) struct RefPlanes<'a> {
+    pub(crate) y: &'a [u16],
+    pub(crate) cb: &'a [u16],
+    pub(crate) cr: &'a [u16],
     pub(crate) width: usize,
     pub(crate) height: usize,
+    /// The picture's chroma format / bit depths (chroma plane
+    /// geometry, interpolation shifts, chroma motion-vector scaling).
+    pub(crate) fmt: SampleFmt,
+}
+
+/// Borrow the planes of a reference list's reconstructions.
+pub(crate) fn ref_planes<'r>(
+    list: &[(i32, &'r WideRecon)],
+    width: usize,
+    height: usize,
+    fmt: SampleFmt,
+) -> Vec<RefPlanes<'r>> {
+    list.iter()
+        .map(|&(_, rec)| RefPlanes::of(rec, width, height, fmt))
+        .collect()
+}
+
+impl<'a> RefPlanes<'a> {
+    /// Borrow a reconstruction's planes.
+    pub(crate) fn of(rec: &'a WideRecon, width: usize, height: usize, fmt: SampleFmt) -> Self {
+        Self {
+            y: &rec.y,
+            cb: &rec.cb,
+            cr: &rec.cr,
+            width,
+            height,
+            fmt,
+        }
+    }
 }
 
 /// Luma SAD between a prediction and the source block.
@@ -1420,7 +1691,7 @@ fn pred_recon(pred: &InterPrediction, src: &[Vec<i32>; 3]) -> ([Vec<u8>; 3], u64
 /// luma samples.
 #[allow(clippy::too_many_arguments)]
 fn integer_me(
-    refp: &RefPlanes,
+    refp: &RefPlanes<'_>,
     src_y: &[i32],
     x0: usize,
     y0: usize,
@@ -1616,12 +1887,12 @@ fn fractional_me(
 
 /// Inputs shared by every per-PU decision of one slice.
 pub(crate) struct PuChooseCtx<'a> {
-    pub(crate) refs_l0: &'a [RefPlanes],
-    pub(crate) refs_l1: &'a [RefPlanes],
+    pub(crate) refs_l0: &'a [RefPlanes<'a>],
+    pub(crate) refs_l1: &'a [RefPlanes<'a>],
     /// The motion-search reference planes (the luma-weighted copies
     /// under explicit weighted prediction; else `refs_lX`).
-    pub(crate) me_refs_l0: &'a [RefPlanes],
-    pub(crate) me_refs_l1: &'a [RefPlanes],
+    pub(crate) me_refs_l0: &'a [RefPlanes<'a>],
+    pub(crate) me_refs_l1: &'a [RefPlanes<'a>],
     /// The slice's explicit weighted-prediction tables, when the PPS
     /// enables them.
     pub(crate) wp: Option<&'a SliceWpTables>,
@@ -2047,14 +2318,44 @@ pub(crate) fn encode_ref_idx(
 /// reconstruction, and its CU mode-decision counters.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn encode_inter_slice(
+    frame: &YuvFrameWide<'_>,
+    spec: &SliceSpec<'_>,
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, WideRecon, FrameStats) {
+    if spec.tree.is_some() {
+        return crate::encoder::ctu::encode_inter_slice_tree(frame, spec, width, height);
+    }
+    // The historical one-CU-per-CTB coder is 8-bit 4:2:0 (its streams
+    // are byte-pinned): narrow the frame in, widen the recon out.
+    debug_assert!(
+        spec.fmt.is_yuv420_8(),
+        "deep layouts route through the quadtree coder"
+    );
+    let (y, cb, cr) = narrow_frame(frame);
+    let (rbsp, recon, stats) = encode_inter_slice_legacy(
+        &YuvFrame {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+        spec,
+        width,
+        height,
+    );
+    let mut wide = WideRecon::from_narrow(recon.y, recon.cb, recon.cr);
+    wide.motion_field = recon.motion_field;
+    (rbsp, wide, stats)
+}
+
+/// The fixed-geometry (`CtbSizeY == MinCbSizeY == 16`, one CU per
+/// CTB) 8-bit 4:2:0 inter coder.
+fn encode_inter_slice_legacy(
     frame: &YuvFrame<'_>,
     spec: &SliceSpec<'_>,
     width: usize,
     height: usize,
 ) -> (Vec<u8>, FrameRecon, FrameStats) {
-    if spec.tree.is_some() {
-        return crate::encoder::ctu::encode_inter_slice_tree(frame, spec, width, height);
-    }
     let (poc, qp, b_slice, lf) = (spec.poc, spec.qp, spec.b_slice, spec.lf);
     let (cw, ch) = (width / 2, height / 2);
     let ctbs_x = width / CTB;
@@ -2067,20 +2368,8 @@ pub(crate) fn encode_inter_slice(
     // at `spec.aq == 0`); signalled through cu_qp_delta.
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas(frame.y, width, height, spec.aq, CTB);
 
-    let to_u16 = |p: &[u8]| -> Vec<u16> { p.iter().map(|&v| u16::from(v)).collect() };
-    let to_planes = |list: &[(i32, &FrameRecon)]| -> Vec<RefPlanes> {
-        list.iter()
-            .map(|&(_, rec)| RefPlanes {
-                y: to_u16(&rec.y),
-                cb: to_u16(&rec.cb),
-                cr: to_u16(&rec.cr),
-                width,
-                height,
-            })
-            .collect()
-    };
-    let refs_l0: Vec<RefPlanes> = to_planes(&spec.l0);
-    let refs_l1: Vec<RefPlanes> = to_planes(&spec.l1);
+    let refs_l0: Vec<RefPlanes<'_>> = ref_planes(&spec.l0, width, height, spec.fmt);
+    let refs_l1: Vec<RefPlanes<'_>> = ref_planes(&spec.l1, width, height, spec.fmt);
     let l0_pocs: Vec<i32> = spec.l0.iter().map(|&(p, _)| p).collect();
     let l1_pocs: Vec<i32> = spec.l1.iter().map(|&(p, _)| p).collect();
     let n_l0 = l0_pocs.len() as i32;

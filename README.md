@@ -170,7 +170,7 @@ with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop
 filters and rate control, registered.** `make_encoder` / `H265Encoder`
 with three modes:
 
-* `mode = "inter"` (`qp` 0..=51, `gop`, `bslices`, `amp`, `ctb`,
+* `mode = "inter"` (`qp` −QpBdOffsetY..=51, `gop`, `bslices`, `amp`, `ctb`,
   `refs`, `tmvp`, `tudepth`, `rdoq`, `sdh`, `sl`, `wp`, `wpp`,
   `tiles`, `pyramid` / `pyramidstep` / `adaptivegop`) —
   low-delay `IDR, P/B, …` GOPs (`encoder::inter::LowDelayPEncoder`)
@@ -348,6 +348,40 @@ the OS image reader renders the 8 / 10-bit layouts and full-range
 12-bit 4:2:0) black — for the lossless PCM streams and a third-party
 encoder's 12-bit 4:4:4 / 4:2:2 output alike (a reader limit, not a
 stream defect).
+
+**Every lossy HEIC sample layout also codes INTER** (round 479): the
+low-delay P / low-delay B and hierarchical-B coders take Main 10 /
+4:2:0 12-bit, 4:2:2 8 / 10-bit, 4:4:4 8 / 10 / 12-bit and monochrome
+pictures (`LowDelayPEncoder::new_fmt` / `PyramidEncoder::new_fmt` +
+`encode_frame_wide` / `flush_wide` on the direct API — `YuvFrameWide`
+in, `WideRecon` out — and `mode = "inter"` with any planar pixel
+format on the registry; `ctb` defaults to 64 there). The whole §8.5
+machinery runs at the layout's depth: the §8.5.3.3.3 interpolation
+shifts (`shift1 = Min(4, BitDepth − 8)`, `shift2 = 6`, `shift3 =
+Max(2, 14 − BitDepth)`), chroma motion vectors per `SubWidthC` /
+`SubHeightC` (§8.5.3.2.10: identity at 4:2:0, doubled on the
+full-resolution axes of 4:2:2 / 4:4:4), the chroma residual quadtree
+of the inter CU (two vertically stacked blocks per component at
+4:2:2, in-place 4x4 chroma at 4:4:4, none for monochrome), explicit
+weighted prediction with the §7.4.7.3 `WpOffsetBdShift`-scaled
+offsets (the fit runs in 8-bit units, the coded `luma_offset_lX` /
+`delta_chroma_offset_lX` stay 8-bit quantities), the λ ladder on
+`Qp′Y`, AQ / scene-cut statistics normalised to 8-bit units. A
+19-cell matrix — every layout × low-delay P / low-delay B / 4-frame
+pyramid on a five-frame synthetic pan — decodes through this crate's
+decoder to exactly the encoder reconstruction, the registry stream is
+byte-identical to the direct-API stream, and every cell is
+**byte-exact against a black-box reference decoder**
+(`tests/deep_inter_interop.rs`, CI-pinned digests). The engine is one
+`u16` sample path at every depth (the 8-bit 4:2:0 API is a thin
+shim, its golden streams unchanged); references are borrowed, not
+copied per frame. Three defects fell out of the matrix: the
+`intra_rd == 0` coder's `PART_NxN` chroma used the raw luma mode at
+4:2:2 instead of the Table 8-3-remapped derived mode (its stills
+were pinned at `rd` 2 only), the inter CU's intra fallback did the
+same, and a monochrome P / B picture emitted a depth-0 inter
+`cbf_luma` the decoder infers (the root transform-tree call's open
+parent gates read as "chroma coded").
 
 **Every HEIC sample layout** also encodes as a lossless PCM still (round
 462, `mode = "pcm"`): grey at 8 / 10 / 12 / 16 bits, 4:2:0 at 10 / 12
@@ -559,13 +593,13 @@ and ~985 unit tests.
   process (F.10.2) are not applied; the SHVC resampling path and the
   `poc_reset_*` machinery have no black-box oracle on this machine
   (only the MV-HEVC path is validated against a reference decoder).
-* Deep layouts on the inter modes: 10 / 12-bit, 4:2:2 / 4:4:4 and
-  monochrome code intra-only (`pcm` / `intra`); the low-delay and
-  pyramid coders stay 8-bit 4:2:0. 16-bit grey is PCM-only (the 16-bit
-  RExt rows need the extended-precision tools). An odd-sized 4:2:0 /
-  4:2:2 picture crops to its even rounding in the subsampled
-  dimension (the container's clean aperture carries the odd last
-  column / row).
+* 16-bit grey is PCM-only (the 16-bit RExt rows need the
+  extended-precision tools); the lossy coders take 8..=12-bit
+  samples. An odd-sized 4:2:0 / 4:2:2 picture crops to its even
+  rounding in the subsampled dimension (the container's clean
+  aperture carries the odd last column / row). The historical
+  one-CU-per-CTB inter coder (no `ctb` option) stays 8-bit 4:2:0;
+  every deeper layout routes through the quadtree coder.
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
   level-0 time serially (38 s for a 12 MP still; 7.5 s on 8 workers
   with `wpp`) against ~1 s for the third-party encoder's
