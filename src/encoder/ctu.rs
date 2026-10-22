@@ -662,20 +662,60 @@ pub(crate) struct ReconPlanes {
     /// Empty for monochrome.
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
+    /// First picture luma row the planes store (0 = whole picture):
+    /// a wavefront worker's row window keeps just the CTB row it
+    /// decides plus the row above (the §8.4.4.2 reference samples
+    /// and the merge / AMVP neighbourhood never reach further up).
+    y_origin: usize,
+    /// `y_origin / SubHeightC`.
+    c_origin: usize,
 }
 
 impl ReconPlanes {
-    fn new(fmt: &SampleFmt, width: usize, height: usize) -> Self {
-        let (cw, ch) = fmt.chroma_dims(width, height);
+    /// Planes for picture luma rows `y_origin .. y_origin + rows`
+    /// (full width), addressed in picture coordinates through
+    /// [`Self::ly`] / [`Self::cy`].
+    fn new_band(
+        fmt: &SampleFmt,
+        width: usize,
+        height: usize,
+        y_origin: usize,
+        rows: usize,
+    ) -> Self {
+        debug_assert!(y_origin + rows <= height, "band past the picture");
+        let (_, sh) = fmt.sub_wh();
+        let (cw, _) = fmt.chroma_dims(width, height);
+        let (crows, c_origin) = if fmt.has_chroma() {
+            (rows / sh, y_origin / sh)
+        } else {
+            (0, 0)
+        };
         Self {
-            y: vec![0; width * height],
-            cb: vec![0; cw * ch],
-            cr: vec![0; cw * ch],
+            y: vec![0; width * rows],
+            cb: vec![0; cw * crows],
+            cr: vec![0; cw * crows],
+            y_origin,
+            c_origin,
         }
+    }
+
+    /// Band-local luma row of picture luma row `y`.
+    #[inline]
+    fn ly(&self, y: usize) -> usize {
+        debug_assert!(y >= self.y_origin, "luma row above the band");
+        y - self.y_origin
+    }
+
+    /// Band-local chroma row of picture chroma row `cy`.
+    #[inline]
+    fn cy(&self, cy: usize) -> usize {
+        debug_assert!(cy >= self.c_origin, "chroma row above the band");
+        cy - self.c_origin
     }
 
     /// The inter coders' [`WideRecon`] (no motion field yet).
     fn into_wide_recon(self) -> WideRecon {
+        debug_assert_eq!(self.y_origin, 0, "a band is not a picture");
         WideRecon {
             y: self.y,
             cb: self.cb,
@@ -700,7 +740,12 @@ struct EncState {
     /// Per-4x4-cell `cu_skip_flag`.
     skip: Vec<u8>,
     w_cells: usize,
+    /// Rows of 4x4 cells the window stores.
     h_cells: usize,
+    /// Rows of 4x4 cells in the picture.
+    pic_h_cells: usize,
+    /// First picture cell row of the window.
+    cell_origin: usize,
     /// The RDOQ rate model for the CTB being decided (the shadow
     /// emission's residual context states at the CTB start); `None`
     /// when RDOQ is off.
@@ -709,22 +754,48 @@ struct EncState {
 
 impl EncState {
     fn new(fmt: &SampleFmt, width: usize, height: usize, ctb_log2: u32) -> Self {
+        Self::new_band(fmt, width, height, ctb_log2, 0, height)
+    }
+
+    /// The state of picture luma rows `y_origin .. y_origin + rows`
+    /// only (a wavefront worker's row window); every accessor takes
+    /// picture coordinates, rows outside the window read as
+    /// "not coded" and are never written.
+    fn new_band(
+        fmt: &SampleFmt,
+        width: usize,
+        height: usize,
+        ctb_log2: u32,
+        y_origin: usize,
+        rows: usize,
+    ) -> Self {
         let w_cells = width.div_ceil(4);
-        let h_cells = height.div_ceil(4);
+        let h_cells = rows.div_ceil(4);
         Self {
-            recon: ReconPlanes::new(fmt, width, height),
-            field: MotionField::new(width, height),
-            modes: IntraModeField::new(width, height, ctb_log2),
+            recon: ReconPlanes::new_band(fmt, width, height, y_origin, rows),
+            field: MotionField::new_band(width, height, y_origin, rows),
+            modes: IntraModeField::new_band(width, height, ctb_log2, y_origin, rows),
             ct_depth: vec![-1; w_cells * h_cells],
             skip: vec![0; w_cells * h_cells],
             w_cells,
             h_cells,
+            pic_h_cells: height.div_ceil(4),
+            cell_origin: y_origin / 4,
             rdoq_model: None,
         }
     }
 
+    /// Whether 4x4-cell row `by` lies inside the stored window.
+    #[inline]
+    fn cell_row_in_band(&self, by: usize) -> bool {
+        by >= self.cell_origin && by < self.cell_origin + self.h_cells
+    }
+
+    /// Index of the 4x4 cell holding luma sample `(x, y)` (the row
+    /// must lie inside the window).
     fn cell(&self, x: usize, y: usize) -> usize {
-        (y / 4) * self.w_cells + x / 4
+        debug_assert!(self.cell_row_in_band(y / 4), "cell row outside the band");
+        (y / 4 - self.cell_origin) * self.w_cells + x / 4
     }
 
     /// `(value, available)` cell reads for the §9.3.4.2.2 ctxIncs.
@@ -733,7 +804,12 @@ impl EncState {
             Neighbour::Left => (x0 as i64 - 1, y0 as i64),
             Neighbour::Above => (x0 as i64, y0 as i64 - 1),
         };
-        if x < 0 || y < 0 || x >= (self.w_cells * 4) as i64 || y >= (self.h_cells * 4) as i64 {
+        if x < 0
+            || y < 0
+            || x >= (self.w_cells * 4) as i64
+            || y >= (self.pic_h_cells * 4) as i64
+            || !self.cell_row_in_band(y as usize / 4)
+        {
             return (0, false);
         }
         let d = self.ct_depth[self.cell(x as usize, y as usize)];
@@ -749,7 +825,12 @@ impl EncState {
             Neighbour::Left => (x0 as i64 - 1, y0 as i64),
             Neighbour::Above => (x0 as i64, y0 as i64 - 1),
         };
-        if x < 0 || y < 0 || x >= (self.w_cells * 4) as i64 || y >= (self.h_cells * 4) as i64 {
+        if x < 0
+            || y < 0
+            || x >= (self.w_cells * 4) as i64
+            || y >= (self.pic_h_cells * 4) as i64
+            || !self.cell_row_in_band(y as usize / 4)
+        {
             return (0, false);
         }
         let c = self.cell(x as usize, y as usize);
@@ -762,11 +843,12 @@ impl EncState {
 
     fn fill_cells(&mut self, x0: usize, y0: usize, n: usize, depth: i8, skip: u8) {
         let bx1 = ((x0 + n).min(self.w_cells * 4)).div_ceil(4);
-        let by1 = ((y0 + n).min(self.h_cells * 4)).div_ceil(4);
+        let by1 = ((y0 + n).min(self.pic_h_cells * 4)).div_ceil(4);
         for by in y0 / 4..by1 {
+            let row = (by - self.cell_origin) * self.w_cells;
             for bx in x0 / 4..bx1 {
-                self.ct_depth[by * self.w_cells + bx] = depth;
-                self.skip[by * self.w_cells + bx] = skip;
+                self.ct_depth[row + bx] = depth;
+                self.skip[row + bx] = skip;
             }
         }
     }
@@ -822,22 +904,21 @@ impl EncState {
         let bx0 = x0 / 4;
         let by0 = y0 / 4;
         let bx1 = (x0 + w).div_ceil(4).min(self.w_cells);
-        let by1 = (y0 + h).div_ceil(4).min(self.h_cells);
+        let by1 = (y0 + h).div_ceil(4).min(self.pic_h_cells);
         let mut depth = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
         let mut skip = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
         for by in by0..by1 {
-            depth.extend_from_slice(
-                &self.ct_depth[by * self.w_cells + bx0..by * self.w_cells + bx1],
-            );
-            skip.extend_from_slice(&self.skip[by * self.w_cells + bx0..by * self.w_cells + bx1]);
+            let row = (by - self.cell_origin) * self.w_cells;
+            depth.extend_from_slice(&self.ct_depth[row + bx0..row + bx1]);
+            skip.extend_from_slice(&self.skip[row + bx0..row + bx1]);
         }
         Snap {
             x0,
             y0,
             n,
-            y: rect_copy(&self.recon.y, ctx.width, x0, y0, w, h),
-            cb: rect_copy(&self.recon.cb, cw, cx0, cy0, wc, hc),
-            cr: rect_copy(&self.recon.cr, cw, cx0, cy0, wc, hc),
+            y: rect_copy(&self.recon.y, ctx.width, x0, self.recon.ly(y0), w, h),
+            cb: rect_copy(&self.recon.cb, cw, cx0, self.recon.cy(cy0), wc, hc),
+            cr: rect_copy(&self.recon.cr, cw, cx0, self.recon.cy(cy0), wc, hc),
             field: self.field.snapshot_rect(x0, y0, n, n),
             modes: self.modes.snapshot_rect(x0, y0, n, n),
             depth,
@@ -856,21 +937,22 @@ impl EncState {
         } else {
             (0, 0)
         };
-        rect_paste(&mut self.recon.y, ctx.width, x0, y0, w, h, &snap.y);
-        rect_paste(&mut self.recon.cb, cw, cx0, cy0, wc, hc, &snap.cb);
-        rect_paste(&mut self.recon.cr, cw, cx0, cy0, wc, hc, &snap.cr);
+        let (ly0, lcy0) = (self.recon.ly(y0), self.recon.cy(cy0));
+        rect_paste(&mut self.recon.y, ctx.width, x0, ly0, w, h, &snap.y);
+        rect_paste(&mut self.recon.cb, cw, cx0, lcy0, wc, hc, &snap.cb);
+        rect_paste(&mut self.recon.cr, cw, cx0, lcy0, wc, hc, &snap.cr);
         self.field.restore_rect(x0, y0, n, n, &snap.field);
         self.modes.restore_rect(x0, y0, n, n, &snap.modes);
         let bx0 = x0 / 4;
         let by0 = y0 / 4;
         let bx1 = (x0 + w).div_ceil(4).min(self.w_cells);
-        let by1 = (y0 + h).div_ceil(4).min(self.h_cells);
+        let by1 = (y0 + h).div_ceil(4).min(self.pic_h_cells);
         let row = bx1 - bx0;
         for (i, by) in (by0..by1).enumerate() {
-            self.ct_depth[by * self.w_cells + bx0..by * self.w_cells + bx1]
+            let base = (by - self.cell_origin) * self.w_cells;
+            self.ct_depth[base + bx0..base + bx1]
                 .copy_from_slice(&snap.depth[i * row..(i + 1) * row]);
-            self.skip[by * self.w_cells + bx0..by * self.w_cells + bx1]
-                .copy_from_slice(&snap.skip[i * row..(i + 1) * row]);
+            self.skip[base + bx0..base + bx1].copy_from_slice(&snap.skip[i * row..(i + 1) * row]);
         }
     }
 }
@@ -1067,7 +1149,7 @@ fn pred_params(fmt: &SampleFmt, mode: u8, cidx: PredComponent) -> IntraPredParam
 /// `(x0, y0)` from the frame reconstruction, availability per §6.4.1.
 fn gather_luma_refs(
     ctx: &SliceCtx<'_>,
-    recon_y: &[u16],
+    recon: &ReconPlanes,
     x0: usize,
     y0: usize,
     n: usize,
@@ -1075,7 +1157,7 @@ fn gather_luma_refs(
     let get = |x: i64, y: i64| -> (i32, bool) {
         if ctx.z_avail(x0, y0, x, y) {
             (
-                i32::from(recon_y[y as usize * ctx.width + x as usize]),
+                i32::from(recon.y[recon.ly(y as usize) * ctx.width + x as usize]),
                 true,
             )
         } else {
@@ -1105,12 +1187,14 @@ type SrcOverride<'a> = (&'a [u16], (usize, usize, usize, usize));
 /// stand-in for not-yet-reconstructed samples of the current CU.
 fn gather_chroma_refs(
     ctx: &SliceCtx<'_>,
-    plane: &[u16],
+    recon: &ReconPlanes,
+    plane_idx: usize,
     cx0: usize,
     cy0: usize,
     n: usize,
     override_src: Option<SrcOverride<'_>>,
 ) -> MarkedReferenceSamples {
+    let plane: &[u16] = if plane_idx == 1 { &recon.cb } else { &recon.cr };
     let cw = ctx.cw();
     let ch = ctx.ch();
     let (sw, sh) = ctx.fmt.sub_wh();
@@ -1125,7 +1209,7 @@ fn gather_chroma_refs(
             }
         }
         if ctx.z_avail(cx0 * sw, cy0 * sh, x * sw as i64, y * sh as i64) {
-            (i32::from(plane[yu * cw + xu]), true)
+            (i32::from(plane[recon.cy(yu) * cw + xu]), true)
         } else {
             (0, false)
         }
@@ -1342,17 +1426,13 @@ fn elect_chroma_mode(
             None => {
                 let mut d = 0u64;
                 for (plane_idx, pc) in [(1usize, PredComponent::Cb), (2, PredComponent::Cr)] {
-                    let recon_plane = if plane_idx == 1 {
-                        &st.recon.cb
-                    } else {
-                        &st.recon.cr
-                    };
                     for v in 0..blocks * per_row {
                         for u in 0..per_row {
                             let (cx, cy) = (cx0 + u * nc, cy0 + v * nc);
                             let marked = gather_chroma_refs(
                                 ctx,
-                                recon_plane,
+                                &st.recon,
+                                plane_idx,
                                 cx,
                                 cy,
                                 nc,
@@ -1400,7 +1480,7 @@ fn search_mode_64(
         if xu >= x0 && xu < x0 + 64 && yu >= y0 && yu < y0 + 64 {
             i32::from(ctx.src[0][yu * ctx.width + xu])
         } else {
-            i32::from(st.recon.y[yu * ctx.width + xu])
+            i32::from(st.recon.y[st.recon.ly(yu) * ctx.width + xu])
         }
     };
     for mode in 0..=34u8 {
@@ -1465,7 +1545,7 @@ fn code_intra_luma_tb(
     qp_y: u32,
     lambda: u64,
 ) -> (Vec<i32>, u64) {
-    let marked = gather_luma_refs(ctx, &st.recon.y, x, y, n);
+    let marked = gather_luma_refs(ctx, &st.recon, x, y, n);
     let pred =
         intra_predict_with_substitution(&marked, &pred_params(&ctx.fmt, mode, PredComponent::Luma))
             .expect("legal prediction params");
@@ -1489,7 +1569,8 @@ fn code_intra_luma_tb(
         tools,
     );
     let dist = ssd(&recon, &src);
-    store(&mut st.recon.y, ctx.width, x, y, n, &recon);
+    let ly = st.recon.ly(y);
+    store(&mut st.recon.y, ctx.width, x, ly, n, &recon);
     (levels, dist)
 }
 
@@ -1529,11 +1610,7 @@ fn code_intra_chroma_tbs(
         let mut dist = 0u64;
         for v in 0..blocks {
             let cy_v = cy + v * n;
-            let recon_plane = match plane_idx {
-                1 => &st.recon.cb,
-                _ => &st.recon.cr,
-            };
-            let marked = gather_chroma_refs(ctx, recon_plane, cx, cy_v, n, None);
+            let marked = gather_chroma_refs(ctx, &st.recon, plane_idx, cx, cy_v, n, None);
             let pred = intra_predict_with_substitution(&marked, &pred_params(&fmt, mode_c, pc))
                 .expect("legal prediction params");
             let src = extract(ctx.src[plane_idx], cw, cx, cy_v, n);
@@ -1548,11 +1625,12 @@ fn code_intra_chroma_tbs(
             );
             let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra, tools);
             dist += ssd(&recon, &src);
+            let lcy = st.recon.cy(cy_v);
             let recon_plane = match plane_idx {
                 1 => &mut st.recon.cb,
                 _ => &mut st.recon.cr,
             };
-            store(recon_plane, cw, cx, cy_v, n, &recon);
+            store(recon_plane, cw, cx, lcy, n, &recon);
             all_levels.extend(levels);
         }
         (all_levels, dist)
@@ -1839,7 +1917,7 @@ fn code_intra_cu_legacy(
     let mode = if log2 == 6 {
         search_mode_64(ctx, st, x0, y0, None)
     } else {
-        let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
+        let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
         let src = extract(ctx.src[0], ctx.width, x0, y0, n);
         search_best_mode(&ctx.fmt, &marked, &src).0
     };
@@ -1891,7 +1969,7 @@ fn code_intra_cu_legacy(
         let mut rate = 0u64;
         for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
             let (px, py) = (x0 + zx * 4, y0 + zy * 4);
-            let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
+            let marked = gather_luma_refs(ctx, &st.recon, px, py, 4);
             let src = extract(ctx.src[0], ctx.width, px, py, 4);
             let (m, _) = search_best_mode(&ctx.fmt, &marked, &src);
             let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
@@ -1983,7 +2061,7 @@ fn code_intra_cu_rd(
     let cands: Vec<u8> = if log2 == 6 {
         vec![search_mode_64(ctx, st, x0, y0, Some((&mpm, lambda_me)))]
     } else {
-        let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
+        let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
         let src = extract(ctx.src[0], ctx.width, x0, y0, n);
         let keep = match (ctx.cfg.intra_rd, log2) {
             (1, _) => 1,
@@ -2059,7 +2137,7 @@ fn code_intra_cu_rd(
         let mut mode_bins = 0u64;
         for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
             let (px, py) = (x0 + zx * 4, y0 + zy * 4);
-            let marked = gather_luma_refs(ctx, &st.recon.y, px, py, 4);
+            let marked = gather_luma_refs(ctx, &st.recon, px, py, 4);
             let src = extract(ctx.src[0], ctx.width, px, py, 4);
             let pb_mpm = mpm_list(ctx, st, px, py);
             let mut pb_cands = rough_intra_modes(&ctx.fmt, &marked, &src, 4, &pb_mpm, lambda_me, 3);
@@ -2768,7 +2846,7 @@ fn code_inter_cu(
         let mode = if log2 == 6 {
             search_mode_64(ctx, st, x0, y0, None)
         } else {
-            let marked = gather_luma_refs(ctx, &st.recon.y, x0, y0, n);
+            let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
             if ctx.cfg.intra_rd == 0 {
                 search_best_mode(&ctx.fmt, &marked, &src[0]).0
             } else {
@@ -2798,9 +2876,9 @@ fn code_inter_cu(
             lambda,
         );
         let recon = LocalRecon {
-            y: rect_copy(&st.recon.y, ctx.width, x0, y0, n, n),
-            cb: rect_copy(&st.recon.cb, cw, cx0, cy0, ncw, nch),
-            cr: rect_copy(&st.recon.cr, cw, cx0, cy0, ncw, nch),
+            y: rect_copy(&st.recon.y, ctx.width, x0, st.recon.ly(y0), n, n),
+            cb: rect_copy(&st.recon.cb, cw, cx0, st.recon.cy(cy0), ncw, nch),
+            cr: rect_copy(&st.recon.cr, cw, cx0, st.recon.cy(cy0), ncw, nch),
         };
         st.restore(ctx, &before);
         cands.push(InterCand {
@@ -2822,10 +2900,11 @@ fn code_inter_cu(
         .expect("at least the skip candidate");
 
     // ---- commit ----
-    store(&mut st.recon.y, ctx.width, x0, y0, n, &chosen.recon.y);
+    let (ly0, lcy0) = (st.recon.ly(y0), st.recon.cy(cy0));
+    store(&mut st.recon.y, ctx.width, x0, ly0, n, &chosen.recon.y);
     if has_chroma {
-        store_rect(&mut st.recon.cb, cw, cx0, cy0, ncw, nch, &chosen.recon.cb);
-        store_rect(&mut st.recon.cr, cw, cx0, cy0, ncw, nch, &chosen.recon.cr);
+        store_rect(&mut st.recon.cb, cw, cx0, lcy0, ncw, nch, &chosen.recon.cb);
+        store_rect(&mut st.recon.cr, cw, cx0, lcy0, ncw, nch, &chosen.recon.cr);
     }
     let is_skip = matches!(chosen.kind, TreeCuKind::Skip { .. });
     match &chosen.kind {
@@ -4024,12 +4103,25 @@ fn code_tile_wpp(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                let mut st = EncState::new(&ctx.fmt, ctx.width, ctx.height, ctx.cfg.ctb_log2);
                 loop {
                     let r = next_row.fetch_add(1, Ordering::SeqCst);
                     if r >= rows {
                         break;
                     }
+                    // The worker's row window: the CTB row it decides
+                    // plus the row above (merged in from the picture
+                    // state as the wavefront advances) — never a
+                    // whole-picture copy per worker.
+                    let y_top = (row0 + r.saturating_sub(1)) * ctb;
+                    let y_end = ((row0 + r + 1) * ctb).min(ctx.height);
+                    let mut st = EncState::new_band(
+                        &ctx.fmt,
+                        ctx.width,
+                        ctx.height,
+                        ctx.cfg.ctb_log2,
+                        y_top,
+                        y_end - y_top,
+                    );
                     let mut plans = Vec::with_capacity(cols);
                     let mut ctb_qps = Vec::with_capacity(cols);
                     let mut shadow: Option<(EntropyCoder, i32)> = None;
@@ -4150,25 +4242,30 @@ fn merge_rect(
     let (master, tile) = (to, from);
     let (sw, sh) = ctx.fmt.sub_wh();
     let (cw, cx0, cy0) = (ctx.cw(), x0 / sw, y0 / sh);
-    let y = rect_copy(&tile.recon.y, ctx.width, x0, y0, w, h);
-    rect_paste(&mut master.recon.y, ctx.width, x0, y0, w, h, &y);
+    let y = rect_copy(&tile.recon.y, ctx.width, x0, tile.recon.ly(y0), w, h);
+    let mly0 = master.recon.ly(y0);
+    rect_paste(&mut master.recon.y, ctx.width, x0, mly0, w, h, &y);
     if ctx.fmt.has_chroma() {
-        let cb = rect_copy(&tile.recon.cb, cw, cx0, cy0, w / sw, h / sh);
-        rect_paste(&mut master.recon.cb, cw, cx0, cy0, w / sw, h / sh, &cb);
-        let cr = rect_copy(&tile.recon.cr, cw, cx0, cy0, w / sw, h / sh);
-        rect_paste(&mut master.recon.cr, cw, cx0, cy0, w / sw, h / sh, &cr);
+        let (tcy0, mcy0) = (tile.recon.cy(cy0), master.recon.cy(cy0));
+        let cb = rect_copy(&tile.recon.cb, cw, cx0, tcy0, w / sw, h / sh);
+        rect_paste(&mut master.recon.cb, cw, cx0, mcy0, w / sw, h / sh, &cb);
+        let cr = rect_copy(&tile.recon.cr, cw, cx0, tcy0, w / sw, h / sh);
+        rect_paste(&mut master.recon.cr, cw, cx0, mcy0, w / sw, h / sh, &cr);
     }
     let field = tile.field.snapshot_rect(x0, y0, w, h);
     master.field.restore_rect(x0, y0, w, h, &field);
     let modes = tile.modes.snapshot_rect(x0, y0, w, h);
     master.modes.restore_rect(x0, y0, w, h, &modes);
     let bx1 = (x0 + w).div_ceil(4).min(master.w_cells);
-    let by1 = (y0 + h).div_ceil(4).min(master.h_cells);
+    let by1 = (y0 + h).div_ceil(4).min(master.pic_h_cells);
     for by in y0 / 4..by1 {
+        let (mrow, trow) = (
+            (by - master.cell_origin) * master.w_cells,
+            (by - tile.cell_origin) * tile.w_cells,
+        );
         for bx in x0 / 4..bx1 {
-            let c = by * master.w_cells + bx;
-            master.ct_depth[c] = tile.ct_depth[c];
-            master.skip[c] = tile.skip[c];
+            master.ct_depth[mrow + bx] = tile.ct_depth[trow + bx];
+            master.skip[mrow + bx] = tile.skip[trow + bx];
         }
     }
 }

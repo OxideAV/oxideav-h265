@@ -603,11 +603,15 @@ and ~985 unit tests.
 * Still-picture encoder speed: the level-2 mode decision is ~2x the
   level-0 time serially (38 s for a 12 MP still; 7.5 s on 8 workers
   with `wpp`) against ~1 s for the third-party encoder's
-  multi-threaded default preset — no SIMD. Encoder memory: the 12 MP
-  wavefront encode peaks at 459 MiB on 8 workers (391 MiB serial;
-  777 / 579 at the start of round 464) — every worker still holds a
-  whole-picture `EncState` whose untouched rows stay unmapped; a
-  row-window state per worker is the next step.
+  multi-threaded default preset — no SIMD. Encoder memory (round
+  479): each wavefront worker holds a **row window** — the CTB row it
+  decides plus the row above — instead of a whole-picture state, so
+  the 12 MP WPP encode peaks at 314 MiB on 8 workers (295 on 4, 290
+  serial) for Main and 327 / 312 / 306 MiB for Main 10, against
+  390 / 360 / 290 and 407 / 376 / 305 before, with byte-identical
+  output at every budget; what remains is the serial floor (the
+  picture's decided CU plans with their coefficient levels, the input
+  and output planes).
 * Decoder parallelism covers WPP pictures (wavefront), tiled pictures
   (per tile) and the in-loop filters of every picture; pictures with
   WPP inside tiles, SCC palette / current-picture referencing or
