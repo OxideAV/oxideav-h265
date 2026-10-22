@@ -12,6 +12,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - *(encoder)* **per-worker row-window state for the WPP wavefront** (round 479): a wavefront worker's `EncState` now covers the CTB row it decides plus the row above (`ReconPlanes` / `MotionField` / `IntraModeField` bands with picture-coordinate accessors, the cell maps likewise) instead of a whole-picture copy; the 12 MP WPP still encode peaks at 314 MiB on 8 workers / 295 on 4 (Main; 327 / 312 for Main 10) against 390 / 360 (407 / 376) before, serial unchanged at 290 / 306 MiB, output bytes identical at every worker budget
 
+- *(fuzz)* seeds for the round-479 parse paths: the HEIF conformance still's parameter sets (out-of-range `bitstream_restriction`) and the MV-HEVC stream with its SPSs ahead of the VPS, on `parse_annexb` and (as an `hvcC` record whose arrays run SPS, PPS, VPS) `hvcc_decode`; both targets ran ten minutes clean on the round's code (3.3 M / 2.1 M runs)
+
 ### Fixed
 
 - *(encoder)* the `intra_rd == 0` intra coder's `PART_NxN` chroma at 4:2:2 predicted with the raw luma mode instead of the Table 8-3-remapped derived mode (`intra_chroma_pred_mode` 4) — the reconstruction diverged from the decoder's on 4:2:2 pictures coded at `rd` 0 (the stills were pinned at `rd` 2); the inter CU's intra fallback had the same defect
