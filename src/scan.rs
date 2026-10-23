@@ -484,7 +484,7 @@ mod tests {
         for (i, p) in trav.iter().enumerate() {
             let row = i / blk;
             let col_in_row = i % blk;
-            let expected_x = if row % 2 == 0 {
+            let expected_x = if row.is_multiple_of(2) {
                 col_in_row
             } else {
                 blk - 1 - col_in_row

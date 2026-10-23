@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - *(encoder)* **inter coding on every lossy HEIC sample layout** (round 479): the low-delay P / low-delay B and hierarchical-B coders take Main 10 / 4:2:0 12-bit, 4:2:2 8 / 10-bit, 4:4:4 8 / 10 / 12-bit and monochrome pictures — `LowDelayPEncoder::new_fmt` / `PyramidEncoder::new_fmt` (a `PcmLayout`, `SliceQpY` in `−QpBdOffsetY ..= 51`), `encode_frame_wide` / `flush_wide` with the new `YuvFrameWide` / `WideRecon` / `EncodedWideFrame` / `PyramidAuWide` types (`#[non_exhaustive]`), `sample_layout()`; the registry encoder routes `mode = "inter"` with any planar 8..=12-bit pixel format through them (`ctb` defaults to 64 on a deep layout). Motion compensation at the layout's depth (§8.5.3.3.3 shifts), chroma motion vectors per `SubWidthC` / `SubHeightC` (§8.5.3.2.10), the inter residual quadtree per chroma format (4:2:2 stacked blocks, 4:4:4 in-place 4x4 chroma, none for monochrome), weighted prediction with `WpOffsetBdShift`-scaled offsets (§7.4.7.3), λ / AQ / scene-cut statistics in depth-normalised units. A 19-cell layout × P / B / pyramid matrix decodes to exactly the encoder reconstruction and byte-exact against a black-box reference decoder (`tests/deep_inter_interop.rs`). The engine is one `u16` sample path (the 8-bit API is a thin shim; every golden 8-bit stream is unchanged); reference planes are borrowed per frame instead of copied

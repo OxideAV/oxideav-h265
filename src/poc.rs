@@ -133,7 +133,7 @@ impl NalKind {
     #[inline]
     #[must_use]
     pub fn is_slnr(self) -> bool {
-        self.0 <= Self::RADL_R && self.0 % 2 == 0
+        self.0 <= Self::RADL_R && self.0.is_multiple_of(2)
             || self.0 == 10
             || self.0 == 12
             || self.0 == 14

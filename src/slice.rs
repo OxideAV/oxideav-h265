@@ -1104,20 +1104,12 @@ impl PredWeightTable {
 
     fn luma_weight_value(&self, flag: bool, delta: i32) -> i32 {
         let base = 1i32 << self.luma_log2_weight_denom;
-        if flag {
-            base + delta
-        } else {
-            base
-        }
+        if flag { base + delta } else { base }
     }
 
     fn chroma_weight_value(&self, flag: bool, delta: i32) -> i32 {
         let base = 1i32 << self.chroma_log2_weight_denom();
-        if flag {
-            base + delta
-        } else {
-            base
-        }
+        if flag { base + delta } else { base }
     }
 }
 
@@ -3029,7 +3021,7 @@ const HEVC_MAX_LONG_TERM_PICS_IN_SLICE: usize = 16;
 fn consume_byte_alignment(br: &mut BitReader<'_>) -> Result<usize, SliceError> {
     // alignment_bit_equal_to_one.
     let _ = br.u1()?;
-    while br.bit_pos() % 8 != 0 {
+    while !br.bit_pos().is_multiple_of(8) {
         let _ = br.u1()?;
     }
     Ok(br.bit_pos() / 8)
@@ -4457,7 +4449,7 @@ mod tests {
         fields.push((0, 1)); // chroma_weight_l0_flag[0]
         fields.push(se_codeword(5)); // delta_luma_weight_l0[0]
         fields.push(se_codeword(0)); // luma_offset_l0[0]
-                                     // Inter-slice tail
+        // Inter-slice tail
         fields.push(ue_codeword(0)); // five_minus_max_num_merge_cand
         fields.push(se_codeword(0)); // slice_qp_delta
         fields.push((1, 1)); // slice_loop_filter_across_slices_enabled_flag
@@ -4515,7 +4507,7 @@ mod tests {
         fields.push(se_codeword(-1)); // delta_chroma_offset_l1[0][0] = -1
         fields.push(se_codeword(-3)); // delta_chroma_weight_l1[0][1] = -3
         fields.push(se_codeword(0)); // delta_chroma_offset_l1[0][1] = 0
-                                     // Inter-slice tail
+        // Inter-slice tail
         fields.push(ue_codeword(0)); // five_minus_max_num_merge_cand
         fields.push(se_codeword(0)); // slice_qp_delta
         fields.push((1, 1)); // slice_loop_filter_across_slices_enabled_flag
@@ -5055,7 +5047,7 @@ mod tests {
         // flag_l0=1 declared but no bits remain for list_entry_l0[0].
         let bits: Vec<u8> = vec![1];
         let rbsp = pack_bits(&bits); // one byte: 0b1000_0000
-                                     // Restrict the reader to the first bit only.
+        // Restrict the reader to the first bit only.
         let buf = &rbsp[..0]; // zero bytes; even flag_l0 fails
         let mut br = BitReader::new(buf);
         let err = RefPicListsModification::parse(&mut br, SliceType::P, 0, 0, 4)

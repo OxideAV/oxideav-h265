@@ -359,66 +359,66 @@ pub use availability::{AvailabilityError, PictureTiling, TilingParams};
 pub use bitreader::{BitReader, BitReaderError};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use cabac::{init_type, CabacEngine, CabacError, ContextModel, RangedElement};
+pub use cabac::{CabacEngine, CabacError, ContextModel, RangedElement, init_type};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use ctx_init::SliceContexts;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use deblock::{
-    deblock_picture, deblock_picture_full, derive_boundary_strength, derive_edge_flags,
-    filter_cu_edges, filter_cu_edges_full, BoundaryStrength, DeblockCu, DeblockCuDesc,
-    DeblockCuParams, EdgeFlags, EdgeType, NoFilterMap, TransformSplit,
+    BoundaryStrength, DeblockCu, DeblockCuDesc, DeblockCuParams, EdgeFlags, EdgeType, NoFilterMap,
+    TransformSplit, deblock_picture, deblock_picture_full, derive_boundary_strength,
+    derive_edge_flags, filter_cu_edges, filter_cu_edges_full,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use decode::{PictureHeaderInfo, PictureRefState, PictureSequenceState, SliceRefParams};
-pub use decoder::{make_decoder, H265Decoder};
+pub use decoder::{H265Decoder, make_decoder};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use dpb::{
-    build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
-    Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
+    Dpb, DpbEntry, LongTermEntry, Marking, RefPicListParams, RefPicLists, ResolvedRps, RpsPocLists,
+    build_rps_poc_lists, no_backward_pred_flag, select_col_pic,
 };
-pub use encoder::{make_encoder, H265Encoder, H265PcmEncoder};
+pub use encoder::{H265Encoder, H265PcmEncoder, make_encoder};
 pub use hrd::HrdError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use hrd::{
-    CpbEntry, HrdCommonInfo, HrdParameters, SubLayerHrd, SubLayerHrdParameters, VpsHrdEntry,
-    HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1,
+    CpbEntry, HEVC_MAX_CPB_CNT, HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1, HrdCommonInfo,
+    HrdParameters, SubLayerHrd, SubLayerHrdParameters, VpsHrdEntry,
 };
 pub use hvcc::{
-    extradata_is_hvcc, nal_unit_from_coded, parse_hvcc, split_length_prefixed, HvccError,
-    HvccRecord,
+    HvccError, HvccRecord, extradata_is_hvcc, nal_unit_from_coded, parse_hvcc,
+    split_length_prefixed,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use inter_pred::{
-    default_weighted_pred, explicit_weighted_pred, interp_chroma_block, interp_luma_block,
-    predict_inter_pu, predict_inter_pu_weighted, InterPredError, InterPredGeometry,
-    InterPrediction, ListPrediction, MotionVector, PuWeights, RefPlane, WpListWeights,
+    InterPredError, InterPredGeometry, InterPrediction, ListPrediction, MotionVector, PuWeights,
+    RefPlane, WpListWeights, default_weighted_pred, explicit_weighted_pred, interp_chroma_block,
+    interp_luma_block, predict_inter_pu, predict_inter_pu_weighted,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use inter_recon::SliceWpTables;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use intra_mode_field::{IntraModeField, Neighbour, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE};
+pub use intra_mode_field::{IntraModeField, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE, Neighbour};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use motion::{
+    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
+    PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbours, TemporalMvContext,
     append_combined_bi_candidates, append_zero_merge_candidates, build_merge_candidate,
     derive_chroma_mv, derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv,
-    reconstruct_mv, MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext,
-    NeighbourPu, PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbours,
-    TemporalMvContext,
+    reconstruct_mv,
 };
-pub use nal::{collect_nal_units, NalError, NalHeader, NalIter, NalUnit};
-pub use picture::{clip1, sub_wh_c, Picture, Plane};
+pub use nal::{NalError, NalHeader, NalIter, NalUnit, collect_nal_units};
+pub use picture::{Picture, Plane, clip1, sub_wh_c};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use poc::{diff_pic_order_cnt, NalKind, PicOrderCnt, PocState};
+pub use poc::{NalKind, PicOrderCnt, PocState, diff_pic_order_cnt};
 pub use pps::PpsError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -428,80 +428,79 @@ pub use pps::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use pu_mv::{
-    pu_partitions, resolve_cu_motion, resolve_pu_motion, InterCuDesc, PartMode as PuPartMode,
-    PuGeometry, PuMotion, PuMvContext, PuRect,
+    InterCuDesc, PartMode as PuPartMode, PuGeometry, PuMotion, PuMvContext, PuRect, pu_partitions,
+    resolve_cu_motion, resolve_pu_motion,
 };
 pub use recon::ReconError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use recon::{
+    IntraPictureParams, PlacedCtu, ReconCtx, ReconParams, ResolvedList, SliceSegmentBoundary,
     build_slice_addr_map, reconstruct_inter_pu, reconstruct_inter_pu_weighted,
     reconstruct_intra_ctu, reconstruct_intra_ctu_ctx, reconstruct_intra_picture,
-    IntraPictureParams, PlacedCtu, ReconCtx, ReconParams, ResolvedList, SliceSegmentBoundary,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use sao::{
-    apply_sao_ctb, apply_sao_picture, apply_sao_picture_full, apply_sao_picture_in_place,
-    ResolvedSao, ResolvedSaoComponent,
+    ResolvedSao, ResolvedSaoComponent, apply_sao_ctb, apply_sao_picture, apply_sao_picture_full,
+    apply_sao_picture_in_place,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scaling_list::{
-    ScalingFactorMatrix, ScalingFactors, ScalingListData, ScalingListError, ScalingListMatrix,
-    MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS,
+    MAX_COEF_NUM, NUM_MATRIX_IDS, NUM_SIZE_IDS, ScalingFactorMatrix, ScalingFactors,
+    ScalingListData, ScalingListError, ScalingListMatrix,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scan::{
-    horizontal, scan_order, traverse, up_right_diagonal, vertical, ScanIdx, ScanOrderError, ScanPos,
+    ScanIdx, ScanOrderError, ScanPos, horizontal, scan_order, traverse, up_right_diagonal, vertical,
 };
-pub use sequence::{decode_annexb_sequence, DecodedFrame, SequenceDecoder, SequenceError};
+pub use sequence::{DecodedFrame, SequenceDecoder, SequenceError, decode_annexb_sequence};
 pub use slice::SliceError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use slice::{
-    EntryPointOffsets, NumPicTotalCurrInputs, PredWeightEntry, PredWeightTable,
-    PredWeightTableInputs, RefPicListsModification, SliceDeblocking, SliceLongTermRefPic,
-    SliceLongTermRefPicSource, SliceSegmentHeader, SliceType, BLA_W_LP, IDR_N_LP, IDR_W_RADL,
-    RSV_IRAP_VCL23,
+    BLA_W_LP, EntryPointOffsets, IDR_N_LP, IDR_W_RADL, NumPicTotalCurrInputs, PredWeightEntry,
+    PredWeightTable, PredWeightTableInputs, RSV_IRAP_VCL23, RefPicListsModification,
+    SliceDeblocking, SliceLongTermRefPic, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use slice_data::{
-    decode_coding_quadtree, decode_coding_tree_unit, decode_coding_tree_unit_in_picture,
-    decode_sao, CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode, PcmSamples,
-    PictureParseState, PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams,
+    CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode, PcmSamples, PictureParseState,
+    PredictionUnit, SaoComponent, SaoCtbParams, SliceDataParams, decode_coding_quadtree,
+    decode_coding_tree_unit, decode_coding_tree_unit_in_picture, decode_sao,
 };
 pub use sps::{ShortTermRefPicSetMaterializeError, SpsError};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use sps::{
-    ConformanceWindow, LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo,
-    SeqParameterSet, ShortTermRefPicSet, SpsExtensionFlags, SpsRangeExtension,
-    HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
+    ConformanceWindow, HEVC_MAX_NUM_LONG_TERM_RPS, HEVC_MAX_NUM_SHORT_TERM_RPS, HEVC_MAX_RPS_PICS,
+    LongTermRefPicEntry, MaterializedShortTermRefPicSet, OpaqueTail, PcmInfo, SeqParameterSet,
+    ShortTermRefPicSet, SpsExtensionFlags, SpsRangeExtension,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use transform_tree::{decode_transform_tree, TransformTree, TransformTreeParams};
+pub use transform_tree::{TransformTree, TransformTreeParams, decode_transform_tree};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use transform_unit::{
-    decode_transform_unit, CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams,
+    CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams, decode_transform_unit,
 };
 pub use vps::VpsError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use vps::{
-    HevcVps, LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsTimingInfo,
-    HEVC_MAX_SUB_LAYERS, HEVC_VPS_MAX_NUM_LAYERS, HEVC_VPS_MAX_NUM_LAYER_SETS,
+    HEVC_MAX_SUB_LAYERS, HEVC_VPS_MAX_NUM_LAYER_SETS, HEVC_VPS_MAX_NUM_LAYERS, HevcVps,
+    LayerIdInclusionRow, ProfileTierLevel, SubLayerOrderingInfo, VpsTimingInfo,
 };
 pub use vui::VuiError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use vui::{
-    BitstreamRestriction, ColourDescription, DefaultDisplayWindow, VideoSignalType, VuiParameters,
-    VuiTimingInfo, EXTENDED_SAR,
+    BitstreamRestriction, ColourDescription, DefaultDisplayWindow, EXTENDED_SAR, VideoSignalType,
+    VuiParameters, VuiTimingInfo,
 };
 
 /// Crate-local error type for the structural utilities (the NAL

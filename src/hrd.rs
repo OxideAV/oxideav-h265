@@ -292,26 +292,26 @@ impl SubLayerHrdParameters {
             let bit_rate_value_minus1 = br.ue()?;
             // §E.3.3: "For any i > 0, bit_rate_value_minus1[ i ] shall
             // be greater than bit_rate_value_minus1[ i − 1 ]."
-            if let Some(prev) = prev_bit_rate {
-                if bit_rate_value_minus1 <= prev {
-                    return Err(HrdError::ValueOutOfRange {
-                        field: "bit_rate_value_minus1",
-                        got: bit_rate_value_minus1,
-                    });
-                }
+            if let Some(prev) = prev_bit_rate
+                && bit_rate_value_minus1 <= prev
+            {
+                return Err(HrdError::ValueOutOfRange {
+                    field: "bit_rate_value_minus1",
+                    got: bit_rate_value_minus1,
+                });
             }
             prev_bit_rate = Some(bit_rate_value_minus1);
 
             let cpb_size_value_minus1 = br.ue()?;
             // §E.3.3: "For any i greater than 0, cpb_size_value_minus1[ i ]
             // shall be less than or equal to cpb_size_value_minus1[ i − 1 ]."
-            if let Some(prev) = prev_cpb_size {
-                if cpb_size_value_minus1 > prev {
-                    return Err(HrdError::ValueOutOfRange {
-                        field: "cpb_size_value_minus1",
-                        got: cpb_size_value_minus1,
-                    });
-                }
+            if let Some(prev) = prev_cpb_size
+                && cpb_size_value_minus1 > prev
+            {
+                return Err(HrdError::ValueOutOfRange {
+                    field: "cpb_size_value_minus1",
+                    got: cpb_size_value_minus1,
+                });
             }
             prev_cpb_size = Some(cpb_size_value_minus1);
 
@@ -321,25 +321,25 @@ impl SubLayerHrdParameters {
                 // §E.3.3: "For any i greater than 0,
                 // cpb_size_du_value_minus1[ i ] shall be less than or
                 // equal to cpb_size_du_value_minus1[ i − 1 ]."
-                if let Some(prev) = prev_cpb_size_du {
-                    if du_cpb > prev {
-                        return Err(HrdError::ValueOutOfRange {
-                            field: "cpb_size_du_value_minus1",
-                            got: du_cpb,
-                        });
-                    }
+                if let Some(prev) = prev_cpb_size_du
+                    && du_cpb > prev
+                {
+                    return Err(HrdError::ValueOutOfRange {
+                        field: "cpb_size_du_value_minus1",
+                        got: du_cpb,
+                    });
                 }
                 prev_cpb_size_du = Some(du_cpb);
                 let du_bit = br.ue()?;
                 // §E.3.3: "For any i > 0, bit_rate_du_value_minus1[ i ]
                 // shall be greater than bit_rate_du_value_minus1[ i − 1 ]."
-                if let Some(prev) = prev_bit_rate_du {
-                    if du_bit <= prev {
-                        return Err(HrdError::ValueOutOfRange {
-                            field: "bit_rate_du_value_minus1",
-                            got: du_bit,
-                        });
-                    }
+                if let Some(prev) = prev_bit_rate_du
+                    && du_bit <= prev
+                {
+                    return Err(HrdError::ValueOutOfRange {
+                        field: "bit_rate_du_value_minus1",
+                        got: du_bit,
+                    });
                 }
                 prev_bit_rate_du = Some(du_bit);
                 (Some(du_cpb), Some(du_bit))
@@ -595,7 +595,7 @@ mod tests {
                 }
             }
         }
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);

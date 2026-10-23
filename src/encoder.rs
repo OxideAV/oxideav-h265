@@ -383,9 +383,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
                 PixelFormat::Yuv444P12Le => (3, 12),
                 other => {
                     return Err(Error::InvalidData(format!(
-                    "h265 encode: unsupported pixel format {other:?} (planar YUV 4:2:0 / 4:2:2 / \
+                        "h265 encode: unsupported pixel format {other:?} (planar YUV 4:2:0 / 4:2:2 / \
                          4:4:4 at 8 / 10 / 12 bits or grey at 8 / 10 / 12 / 16 bits)"
-                )))
+                    )));
                 }
             };
             // 16-bit grey is PCM-only: the lossy coders code 8..=12-bit
@@ -741,7 +741,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             Some(v) => {
                 return Err(Error::InvalidData(format!(
                     "h265 encode: range must be \"full\" or \"limited\", got {v:?}"
-                )))
+                )));
             }
         };
         let code = |key: &str| -> Result<Option<u8>> {
@@ -1014,7 +1014,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(other) => {
             return Err(Error::InvalidData(format!(
                 "h265 encode: unknown mode {other:?} (expected \"pcm\", \"intra\" or \"inter\")"
-            )))
+            )));
         }
     };
     let mut output_params = params.clone();
@@ -1204,11 +1204,11 @@ impl H265Encoder {
         };
         let mut vs = self.video_signal.unwrap_or_default();
         let mut touched = false;
-        if !self.range_explicit {
-            if let Some(full) = signal.range.full_range_flag() {
-                vs.full_range = full;
-                touched = true;
-            }
+        if !self.range_explicit
+            && let Some(full) = signal.range.full_range_flag()
+        {
+            vs.full_range = full;
+            touched = true;
         }
         if !self.colour_explicit {
             let any = !signal.primaries.is_unspecified()
@@ -1272,7 +1272,9 @@ impl H265Encoder {
                 let line = &plane.data[src_row * plane.stride..src_row * plane.stride + w * bps];
                 if wide {
                     out.extend(
-                        line.chunks_exact(2)
+                        line.as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]])),
                     );
                 } else {

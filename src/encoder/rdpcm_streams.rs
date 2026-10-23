@@ -34,9 +34,9 @@ use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
-    intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
+    Component as PredComponent, IntraPredParams, intra_predict_with_substitution,
 };
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 
 /// One picture's `(Y, Cb, Cr)` planes.
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -106,10 +106,10 @@ pub(crate) fn write_ptl_rext(w: &mut BitWriter, level_idc: u8) {
     w.put_bit(0); // general_interlaced_source_flag
     w.put_bit(1); // general_non_packed_constraint_flag
     w.put_bit(1); // general_frame_only_constraint_flag
-                  // profile_idc 4: max_12bit / max_10bit / max_8bit /
-                  // max_422chroma / max_420chroma constraint flags set
-                  // (4:2:0 8-bit), then max_monochrome / intra /
-                  // one_picture_only / lossless 0 + 34 reserved bits.
+    // profile_idc 4: max_12bit / max_10bit / max_8bit /
+    // max_422chroma / max_420chroma constraint flags set
+    // (4:2:0 8-bit), then max_monochrome / intra /
+    // one_picture_only / lossless 0 + 34 reserved bits.
     w.put_bit(1); // general_max_12bit_constraint_flag
     w.put_bit(1); // general_max_10bit_constraint_flag
     w.put_bit(1); // general_max_8bit_constraint_flag
@@ -190,7 +190,7 @@ fn write_sps_rext(width: usize, height: usize, level_idc: u8) -> Vec<u8> {
     w.put_bit(0); // sps_3d_extension_flag
     w.put_bit(0); // sps_scc_extension_flag
     w.put_bits(0, 4); // sps_extension_4bits
-                      // sps_range_extension() — §7.3.2.2.2.
+    // sps_range_extension() — §7.3.2.2.2.
     w.put_bit(0); // transform_skip_rotation_enabled_flag
     w.put_bit(0); // transform_skip_context_enabled_flag
     w.put_bit(1); // implicit_rdpcm_enabled_flag
@@ -314,7 +314,7 @@ fn intra_plan(col: usize, row: usize, ctb: usize) -> (u8, u8) {
         (26, 4) // DM ⇒ chroma 26
     } else {
         // Interior: luma control mode (no DPCM), chroma 26 / 10.
-        let luma = if ctb % 2 == 0 { 1 } else { 0 };
+        let luma = if ctb.is_multiple_of(2) { 1 } else { 0 };
         let chroma_raw = if ctb % 4 < 2 { 1 } else { 2 };
         (luma, chroma_raw)
     }
@@ -330,11 +330,7 @@ fn mode_c_of(raw: u8, luma: u8) -> u8 {
         3 => 1,
         _ => return luma,
     };
-    if base == luma {
-        34
-    } else {
-        base
-    }
+    if base == luma { 34 } else { base }
 }
 
 /// Encode the all-intra bypass slice: one 16x16 `PART_2Nx2N` CU per
@@ -545,7 +541,7 @@ fn encode_bypass_p_slice(
     w.ue(1); // slice_type = P
     w.put_bits(1, 8); // slice_pic_order_cnt_lsb (log2 max = 8 bits)
     w.put_bit(0); // short_term_ref_pic_set_sps_flag
-                  // st_ref_pic_set( 0 ): one negative reference at −1.
+    // st_ref_pic_set( 0 ): one negative reference at −1.
     w.ue(1); // num_negative_pics
     w.ue(0); // num_positive_pics
     w.ue(0); // delta_poc_s0_minus1[0]
@@ -601,8 +597,8 @@ fn encode_bypass_p_slice(
         cabac.encode_decision(&mut w, &mut ctxs.pred_mode_flag[0], 0); // MODE_INTER
         cabac.encode_decision(&mut w, &mut ctxs.part_mode[0], 1); // PART_2Nx2N
         cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 1); // merge_flag
-                                                                   // merge_idx absent (MaxNumMergeCand == 1);
-                                                                   // rqt_root_cbf inferred 1 (2Nx2N merge).
+        // merge_idx absent (MaxNumMergeCand == 1);
+        // rqt_root_cbf inferred 1 (2Nx2N merge).
 
         // Per-CTB explicit-RDPCM plan: two of three CUs signal the
         // flag (alternating direction), the third is a flag-0 control.

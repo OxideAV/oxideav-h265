@@ -40,10 +40,10 @@
 //! deferred-chroma 4x4 leaves, §7.3.8.14 `delta_qp( )` once per
 //! quantization group).
 
-use crate::availability::{PictureTiling, TilingParams, MODE_INTRA};
+use crate::availability::{MODE_INTRA, PictureTiling, TilingParams};
 use crate::binarization::{
-    cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cu_skip_flag_ctx_inc,
-    intra_luma_cand_mode_list, split_cu_flag_ctx_inc, split_transform_flag_ctx_inc, CuPredMode,
+    CuPredMode, cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cu_skip_flag_ctx_inc,
+    intra_luma_cand_mode_list, split_cu_flag_ctx_inc, split_transform_flag_ctx_inc,
 };
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
@@ -51,35 +51,35 @@ use crate::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, TransformSplit};
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::inter::{
-    amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx, encode_pu_syntax_at,
-    entry_point_offsets, extract, extract_rect, merge_pu, part_is_amp, part_is_horizontal,
-    predict_block_wp, store, store_rect, sub_block, write_entry_points, FrameStats, PuChooseCtx,
-    PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, WideRecon, YuvFrameWide,
+    FrameStats, PuChooseCtx, PuSyntax, RefPlanes, SliceLfSignalling, SliceSpec, WideRecon,
+    YuvFrameWide, amvp_search, bin_part_mode, blit, choose_pu, encode_merge_idx,
+    encode_pu_syntax_at, entry_point_offsets, extract, extract_rect, merge_pu, part_is_amp,
+    part_is_horizontal, predict_block_wp, store, store_rect, sub_block, write_entry_points,
 };
 use crate::encoder::intra::{
-    encode_cu_qp_delta, forward_transform_bd, rate_proxy, IntraEncodeError, IntraEncodedAu,
-    IntraEncodedAuWide, SpsCfg,
+    IntraEncodeError, IntraEncodedAu, IntraEncodedAuWide, SpsCfg, encode_cu_qp_delta,
+    forward_transform_bd, rate_proxy,
 };
 use crate::encoder::loopfilter::{
-    encode_sao_ctb_fmt, filter_frame, FilterInput, LoopFilterCfg, TreeLayout,
+    FilterInput, LoopFilterCfg, TreeLayout, encode_sao_ctb_fmt, filter_frame,
 };
 use crate::encoder::pcm::TileGrid;
-use crate::encoder::quant::{quantize_tb, scaling_lists_for, RdoqModel, TbQuant};
+use crate::encoder::quant::{RdoqModel, TbQuant, quantize_tb, scaling_lists_for};
 use crate::encoder::residual::encode_residual_coding;
 use crate::encoder::sample::{Sample, SampleFmt};
 use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
-    intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
-    MarkedReferenceSamples,
+    Component as PredComponent, IntraPredParams, MarkedReferenceSamples,
+    intra_predict_with_substitution,
 };
 use crate::motion::{MotionCell, MotionField};
-use crate::pu_mv::{pu_partitions, resolve_pu_motion, PartMode, PuGeometry, PuMotion, PuMvContext};
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::pu_mv::{PartMode, PuGeometry, PuMotion, PuMvContext, pu_partitions, resolve_pu_motion};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 use crate::scaling_list::{ScalingFactorMatrix, ScalingFactors};
 use crate::scan::ScanIdx;
 use crate::slice_data::SaoCtbParams;
-use crate::transform::{forward_dst4_1d, residual_block, BlockParams, Component, PredMode};
+use crate::transform::{BlockParams, Component, PredMode, forward_dst4_1d, residual_block};
 
 /// `MaxNumMergeCand` (§7.4.7.1) — `five_minus_max_num_merge_cand = 0`.
 const MAX_MERGE: usize = 5;
@@ -599,7 +599,7 @@ impl SliceCtx<'_> {
     fn row_start_in_tile(&self, ts: usize) -> bool {
         let rs = self.ctb_rs(ts) as u32;
         let w = self.ctbs_x() as u32;
-        rs % w == 0
+        rs.is_multiple_of(w)
             || self.tiling.tile_id(self.tiling.ctb_addr_rs_to_ts(rs - 1))
                 != self.tiling.tile_id(ts as u32)
     }
@@ -813,11 +813,7 @@ impl EncState {
             return (0, false);
         }
         let d = self.ct_depth[self.cell(x as usize, y as usize)];
-        if d < 0 {
-            (0, false)
-        } else {
-            (d as u32, true)
-        }
+        if d < 0 { (0, false) } else { (d as u32, true) }
     }
 
     fn nb_skip(&self, x0: usize, y0: usize, nb: Neighbour) -> (u8, bool) {
@@ -1203,10 +1199,11 @@ fn gather_chroma_refs(
             return (0, false);
         }
         let (xu, yu) = (x as usize, y as usize);
-        if let Some((src, (rx, ry, rw, rh))) = override_src {
-            if (rx..rx + rw).contains(&xu) && (ry..ry + rh).contains(&yu) {
-                return (i32::from(src[yu * cw + xu]), true);
-            }
+        if let Some((src, (rx, ry, rw, rh))) = override_src
+            && (rx..rx + rw).contains(&xu)
+            && (ry..ry + rh).contains(&yu)
+        {
+            return (i32::from(src[yu * cw + xu]), true);
         }
         if ctx.z_avail(cx0 * sw, cy0 * sh, x * sw as i64, y * sh as i64) {
             (i32::from(plane[recon.cy(yu) * cw + xu]), true)
@@ -2102,7 +2099,7 @@ fn code_intra_cu_rd(
             0
         };
         let cost = dist + lambda * (rate + base_bins + luma_mode_bins(mode, &mpm) + c_bins);
-        if best_2n.as_ref().map_or(true, |b| cost < b.3) {
+        if best_2n.as_ref().is_none_or(|b| cost < b.3) {
             best_2n = Some((mode, chroma_idx, tree, cost, st.snapshot(ctx, x0, y0, n)));
         }
     }
@@ -2154,7 +2151,7 @@ fn code_intra_cu_rd(
                 let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
                 let bins = rate_proxy(&lv) + 1 + luma_mode_bins(m, &pb_mpm);
                 let cost = d + lambda * bins;
-                if best.as_ref().map_or(true, |b| cost < b.3) {
+                if best.as_ref().is_none_or(|b| cost < b.3) {
                     best = Some((m, lv, d, cost, st.snapshot(ctx, px, py, 4)));
                 }
             }
@@ -3060,10 +3057,11 @@ fn code_quadtree(
     let leaf_cost = leaf_cost + lambda;
     // Skip-CU shortcut: a skip whose prediction is already tight will
     // not be beaten by four coded children (deterministic bound).
-    if let CuNode::Leaf(cu) = &leaf_node {
-        if matches!(cu.kind, TreeCuKind::Skip { .. }) && cu.cost <= (n * n) as u64 * 2 {
-            return (leaf_node, leaf_cost);
-        }
+    if let CuNode::Leaf(cu) = &leaf_node
+        && matches!(cu.kind, TreeCuKind::Skip { .. })
+        && cu.cost <= (n * n) as u64 * 2
+    {
+        return (leaf_node, leaf_cost);
     }
     let after_leaf = st.snapshot(ctx, x0, y0, n);
     st.restore(ctx, &before);
@@ -3118,11 +3116,7 @@ fn qp_walk(ctx: &SliceCtx<'_>, plans: &[CuNode], ctb_qps: &[i32], aq_on: bool) -
                 delta_coded = true;
             }
             let qp_y = if aq_on {
-                if delta_coded {
-                    ctb_qp
-                } else {
-                    qp_prev
-                }
+                if delta_coded { ctb_qp } else { qp_prev }
             } else {
                 ctx.qp
             };
@@ -4150,12 +4144,12 @@ fn code_tile_wpp(
                             // spatial neighbour T is available.
                             let mut coder =
                                 EntropyCoder::new(init_type(slice_type_raw, false), ctx.qp);
-                            if r > 0 && ctx.wpp_sync_available(ts) {
-                                if let Some(ctxs) =
+                            if r > 0
+                                && ctx.wpp_sync_available(ts)
+                                && let Some(ctxs) =
                                     stored[r - 1].lock().expect("stored contexts").as_ref()
-                                {
-                                    coder.ctxs = ctxs.clone();
-                                }
+                            {
+                                coder.ctxs = ctxs.clone();
                             }
                             shadow = Some((coder, ctx.qp));
                         }
@@ -4477,7 +4471,7 @@ fn emit_slice_data(
                     .tile_id(ctx.tiling.ctb_addr_rs_to_ts(other as u32))
                     == ctx.tiling.tile_id(ctb_idx as u32)
             };
-            let can_left = rs % ctbs_x > 0 && same_tile(rs - 1);
+            let can_left = !rs.is_multiple_of(ctbs_x) && same_tile(rs - 1);
             let can_up = rs / ctbs_x > 0 && same_tile(rs - ctbs_x);
             encode_sao_ctb_fmt(
                 &mut coder.w,
@@ -4578,7 +4572,7 @@ pub(crate) fn encode_intra_picture_tree_wide(
 ) -> Result<IntraEncodedAuWide, IntraEncodeError> {
     let tree = cfg.tree.expect("tree config present");
     let fmt = cfg.fmt;
-    if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(IntraEncodeError::BadDimensions { width, height });
     }
     if !fmt.qp_range().contains(&qp) {
@@ -4776,13 +4770,7 @@ pub(crate) fn encode_inter_slice_tree(
     let n_l0 = l0_pocs.len() as i32;
     let n_l1 = l1_pocs.len() as i32;
     let two_sided = spec.b_slice && l0_pocs != l1_pocs;
-    let list_pocs = |list: usize| -> &Vec<i32> {
-        if list == 0 {
-            &l0_pocs
-        } else {
-            &l1_pocs
-        }
-    };
+    let list_pocs = |list: usize| -> &Vec<i32> { if list == 0 { &l0_pocs } else { &l1_pocs } };
     let ref_poc = |list: usize, ref_idx: i32| -> i32 {
         usize::try_from(ref_idx)
             .ok()
@@ -4968,7 +4956,11 @@ mod tests {
     fn planes_fmt(fmt: &SampleFmt, w: usize, h: usize) -> [Vec<u16>; 3] {
         let tex = |x: usize, y: usize, seed: usize, bd: u8| -> u16 {
             let v = (x * 3 + y * 5 + seed * 7) % 256;
-            let block = if (x / 20 + y / 14) % 3 == 0 { 40 } else { 0 };
+            let block = if (x / 20 + y / 14).is_multiple_of(3) {
+                40
+            } else {
+                0
+            };
             let ripple = ((x * y + seed) % 9) as u32;
             let s8 = (v / 2 + block) as u32;
             // Scale to the depth and add sub-8-bit detail.

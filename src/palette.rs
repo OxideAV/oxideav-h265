@@ -22,8 +22,8 @@
 //! clones carry it.
 
 use crate::binarization::{
-    decode_cu_chroma_qp_offset, decode_cu_qp_delta, decode_eg_k, palette_run_prefix_ctx_inc,
-    palette_run_prefix_tr_cmax, read_truncated_rice_prefix, CuChromaQpOffset, CuQpDelta,
+    CuChromaQpOffset, CuQpDelta, decode_cu_chroma_qp_offset, decode_cu_qp_delta, decode_eg_k,
+    palette_run_prefix_ctx_inc, palette_run_prefix_tr_cmax, read_truncated_rice_prefix,
 };
 use crate::cabac::{CabacEngine, CabacError, RangedElement};
 use crate::ctx_init::SliceContexts;

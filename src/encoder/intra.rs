@@ -43,15 +43,15 @@
 //! in the PPS), so a conforming decoder's output equals the encoder's
 //! reconstruction exactly — pinned by the roundtrip tests.
 
-use crate::binarization::intra_luma_cand_mode_list;
 use crate::binarization::PartMode;
+use crate::binarization::intra_luma_cand_mode_list;
 use crate::binarization::{cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc};
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::loopfilter::{
-    encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
+    CtbShape, FilterInput, LoopFilterCfg, encode_sao_ctb, filter_frame,
 };
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::pcm::{
@@ -61,13 +61,13 @@ use crate::encoder::residual::encode_residual_coding;
 use crate::encoder::sample::SampleFmt;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
-    intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
-    MarkedReferenceSamples,
+    Component as PredComponent, IntraPredParams, MarkedReferenceSamples,
+    intra_predict_with_substitution,
 };
 use crate::motion::MotionField;
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 use crate::slice_data::SaoCtbParams;
-use crate::transform::{forward_dct_1d, residual_block, BlockParams, Component, PredMode};
+use crate::transform::{BlockParams, Component, PredMode, forward_dct_1d, residual_block};
 
 /// The fixed CTB / coding-block log2 size (16x16).
 const CTB_LOG2: u32 = 4;
@@ -422,7 +422,7 @@ pub(crate) fn write_sps_cfg(
                     None => w.put_bit(0), // vui_hrd_parameters_present_flag
                     Some(hrd) => {
                         w.put_bit(1); // vui_hrd_parameters_present_flag
-                                      // §E.2.2 hrd_parameters( 1, 0 ).
+                        // §E.2.2 hrd_parameters( 1, 0 ).
                         crate::encoder::hrd::write_hrd_parameters(&mut w, hrd);
                     }
                 }
@@ -718,11 +718,7 @@ pub(crate) fn rate_proxy(levels: &[i32]) -> u64 {
         .filter(|&&l| l != 0)
         .map(|&l| 3 + 2 * u64::from(32 - l.unsigned_abs().leading_zeros()))
         .sum();
-    if bits == 0 {
-        1
-    } else {
-        bits + 8
-    }
+    if bits == 0 { 1 } else { bits + 8 }
 }
 
 /// One coded luma partition candidate for a CTB.
@@ -888,7 +884,7 @@ pub(crate) fn encode_idr_intra_au_full(
     aq: u8,
     ctu_rc: Option<u64>,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
-    if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(CTB) || !height.is_multiple_of(CTB) {
         return Err(IntraEncodeError::BadDimensions { width, height });
     }
     if !(0..=51).contains(&qp) {
@@ -1108,11 +1104,7 @@ pub(crate) fn encode_idr_intra_au_full(
                 if cfg.cu_qp_delta && p.any_cbf() {
                     prev = p.qp;
                 }
-                if cfg.cu_qp_delta {
-                    prev
-                } else {
-                    qp
-                }
+                if cfg.cu_qp_delta { prev } else { qp }
             })
             .collect()
     };

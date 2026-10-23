@@ -413,7 +413,7 @@ impl LayerModel {
             .map(|flags| {
                 ids.iter()
                     .zip(flags.iter())
-                    .filter(|(_, &f)| f)
+                    .filter(|&(_, &f)| f)
                     .map(|(&id, _)| id)
                     .collect()
             })
@@ -778,7 +778,7 @@ impl VpsExtension {
             let ids: Vec<u8> = row
                 .iter()
                 .enumerate()
-                .filter(|(_, &f)| f)
+                .filter(|&(_, &f)| f)
                 .map(|(m, _)| m as u8)
                 .collect();
             layer_set_layer_id_list.push(ids);
@@ -942,10 +942,10 @@ impl VpsExtension {
                     let cur = layer_idx_in_vps[usize::from(ids[k])];
                     for r in 0..k {
                         let rf = layer_idx_in_vps[usize::from(ids[r])];
-                        if let (Some(c), Some(rr)) = (cur, rf) {
-                            if dependency_flag[usize::from(c)][usize::from(rr)] {
-                                necessary[r] = true;
-                            }
+                        if let (Some(c), Some(rr)) = (cur, rf)
+                            && dependency_flag[usize::from(c)][usize::from(rr)]
+                        {
+                            necessary[r] = true;
                         }
                     }
                 }
@@ -1135,7 +1135,7 @@ impl VpsExtension {
 
         let (vps_vui, vps_vui_malformed) = if vps_vui_present_flag {
             // vps_vui_alignment_bit_equal_to_one until byte aligned.
-            while br.bit_pos() % 8 != 0 {
+            while !br.bit_pos().is_multiple_of(8) {
                 br.u1()?;
             }
             match VpsVui::parse(br, inp, &layers, &sub_layers_vps_max_minus1) {

@@ -48,7 +48,7 @@
 //! `lengthSizeMinusOne + 1`-byte big-endian sizes, each followed by
 //! that many coded NAL bytes.
 
-use crate::nal::{strip_emulation_prevention, NalError, NalHeader, NalUnit};
+use crate::nal::{NalError, NalHeader, NalUnit, strip_emulation_prevention};
 
 /// Errors from the `hvcC` record parse or the length-prefixed
 /// sample-data split.
@@ -465,7 +465,7 @@ mod tests {
     fn skips_reserved_array_types() {
         let mut r = tiny_record(1, 3);
         r[22] = 2; // numOfArrays = 2
-                   // Second array with reserved type 41: one 3-byte NAL.
+        // Second array with reserved type 41: one 3-byte NAL.
         r.extend_from_slice(&[0x29, 0x00, 0x01, 0x00, 0x03, 0x42, 0x01, 0xBB]);
         let rec = parse_hvcc(&r).expect("parse");
         assert_eq!(rec.nal_units.len(), 1, "reserved-type array ignored");

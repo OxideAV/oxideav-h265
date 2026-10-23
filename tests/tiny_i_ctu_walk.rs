@@ -23,7 +23,7 @@ use oxideav_h265::bitreader::BitReader;
 use oxideav_h265::cabac::CabacEngine;
 use oxideav_h265::ctx_init::SliceContexts;
 use oxideav_h265::nal::strip_emulation_prevention;
-use oxideav_h265::slice_data::{decode_coding_tree_unit, CodingQuadtree, SliceDataParams};
+use oxideav_h265::slice_data::{CodingQuadtree, SliceDataParams, decode_coding_tree_unit};
 
 /// The 16-byte IDR_N_LP (`nal_unit_type == 20`) slice NAL of
 /// `docs/video/h265/fixtures/tiny-i-only-16x16-main/input.hevc`
@@ -205,7 +205,7 @@ fn tiny_i_single_ctu_decodes_end_to_end() {
 #[test]
 fn tiny_i_reconstructs_expected_yuv_end_to_end() {
     use oxideav_h265::picture::{Picture, Plane};
-    use oxideav_h265::recon::{reconstruct_intra_ctu, ReconParams};
+    use oxideav_h265::recon::{ReconParams, reconstruct_intra_ctu};
 
     let rbsp = strip_emulation_prevention(&SLICE_NAL[2..]);
     let cabac_offset = slice_header_cabac_offset(&rbsp);
@@ -281,7 +281,7 @@ fn tiny_i_reconstructs_expected_yuv_end_to_end() {
 fn tiny_i_picture_driver_reconstructs_expected_yuv_with_sao() {
     use oxideav_h265::availability::TilingParams;
     use oxideav_h265::recon::{
-        reconstruct_intra_picture, IntraPictureParams, PlacedCtu, ReconParams,
+        IntraPictureParams, PlacedCtu, ReconParams, reconstruct_intra_picture,
     };
 
     let rbsp = strip_emulation_prevention(&SLICE_NAL[2..]);

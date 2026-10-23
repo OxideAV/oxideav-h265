@@ -102,13 +102,13 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         (Some(l), _, _) => {
             return Err(Error::InvalidData(format!(
                 "h265 decode: layer must be 0..=63, got {l}"
-            )))
+            )));
         }
         (None, Some(v), _) if v <= u32::from(u16::MAX) => LayerTarget::View(v as u16),
         (None, Some(v), _) => {
             return Err(Error::InvalidData(format!(
                 "h265 decode: view must be 0..=65535, got {v}"
-            )))
+            )));
         }
         (None, None, Some(o)) => LayerTarget::Ols(o as usize),
         (None, None, None) => LayerTarget::HighestOls,

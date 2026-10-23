@@ -976,11 +976,12 @@ fn cqpoffset_signals_and_applies_the_pps_chroma_qp_offsets() {
     };
     let sse = |a: &VideoPlane, b: &VideoPlane| -> u64 {
         a.data
-            .chunks_exact(2)
-            .zip(b.data.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(b.data.as_chunks::<2>().0)
             .map(|(x, y)| {
-                let d = i64::from(u16::from_le_bytes([x[0], x[1]]))
-                    - i64::from(u16::from_le_bytes([y[0], y[1]]));
+                let d = i64::from(u16::from_le_bytes(*x)) - i64::from(u16::from_le_bytes(*y));
                 (d * d) as u64
             })
             .sum()
@@ -1210,9 +1211,9 @@ fn video_signal_options_write_the_vui_block_on_every_mode() {
 /// enforced.
 #[test]
 fn parameter_set_id_options_reach_every_parameter_set_and_slice() {
+    use oxideav_h265::HevcVps;
     use oxideav_h265::pps::PicParameterSet;
     use oxideav_h265::slice::SliceSegmentHeader;
-    use oxideav_h265::HevcVps;
 
     let modes: [&[(&str, &str)]; 5] = [
         &[("mode", "pcm")],

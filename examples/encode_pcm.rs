@@ -9,7 +9,7 @@
 //! coded as a single slice segment over a uniform CxR tile grid
 //! (`tiles_enabled_flag == 1`, per-tile entry-point offsets).
 
-use oxideav_h265::encoder::pcm::{encode_idr_pcm_au_opts, PcmAuOptions};
+use oxideav_h265::encoder::pcm::{PcmAuOptions, encode_idr_pcm_au_opts};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

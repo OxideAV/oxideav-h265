@@ -18,7 +18,7 @@
 //! AND re-run the external cross-decode before updating the pin.
 
 use oxideav_h265::decode_annexb_sequence;
-use oxideav_h265::encoder::inter::{encode_low_delay_p, YuvFrame};
+use oxideav_h265::encoder::inter::{YuvFrame, encode_low_delay_p};
 
 /// The fixed clip: a textured background with a 12x12 bright square
 /// moving 3 px right / 1 px down per frame, chroma drifting per frame.

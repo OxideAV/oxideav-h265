@@ -386,7 +386,7 @@ impl<'a> CabacEngine<'a> {
     /// # Errors
     /// [`CabacError::EndOfBuffer`] on a truncated stream.
     pub fn pcm_align(&mut self) -> Result<(), CabacError> {
-        while self.reader.bit_pos() % 8 != 0 {
+        while !self.reader.bit_pos().is_multiple_of(8) {
             let _ = self.reader.u1()?;
         }
         Ok(())

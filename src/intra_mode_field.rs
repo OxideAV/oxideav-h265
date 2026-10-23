@@ -334,7 +334,7 @@ impl IntraModeField {
     /// Write back a [`Self::snapshot_rect`] copy of the same rectangle.
     pub(crate) fn restore_rect(&mut self, x: usize, y: usize, w: usize, h: usize, snap: &[u8]) {
         let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
-        let mut it = snap.chunks_exact(3);
+        let mut it = snap.as_chunks::<3>().0.iter();
         for by in by0..by1 {
             for bx in bx0..bx1 {
                 let c = it.next().expect("snapshot geometry");

@@ -1674,7 +1674,7 @@ mod tests {
         bits += "0";
         // rbsp_trailing_bits(): stop bit '1' then zero-pad to a byte.
         bits += "1";
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1710,7 +1710,7 @@ mod tests {
         bits += "0000"; // pps_range/multilayer/3d/scc flags = 0
         bits += "0000"; // pps_extension_4bits = 0
         bits += "1"; // rbsp stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1740,13 +1740,13 @@ mod tests {
         bits += "1"; // pps_range_extension_flag = 1
         bits += "000"; // pps_multilayer/3d/scc = 0
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_range_extension() body (transform_skip off):
+        // pps_range_extension() body (transform_skip off):
         bits += "1"; // cross_component_prediction_enabled_flag = 1
         bits += "0"; // chroma_qp_offset_list_enabled_flag = 0
         bits += "010"; // log2_sao_offset_scale_luma = 1 (ue)
         bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1776,12 +1776,12 @@ mod tests {
         bits += "1"; // pps_extension_present_flag = 1
         bits += "1"; // pps_range_extension_flag = 1
         bits += "0000000"; // multilayer/3d/scc + 4bits = 0
-                           // pps_range_extension() body (transform_skip off):
+        // pps_range_extension() body (transform_skip off):
         bits += "0"; // cross_component_prediction_enabled_flag = 0
         bits += "1"; // chroma_qp_offset_list_enabled_flag = 1
         bits += "1"; // diff_cu_chroma_qp_offset_depth = 0 (ue)
         bits += "010"; // chroma_qp_offset_list_len_minus1 = 1 (ue) → 2 entries
-                       // entry 0: cb=+1 (se '010'), cr=-1 (se '011')
+        // entry 0: cb=+1 (se '010'), cr=-1 (se '011')
         bits += "010";
         bits += "011";
         // entry 1: cb=+2 (se '00100'), cr=0 (se '1')
@@ -1790,7 +1790,7 @@ mod tests {
         bits += "1"; // log2_sao_offset_scale_luma = 0 (ue)
         bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1819,12 +1819,12 @@ mod tests {
         bits += "0"; // pps_3d_extension_flag = 0
         bits += "1"; // pps_scc_extension_flag = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_scc_extension():
+        // pps_scc_extension():
         bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
         bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1849,7 +1849,7 @@ mod tests {
         bits += "1"; // pps_extension_present_flag = 1
         bits += "0001"; // range/multilayer/3d = 0, scc = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_scc_extension():
+        // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
         bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
         bits += "1"; // pps_slice_act_qp_offsets_present_flag = 1
@@ -1858,7 +1858,7 @@ mod tests {
         bits += "00100"; // pps_act_cr_qp_offset_plus3 = +2 (se '00100')
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1886,19 +1886,19 @@ mod tests {
         bits += "1"; // pps_extension_present_flag = 1
         bits += "0001"; // range/multilayer/3d = 0, scc = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_scc_extension():
+        // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
         bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
         bits += "0"; // pps_slice_act_qp_offsets_present_flag = 0
-                     // pps_act_y_qp_offset_plus5 = +30 (se → codeNum 59,
-                     // ue '00000111100') → PpsActQpOffsetY = 25 > 12,
-                     // illegal
+        // pps_act_y_qp_offset_plus5 = +30 (se → codeNum 59,
+        // ue '00000111100') → PpsActQpOffsetY = 25 > 12,
+        // illegal
         bits += "00000111100";
         bits += "1"; // pps_act_cb_qp_offset_plus5 = 0 (se)
         bits += "1"; // pps_act_cr_qp_offset_plus3 = 0 (se)
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1923,7 +1923,7 @@ mod tests {
         bits += "1"; // pps_extension_present_flag = 1
         bits += "0001"; // range/multilayer/3d = 0, scc = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_scc_extension():
+        // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
         bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
         bits += "1"; // pps_palette_predictor_initializers_present_flag = 1
@@ -1931,7 +1931,7 @@ mod tests {
         bits += "0"; // monochrome_palette_flag = 0 → numComps = 3
         bits += "1"; // luma_bit_depth_entry_minus8 = 0 (ue) → 8-bit luma
         bits += "1"; // chroma_bit_depth_entry_minus8 = 0 (ue) → 8-bit chroma
-                     // comp 0 (8-bit): 0x0A, 0x0B
+        // comp 0 (8-bit): 0x0A, 0x0B
         bits += "00001010";
         bits += "00001011";
         // comp 1 (8-bit): 0x0C, 0x0D
@@ -1941,7 +1941,7 @@ mod tests {
         bits += "00001110";
         bits += "00001111";
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -1971,17 +1971,17 @@ mod tests {
         bits += "00"; // pps_multilayer/3d = 0
         bits += "1"; // pps_scc_extension_flag = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_range_extension() body (transform_skip off):
+        // pps_range_extension() body (transform_skip off):
         bits += "0"; // cross_component_prediction_enabled_flag = 0
         bits += "0"; // chroma_qp_offset_list_enabled_flag = 0
         bits += "1"; // log2_sao_offset_scale_luma = 0 (ue)
         bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
-                     // pps_scc_extension():
+        // pps_scc_extension():
         bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
         bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2006,7 +2006,7 @@ mod tests {
         bits += "0"; // pps_3d_extension_flag = 0
         bits += "1"; // pps_scc_extension_flag = 1
         bits += "0000"; // pps_extension_4bits = 0
-                        // pps_multilayer_extension():
+        // pps_multilayer_extension():
         bits += "1"; // poc_reset_info_present_flag = 1
         bits += "0"; // pps_infer_scaling_list_flag = 0
         bits += "010"; // num_ref_loc_offsets = 1 (ue)
@@ -2023,12 +2023,12 @@ mod tests {
         bits += "0001001"; // phase_hor_chroma_plus8 = 8 (ue)
         bits += "0001100"; // phase_ver_chroma_plus8 = 11 (ue)
         bits += "0"; // colour_mapping_enabled_flag = 0
-                     // pps_scc_extension():
+        // pps_scc_extension():
         bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
         bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2093,10 +2093,10 @@ mod tests {
         bits += "00"; // cm_delta_flc_bits_minus1 = 0 → CMResLSBits = 9
         bits += "1"; // cm_adapt_threshold_u_delta = 0
         bits += "1"; // cm_adapt_threshold_v_delta = 0
-                     // colour_mapping_octants( 0, 0, 0, 0, 2 ):
+        // colour_mapping_octants( 0, 0, 0, 0, 2 ):
         bits += "1"; // split_octant_flag = 1
-                     // eight leaves at depth 1 (no split flag), PartNumY = 1:
-                     // leaf 0: j=0 coded with residuals (q=1, r=3, s=1) x3, j=1..3 not coded
+        // eight leaves at depth 1 (no split flag), PartNumY = 1:
+        // leaf 0: j=0 coded with residuals (q=1, r=3, s=1) x3, j=1..3 not coded
         bits += "1"; // coded_res_flag[0]
         for _ in 0..3 {
             bits += "010"; // res_coeff_q = 1
@@ -2108,7 +2108,7 @@ mod tests {
             bits += "0000"; // remaining leaves: nothing coded
         }
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2142,7 +2142,7 @@ mod tests {
         bits += "0000"; // pps_extension_4bits = 0
         bits += "11001100"; // opaque 3d + scc span sentinel
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2164,7 +2164,7 @@ mod tests {
         bits += "1"; // diff_cu_chroma_qp_offset_depth = 0 (ue)
         bits += "00111"; // chroma_qp_offset_list_len_minus1 = 6 (ue) → > 5
         bits += "1"; // padding to keep a well-formed buffer
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2193,7 +2193,7 @@ mod tests {
         bits += "0001"; // pps_extension_4bits = 1 (reserved, non-zero)
         bits += "0"; // a single pps_extension_data_flag value
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2212,7 +2212,7 @@ mod tests {
         let mut bits = minimal_pps_prefix_bits();
         bits += "0"; // pps_extension_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2231,9 +2231,9 @@ mod tests {
     fn parses_scaling_list_present() {
         let mut bits = minimal_pps_prefix_bits_until_scaling_list();
         bits += "1"; // pps_scaling_list_data_present_flag = 1
-                     // scaling_list_data(): 24 slots, each '0' (pred_mode
-                     // = 0) + '1' (scaling_list_pred_matrix_id_delta ue
-                     // = 0). sizeId 0/1/2 each 6 slots; sizeId 3 only 2.
+        // scaling_list_data(): 24 slots, each '0' (pred_mode
+        // = 0) + '1' (scaling_list_pred_matrix_id_delta ue
+        // = 0). sizeId 0/1/2 each 6 slots; sizeId 3 only 2.
         for size_id in 0..4 {
             let step = if size_id == 3 { 3 } else { 1 };
             let mut m = 0;
@@ -2249,7 +2249,7 @@ mod tests {
         bits += "0"; // slice_segment_header_extension_present_flag
         bits += "0"; // pps_extension_present_flag
         bits += "1"; // rbsp stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2305,8 +2305,8 @@ mod tests {
         bits += "0"; // cabac_init_present_flag
         bits += "1"; // num_ref_idx_l0_default_active_minus1 = 0
         bits += "1"; // num_ref_idx_l1_default_active_minus1 = 0
-                     // init_qp_minus26 = -70 → se value -70: codeNum = 2*70 = 140.
-                     // ue(140): leadingZeroBits = 7, suffix = 140+1-128 = 13.
+        // init_qp_minus26 = -70 → se value -70: codeNum = 2*70 = 140.
+        // ue(140): leadingZeroBits = 7, suffix = 140+1-128 = 13.
         bits += "0000000"; // 7 leading zeros
         bits += "1"; // terminator
         bits += "0001101"; // 7-bit suffix = 13 → codeNum = 127 + 13 = 140
@@ -2329,7 +2329,7 @@ mod tests {
         bits += "0"; // slice_segment_header_extension_present_flag
         bits += "0"; // pps_extension_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);
@@ -2362,7 +2362,7 @@ mod tests {
         bits += "0"; // entropy_coding_sync_enabled_flag = 0
         bits += "00000101001"; // num_tile_columns_minus1 ue = 40
         bits += "1"; // num_tile_rows_minus1 = 0
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits += "0";
         }
         let rbsp = pack_bits(&bits);

@@ -22,13 +22,12 @@
 
 use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
 use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
-use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+use oxideav_h265::encoder::pyramid::{PyramidEncoder, encode_pyramid_with};
 use oxideav_h265::encoder::rate::RateControlCfg;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage =
-        "usage: encode_abr <in.yuv> <WxH> <BITRATE> <FPS> <out.hevc> [recon.yuv] [gop=N] [b] [deblock] [sao]";
+    let usage = "usage: encode_abr <in.yuv> <WxH> <BITRATE> <FPS> <out.hevc> [recon.yuv] [gop=N] [b] [deblock] [sao]";
     if args.len() < 5 {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -53,7 +52,7 @@ fn main() {
     let data = std::fs::read(&args[0]).expect("read input");
     let frame_len = w * h * 3 / 2;
     assert!(
-        !data.is_empty() && data.len() % frame_len == 0,
+        !data.is_empty() && data.len().is_multiple_of(frame_len),
         "input must be whole planar 4:2:0 frames"
     );
     let frames: Vec<YuvFrame<'_>> = data

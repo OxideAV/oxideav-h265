@@ -137,7 +137,7 @@
 
 use crate::bitreader::{BitReader, BitReaderError};
 use crate::scaling_list::{ScalingListData, ScalingListError};
-use crate::vps::{ProfileTierLevel, SubLayerOrderingInfo, VpsError, HEVC_MAX_SUB_LAYERS};
+use crate::vps::{HEVC_MAX_SUB_LAYERS, ProfileTierLevel, SubLayerOrderingInfo, VpsError};
 use crate::vui::{VuiError, VuiParameters};
 
 /// Maximum number of short-term reference picture sets an SPS may
@@ -404,8 +404,8 @@ impl ShortTermRefPicSet {
             let num_neg_src = source.num_negative_pics();
             let num_pos_src = source.num_positive_pics();
             let num_delta_src = source.num_delta_pocs(); // == num_neg_src + num_pos_src
-                                                         // Per §7.4.8 the `used_by_curr_pic_flag` / `use_delta_flag`
-                                                         // arrays have length `NumDeltaPocs[RefRpsIdx] + 1`.
+            // Per §7.4.8 the `used_by_curr_pic_flag` / `use_delta_flag`
+            // arrays have length `NumDeltaPocs[RefRpsIdx] + 1`.
             let expected = (num_delta_src + 1) as usize;
             if self.used_by_curr_pic_flag.len() != expected || self.use_delta_flag.len() != expected
             {
@@ -1990,7 +1990,7 @@ mod tests {
                 bits.push((c as u8) - b'0');
             }
         }
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut out = Vec::with_capacity(bits.len() / 8);
@@ -2017,7 +2017,7 @@ mod tests {
         s += "0000"; // vps_id
         s += "000"; // max_sub_layers_minus1
         s += "1"; // nesting flag
-                  // profile_tier_level(1, 0)
+        // profile_tier_level(1, 0)
         s += "00"; // profile_space
         s += "0"; // tier
         s += "00001"; // profile_idc
@@ -2030,7 +2030,7 @@ mod tests {
         }
         s += "0";
         s += "00011110"; // level=30
-                         // sps_id ue(v)=0
+        // sps_id ue(v)=0
         s += "1";
         // chroma_format_idc ue(v)=1 → '010'
         s += "010";
@@ -2258,7 +2258,7 @@ mod tests {
         s += "0000"; // vps_id
         s += "000"; // max_sub_layers_minus1
         s += "1"; // nesting
-                  // PTL(1,0)
+        // PTL(1,0)
         s += "00";
         s += "0";
         s += "00001";
@@ -2366,7 +2366,7 @@ mod tests {
         }
         s += "0";
         s += "00011110"; // level=30
-                         // sub_layer_profile_present[0]/level_present[0] = 0,0
+        // sub_layer_profile_present[0]/level_present[0] = 0,0
         s += "00";
         for _ in 0..14 {
             s += "0";
@@ -2523,9 +2523,9 @@ mod tests {
         let mut s = synthesised_prefix_before_scaling_list();
         s += "1"; // scaling_list_enabled = 1
         s += "1"; // sps_scaling_list_data_present_flag = 1
-                  // scaling_list_data(): 24 slots, each pred_mode=0
-                  // ('0') + scaling_list_pred_matrix_id_delta ue=0 ('1').
-                  // sizeId 0/1/2 each 6 slots; sizeId 3 only 2 slots.
+        // scaling_list_data(): 24 slots, each pred_mode=0
+        // ('0') + scaling_list_pred_matrix_id_delta ue=0 ('1').
+        // sizeId 0/1/2 each 6 slots; sizeId 3 only 2 slots.
         for size_id in 0..4 {
             let step = if size_id == 3 { 3 } else { 1 };
             let mut m = 0;
@@ -2762,8 +2762,8 @@ mod tests {
     fn rejects_pcm_bit_depth_exceeding_luma() {
         let mut s = synthesised_prefix_bits();
         s += "1"; // pcm_enabled_flag
-                  // pcm_sample_bit_depth_luma_minus1 = 15 (PcmBitDepthY = 16)
-                  // BitDepthY in the synthesised prefix is 8.
+        // pcm_sample_bit_depth_luma_minus1 = 15 (PcmBitDepthY = 16)
+        // BitDepthY in the synthesised prefix is 8.
         s += "1111";
         let bytes = bits_to_bytes(&s);
         let err = SeqParameterSet::parse(&bytes).unwrap_err();
@@ -2828,7 +2828,7 @@ mod tests {
     fn parses_inter_rps_prediction() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm_enabled_flag
-                  // num_short_term_ref_pic_sets = 2 → codeNum 2 → '011'
+        // num_short_term_ref_pic_sets = 2 → codeNum 2 → '011'
         s += "011";
         // st_ref_pic_set(0): explicit, num_negative_pics=1, num_positive=0,
         // delta_poc_s0_minus1[0]=0, used_by_curr_pic_s0_flag[0]=1
@@ -2836,7 +2836,7 @@ mod tests {
         s += "1"; // num_pos=0
         s += "1"; // dp0=0
         s += "1"; // used=1
-                  // st_ref_pic_set(1): inter_ref_pic_set_prediction_flag = 1
+        // st_ref_pic_set(1): inter_ref_pic_set_prediction_flag = 1
         s += "1";
         //   delta_idx_minus1 is NOT signalled (st_rps_idx=1, num=2; only
         //   signalled when st_rps_idx == num). Inferred to 0 →
@@ -2878,7 +2878,7 @@ mod tests {
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
         s += "1"; // long_term_ref_pics_present_flag = 1
-                  // num_long_term_ref_pics_sps = 2 → codeNum 2 → '011'
+        // num_long_term_ref_pics_sps = 2 → codeNum 2 → '011'
         s += "011";
         // log2_max_pic_order_cnt_lsb_minus4 = 4 in the synthesised
         // prefix, so lt_ref_pic_poc_lsb_sps[i] is 8 bits wide.
@@ -2920,7 +2920,7 @@ mod tests {
         s += "1"; // temporal_mvp = 1
         s += "1"; // strong_intra_smoothing = 1
         s += "1"; // vui_parameters_present_flag = 1
-                  // vui_parameters(): ten flags all 0 (minimal body)
+        // vui_parameters(): ten flags all 0 (minimal body)
         s += "0000000000";
         s += "0"; // sps_extension_present_flag = 0
         s += "1"; // rbsp stop bit
@@ -2952,7 +2952,7 @@ mod tests {
         s += "1"; // temporal_mvp = 1
         s += "1"; // strong_intra_smoothing = 1
         s += "1"; // vui_parameters_present_flag = 1
-                  // vui_parameters():
+        // vui_parameters():
         s += "0"; // aspect_ratio_info_present_flag = 0
         s += "0"; // overscan_info_present_flag = 0
         s += "0"; // video_signal_type_present_flag = 0
@@ -2967,10 +2967,10 @@ mod tests {
         s += "0"; // vui_poc_proportional_to_timing_flag = 0
         s += "0"; // vui_hrd_parameters_present_flag = 0
         s += "0"; // bitstream_restriction_flag = 0
-                  // sps_extension_present_flag = 1, followed by the
-                  // typed extension flag block. Set the range-extension
-                  // flag so the nine `sps_range_extension()` flags are
-                  // decoded; with no further body, no opaque tail follows.
+        // sps_extension_present_flag = 1, followed by the
+        // typed extension flag block. Set the range-extension
+        // flag so the nine `sps_range_extension()` flags are
+        // decoded; with no further body, no opaque tail follows.
         s += "1"; // sps_extension_present_flag
         s += "1"; // sps_range_extension_flag = 1
         s += "000"; // sps_multilayer / sps_3d / sps_scc = 0
@@ -3024,8 +3024,8 @@ mod tests {
         s += "1"; // sps_range_extension_flag = 1
         s += "000"; // sps_multilayer / sps_3d / sps_scc = 0
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_range_extension() nine `u(1)` flags, all set —
-                     // every RExt tool enabled.
+        // sps_range_extension() nine `u(1)` flags, all set —
+        // every RExt tool enabled.
         s += "111111111";
         s += "1"; // rbsp_trailing_bits stop bit
         let bytes = bits_to_bytes(&s);
@@ -3070,7 +3070,7 @@ mod tests {
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
         s += "000000000"; // sps_range_extension() nine flags, all 0
-                          // sps_scc_extension():
+        // sps_scc_extension():
         s += "1"; // sps_curr_pic_ref_enabled_flag = 1
         s += "0"; // palette_mode_enabled_flag = 0 (palette block absent)
         s += "10"; // motion_vector_resolution_control_idc = 2 (u(2))
@@ -3113,15 +3113,15 @@ mod tests {
         s += "1"; // sps_extension_present_flag = 1
         s += "0001"; // range/multilayer/3d = 0, scc = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_scc_extension():
+        // sps_scc_extension():
         s += "0"; // sps_curr_pic_ref_enabled_flag = 0
         s += "1"; // palette_mode_enabled_flag = 1
         s += "00100"; // palette_max_size = ue(3) → "00100"
         s += "010"; // delta_palette_max_predictor_size = ue(1) → "010"
         s += "1"; // sps_palette_predictor_initializers_present_flag = 1
         s += "010"; // sps_num_palette_predictor_initializers_minus1 = ue(1) → 1
-                    // numComps = 3, num_entries = 2; default BitDepthY/C = 8.
-                    // comp 0 (8-bit): 0x01, 0x02
+        // numComps = 3, num_entries = 2; default BitDepthY/C = 8.
+        // comp 0 (8-bit): 0x01, 0x02
         s += "00000001";
         s += "00000010";
         // comp 1 (8-bit): 0x03, 0x04
@@ -3169,14 +3169,14 @@ mod tests {
         s += "1"; // sps_extension_present_flag = 1
         s += "0001"; // range/multilayer/3d = 0, scc = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_scc_extension():
+        // sps_scc_extension():
         s += "0"; // sps_curr_pic_ref_enabled_flag = 0
         s += "1"; // palette_mode_enabled_flag = 1
         s += "00100"; // palette_max_size = 3
         s += "010"; // delta_palette_max_predictor_size = 1
         s += "1"; // sps_palette_predictor_initializers_present_flag = 1
-                  // sps_num_palette_predictor_initializers_minus1 = ue(128):
-                  // 129 in 8 bits = 10000001, prefix of 7 zeros.
+        // sps_num_palette_predictor_initializers_minus1 = ue(128):
+        // 129 in 8 bits = 10000001, prefix of 7 zeros.
         s += "0000000";
         s += "10000001";
         s += "1"; // (whatever follows is unreached)
@@ -3205,7 +3205,7 @@ mod tests {
         s += "1"; // sps_extension_present_flag = 1
         s += "0001"; // range/multilayer/3d = 0, scc = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_scc_extension():
+        // sps_scc_extension():
         s += "0"; // sps_curr_pic_ref_enabled_flag = 0
         s += "0"; // palette_mode_enabled_flag = 0
         s += "11"; // motion_vector_resolution_control_idc = 3 (reserved)
@@ -3237,7 +3237,7 @@ mod tests {
         s += "1"; // sps_extension_present_flag = 1
         s += "0001"; // range/multilayer/3d = 0, scc = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_scc_extension():
+        // sps_scc_extension():
         s += "0"; // sps_curr_pic_ref_enabled_flag = 0
         s += "1"; // palette_mode_enabled_flag = 1
         s += "1"; // palette_max_size = 0 (ue)
@@ -3307,7 +3307,7 @@ mod tests {
         s += "0"; // sps_3d_extension_flag = 0
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_scc_extension():
+        // sps_scc_extension():
         s += "1"; // sps_curr_pic_ref_enabled_flag = 1
         s += "0"; // palette_mode_enabled_flag = 0
         s += "01"; // motion_vector_resolution_control_idc = 1 (u(2))
@@ -3348,9 +3348,9 @@ mod tests {
         s += "0"; // sps_3d_extension_flag = 0
         s += "1"; // sps_scc_extension_flag = 1
         s += "0000"; // sps_extension_4bits = 0
-                     // sps_multilayer_extension():
+        // sps_multilayer_extension():
         s += "1"; // inter_view_mv_vert_constraint_flag = 1
-                  // sps_scc_extension():
+        // sps_scc_extension():
         s += "1"; // sps_curr_pic_ref_enabled_flag = 1
         s += "0"; // palette_mode_enabled_flag = 0
         s += "01"; // motion_vector_resolution_control_idc = 1 (u(2))
@@ -3472,10 +3472,10 @@ mod tests {
     fn rejects_too_many_short_term_rps() {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm
-                  // num_short_term_ref_pic_sets = 65 → codeNum 65
-                  // 65 in 0-th order Exp-Golomb: leadingZeroBits=6,
-                  //   suffix = 65 - (2^6 - 1) = 2 = '000010'
-                  // so the bit string is '000000 1 000010' = 13 bits.
+        // num_short_term_ref_pic_sets = 65 → codeNum 65
+        // 65 in 0-th order Exp-Golomb: leadingZeroBits=6,
+        //   suffix = 65 - (2^6 - 1) = 2 = '000010'
+        // so the bit string is '000000 1 000010' = 13 bits.
         s += "0000001000010";
         let bytes = bits_to_bytes(&s);
         let err = SeqParameterSet::parse(&bytes).unwrap_err();
@@ -3692,8 +3692,8 @@ mod tests {
         let mut s = synthesised_prefix_bits();
         s += "0"; // pcm_enabled_flag
         s += "011"; // num_short_term_ref_pic_sets = 2
-                    // st_ref_pic_set(0): explicit num_neg=1, num_pos=0,
-                    // delta_poc_s0_minus1[0]=0, used_by_curr_pic_s0_flag=1
+        // st_ref_pic_set(0): explicit num_neg=1, num_pos=0,
+        // delta_poc_s0_minus1[0]=0, used_by_curr_pic_s0_flag=1
         s += "010";
         s += "1";
         s += "1";
@@ -3707,8 +3707,8 @@ mod tests {
         s += "1"; // used_by_curr_pic_flag[0] = 1 (use_delta inferred)
         s += "0"; // used_by_curr_pic_flag[1] = 0
         s += "1"; // use_delta_flag[1] = 1
-                  // long_term=0, temporal_mvp=1, strong_intra_smoothing=1,
-                  // vui=0, ext=0, stop bit
+        // long_term=0, temporal_mvp=1, strong_intra_smoothing=1,
+        // vui=0, ext=0, stop bit
         s += "0";
         s += "1";
         s += "1";
@@ -3741,9 +3741,9 @@ mod tests {
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "1"; // long_term_ref_pics_present
-                  // num_long_term_ref_pics_sps = 33: codeNum 33
-                  // leadingZeroBits=5, suffix = 33 - (2^5 - 1) = 2 = '00010'
-                  // bit string: '00000 1 00010' = 11 bits.
+        // num_long_term_ref_pics_sps = 33: codeNum 33
+        // leadingZeroBits=5, suffix = 33 - (2^5 - 1) = 2 = '00010'
+        // bit string: '00000 1 00010' = 11 bits.
         s += "00000100010";
         let bytes = bits_to_bytes(&s);
         let err = SeqParameterSet::parse(&bytes).unwrap_err();

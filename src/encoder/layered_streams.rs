@@ -30,7 +30,7 @@ use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::nal::{annexb, nal_unit};
-use crate::encoder::pcm::{encode_idr_pcm_au_opts, write_ptl_cfg, PcmAuOptions};
+use crate::encoder::pcm::{PcmAuOptions, encode_idr_pcm_au_opts, write_ptl_cfg};
 use crate::nal::collect_nal_units;
 
 /// CTB and minimum CB size of both layers (one CU per CTB, no
@@ -75,7 +75,7 @@ fn write_vps_two_layers(base_w: u16, base_h: u16, enh_w: u16, enh_h: u16) -> Vec
     w.put_bit(1); // layer_id_included_flag[1][1]
     w.put_bit(0); // vps_timing_info_present_flag
     w.put_bit(1); // vps_extension_flag
-    while w.bit_len() % 8 != 0 {
+    while !w.bit_len().is_multiple_of(8) {
         w.put_bit(1); // vps_extension_alignment_bit_equal_to_one
     }
     // ---- vps_extension( ) (F.7.3.2.1.1) ----
@@ -110,8 +110,8 @@ fn write_vps_two_layers(base_w: u16, base_h: u16, enh_w: u16, enh_h: u16) -> Vec
     w.put_bit(0); // rep_format_idx_present_flag
     w.put_bit(1); // max_one_active_ref_layer_flag
     w.put_bit(0); // vps_poc_lsb_aligned_flag
-                  // poc_lsb_not_present_flag[1]: absent (layer 1 has a reference layer)
-                  // dpb_size( ): OLS 1
+    // poc_lsb_not_present_flag[1]: absent (layer 1 has a reference layer)
+    // dpb_size( ): OLS 1
     w.put_bit(0); // sub_layer_flag_info_present_flag[1]
     w.ue(0); // max_vps_dec_pic_buffering_minus1[1][0][0]
     w.ue(0); // max_vps_dec_pic_buffering_minus1[1][1][0]
@@ -218,12 +218,12 @@ fn encode_skip_p_slice_layer1(width: usize, height: usize) -> Vec<u8> {
     w.ue(1); // slice_pic_parameter_set_id
     w.ue(1); // slice_type = P
     w.put_bits(0, 8); // slice_pic_order_cnt_lsb (nuh_layer_id > 0)
-                      // IDR: no reference picture set block.
+    // IDR: no reference picture set block.
     w.put_bit(0); // num_ref_idx_active_override_flag
     w.ue(4); // five_minus_max_num_merge_cand (MaxNumMergeCand = 1)
     w.se(0); // slice_qp_delta
     w.rbsp_trailing_bits(); // byte_alignment()
-                            // ---- slice_segment_data( ) ----
+    // ---- slice_segment_data( ) ----
     let mut cabac = CabacEncoder::new();
     let mut ctxs = SliceContexts::init(init_type(1, false), SLICE_QP);
     for ctb in 0..ctbs_x * ctbs_y {
@@ -276,8 +276,8 @@ pub(crate) fn build_shvc_2x_stream() -> (Vec<u8>, Planes) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ilref::{resample_picture, IlRefGeometry, LayerFormat};
-    use crate::sequence::{decode_annexb_sequence, LayerTarget, SequenceDecoder};
+    use crate::ilref::{IlRefGeometry, LayerFormat, resample_picture};
+    use crate::sequence::{LayerTarget, SequenceDecoder, decode_annexb_sequence};
 
     #[test]
     fn shvc_2x_stream_decodes_enhancement_as_resampled_base() {

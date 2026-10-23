@@ -269,7 +269,7 @@ fn prediction_block_intra_neighbour_masked_out() {
     let same_slice = |_rs: u32| 0u32;
     let all_intra = |_x: u32, _y: u32| MODE_INTRA;
     let all_inter = |_x: u32, _y: u32| 0u8; // MODE_INTER
-                                            // 64×64 CU == one 64×64 PB (2Nx2N), partIdx 0.
+    // 64×64 CU == one 64×64 PB (2Nx2N), partIdx 0.
     assert!(!t.prediction_block_availability(
         64, 64, 64, 64, 64, 64, 64, 0, 63, 64, same_slice, all_intra,
     ));

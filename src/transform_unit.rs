@@ -28,15 +28,15 @@
 //! invokes it; both remain the caller's responsibility.
 
 use crate::binarization::{
-    decode_cross_comp_pred, decode_cu_chroma_qp_offset, decode_cu_qp_delta,
-    decode_tu_residual_act_flag, log2_res_scale_abs_plus1_ctx_inc, res_scale_sign_flag_ctx_inc,
-    tu_residual_act_flag_inferred, CrossCompPred, CuChromaQpOffset, CuQpDelta,
+    CrossCompPred, CuChromaQpOffset, CuQpDelta, decode_cross_comp_pred, decode_cu_chroma_qp_offset,
+    decode_cu_qp_delta, decode_tu_residual_act_flag, log2_res_scale_abs_plus1_ctx_inc,
+    res_scale_sign_flag_ctx_inc, tu_residual_act_flag_inferred,
 };
 use crate::cabac::CabacEngine;
 use crate::ctx_init::SliceContexts;
 use crate::residual::{
-    decode_residual_coding, residual_coding_scan_idx, ResidualBlock, ResidualCodingError,
-    ResidualCodingParams,
+    ResidualBlock, ResidualCodingError, ResidualCodingParams, decode_residual_coding,
+    residual_coding_scan_idx,
 };
 
 /// The §7.3.8.5 `CuPredMode` of the coding unit containing this

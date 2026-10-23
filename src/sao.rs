@@ -35,7 +35,7 @@
 //! single-tile picture; multi-slice / multi-tile boundary masking is a
 //! follow-up that threads the per-sample slice / tile id.
 
-use crate::picture::{sub_wh_c, Picture, Plane};
+use crate::picture::{Picture, Plane, sub_wh_c};
 use crate::slice_data::{SaoComponent, SaoCtbParams};
 
 /// `Sign( x )` (§5, equation 5-18).
@@ -157,15 +157,15 @@ impl ResolvedSao {
         log2_offset_scale_luma: u8,
         log2_offset_scale_chroma: u8,
     ) -> Self {
-        if params.merge_left {
-            if let Some(l) = left {
-                return *l;
-            }
+        if params.merge_left
+            && let Some(l) = left
+        {
+            return *l;
         }
-        if params.merge_up {
-            if let Some(a) = above {
-                return *a;
-            }
+        if params.merge_up
+            && let Some(a) = above
+        {
+            return *a;
         }
         let mut components = [ResolvedSaoComponent::off(); 3];
         for (cidx, comp) in components.iter_mut().enumerate() {

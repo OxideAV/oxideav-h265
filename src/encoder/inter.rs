@@ -40,39 +40,39 @@
 //! buffer is bit-identical to a conforming decoder's output (in-loop
 //! filters are off), which the roundtrip tests pin frame by frame.
 
-use crate::availability::{PictureTiling, TilingParams, MODE_INTRA};
+use crate::availability::{MODE_INTRA, PictureTiling, TilingParams};
 use crate::binarization::{
-    cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc, cu_skip_flag_ctx_inc,
-    intra_luma_cand_mode_list, CuPredMode, InterPredIdc, MvdComponent,
+    CuPredMode, InterPredIdc, MvdComponent, cbf_cb_ctx_inc, cbf_cr_ctx_inc, cbf_luma_ctx_inc,
+    cu_skip_flag_ctx_inc, intra_luma_cand_mode_list,
 };
 use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::hrd::{
-    buffering_period_payload, filler_data_nal_framed, pic_timing_payload, sei_prefix_nal, HrdClock,
-    HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+    HrdClock, HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING, buffering_period_payload,
+    filler_data_nal_framed, pic_timing_payload, sei_prefix_nal,
 };
 use crate::encoder::intra::{
-    chroma_qp_420, code_tb, encode_cu_qp_delta, encode_idr_intra_au_full, gather_refs, pred_params,
-    search_best_mode, ssd, zscan_avail, IntraEncodeError, SpsCfg,
+    IntraEncodeError, SpsCfg, chroma_qp_420, code_tb, encode_cu_qp_delta, encode_idr_intra_au_full,
+    gather_refs, pred_params, search_best_mode, ssd, zscan_avail,
 };
 use crate::encoder::loopfilter::{
-    encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
+    CtbShape, FilterInput, LoopFilterCfg, encode_sao_ctb, filter_frame,
 };
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
 use crate::encoder::residual::encode_residual_coding;
 use crate::encoder::sample::SampleFmt;
 use crate::inter_pred::{
-    predict_inter_pu_weighted, InterPredGeometry, InterPrediction, ListPrediction, RefPlane,
+    InterPredGeometry, InterPrediction, ListPrediction, RefPlane, predict_inter_pu_weighted,
 };
 use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
-use crate::intra_pred::{intra_predict_with_substitution, Component as PredComponent};
-use crate::motion::{derive_chroma_mv, MotionCell, MotionField, Mv};
-use crate::pu_mv::{resolve_pu_motion, PartMode, PuGeometry, PuMotion, PuMvContext};
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::intra_pred::{Component as PredComponent, intra_predict_with_substitution};
+use crate::motion::{MotionCell, MotionField, Mv, derive_chroma_mv};
+use crate::pu_mv::{PartMode, PuGeometry, PuMotion, PuMvContext, resolve_pu_motion};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 use crate::slice_data::PredictionUnit;
 use crate::transform::{Component, PredMode};
 
@@ -440,7 +440,7 @@ impl LowDelayPEncoder {
     /// # Errors
     /// [`IntraEncodeError`] on bad dimensions / QP.
     pub fn new(width: usize, height: usize, qp: i32, gop: usize) -> Result<Self, IntraEncodeError> {
-        if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(CTB) || !height.is_multiple_of(CTB) {
             return Err(IntraEncodeError::BadDimensions { width, height });
         }
         if !(0..=51).contains(&qp) {
@@ -506,8 +506,8 @@ impl LowDelayPEncoder {
         let fmt = SampleFmt::from_layout(layout);
         if width == 0
             || height == 0
-            || width % CTB != 0
-            || height % CTB != 0
+            || !width.is_multiple_of(CTB)
+            || !height.is_multiple_of(CTB)
             || layout.bit_depth > 12
         {
             return Err(IntraEncodeError::BadDimensions { width, height });
@@ -1169,8 +1169,8 @@ pub(crate) fn write_inter_slice_header(
     w.ue(u32::from(!spec.b_slice)); // slice_type (0 = B, 1 = P)
     w.put_bits((spec.poc & 0xFF) as u32, 8); // slice_pic_order_cnt_lsb
     w.put_bit(0); // short_term_ref_pic_set_sps_flag
-                  // st_ref_pic_set( 0 ) — idx 0 has no
-                  // inter_ref_pic_set_prediction_flag (§7.3.7).
+    // st_ref_pic_set( 0 ) — idx 0 has no
+    // inter_ref_pic_set_prediction_flag (§7.3.7).
     w.ue(spec.rps_neg.len() as u32); // num_negative_pics
     w.ue(spec.rps_pos.len() as u32); // num_positive_pics
     let mut prev = 0u32;
@@ -1647,11 +1647,7 @@ pub(crate) fn levels_rate(levels: &[i32]) -> u64 {
         .filter(|&&l| l != 0)
         .map(|&l| 3 + 2 * u64::from(32 - l.unsigned_abs().leading_zeros()))
         .sum();
-    if bits == 0 {
-        1
-    } else {
-        bits + 8
-    }
+    if bits == 0 { 1 } else { bits + 8 }
 }
 
 /// Transform-code the three components of a CTB against `pred`,
@@ -1822,11 +1818,7 @@ fn integer_me(
     match grid {
         Some((g, _)) if g != best_a => {
             let (best_b, cost_b) = refine(g, sad_at(g[0], g[1]) + mv_cost(g[0], g[1]));
-            if cost_b < cost_a {
-                best_b
-            } else {
-                best_a
-            }
+            if cost_b < cost_a { best_b } else { best_a }
         }
         _ => best_a,
     }
@@ -2406,13 +2398,7 @@ fn encode_inter_slice_legacy(
     .expect("legal single-tile geometry");
 
     // §8.5.3.2 reference resolvers over the spec's explicit lists.
-    let list_pocs = |list: usize| -> &Vec<i32> {
-        if list == 0 {
-            &l0_pocs
-        } else {
-            &l1_pocs
-        }
-    };
+    let list_pocs = |list: usize| -> &Vec<i32> { if list == 0 { &l0_pocs } else { &l1_pocs } };
     let ref_poc = |list: usize, ref_idx: i32| -> i32 {
         usize::try_from(ref_idx)
             .ok()

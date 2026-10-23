@@ -25,18 +25,18 @@
 //! rewrites.
 
 use crate::binarization::{
-    coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
+    Greater1State, coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
     coeff_abs_level_remaining_c_max_eq_9_26, coeff_abs_level_remaining_c_rice_param_eq_9_24,
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
     sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc, sig_coeff_flag_sig_ctx_general,
-    sig_coeff_flag_sig_ctx_log2_2, sig_coeff_flag_sig_ctx_transform_skip, Greater1State,
+    sig_coeff_flag_sig_ctx_log2_2, sig_coeff_flag_sig_ctx_transform_skip,
 };
 use crate::cabac::ContextModel;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::residual::{ResidualCodingParams, ResidualContexts, ResidualElement};
-use crate::scan::{scan_order, ScanIdx};
+use crate::scan::{ScanIdx, scan_order};
 
 /// Errors from [`encode_residual_coding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,7 +514,7 @@ mod tests {
     use super::*;
     use crate::bitreader::BitReader;
     use crate::cabac::CabacEngine;
-    use crate::residual::{decode_residual_coding, ResidualContexts};
+    use crate::residual::{ResidualContexts, decode_residual_coding};
 
     /// Differential harness: encode `levels` (row-major), terminate,
     /// then decode with the crate's §7.3.8.11 decoder from identically
@@ -596,11 +596,7 @@ mod tests {
                                 if r % 16 < density {
                                     let mag = (r >> 8) % 200;
                                     let v = mag as i32 + 1;
-                                    if r & 1 == 0 {
-                                        v
-                                    } else {
-                                        -v
-                                    }
+                                    if r & 1 == 0 { v } else { -v }
                                 } else {
                                     0
                                 }

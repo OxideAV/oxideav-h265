@@ -26,7 +26,7 @@
 use oxideav_h265::decode_annexb_sequence;
 use oxideav_h265::encoder::inter::{FrameRecon, LowDelayPEncoder, YuvFrame};
 use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
-use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+use oxideav_h265::encoder::pyramid::{PyramidEncoder, encode_pyramid_with};
 
 /// Banded 64x64 clip: three horizontal texture bands split at y = 20
 /// and y = 44 (quarter offsets inside CTB rows 1 and 2), the middle

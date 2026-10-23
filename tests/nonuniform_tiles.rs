@@ -7,7 +7,7 @@
 //! `fixture_bytes/r453-generation-notes.md`).
 
 use oxideav_h265::decode_annexb_sequence;
-use oxideav_h265::encoder::pcm::{encode_idr_pcm_au_opts, PcmAuOptions};
+use oxideav_h265::encoder::pcm::{PcmAuOptions, encode_idr_pcm_au_opts};
 
 fn planes(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let y: Vec<u8> = (0..w * h)

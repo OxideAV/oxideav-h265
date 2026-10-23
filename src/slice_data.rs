@@ -30,6 +30,7 @@
 //! transform tree.
 
 use crate::binarization::{
+    CuPredMode, InterPredIdc, LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
     cu_pred_mode_from_flag, cu_pred_mode_from_skip, cu_skip_flag_ctx_inc, decode_cu_skip_flag,
     decode_cu_transquant_bypass_flag, decode_end_of_slice_segment_flag, decode_inter_pred_idc,
     decode_intra_chroma_pred_mode, decode_merge_flag, decode_merge_idx, decode_mpm_idx,
@@ -38,14 +39,13 @@ use crate::binarization::{
     decode_rqt_root_cbf, decode_sao_band_position, decode_sao_eo_class, decode_sao_merge_flag,
     decode_sao_offset_abs, decode_sao_offset_sign, decode_sao_type_idx, decode_split_cu_flag,
     derive_intra_pred_mode_c, derive_intra_pred_mode_y, intra_luma_cand_mode_list,
-    luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc, CuPredMode, InterPredIdc,
-    LumaIntraModeSource, MvdComponent, PartMode, PartModeResult,
+    luma_intra_mode_source_from_flag, split_cu_flag_ctx_inc,
 };
 use crate::cabac::CabacEngine;
 use crate::ctx_init::SliceContexts;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::residual::ResidualCodingError;
-use crate::transform_tree::{decode_transform_tree, TransformTree, TransformTreeParams};
+use crate::transform_tree::{TransformTree, TransformTreeParams, decode_transform_tree};
 use crate::transform_unit::{CuPredMode as TuCuPredMode, QuantGroupState, TransformUnitParams};
 
 /// Map the §7.3.8.5 [`binarization::CuPredMode`](CuPredMode) (which
@@ -536,7 +536,7 @@ impl PictureParseState {
             return (0, false);
         }
         let c = self.cell(x_nb, y_nb);
-        if self.ct_depth.get(c).map_or(true, |&d| d < 0) {
+        if self.ct_depth.get(c).is_none_or(|&d| d < 0) {
             return (0, false);
         }
         (self.cu_skip[c], true)

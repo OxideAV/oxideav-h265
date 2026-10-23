@@ -107,17 +107,17 @@
 //! bring-up constructor for scripted tests.
 
 use crate::binarization::{
-    coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
+    Greater1State, coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
     coeff_abs_level_remaining_c_rice_param_eq_9_24, coeff_abs_level_remaining_c_rice_param_eq_9_25,
     decode_coeff_abs_level_remaining_ext_with, decode_coeff_abs_level_remaining_with,
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
     read_truncated_rice_prefix, sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc,
     sig_coeff_flag_sig_ctx_general, sig_coeff_flag_sig_ctx_log2_2,
-    sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag, Greater1State,
+    sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag,
 };
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
-use crate::scan::{scan_order, ScanIdx, ScanOrderError};
+use crate::scan::{ScanIdx, ScanOrderError, scan_order};
 
 // ---------------------------------------------------------------------
 // Context banks
@@ -223,9 +223,10 @@ impl ResidualContexts {
     #[must_use]
     pub fn init(init_type: u8, slice_qp_y: i32) -> Self {
         use crate::ctx_init::{
-            sig_coeff_flag_init_values, uniform_init_values, TABLE_9_26_LAST_SIG_COEFF_X_PREFIX,
-            TABLE_9_27_LAST_SIG_COEFF_Y_PREFIX, TABLE_9_28_CODED_SUB_BLOCK_FLAG,
-            TABLE_9_30_COEFF_ABS_LEVEL_GREATER1_FLAG, TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG,
+            TABLE_9_26_LAST_SIG_COEFF_X_PREFIX, TABLE_9_27_LAST_SIG_COEFF_Y_PREFIX,
+            TABLE_9_28_CODED_SUB_BLOCK_FLAG, TABLE_9_30_COEFF_ABS_LEVEL_GREATER1_FLAG,
+            TABLE_9_31_COEFF_ABS_LEVEL_GREATER2_FLAG, sig_coeff_flag_init_values,
+            uniform_init_values,
         };
         let init = |v: u8| ContextModel::init(v, slice_qp_y);
         Self {
@@ -1174,7 +1175,7 @@ mod tests {
         decisions.extend([0; 15]); // i=1: sig n=15..1 all 0 ⇒ DC inferred
         decisions.push(0); // i=1: greater1 (inferred DC) = 0
         decisions.extend([0; 16]); // i=0: sig n=15..0 all 0
-                                   // bypass: last_x suffix 0, last_y suffix 0, sign(i=3) +, sign(i=1) −
+        // bypass: last_x suffix 0, last_y suffix 0, sign(i=3) +, sign(i=1) −
         let mut bins = Scripted::new(&decisions, &[0, 0, 0, 1]);
         let block = decode_residual_coding_with(&params, &mut bins).unwrap();
         assert_eq!((block.last_sig_coeff_x, block.last_sig_coeff_y), (4, 4));
@@ -1266,12 +1267,12 @@ mod tests {
         let params = luma_params(2, ScanIdx::Diagonal);
         let mut decisions = Vec::new();
         decisions.extend([1, 1, 1, 1, 1, 1]); // last at (3,3)
-                                              // sig n=14..0: nine 1s (n=14..6) then six 0s (n=5..0).
+        // sig n=14..0: nine 1s (n=14..6) then six 0s (n=5..0).
         decisions.extend([1; 9]);
         decisions.extend([0; 6]);
         decisions.extend([0; 8]); // greater1: capped at 8 bins, all 0
-                                  // bypass: 10 signs, then two remaining values of 0 (single
-                                  // TR-prefix terminator bin each at cRiceParam 0).
+        // bypass: 10 signs, then two remaining values of 0 (single
+        // TR-prefix terminator bin each at cRiceParam 0).
         let mut bins = Scripted::new(&decisions, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let block = decode_residual_coding_with(&params, &mut bins).unwrap();
         let g1_bins = bins
@@ -1299,11 +1300,11 @@ mod tests {
         decisions.extend([0; 14]); // sig n=13..0 = 0
         decisions.extend([1, 1]); // greater1 at n=15, n=14
         decisions.push(1); // greater2 at n=15 (lastGreater1ScanPos)
-                           // remaining #1 = 10 at cRiceParam 0: TR escape prefix `1111`,
-                           // then EGk(k=1) of suffixVal = 6 = prefix `110` (§9.3.3.3 ones-
-                           // then-zero) + 3-bit suffix `000`.
-                           // remaining #2 = 1 at cRiceParam 1: TR prefix `0` (terminator)
-                           // + 1-bit suffix `1`.
+        // remaining #1 = 10 at cRiceParam 0: TR escape prefix `1111`,
+        // then EGk(k=1) of suffixVal = 6 = prefix `110` (§9.3.3.3 ones-
+        // then-zero) + 3-bit suffix `000`.
+        // remaining #2 = 1 at cRiceParam 1: TR prefix `0` (terminator)
+        // + 1-bit suffix `1`.
         let bypasses = [
             0, 0, // signs at n=15, n=14
             1, 1, 1, 1, 1, 1, 0, 0, 0, 0, // remaining #1 = 10 (escape + EG1)
@@ -1330,8 +1331,8 @@ mod tests {
         let mut decisions = Vec::new();
         decisions.extend([1, 1, 0]); // wire X prefix = 2
         decisions.push(0); // wire Y prefix = 0
-                           // After the swap the last position is (0, 2) = vertical scan
-                           // pos 2; sig bins for n=1..0, then one greater1.
+        // After the swap the last position is (0, 2) = vertical scan
+        // pos 2; sig bins for n=1..0, then one greater1.
         decisions.extend([0, 0, 0]);
         let mut bins = Scripted::new(&decisions, &[0]);
         let block = decode_residual_coding_with(&params, &mut bins).unwrap();

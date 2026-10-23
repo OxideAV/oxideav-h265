@@ -116,7 +116,7 @@ pub(crate) fn write_hrd_parameters(w: &mut BitWriter, cfg: &HrdSignalCfg) {
     w.put_bit(1); // fixed_pic_rate_general_flag[0]
     w.ue(0); // elemental_duration_in_tc_minus1[0] — one AU per tick
     w.ue(0); // cpb_cnt_minus1[0]
-             // sub_layer_hrd_parameters( 0 ), NAL path.
+    // sub_layer_hrd_parameters( 0 ), NAL path.
     w.ue(cfg.bit_rate_value_minus1());
     w.ue(cfg.cpb_size_value_minus1());
     w.put_bit(u8::from(cfg.cbr)); // cbr_flag[0]
@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(clock.au_cpb_removal_delay_minus1(), 0); // AU 1
         clock.push_au(2_000);
         assert_eq!(clock.au_cpb_removal_delay_minus1(), 1); // AU 2
-                                                            // AU 2 opens a new period: its own PT still counts from AU 0.
+        // AU 2 opens a new period: its own PT still counts from AU 0.
         let (delay, offset) = clock.begin_buffering_period();
         assert!(delay >= 1 && delay <= clock.delay0_90k);
         assert_eq!(

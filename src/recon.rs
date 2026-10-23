@@ -26,20 +26,20 @@
 
 use crate::availability::PictureTiling;
 use crate::binarization::{
-    derive_intra_pred_mode_c, derive_intra_pred_mode_y, intra_luma_cand_mode_list,
-    luma_intra_mode_source_from_flag, CuPredMode, LumaIntraModeSource, PartMode,
+    CuPredMode, LumaIntraModeSource, PartMode, derive_intra_pred_mode_c, derive_intra_pred_mode_y,
+    intra_luma_cand_mode_list, luma_intra_mode_source_from_flag,
 };
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
-    intra_predict_with_substitution, Component as IpComponent, IntraPredError, IntraPredParams,
-    MarkedReferenceSamples, INTRA_DC,
+    Component as IpComponent, INTRA_DC, IntraPredError, IntraPredParams, MarkedReferenceSamples,
+    intra_predict_with_substitution,
 };
-use crate::picture::{clip1, sub_wh_c, Picture, Plane};
+use crate::picture::{Picture, Plane, clip1, sub_wh_c};
 use crate::scaling_list::ScalingFactors;
 use crate::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
 use crate::transform::{
-    rdpcm_accumulate, residual_block, BlockParams, Component as TfComponent, PredMode,
-    TransformError,
+    BlockParams, Component as TfComponent, PredMode, TransformError, rdpcm_accumulate,
+    residual_block,
 };
 use crate::transform_tree::TransformTree;
 use crate::transform_unit::TransformUnit;
@@ -2348,50 +2348,47 @@ fn reconstruct_cu(
     // the four luma PBs (each carrying that PB's luma mode); chroma uses
     // the CU-level IntraPredModeC throughout.
     if let Some(tree) = &cu.transform_tree {
-        if is_nxn {
-            if let TransformTree::Split { children, .. } = tree {
-                let half = n_cb / 2;
-                // §7.3.8.10: when the four children are 4×4 luma leaves
-                // (and ChromaArrayType != 3), the CU's chroma transform
-                // blocks are decoded once, deferred to blkIdx == 3 — the
-                // children carry no chroma of their own.
-                let child_log2 = cu.log2_cb_size - 1;
-                let defer_chroma = child_log2 == 2
-                    && params.chroma_array_type != 0
-                    && params.chroma_array_type != 3;
-                let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
-                for (i, (child, (dx, dy))) in children.iter().zip(offsets).enumerate() {
-                    reconstruct_transform_tree(
-                        pic,
-                        params,
-                        ctx,
-                        child,
-                        x_cb + dx,
-                        y_cb + dy,
-                        child_log2,
-                        pb_modes[i],
-                        modes_c[i],
-                        qp_y,
-                        cu.cu_transquant_bypass_flag,
-                        defer_chroma,
-                    )?;
-                }
-                if defer_chroma {
-                    reconstruct_deferred_chroma(
-                        pic,
-                        params,
-                        ctx,
-                        children,
-                        x_cb,
-                        y_cb,
-                        cu.log2_cb_size,
-                        intra_pred_mode_c,
-                        qp_y,
-                        cu.cu_transquant_bypass_flag,
-                    )?;
-                }
-                return Ok(());
+        if is_nxn && let TransformTree::Split { children, .. } = tree {
+            let half = n_cb / 2;
+            // §7.3.8.10: when the four children are 4×4 luma leaves
+            // (and ChromaArrayType != 3), the CU's chroma transform
+            // blocks are decoded once, deferred to blkIdx == 3 — the
+            // children carry no chroma of their own.
+            let child_log2 = cu.log2_cb_size - 1;
+            let defer_chroma =
+                child_log2 == 2 && params.chroma_array_type != 0 && params.chroma_array_type != 3;
+            let offsets = [(0, 0), (half, 0), (0, half), (half, half)];
+            for (i, (child, (dx, dy))) in children.iter().zip(offsets).enumerate() {
+                reconstruct_transform_tree(
+                    pic,
+                    params,
+                    ctx,
+                    child,
+                    x_cb + dx,
+                    y_cb + dy,
+                    child_log2,
+                    pb_modes[i],
+                    modes_c[i],
+                    qp_y,
+                    cu.cu_transquant_bypass_flag,
+                    defer_chroma,
+                )?;
             }
+            if defer_chroma {
+                reconstruct_deferred_chroma(
+                    pic,
+                    params,
+                    ctx,
+                    children,
+                    x_cb,
+                    y_cb,
+                    cu.log2_cb_size,
+                    intra_pred_mode_c,
+                    qp_y,
+                    cu.cu_transquant_bypass_flag,
+                )?;
+            }
+            return Ok(());
         }
         reconstruct_transform_tree(
             pic,

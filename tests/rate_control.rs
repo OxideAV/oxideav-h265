@@ -180,7 +180,7 @@ fn abr_streams_decode_bit_exact_through_own_decoder() {
 
 #[test]
 fn pyramid_abr_hits_target_and_roundtrips() {
-    use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+    use oxideav_h265::encoder::pyramid::{PyramidEncoder, encode_pyramid_with};
     let planes = clip(33); // IDR + four GOP-8 mini-GOPs
     let frames = frames(&planes);
     let mut totals = Vec::new();
@@ -566,7 +566,7 @@ fn fps_option_declares_vui_timing() {
     assert!(sps_of(&pkt2.data).vui_parameters.is_none());
     // Direct pyramid API + decode still bit-exact with the VUI SPS.
     {
-        use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+        use oxideav_h265::encoder::pyramid::{PyramidEncoder, encode_pyramid_with};
         let frames = frames(&planes);
         let enc = PyramidEncoder::new(W, H, 30, 2)
             .expect("encoder")

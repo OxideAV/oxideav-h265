@@ -18,16 +18,16 @@ use std::collections::BTreeMap;
 
 use crate::availability::{PictureTiling, TilingParams};
 use crate::bitreader::BitReader;
-use crate::cabac::{init_type, CabacEngine};
+use crate::cabac::{CabacEngine, init_type};
 use crate::ctx_init::SliceContexts;
 use crate::decode::LayeredPictureInputs;
 use crate::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
 use crate::dpb::{DpbEntry, LongTermEntry, Marking, RefPicLists};
-use crate::ilref::{resample_motion, resample_picture, IlRefGeometry, LayerFormat};
+use crate::ilref::{IlRefGeometry, LayerFormat, resample_motion, resample_picture};
 use crate::inter_pred::WpListWeights;
 use crate::inter_recon::{
-    reconstruct_inter_picture, InterSliceContext, PictureReconstructor, PlacedInterCtu,
-    RefListAccess, SliceWpTables,
+    InterSliceContext, PictureReconstructor, PlacedInterCtu, RefListAccess, SliceWpTables,
+    reconstruct_inter_picture,
 };
 use crate::nal::{NalError, NalIter, NalUnit};
 use crate::picture::Picture;
@@ -38,8 +38,8 @@ use crate::residual::ResidualCodingError;
 use crate::slice::SliceLayerContext;
 use crate::slice::{SliceError, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType};
 use crate::slice_data::{
-    decode_coding_tree_unit_in_picture, end_of_slice_segment_flag, CodingTreeUnit,
-    PictureParseState, SliceDataParams,
+    CodingTreeUnit, PictureParseState, SliceDataParams, decode_coding_tree_unit_in_picture,
+    end_of_slice_segment_flag,
 };
 use crate::sps::{
     MaterializedShortTermRefPicSet, SeqParameterSet, ShortTermRefPicSetMaterializeError, SpsError,
@@ -346,7 +346,7 @@ impl LayerPlan {
                         .map_or(&[][..], Vec::as_slice)
                         .iter(),
                 )
-                .filter(|(_, &n)| n)
+                .filter(|&(_, &n)| n)
                 .map(|(&id, _)| id)
                 .collect();
             let decode = if necessary.is_empty() {
@@ -534,7 +534,7 @@ impl SequenceDecoder {
                 // and SEI between two pictures belong to whichever
                 // access unit the next VCL NAL unit starts — they do
                 // not open one by themselves.)
-                let new_au = self.au.max_layer.map_or(true, |m| header.nuh_layer_id <= m);
+                let new_au = self.au.max_layer.is_none_or(|m| header.nuh_layer_id <= m);
                 if new_au && self.au.seen_vcl {
                     self.au.index += 1;
                     self.au.pictures.clear();
@@ -764,7 +764,7 @@ impl SequenceDecoder {
         // not.
         let nal_kind = NalKind::new(indep.nal_type);
         let lstate = self.layers.get(&layer_id).copied().unwrap_or_default();
-        let ref_layers_initialized = ext.map_or(true, |e| {
+        let ref_layers_initialized = ext.is_none_or(|e| {
             e.layers
                 .direct_ref_layers(layer_id)
                 .iter()
@@ -1960,7 +1960,7 @@ fn build_inter_slice_context(
             .slice_loop_filter_across_slices_enabled_flag
             .unwrap_or(pps.pps_loop_filter_across_slices_enabled_flag),
         filter_across_tiles: pps.loop_filter_across_tiles_enabled_flag,
-        deblock_enabled: deblock.map_or(true, |d| !d.disabled_flag),
+        deblock_enabled: deblock.is_none_or(|d| !d.disabled_flag),
         beta_offset_div2: deblock.map_or(0, |d| i32::from(d.beta_offset_div2)),
         tc_offset_div2: deblock.map_or(0, |d| i32::from(d.tc_offset_div2)),
         slice_qp_y: recon.slice_qp_y,

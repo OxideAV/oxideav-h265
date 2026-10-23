@@ -73,11 +73,7 @@ fn reconstruct_component(mvp: i32, mvd: i32, integer_mv: bool) -> i32 {
     };
     let u = sum.rem_euclid(MV_WRAP);
     // eq 8-95 / 8-99: fold the upper half to the negative range.
-    if u >= MV_HALF {
-        u - MV_WRAP
-    } else {
-        u
-    }
+    if u >= MV_HALF { u - MV_WRAP } else { u }
 }
 
 /// §8.5.3.2.1 step 4 / 5 — reconstruct a luma motion vector `mvLX` from
@@ -836,10 +832,10 @@ pub fn derive_mvp_candidate(
     } else if avail_b {
         list.push(mv_b);
     }
-    if list.len() < 2 {
-        if let Some(c) = col {
-            list.push(c);
-        }
+    if list.len() < 2
+        && let Some(c) = col
+    {
+        list.push(c);
     }
     while list.len() < 2 {
         list.push([0, 0]);

@@ -26,12 +26,12 @@
 
 use crate::dpb::{DpbEntry, RefPicLists};
 use crate::inter_pred::{PuWeights, WpListWeights};
-use crate::motion::{derive_chroma_mv, MotionField};
-use crate::picture::{sub_wh_c, Picture, Plane};
-use crate::pu_mv::{resolve_cu_motion, InterCuDesc, PuMotion, PuMvContext, PuRect};
+use crate::motion::{MotionField, derive_chroma_mv};
+use crate::picture::{Picture, Plane, sub_wh_c};
+use crate::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
 use crate::recon::{
-    extract_cu_residual, reconstruct_inter_pu_weighted, CuResidual, ReconError, ReconParams,
-    ResolvedList,
+    CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual,
+    reconstruct_inter_pu_weighted,
 };
 use crate::slice_data::{CodingUnit, PredictionUnit};
 

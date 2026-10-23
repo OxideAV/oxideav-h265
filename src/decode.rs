@@ -19,8 +19,8 @@
 //! short-term reference, completing the per-picture cycle.
 
 use crate::dpb::{
-    build_rps_poc_lists, no_backward_pred_flag, select_col_pic, Dpb, DpbEntry, LongTermEntry,
-    Marking, RefPicListParams, RefPicLists, ResolvedRps,
+    Dpb, DpbEntry, LongTermEntry, Marking, RefPicListParams, RefPicLists, ResolvedRps,
+    build_rps_poc_lists, no_backward_pred_flag, select_col_pic,
 };
 use crate::motion::MotionField;
 use crate::picture::Picture;

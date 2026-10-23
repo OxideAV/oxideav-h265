@@ -27,7 +27,7 @@
 
 use crate::binarization::PartMode;
 use crate::motion::MotionField;
-use crate::picture::{sub_wh_c, Picture, Plane};
+use crate::picture::{Picture, Plane, sub_wh_c};
 
 /// §8.7.2.1 — the edge orientation being filtered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

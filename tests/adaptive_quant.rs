@@ -221,7 +221,7 @@ fn inter_aq_gops_decode_bit_exact() {
 #[test]
 fn pyramid_aq_with_rate_control_decodes_bit_exact() {
     use oxideav_h265::encoder::inter::YuvFrame;
-    use oxideav_h265::encoder::pyramid::{encode_pyramid_with, PyramidEncoder};
+    use oxideav_h265::encoder::pyramid::{PyramidEncoder, encode_pyramid_with};
     use oxideav_h265::encoder::rate::RateControlCfg;
     let (w, h, n) = (64usize, 64usize, 9usize);
     let planes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> =

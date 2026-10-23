@@ -1,6 +1,6 @@
 //! Debug: decode NAL-by-NAL, reporting per-picture success/failure.
-use oxideav_h265::sequence::SequenceDecoder;
 use oxideav_h265::NalIter;
+use oxideav_h265::sequence::SequenceDecoder;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap();

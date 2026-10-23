@@ -546,8 +546,8 @@ mod tests {
     fn ue(code_num: u32) -> Vec<(u64, u32)> {
         let x = code_num + 1;
         let m = 31 - x.leading_zeros(); // floor(log2(x))
-                                        // m leading zeros + the implicit leading 1 of `x` (so `x` in
-                                        // (m+1) bits) gives the standard Exp-Golomb codeword.
+        // m leading zeros + the implicit leading 1 of `x` (so `x` in
+        // (m+1) bits) gives the standard Exp-Golomb codeword.
         vec![(0, m), (x as u64, m + 1)]
     }
 

@@ -42,7 +42,7 @@ struct Still {
 }
 
 macro_rules! still {
-    ($name:literal, $w:expr, $h:expr, $md5:literal) => {
+    ($name:literal, $w:expr_2021, $h:expr_2021, $md5:literal) => {
         Still {
             name: $name,
             hevc: include_bytes!(concat!("fixture_bytes/r460/", $name, ".hevc")),

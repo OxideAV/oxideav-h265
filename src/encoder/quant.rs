@@ -36,18 +36,18 @@
 use std::sync::OnceLock;
 
 use crate::binarization::{
-    coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
+    Greater1State, coded_sub_block_flag_ctx_inc_with_edge, coeff_abs_level_greater2_flag_ctx_inc,
     coeff_abs_level_remaining_c_max_eq_9_26, coeff_abs_level_remaining_c_rice_param_eq_9_24,
     last_sig_coeff_position, last_sig_coeff_prefix_cmax, last_sig_coeff_prefix_ctx_inc,
     last_sig_coeff_prefix_ctx_offset_shift, last_sig_coeff_suffix_n_bits,
     sig_coeff_flag_ctx_inc_from_sig_ctx, sig_coeff_flag_sig_ctx_dc, sig_coeff_flag_sig_ctx_general,
-    sig_coeff_flag_sig_ctx_log2_2, Greater1State,
+    sig_coeff_flag_sig_ctx_log2_2,
 };
 use crate::cabac::{ContextModel, RANGE_TAB_LPS};
 use crate::encoder::bitwriter::BitWriter;
 use crate::residual::ResidualContexts;
-use crate::scaling_list::{ScalingFactorMatrix, ScalingListData, NUM_MATRIX_IDS, NUM_SIZE_IDS};
-use crate::scan::{scan_order, ScanIdx};
+use crate::scaling_list::{NUM_MATRIX_IDS, NUM_SIZE_IDS, ScalingFactorMatrix, ScalingListData};
+use crate::scan::{ScanIdx, scan_order};
 use crate::transform::LEVEL_SCALE;
 
 /// Cost of one bypass bin (1/256-bit units).
@@ -323,11 +323,7 @@ pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
 /// shift.
 fn lambda_coef(lambda: u64, log2: u32, bit_depth: u8) -> u64 {
     let e = 2 * (15 - i32::from(bit_depth) - log2 as i32);
-    if e >= 0 {
-        lambda << e
-    } else {
-        lambda >> (-e)
-    }
+    if e >= 0 { lambda << e } else { lambda >> (-e) }
 }
 
 /// One coefficient's RDOQ bookkeeping.
@@ -763,7 +759,7 @@ fn apply_sign_hiding(
                 levels[idx] = candidate;
                 let ok = consistent(levels, sb_i);
                 levels[idx] = old;
-                if ok && best.map_or(true, |(c, _, _)| cost < c) {
+                if ok && best.is_none_or(|(c, _, _)| cost < c) {
                     best = Some((cost, idx, candidate));
                 }
             }
@@ -783,7 +779,7 @@ mod tests {
     use crate::encoder::bitwriter::BitWriter;
     use crate::encoder::cabac::CabacEncoder;
     use crate::encoder::residual::encode_residual_coding;
-    use crate::residual::{decode_residual_coding, ResidualCodingParams};
+    use crate::residual::{ResidualCodingParams, decode_residual_coding};
 
     #[test]
     fn fixed_log2_matches_known_points() {

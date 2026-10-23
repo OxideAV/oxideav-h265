@@ -48,14 +48,14 @@
 use std::collections::BTreeMap;
 
 use crate::encoder::hrd::{
-    buffering_period_payload, filler_data_nal_framed, pic_timing_payload, sei_prefix_nal, HrdClock,
-    HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING,
+    HrdClock, HrdSignalCfg, SEI_BUFFERING_PERIOD, SEI_PIC_TIMING, buffering_period_payload,
+    filler_data_nal_framed, pic_timing_payload, sei_prefix_nal,
 };
 use crate::encoder::inter::{
-    build_ref_lists, encode_inter_slice, narrow_frame, widen_frame, FrameRecon, FrameStats,
-    SliceSpec, TmvpSpec, WideRecon, YuvFrame, YuvFrameWide,
+    FrameRecon, FrameStats, SliceSpec, TmvpSpec, WideRecon, YuvFrame, YuvFrameWide,
+    build_ref_lists, encode_inter_slice, narrow_frame, widen_frame,
 };
-use crate::encoder::intra::{encode_idr_intra_au_full, IntraEncodeError, SpsCfg};
+use crate::encoder::intra::{IntraEncodeError, SpsCfg, encode_idr_intra_au_full};
 use crate::encoder::loopfilter::LoopFilterCfg;
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::rate::{FrameClass, RateControlCfg, RateController};
@@ -277,7 +277,7 @@ impl PyramidEncoder {
     /// in 2..=16 is legal; non-dyadic lengths use the same midpoint
     /// schedule with exact DPB / reorder bounds).
     pub fn new(width: usize, height: usize, qp: i32, gop: usize) -> Result<Self, PyramidError> {
-        if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(CTB) || !height.is_multiple_of(CTB) {
             return Err(PyramidError::Encode(IntraEncodeError::BadDimensions {
                 width,
                 height,

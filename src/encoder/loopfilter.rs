@@ -49,13 +49,13 @@
 
 use crate::binarization::PartMode;
 use crate::ctx_init::SliceContexts;
-use crate::deblock::{deblock_picture_full, DeblockCu, DeblockCuDesc, DeblockCuParams};
+use crate::deblock::{DeblockCu, DeblockCuDesc, DeblockCuParams, deblock_picture_full};
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::encoder::sample::{Sample, SampleFmt};
 use crate::motion::MotionField;
 use crate::picture::{Picture, Plane};
-use crate::sao::{apply_sao_ctb_full, apply_sao_picture_full, ResolvedSao, ResolvedSaoComponent};
+use crate::sao::{ResolvedSao, ResolvedSaoComponent, apply_sao_ctb_full, apply_sao_picture_full};
 use crate::slice_data::{SaoComponent, SaoCtbParams};
 
 /// The fixed CTB log2 size of the bootstrap encoders (16x16).
@@ -905,9 +905,7 @@ pub(crate) fn filter_frame<S: Sample>(
             }
             // §7.3.8.3: the merge candidates must lie in the same tile.
             let same_tile = |other: usize| -> bool {
-                input
-                    .tile_ids
-                    .map_or(true, |ids| ids[other] == ids[ctb_idx])
+                input.tile_ids.is_none_or(|ids| ids[other] == ids[ctb_idx])
             };
             let can_left = rx > 0 && same_tile(ctb_idx - 1);
             let can_up = ry > 0 && same_tile(ctb_idx - ctbs_x);
@@ -1139,7 +1137,7 @@ mod tests {
     use super::*;
     use crate::bitreader::BitReader;
     use crate::cabac::CabacEngine;
-    use crate::slice_data::{decode_sao, SliceDataParams};
+    use crate::slice_data::{SliceDataParams, decode_sao};
 
     fn sao_params(sao_luma: bool, sao_chroma: bool) -> SliceDataParams {
         SliceDataParams {

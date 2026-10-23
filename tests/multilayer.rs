@@ -13,8 +13,8 @@ mod fixture_bytes;
 
 use fixture_bytes::md5;
 use oxideav_core::{CodecParameters, Decoder, Error, Frame, Packet, TimeBase};
-use oxideav_h265::nal::{collect_nal_units, NalUnit};
-use oxideav_h265::sequence::{decode_annexb_sequence, LayerTarget, SequenceDecoder};
+use oxideav_h265::nal::{NalUnit, collect_nal_units};
+use oxideav_h265::sequence::{LayerTarget, SequenceDecoder, decode_annexb_sequence};
 
 const STREAM: &[u8] = include_bytes!("fixture_bytes/r462-mvhevc-3au.hevc");
 const WIDTH: usize = 960;

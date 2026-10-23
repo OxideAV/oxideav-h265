@@ -38,7 +38,7 @@ use crate::cabac::CabacEngine;
 use crate::ctx_init::SliceContexts;
 use crate::residual::ResidualCodingError;
 use crate::transform_unit::{
-    decode_transform_unit, CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams,
+    CuPredMode, QuantGroupState, TransformUnit, TransformUnitParams, decode_transform_unit,
 };
 
 /// Geometry + coding-unit context shared by every node of one

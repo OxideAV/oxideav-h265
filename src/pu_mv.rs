@@ -23,10 +23,9 @@
 
 use crate::binarization::InterPredIdc;
 use crate::motion::{
-    build_merge_candidate, derive_mvp_candidate, derive_spatial_merge_candidates,
-    derive_temporal_mv, reconstruct_mv, MergeCandidate, MergeListParams, MotionCell, MotionField,
-    Mv, MvpContext, NeighbourPu, PartitionContext, RefPicId, SpatialMergeNeighbours,
-    TemporalMvContext,
+    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
+    PartitionContext, RefPicId, SpatialMergeNeighbours, TemporalMvContext, build_merge_candidate,
+    derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv, reconstruct_mv,
 };
 use crate::slice_data::PredictionUnit;
 

@@ -65,7 +65,7 @@
 //! `part_mode` only ctxIdx 0 there: the I-slice §9.3.4.2 binarization
 //! uses a single context-coded bin).
 
-use crate::cabac::{init_type, ContextModel};
+use crate::cabac::{ContextModel, init_type};
 use crate::residual::ResidualContexts;
 use crate::slice::SliceType;
 
@@ -672,9 +672,11 @@ mod tests {
         assert_eq!(TABLE_9_42_PALETTE_TRANSPOSE_FLAG.len(), 3);
         // The all-154 tables really are uniform.
         assert!(TABLE_9_24_CU_QP_DELTA_ABS.iter().all(|&v| v == 154));
-        assert!(TABLE_9_36_LOG2_RES_SCALE_ABS_PLUS1
-            .iter()
-            .all(|&v| v == 154));
+        assert!(
+            TABLE_9_36_LOG2_RES_SCALE_ABS_PLUS1
+                .iter()
+                .all(|&v| v == 154)
+        );
         assert!(TABLE_9_37_RES_SCALE_SIGN_FLAG.iter().all(|&v| v == 154));
         assert!(TABLE_9_40_PALETTE_RUN_PREFIX.iter().all(|&v| v == 154));
         // The all-139 tables (transform-skip / RDPCM group).

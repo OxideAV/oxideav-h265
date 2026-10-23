@@ -633,7 +633,7 @@ impl HevcVps {
         let mut extension = None;
         let mut vps_extension2_flag = false;
         if vps_extension_flag {
-            while br.bit_pos() % 8 != 0 {
+            while !br.bit_pos().is_multiple_of(8) {
                 br.u1()?;
             }
             let rows: Vec<Vec<bool>> = layer_id_included_flag
@@ -856,14 +856,14 @@ mod tests {
         push("1"); // ue=0 (max_dec_pic_buffering_minus1[1])
         push("1"); // ue=0 (max_num_reorder_pics[1])
         push("1"); // ue=0 (max_latency_increase_plus1[1])
-                   // VPS tail (round 12 — fully parsed):
+        // VPS tail (round 12 — fully parsed):
         push("000000"); // vps_max_layer_id = 0 (single layer)
         push("1"); // vps_num_layer_sets_minus1 ue=0 (just layer set 0)
         push("0"); // vps_timing_info_present_flag = 0
         push("0"); // vps_extension_flag = 0
 
         // Pad with zeros to next byte boundary and pack.
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -934,17 +934,17 @@ mod tests {
         push("00"); // sub_layer present flags both 0
         push(&"0".repeat(14));
         push("0"); // sub_layer_ordering_info_present_flag = 0
-                   // Only the i=1 triple is read; we want the [1] DPB = 2 (codeNum 2 = '011').
+        // Only the i=1 triple is read; we want the [1] DPB = 2 (codeNum 2 = '011').
         push("011"); // max_dec_pic_buffering_minus1[1] = 2
         push("1"); // max_num_reorder_pics[1] = 0
         push("1"); // max_latency_increase_plus1[1] = 0
-                   // VPS tail (round 12 — fully parsed):
+        // VPS tail (round 12 — fully parsed):
         push("000000"); // vps_max_layer_id = 0
         push("1"); // vps_num_layer_sets_minus1 ue=0
         push("0"); // vps_timing_info_present_flag = 0
         push("0"); // vps_extension_flag = 0
 
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -1005,13 +1005,13 @@ mod tests {
         push("1"); // ue=0 (max_dec_pic_buffering_minus1[0])
         push("1"); // ue=0 (max_num_reorder_pics[0])
         push("1"); // ue=0 (max_latency_increase_plus1[0])
-                   // Tail:
+        // Tail:
         push("000001"); // vps_max_layer_id = 1 (so row width 2)
         push("010"); // vps_num_layer_sets_minus1 ue=1 (one signalled row)
-                     // layer_id_included_flag[1][0..=1]: pick 1, 0
+        // layer_id_included_flag[1][0..=1]: pick 1, 0
         push("10");
         push("1"); // vps_timing_info_present_flag = 1
-                   // num_units_in_tick = 1001 (NTSC-ish denominator)
+        // num_units_in_tick = 1001 (NTSC-ish denominator)
         for i in (0..32).rev() {
             let b = (1001u32 >> i) & 1;
             push(if b == 1 { "1" } else { "0" });
@@ -1026,7 +1026,7 @@ mod tests {
         push("1"); // num_hrd_parameters ue=0 (no HRDs — keeps tail parseable)
         push("0"); // vps_extension_flag = 0
 
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -1100,22 +1100,22 @@ mod tests {
         }
         push("0"); // poc_proportional_to_timing_flag = 0
         push("010"); // num_hrd_parameters ue=1
-                     // HRD entry i=0:
+        // HRD entry i=0:
         push("1"); // hrd_layer_set_idx ue=0
-                   // cprms_present_flag not signalled (i == 0); inferred 1
-                   // hrd_parameters( 1, 0 ):
+        // cprms_present_flag not signalled (i == 0); inferred 1
+        // hrd_parameters( 1, 0 ):
         push("0"); // nal_hrd_parameters_present_flag
         push("0"); // vcl_hrd_parameters_present_flag
-                   // (nal | vcl) = 0 → no common-info inner block
-                   // sub-layer i=0:
+        // (nal | vcl) = 0 → no common-info inner block
+        // sub-layer i=0:
         push("1"); // fixed_pic_rate_general_flag = 1 → within_cvs inferred 1
         push("1"); // elemental_duration_in_tc_minus1 ue=0
-                   // low_delay not signalled, inferred 0
+        // low_delay not signalled, inferred 0
         push("1"); // cpb_cnt_minus1 ue=0
-                   // no NAL/VCL HRD bodies (gates = 0)
+        // no NAL/VCL HRD bodies (gates = 0)
         push("0"); // vps_extension_flag = 0
 
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -1188,7 +1188,7 @@ mod tests {
         push(&"0".repeat(32)); // num_units_in_tick = 0  → invalid
         push(&"0".repeat(32)); // time_scale (unread)
 
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);
@@ -1245,7 +1245,7 @@ mod tests {
         push("1");
         push("000000"); // max_layer_id = 0
         push("011"); // vps_num_layer_sets_minus1 ue=2 → 3 layer sets, room for 3 HRDs
-                     // layer_id_included_flag[1..=2][0..=0]: two rows of one bit each
+        // layer_id_included_flag[1..=2][0..=0]: two rows of one bit each
         push("1");
         push("1");
         push("1"); // timing_info_present_flag = 1
@@ -1262,11 +1262,11 @@ mod tests {
 
         // HRD entry i=0: hrd_layer_set_idx=0, cprms inferred 1.
         push("1"); // hrd_layer_set_idx ue=0
-                   // hrd_parameters( 1, 0 ):
+        // hrd_parameters( 1, 0 ):
         push("1"); // nal_hrd_parameters_present_flag = 1
         push("0"); // vcl
         push("0"); // sub_pic_hrd_params_present_flag = 0
-                   // bit_rate_scale / cpb_size_scale u(4) each
+        // bit_rate_scale / cpb_size_scale u(4) each
         push("0000");
         push("0000");
         // initial / au / dpb_output u(5) each
@@ -1276,7 +1276,7 @@ mod tests {
         // sub-layer i=0:
         push("1"); // fixed_pic_rate_general = 1
         push("1"); // elemental_duration_in_tc_minus1 ue=0
-                   // cpb_cnt_minus1 ue=0
+        // cpb_cnt_minus1 ue=0
         push("1");
         // NAL HRD body: CpbCnt = 1
         push("1"); // bit_rate_value_minus1 ue=0
@@ -1286,12 +1286,12 @@ mod tests {
         // HRD entry i=1: hrd_layer_set_idx ue=1 ("010"), cprms_present_flag = 0
         push("010"); // hrd_layer_set_idx = 1
         push("0"); // cprms_present_flag[1] = 0 → inherit entry 0's common info
-                   // hrd_parameters( 0, 0 ): no common info read; gates
-                   // inherited (nal = true).
-                   // sub-layer i=0:
+        // hrd_parameters( 0, 0 ): no common info read; gates
+        // inherited (nal = true).
+        // sub-layer i=0:
         push("1"); // fixed_pic_rate_general = 1
         push("1"); // elemental_duration_in_tc_minus1 ue=0
-                   // cpb_cnt_minus1 ue=0
+        // cpb_cnt_minus1 ue=0
         push("1");
         push("1"); // bit_rate_value_minus1 ue=0
         push("1"); // cpb_size_value_minus1 ue=0
@@ -1299,7 +1299,7 @@ mod tests {
 
         push("0"); // vps_extension_flag = 0
 
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);

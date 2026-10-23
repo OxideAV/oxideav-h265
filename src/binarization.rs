@@ -593,11 +593,7 @@ fn decode_eg_k0(engine: &mut CabacEngine<'_>) -> Result<u32, CabacError> {
 /// indexed.
 #[must_use]
 pub fn cu_qp_delta_abs_ctx_inc(bin_idx: u32) -> u32 {
-    if bin_idx == 0 {
-        0
-    } else {
-        1
-    }
+    if bin_idx == 0 { 0 } else { 1 }
 }
 
 /// `cu_qp_delta_abs` TR prefix `cMax`. §9.3.3.10 (with §9.3.4.2.2
@@ -1886,11 +1882,7 @@ pub fn last_sig_coeff_position(prefix: u32, suffix: Option<u32>) -> u32 {
 /// signalled).
 #[must_use]
 pub fn last_sig_coeff_suffix_n_bits(prefix: u32) -> u32 {
-    if prefix > 3 {
-        (prefix >> 1) - 1
-    } else {
-        0
-    }
+    if prefix > 3 { (prefix >> 1) - 1 } else { 0 }
 }
 
 /// Decoded `last_sig_coeff_*` element (one of X or Y; same shape for
@@ -2326,11 +2318,7 @@ pub fn split_transform_flag_ctx_inc(log2_trafo_size: u32) -> u32 {
 /// to context 1.
 #[must_use]
 pub fn cbf_luma_ctx_inc(trafo_depth: u32) -> u32 {
-    if trafo_depth == 0 {
-        1
-    } else {
-        0
-    }
+    if trafo_depth == 0 { 1 } else { 0 }
 }
 
 /// Shared `ctxInc` derivation for `cbf_cb` and `cbf_cr` (Table 9-48
@@ -2503,11 +2491,7 @@ pub fn inter_pred_idc_ctx_inc(bin_idx: u32, n_pb_w: u32, n_pb_h: u32, ct_depth: 
         // Bin 0 routes through CtDepth unless the PU is 8×4 or 4×8
         // (luma area 16 samples ⇒ nPbW + nPbH == 12), in which case
         // it shares the bin-1 context bank.
-        if n_pb_w + n_pb_h != 12 {
-            ct_depth
-        } else {
-            4
-        }
+        if n_pb_w + n_pb_h != 12 { ct_depth } else { 4 }
     } else {
         // Bin 1 — and the `na` entries `binIdx >= 2` — use ctx 4.
         // Table 9-47 caps the prefix at `cMax = 2` (one or two bins),
@@ -3446,11 +3430,7 @@ impl Greater1State {
     #[must_use]
     pub fn current_ctx_inc(&self, is_chroma: bool) -> u32 {
         let base = self.ctx_set * 4 + self.greater1_ctx.min(3);
-        if is_chroma {
-            base + 16
-        } else {
-            base
-        }
+        if is_chroma { base + 16 } else { base }
     }
 
     /// Current `ctxSet` value, exported for §9.3.4.2.7
@@ -3487,11 +3467,7 @@ impl Default for Greater1State {
 /// simply reads it off without further state plumbing.
 #[must_use]
 pub fn coeff_abs_level_greater2_flag_ctx_inc(ctx_set: u32, is_chroma: bool) -> u32 {
-    if is_chroma {
-        ctx_set + 4
-    } else {
-        ctx_set
-    }
+    if is_chroma { ctx_set + 4 } else { ctx_set }
 }
 
 /// Table 9-43 binarization shape for `coeff_abs_level_greater1_flag`
@@ -3528,11 +3504,7 @@ pub const SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2: [u8; 16] =
 #[must_use]
 pub fn sig_coeff_flag_sig_ctx_transform_skip(is_chroma: bool) -> u32 {
     // Eq. 9-40: sigCtx = (cIdx == 0) ? 42 : 16.
-    if is_chroma {
-        16
-    } else {
-        42
-    }
+    if is_chroma { 16 } else { 42 }
 }
 
 /// §9.3.4.2.5 second-branch sigCtx (equation 9-41) — used for the
@@ -3708,11 +3680,7 @@ pub fn sig_coeff_flag_sig_ctx_dc(is_chroma: bool, log2_trafo_size: u32, scan_idx
 /// ```
 #[must_use]
 pub fn sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx: u32, is_chroma: bool) -> u32 {
-    if is_chroma {
-        27 + sig_ctx
-    } else {
-        sig_ctx
-    }
+    if is_chroma { 27 + sig_ctx } else { sig_ctx }
 }
 
 /// Table 9-43 binarization shape for `sig_coeff_flag`: FL with
@@ -6148,8 +6116,8 @@ mod tests {
     #[test]
     fn coeff_abs_level_remaining_suffix_val_eq_9_28_subtracts_c_max() {
         let c_max = coeff_abs_level_remaining_c_max_eq_9_26(1); // 8
-                                                                // Below cMax: clamp at 0 (suffix is absent; caller checks the
-                                                                // prefix-escape flag before consuming it).
+        // Below cMax: clamp at 0 (suffix is absent; caller checks the
+        // prefix-escape flag before consuming it).
         assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(0, c_max), 0);
         assert_eq!(coeff_abs_level_remaining_suffix_val_eq_9_28(7, c_max), 0);
         // At cMax: suffix = 0 (escape boundary).

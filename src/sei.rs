@@ -706,7 +706,7 @@ fn decode_decoded_picture_hash(body: &[u8]) -> Result<DecodedPictureHash, SeiErr
             return Ok(DecodedPictureHash {
                 hash_type,
                 component_hashes,
-            })
+            });
         }
     };
     while off + per_component <= body.len() {

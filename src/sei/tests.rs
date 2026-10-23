@@ -533,7 +533,7 @@ mod hrd_sei {
         w.put_bits(0, 24); // au_cpb_removal_delay_delta_minus1
         w.put_bits(123_456, 24); // nal_initial_cpb_removal_delay[0]
         w.put_bits(7_890, 24); // nal_initial_cpb_removal_offset[0]
-                               // §D.3.1 payload alignment: bit_equal_to_one + zeros.
+        // §D.3.1 payload alignment: bit_equal_to_one + zeros.
         w.put_bit(1);
         w.align_zero();
         let body = w.finish();

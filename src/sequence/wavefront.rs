@@ -27,9 +27,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
-use super::{build_slice_data_params, split_substreams, Geometry, SegmentData, SequenceError};
+use super::{Geometry, SegmentData, SequenceError, build_slice_data_params, split_substreams};
 use crate::bitreader::BitReader;
-use crate::cabac::{init_type, CabacEngine};
+use crate::cabac::{CabacEngine, init_type};
 use crate::ctx_init::SliceContexts;
 use crate::deblock::SamplePlane;
 use crate::inter_recon::{
@@ -41,7 +41,7 @@ use crate::pps::PicParameterSet;
 use crate::recon::ReconParams;
 use crate::slice::SliceType;
 use crate::slice_data::{
-    decode_coding_tree_unit_in_picture, end_of_slice_segment_flag, PictureParseState,
+    PictureParseState, decode_coding_tree_unit_in_picture, end_of_slice_segment_flag,
 };
 use crate::sps::SeqParameterSet;
 
@@ -740,7 +740,7 @@ pub(crate) fn filter_picture_parallel(
     no_filter_map: Option<&crate::deblock::NoFilterMap<'_>>,
     workers: usize,
 ) -> Picture {
-    use crate::deblock::{deblock_rows_planes, EdgeType, QpMap};
+    use crate::deblock::{EdgeType, QpMap, deblock_rows_planes};
     let slice = inputs.slice;
     let params = inputs.params;
     let ctb = 1usize << slice.ctb_log2_size_y;
@@ -785,78 +785,80 @@ pub(crate) fn filter_picture_parallel(
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..workers.min(bounds.len() - 1) {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::AcqRel);
-                    if i >= bounds.len() - 1 {
-                        break;
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::AcqRel);
+                        if i >= bounds.len() - 1 {
+                            break;
+                        }
+                        let (r, l, c1, c2) = tasks.lock().unwrap_or_else(|e| e.into_inner())[i]
+                            .take()
+                            .expect("task taken once");
+                        let (y0, _) = (bounds[r], bounds[r + 1]);
+                        let mut luma = SamplePlane {
+                            samples: l,
+                            width: pw,
+                            stride: pw,
+                            y_origin: y0,
+                        };
+                        let mut cb = SamplePlane {
+                            samples: c1,
+                            width: cw,
+                            stride: cw,
+                            y_origin: y0 / sub_h,
+                        };
+                        let mut cr = SamplePlane {
+                            samples: c2,
+                            width: cw,
+                            stride: cw,
+                            y_origin: y0 / sub_h,
+                        };
+                        f(r, &mut luma, chroma.then_some((&mut cb, &mut cr)));
                     }
-                    let (r, l, c1, c2) = tasks.lock().unwrap_or_else(|e| e.into_inner())[i]
-                        .take()
-                        .expect("task taken once");
-                    let (y0, _) = (bounds[r], bounds[r + 1]);
-                    let mut luma = SamplePlane {
-                        samples: l,
-                        width: pw,
-                        stride: pw,
-                        y_origin: y0,
-                    };
-                    let mut cb = SamplePlane {
-                        samples: c1,
-                        width: cw,
-                        stride: cw,
-                        y_origin: y0 / sub_h,
-                    };
-                    let mut cr = SamplePlane {
-                        samples: c2,
-                        width: cw,
-                        stride: cw,
-                        y_origin: y0 / sub_h,
-                    };
-                    f(r, &mut luma, chroma.then_some((&mut cb, &mut cr)));
                 });
             }
         });
     };
 
-    if slice.deblock_enabled {
-        if let Some(dparams) = inputs.edges.params() {
-            let edges = inputs.edges;
-            // Pass 1: vertical edges, natural CTB-row chunks.
-            let bounds: Vec<usize> = (0..=h_ctbs).map(|r| (r * ctb).min(ph)).collect();
-            run_bands(&mut pic, &bounds, &|r, luma, chroma| {
-                deblock_rows_planes(
-                    luma,
-                    chroma,
-                    (pw, ph, cw, ch),
-                    edges,
-                    &dparams,
-                    qp_map,
-                    no_filter_map,
-                    EdgeType::Vertical,
-                    bounds_at(r, ctb, ph),
-                    bounds_at(r + 1, ctb, ph),
-                );
-            });
-            // Pass 2: horizontal edges; chunks start four luma rows
-            // (the p side of the first edge) early.
-            let bounds: Vec<usize> = (0..=h_ctbs)
-                .map(|r| if r == 0 { 0 } else { (r * ctb - 4).min(ph) })
-                .collect();
-            run_bands(&mut pic, &bounds, &|r, luma, chroma| {
-                deblock_rows_planes(
-                    luma,
-                    chroma,
-                    (pw, ph, cw, ch),
-                    edges,
-                    &dparams,
-                    qp_map,
-                    no_filter_map,
-                    EdgeType::Horizontal,
-                    bounds_at(r, ctb, ph),
-                    bounds_at(r + 1, ctb, ph),
-                );
-            });
-        }
+    if slice.deblock_enabled
+        && let Some(dparams) = inputs.edges.params()
+    {
+        let edges = inputs.edges;
+        // Pass 1: vertical edges, natural CTB-row chunks.
+        let bounds: Vec<usize> = (0..=h_ctbs).map(|r| (r * ctb).min(ph)).collect();
+        run_bands(&mut pic, &bounds, &|r, luma, chroma| {
+            deblock_rows_planes(
+                luma,
+                chroma,
+                (pw, ph, cw, ch),
+                edges,
+                &dparams,
+                qp_map,
+                no_filter_map,
+                EdgeType::Vertical,
+                bounds_at(r, ctb, ph),
+                bounds_at(r + 1, ctb, ph),
+            );
+        });
+        // Pass 2: horizontal edges; chunks start four luma rows
+        // (the p side of the first edge) early.
+        let bounds: Vec<usize> = (0..=h_ctbs)
+            .map(|r| if r == 0 { 0 } else { (r * ctb - 4).min(ph) })
+            .collect();
+        run_bands(&mut pic, &bounds, &|r, luma, chroma| {
+            deblock_rows_planes(
+                luma,
+                chroma,
+                (pw, ph, cw, ch),
+                edges,
+                &dparams,
+                qp_map,
+                no_filter_map,
+                EdgeType::Horizontal,
+                bounds_at(r, ctb, ph),
+                bounds_at(r + 1, ctb, ph),
+            );
+        });
     }
 
     // Pass 3: SAO. Save every CTB-row boundary's two lines (deblocked,
@@ -1149,27 +1151,29 @@ pub(super) fn decode_tiles(
         for _ in 0..workers.min(n_tiles) {
             let my_params = params.clone();
             let (merged, error, abort, next) = (&merged, &error, &abort, &next);
-            scope.spawn(move || loop {
-                let t = next.fetch_add(1, Ordering::AcqRel);
-                if t >= n_tiles || abort.load(Ordering::Acquire) {
-                    break;
-                }
-                match decode_tile(plan, inputs, &my_params, t) {
-                    Ok(band) => {
-                        merged.lock().unwrap_or_else(|e| e.into_inner()).merge_rect(
-                            band,
-                            with_motion,
-                            w_ctbs,
-                            1usize << geom.ctb_log2,
-                        );
-                    }
-                    Err(e) => {
-                        let mut slot = error.lock().unwrap_or_else(|e| e.into_inner());
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
-                        abort.store(true, Ordering::Release);
+            scope.spawn(move || {
+                loop {
+                    let t = next.fetch_add(1, Ordering::AcqRel);
+                    if t >= n_tiles || abort.load(Ordering::Acquire) {
                         break;
+                    }
+                    match decode_tile(plan, inputs, &my_params, t) {
+                        Ok(band) => {
+                            merged.lock().unwrap_or_else(|e| e.into_inner()).merge_rect(
+                                band,
+                                with_motion,
+                                w_ctbs,
+                                1usize << geom.ctb_log2,
+                            );
+                        }
+                        Err(e) => {
+                            let mut slot = error.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            abort.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
             });

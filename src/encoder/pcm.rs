@@ -401,8 +401,8 @@ pub(crate) fn write_ptl_layout(w: &mut BitWriter, level_idc: u8, still: bool, la
 /// `general_profile_space` / `general_tier_flag`.
 fn write_ptl_main_tail(w: &mut BitWriter, level_idc: u8, still: bool) {
     w.put_bits(if still { 3 } else { 1 }, 5); // general_profile_idc
-                                              // general_profile_compatibility_flag[0..32]: Main (1) is also
-                                              // decodable by Main 10 (2) decoders; a still adds flag 3.
+    // general_profile_compatibility_flag[0..32]: Main (1) is also
+    // decodable by Main 10 (2) decoders; a still adds flag 3.
     let mut compat: u32 = 0;
     compat |= 1 << (31 - 1); // flag[1] — Main
     compat |= 1 << (31 - 2); // flag[2] — Main 10
@@ -414,9 +414,9 @@ fn write_ptl_main_tail(w: &mut BitWriter, level_idc: u8, still: bool) {
     w.put_bit(0); // general_interlaced_source_flag
     w.put_bit(1); // general_non_packed_constraint_flag
     w.put_bit(1); // general_frame_only_constraint_flag
-                  // Compatibility flag 2 set: general_reserved_zero_7bits,
-                  // general_one_picture_only_constraint_flag,
-                  // general_reserved_zero_35bits (43 bits).
+    // Compatibility flag 2 set: general_reserved_zero_7bits,
+    // general_one_picture_only_constraint_flag,
+    // general_reserved_zero_35bits (43 bits).
     w.put_bits(0, 7);
     w.put_bit(u8::from(still)); // general_one_picture_only_constraint_flag
     w.put_bits(0, 32);
@@ -424,7 +424,7 @@ fn write_ptl_main_tail(w: &mut BitWriter, level_idc: u8, still: bool) {
     // Profile 1 / 3: general_inbld_flag = 0.
     w.put_bit(0);
     w.put_bits(u32::from(level_idc), 8); // general_level_idc
-                                         // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
+    // max_sub_layers_minus1 == 0: no sub-layer PTL syntax.
 }
 
 /// §7.3.2.1 — the minimal single-layer VPS with explicit `vps_max_dec_pic_buffering_minus1[0]` /
@@ -1117,7 +1117,7 @@ fn encode_au_wide(
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
     let segments = opts.segments;
-    if width == 0 || height == 0 || width % CTB != 0 || height % CTB != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(CTB) || !height.is_multiple_of(CTB) {
         return Err(PcmEncodeError::BadDimensions { width, height });
     }
     let total_ctbs = (width / CTB) * (height / CTB);
@@ -1276,9 +1276,9 @@ mod tests {
         assert_eq!(level_idc_for_dims(8000, 5000), 189); // 40 MP -> level 6.3
         assert_eq!(level_idc_for_dims(12000, 10000), 210); // 120 MP -> level 7
         assert_eq!(level_idc_for_dims(16000, 16000), 216); // beyond level 7's MaxLumaPs
-                                                           // 4096 x 64 = 262 144 samples fit level 3 (552 960) but the
-                                                           // width exceeds Sqrt( 552 960 * 8 ) = 2103; level 4 allows
-                                                           // Sqrt( 2 228 224 * 8 ) = 4222.
+        // 4096 x 64 = 262 144 samples fit level 3 (552 960) but the
+        // width exceeds Sqrt( 552 960 * 8 ) = 2103; level 4 allows
+        // Sqrt( 2 228 224 * 8 ) = 4222.
         assert_eq!(level_idc_for_dims(4096, 64), 120);
         assert_eq!(level_idc_for_dims(2048, 64), 90); // 131 072 samples, side 2048 <= 2103
     }

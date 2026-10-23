@@ -107,10 +107,11 @@ fn encoder_pads_unaligned_dimensions_and_rejects_zero() {
     );
     // Lossless PCM: the cropped luma is the source.
     let luma = out.plane(oxideav_h265::picture::Plane::Luma);
-    assert!(luma
-        .iter()
-        .enumerate()
-        .all(|(i, &v)| v == u16::from((i % 251) as u8)));
+    assert!(
+        luma.iter()
+            .enumerate()
+            .all(|(i, &v)| v == u16::from((i % 251) as u8))
+    );
 
     for (w, h) in [(0u32, 32u32), (50, 0)] {
         let mut params = CodecParameters::video("h265".into());

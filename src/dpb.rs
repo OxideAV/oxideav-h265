@@ -424,10 +424,12 @@ impl Dpb {
         );
         let mut list0 = apply_list_modification(&temp0, active0, params.list_entry_l0);
         // Equation 8-9 closing clause.
-        if params.curr_pic_ref_enabled && params.list_entry_l0.is_none() && num_temp0 > active0 {
-            if let Some(last) = list0.last_mut() {
-                *last = Some(CURR_PIC);
-            }
+        if params.curr_pic_ref_enabled
+            && params.list_entry_l0.is_none()
+            && num_temp0 > active0
+            && let Some(last) = list0.last_mut()
+        {
+            *last = Some(CURR_PIC);
         }
 
         let list1 = if params.is_b {
@@ -879,7 +881,7 @@ mod tests {
         let mut dpb = Dpb::new();
         dpb.insert(entry(0, Marking::ShortTerm)); // index 0 (past)
         dpb.insert(entry(4, Marking::ShortTerm)); // index 1 (future)
-                                                  // Current POC 2; list0 references the past pic only ⇒ no backward.
+        // Current POC 2; list0 references the past pic only ⇒ no backward.
         let past_only = RefPicLists {
             list0: vec![Some(0)],
             list1: None,

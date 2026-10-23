@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use oxideav_h265::decode_annexb_sequence;
 use oxideav_h265::nal::NalIter;
 use oxideav_h265::picture::Plane;
-use oxideav_h265::sei::{parse_sei_rbsp, PictureHash, SeiNalType, SeiPayload};
+use oxideav_h265::sei::{PictureHash, SeiNalType, SeiPayload, parse_sei_rbsp};
 
 /// RFC 1321 MD5 (self-contained; used only to check decoded output
 /// against the published conformance digests).
@@ -58,7 +58,7 @@ mod md5 {
         }
         msg.extend_from_slice(&bit_len.to_le_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0 {
             let mut m = [0u32; 16];
             for (i, w) in m.iter_mut().enumerate() {
                 *w = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());

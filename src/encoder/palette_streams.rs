@@ -82,7 +82,7 @@ fn write_sps_scc(width: usize, height: usize, level_idc: u8, initializers: &[[u1
     w.put_bit(0); // sps_3d_extension_flag
     w.put_bit(1); // sps_scc_extension_flag
     w.put_bits(0, 4); // sps_extension_4bits
-                      // sps_scc_extension() — §7.3.2.2.3.
+    // sps_scc_extension() — §7.3.2.2.3.
     w.put_bit(0); // sps_curr_pic_ref_enabled_flag
     w.put_bit(1); // palette_mode_enabled_flag
     w.ue(PALETTE_MAX_SIZE); // palette_max_size
@@ -92,7 +92,7 @@ fn write_sps_scc(width: usize, height: usize, level_idc: u8, initializers: &[[u1
     } else {
         w.put_bit(1); // sps_palette_predictor_initializers_present_flag
         w.ue(initializers.len() as u32 - 1); // sps_num_..._minus1
-                                             // §7.3.2.2.3: component-major, u(BitDepth) each (8 bits here).
+        // §7.3.2.2.3: component-major, u(BitDepth) each (8 bits here).
         for c in 0..3 {
             for e in initializers {
                 w.put_bits(u32::from(e[c]), 8);
@@ -295,18 +295,10 @@ fn encode_palette_cu(
             // run-1 then reuse; the value 1 is the terminator, so a
             // gap of exactly one entry is encoded as run = 2, etc.
             let wire = if emitted == 0 {
-                if i == 0 {
-                    0
-                } else {
-                    i as u32 + 1
-                }
+                if i == 0 { 0 } else { i as u32 + 1 }
             } else {
                 let gap = (i as i64 - last - 1) as u32;
-                if gap == 0 {
-                    0
-                } else {
-                    gap + 1
-                }
+                if gap == 0 { 0 } else { gap + 1 }
             };
             let _ = run;
             encode_eg0(cabac, w, wire);

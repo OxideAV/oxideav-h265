@@ -572,7 +572,7 @@ mod tests {
                 }
             }
         }
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(0);
         }
         let mut bytes = Vec::with_capacity(bits.len() / 8);

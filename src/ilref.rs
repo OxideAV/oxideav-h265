@@ -28,7 +28,7 @@
 //! reported as unsupported by the driver.
 
 use crate::motion::{MotionCell, MotionField};
-use crate::picture::{sub_wh_c, Picture, Plane};
+use crate::picture::{Picture, Plane, sub_wh_c};
 use crate::pps::RefLocOffset;
 
 /// Table H.1 — 16-phase luma resampling filter `fL[ p ][ x ]`.

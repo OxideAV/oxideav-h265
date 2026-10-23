@@ -33,9 +33,9 @@ use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
 use crate::intra_pred::{
-    intra_predict_with_substitution, Component as PredComponent, IntraPredParams,
+    Component as PredComponent, IntraPredParams, intra_predict_with_substitution,
 };
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 
 /// One picture's `(Y, Cb, Cr)` planes (all full-resolution — 4:4:4).
 pub(super) type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -95,12 +95,12 @@ fn write_ptl_rext_444(w: &mut BitWriter, level_idc: u8) {
     w.put_bit(0); // general_intra_constraint_flag
     w.put_bit(0); // general_one_picture_only_constraint_flag
     w.put_bit(0); // general_lower_bit_rate_constraint_flag
-                  // general_reserved_zero_34bits
+    // general_reserved_zero_34bits
     w.put_bits(0, 32);
     w.put_bits(0, 2);
     w.put_bit(0); // general_inbld_flag (reserved zero)
     w.put_bits(level_idc as u32, 8); // general_level_idc
-                                     // sps_max_sub_layers_minus1 == 0: no sub-layer flags, no bytes.
+    // sps_max_sub_layers_minus1 == 0: no sub-layer flags, no bytes.
 }
 
 /// §7.3.2.1 — minimal single-layer VPS carrying the 4:4:4 Rext PTL.
@@ -207,8 +207,8 @@ fn write_pps_ccp() -> Vec<u8> {
     w.put_bit(0); // pps_3d_extension_flag
     w.put_bit(0); // pps_scc_extension_flag
     w.put_bits(0, 4); // pps_extension_4bits
-                      // pps_range_extension() — §7.3.2.3.2 (transform_skip disabled ⇒ no
-                      // log2_max_transform_skip_block_size_minus2).
+    // pps_range_extension() — §7.3.2.3.2 (transform_skip disabled ⇒ no
+    // log2_max_transform_skip_block_size_minus2).
     w.put_bit(1); // cross_component_prediction_enabled_flag
     w.put_bit(0); // chroma_qp_offset_list_enabled_flag
     w.ue(0); // log2_sao_offset_scale_luma

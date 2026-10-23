@@ -23,7 +23,7 @@ use oxideav_h265::encoder::loopfilter::LoopFilterCfg;
 use oxideav_h265::encoder::pyramid::PyramidEncoder;
 use oxideav_h265::encoder::rate::RateControlCfg;
 use oxideav_h265::hrd::HrdCommonInfo;
-use oxideav_h265::sei::{parse_sei_rbsp, BufferingPeriodSei, PicTimingSei, SeiNalType};
+use oxideav_h265::sei::{BufferingPeriodSei, PicTimingSei, SeiNalType, parse_sei_rbsp};
 use oxideav_h265::sps::SeqParameterSet;
 use oxideav_h265::{collect_nal_units, decode_annexb_sequence, make_encoder};
 

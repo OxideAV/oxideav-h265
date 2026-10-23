@@ -34,15 +34,15 @@ use crate::cabac::init_type;
 use crate::ctx_init::SliceContexts;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
-use crate::encoder::ccp_streams::{extract, ip_params_444, source_planes_444, Planes};
+use crate::encoder::ccp_streams::{Planes, extract, ip_params_444, source_planes_444};
 use crate::encoder::intra::{gather_refs, zscan_avail};
 use crate::encoder::nal::{annexb, nal_unit};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
-use crate::intra_pred::{intra_predict_with_substitution, Component as PredComponent};
+use crate::intra_pred::{Component as PredComponent, intra_predict_with_substitution};
 use crate::motion::MotionField;
-use crate::pu_mv::{resolve_pu_motion, PartMode, PuGeometry, PuMvContext};
-use crate::residual::{residual_coding_scan_idx, ResidualCodingParams};
+use crate::pu_mv::{PartMode, PuGeometry, PuMvContext, resolve_pu_motion};
+use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
 use crate::slice_data::PredictionUnit;
 
 /// CTB / coding-block log2 size (16x16, `MinCbSizeY == CtbSizeY`).
@@ -76,7 +76,7 @@ fn write_ptl_scc(w: &mut BitWriter, level_idc: u8, chroma444: bool) {
     w.put_bit(0); // general_one_picture_only_constraint_flag
     w.put_bit(0); // general_lower_bit_rate_constraint_flag
     w.put_bit(1); // general_max_14bit_constraint_flag
-                  // general_reserved_zero_33bits
+    // general_reserved_zero_33bits
     w.put_bits(0, 32);
     w.put_bit(0);
     w.put_bit(0); // general_inbld_flag (reserved zero)
@@ -157,7 +157,7 @@ fn write_sps_scc(
     w.put_bit(0); // sps_3d_extension_flag
     w.put_bit(1); // sps_scc_extension_flag
     w.put_bits(0, 4); // sps_extension_4bits
-                      // sps_scc_extension() — §7.3.2.2.3.
+    // sps_scc_extension() — §7.3.2.2.3.
     w.put_bit(u8::from(curr_pic_ref)); // sps_curr_pic_ref_enabled_flag
     w.put_bit(0); // palette_mode_enabled_flag
     w.put_bits(0, 2); // motion_vector_resolution_control_idc
@@ -297,7 +297,7 @@ fn act_plan(ctb: usize) -> (u8, bool, i32, i32) {
     const SCALES: [i32; 5] = [0, 1, -2, 4, -8];
     (
         MODES[ctb % MODES.len()],
-        ctb % 2 == 0,
+        ctb.is_multiple_of(2),
         SCALES[ctb % SCALES.len()],
         SCALES[(ctb + 2) % SCALES.len()],
     )
@@ -522,7 +522,7 @@ fn encode_ibc_p_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usiz
     w.ue(1); // slice_type = P
     w.put_bit(0); // num_ref_idx_active_override_flag (1 active ref)
     w.ue(4); // five_minus_max_num_merge_cand (MaxNumMergeCand = 1)
-             // use_integer_mv_flag absent (motion_vector_resolution_control_idc 0)
+    // use_integer_mv_flag absent (motion_vector_resolution_control_idc 0)
     w.se(0); // slice_qp_delta
     w.rbsp_trailing_bits(); // byte_alignment()
 
@@ -706,17 +706,17 @@ fn encode_ibc_p_slice(y: &[u8], cb: &[u8], cr: &[u8], width: usize, height: usiz
             assert_eq!(merge_probe.mv_l0, target, "A1 merge must copy the IBC MV");
             assert!(any_res, "merge (non-skip) TU needs a coded residual");
             cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 1); // merge
-                                                                       // merge_idx absent (MaxNumMergeCand == 1); rqt_root_cbf
-                                                                       // inferred 1 for a 2Nx2N merge CU.
+            // merge_idx absent (MaxNumMergeCand == 1); rqt_root_cbf
+            // inferred 1 for a 2Nx2N merge CU.
             emit_tu_420(
                 &mut w, &mut cabac, &mut ctxs, &res_l, &res_cb, &res_cr, false, 0,
             );
         } else {
             cabac.encode_decision(&mut w, &mut ctxs.merge_flag[0], 0); // AMVP
-                                                                       // ref_idx_l0 absent (one active reference).
+            // ref_idx_l0 absent (one active reference).
             encode_mvd_pair(&mut w, &mut cabac, &mut ctxs, mvd);
             cabac.encode_decision(&mut w, &mut ctxs.mvp_flag[0], 0); // mvp_l0_flag
-                                                                     // rqt_root_cbf (non-merge inter CU).
+            // rqt_root_cbf (non-merge inter CU).
             cabac.encode_decision(&mut w, &mut ctxs.rqt_root_cbf[0], u8::from(any_res));
             if any_res {
                 emit_tu_420(
