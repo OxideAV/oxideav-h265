@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-h265/compare/v0.0.15...v0.0.16) - 2026-10-24
+
+### Added
+
+- *(encoder)* set_bit_rate retargets a rate-controlled stream mid-sequence
+- *(encoder)* forced keyframes, non-reference pictures, layer QP offsets, explicit level/tier
+- *(encoder)* speed-first quadtree decisions (TreeCfg::with_speed)
+- *(encoder)* inter coding on every lossy HEIC layout — Main 10 / 4:2:0 12 / 4:2:2 / 4:4:4 / monochrome P, B and pyramid GOPs, byte-exact against a black-box decoder
+
+### Fixed
+
+- *(decoder)* name the missing reference instead of InterNotSupported
+- fixup for #18: CHANGELOG entries for the speed-first decisions, stream controls and the VPS DPB-bound fix
+- *(encoder)* the VPS signals the SPS's DPB bounds
+- fixup for #16: CHANGELOG entry for the inter CU intra-flag window
+- *(decoder)* HEIF conformance stills decode — bitstream_restriction bounds carried as coded (§E.1) and reported; non-base SPS before its VPS deferred, not refused
+
+### Other
+
+- *(encoder)* rustfmt + clippy on the speed-first decisions and their tests
+- snapshot only the CU's bordering intra flags for availability
+- edition 2024, MSRV 1.95
+- *(changelog)* note the round-479 fuzz seeds and campaigns
+- *(fuzz)* seed parse_annexb / hvcc_decode with the HEIF still's out-of-range VUI and an SPS-before-VPS layered record
+- *(encoder)* per-worker row-window state for the WPP wavefront — 12 MP encode 390 → 314 MiB on 8 workers, output bytes identical
+
 ### Changed
 
 - edition 2024, MSRV 1.95
