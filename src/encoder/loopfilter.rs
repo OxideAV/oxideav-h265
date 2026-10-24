@@ -218,6 +218,9 @@ pub(crate) struct FilterInput<'a, S: Sample = u8> {
     /// §7.3.8.3 `sao_merge_left/up_flag` candidates exist only inside
     /// the CTB's tile. `None` = a single tile.
     pub tile_ids: Option<&'a [u32]>,
+    /// Elect the slice β / tC offsets over the {−2, 0, 2}² sweep;
+    /// `false` measures only the zero offsets against filtering off.
+    pub deblock_sweep: bool,
 }
 
 /// The quadtree coder's deblocking inputs (see [`FilterInput::tree`]).
@@ -800,8 +803,9 @@ pub(crate) fn filter_frame<S: Sample>(
         // (override group: ~3 bits + the two se(v) fields).
         let mut best_pic = pre.clone();
         let mut best_cost = ssd(&pre) + input.lambda;
-        for beta in [-2i32, 0, 2] {
-            for tc in [-2i32, 0, 2] {
+        let offsets: &[i32] = if input.deblock_sweep { &[-2, 0, 2] } else { &[0] };
+        for &beta in offsets {
+            for &tc in offsets {
                 let mut filtered = pre.clone();
                 match &input.tree {
                     None => {
@@ -1398,6 +1402,7 @@ mod tests {
             ctb_log2: 4,
             tree: None,
             tile_ids: None,
+            deblock_sweep: true,
         };
         let out = filter_frame(&input, &LoopFilterCfg::all());
         assert!(out.slice_sao_luma || out.slice_sao_chroma, "SAO elected");
@@ -1481,6 +1486,7 @@ mod tests {
             ctb_log2: 4,
             tree: None,
             tile_ids: None,
+            deblock_sweep: true,
         };
         let cfg = LoopFilterCfg {
             deblocking: true,

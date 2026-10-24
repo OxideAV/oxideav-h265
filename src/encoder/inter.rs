@@ -144,6 +144,9 @@ pub struct WideRecon {
     /// The picture's decoded motion field (see
     /// [`FrameRecon::motion_field`]).
     pub motion_field: Option<MotionField>,
+    /// The half-sample planes the speed-first motion search reads,
+    /// built on first use as a reference.
+    pub(crate) halfpel: std::sync::OnceLock<std::sync::Arc<crate::encoder::ctu::HalfPel>>,
 }
 
 impl WideRecon {
@@ -169,6 +172,7 @@ impl WideRecon {
             cb: crate::encoder::ctu::widen(&cb),
             cr: crate::encoder::ctu::widen(&cr),
             motion_field: None,
+            halfpel: std::sync::OnceLock::new(),
         }
     }
 }
@@ -976,6 +980,7 @@ impl LowDelayPEncoder {
                         cb: idr.recon_cb,
                         cr: idr.recon_cr,
                         motion_field: None,
+                        halfpel: std::sync::OnceLock::new(),
                     },
                 )
             };
@@ -1396,7 +1401,7 @@ pub(crate) fn merge_pu(merge_idx: usize) -> PredictionUnit {
 /// An AMVP PU carrying the given per-list signalling groups (the
 /// §7.3.8.6 fields the §8.5.3.2 derivation reads). At least one list
 /// must be used; `inter_pred_idc` follows from which are.
-fn amvp_pu(l0: Option<AmvpGroup>, l1: Option<AmvpGroup>) -> PredictionUnit {
+pub(crate) fn amvp_pu(l0: Option<AmvpGroup>, l1: Option<AmvpGroup>) -> PredictionUnit {
     let comp = |v: i32| MvdComponent {
         greater0_flag: u8::from(v != 0),
         greater1_flag: None,
@@ -1425,7 +1430,7 @@ fn amvp_pu(l0: Option<AmvpGroup>, l1: Option<AmvpGroup>) -> PredictionUnit {
 
 /// A single-list [`amvp_pu`] probe (zero or explicit mvd) for the
 /// §8.5.3.2.6 predictor derivation and the ME resolution step.
-fn amvp_pu_list(list: usize, ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUnit {
+pub(crate) fn amvp_pu_list(list: usize, ref_idx: u8, mvd: Mv, mvp_flag: u8) -> PredictionUnit {
     let g = Some(AmvpGroup {
         ref_idx,
         mvd,
@@ -1581,6 +1586,9 @@ fn uni_l0(mv: Mv) -> PuMotion {
 /// The previous frame's reconstruction as `i32` planes (the
 /// §8.5.3.3.3 interpolation input).
 pub(crate) struct RefPlanes<'a> {
+    /// The reconstruction's lazily built half-sample planes (`None`
+    /// for derived planes such as weighted-prediction luma copies).
+    pub(crate) halfpel: Option<&'a std::sync::OnceLock<std::sync::Arc<crate::encoder::ctu::HalfPel>>>,
     pub(crate) y: &'a [u16],
     pub(crate) cb: &'a [u16],
     pub(crate) cr: &'a [u16],
@@ -1607,6 +1615,7 @@ impl<'a> RefPlanes<'a> {
     /// Borrow a reconstruction's planes.
     pub(crate) fn of(rec: &'a WideRecon, width: usize, height: usize, fmt: SampleFmt) -> Self {
         Self {
+            halfpel: Some(&rec.halfpel),
             y: &rec.y,
             cb: &rec.cb,
             cr: &rec.cr,
@@ -3013,6 +3022,7 @@ fn encode_inter_slice_legacy(
                 ctb_log2: 4,
                 tree: None,
                 tile_ids: None,
+                deblock_sweep: true,
             },
             lf,
         );

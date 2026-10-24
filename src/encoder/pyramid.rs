@@ -779,6 +779,7 @@ impl PyramidEncoder {
                                 cb: idr.recon_cb,
                                 cr: idr.recon_cr,
                                 motion_field: None,
+                                halfpel: std::sync::OnceLock::new(),
                             },
                         ))
                     }

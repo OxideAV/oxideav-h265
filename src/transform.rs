@@ -269,7 +269,7 @@ pub fn scale_coefficients(
 /// §8.6.4.2 equation 8-316 — the `trType == 1` 4x4 alternate (DST-VII)
 /// transform matrix, `transMatrix[ i ][ j ]`, row-major.
 #[rustfmt::skip]
-const DST4: [[i32; 4]; 4] = [
+pub(crate) const DST4: [[i32; 4]; 4] = [
     [29,  55,  74,  84],
     [74,  74,   0, -74],
     [84, -29, -74,  55],
@@ -281,7 +281,7 @@ const DST4: [[i32; 4]; 4] = [
 /// row-major. The smaller 4 / 8 / 16 transforms subsample column `n`
 /// at stride `1 << ( 5 − log2( nTbS ) )` per equation 8-317.
 #[rustfmt::skip]
-const DCT32: [[i32; 32]; 32] = [
+pub(crate) const DCT32: [[i32; 32]; 32] = [
     [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],
     [90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90],
     [90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90],

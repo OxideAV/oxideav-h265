@@ -1146,6 +1146,7 @@ pub(crate) fn encode_idr_intra_au_full(
                 ctb_log2: 4,
                 tree: None,
                 tile_ids: None,
+                deblock_sweep: true,
             },
             lf,
         );

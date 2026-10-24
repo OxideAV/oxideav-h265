@@ -282,6 +282,7 @@ pub(crate) fn with_luma<'r>(planes: &'r [Vec<u16>], refs: &[RefPlanes<'r>]) -> V
         .iter()
         .zip(refs)
         .map(|(y, r)| RefPlanes {
+            halfpel: None,
             y,
             cb: r.cb,
             cr: r.cr,

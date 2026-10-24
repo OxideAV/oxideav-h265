@@ -81,6 +81,10 @@ use crate::scan::ScanIdx;
 use crate::slice_data::SaoCtbParams;
 use crate::transform::{BlockParams, Component, PredMode, forward_dst4_1d, residual_block};
 
+mod fast;
+mod fast_dsp;
+pub(crate) use fast_dsp::HalfPel;
+
 /// `MaxNumMergeCand` (§7.4.7.1) — `five_minus_max_num_merge_cand = 0`.
 const MAX_MERGE: usize = 5;
 /// The z-order offsets of the four quadrants of a split node.
@@ -135,6 +139,12 @@ pub struct TreeCfg {
     /// 2 above, plus the most-probable mode) each coded for real
     /// through the RD-elected RQT, the cheapest kept.
     pub intra_rd: u8,
+    /// Decision speed: 0 = the rate-distortion search below; 1 = the
+    /// speed-first decisions of [`fast`] (32 / 16 / 8 CUs with one
+    /// TU each, SATD-pruned candidates, a single deblocking pass at
+    /// zero offsets). 4:2:0 pictures only; other layouts keep the
+    /// search.
+    pub speed: u8,
 }
 
 /// A tile grid for [`TreeCfg`]: uniform spacing, or explicit
@@ -248,7 +258,20 @@ impl TreeCfg {
             wpp: false,
             tiles: TileLayout::single(),
             intra_rd: 0,
+            speed: 0,
         })
+    }
+
+    /// Select the decision speed (see [`Self::speed`]); speed 1 also
+    /// sets both residual-quadtree depths to 0 (one TU per CU).
+    #[must_use]
+    pub fn with_speed(mut self, speed: u8) -> Self {
+        self.speed = speed.min(1);
+        if self.speed > 0 {
+            self.th_depth_intra = 0;
+            self.th_depth_inter = 0;
+        }
+        self
     }
 
     /// Switch wavefront parallel processing signalling on / off.
@@ -721,6 +744,7 @@ impl ReconPlanes {
             cb: self.cb,
             cr: self.cr,
             motion_field: None,
+            halfpel: std::sync::OnceLock::new(),
         }
     }
 }
@@ -3012,6 +3036,9 @@ fn code_quadtree(
     depth: u32,
     ctb_qp: i32,
 ) -> (CuNode, u64) {
+    if ctx.cfg.speed > 0 && ctx.fmt.chroma_format_idc == 1 {
+        return fast::code_quadtree(ctx, st, x0, y0, log2, depth, ctb_qp);
+    }
     let n = 1usize << log2;
     let fits = x0 + n <= ctx.width && y0 + n <= ctx.height;
     let min_cb = ctx.cfg.min_cb_log2();
@@ -4425,6 +4452,7 @@ fn code_picture(
                     w_cells: walk.w_cells,
                 }),
                 tile_ids: tile_ids.as_deref(),
+                deblock_sweep: ctx.cfg.speed == 0,
             },
             lf,
         );
