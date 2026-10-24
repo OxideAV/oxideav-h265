@@ -1563,15 +1563,12 @@ pub(crate) fn assemble_idr_au(
     let level_idc = cfg
         .level_idc
         .unwrap_or_else(|| level_idc_for_dims(width, height));
-    // The reorder-free streams keep the historical VPS bounds (1, 0)
-    // so every golden pin stays byte-stable; a reordering
-    // (hierarchical-B) stream signals its honest DPB bounds, a still
-    // its one-picture DPB and profile.
+    // The VPS signals the SPS's DPB bounds (§7.4.3.2.1: an SPS bound
+    // never exceeds its VPS's); a still its one-picture DPB and
+    // profile.
     let layout = cfg.fmt.layout();
     let vps = if cfg.still {
         write_vps_layout(level_idc, cfg.high_tier, 0, 0, true, cfg.ids.vps, layout)
-    } else if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
-        write_vps_layout(level_idc, cfg.high_tier, 1, 0, false, cfg.ids.vps, layout)
     } else {
         write_vps_layout(
             level_idc,
