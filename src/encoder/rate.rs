@@ -179,6 +179,17 @@ impl RateController {
         }
     }
 
+    /// Retarget to `bits_per_second` at `fps_num / fps_den`: the
+    /// per-frame budget and the leaky bucket's bound follow, the
+    /// complexity model and QP history carry over (the next election
+    /// moves within its usual excursion window).
+    pub(crate) fn set_bit_rate(&mut self, bits_per_second: u64, fps_num: u32, fps_den: u32) {
+        let (num, den) = (u64::from(fps_num.max(1)), u64::from(fps_den.max(1)));
+        self.target = ((bits_per_second.saturating_mul(den) / num).max(64)) as i64;
+        self.buffer_cap = (bits_per_second.max(64)).min(i64::MAX as u64) as i64;
+        self.buffer = self.buffer.clamp(-self.buffer_cap, self.buffer_cap);
+    }
+
     /// The bit budget the most recent [`Self::pick_qp`] aimed at
     /// (`None` before the first election) — the frame allocation the
     /// quadtree coder's CTU-level feedback tracks inside the picture.

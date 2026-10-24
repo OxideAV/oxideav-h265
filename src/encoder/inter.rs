@@ -581,6 +581,17 @@ impl LowDelayPEncoder {
         self
     }
 
+    /// Change the average-bitrate target of a rate-controlled stream
+    /// from the next coded picture on (no effect without
+    /// [`Self::with_rate_control`]; a signalled HRD schedule keeps its
+    /// configured rate).
+    pub fn set_bit_rate(&mut self, bits_per_second: u64) {
+        if let (Some(rc), Some(cfg)) = (&mut self.rc, &mut self.rc_cfg) {
+            cfg.bits_per_second = bits_per_second;
+            rc.set_bit_rate(bits_per_second, cfg.fps_num, cfg.fps_den);
+        }
+    }
+
     /// Signal `general_level_idc` / `general_tier_flag` explicitly
     /// (the caller vouches for the stream meeting that level; by
     /// default the level is the smallest admitting the picture size,
