@@ -286,6 +286,11 @@ pub(crate) struct SpsCfg {
     /// quadtree intra coder quantizes and deblocks its chroma at it —
     /// 0 everywhere else).
     pub chroma_qp_offset: i32,
+    /// `general_level_idc` to signal (`None` = the smallest level
+    /// whose picture-size bounds admit the dimensions).
+    pub level_idc: Option<u8>,
+    /// `general_tier_flag` (High tier).
+    pub high_tier: bool,
 }
 
 impl SpsCfg {
@@ -309,6 +314,8 @@ impl SpsCfg {
             ids: ParameterSetIds::default(),
             fmt: crate::encoder::sample::SampleFmt::YUV420_8,
             chroma_qp_offset: 0,
+            level_idc: None,
+            high_tier: false,
         }
     }
 }
@@ -343,7 +350,7 @@ pub(crate) fn write_sps_cfg(
     w.put_bits(u32::from(cfg.ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl_layout(&mut w, level_idc, cfg.still, cfg.fmt.layout());
+    write_ptl_layout(&mut w, level_idc, cfg.high_tier, cfg.still, cfg.fmt.layout());
     w.ue(u32::from(cfg.ids.sps)); // sps_seq_parameter_set_id
     w.ue(u32::from(cfg.fmt.chroma_format_idc)); // chroma_format_idc
     if cfg.fmt.chroma_format_idc == 3 {
@@ -1547,19 +1554,20 @@ pub(crate) fn assemble_idr_au(
     lf: &LoopFilterCfg,
     slice_rbsp: &[u8],
 ) -> Vec<u8> {
-    let level_idc = level_idc_for_dims(width, height);
+    let level_idc = cfg.level_idc.unwrap_or_else(|| level_idc_for_dims(width, height));
     // The reorder-free streams keep the historical VPS bounds (1, 0)
     // so every golden pin stays byte-stable; a reordering
     // (hierarchical-B) stream signals its honest DPB bounds, a still
     // its one-picture DPB and profile.
     let layout = cfg.fmt.layout();
     let vps = if cfg.still {
-        write_vps_layout(level_idc, 0, 0, true, cfg.ids.vps, layout)
+        write_vps_layout(level_idc, cfg.high_tier, 0, 0, true, cfg.ids.vps, layout)
     } else if cfg.max_num_reorder_pics == 0 && cfg.max_dec_pic_buffering_minus1 <= 2 {
-        write_vps_layout(level_idc, 1, 0, false, cfg.ids.vps, layout)
+        write_vps_layout(level_idc, cfg.high_tier, 1, 0, false, cfg.ids.vps, layout)
     } else {
         write_vps_layout(
             level_idc,
+            cfg.high_tier,
             cfg.max_dec_pic_buffering_minus1,
             cfg.max_num_reorder_pics,
             false,

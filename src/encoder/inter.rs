@@ -433,6 +433,9 @@ pub struct LowDelayPEncoder {
     video_signal: Option<crate::encoder::intra::VideoSignal>,
     /// Parameter-set ids ([`Self::with_parameter_set_ids`]).
     ids: crate::encoder::intra::ParameterSetIds,
+    /// Signalled `(general_level_idc, general_tier_flag)`
+    /// ([`Self::with_level`]; `None` = derived from the dimensions).
+    level: Option<(u8, bool)>,
 }
 
 impl LowDelayPEncoder {
@@ -476,6 +479,7 @@ impl LowDelayPEncoder {
             conformance_window: None,
             video_signal: None,
             ids: crate::encoder::intra::ParameterSetIds::default(),
+            level: None,
         })
     }
 
@@ -575,6 +579,22 @@ impl LowDelayPEncoder {
     pub fn with_parameter_set_ids(mut self, ids: crate::encoder::intra::ParameterSetIds) -> Self {
         self.ids = ids;
         self
+    }
+
+    /// Signal `general_level_idc` / `general_tier_flag` explicitly
+    /// (the caller vouches for the stream meeting that level; by
+    /// default the level is the smallest admitting the picture size,
+    /// Main tier).
+    #[must_use]
+    pub fn with_level(mut self, level_idc: u8, high_tier: bool) -> Self {
+        self.level = Some((level_idc, high_tier));
+        self
+    }
+
+    /// Code the next frame as an IDR access unit (a new coded video
+    /// sequence; the following frames reference only it).
+    pub fn force_keyframe(&mut self) {
+        self.poc = 0;
     }
 
     /// [`Self::with_threads`] on a constructed encoder.
@@ -941,6 +961,8 @@ impl LowDelayPEncoder {
                 ids: self.ids,
                 fmt: self.fmt,
                 chroma_qp_offset: 0,
+                level_idc: self.level.map(|(l, _)| l),
+                high_tier: self.level.is_some_and(|(_, t)| t),
             };
             // The 8-bit 4:2:0 picture keeps the historical entry (its
             // streams are byte-pinned); every other layout codes

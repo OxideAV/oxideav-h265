@@ -260,6 +260,21 @@ pub struct PyramidEncoder {
     video_signal: Option<crate::encoder::intra::VideoSignal>,
     /// Parameter-set ids ([`Self::with_parameter_set_ids`]).
     ids: crate::encoder::intra::ParameterSetIds,
+    /// Signalled `(general_level_idc, general_tier_flag)`
+    /// ([`Self::with_level`]).
+    level: Option<(u8, bool)>,
+    /// Per-layer QP offsets ([`Self::with_layer_qp_offsets`]; `None`
+    /// = `layer * layer_qp_step`).
+    layer_qp_offsets: Option<Vec<i32>>,
+    /// Mark pictures no later picture references as TRAIL_N
+    /// ([`Self::with_non_reference_pictures`]).
+    non_ref: bool,
+    /// The next pushed frame starts a new coded video sequence
+    /// ([`Self::force_keyframe`]).
+    force_idr: bool,
+    /// Display index of the current coded video sequence's IDR
+    /// (`PicOrderCntVal` counts from it).
+    display_base: usize,
     /// Running mean absolute inter-frame luma difference (Q4) of the
     /// non-cut frame pairs seen so far — the scene-cut baseline.
     mad_avg_q4: Option<u64>,
@@ -319,6 +334,11 @@ impl PyramidEncoder {
             conformance_window: None,
             video_signal: None,
             ids: crate::encoder::intra::ParameterSetIds::default(),
+            level: None,
+            layer_qp_offsets: None,
+            non_ref: false,
+            force_idr: false,
+            display_base: 0,
         })
     }
 
@@ -407,6 +427,42 @@ impl PyramidEncoder {
     pub fn with_parameter_set_ids(mut self, ids: crate::encoder::intra::ParameterSetIds) -> Self {
         self.ids = ids;
         self
+    }
+
+    /// Signal `general_level_idc` / `general_tier_flag` explicitly
+    /// (see [`crate::encoder::inter::LowDelayPEncoder::with_level`]).
+    #[must_use]
+    pub fn with_level(mut self, level_idc: u8, high_tier: bool) -> Self {
+        self.level = Some((level_idc, high_tier));
+        self
+    }
+
+    /// Per-layer slice QP offsets: a slice on pyramid layer `l` codes
+    /// at `base + offsets[min(l, len − 1)]` (replacing the linear
+    /// [`Self::with_layer_qp_step`] ladder; `offsets[0]` applies to
+    /// the anchors).
+    #[must_use]
+    pub fn with_layer_qp_offsets(mut self, offsets: &[i32]) -> Self {
+        self.layer_qp_offsets = (!offsets.is_empty()).then(|| offsets.to_vec());
+        self
+    }
+
+    /// Code every picture that no later picture references (the
+    /// deepest pyramid layer) as a sub-layer non-reference picture
+    /// (`TRAIL_N`), dropped from the DPB once output; off by default
+    /// (every slice `TRAIL_R`).
+    #[must_use]
+    pub fn with_non_reference_pictures(mut self, on: bool) -> Self {
+        self.non_ref = on;
+        self
+    }
+
+    /// Start a new coded video sequence at the next pushed frame: the
+    /// frames buffered so far are coded first as a shorter mini-GOP
+    /// (returned by that [`Self::encode_frame`] call ahead of the
+    /// IDR), then the frame itself as an IDR.
+    pub fn force_keyframe(&mut self) {
+        self.force_idr = true;
     }
 
     /// [`Self::with_threads`] on a constructed encoder.
@@ -676,6 +732,8 @@ impl PyramidEncoder {
             ids: self.ids,
             fmt: self.fmt,
             chroma_qp_offset: 0,
+            level_idc: self.level.map(|(l, _)| l),
+            high_tier: self.level.is_some_and(|(_, t)| t),
         }
     }
 
@@ -684,7 +742,11 @@ impl PyramidEncoder {
     /// layout's `SliceQpY` range.
     fn layer_qp(&self, base: i32, layer: u8) -> i32 {
         let range = self.fmt.qp_range();
-        (base + i32::from(layer) * self.layer_qp_step).clamp(*range.start(), *range.end())
+        let offset = match &self.layer_qp_offsets {
+            Some(o) => o[usize::from(layer).min(o.len() - 1)],
+            None => i32::from(layer) * self.layer_qp_step,
+        };
+        (base + offset).clamp(*range.start(), *range.end())
     }
 
     /// Push the next DISPLAY-order frame; returns every access unit
@@ -729,6 +791,19 @@ impl PyramidEncoder {
         }
 
         self.ensure_hrd()?;
+        let mut out = Vec::new();
+        if self.force_idr && self.anchor.is_some() {
+            // Close the open coded video sequence: the buffered frames
+            // become a (shorter) mini-GOP, then this frame its IDR.
+            let n = self.pending.len();
+            if n > 0 {
+                out.extend(self.code_mini_gop(n));
+            }
+            self.anchor = None;
+            self.refs.clear();
+            self.display_base = self.next_display;
+        }
+        self.force_idr = false;
         if self.anchor.is_none() {
             // The leading IDR (POC 0, layer 0).
             let mut idr_qp = match &mut self.rc {
@@ -807,17 +882,17 @@ impl PyramidEncoder {
             recon.motion_field = Some(crate::motion::MotionField::new(self.width, self.height));
             self.refs.insert(0, recon.clone());
             self.anchor = Some(0);
-            self.next_display = 1;
+            self.next_display = self.display_base + 1;
             if let Some(rc) = &mut self.rc {
                 rc.update(FrameClass::Intra, idr_qp, idr.0.len() as u64 * 8);
             }
             if let Some((_, clock)) = &mut self.hrd {
                 clock.push_au(idr.0.len() as u64 * 8);
             }
-            return Ok(vec![PyramidAuWide {
+            out.push(PyramidAuWide {
                 au: idr.0,
                 keyframe: true,
-                display_order: 0,
+                display_order: self.display_base,
                 layer: 0,
                 recon,
                 stats: FrameStats {
@@ -825,7 +900,8 @@ impl PyramidEncoder {
                     ..FrameStats::default()
                 },
                 qp: idr_qp,
-            }]);
+            });
+            return Ok(out);
         }
 
         // Scene-cut test against the previous input frame (the last
@@ -853,7 +929,6 @@ impl PyramidEncoder {
                 }
                 is_cut
             });
-        let mut out = Vec::new();
         if cut {
             // Close the mini-GOP before the cut; the cut frame opens
             // the next one.
@@ -903,8 +978,16 @@ impl PyramidEncoder {
             self.refs.retain(|p, _| retained.contains(p));
 
             let frame = &pending[(s.poc - a - 1) as usize];
-            let au = self.code_slice_vbv(frame.as_yuv(), s, &retained);
-            self.refs.insert(s.poc, au.recon.clone());
+            // A picture no later slice of the schedule references (and
+            // not the next anchor) is a sub-layer non-reference
+            // picture: TRAIL_N, never retained.
+            let referenced = !self.non_ref
+                || s.poc == a + g
+                || sched[i + 1..].iter().any(|t| t.l0 == s.poc || t.l1 == Some(s.poc));
+            let au = self.code_slice_vbv(frame.as_yuv(), s, &retained, referenced);
+            if referenced {
+                self.refs.insert(s.poc, au.recon.clone());
+            }
             out.push(au);
         }
         // Only the new anchor survives into the next mini-GOP.
@@ -925,6 +1008,7 @@ impl PyramidEncoder {
         frame: YuvFrameWide<'_>,
         s: &Sched,
         retained: &[i32],
+        referenced: bool,
     ) -> PyramidAuWide {
         // Per-slice base election: the controller tracks every access
         // unit at its own decode instant (the once-per-mini-GOP
@@ -938,13 +1022,13 @@ impl PyramidEncoder {
         let sei = self.sei_prefix(false, s.poc as u64);
         let sei_bits = sei.as_ref().map_or(0, |s| s.len() as u64 * 8);
         let mut bump = 0i32;
-        let mut au = self.code_slice(frame, s, retained, self.layer_qp(base, s.layer));
+        let mut au = self.code_slice(frame, s, retained, self.layer_qp(base, s.layer), referenced);
         if let Some(cap) = self.au_cap() {
             let ceiling = self.rc.as_ref().map_or(51, RateController::max_qp);
             while au.au.len() as u64 * 8 + sei_bits > cap && au.qp < ceiling {
                 bump += 3;
                 let qp = (self.layer_qp(base, s.layer) + bump).min(ceiling);
-                au = self.code_slice(frame, s, retained, qp);
+                au = self.code_slice(frame, s, retained, qp, referenced);
             }
         }
         if let Some(sei) = &sei {
@@ -975,6 +1059,7 @@ impl PyramidEncoder {
         s: &Sched,
         retained: &[i32],
         qp: i32,
+        referenced: bool,
     ) -> PyramidAuWide {
         let b_slice = s.l1.is_some();
         let rec_of = |p: i32| -> &WideRecon { self.refs.get(&p).expect("retained recon") };
@@ -1046,9 +1131,10 @@ impl PyramidEncoder {
         };
         let (rbsp, recon, stats) = encode_inter_slice(&frame, &spec, self.width, self.height);
         PyramidAuWide {
-            au: annexb(&[nal_unit(1, 0, 0, &rbsp)]), // TRAIL_R
+            // TRAIL_R (1), or TRAIL_N (0) for a non-reference picture.
+            au: annexb(&[nal_unit(u8::from(referenced), 0, 0, &rbsp)]),
             keyframe: false,
-            display_order: s.poc as usize,
+            display_order: self.display_base + s.poc as usize,
             layer: s.layer,
             recon,
             stats,

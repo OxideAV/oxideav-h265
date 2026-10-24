@@ -337,7 +337,7 @@ fn level_idc_for_tiles(cols: u32, rows: u32) -> u8 {
 /// which per A.3.3 also indicates Main 10 Still Picture conformance.
 #[cfg_attr(not(test), allow(dead_code))] // the layered self-built streams use it
 pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
-    write_ptl_layout(w, level_idc, still, PcmLayout::default());
+    write_ptl_layout(w, level_idc, false, still, PcmLayout::default());
 }
 
 /// §7.3.3 `profile_tier_level( 1, 0 )` for a sample layout: 8-bit
@@ -353,11 +353,17 @@ pub(crate) fn write_ptl_cfg(w: &mut BitWriter, level_idc: u8, still: bool) {
 /// `general_one_picture_only_constraint_flag` (the Main 4:4:4 Still
 /// Picture / Main 4:4:4 16 Still Picture rows; for the other layouts a
 /// strictly tighter indication of the same row).
-pub(crate) fn write_ptl_layout(w: &mut BitWriter, level_idc: u8, still: bool, layout: PcmLayout) {
+pub(crate) fn write_ptl_layout(
+    w: &mut BitWriter,
+    level_idc: u8,
+    high_tier: bool,
+    still: bool,
+    layout: PcmLayout,
+) {
     let main_family = layout.chroma_format_idc == 1 && layout.bit_depth == 8;
     let main10 = layout.chroma_format_idc == 1 && layout.bit_depth == 10;
     w.put_bits(0, 2); // general_profile_space
-    w.put_bit(0); // general_tier_flag
+    w.put_bit(u8::from(high_tier)); // general_tier_flag
     if main_family {
         write_ptl_main_tail(w, level_idc, still);
         return;
@@ -440,6 +446,7 @@ pub(crate) fn write_vps_cfg(
 ) -> Vec<u8> {
     write_vps_layout(
         level_idc,
+        false,
         max_dec_pic_buffering_minus1,
         max_num_reorder_pics,
         still,
@@ -452,6 +459,7 @@ pub(crate) fn write_vps_cfg(
 /// sample layout ([`write_ptl_layout`]).
 pub(crate) fn write_vps_layout(
     level_idc: u8,
+    high_tier: bool,
     max_dec_pic_buffering_minus1: u32,
     max_num_reorder_pics: u32,
     still: bool,
@@ -466,7 +474,7 @@ pub(crate) fn write_vps_layout(
     w.put_bits(0, 3); // vps_max_sub_layers_minus1
     w.put_bit(1); // vps_temporal_id_nesting_flag
     w.put_bits(0xFFFF, 16); // vps_reserved_0xffff_16bits
-    write_ptl_layout(&mut w, level_idc, still, layout);
+    write_ptl_layout(&mut w, level_idc, high_tier, still, layout);
     w.put_bit(1); // vps_sub_layer_ordering_info_present_flag
     w.ue(max_dec_pic_buffering_minus1); // vps_max_dec_pic_buffering_minus1[0]
     w.ue(max_num_reorder_pics); // vps_max_num_reorder_pics[0]
@@ -497,7 +505,7 @@ fn write_sps(
     w.put_bits(u32::from(ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl_layout(&mut w, level_idc, still, layout);
+    write_ptl_layout(&mut w, level_idc, false, still, layout);
     w.ue(u32::from(ids.sps)); // sps_seq_parameter_set_id
     w.ue(u32::from(layout.chroma_format_idc)); // chroma_format_idc
     if layout.chroma_format_idc == 3 {
