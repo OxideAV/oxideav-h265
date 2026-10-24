@@ -803,7 +803,11 @@ pub(crate) fn filter_frame<S: Sample>(
         // (override group: ~3 bits + the two se(v) fields).
         let mut best_pic = pre.clone();
         let mut best_cost = ssd(&pre) + input.lambda;
-        let offsets: &[i32] = if input.deblock_sweep { &[-2, 0, 2] } else { &[0] };
+        let offsets: &[i32] = if input.deblock_sweep {
+            &[-2, 0, 2]
+        } else {
+            &[0]
+        };
         for &beta in offsets {
             for &tc in offsets {
                 let mut filtered = pre.clone();

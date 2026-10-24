@@ -350,7 +350,13 @@ pub(crate) fn write_sps_cfg(
     w.put_bits(u32::from(cfg.ids.vps), 4); // sps_video_parameter_set_id
     w.put_bits(0, 3); // sps_max_sub_layers_minus1
     w.put_bit(1); // sps_temporal_id_nesting_flag
-    write_ptl_layout(&mut w, level_idc, cfg.high_tier, cfg.still, cfg.fmt.layout());
+    write_ptl_layout(
+        &mut w,
+        level_idc,
+        cfg.high_tier,
+        cfg.still,
+        cfg.fmt.layout(),
+    );
     w.ue(u32::from(cfg.ids.sps)); // sps_seq_parameter_set_id
     w.ue(u32::from(cfg.fmt.chroma_format_idc)); // chroma_format_idc
     if cfg.fmt.chroma_format_idc == 3 {
@@ -1554,7 +1560,9 @@ pub(crate) fn assemble_idr_au(
     lf: &LoopFilterCfg,
     slice_rbsp: &[u8],
 ) -> Vec<u8> {
-    let level_idc = cfg.level_idc.unwrap_or_else(|| level_idc_for_dims(width, height));
+    let level_idc = cfg
+        .level_idc
+        .unwrap_or_else(|| level_idc_for_dims(width, height));
     // The reorder-free streams keep the historical VPS bounds (1, 0)
     // so every golden pin stays byte-stable; a reordering
     // (hierarchical-B) stream signals its honest DPB bounds, a still

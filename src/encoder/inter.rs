@@ -1610,7 +1610,8 @@ fn uni_l0(mv: Mv) -> PuMotion {
 pub(crate) struct RefPlanes<'a> {
     /// The reconstruction's lazily built half-sample planes (`None`
     /// for derived planes such as weighted-prediction luma copies).
-    pub(crate) halfpel: Option<&'a std::sync::OnceLock<std::sync::Arc<crate::encoder::ctu::HalfPel>>>,
+    pub(crate) halfpel:
+        Option<&'a std::sync::OnceLock<std::sync::Arc<crate::encoder::ctu::HalfPel>>>,
     pub(crate) y: &'a [u16],
     pub(crate) cb: &'a [u16],
     pub(crate) cr: &'a [u16],

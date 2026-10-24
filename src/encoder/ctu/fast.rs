@@ -133,7 +133,14 @@ fn luma_refs(ctx: &SliceCtx<'_>, st: &EncState, x: usize, y: usize, n: usize) ->
 
 /// The 4:2:0 chroma twin of [`luma_refs`] for an `n` chroma TB at
 /// chroma `(cx, cy)` of plane `plane` (1 = Cb, 2 = Cr).
-fn chroma_refs(ctx: &SliceCtx<'_>, st: &EncState, plane: usize, cx: usize, cy: usize, n: usize) -> Refs {
+fn chroma_refs(
+    ctx: &SliceCtx<'_>,
+    st: &EncState,
+    plane: usize,
+    cx: usize,
+    cy: usize,
+    n: usize,
+) -> Refs {
     let cw = ctx.cw();
     let rec = &st.recon;
     let p: &[u16] = if plane == 1 { &rec.cb } else { &rec.cr };
@@ -187,7 +194,11 @@ fn intra_mode_search(
             return;
         }
         tried[mode as usize] = true;
-        let r = if dsp::filter_flag(mode, n) { &filt } else { &refs };
+        let r = if dsp::filter_flag(mode, n) {
+            &filt
+        } else {
+            &refs
+        };
         dsp::predict_intra(r, mode, true, bd, &mut pred);
         let cost = f64::from(dsp::satd(src, ctx.width, &pred, n, n))
             + lam.sad * f64::from(mode_bins(mode, &mpm));
@@ -292,7 +303,17 @@ fn code_intra_leaf(
     dsp::predict_intra(&r, mode, true, ctx.fmt.bit_depth_luma, &mut pred);
     let mut y = Box::new([0i32; MAXB * MAXB]);
     let src = &ctx.src[0][y0 * ctx.width + x0..];
-    let (ly, by) = code_block(src, ctx.width, &pred, n, qp_y, ctx.fmt.bit_depth_luma, true, n == 4, &mut y[..]);
+    let (ly, by) = code_block(
+        src,
+        ctx.width,
+        &pred,
+        n,
+        qp_y,
+        ctx.fmt.bit_depth_luma,
+        true,
+        n == 4,
+        &mut y[..],
+    );
     let mut dist = dsp::ssd_block(src, ctx.width, &y[..], n, n);
     let mode_c = derive_intra_pred_mode_c(4, mode, false);
     let nc = n / 2;
@@ -305,7 +326,17 @@ fn code_intra_leaf(
         let r = chroma_refs(ctx, st, plane, cx, cy, nc);
         dsp::predict_intra(&r, mode_c, false, ctx.fmt.bit_depth_chroma, &mut pred);
         let src = &ctx.src[plane][cy * cw + cx..];
-        let (lv, b) = code_block(src, cw, &pred, nc, qp_c, ctx.fmt.bit_depth_chroma, true, false, out);
+        let (lv, b) = code_block(
+            src,
+            cw,
+            &pred,
+            nc,
+            qp_c,
+            ctx.fmt.bit_depth_chroma,
+            true,
+            false,
+            out,
+        );
         dist += dsp::ssd_block(src, cw, out, nc, nc);
         bits += b;
         levels_or_zero(lv, nc)
@@ -369,14 +400,30 @@ impl InterSearch<'_, '_> {
         let mut a = [0i16; MAXB * MAXB];
         if motion.pred_flag_l0 && motion.pred_flag_l1 {
             let mut b = [0i16; MAXB * MAXB];
-            self.mc(&ctx.refs_l0[motion.ref_idx_l0 as usize], motion.mv_l0, &mut a);
-            self.mc(&ctx.refs_l1[motion.ref_idx_l1 as usize], motion.mv_l1, &mut b);
+            self.mc(
+                &ctx.refs_l0[motion.ref_idx_l0 as usize],
+                motion.mv_l0,
+                &mut a,
+            );
+            self.mc(
+                &ctx.refs_l1[motion.ref_idx_l1 as usize],
+                motion.mv_l1,
+                &mut b,
+            );
             dsp::weight_bi(&a, &b, len, bd, pred);
         } else if motion.pred_flag_l0 {
-            self.mc(&ctx.refs_l0[motion.ref_idx_l0 as usize], motion.mv_l0, &mut a);
+            self.mc(
+                &ctx.refs_l0[motion.ref_idx_l0 as usize],
+                motion.mv_l0,
+                &mut a,
+            );
             dsp::weight_uni(&a, len, bd, pred);
         } else {
-            self.mc(&ctx.refs_l1[motion.ref_idx_l1 as usize], motion.mv_l1, &mut a);
+            self.mc(
+                &ctx.refs_l1[motion.ref_idx_l1 as usize],
+                motion.mv_l1,
+                &mut a,
+            );
             dsp::weight_uni(&a, len, bd, pred);
         }
     }
@@ -397,14 +444,30 @@ impl InterSearch<'_, '_> {
                 dsp::mc_chroma(p, cw, ch, cx, cy, mv, nc, nc, bd, buf);
             };
             if motion.pred_flag_l0 && motion.pred_flag_l1 {
-                run(&ctx.refs_l0[motion.ref_idx_l0 as usize], motion.mv_l0, &mut a);
-                run(&ctx.refs_l1[motion.ref_idx_l1 as usize], motion.mv_l1, &mut b);
+                run(
+                    &ctx.refs_l0[motion.ref_idx_l0 as usize],
+                    motion.mv_l0,
+                    &mut a,
+                );
+                run(
+                    &ctx.refs_l1[motion.ref_idx_l1 as usize],
+                    motion.mv_l1,
+                    &mut b,
+                );
                 dsp::weight_bi(&a, &b, len, bd, out);
             } else if motion.pred_flag_l0 {
-                run(&ctx.refs_l0[motion.ref_idx_l0 as usize], motion.mv_l0, &mut a);
+                run(
+                    &ctx.refs_l0[motion.ref_idx_l0 as usize],
+                    motion.mv_l0,
+                    &mut a,
+                );
                 dsp::weight_uni(&a, len, bd, out);
             } else {
-                run(&ctx.refs_l1[motion.ref_idx_l1 as usize], motion.mv_l1, &mut a);
+                run(
+                    &ctx.refs_l1[motion.ref_idx_l1 as usize],
+                    motion.mv_l1,
+                    &mut a,
+                );
                 dsp::weight_uni(&a, len, bd, out);
             }
         }
@@ -413,7 +476,13 @@ impl InterSearch<'_, '_> {
     /// SATD of the source block against a final prediction.
     fn satd(&self, pred: &[i32]) -> u32 {
         let ctx = self.ctx;
-        dsp::satd(&ctx.src[0][self.y0 * ctx.width + self.x0..], ctx.width, pred, self.n, self.n)
+        dsp::satd(
+            &ctx.src[0][self.y0 * ctx.width + self.x0..],
+            ctx.width,
+            pred,
+            self.n,
+            self.n,
+        )
     }
 
     /// The reference's half-sample planes (built on first use).
@@ -436,7 +505,10 @@ impl InterSearch<'_, '_> {
         let m = (HP_PAD - 8) as i32;
         let n = self.n as i32;
         let (x, y) = (self.x0 as i32 + (mv[0] >> 2), self.y0 as i32 + (mv[1] >> 2));
-        x >= -m && y >= -m && x + n + 1 <= self.ctx.width as i32 + m && y + n + 1 <= self.ctx.height as i32 + m
+        x >= -m
+            && y >= -m
+            && x + n < self.ctx.width as i32 + m
+            && y + n < self.ctx.height as i32 + m
     }
 
     /// The search-grade luma prediction of resolved `motion` (the
@@ -444,8 +516,18 @@ impl InterSearch<'_, '_> {
     fn approx_luma(&self, motion: &PuMotion, pred: &mut [i32]) {
         let ctx = self.ctx;
         let used = [
-            (motion.pred_flag_l0, motion.mv_l0, ctx.refs_l0, motion.ref_idx_l0),
-            (motion.pred_flag_l1, motion.mv_l1, ctx.refs_l1, motion.ref_idx_l1),
+            (
+                motion.pred_flag_l0,
+                motion.mv_l0,
+                ctx.refs_l0,
+                motion.ref_idx_l0,
+            ),
+            (
+                motion.pred_flag_l1,
+                motion.mv_l1,
+                ctx.refs_l1,
+                motion.ref_idx_l1,
+            ),
         ];
         if used.iter().any(|&(f, mv, _, _)| f && !self.in_pad(mv)) {
             self.predict_luma(motion, pred);
@@ -489,8 +571,14 @@ impl InterSearch<'_, '_> {
                 return f64::MAX;
             }
             let (plane, i) = hp.at(0, 0, x0 as i32 + m[0], y0 as i32 + m[1]);
-            f64::from(dsp::sad_plane(src, self.ctx.width, &plane[i..], hp.stride(), n, n))
-                + lam.sad * bits([m[0] * 4, m[1] * 4]) as f64
+            f64::from(dsp::sad_plane(
+                src,
+                self.ctx.width,
+                &plane[i..],
+                hp.stride(),
+                n,
+                n,
+            )) + lam.sad * bits([m[0] * 4, m[1] * 4]) as f64
         };
         let mut best = [0i32, 0];
         let mut best_cost = f64::MAX;
@@ -505,7 +593,16 @@ impl InterSearch<'_, '_> {
         for step in ME_STEPS {
             for _ in 0..ME_ITERS {
                 let centre = best;
-                for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step), (step, step), (step, -step), (-step, step), (-step, -step)] {
+                for (dx, dy) in [
+                    (step, 0),
+                    (-step, 0),
+                    (0, step),
+                    (0, -step),
+                    (step, step),
+                    (step, -step),
+                    (-step, step),
+                    (-step, -step),
+                ] {
                     let m = [centre[0] + dx, centre[1] + dy];
                     let c = int_cost(m);
                     if c < best_cost {
@@ -535,7 +632,16 @@ impl InterSearch<'_, '_> {
         eval(mv, &mut cost, &mut mv);
         for step in [2i32, 1] {
             let centre = mv;
-            for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step), (step, step), (step, -step), (-step, step), (-step, -step)] {
+            for (dx, dy) in [
+                (step, 0),
+                (-step, 0),
+                (0, step),
+                (0, -step),
+                (step, step),
+                (step, -step),
+                (-step, step),
+                (-step, -step),
+            ] {
                 eval([centre[0] + dx, centre[1] + dy], &mut cost, &mut mv);
             }
         }
@@ -553,7 +659,15 @@ struct InterChoice {
 /// Decide and code the best leaf of an `n` CU at `(x0, y0)` on a P /
 /// B slice.
 #[allow(clippy::too_many_lines)]
-fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize, qp: i32, lam: Lambda) -> Leaf {
+fn inter_leaf(
+    ctx: &SliceCtx<'_>,
+    st: &EncState,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    qp: i32,
+    lam: Lambda,
+) -> Leaf {
     let mv_ctx = ctx.mv_ctx.expect("inter slice has motion context");
     let geom = PuGeometry {
         x_cb: x0,
@@ -588,7 +702,13 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
             },
         )
     };
-    let search = InterSearch { ctx, x0, y0, n, lam };
+    let search = InterSearch {
+        ctx,
+        x0,
+        y0,
+        n,
+        lam,
+    };
     let mut pred = [0i32; MAXB * MAXB];
 
     // ---- merge candidates ----
@@ -622,7 +742,13 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
     for &list in lists {
         let refs = if list == 0 { ctx.refs_l0 } else { ctx.refs_l1 };
         let mv_of = |m: &PuMotion| if list == 0 { m.mv_l0 } else { m.mv_l1 };
-        let used = |m: &PuMotion| if list == 0 { m.pred_flag_l0 } else { m.pred_flag_l1 };
+        let used = |m: &PuMotion| {
+            if list == 0 {
+                m.pred_flag_l0
+            } else {
+                m.pred_flag_l1
+            }
+        };
         for (r, refp) in refs.iter().enumerate() {
             let probe = |flag: u8| {
                 mv_of(&resolve_pu_motion(
@@ -636,7 +762,14 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
             let mvp = [probe(0), probe(1)];
             let seeds: Vec<Mv> = merges
                 .iter()
-                .filter(|(_, m)| used(m) && (if list == 0 { m.ref_idx_l0 } else { m.ref_idx_l1 }) == r as i32)
+                .filter(|(_, m)| {
+                    used(m)
+                        && (if list == 0 {
+                            m.ref_idx_l0
+                        } else {
+                            m.ref_idx_l1
+                        }) == r as i32
+                })
                 .map(|(_, m)| mv_of(m))
                 .chain(std::iter::once([0, 0]))
                 .collect();
@@ -645,7 +778,11 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
                 .map(|f| (f, [mv[0] - mvp[f as usize][0], mv[1] - mvp[f as usize][1]]))
                 .min_by_key(|&(_, d)| mvd_bits(d))
                 .expect("two predictors");
-            let group = AmvpGroup { ref_idx: r as u8, mvd, mvp_flag };
+            let group = AmvpGroup {
+                ref_idx: r as u8,
+                mvd,
+                mvp_flag,
+            };
             let motion = resolve_pu_motion(
                 &st.field,
                 &geom,
@@ -660,16 +797,22 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
             }
         }
     }
-    for list in 0..2 {
-        if let Some((g, motion, cost, _)) = &list_best[list]
+    for (list, entry) in list_best.iter().enumerate() {
+        if let Some((g, motion, cost, _)) = entry
             && *cost < best.satd_cost
         {
             best = InterChoice {
                 kind: TreeCuKind::Amvp {
                     pu: if list == 0 {
-                        PuSyntax::Amvp { l0: Some(*g), l1: None }
+                        PuSyntax::Amvp {
+                            l0: Some(*g),
+                            l1: None,
+                        }
                     } else {
-                        PuSyntax::Amvp { l0: None, l1: Some(*g) }
+                        PuSyntax::Amvp {
+                            l0: None,
+                            l1: Some(*g),
+                        }
                     },
                 },
                 motion: *motion,
@@ -691,7 +834,10 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
         if c < best.satd_cost {
             best = InterChoice {
                 kind: TreeCuKind::Amvp {
-                    pu: PuSyntax::Amvp { l0: Some(b0.0), l1: Some(b1.0) },
+                    pu: PuSyntax::Amvp {
+                        l0: Some(b0.0),
+                        l1: Some(b1.0),
+                    },
                 },
                 motion,
                 satd_cost: c,
@@ -721,9 +867,39 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
     let mut y = Box::new([0i32; MAXB * MAXB]);
     let mut cb = Box::new([0i32; MAXB * MAXB / 4]);
     let mut cr = Box::new([0i32; MAXB * MAXB / 4]);
-    let (ly, by) = code_block(src_y, ctx.width, &pred, n, qp_y, ctx.fmt.bit_depth_luma, false, false, &mut y[..]);
-    let (lcb, bcb) = code_block(src_cb, cw, &pcb, nc, qp_c, ctx.fmt.bit_depth_chroma, false, false, &mut cb[..]);
-    let (lcr, bcr) = code_block(src_cr, cw, &pcr, nc, qp_c, ctx.fmt.bit_depth_chroma, false, false, &mut cr[..]);
+    let (ly, by) = code_block(
+        src_y,
+        ctx.width,
+        &pred,
+        n,
+        qp_y,
+        ctx.fmt.bit_depth_luma,
+        false,
+        false,
+        &mut y[..],
+    );
+    let (lcb, bcb) = code_block(
+        src_cb,
+        cw,
+        &pcb,
+        nc,
+        qp_c,
+        ctx.fmt.bit_depth_chroma,
+        false,
+        false,
+        &mut cb[..],
+    );
+    let (lcr, bcr) = code_block(
+        src_cr,
+        cw,
+        &pcr,
+        nc,
+        qp_c,
+        ctx.fmt.bit_depth_chroma,
+        false,
+        false,
+        &mut cr[..],
+    );
     let coded = !(ly.is_empty() && lcb.is_empty() && lcr.is_empty());
     let dist = dsp::ssd_block(src_y, ctx.width, &y[..], n, n)
         + dsp::ssd_block(src_cb, cw, &cb[..], nc, nc)
@@ -739,7 +915,12 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
             + dsp::ssd_block(src_cb, cw, &pcb, nc, nc)
             + dsp::ssd_block(src_cr, cw, &pcr, nc, nc)
     };
-    let as_leaf = |kind: TreeCuKind, tree: Option<TuNode>, y: Box<[i32; MAXB * MAXB]>, cb: Box<[i32; MAXB * MAXB / 4]>, cr: Box<[i32; MAXB * MAXB / 4]>, cost: f64| Leaf {
+    let as_leaf = |kind: TreeCuKind,
+                   tree: Option<TuNode>,
+                   y: Box<[i32; MAXB * MAXB]>,
+                   cb: Box<[i32; MAXB * MAXB / 4]>,
+                   cr: Box<[i32; MAXB * MAXB / 4]>,
+                   cost: f64| Leaf {
         kind,
         motions: vec![motion],
         tree,
@@ -780,7 +961,15 @@ fn inter_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize,
 
 /// Write a leaf's reconstruction and decoder-visible state into the
 /// picture state (the parent module's commit protocol).
-fn commit(ctx: &SliceCtx<'_>, st: &mut EncState, x0: usize, y0: usize, n: usize, depth: u32, leaf: &Leaf) {
+fn commit(
+    ctx: &SliceCtx<'_>,
+    st: &mut EncState,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    depth: u32,
+    leaf: &Leaf,
+) {
     let w = ctx.width;
     let ly0 = st.recon.ly(y0);
     let maxy = ctx.fmt.max_luma();
@@ -825,7 +1014,11 @@ fn commit(ctx: &SliceCtx<'_>, st: &mut EncState, x0: usize, y0: usize, n: usize,
                 x0,
                 y0,
                 n,
-                if is_skip { CuPredMode::Skip } else { CuPredMode::Inter },
+                if is_skip {
+                    CuPredMode::Skip
+                } else {
+                    CuPredMode::Inter
+                },
             );
             if let Some(tree) = &leaf.tree {
                 mark_nonzero(&mut st.field, tree, x0, y0, n.trailing_zeros());
@@ -849,7 +1042,15 @@ fn to_cu(x0: usize, y0: usize, log2: u32, leaf: Leaf) -> CuCoded {
 }
 
 /// Decide and code one leaf candidate (no state change).
-fn eval_leaf(ctx: &SliceCtx<'_>, st: &EncState, x0: usize, y0: usize, n: usize, qp: i32, lam: Lambda) -> Leaf {
+fn eval_leaf(
+    ctx: &SliceCtx<'_>,
+    st: &EncState,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    qp: i32,
+    lam: Lambda,
+) -> Leaf {
     if ctx.intra_slice {
         let (mode, _) = intra_mode_search(ctx, st, x0, y0, n, lam);
         code_intra_leaf(ctx, st, x0, y0, n, mode, qp, lam)
@@ -893,11 +1094,20 @@ pub(super) fn code_quadtree(
     }
     let leaf = eval_leaf(ctx, st, x0, y0, n, ctb_qp, lam);
     let stop = log2 == ctx.cfg.min_cb_log2()
-        || (matches!(leaf.kind, TreeCuKind::Skip { .. }) && leaf.cost < lam.sse * (n * n) as f64 / 16.0);
+        || (matches!(leaf.kind, TreeCuKind::Skip { .. })
+            && leaf.cost < lam.sse * (n * n) as f64 / 16.0);
     if stop {
         commit(ctx, st, x0, y0, n, depth, &leaf);
-        let cost = leaf.cost + if log2 > ctx.cfg.min_cb_log2() { lam.sse } else { 0.0 };
-        return (CuNode::Leaf(Box::new(to_cu(x0, y0, log2, leaf))), cost as u64);
+        let cost = leaf.cost
+            + if log2 > ctx.cfg.min_cb_log2() {
+                lam.sse
+            } else {
+                0.0
+            };
+        return (
+            CuNode::Leaf(Box::new(to_cu(x0, y0, log2, leaf))),
+            cost as u64,
+        );
     }
     let before = st.snapshot(ctx, x0, y0, n);
     let (node, split_cost) = split(ctx, st);
@@ -905,7 +1115,10 @@ pub(super) fn code_quadtree(
         st.restore(ctx, &before);
         commit(ctx, st, x0, y0, n, depth, &leaf);
         let cost = leaf.cost + lam.sse;
-        (CuNode::Leaf(Box::new(to_cu(x0, y0, log2, leaf))), cost as u64)
+        (
+            CuNode::Leaf(Box::new(to_cu(x0, y0, log2, leaf))),
+            cost as u64,
+        )
     } else {
         (node, (split_cost + lam.sse) as u64)
     }

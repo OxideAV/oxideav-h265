@@ -30,7 +30,8 @@ fn sequence(w: usize, h: usize, n: usize, depth: u8) -> Vec<(Vec<u16>, Vec<u16>,
             for j in 0..h {
                 for i in 0..w {
                     let x = i as i32 + pan;
-                    let v = 128 + ((x * 7) % 61 - 30) + ((j as i32 * 5 + x / 3) % 37 - 18) + noise();
+                    let v =
+                        128 + ((x * 7) % 61 - 30) + ((j as i32 * 5 + x / 3) % 37 - 18) + noise();
                     y[j * w + i] = (v * scale).clamp(0, max) as u16;
                 }
             }
@@ -41,7 +42,8 @@ fn sequence(w: usize, h: usize, n: usize, depth: u8) -> Vec<(Vec<u16>, Vec<u16>,
                 for i in 0..cw {
                     let x = i as i32 + pan / 2;
                     cb[j * cw + i] = ((128 + (x % 23) - 11) * scale).clamp(0, max) as u16;
-                    cr[j * cw + i] = ((128 + (j as i32 % 19) - 9 + noise()) * scale).clamp(0, max) as u16;
+                    cr[j * cw + i] =
+                        ((128 + (j as i32 % 19) - 9 + noise()) * scale).clamp(0, max) as u16;
                 }
             }
             (y, cb, cr)
@@ -62,7 +64,10 @@ fn assert_decodes_to(stream: &[u8], recons: &[Vec<u8>], label: &str) {
     for (k, (f, want)) in out.iter().zip(recons).enumerate() {
         let pic = f.output_picture();
         let got = pic.to_planar_u8().unwrap_or_else(|| pic.to_planar_le16());
-        assert!(got == *want, "{label}: picture {k} differs from the reconstruction");
+        assert!(
+            got == *want,
+            "{label}: picture {k} differs from the reconstruction"
+        );
     }
 }
 
@@ -88,12 +93,22 @@ fn fast_low_delay_decodes_to_recon() {
                 enc.force_keyframe();
             }
             let (y, cb, cr) = (narrow(y), narrow(cb), narrow(cr));
-            let f = enc.encode_frame(&YuvFrame { y: &y, cb: &cb, cr: &cr }).unwrap();
+            let f = enc
+                .encode_frame(&YuvFrame {
+                    y: &y,
+                    cb: &cb,
+                    cr: &cr,
+                })
+                .unwrap();
             assert_eq!(f.keyframe, k == 0 || k == 3, "ctb {ctb}: keyframe {k}");
             stream.extend_from_slice(&f.au);
             recons.push([f.recon.y, f.recon.cb, f.recon.cr].concat());
         }
-        assert_decodes_to(&stream, &recons, &format!("low-delay ctb {ctb} wpp {wpp} b {b}"));
+        assert_decodes_to(
+            &stream,
+            &recons,
+            &format!("low-delay ctb {ctb} wpp {wpp} b {b}"),
+        );
     }
 }
 
@@ -132,7 +147,13 @@ fn fast_pyramid_with_keyframes_and_non_reference_pictures() {
             enc.force_keyframe();
         }
         let (y, cb, cr) = (narrow(y), narrow(cb), narrow(cr));
-        let aus = enc.encode_frame(&YuvFrame { y: &y, cb: &cb, cr: &cr }).unwrap();
+        let aus = enc
+            .encode_frame(&YuvFrame {
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+            })
+            .unwrap();
         take(aus, &mut stream, &mut recons);
     }
     take(enc.flush(), &mut stream, &mut recons);
@@ -146,7 +167,10 @@ fn fast_pyramid_with_keyframes_and_non_reference_pictures() {
     }
     // The signalled level and tier.
     let nals = oxideav_h265::nal::collect_nal_units(&stream).unwrap();
-    let sps_nal = nals.iter().find(|n| n.header.nal_unit_type == 33).expect("an SPS");
+    let sps_nal = nals
+        .iter()
+        .find(|n| n.header.nal_unit_type == 33)
+        .expect("an SPS");
     let sps = oxideav_h265::sps::SeqParameterSet::parse(&sps_nal.rbsp).unwrap();
     assert_eq!(sps.ptl.general_level_idc, 123);
     assert!(sps.ptl.general_tier_flag);
@@ -161,7 +185,6 @@ fn fast_main10_pyramid_decodes_to_recon() {
     let layout = PcmLayout {
         chroma_format_idc: 1,
         bit_depth: 10,
-        ..PcmLayout::default()
     };
     let mut enc = PyramidEncoder::new_fmt(w, h, 30, 4, layout)
         .unwrap()
@@ -172,7 +195,10 @@ fn fast_main10_pyramid_decodes_to_recon() {
     let le16 = |p: &[u16]| -> Vec<u8> { p.iter().flat_map(|v| v.to_le_bytes()).collect() };
     let mut aus = Vec::new();
     for (y, cb, cr) in &seq {
-        aus.extend(enc.encode_frame_wide(&YuvFrameWide::new(y, cb, cr)).unwrap());
+        aus.extend(
+            enc.encode_frame_wide(&YuvFrameWide::new(y, cb, cr))
+                .unwrap(),
+        );
     }
     aus.extend(enc.flush_wide());
     for au in aus {

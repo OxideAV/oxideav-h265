@@ -983,7 +983,9 @@ impl PyramidEncoder {
             // picture: TRAIL_N, never retained.
             let referenced = !self.non_ref
                 || s.poc == a + g
-                || sched[i + 1..].iter().any(|t| t.l0 == s.poc || t.l1 == Some(s.poc));
+                || sched[i + 1..]
+                    .iter()
+                    .any(|t| t.l0 == s.poc || t.l1 == Some(s.poc));
             let au = self.code_slice_vbv(frame.as_yuv(), s, &retained, referenced);
             if referenced {
                 self.refs.insert(s.poc, au.recon.clone());

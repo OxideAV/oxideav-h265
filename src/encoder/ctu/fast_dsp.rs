@@ -289,7 +289,9 @@ pub(super) fn filter_flag(mode: u8, n: usize) -> bool {
     if mode == 1 || n == 4 {
         return false;
     }
-    let d = (i32::from(mode) - 26).abs().min((i32::from(mode) - 10).abs());
+    let d = (i32::from(mode) - 26)
+        .abs()
+        .min((i32::from(mode) - 10).abs());
     let thres = match n {
         8 => 7,
         16 => 1,
@@ -325,8 +327,8 @@ pub(super) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: 
             out[..n * n].fill(dc);
             if luma && n < 32 {
                 out[0] = (r.left[1] + 2 * dc + r.top[1] + 2) >> 2;
-                for x in 1..n {
-                    out[x] = (r.top[1 + x] + 3 * dc + 2) >> 2;
+                for (o, &t) in out[1..n].iter_mut().zip(&r.top[2..=n]) {
+                    *o = (t + 3 * dc + 2) >> 2;
                 }
                 for y in 1..n {
                     out[y * n] = (r.left[1 + y] + 3 * dc + 2) >> 2;
@@ -343,9 +345,7 @@ pub(super) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: 
             } else {
                 (&r.left, &r.top)
             };
-            for k in 0..=n {
-                refa[k + n] = main[k];
-            }
+            refa[n..=2 * n].copy_from_slice(&main[..=n]);
             if angle < 0 {
                 let last = (n as i32 * angle) >> 5;
                 if last < -1 {
@@ -356,9 +356,7 @@ pub(super) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: 
                     }
                 }
             } else {
-                for k in n + 1..=2 * n {
-                    refa[k + n] = main[k];
-                }
+                refa[2 * n + 1..=3 * n].copy_from_slice(&main[n + 1..=2 * n]);
             }
             for a in 0..n {
                 let pos = (a as i32 + 1) * angle;
@@ -384,8 +382,8 @@ pub(super) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: 
                         out[y * n] = (r.top[1] + ((r.left[1 + y] - r.left[0]) >> 1)).clamp(0, max);
                     }
                 } else if mode == 10 {
-                    for x in 0..n {
-                        out[x] = (r.left[1] + ((r.top[1 + x] - r.top[0]) >> 1)).clamp(0, max);
+                    for (o, &t) in out[..n].iter_mut().zip(&r.top[1..=n]) {
+                        *o = (r.left[1] + ((t - r.top[0]) >> 1)).clamp(0, max);
                     }
                 }
             }
@@ -594,7 +592,11 @@ pub(super) fn weight_bi(a: &[i16], b: &[i16], len: usize, bit_depth: u8, out: &m
 /// The `n`-point basis row `k` (DST-VII when `dst`).
 #[inline]
 fn basis_row(n: usize, k: usize, dst: bool) -> &'static [i32] {
-    if dst { &DST4[k][..] } else { &DCT32[k * (32 / n)][..n] }
+    if dst {
+        &DST4[k][..]
+    } else {
+        &DCT32[k * (32 / n)][..n]
+    }
 }
 
 /// Forward 2-D transform of an `n`x`n` residual (DST-VII when `dst`,
@@ -696,7 +698,7 @@ pub(super) fn dequant_inverse(
     let mut rows_nz = [false; MAXB];
     for (i, (&l, o)) in levels[..n * n].iter().zip(d.iter_mut()).enumerate() {
         if l != 0 {
-            *o = (((i64::from(l) * scale) << (qp / 6)) + add >> bd_shift).clamp(-32768, 32767)
+            *o = ((((i64::from(l) * scale) << (qp / 6)) + add) >> bd_shift).clamp(-32768, 32767)
                 as i32;
             rows_nz[i / n] = true;
         }
@@ -802,7 +804,9 @@ impl HalfPel {
                         scope.spawn(|| {
                             loop {
                                 let job = queue.lock().expect("band queue").pop();
-                                let Some((phase, band, chunk)) = job else { break };
+                                let Some((phase, band, chunk)) = job else {
+                                    break;
+                                };
                                 fill_band(phase, band, chunk);
                             }
                         });
@@ -845,7 +849,15 @@ impl HalfPel {
 /// the rounded mean of the two nearest half-sample-grid samples at
 /// quarter positions. The block must lie inside the padding.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn approx_pred(hp: &HalfPel, x0: usize, y0: usize, mv: [i32; 2], w: usize, h: usize, out: &mut [i32]) {
+pub(super) fn approx_pred(
+    hp: &HalfPel,
+    x0: usize,
+    y0: usize,
+    mv: [i32; 2],
+    w: usize,
+    h: usize,
+    out: &mut [i32],
+) {
     // Half-sample grid coordinates of the block origin (floor).
     let hx = 2 * x0 as i32 + (mv[0] >> 1);
     let hy = 2 * y0 as i32 + (mv[1] >> 1);
@@ -855,7 +867,10 @@ pub(super) fn approx_pred(hp: &HalfPel, x0: usize, y0: usize, mv: [i32; 2], w: u
     let (pa, ia) = read(hx, hy);
     if ox == 0 && oy == 0 {
         for j in 0..h {
-            for (o, &v) in out[j * w..j * w + w].iter_mut().zip(&pa[ia + j * st..ia + j * st + w]) {
+            for (o, &v) in out[j * w..j * w + w]
+                .iter_mut()
+                .zip(&pa[ia + j * st..ia + j * st + w])
+            {
                 *o = i32::from(v);
             }
         }
@@ -884,7 +899,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
     }
@@ -904,7 +922,8 @@ mod tests {
                     let mut v = rng.next() % (max + 1);
                     let mut sample = |rng: &mut Lcg| {
                         if smooth {
-                            v = (v as i32 + (rng.next() % 9) as i32 - 4).clamp(0, max as i32) as u32;
+                            v = (v as i32 + (rng.next() % 9) as i32 - 4).clamp(0, max as i32)
+                                as u32;
                             v as i32
                         } else {
                             (rng.next() % (max + 1)) as i32
@@ -944,7 +963,11 @@ mod tests {
                             let mut got = [0i32; MAXB * MAXB];
                             let use_f = luma && filter_flag(mode, n);
                             predict_intra(if use_f { &rf } else { &r }, mode, luma, bd, &mut got);
-                            assert_eq!(&got[..n * n], &want[..], "bd {bd} n {n} mode {mode} luma {luma} trial {trial}");
+                            assert_eq!(
+                                &got[..n * n],
+                                &want[..],
+                                "bd {bd} n {n} mode {mode} luma {luma} trial {trial}"
+                            );
                         }
                     }
                 }
@@ -964,7 +987,7 @@ mod tests {
                     for qp in [4u32, 22, 37, 51, 63] {
                         let mut levels = vec![0i32; n * n];
                         for (i, l) in levels.iter_mut().enumerate() {
-                            if rng.next() % 4 == 0 || i == 0 {
+                            if rng.next().is_multiple_of(4) || i == 0 {
                                 *l = (rng.next() % 64) as i32 - 32;
                             }
                         }
@@ -975,7 +998,11 @@ mod tests {
                                 n_tbs: n,
                                 q_p: qp,
                                 component: Component::Luma,
-                                pred_mode: if dst { PredMode::Intra } else { PredMode::Inter },
+                                pred_mode: if dst {
+                                    PredMode::Intra
+                                } else {
+                                    PredMode::Inter
+                                },
                                 bit_depth: bd,
                                 extended_precision: false,
                                 transquant_bypass: false,
@@ -1004,7 +1031,12 @@ mod tests {
             quantize(&coef, n, 4, 8, true, &mut lv);
             let mut back = [0i32; MAXB * MAXB];
             dequant_inverse(&lv, n, 4, 8, false, &mut back);
-            let err: i32 = res.iter().zip(&back).map(|(a, b)| (a - b).abs()).max().unwrap();
+            let err: i32 = res
+                .iter()
+                .zip(&back)
+                .map(|(a, b)| (a - b).abs())
+                .max()
+                .unwrap();
             assert!(err <= 2, "n {n} max error {err}");
         }
     }
@@ -1018,21 +1050,51 @@ mod tests {
         for bd in [8u8, 10] {
             let (w, h) = (64usize, 48usize);
             let max = (1u32 << bd) - 1;
-            let y: Vec<u16> = (0..w * h).map(|_| (rng.next() % (max + 1)) as u16).collect();
-            let cb: Vec<u16> = (0..w * h / 4).map(|_| (rng.next() % (max + 1)) as u16).collect();
-            let cr: Vec<u16> = (0..w * h / 4).map(|_| (rng.next() % (max + 1)) as u16).collect();
-            let y1: Vec<u16> = (0..w * h).map(|_| (rng.next() % (max + 1)) as u16).collect();
+            let y: Vec<u16> = (0..w * h)
+                .map(|_| (rng.next() % (max + 1)) as u16)
+                .collect();
+            let cb: Vec<u16> = (0..w * h / 4)
+                .map(|_| (rng.next() % (max + 1)) as u16)
+                .collect();
+            let cr: Vec<u16> = (0..w * h / 4)
+                .map(|_| (rng.next() % (max + 1)) as u16)
+                .collect();
+            let y1: Vec<u16> = (0..w * h)
+                .map(|_| (rng.next() % (max + 1)) as u16)
+                .collect();
             let fmt = SampleFmt::new(1, bd).unwrap();
-            let r0 = RefPlanes { halfpel: None, y: &y, cb: &cb, cr: &cr, width: w, height: h, fmt };
-            let r1 = RefPlanes { halfpel: None, y: &y1, cb: &cr, cr: &cb, width: w, height: h, fmt };
+            let r0 = RefPlanes {
+                halfpel: None,
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+                width: w,
+                height: h,
+                fmt,
+            };
+            let r1 = RefPlanes {
+                halfpel: None,
+                y: &y1,
+                cb: &cr,
+                cr: &cb,
+                width: w,
+                height: h,
+                fmt,
+            };
             for trial in 0..200 {
                 let bw = [8usize, 16, 32][trial % 3];
                 let bh = [8usize, 16, 32][(trial / 3) % 3];
                 let px = (rng.next() as usize % (w / 8)) * 8;
                 let py = (rng.next() as usize % (h / 8)) * 8;
                 let (bw, bh) = (bw.min(w - px), bh.min(h - py));
-                let mv0 = [(rng.next() % 161) as i32 - 80, (rng.next() % 161) as i32 - 80];
-                let mv1 = [(rng.next() % 161) as i32 - 80, (rng.next() % 161) as i32 - 80];
+                let mv0 = [
+                    (rng.next() % 161) as i32 - 80,
+                    (rng.next() % 161) as i32 - 80,
+                ];
+                let mv1 = [
+                    (rng.next() % 161) as i32 - 80,
+                    (rng.next() % 161) as i32 - 80,
+                ];
                 let bi = trial % 2 == 1;
                 let m = PuMotion {
                     pred_flag_l0: true,
