@@ -9,6 +9,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - edition 2024, MSRV 1.95
+- *(decoder)* inter CUs snapshot only their own one-cell intra-flag border for the §6.4.2 prediction-block availability instead of the whole picture's 4x4 grid (external contribution, #16); output is unchanged and a 30-frame 1080p libx265 IBBBP stream decodes about 10x faster single-threaded (10.6 s → 1.0 s, MD5 identical to the black-box reference decoder)
 
 ### Added
 
