@@ -142,6 +142,25 @@ impl<'a> RefListAccess<'a> {
     }
 
     /// The raw `RefPicListX[ ref_idx ]` slot value.
+    /// The number of entries `RefPicListX` holds (0 for an absent list).
+    fn list_len(&self, list: usize) -> usize {
+        if list == 0 {
+            self.lists.list0.len()
+        } else {
+            self.lists.list1.as_ref().map_or(0, Vec::len)
+        }
+    }
+
+    /// The [`ReconError::MissingReference`] for `RefPicListX[ ref_idx ]`.
+    fn missing(&self, list: usize, ref_idx: i32) -> ReconError {
+        ReconError::MissingReference {
+            list: list as u8,
+            ref_idx,
+            list_len: self.list_len(list),
+            poc: None,
+        }
+    }
+
     fn slot(&self, list: usize, ref_idx: i32) -> Option<usize> {
         if ref_idx < 0 {
             return None;
@@ -301,14 +320,16 @@ where
         }
         // A used list with an unresolvable reference is a malformed stream;
         // surface it rather than silently dropping the prediction.
-        return Err(ReconError::InterNotSupported);
+        return Err(refs.missing(list, ref_idx));
     }
     // Unused list: point at any available picture (the prediction skips it).
+    // With none at all, the used list of this PU is missing too; report
+    // RefPicList0[ 0 ] (the slot every P / B slice holds).
     let fallback = refs
         .ref_pic(0, 0)
         .or_else(|| refs.ref_pic(1, 0))
         .or(curr_snapshot)
-        .ok_or(ReconError::InterNotSupported)?;
+        .ok_or_else(|| refs.missing(0, 0))?;
     Ok(ResolvedList {
         pred_flag: false,
         mv_l: [0, 0],
@@ -989,8 +1010,14 @@ impl<'a> PictureReconstructor<'a> {
     /// §7.4.9.3 SAO parameters.
     ///
     /// # Errors
-    /// Propagates [`ReconError`] from the per-CU reconstruction.
+    /// Propagates [`ReconError`] from the per-CU reconstruction (a
+    /// [`ReconError::MissingReference`] carries this picture's POC).
     pub fn push_ctu(&mut self, placed: &PlacedInterCtu<'_>) -> Result<(), ReconError> {
+        let poc = self.slice.curr_poc;
+        self.push_ctu_inner(placed).map_err(|e| e.in_picture(poc))
+    }
+
+    fn push_ctu_inner(&mut self, placed: &PlacedInterCtu<'_>) -> Result<(), ReconError> {
         let slice = self.slice;
         let params = self.params;
         let refs = self.refs;
@@ -1654,10 +1681,10 @@ fn reconstruct_inter_leaf_cu(
 /// Returns the (output) reconstructed picture.
 ///
 /// # Errors
-/// [`ReconError::InterNotSupported`] when the picture is an I picture (no
-/// reference lists were built — use the intra driver instead) or a used
-/// reference resolves to "no reference picture"; otherwise the per-CU
-/// reconstruction errors.
+/// [`ReconError::NoReferenceLists`] when the picture is an I picture (no
+/// reference lists were built — use the intra driver instead);
+/// [`ReconError::MissingReference`] when a used reference resolves to "no
+/// reference picture"; otherwise the per-CU reconstruction errors.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_inter_picture(
     seq: &mut crate::decode::PictureSequenceState,
@@ -1675,7 +1702,9 @@ pub fn decode_inter_picture(
     let lists = ref_state
         .ref_pic_lists
         .clone()
-        .ok_or(ReconError::InterNotSupported)?;
+        .ok_or(ReconError::NoReferenceLists {
+            poc: ref_state.poc.val,
+        })?;
     let layer_id = header.layer_id;
     let poc = ref_state.poc;
 
@@ -1758,6 +1787,69 @@ mod tests {
             }
         }
         p
+    }
+
+    #[test]
+    fn used_list_on_no_reference_picture_names_the_slot() {
+        let params = p_params();
+        let entries = [dpb_entry(0, Picture::new(32, 32, 1, 8, 8))];
+        let lists = RefPicLists {
+            list0: vec![None, Some(0)],
+            list1: Some(vec![Some(0)]),
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+        let Err(err) = resolve_list(&params, &refs, None, 0, true, 0, [0, 0]) else {
+            panic!("RefPicList0[0] is missing");
+        };
+        assert_eq!(
+            err,
+            ReconError::MissingReference {
+                list: 0,
+                ref_idx: 0,
+                list_len: 2,
+                poc: None,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "RefPicList0[0] is \"no reference picture\" (the reference picture set \
+             names a picture the DPB does not hold)"
+        );
+        let err = err.in_picture(7);
+        assert!(
+            err.to_string().starts_with("picture POC 7: RefPicList0[0]"),
+            "{err}"
+        );
+        // The resolvable slots still resolve; an out-of-range index is
+        // reported as such.
+        assert!(resolve_list(&params, &refs, None, 0, true, 1, [0, 0]).is_ok());
+        let Err(err) = resolve_list(&params, &refs, None, 1, true, 3, [0, 0]) else {
+            panic!("ref_idx_l1 = 3 is out of range");
+        };
+        assert_eq!(
+            err.to_string(),
+            "ref_idx_l1 = 3 lies outside RefPicList1 (1 entries)"
+        );
+        // Unused lists with no picture anywhere: RefPicList0[ 0 ].
+        let empty = RefPicLists {
+            list0: vec![None],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &empty,
+            entries: &[],
+        };
+        assert!(matches!(
+            resolve_list(&params, &refs, None, 1, false, -1, [0, 0]),
+            Err(ReconError::MissingReference {
+                list: 0,
+                ref_idx: 0,
+                ..
+            })
+        ));
     }
 
     fn dpb_entry(poc: i32, pic: Picture) -> DpbEntry {

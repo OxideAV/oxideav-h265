@@ -46,6 +46,7 @@ use crate::transform_unit::TransformUnit;
 
 /// Errors raised while reconstructing samples from a decoded CTU.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReconError {
     /// A §8.4.4.2 intra-prediction primitive failed.
     IntraPred(IntraPredError),
@@ -56,6 +57,27 @@ pub enum ReconError {
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
+    /// A prediction unit predicts from `RefPicListX[ refIdx ]` (§8.5.3.3.2)
+    /// but that entry is "no reference picture" — the slice's §8.3.2
+    /// reference picture set names a picture the DPB does not hold (a
+    /// stream entered mid-sequence, or a lost picture) — or `ref_idx`
+    /// lies outside the §8.3.4 list.
+    MissingReference {
+        /// `X` of `RefPicListX` (0 or 1).
+        list: u8,
+        /// The PU's `ref_idx_lX`.
+        ref_idx: i32,
+        /// The number of entries `RefPicListX` holds.
+        list_len: usize,
+        /// `PicOrderCntVal` of the picture being reconstructed, when known.
+        poc: Option<i32>,
+    },
+    /// A P / B picture reached inter reconstruction with no §8.3.4
+    /// reference picture lists (none were built for it).
+    NoReferenceLists {
+        /// `PicOrderCntVal` of the picture being reconstructed.
+        poc: i32,
+    },
     /// The §6.4.1 picture-tiling geometry needed for neighbour
     /// availability could not be built.
     Tiling(crate::availability::AvailabilityError),
@@ -70,12 +92,62 @@ impl core::fmt::Display for ReconError {
             Self::InterNotSupported => {
                 f.write_str("inter prediction is not reconstructed by the intra path")
             }
+            Self::MissingReference {
+                list,
+                ref_idx,
+                list_len,
+                poc,
+            } => {
+                if let Some(poc) = poc {
+                    write!(f, "picture POC {poc}: ")?;
+                }
+                if (0..*list_len as i64).contains(&i64::from(*ref_idx)) {
+                    write!(
+                        f,
+                        "RefPicList{list}[{ref_idx}] is \"no reference picture\" \
+                         (the reference picture set names a picture the DPB does not hold)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "ref_idx_l{list} = {ref_idx} lies outside RefPicList{list} \
+                         ({list_len} entries)"
+                    )
+                }
+            }
+            Self::NoReferenceLists { poc } => write!(
+                f,
+                "picture POC {poc}: no reference picture lists were built for an inter picture"
+            ),
             Self::Tiling(e) => write!(f, "picture tiling geometry invalid: {e}"),
         }
     }
 }
 
 impl std::error::Error for ReconError {}
+
+impl ReconError {
+    /// Attach the current picture's `PicOrderCntVal` to a
+    /// [`Self::MissingReference`] that lacks it (other variants pass
+    /// through unchanged).
+    #[must_use]
+    pub(crate) fn in_picture(self, picture_poc: i32) -> Self {
+        match self {
+            Self::MissingReference {
+                list,
+                ref_idx,
+                list_len,
+                poc: None,
+            } => Self::MissingReference {
+                list,
+                ref_idx,
+                list_len,
+                poc: Some(picture_poc),
+            },
+            e => e,
+        }
+    }
+}
 
 impl From<IntraPredError> for ReconError {
     fn from(e: IntraPredError) -> Self {
