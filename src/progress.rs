@@ -125,6 +125,18 @@ impl InFlightPicture {
         self.wait_for(&self.lines, need);
     }
 
+    /// `(rows per band, row width)` of `plane`.
+    #[inline]
+    pub(crate) fn band_geom(&self, plane: usize) -> (usize, usize) {
+        (BAND / self.sub_h[plane], self.dims[plane].0)
+    }
+
+    /// Band `b` of `plane` (published).
+    #[inline]
+    pub(crate) fn band(&self, plane: usize, b: usize) -> &[u16] {
+        self.bands[plane][b].get().expect("a published band")
+    }
+
     /// Plane row `y` (published).
     pub(crate) fn row(&self, plane: usize, y: usize) -> &[u16] {
         let bh = BAND / self.sub_h[plane];

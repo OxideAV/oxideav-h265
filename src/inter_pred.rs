@@ -172,6 +172,29 @@ impl<'a> RefPlane<'a> {
         }
     }
 
+    /// [`Self::row`] remembering the last band of a pending plane (the
+    /// rows of a filter window mostly share one).
+    #[inline]
+    fn row_cached(&self, y: usize, cache: &mut Option<(usize, &'a [u16])>) -> &'a [u16] {
+        match self.pending {
+            None => &self.samples[y * self.width..(y + 1) * self.width],
+            Some((p, i)) => {
+                let (bh, w) = p.band_geom(i);
+                let b = y / bh;
+                let band = match *cache {
+                    Some((cb, s)) if cb == b => s,
+                    _ => {
+                        let s = p.band(i, b);
+                        *cache = Some((b, s));
+                        s
+                    }
+                };
+                let o = (y - b * bh) * w;
+                &band[o..o + w]
+            }
+        }
+    }
+
     /// Make sure rows `y_from .. y_to` (clamped into the plane) are
     /// readable: a no-op for a finished plane, a wait on the worker's
     /// published rows for a pending one.
@@ -629,8 +652,12 @@ fn interp_block<const TAPS: usize>(
                 window.clear();
                 window.reserve(ww * wh);
                 let pw = plane.width as i32;
+                let mut band = None;
                 for j in 0..wh as i32 {
-                    let row = plane.row((y0 + j).clamp(0, plane.height as i32 - 1) as usize);
+                    let row = plane.row_cached(
+                        (y0 + j).clamp(0, plane.height as i32 - 1) as usize,
+                        &mut band,
+                    );
                     if x0 >= 0 && x0 + ww as i32 <= pw {
                         window.extend_from_slice(&row[x0 as usize..x0 as usize + ww]);
                     } else {
