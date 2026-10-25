@@ -435,3 +435,114 @@ fn multi_layer_output_descriptions() {
     assert_eq!(sizes, vec![(Some(32), 0), (Some(64), 1)]);
     assert_eq!(t, whole(&shvc, 8), "1 vs 8 threads");
 }
+
+/// `reset` (a seek) drops everything decoded before it, keeps the
+/// `hvcC` parameter sets, and decodes from the next IRAP picture
+/// exactly as a straight decode does; the generation does not move at
+/// the reset, only at the first returned frame of a different shape.
+#[test]
+fn reset_seeks_to_the_next_irap() {
+    fn video(f: Frame) -> VideoFrame {
+        match f {
+            Frame::Video(v) => v,
+            _ => panic!("non-video frame"),
+        }
+    }
+    let name = "yuv420p10_64x48_50.hevc";
+    let (hvcc, packets) = to_hvcc(&fixture(name));
+    let mut params = CodecParameters::video(CodecId::new("h265"));
+    params.extradata = hvcc;
+    let decode = |packets: &[Vec<u8>], reset_after: Option<usize>| -> Vec<Vec<u8>> {
+        let mut dec = make_decoder(&params).expect("make_decoder");
+        let mut frames = Vec::new();
+        if let Some(n) = reset_after {
+            for p in &packets[..n] {
+                dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), p.clone()))
+                    .expect("send");
+                let _ = dec.receive_frame();
+            }
+            dec.reset().expect("reset");
+        }
+        let start = reset_after.map_or(0, |_| {
+            // The second IRAP (nal_unit_type 16..=21) of the stream.
+            packets
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| (16..=21).contains(&nal_type(&p[4..])))
+                .nth(1)
+                .expect("second IRAP")
+                .0
+        });
+        for p in &packets[start..] {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), p.clone()))
+                .expect("send");
+            while let Ok(f) = dec.receive_frame() {
+                frames.push(video(f).planes.concat_data());
+            }
+        }
+        dec.flush().expect("flush");
+        while let Ok(f) = dec.receive_frame() {
+            frames.push(video(f).planes.concat_data());
+        }
+        assert_eq!(dec.output_params_generation(), 0);
+        frames
+    };
+    let straight = decode(&packets, None);
+    let seeked = decode(&packets, Some(6));
+    assert_eq!(straight.len(), 10);
+    // The second GOP opens with a CRA picture whose RASL picture is
+    // output ahead of it (straight[4]); after the seek the RASL picture
+    // is skipped (§8.1.3 — its reference precedes the CRA picture) and
+    // the rest is the straight decode's tail.
+    assert_eq!(seeked.len(), 5, "the CRA picture and what follows it");
+    assert_eq!(
+        seeked,
+        straight[5..],
+        "same pictures as the straight decode"
+    );
+
+    // Back to a differently shaped segment: the bump comes with the
+    // first frame returned after the seek, not with the reset.
+    let bytes = fixture("change_64x48_8bit_then_48x32_10bit.hevc");
+    let nals = nal_payloads(&bytes);
+    let annexb = |n: &[u8]| {
+        let mut d = vec![0, 0, 0, 1];
+        d.extend_from_slice(n);
+        Packet::new(0, TimeBase::new(1, 25), d)
+    };
+    let mut dec = make_decoder(&CodecParameters::video(CodecId::new("h265"))).expect("decoder");
+    for n in &nals {
+        dec.send_packet(&annexb(n)).expect("send");
+    }
+    dec.flush().expect("flush");
+    while dec.receive_frame().is_ok() {}
+    assert_eq!(dec.output_params().and_then(|p| p.width), Some(48));
+    let generation = dec.output_params_generation();
+    dec.reset().expect("reset");
+    assert_eq!(
+        dec.output_params_generation(),
+        generation,
+        "no bump at reset"
+    );
+    for n in &nals {
+        dec.send_packet(&annexb(n)).expect("send");
+        if let Ok(f) = dec.receive_frame() {
+            let p = dec.output_params().expect("answer");
+            assert_frame_matches(&video(f), &p, "after the seek");
+            assert_eq!(p.width, Some(64));
+            assert_eq!(dec.output_params_generation(), generation.wrapping_add(1));
+            return;
+        }
+    }
+    panic!("no frame after the seek");
+}
+
+trait ConcatData {
+    fn concat_data(&self) -> Vec<u8>;
+}
+
+impl ConcatData for Vec<oxideav_core::VideoPlane> {
+    fn concat_data(&self) -> Vec<u8> {
+        self.iter().flat_map(|p| p.data.iter().copied()).collect()
+    }
+}

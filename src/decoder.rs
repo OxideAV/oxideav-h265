@@ -170,6 +170,12 @@ impl H265Decoder {
     /// Move decoded pictures into the reorder buffer and emit every
     /// frame that is guaranteed next in output order.
     fn drain(&mut self, flush: bool) {
+        // A skipped RASL picture never comes out; it precedes its IRAP
+        // picture (and every later one) in output order, so its PTS is
+        // the smallest still queued.
+        for _ in 0..self.seq.take_skipped_pictures() {
+            self.pts_queue.pop();
+        }
         self.reorder.extend(self.seq.take_decoded());
         // Output order: POC within a CVS, the layers of one access unit
         // consecutively by increasing nuh_layer_id.
@@ -307,6 +313,19 @@ impl Decoder for H265Decoder {
         // Bounded through the core contract: at most `threads` workers
         // for the per-picture wavefront / row-parallel filters.
         self.seq.set_threads(ctx.threads);
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // A seek: nothing decoded before it is output. The description
+        // of the last returned frame stays until a frame of the new
+        // position is returned (the generation moves only then, and
+        // only if the shape differs).
+        self.seq.reset_stream();
+        self.reorder.clear();
+        self.ready.clear();
+        self.pts_queue.clear();
+        self.flushed = false;
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {

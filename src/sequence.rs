@@ -448,6 +448,12 @@ pub struct SequenceDecoder {
     /// pictures have been decoded (an SPS stays active for a whole
     /// coded video sequence of its layer, §7.4.2.4.2).
     traits: BTreeMap<(u32, u8), ShapeTraits>,
+    /// The associated IRAP picture of the base layer had
+    /// `NoRaslOutputFlag == 1`: its RASL pictures are skipped (§8.1.3).
+    skip_rasl: bool,
+    /// Pictures skipped that way, not yet reported by
+    /// [`Self::take_skipped_pictures`].
+    skipped_pictures: usize,
 }
 
 impl Drop for SequenceDecoder {
@@ -730,6 +736,37 @@ impl SequenceDecoder {
         workers
     }
 
+    /// The number of coded pictures skipped since the last call (RASL
+    /// pictures of a random access point, §8.1.3) — pictures that
+    /// will never come out of [`Self::take_decoded`].
+    pub(crate) fn take_skipped_pictures(&mut self) -> usize {
+        std::mem::take(&mut self.skipped_pictures)
+    }
+
+    /// Forget the stream position for a seek: drop the picture being
+    /// assembled, the pictures decoded but not taken and every
+    /// reference picture, and treat the next IRAP picture as the first
+    /// of the bitstream (§8.1.3 — a CRA starts a coded video sequence
+    /// with `NoRaslOutputFlag == 1`, its RASL pictures skipped). The
+    /// parameter sets stay in force. In-flight frame-threading workers
+    /// are waited for and their results dropped.
+    pub(crate) fn reset_stream(&mut self) {
+        self.pending.clear();
+        let _ = self.collect_done(true);
+        self.deferred_error = None;
+        self.release_references();
+        self.frames.clear();
+        self.au = AccessUnit {
+            index: self.au.index,
+            ..AccessUnit::default()
+        };
+        self.layers.clear();
+        // The pictures after the seek start a new coded video sequence
+        // for output ordering; the first IRAP does not count again.
+        self.cvs_index += 1;
+        self.seen_picture = false;
+    }
+
     /// Release every reference picture: the bitstream has ended, so no
     /// later picture can reference them, and the decoded frames still
     /// to be taken become the sole owners of their planes (a consumer
@@ -853,6 +890,19 @@ impl SequenceDecoder {
             return Err(SequenceError::Malformed(
                 "first slice segment of a picture is dependent",
             ));
+        }
+        // §8.1.3: a RASL picture associated with an IRAP picture whose
+        // NoRaslOutputFlag is 1 (the first picture of the bitstream, or
+        // the first after a seek) is not output, and its leading
+        // references precede the random access point — it is skipped.
+        if indep.layer_id == 0 {
+            let kind = NalKind::new(indep.nal_type);
+            if kind.is_irap() {
+                self.skip_rasl = kind.is_idr() || kind.is_bla() || !self.seen_picture;
+            } else if kind.is_rasl() && self.skip_rasl {
+                self.skipped_pictures += 1;
+                return Ok(());
+            }
         }
         let plan = self.plan();
         // Frame threading: this picture's slice data goes to a worker
@@ -1371,8 +1421,7 @@ impl SequenceDecoder {
         let poc = ref_state.poc;
         let view_id = ext.map_or(0, |e| e.layers.view_id_of(layer_id));
         self.traits
-            .entry((self.cvs_index, layer_id))
-            .or_insert_with(|| ShapeTraits::of_sps(sps));
+            .insert((self.cvs_index, layer_id), ShapeTraits::of_sps(sps));
         self.frames.push(DecodedFrame {
             cvs_index: self.cvs_index,
             poc: poc.val,

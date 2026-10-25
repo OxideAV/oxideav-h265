@@ -21,6 +21,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   of an MV-HEVC stream share one description. Verified against ffprobe
   on black-box libx265 fixtures (`tests/fixtures/output_params/`,
   `gen.sh`).
+- *(decoder)* `reset()` for seeks: drops the queued and in-flight
+  pictures and the references, keeps the parameter sets (`hvcC`
+  included) and treats the next IRAP picture as the first of the
+  bitstream. The default trait reset drained the queue through
+  `receive_frame` and left the decoder in its end-of-stream state.
+
+### Fixed
+
+- *(decoder)* RASL pictures of a CRA picture with `NoRaslOutputFlag`
+  1 (a stream that starts at a CRA, or the first CRA after a seek) are
+  skipped as §8.1.3 prescribes instead of failing on their missing
+  leading reference; their PTS is dropped with them.
 
 ## [0.0.16](https://github.com/OxideAV/oxideav-h265/compare/v0.0.15...v0.0.16) - 2026-10-25
 
