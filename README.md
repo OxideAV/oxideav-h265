@@ -471,14 +471,28 @@ decoding ~20 %, intra prediction ~6 %, prediction + residual add ~4 %,
 deblocking ~6 %, SAO ~3 %, allocation ~6 %.
 
 Under a thread budget (`set_execution_context` / `SequenceDecoder::
-set_threads`), a WPP picture decodes its CTB rows in a wavefront (each
-row parsed and reconstructed by one worker into a row band with a
-four-line halo; the row below imports what each CTB publishes), a tiled
-picture decodes its tiles independently into rectangular bands (the
-tile-boundary CUs' deblocking strengths derived again over the merged
-motion field), every picture's deblocking and SAO run row-parallel, and
-the bytes equal the serial decode for any budget
-(`tests/threaded_decode.rs`).
+set_threads`), a sequence decodes **frame-parallel**: the §8.3 POC /
+RPS / DPB cycle stays on the calling thread in decode order, and up to
+`threads` pictures decode their slice data on workers at once. A
+picture still being decoded sits in the DPB as a stand-in; each worker
+reconstructs in CTB raster order and, as each CTB row completes,
+publishes the row's motion, keeps its unfiltered last line for the next
+row's intra prediction, deblocks it and SAO-filters every line whose
+window is final, publishing those lines — a later picture's worker
+waits only for the lines its motion vector and the interpolation taps
+reach. The last picture of a flush (a still) instead decodes in place:
+a WPP picture's CTB rows in a wavefront (each row parsed and
+reconstructed by one worker into a row band with a four-line halo), a
+tiled picture's tiles independently into rectangular bands, the
+deblocking and SAO row-parallel. The bytes equal the serial decode for
+any budget (`tests/threaded_decode.rs`, and the staged conformance
+corpus at 2 / 4 / 8 threads in `tests/conformance_official.rs`).
+
+Speed on a 10 s 1080p30 libx265 clip (single slice, WPP, B-frames,
+SAO; `examples/decode_bench.rs`, one access unit per packet, Apple M5
+Max): 3.1 s single-threaded, about 1.2 s on 4 threads and 0.85-0.9 s
+on 8, the output matching a black-box decoder's `framemd5` frame for
+frame.
 
 ## What's implemented
 
@@ -612,10 +626,16 @@ and ~985 unit tests.
   output at every budget; what remains is the serial floor (the
   picture's decided CU plans with their coefficient levels, the input
   and output planes).
-* Decoder parallelism covers WPP pictures (wavefront), tiled pictures
-  (per tile) and the in-loop filters of every picture; pictures with
-  WPP inside tiles, SCC palette / current-picture referencing or
-  chroma QP offset lists parse serially (parallel filters only).
+* Decoder parallelism is frame-level for sequences (tolerant and
+  multi-layer decodes stay per picture); a picture referencing itself
+  (SCC current-picture referencing) filters after its last CTU. In
+  place (a still, the last picture of a flush) it covers WPP pictures
+  (wavefront), tiled pictures (per tile) and the in-loop filters;
+  pictures with WPP inside tiles, SCC palette / current-picture
+  referencing or chroma QP offset lists parse serially there (parallel
+  filters only). Each picture in flight keeps a copy of its published
+  rows while a picture in flight still reads it ; the 1080p clip
+  peaks at about 305 MB on 8 threads against 95 MB serial.
 * Known corner: on the §8.7.3.2 SAO cross-slice neighbour rule with
   heterogeneous per-slice flags, a black-box reference decoder
   consults the current sample's slice flag where the spec text (both

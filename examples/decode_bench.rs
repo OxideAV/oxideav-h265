@@ -10,7 +10,8 @@
 //! the summary line adds their best times up.
 //!
 //! `threads=N` hands the decoder an `ExecutionContext` budget of `N`
-//! workers (serial when absent); `repeat=N` decodes the stream `N`
+//! workers (serial when absent; `threads=auto` = the host's available
+//! parallelism); `repeat=N` decodes the stream `N`
 //! times with a fresh decoder each (the reported time is the best).
 //! The digest is a 64-bit FNV-1a (over 8-byte words) of the planes in output order, so
 //! two runs are byte-identical iff their digests agree. `au` feeds the
@@ -47,7 +48,11 @@ fn main() {
     let mut opts = Opts::default();
     for a in std::env::args().skip(1) {
         if let Some(v) = a.strip_prefix("threads=") {
-            threads = v.parse().expect("threads=N");
+            threads = if v == "auto" {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            } else {
+                v.parse().expect("threads=N")
+            };
         } else if let Some(v) = a.strip_prefix("repeat=") {
             repeat = v.parse().expect("repeat=N");
         } else if a == "au" {
