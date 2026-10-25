@@ -701,7 +701,7 @@ fn predict_add_store(
 // §8.5 inter sample reconstruction
 // ---------------------------------------------------------------------------
 
-use crate::inter_pred::{InterPredGeometry, InterPrediction, ListPrediction, RefPlane};
+use crate::inter_pred::RefPlane;
 
 /// One reference list's fully-resolved per-PU motion: the
 /// §8.5.3.2-derived luma motion vector, the §8.5.3.2.10 chroma motion
@@ -716,41 +716,6 @@ pub struct ResolvedList<'a> {
     pub mv_c: [i32; 2],
     /// `RefPicListX[refIdxLX]` — the reference picture's samples.
     pub ref_pic: &'a Picture,
-}
-
-/// Build the §8.5.3.3.2 [`ListPrediction`] for one reference list,
-/// borrowing the reference picture's luma + (when chroma is present)
-/// Cb / Cr planes for the lifetime `'a`.
-fn build_list_prediction<'a>(
-    list: &ResolvedList<'a>,
-    chroma_array_type: u8,
-) -> Result<ListPrediction<'a>, ReconError> {
-    let (lw, lh) = list.ref_pic.plane_dims(Plane::Luma);
-    let lp =
-        RefPlane::new(list.ref_pic.plane(Plane::Luma), lw, lh).map_err(ReconError::InterPred)?;
-    let (cb, cr) = if chroma_array_type != 0 {
-        let (cw, ch) = list.ref_pic.plane_dims(Plane::Cb);
-        (
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cb), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
-            Some(
-                RefPlane::new(list.ref_pic.plane(Plane::Cr), cw, ch)
-                    .map_err(ReconError::InterPred)?,
-            ),
-        )
-    } else {
-        (None, None)
-    };
-    Ok(ListPrediction {
-        pred_flag: list.pred_flag,
-        luma: lp,
-        cb,
-        cr,
-        mv_l: list.mv_l,
-        mv_c: list.mv_c,
-    })
 }
 
 /// §8.5.3.3 — reconstruct one inter prediction unit's motion-compensated
@@ -820,75 +785,295 @@ pub fn reconstruct_inter_pu_weighted(
     residual_cr: Option<&[i32]>,
     weights: Option<&crate::inter_pred::PuWeights>,
 ) -> Result<(), ReconError> {
-    let cat = params.chroma_array_type;
-    // Build the §8.5.3.3.2 reference planes for each used list.
-    let lp0 = build_list_prediction(&l0, cat)?;
-    let lp1 = build_list_prediction(&l1, cat)?;
-    let geom = InterPredGeometry {
-        x_pb: x_pb as i32,
-        y_pb: y_pb as i32,
-        n_pb_w,
-        n_pb_h,
-        chroma_array_type: cat,
-        bit_depth_luma: params.bit_depth_luma,
-        bit_depth_chroma: params.bit_depth_chroma,
+    fn w_of(r: Option<&[i32]>, w: usize) -> Option<ResidualView<'_>> {
+        r.map(|samples| ResidualView { samples, stride: w })
+    }
+    let (sw, _) = if params.chroma_array_type != 0 {
+        sub_wh_c(params.chroma_array_type)
+    } else {
+        (1, 1)
     };
-    let InterPrediction { luma, cb, cr } =
-        crate::inter_pred::predict_inter_pu_weighted(&lp0, &lp1, &geom, weights)
-            .map_err(ReconError::InterPred)?;
-
-    // §8.6.5 / §8.4.4.1: recSamples = Clip1( predSamples + resSamples ).
-    write_inter_plane(
+    reconstruct_inter_pu_views(
         pic,
+        params,
+        (x_pb, y_pb, n_pb_w, n_pb_h),
+        l0,
+        l1,
+        [
+            w_of(residual_luma, n_pb_w),
+            w_of(residual_cb, n_pb_w / sw),
+            w_of(residual_cr, n_pb_w / sw),
+        ],
+        weights,
+    )
+}
+
+/// A residual block inside a larger row-major buffer: `samples[ y *
+/// stride + x ]` is the residual at block position `( x, y )`.
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub struct ResidualView<'a> {
+    /// The block's first sample onwards.
+    pub samples: &'a [i32],
+    /// Row pitch of `samples`.
+    pub stride: usize,
+}
+
+/// The §8.5.3.3.4 combine of one component.
+#[derive(Debug, Clone, Copy)]
+enum Combine {
+    /// §8.5.3.3.4.2 default weighting.
+    Default,
+    /// §8.5.3.3.4.3 explicit `(log2WeightDenom, w0, o0, w1, o1)`.
+    Explicit(u8, i32, i32, i32, i32),
+}
+
+thread_local! {
+    /// Per-thread L0 / L1 intermediate prediction arrays.
+    static MC_SCRATCH: core::cell::RefCell<(Vec<i32>, Vec<i32>)> =
+        const { core::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// §8.5.3.3 for one PU: interpolate each used list straight into
+/// per-thread arrays, combine (§8.5.3.3.4), add the residual and clip
+/// (§8.6.7) into `pic` — the arithmetic of [`reconstruct_inter_pu`]
+/// without its intermediate allocations. `residual` holds the luma /
+/// Cb / Cr views (`None` = no residual).
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn reconstruct_inter_pu_views(
+    pic: &mut Picture,
+    params: &ReconParams,
+    (x_pb, y_pb, n_pb_w, n_pb_h): (usize, usize, usize, usize),
+    l0: ResolvedList<'_>,
+    l1: ResolvedList<'_>,
+    residual: [Option<ResidualView<'_>>; 3],
+    weights: Option<&crate::inter_pred::PuWeights>,
+) -> Result<(), ReconError> {
+    use crate::inter_pred::InterPredError;
+    if n_pb_w == 0 || n_pb_h == 0 {
+        return Err(ReconError::InterPred(InterPredError::EmptyBlock));
+    }
+    if !l0.pred_flag && !l1.pred_flag {
+        return Err(ReconError::InterPred(InterPredError::EmptyPlane));
+    }
+    let cat = params.chroma_array_type;
+    for bd in [params.bit_depth_luma, params.bit_depth_chroma] {
+        if !(8..=16).contains(&bd) {
+            return Err(ReconError::InterPred(InterPredError::InvalidBitDepth(bd)));
+        }
+    }
+    let lists = [l0, l1];
+    let mut planes: Vec<(Plane, [Option<RefPlane<'_>>; 2])> = Vec::with_capacity(3);
+    fn ref_plane<'a>(
+        list: &ResolvedList<'a>,
+        plane: Plane,
+    ) -> Result<Option<RefPlane<'a>>, ReconError> {
+        if !list.pred_flag {
+            return Ok(None);
+        }
+        let (w, h) = list.ref_pic.plane_dims(plane);
+        RefPlane::new(list.ref_pic.plane(plane), w, h)
+            .map(Some)
+            .map_err(ReconError::InterPred)
+    }
+    planes.push((
         Plane::Luma,
-        x_pb,
-        y_pb,
-        n_pb_w,
-        n_pb_h,
-        &luma,
-        residual_luma,
-    );
+        [
+            ref_plane(&lists[0], Plane::Luma)?,
+            ref_plane(&lists[1], Plane::Luma)?,
+        ],
+    ));
     if cat != 0 {
-        let (sw, sh) = sub_wh_c(cat);
-        let xc = x_pb / sw;
-        let yc = y_pb / sh;
-        let pcw = n_pb_w / sw;
-        let pch = n_pb_h / sh;
-        write_inter_plane(pic, Plane::Cb, xc, yc, pcw, pch, &cb, residual_cb);
-        write_inter_plane(pic, Plane::Cr, xc, yc, pcw, pch, &cr, residual_cr);
+        for plane in [Plane::Cb, Plane::Cr] {
+            planes.push((
+                plane,
+                [ref_plane(&lists[0], plane)?, ref_plane(&lists[1], plane)?],
+            ));
+        }
+    }
+    let (sw, sh) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
+    for (ci, (plane, refs)) in planes.iter().enumerate() {
+        let luma = ci == 0;
+        let (x0, y0, w, h) = if luma {
+            (x_pb, y_pb, n_pb_w, n_pb_h)
+        } else {
+            (x_pb / sw, y_pb / sh, n_pb_w / sw, n_pb_h / sh)
+        };
+        let combine = match weights {
+            None => Combine::Default,
+            Some(wp) => match plane {
+                Plane::Luma => Combine::Explicit(
+                    wp.luma_log2_weight_denom,
+                    wp.l0.w_luma,
+                    wp.l0.o_luma,
+                    wp.l1.w_luma,
+                    wp.l1.o_luma,
+                ),
+                Plane::Cb => Combine::Explicit(
+                    wp.chroma_log2_weight_denom,
+                    wp.l0.w_cb,
+                    wp.l0.o_cb,
+                    wp.l1.w_cb,
+                    wp.l1.o_cb,
+                ),
+                Plane::Cr => Combine::Explicit(
+                    wp.chroma_log2_weight_denom,
+                    wp.l0.w_cr,
+                    wp.l0.o_cr,
+                    wp.l1.w_cr,
+                    wp.l1.o_cr,
+                ),
+            },
+        };
+        let bit_depth = pic.bit_depth(*plane);
+        MC_SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let (p0, p1) = &mut *guard;
+            for (li, buf) in [&mut *p0, &mut *p1].into_iter().enumerate() {
+                let Some(rp) = refs[li].as_ref() else {
+                    continue;
+                };
+                buf.resize(w * h, 0);
+                let mv_l = lists[li].mv_l;
+                let mv_c = lists[li].mv_c;
+                if luma {
+                    // §8.5.3.3.3.1 eqs 8-214..8-217.
+                    crate::inter_pred::interp_luma_into(
+                        rp,
+                        x_pb as i32 + (mv_l[0] >> 2),
+                        y_pb as i32 + (mv_l[1] >> 2),
+                        mv_l[0] & 3,
+                        mv_l[1] & 3,
+                        w,
+                        h,
+                        bit_depth,
+                        buf,
+                    );
+                } else {
+                    // Eqs 8-218..8-221.
+                    crate::inter_pred::interp_chroma_into(
+                        rp,
+                        x_pb as i32 / sw as i32 + (mv_c[0] >> 3),
+                        y_pb as i32 / sh as i32 + (mv_c[1] >> 3),
+                        mv_c[0] & 7,
+                        mv_c[1] & 7,
+                        w,
+                        h,
+                        bit_depth,
+                        buf,
+                    );
+                }
+            }
+            write_mc_block(
+                pic,
+                *plane,
+                (x0, y0, w, h),
+                (lists[0].pred_flag, lists[1].pred_flag),
+                (&p0[..], &p1[..]),
+                combine,
+                residual[ci],
+                bit_depth,
+            );
+        });
     }
     Ok(())
 }
 
-/// Write one motion-compensated prediction plane plus its optional
-/// residual into `pic` with the §8.4.4.1 clip.
+/// Combine the intermediate arrays per §8.5.3.3.4 (default or
+/// explicit), add the residual and `Clip1` into the picture.
 #[allow(clippy::too_many_arguments)]
-fn write_inter_plane(
+fn write_mc_block(
     pic: &mut Picture,
     plane: Plane,
-    x0: usize,
-    y0: usize,
-    w: usize,
-    h: usize,
-    pred: &[i32],
-    residual: Option<&[i32]>,
+    (x0, y0, w, h): (usize, usize, usize, usize),
+    flags: (bool, bool),
+    (p0, p1): (&[i32], &[i32]),
+    combine: Combine,
+    residual: Option<ResidualView<'_>>,
+    bit_depth: u8,
 ) {
-    let bit_depth = pic.bit_depth(plane);
+    let max_val = (1i32 << bit_depth) - 1;
     let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
-    for y in 0..h {
-        let o = (y0 + y - oy) * stride + (x0 - ox);
-        let row = &mut buf[o..o + w];
-        let prow = &pred[y * w..(y + 1) * w];
-        match residual {
-            Some(r) => {
-                let rrow = &r[y * w..(y + 1) * w];
-                for ((d, &p), &r) in row.iter_mut().zip(prow).zip(rrow) {
-                    *d = clip1(p + r, bit_depth) as u16;
+    #[inline(always)]
+    fn rows<F: Fn(i32, i32) -> i32>(
+        buf: &mut [u16],
+        stride: usize,
+        (x0, y0, w, h): (usize, usize, usize, usize),
+        (p0, p1): (&[i32], &[i32]),
+        residual: Option<ResidualView<'_>>,
+        max_val: i32,
+        f: F,
+    ) {
+        for y in 0..h {
+            let o = (y0 + y) * stride + x0;
+            let row = &mut buf[o..o + w];
+            let a = p0.get(y * w..(y + 1) * w).unwrap_or(&[]);
+            let b = p1.get(y * w..(y + 1) * w).unwrap_or(&[]);
+            // An unused list's array is not read: index the used one twice.
+            let (a, b) = match (a.is_empty(), b.is_empty()) {
+                (true, _) => (b, b),
+                (_, true) => (a, a),
+                _ => (a, b),
+            };
+            match residual {
+                Some(r) => {
+                    let rr = &r.samples[y * r.stride..y * r.stride + w];
+                    for (((d, &pa), &pb), &rv) in row.iter_mut().zip(a).zip(b).zip(rr) {
+                        *d = (f(pa, pb) + rv).clamp(0, max_val) as u16;
+                    }
+                }
+                None => {
+                    for ((d, &pa), &pb) in row.iter_mut().zip(a).zip(b) {
+                        *d = f(pa, pb) as u16;
+                    }
                 }
             }
-            None => {
-                for (d, &p) in row.iter_mut().zip(prow) {
-                    *d = clip1(p, bit_depth) as u16;
+        }
+    }
+    let rect = (x0 - ox, y0 - oy, w, h);
+    let (p0, p1) = match flags {
+        (true, true) => (p0, p1),
+        (true, false) => (p0, &[][..]),
+        _ => (&[][..], p1),
+    };
+    match combine {
+        Combine::Default => {
+            // Eqs 8-262..8-264.
+            let shift1 = core::cmp::max(2, 14 - i32::from(bit_depth));
+            let shift2 = core::cmp::max(3, 15 - i32::from(bit_depth));
+            let offset1 = 1i32 << (shift1 - 1);
+            let offset2 = 1i32 << (shift2 - 1);
+            if flags.0 && flags.1 {
+                rows(buf, stride, rect, (p0, p1), residual, max_val, |a, b| {
+                    ((a + b + offset2) >> shift2).clamp(0, max_val)
+                });
+            } else {
+                rows(buf, stride, rect, (p0, p1), residual, max_val, |a, _| {
+                    ((a + offset1) >> shift1).clamp(0, max_val)
+                });
+            }
+        }
+        Combine::Explicit(denom, w0, o0, w1, o1) => {
+            // Eqs 8-265..8-277 (64-bit products, as the reference form).
+            let shift1 = core::cmp::max(2, 14 - i64::from(bit_depth));
+            let log2_wd = i64::from(denom) + shift1;
+            let mv = i64::from(max_val);
+            let (w0, o0, w1, o1) = (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
+            match flags {
+                (true, true) => {
+                    let round = (o0 + o1 + 1) << log2_wd;
+                    rows(buf, stride, rect, (p0, p1), residual, max_val, |a, b| {
+                        ((i64::from(a) * w0 + i64::from(b) * w1 + round) >> (log2_wd + 1))
+                            .clamp(0, mv) as i32
+                    });
+                }
+                _ => {
+                    let (w, o) = if flags.0 { (w0, o0) } else { (w1, o1) };
+                    let round = 1i64 << (log2_wd - 1);
+                    rows(buf, stride, rect, (p0, p1), residual, max_val, |a, _| {
+                        (((i64::from(a) * w + round) >> log2_wd) + o).clamp(0, mv) as i32
+                    });
                 }
             }
         }
@@ -962,6 +1147,22 @@ impl CuResidualPlane {
         }
     }
 
+    /// The residual block at component position `( rx, ry )` as a view
+    /// into this plane (`None` when the block does not lie inside it —
+    /// the caller then slices with [`Self::slice_region`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn view(&self, rx: usize, ry: usize, w: usize, h: usize) -> Option<ResidualView<'_>> {
+        (rx >= self.x0
+            && ry >= self.y0
+            && rx + w <= self.x0 + self.width
+            && ry + h <= self.y0 + self.height)
+            .then(|| ResidualView {
+                samples: &self.samples[(ry - self.y0) * self.width + (rx - self.x0)..],
+                stride: self.width,
+            })
+    }
+
     /// Extract the `w × h` residual covering the prediction region at
     /// component position `(rx, ry)` (row-major), zero-filling positions
     /// outside this plane.
@@ -998,6 +1199,15 @@ pub struct CuResidual {
 }
 
 impl CuResidual {
+    /// A residual with zero-sized planes (a CU that codes none).
+    pub(crate) fn empty() -> Self {
+        Self {
+            luma: CuResidualPlane::zeros(0, 0, 0, 0),
+            cb: None,
+            cr: None,
+        }
+    }
+
     /// `true` when this CU codes no residual at all (skip / `rqt_root_cbf
     /// == 0`); the prediction is written directly.
     #[must_use]

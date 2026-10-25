@@ -8,6 +8,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- *(decoder)* §8.5.3.3.3 fractional-sample interpolation runs separably per block (one edge-extended source window, a horizontal row pass and a vertical pass) instead of re-filtering every sample through clamped per-tap reads, and the §8.5.3.3.4 combine, the residual add and the clip write straight into the picture from per-thread arrays (no per-PU prediction / residual-slice allocations; skip CUs build no residual planes). Output is bit-identical (pinned against the per-sample equations at every phase, bit depth and edge position); the 10 s 1080p30 libx265 clip decodes in 3.7 s single-threaded against 5.8 s before
+- *(examples)* `decode_bench` takes `au` (one access unit per packet, the way a demuxer feeds it) and `out=PATH` (raw planes, `-` for stdout, for a black-box `framemd5`), and digests 8-byte words
+
 - edition 2024, MSRV 1.95
 - *(decoder)* inter CUs snapshot only their own one-cell intra-flag border for the §6.4.2 prediction-block availability instead of the whole picture's 4x4 grid (external contribution, #16); output is unchanged and a 30-frame 1080p libx265 IBBBP stream decodes about 10x faster single-threaded (10.6 s → 1.0 s, MD5 identical to the black-box reference decoder)
 

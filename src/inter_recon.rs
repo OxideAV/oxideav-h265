@@ -29,10 +29,7 @@ use crate::inter_pred::{PuWeights, WpListWeights};
 use crate::motion::{MotionField, derive_chroma_mv};
 use crate::picture::{Picture, Plane, sub_wh_c};
 use crate::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
-use crate::recon::{
-    CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual,
-    reconstruct_inter_pu_weighted,
-};
+use crate::recon::{CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual};
 use crate::slice_data::{CodingUnit, PredictionUnit};
 
 /// The slice's §7.4.7.3-derived weighted-prediction tables, resolved
@@ -200,6 +197,23 @@ pub fn reconstruct_inter_cu(
     refs: &RefListAccess,
     wp: Option<&SliceWpTables>,
 ) -> Result<(), ReconError> {
+    let _ = cu;
+    reconstruct_inter_cu_with(pic, params, rects, motions, residual, true, refs, wp)
+}
+
+/// [`reconstruct_inter_cu`] with `has_residual == false` for a CU that
+/// codes no transform tree (its residual planes are not read).
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_inter_cu_with(
+    pic: &mut Picture,
+    params: &ReconParams,
+    rects: &[PuRect],
+    motions: &[PuMotion],
+    residual: &CuResidual,
+    has_residual: bool,
+    refs: &RefListAccess,
+    wp: Option<&SliceWpTables>,
+) -> Result<(), ReconError> {
     let cat = params.chroma_array_type;
     let (sub_w, sub_h) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
 
@@ -241,16 +255,21 @@ pub fn reconstruct_inter_cu(
             motion.mv_l1,
         )?;
 
-        // Slice the PU's covering residual out of the CU residual planes.
-        let res_luma = residual
-            .luma
-            .slice_region(rect.x_pb, rect.y_pb, rect.n_pb_w, rect.n_pb_h);
-        let (res_cb, res_cr) = if cat != 0 {
+        // The PU's covering residual, read in place from the CU residual
+        // planes (`None` for a CU without a coded residual).
+        let res_luma = if has_residual {
+            residual
+                .luma
+                .view(rect.x_pb, rect.y_pb, rect.n_pb_w, rect.n_pb_h)
+        } else {
+            None
+        };
+        let (res_cb, res_cr) = if cat != 0 && has_residual {
             let (cx, cy) = (rect.x_pb / sub_w, rect.y_pb / sub_h);
             let (cw, ch) = (rect.n_pb_w / sub_w, rect.n_pb_h / sub_h);
             (
-                residual.cb.as_ref().map(|p| p.slice_region(cx, cy, cw, ch)),
-                residual.cr.as_ref().map(|p| p.slice_region(cx, cy, cw, ch)),
+                residual.cb.as_ref().and_then(|p| p.view(cx, cy, cw, ch)),
+                residual.cr.as_ref().and_then(|p| p.view(cx, cy, cw, ch)),
             )
         } else {
             (None, None)
@@ -259,22 +278,16 @@ pub fn reconstruct_inter_cu(
         // §8.5.3.3.4.1 — resolve the PU's explicit weights from its
         // reference indices when the slice's weightedPredFlag is 1.
         let pu_weights = wp.map(|t| t.resolve_pu(motion));
-        reconstruct_inter_pu_weighted(
+        crate::recon::reconstruct_inter_pu_views(
             pic,
             params,
-            rect.x_pb,
-            rect.y_pb,
-            rect.n_pb_w,
-            rect.n_pb_h,
+            (rect.x_pb, rect.y_pb, rect.n_pb_w, rect.n_pb_h),
             l0,
             l1,
-            Some(res_luma.as_slice()),
-            res_cb.as_deref(),
-            res_cr.as_deref(),
+            [res_luma, res_cb, res_cr],
             pu_weights.as_ref(),
         )?;
     }
-    let _ = cu;
     Ok(())
 }
 
@@ -374,15 +387,22 @@ pub fn resolve_and_reconstruct_inter_cu(
     let rects =
         crate::pu_mv::pu_partitions(cu.x0 as usize, cu.y0 as usize, n_cb_s, cu.part_mode.into());
 
-    let residual = extract_cu_residual(
-        params,
-        cu.transform_tree.as_ref(),
-        cu.x0 as usize,
-        cu.y0 as usize,
-        n_cb_s,
-        qp_y,
-        cu.cu_transquant_bypass_flag,
-    )?;
+    // A CU without a transform tree (skip / rqt_root_cbf == 0) has an
+    // all-zero residual: nothing to extract or add.
+    let has_residual = cu.transform_tree.is_some();
+    let residual = if has_residual {
+        extract_cu_residual(
+            params,
+            cu.transform_tree.as_ref(),
+            cu.x0 as usize,
+            cu.y0 as usize,
+            n_cb_s,
+            qp_y,
+            cu.cu_transquant_bypass_flag,
+        )?
+    } else {
+        crate::recon::CuResidual::empty()
+    };
 
     // §8.7.2.4 — mark the per-4×4 cells covered by a transform block with a
     // coded luma coefficient so the deblocking boundary-strength `cbf` test
@@ -392,7 +412,16 @@ pub fn resolve_and_reconstruct_inter_cu(
         mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
     }
 
-    reconstruct_inter_cu(pic, params, cu, &rects, &motions, &residual, refs, wp)
+    reconstruct_inter_cu_with(
+        pic,
+        params,
+        &rects,
+        &motions,
+        &residual,
+        has_residual,
+        refs,
+        wp,
+    )
 }
 
 /// Walk an inter CU's transform tree and mark each leaf transform block that

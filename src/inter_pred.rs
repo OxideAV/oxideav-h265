@@ -105,6 +105,23 @@ impl<'a> RefPlane<'a> {
         self.height
     }
 
+    /// The whole plane as one row-major slice.
+    #[inline]
+    fn flat(&self) -> Option<&'a [u16]> {
+        Some(self.samples)
+    }
+
+    /// Plane row `y` (`y < height`).
+    #[inline]
+    fn row(&self, y: usize) -> &'a [u16] {
+        &self.samples[y * self.width..(y + 1) * self.width]
+    }
+
+    /// Make sure rows `y_from .. y_to` (clamped into the plane) are
+    /// readable — a no-op for a finished plane.
+    #[inline]
+    fn ensure_rows(&self, _y_from: i32, _y_to: i32) {}
+
     /// Sample at full-sample location `( x, y )` with the §8.5.3.3.3
     /// `Clip3( 0, dim − 1, … )` edge extension (equations 8-222 / 8-223 /
     /// 8-239 / 8-240). `x` and `y` may be negative or past the edge.
@@ -209,7 +226,10 @@ const LUMA_FILTER: [[i32; 8]; 4] = [
 /// Returns the intermediate sample value (`>> shift1` / `>> shift2`, or
 /// `A << shift3` for the full-pel `( 0, 0 )` corner) at the
 /// `14 − BitDepthY`-bit internal precision — not yet clipped.
-#[inline]
+///
+/// The per-sample form of the equations; the block filters below run
+/// the same arithmetic separably and are pinned against it.
+#[cfg(test)]
 fn interp_luma_sample(
     plane: &RefPlane<'_>,
     x_int: i32,
@@ -302,12 +322,9 @@ pub fn interp_luma_block(
     }
 
     let mut out = vec![0i32; n_pb_w * n_pb_h];
-    for yl in 0..n_pb_h as i32 {
-        for xl in 0..n_pb_w as i32 {
-            out[(yl as usize) * n_pb_w + xl as usize] =
-                interp_luma_sample(plane, x_int + xl, y_int + yl, x_frac, y_frac, bit_depth);
-        }
-    }
+    interp_luma_into(
+        plane, x_int, y_int, x_frac, y_frac, n_pb_w, n_pb_h, bit_depth, &mut out,
+    );
     Ok(out)
 }
 
@@ -334,7 +351,7 @@ const CHROMA_FILTER: [[i32; 4]; 8] = [
 /// One separable 4-tap chroma sample at eighth-pel offset
 /// `( x_frac, y_frac )`, centred on integer location `( x_int, y_int )`
 /// (§8.5.3.3.3.3). Returns the intermediate-precision value (not clipped).
-#[inline]
+#[cfg(test)]
 fn interp_chroma_sample(
     plane: &RefPlane<'_>,
     x_int: i32,
@@ -425,13 +442,216 @@ pub fn interp_chroma_block(
     }
 
     let mut out = vec![0i32; block_w * block_h];
-    for yc in 0..block_h as i32 {
-        for xc in 0..block_w as i32 {
-            out[(yc as usize) * block_w + xc as usize] =
-                interp_chroma_sample(plane, x_int + xc, y_int + yc, x_frac, y_frac, bit_depth);
+    interp_chroma_into(
+        plane, x_int, y_int, x_frac, y_frac, block_w, block_h, bit_depth, &mut out,
+    );
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Separable block filters (the §8.5.3.3.3.2 / §8.5.3.3.3.3 arithmetic
+// run row by row)
+// ---------------------------------------------------------------------------
+
+/// Per-thread scratch of the block filters: the edge-extended source
+/// window and the horizontal-pass rows of a two-dimensional phase.
+#[derive(Default)]
+struct InterpScratch {
+    window: Vec<u16>,
+    rows: Vec<i32>,
+}
+
+thread_local! {
+    static INTERP_SCRATCH: core::cell::RefCell<InterpScratch> =
+        core::cell::RefCell::new(InterpScratch::default());
+}
+
+/// §8.5.3.3.3.2 into a caller buffer: the `n_pb_w × n_pb_h`
+/// intermediate luma prediction at `( x_int, y_int )` / `( x_frac,
+/// y_frac )` (the inputs are not validated — the motion-vector split
+/// always yields in-range fractions).
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn interp_luma_into(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    interp_block::<8>(
+        plane,
+        x_int,
+        y_int,
+        &LUMA_FILTER[x_frac as usize],
+        &LUMA_FILTER[y_frac as usize],
+        (x_frac == 0, y_frac == 0),
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+        out,
+    );
+}
+
+/// §8.5.3.3.3.3 into a caller buffer (see [`interp_luma_into`]).
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn interp_chroma_into(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    block_w: usize,
+    block_h: usize,
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    interp_block::<4>(
+        plane,
+        x_int,
+        y_int,
+        &CHROMA_FILTER[x_frac as usize],
+        &CHROMA_FILTER[y_frac as usize],
+        (x_frac == 0, y_frac == 0),
+        block_w,
+        block_h,
+        bit_depth,
+        out,
+    );
+}
+
+/// The separable `TAPS`-tap interpolation of one block. The source
+/// window `( x_int − TAPS/2 + 1, y_int − TAPS/2 + 1 )` of `( w + TAPS −
+/// 1 ) × ( h + TAPS − 1 )` samples is read in place when it lies inside
+/// the plane and copied with the `Clip3` edge extension (equations
+/// 8-222 / 8-223 / 8-239 / 8-240) otherwise. The horizontal-only and
+/// vertical-only phases apply `>> shift1`, the two-dimensional ones
+/// `>> shift1` on the horizontal rows and `>> 6` (`shift2`) after the
+/// vertical pass, the full-sample phase `<< shift3` — the arithmetic of
+/// the per-sample equations, sample for sample.
+#[allow(clippy::too_many_arguments)]
+fn interp_block<const TAPS: usize>(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    hk: &[i32; TAPS],
+    vk: &[i32; TAPS],
+    (fx0, fy0): (bool, bool),
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    out: &mut [i32],
+) {
+    let shift1 = interp_shift1(bit_depth);
+    let shift3 = interp_shift3(bit_depth);
+    let half = TAPS / 2 - 1;
+    let ww = w + TAPS - 1;
+    let wh = h + TAPS - 1;
+    let x0 = x_int - half as i32;
+    let y0 = y_int - half as i32;
+    INTERP_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let InterpScratch { window, rows } = &mut *scratch;
+        let inside = x0 >= 0
+            && y0 >= 0
+            && x0 as usize + ww <= plane.width
+            && y0 as usize + wh <= plane.height;
+        plane.ensure_rows(y0, y0 + wh as i32);
+        let (src, stride, base): (&[u16], usize, usize) = match (inside, plane.flat()) {
+            (true, Some(flat)) => (flat, plane.width, y0 as usize * plane.width + x0 as usize),
+            _ => {
+                window.clear();
+                window.reserve(ww * wh);
+                let pw = plane.width as i32;
+                for j in 0..wh as i32 {
+                    let row = plane.row((y0 + j).clamp(0, plane.height as i32 - 1) as usize);
+                    if x0 >= 0 && x0 + ww as i32 <= pw {
+                        window.extend_from_slice(&row[x0 as usize..x0 as usize + ww]);
+                    } else {
+                        window.extend(
+                            (0..ww as i32).map(|i| row[(x0 + i).clamp(0, pw - 1) as usize]),
+                        );
+                    }
+                }
+                (&window[..], ww, 0)
+            }
+        };
+        let out = &mut out[..w * h];
+        match (fx0, fy0) {
+            (true, true) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let s = base + (y + half) * stride + half;
+                    for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
+                        *d = i32::from(v) << shift3;
+                    }
+                }
+            }
+            (false, true) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let s = base + (y + half) * stride;
+                    hpass::<TAPS>(&src[s..s + ww], hk, shift1, o);
+                }
+            }
+            (true, false) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    o.fill(0);
+                    for (t, &c) in vk.iter().enumerate() {
+                        let s = base + (y + t) * stride + half;
+                        for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
+                            *d += c * i32::from(v);
+                        }
+                    }
+                    for d in o.iter_mut() {
+                        *d >>= shift1;
+                    }
+                }
+            }
+            (false, false) => {
+                rows.clear();
+                rows.resize(w * wh, 0);
+                for (j, r) in rows.chunks_exact_mut(w).enumerate() {
+                    let s = base + j * stride;
+                    hpass::<TAPS>(&src[s..s + ww], hk, shift1, r);
+                }
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    o.fill(0);
+                    for (t, &c) in vk.iter().enumerate() {
+                        let r = &rows[(y + t) * w..(y + t + 1) * w];
+                        for (d, &v) in o.iter_mut().zip(r) {
+                            *d += c * v;
+                        }
+                    }
+                    for d in o.iter_mut() {
+                        *d >>= 6;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// One horizontal filter row: `out[ x ] = Σ k[ t ] · src[ x + t ] >>
+/// shift1` over a `out.len() + TAPS − 1` sample source row.
+#[inline(always)]
+fn hpass<const TAPS: usize>(src: &[u16], k: &[i32; TAPS], shift1: i32, out: &mut [i32]) {
+    let w = out.len();
+    out.fill(0);
+    for (t, &c) in k.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        for (d, &v) in out.iter_mut().zip(&src[t..t + w]) {
+            *d += c * i32::from(v);
         }
     }
-    Ok(out)
+    for d in out.iter_mut() {
+        *d >>= shift1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1211,61 @@ mod tests {
         // A−3..A3 = x=2..8 = 30,40,50,60,70,80,90.
         let expected = -30 + 4 * 40 - 10 * 50 + 58 * 60 + 17 * 70 - 5 * 80 + 90;
         assert_eq!(blk[0], expected);
+    }
+
+    /// The separable block filters equal the per-sample equations at
+    /// every phase, bit depth and window position — inside the plane
+    /// and hanging over every edge (the `Clip3` extension).
+    #[test]
+    fn block_filters_match_per_sample_equations() {
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for bit_depth in [8u8, 10, 12] {
+            let (pw, ph) = (37usize, 29usize);
+            let max = (1u32 << bit_depth) - 1;
+            let samples: Vec<u16> = (0..pw * ph).map(|_| (rnd() & max) as u16).collect();
+            let plane = RefPlane::new(&samples, pw, ph).unwrap();
+            for _ in 0..400 {
+                let (w, h) = (1 + (rnd() % 16) as usize, 1 + (rnd() % 16) as usize);
+                let x = (rnd() % 70) as i32 - 20;
+                let y = (rnd() % 60) as i32 - 20;
+                let (fx, fy) = ((rnd() % 4) as i32, (rnd() % 4) as i32);
+                let blk = interp_luma_block(&plane, x, y, fx, fy, w, h, bit_depth).unwrap();
+                for j in 0..h {
+                    for i in 0..w {
+                        let want = interp_luma_sample(
+                            &plane,
+                            x + i as i32,
+                            y + j as i32,
+                            fx,
+                            fy,
+                            bit_depth,
+                        );
+                        assert_eq!(blk[j * w + i], want, "luma {fx},{fy} at {x},{y}");
+                    }
+                }
+                let (fx, fy) = ((rnd() % 8) as i32, (rnd() % 8) as i32);
+                let blk = interp_chroma_block(&plane, x, y, fx, fy, w, h, bit_depth).unwrap();
+                for j in 0..h {
+                    for i in 0..w {
+                        let want = interp_chroma_sample(
+                            &plane,
+                            x + i as i32,
+                            y + j as i32,
+                            fx,
+                            fy,
+                            bit_depth,
+                        );
+                        assert_eq!(blk[j * w + i], want, "chroma {fx},{fy} at {x},{y}");
+                    }
+                }
+            }
+        }
     }
 
     /// Chroma flat plane interpolates to the constant value (each 4-tap
