@@ -44,6 +44,9 @@ pub(crate) struct InFlightPicture {
     lines: AtomicUsize,
     /// CTB rows of motion published (a prefix).
     motion_rows: AtomicUsize,
+    /// The finished picture and motion field, once the worker is done:
+    /// readers then take the whole planes directly.
+    done: OnceLock<(Picture, Arc<MotionField>)>,
     lock: Mutex<()>,
     cv: Condvar,
 }
@@ -73,9 +76,23 @@ impl InFlightPicture {
             motion: (0..rows).map(|_| OnceLock::new()).collect(),
             lines: AtomicUsize::new(0),
             motion_rows: AtomicUsize::new(0),
+            done: OnceLock::new(),
             lock: Mutex::new(()),
             cv: Condvar::new(),
         }
+    }
+
+    /// The finished picture and motion field (see [`Self::finish`]).
+    pub(crate) fn done(&self) -> Option<&(Picture, Arc<MotionField>)> {
+        self.done.get()
+    }
+
+    /// The worker is done: everything is published, and later reads go
+    /// straight to the whole picture.
+    pub(crate) fn finish(&self, picture: Picture, motion: Arc<MotionField>) {
+        self.publish_motion(usize::MAX, &motion);
+        self.publish_lines(self.height(), &picture);
+        let _ = self.done.set((picture, motion));
     }
 
     /// Luma lines published so far.
@@ -120,6 +137,9 @@ impl InFlightPicture {
     /// The collocated motion cell covering luma `(x, y)`, once its CTB
     /// row is published.
     pub(crate) fn cell_at(&self, x: usize, y: usize) -> MotionCell {
+        if let Some((_, motion)) = self.done.get() {
+            return motion.cell_at(x, y);
+        }
         let r = (y >> self.ctb_log2).min(self.rows.saturating_sub(1));
         self.wait_for(&self.motion_rows, r + 1);
         self.motion[r]

@@ -1230,6 +1230,10 @@ impl<'a> PictureReconstructor<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct RowFilterState {
     sao: crate::sao::SaoRowFilter,
+    /// §8.7.2.5.4 / §8.7.3.1 suppression cells scanned so far (the
+    /// rows of the CTB rows filtered) and whether one is set.
+    nf_scanned: usize,
+    nf_any: bool,
     /// Plane lines SAO-filtered so far (luma, Cb, Cr).
     sao_done: [usize; 3],
     /// The static parts of the §8.7.3.2 boundary gates (tile ids, tile
@@ -1258,6 +1262,14 @@ impl PictureReconstructor<'_> {
         let ctb = 1usize << slice.ctb_log2_size_y;
         let (pw, ph) = self.pic.plane_dims(Plane::Luma);
         let w4 = pw.div_ceil(4);
+        // As the whole-picture pass, the suppression map only when a
+        // cell is set (the same output, faster without): scan the cells
+        // of the rows reconstructed since the last call.
+        let upto = (((r + 1) * ctb).div_ceil(4) * w4).min(self.no_filter_cells.len());
+        if !st.nf_any && upto > st.nf_scanned {
+            st.nf_any = self.no_filter_cells[st.nf_scanned..upto].iter().any(|&b| b);
+        }
+        st.nf_scanned = st.nf_scanned.max(upto);
         if slice.deblock_enabled
             && let Some(dparams) = self.edges.params()
         {
@@ -1265,14 +1277,10 @@ impl PictureReconstructor<'_> {
                 .ctx
                 .qp_cells()
                 .expect("the picture reconstructor initializes the QP map");
-            let no_filter =
-                self.no_filter_cells
-                    .iter()
-                    .any(|&b| b)
-                    .then_some(crate::deblock::NoFilterMap {
-                        cells: &self.no_filter_cells,
-                        w_cells: w4,
-                    });
+            let no_filter = st.nf_any.then_some(crate::deblock::NoFilterMap {
+                cells: &self.no_filter_cells,
+                w_cells: w4,
+            });
             let qp_map = crate::deblock::QpMap {
                 cells: qp_cells,
                 w_cells: w4,
@@ -1364,16 +1372,10 @@ impl PictureReconstructor<'_> {
         b.slice_addr_of_ctb.clone_from(&self.slice_addr_map);
         b.filter_across_of_ctb = Some(self.filter_across_map.clone());
         let (pw, _) = self.pic.plane_dims(Plane::Luma);
-        // As the whole-picture pass: the suppression map only when a
-        // cell is suppressed (equal output, faster without).
-        let no_filter =
-            self.no_filter_cells
-                .iter()
-                .any(|&b| b)
-                .then_some(crate::deblock::NoFilterMap {
-                    cells: &self.no_filter_cells,
-                    w_cells: pw.div_ceil(4),
-                });
+        let no_filter = st.nf_any.then_some(crate::deblock::NoFilterMap {
+            cells: &self.no_filter_cells,
+            w_cells: pw.div_ceil(4),
+        });
         let ctb = 1usize << slice.ctb_log2_size_y;
         let (sw, sh) = if chroma { sub_wh_c(cat) } else { (1, 1) };
         let mut planes = Vec::with_capacity(3);

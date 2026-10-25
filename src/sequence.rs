@@ -745,13 +745,13 @@ impl SequenceDecoder {
                 .unwrap_or_else(|_| frame_threads::JobOutput {
                     result: Err(SequenceError::Malformed("a picture decode worker panicked")),
                     picture: Picture::new(0, 0, 0, 8, 8),
-                    motion: crate::motion::MotionField::new(0, 0),
+                    motion: std::sync::Arc::new(crate::motion::MotionField::new(0, 0)),
                 });
             let failed = out.result.is_err();
             if let Err(e) = out.result {
                 first_err.get_or_insert(e);
             }
-            let motion = std::sync::Arc::new(out.motion);
+            let motion = out.motion;
             for e in self.state.dpb_mut().entries_mut() {
                 if e.picture.is_pending_on(&job.pending) {
                     e.picture = out.picture.clone();

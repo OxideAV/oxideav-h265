@@ -92,6 +92,10 @@ impl<'a> RefPlane<'a> {
         let (w, h) = pic.plane_dims(plane);
         match pic.pending() {
             None => Self::new(pic.plane(plane), w, h),
+            Some(p) if p.done().is_some() => {
+                let (done, _) = p.done().expect("checked");
+                Self::new(done.plane(plane), w, h)
+            }
             Some(p) => {
                 if w == 0 || h == 0 {
                     return Err(InterPredError::EmptyPlane);

@@ -57,7 +57,7 @@ pub(super) struct PictureJob {
 pub(super) struct JobOutput {
     pub(super) result: Result<(), SequenceError>,
     pub(super) picture: Picture,
-    pub(super) motion: MotionField,
+    pub(super) motion: Arc<MotionField>,
 }
 
 /// Publishes whatever is left when the worker ends without publishing
@@ -121,7 +121,7 @@ pub(super) fn run(job: PictureJob) -> JobOutput {
             return JobOutput {
                 result: Err(e.into()),
                 picture,
-                motion,
+                motion: Arc::new(motion),
             };
         }
     };
@@ -143,9 +143,9 @@ pub(super) fn run(job: PictureJob) -> JobOutput {
         (!curr_ref).then_some(&*progress),
     );
     let (picture, motion) = reconstructor.into_parts();
+    let motion = Arc::new(motion);
     if result.is_ok() {
-        progress.publish_motion(usize::MAX, &motion);
-        progress.publish_lines(progress.height(), &picture);
+        progress.finish(picture.clone(), motion.clone());
     }
     JobOutput {
         result,
