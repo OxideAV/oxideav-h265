@@ -30,6 +30,7 @@ use crate::inter_recon::{
     reconstruct_inter_picture,
 };
 use crate::nal::{NalError, NalIter, NalUnit};
+use crate::out_shape::{OutShape, ShapeTraits};
 use crate::picture::Picture;
 use crate::poc::NalKind;
 use crate::pps::{PicParameterSet, PpsError};
@@ -443,6 +444,10 @@ pub struct SequenceDecoder {
     /// Set while a flush decodes the last pending picture (it decodes on
     /// the calling thread, with every reference complete).
     flushing: bool,
+    /// The VUI output traits of each `(cvs_index, nuh_layer_id)` whose
+    /// pictures have been decoded (an SPS stays active for a whole
+    /// coded video sequence of its layer, §7.4.2.4.2).
+    traits: BTreeMap<(u32, u8), ShapeTraits>,
 }
 
 impl Drop for SequenceDecoder {
@@ -493,6 +498,42 @@ impl SequenceDecoder {
         self.plan
             .as_ref()
             .map_or((vec![0], vec![0]), |p| (p.decode.clone(), p.output.clone()))
+    }
+
+    /// The VUI output traits of the pictures of coded video sequence
+    /// `cvs_index` in layer `layer_id` (unspecified when unknown).
+    ///
+    /// A non-base layer whose SPS signals no VUI timing / colour (the
+    /// usual Annex F layer SPS) takes the base layer's of the same
+    /// coded video sequence, field by field: the pictures of one access
+    /// unit share its timing, and the views of one stream its colour
+    /// signal.
+    pub(crate) fn frame_traits(&self, cvs_index: u32, layer_id: u8) -> ShapeTraits {
+        let own = self
+            .traits
+            .get(&(cvs_index, layer_id))
+            .copied()
+            .unwrap_or_default();
+        if layer_id == 0 {
+            return own;
+        }
+        let Some(base) = self.traits.get(&(cvs_index, 0)) else {
+            return own;
+        };
+        own.or(base)
+    }
+
+    /// Drop the output traits of coded video sequences before
+    /// `cvs_index` (none of their pictures awaits output any more).
+    pub(crate) fn forget_traits_before(&mut self, cvs_index: u32) {
+        self.traits.retain(|&(cvs, _), _| cvs >= cvs_index);
+    }
+
+    /// The output shape announced by the parameter sets before any
+    /// picture has been decoded: the lowest-id SPS (an `hvcC` record's,
+    /// or one received in band ahead of the first slice).
+    pub(crate) fn announced_shape(&self) -> Option<OutShape> {
+        self.sps.values().next().map(OutShape::of_sps)
     }
 
     /// The active VPS (the one the most recently activated SPS refers
@@ -1329,6 +1370,9 @@ impl SequenceDecoder {
             && (layer_id == 0 || initialized);
         let poc = ref_state.poc;
         let view_id = ext.map_or(0, |e| e.layers.view_id_of(layer_id));
+        self.traits
+            .entry((self.cvs_index, layer_id))
+            .or_insert_with(|| ShapeTraits::of_sps(sps));
         self.frames.push(DecodedFrame {
             cvs_index: self.cvs_index,
             poc: poc.val,

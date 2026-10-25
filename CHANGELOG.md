@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- *(decoder)* `Decoder::output_params` / `output_params_generation`
+  (oxideav-core 0.1.42), with `output_pixel_format` forwarded to it:
+  the conformance-cropped width / height, pixel format (8 / 10 / 12 /
+  16-bit 4:0:0 / 4:2:0 / 4:2:2 / 4:4:4), VUI frame rate and colour
+  signal of the emitted frames, answered from the `hvcC` record (or
+  Annex B extradata) right after construction and re-stated with a
+  generation bump exactly at the first frame of a new shape — each
+  queued frame carries its own description, so reorder depth and the
+  worker budget do not move the switch point. A non-base layer whose
+  SPS has no VUI takes the base layer's timing / colour, so the views
+  of an MV-HEVC stream share one description. Verified against ffprobe
+  on black-box libx265 fixtures (`tests/fixtures/output_params/`,
+  `gen.sh`).
+
 ## [0.0.16](https://github.com/OxideAV/oxideav-h265/compare/v0.0.15...v0.0.16) - 2026-10-25
 
 ### Added

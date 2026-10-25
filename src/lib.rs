@@ -292,6 +292,7 @@ pub mod intra_pred;
 #[doc(hidden)]
 pub mod motion;
 pub mod nal;
+mod out_shape;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod palette;

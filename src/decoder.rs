@@ -25,6 +25,7 @@ use oxideav_core::{
 use crate::hvcc::{
     extradata_is_hvcc, extradata_is_lhvc, parse_hvcc_with_len, parse_lhvc, split_length_prefixed,
 };
+use crate::out_shape::{OutShape, pixel_format};
 use crate::picture::{Picture, Plane};
 use crate::sequence::{DecodedFrame, LayerTarget, SequenceDecoder};
 
@@ -39,8 +40,9 @@ pub struct H265Decoder {
     /// Decoded pictures not yet emitted, sorted on demand by
     /// `(cvs_index, poc)`.
     reorder: Vec<DecodedFrame>,
-    /// Frames ready to hand out.
-    ready: VecDeque<Frame>,
+    /// Frames ready to hand out, each with the description
+    /// `output_params` answers once it has been returned.
+    ready: VecDeque<(Frame, OutShape)>,
     /// Min-heap of packet PTS values, re-attached in output order.
     pts_queue: BinaryHeap<std::cmp::Reverse<i64>>,
     /// `Some(n)` when the extradata was an `hvcC` record: packets are
@@ -49,6 +51,11 @@ pub struct H265Decoder {
     /// `None` for Annex B packets.
     nal_length_size: Option<usize>,
     flushed: bool,
+    /// The description of the frame `receive_frame` returned last.
+    emitted_shape: Option<OutShape>,
+    /// `Decoder::output_params_generation` — bumped when a returned
+    /// frame's description differs from the previous frame's.
+    params_generation: u64,
 }
 
 impl std::fmt::Debug for H265Decoder {
@@ -154,6 +161,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         pts_queue: BinaryHeap::new(),
         nal_length_size,
         flushed: false,
+        emitted_shape: None,
+        params_generation: 0,
     }))
 }
 
@@ -193,9 +202,45 @@ impl H265Decoder {
             } else {
                 f.output_picture()
             };
+            let shape = OutShape {
+                width: picture.width_luma() as u32,
+                height: picture.height_luma() as u32,
+                pixel_format: pixel_format(
+                    picture.chroma_array_type(),
+                    picture.bit_depth_luma(),
+                    picture.bit_depth_chroma(),
+                ),
+                traits: self.seq.frame_traits(f.cvs_index, f.layer_id),
+            };
             self.ready
-                .push_back(Frame::Video(video_frame_owned(picture, pts)));
+                .push_back((Frame::Video(video_frame_owned(picture, pts)), shape));
         }
+        // Coded video sequences no queued picture belongs to any more
+        // keep no output traits.
+        if let Some(oldest) = self.reorder.iter().map(|f| f.cvs_index).min() {
+            self.seq.forget_traits_before(oldest);
+        }
+    }
+
+    /// The description of the output before the first frame: the next
+    /// frame released, else the next decoded picture, else the
+    /// parameter sets.
+    fn announced_shape(&self) -> Option<OutShape> {
+        if let Some((_, shape)) = self.ready.front() {
+            return Some(*shape);
+        }
+        self.seq.announced_shape()
+    }
+
+    /// Publish the description of a frame being returned: the
+    /// generation changes exactly when it differs from the previous
+    /// frame's.
+    fn emit(&mut self, (frame, shape): (Frame, OutShape)) -> Frame {
+        if self.emitted_shape.is_some_and(|prev| prev != shape) {
+            self.params_generation = self.params_generation.wrapping_add(1);
+        }
+        self.emitted_shape = Some(shape);
+        frame
     }
 }
 
@@ -231,18 +276,31 @@ impl Decoder for H265Decoder {
 
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(f) = self.ready.pop_front() {
-            return Ok(f);
+            return Ok(self.emit(f));
         }
         if self.flushed {
             if !self.reorder.is_empty() {
                 self.drain(true);
                 if let Some(f) = self.ready.pop_front() {
-                    return Ok(f);
+                    return Ok(self.emit(f));
                 }
             }
             return Err(Error::Eof);
         }
         Err(Error::NeedMore)
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self.emitted_shape.or_else(|| self.announced_shape())?;
+        Some(shape.to_params(&self.codec_id))
+    }
+
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.params_generation
     }
 
     fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
