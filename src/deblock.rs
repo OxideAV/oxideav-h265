@@ -101,6 +101,9 @@ struct TbBoundaryCtx<'a> {
     filter_edge_flag: bool,
     edge_type: EdgeType,
     n_cbs: usize,
+    /// Grid granularity in luma samples (1, or 4 for the compact grids
+    /// of [`DeblockEdgeMap::add_cu`] — every edge lies on the 4×4 grid).
+    g: usize,
     edge_flags: &'a mut [bool],
     tb_edge: &'a mut [bool],
 }
@@ -133,22 +136,23 @@ fn transform_block_boundary(
     // Leaf: mark the leading edge of this transform block. EDGE_VER marks
     // the column xB0 for k = 0..size; EDGE_HOR marks the row yB0.
     let size = 1usize << log2_trafo_size;
-    let n_cbs = ctx.n_cbs;
+    let g = ctx.g;
+    let n = ctx.n_cbs / g;
     match ctx.edge_type {
         EdgeType::Vertical => {
             // edgeFlags[xB0][yB0+k]: filterEdgeFlag at the CB boundary
             // (xB0 == 0), else 1.
             let val = if xb0 == 0 { ctx.filter_edge_flag } else { true };
-            for k in 0..size {
-                let idx = (yb0 + k) * n_cbs + xb0;
+            for k in (0..size).step_by(g) {
+                let idx = (yb0 + k) / g * n + xb0 / g;
                 ctx.edge_flags[idx] = val;
                 ctx.tb_edge[idx] = val;
             }
         }
         EdgeType::Horizontal => {
             let val = if yb0 == 0 { ctx.filter_edge_flag } else { true };
-            for k in 0..size {
-                let idx = yb0 * n_cbs + (xb0 + k);
+            for k in (0..size).step_by(g) {
+                let idx = yb0 / g * n + (xb0 + k) / g;
                 ctx.edge_flags[idx] = val;
                 ctx.tb_edge[idx] = val;
             }
@@ -165,6 +169,7 @@ fn prediction_block_boundary(
     log2_cb_size: u32,
     edge_type: EdgeType,
     n_cbs: usize,
+    g: usize,
     edge_flags: &mut [bool],
 ) {
     // The internal partition column (EDGE_VER) / row (EDGE_HOR), if any.
@@ -180,10 +185,11 @@ fn prediction_block_boundary(
         _ => None,
     };
     if let Some(p) = pos {
-        for k in 0..n_cbs {
+        let n = n_cbs / g;
+        for k in 0..n {
             let idx = match edge_type {
-                EdgeType::Vertical => k * n_cbs + p,
-                EdgeType::Horizontal => p * n_cbs + k,
+                EdgeType::Vertical => k * n + p / g,
+                EdgeType::Horizontal => p / g * n + k,
             };
             edge_flags[idx] = true;
         }
@@ -260,6 +266,7 @@ pub fn derive_edge_flags(
         log2_cb_size,
         edge_type,
         filter_edge_flag,
+        1,
         &mut edge_flags,
         &mut tb_edge,
     );
@@ -270,14 +277,16 @@ pub fn derive_edge_flags(
     }
 }
 
-/// [`derive_edge_flags`] into caller grids (`nCbS²` each, all `false`
-/// on entry).
+/// [`derive_edge_flags`] into caller grids of granularity `g` luma
+/// samples (`(nCbS / g)²` each, all `false` on entry; `g` 1 or 4).
+#[allow(clippy::too_many_arguments)]
 fn edge_flags_into(
     transform_split: &TransformSplit,
     part_mode: PartMode,
     log2_cb_size: u32,
     edge_type: EdgeType,
     filter_edge_flag: bool,
+    g: usize,
     edge_flags: &mut [bool],
     tb_edge: &mut [bool],
 ) {
@@ -287,12 +296,13 @@ fn edge_flags_into(
             filter_edge_flag,
             edge_type,
             n_cbs,
+            g,
             edge_flags,
             tb_edge,
         };
         transform_block_boundary(transform_split, 0, 0, log2_cb_size, &mut ctx);
     }
-    prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, edge_flags);
+    prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, g, edge_flags);
 }
 
 thread_local! {
@@ -451,6 +461,7 @@ pub fn derive_boundary_strength(
         y_cb,
         log2_cb_size,
         edge_type,
+        1,
         edge_flags,
         tb_edge,
         &mut bs,
@@ -458,8 +469,9 @@ pub fn derive_boundary_strength(
     BoundaryStrength { n_cbs, bs }
 }
 
-/// [`derive_boundary_strength`] into a caller grid (`nCbS²`, zero on
-/// entry; only the sampled edge positions are written).
+/// [`derive_boundary_strength`] into a caller grid of granularity `g`
+/// (`(nCbS / g)²`, zero on entry; only the sampled edge positions are
+/// written), reading [`edge_flags_into`] grids of the same granularity.
 #[allow(clippy::too_many_arguments)]
 fn boundary_strength_into(
     field: &MotionField,
@@ -467,11 +479,13 @@ fn boundary_strength_into(
     y_cb: usize,
     log2_cb_size: u32,
     edge_type: EdgeType,
+    g: usize,
     edge_flags: &[bool],
     tb_edge: &[bool],
     bs: &mut [u8],
 ) {
     let n_cbs = 1usize << log2_cb_size;
+    let n = n_cbs / g;
 
     // §8.7.2.4 sampling grid: EDGE_VER strides 8 in x, 4 in y; EDGE_HOR
     // strides 4 in x, 8 in y.
@@ -484,7 +498,7 @@ fn boundary_strength_into(
     while y_dj < n_cbs {
         let mut x_di = 0;
         while x_di < n_cbs {
-            let idx = y_dj * n_cbs + x_di;
+            let idx = y_dj / g * n + x_di / g;
             if edge_flags[idx] {
                 // p0 / q0 sample positions (§8.7.2.4).
                 let (px, py, qx, qy) = match edge_type {
@@ -1624,18 +1638,22 @@ impl DeblockEdgeMap {
                 EdgeType::Vertical => desc.filter_left,
                 EdgeType::Horizontal => desc.filter_top,
             };
+            // Every §8.7.2.2 / §8.7.2.3 edge lies on the 4×4 grid: the
+            // compact grids hold one entry per 4×4 cell.
+            let n4 = n_cbs / 4;
             for v in [&mut *edge_flags, &mut *tb_edge] {
                 v.clear();
-                v.resize(n_cbs * n_cbs, false);
+                v.resize(n4 * n4, false);
             }
             bs.clear();
-            bs.resize(n_cbs * n_cbs, 0);
+            bs.resize(n4 * n4, 0);
             edge_flags_into(
                 &desc.transform_split,
                 desc.part_mode,
                 log2_cb_size,
                 edge_type,
                 filter_edge_flag,
+                4,
                 edge_flags,
                 tb_edge,
             );
@@ -1645,6 +1663,7 @@ impl DeblockEdgeMap {
                 y_cb,
                 log2_cb_size,
                 edge_type,
+                4,
                 edge_flags,
                 tb_edge,
                 bs,
@@ -1655,7 +1674,7 @@ impl DeblockEdgeMap {
                         EdgeType::Vertical => (e << 3, s_idx << 2),
                         EdgeType::Horizontal => (s_idx << 2, e << 3),
                     };
-                    let v = bs[y_dm * n_cbs + x_dk];
+                    let v = bs[(y_dm / 4) * (n_cbs / 4) + x_dk / 4];
                     if v == 0 {
                         continue;
                     }

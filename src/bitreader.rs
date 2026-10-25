@@ -88,6 +88,15 @@ impl<'a> BitReader<'a> {
         if self.bits_left() < n as usize {
             return Err(BitReaderError::EndOfBuffer);
         }
+        let byte = self.bit_pos / 8;
+        if let Some(chunk) = self.buf.get(byte..byte + 8) {
+            // n <= 32 bits from bit (bit_pos % 8) <= 7 of an 8-byte
+            // big-endian window: always inside it.
+            let word = u64::from_be_bytes(chunk.try_into().expect("8 bytes"));
+            let value = ((word << (self.bit_pos % 8)) >> (64 - u32::from(n))) as u32;
+            self.bit_pos += usize::from(n);
+            return Ok(value);
+        }
         let mut value: u32 = 0;
         for _ in 0..n {
             value = (value << 1) | (self.u1()? as u32);

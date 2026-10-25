@@ -413,10 +413,14 @@ impl<'a> CabacEngine<'a> {
     /// (RenormD). While `ivlCurrRange < 256`, double `ivlCurrRange` and
     /// shift one fresh bit into `ivlOffset`.
     fn renorm(&mut self) -> Result<(), CabacError> {
-        while self.ivl_curr_range < 256 {
-            self.ivl_curr_range <<= 1;
-            let bit = self.reader.u1()? as u16;
-            self.ivl_offset = (self.ivl_offset << 1) | bit;
+        // The loop of §9.3.4.3.3 doubles ivlCurrRange (shifting one bit
+        // into ivlOffset) until it reaches 256: as many times as it
+        // has leading zeros past bit 8, done in one shift.
+        if self.ivl_curr_range < 256 {
+            let shift = self.ivl_curr_range.leading_zeros() - 7;
+            let bits = self.reader.u(shift as u8)? as u16;
+            self.ivl_curr_range <<= shift;
+            self.ivl_offset = (self.ivl_offset << shift) | bits;
         }
         Ok(())
     }
