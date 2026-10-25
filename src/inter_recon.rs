@@ -1230,6 +1230,8 @@ impl<'a> PictureReconstructor<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct RowFilterState {
     sao: crate::sao::SaoRowFilter,
+    /// Plane lines SAO-filtered so far (luma, Cb, Cr).
+    sao_done: [usize; 3],
     /// The static parts of the §8.7.3.2 boundary gates (tile ids, tile
     /// scan); the per-CTB slice maps are refreshed per row.
     boundaries: Option<crate::sao::SaoBoundaries>,
@@ -1241,16 +1243,17 @@ impl PictureReconstructor<'_> {
         &self.field
     }
 
-    /// The §8.7 filters for CTB row `r` once every CTU of rows `..= r +
-    /// 1` is reconstructed (row `r + 1`'s intra prediction reads row
-    /// `r`'s unfiltered last line): deblock row `r`'s vertical then horizontal
-    /// edges (the latter reach three lines into row `r − 1`), then SAO
-    /// row `r − 1`, whose window reaches the now final first line of
-    /// row `r`. Rows `.. r` are final afterwards. The edges, QP cells,
+    /// The §8.7 filters for CTB row `r` once every CTU of rows `..= r`
+    /// is reconstructed and its unfiltered last line is kept for row `r
+    /// + 1`'s intra prediction ([`Self::save_unfiltered_last_line`]):
+    /// deblock row `r`'s vertical then horizontal edges (the latter
+    /// reach three lines into row `r − 1`), then SAO every line whose
+    /// three-line window is deblocking-final — all but row `r`'s last
+    /// four. Returns the number of final luma lines. The edges, QP cells,
     /// suppression flags and slice maps read are those of the rows the
     /// whole-picture pass would read, so the samples equal
     /// [`filter_picture`]'s.
-    pub(crate) fn filter_ctb_row(&mut self, r: usize, st: &mut RowFilterState) {
+    pub(crate) fn filter_ctb_row(&mut self, r: usize, st: &mut RowFilterState) -> usize {
         let slice = self.slice;
         let ctb = 1usize << slice.ctb_log2_size_y;
         let (pw, ph) = self.pic.plane_dims(Plane::Luma);
@@ -1287,21 +1290,46 @@ impl PictureReconstructor<'_> {
                 );
             }
         }
-        if r > 0 {
-            self.sao_row(r - 1, st);
-        }
+        // SAO every line whose window is deblocking-final now: all but
+        // the last four luma lines of row `r` (the next row's
+        // horizontal edges still reach three of them), the whole rest
+        // of the picture after its last row.
+        let last = r + 1 >= ph.div_ceil(ctb);
+        let luma_final = if last {
+            ph
+        } else {
+            ((r + 1) * ctb).min(ph) - 4
+        };
+        self.sao_lines(luma_final, st);
+        luma_final
     }
 
-    /// The last CTB row's SAO, after its [`Self::filter_ctb_row`].
-    pub(crate) fn filter_last_row(&mut self, st: &mut RowFilterState) {
+    /// Keep CTB row `r`'s unfiltered last line (every plane) for the
+    /// §8.4.4.2 reference samples of row `r + 1`, so row `r` may be
+    /// deblocked before row `r + 1` is reconstructed.
+    pub(crate) fn save_unfiltered_last_line(&mut self, r: usize) {
         let ctb = 1usize << self.slice.ctb_log2_size_y;
-        let rows = self.pic.plane_dims(Plane::Luma).1.div_ceil(ctb);
-        if rows > 0 {
-            self.sao_row(rows - 1, st);
+        let mut lines = self.ctx.take_unfiltered_above().unwrap_or_default();
+        let chroma = self.params.chroma_array_type != 0;
+        for (pi, plane) in [Plane::Luma, Plane::Cb, Plane::Cr].into_iter().enumerate() {
+            let (_, h) = self.pic.plane_dims(plane);
+            let (y, line) = &mut lines[pi];
+            line.clear();
+            if (pi > 0 && !chroma) || h == 0 {
+                *y = usize::MAX;
+                continue;
+            }
+            let (_, lh) = self.pic.plane_dims(Plane::Luma);
+            let rows = ((r + 1) * ctb * h / lh).min(h);
+            *y = rows - 1;
+            line.extend_from_slice(self.pic.row(plane, rows - 1));
         }
+        self.ctx.set_unfiltered_above(lines);
     }
 
-    fn sao_row(&mut self, ry: usize, st: &mut RowFilterState) {
+    /// SAO each plane's lines up to luma line `luma_upto` (chroma at
+    /// `SubHeightC`), continuing where the previous call stopped.
+    fn sao_lines(&mut self, luma_upto: usize, st: &mut RowFilterState) {
         let slice = self.slice;
         let cat = self.params.chroma_array_type;
         let chroma = cat != 0;
@@ -1340,22 +1368,29 @@ impl PictureReconstructor<'_> {
         let (sw, sh) = if chroma { sub_wh_c(cat) } else { (1, 1) };
         let mut planes = Vec::with_capacity(3);
         if slice.slice_sao_luma_flag {
-            planes.push((Plane::Luma, 0usize, ctb, ctb));
+            planes.push(((Plane::Luma, 0usize, ctb, ctb), 1usize));
         }
         if chroma && slice.slice_sao_chroma_flag {
-            planes.push((Plane::Cb, 1, ctb / sw, ctb / sh));
-            planes.push((Plane::Cr, 2, ctb / sw, ctb / sh));
+            planes.push(((Plane::Cb, 1, ctb / sw, ctb / sh), sh));
+            planes.push(((Plane::Cr, 2, ctb / sw, ctb / sh), sh));
         }
-        for p in planes {
-            st.sao.row(
+        for (spec, sub_h) in planes {
+            let cidx = spec.1;
+            let upto = luma_upto / sub_h;
+            let from = st.sao_done[cidx];
+            if upto <= from {
+                continue;
+            }
+            st.sao.lines(
                 &mut self.pic,
-                p,
-                ry,
+                spec,
+                (from, upto),
                 &self.sao_grid,
                 pic_w_ctbs,
                 Some(b),
                 Some(&no_filter),
             );
+            st.sao_done[cidx] = upto;
         }
     }
 

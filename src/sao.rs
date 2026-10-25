@@ -327,7 +327,16 @@ pub fn apply_sao_ctb_full(
     };
     let (dst, dst_stride) = sao_out.plane_mut(plane);
     sao_ctb_core(
-        src, dst, dst_stride, 0, &geom, comp, x_ctb, y_ctb, n_w, n_h, boundaries, no_filter,
+        src,
+        dst,
+        dst_stride,
+        0,
+        &geom,
+        comp,
+        (x_ctb, y_ctb, n_w, n_h),
+        (0, n_h),
+        boundaries,
+        no_filter,
     );
 }
 
@@ -379,6 +388,9 @@ impl SaoSource<'_> {
 /// §8.7.3.2 for one CTB of one component: classify from `src` (the
 /// pre-SAO samples), write the offset samples into `dst`.
 #[allow(clippy::too_many_arguments)]
+/// `(j0, j1)` restricts the pass to the CTB's rows `j0 .. j1` (the
+/// whole CTB is `(0, n_h)`); the CTB-border tests stay those of the
+/// whole CTB.
 fn sao_ctb_core(
     src: SaoSource<'_>,
     dst: &mut [u16],
@@ -386,10 +398,8 @@ fn sao_ctb_core(
     dst_y_origin: usize,
     geom: &SaoPlaneGeom,
     comp: &ResolvedSaoComponent,
-    x_ctb: usize,
-    y_ctb: usize,
-    n_w: usize,
-    n_h: usize,
+    (x_ctb, y_ctb, n_w, n_h): (usize, usize, usize, usize),
+    (j0, j1): (usize, usize),
     boundaries: Option<&SaoBoundaries>,
     no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
 ) {
@@ -414,7 +424,7 @@ fn sao_ctb_core(
         // tile tests entirely.
         let vertical = v0 != 0 || v1 != 0;
         let horizontal = h0 != 0 || h1 != 0;
-        for j in 0..h {
+        for j in j0..j1.min(h) {
             let ysj = y_ctb + j;
             let border_row = vertical && (j == 0 || j + 1 == h);
             let dr = ysj - dst_y_origin;
@@ -479,7 +489,7 @@ fn sao_ctb_core(
         for k in 0..4i32 {
             band_table[((k + sao_left_class) & 31) as usize] = (k + 1) as usize;
         }
-        for j in 0..h {
+        for j in j0..j1.min(h) {
             let ysj = y_ctb + j;
             let dr = ysj - dst_y_origin;
             let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
@@ -647,28 +657,53 @@ pub fn apply_sao_picture_in_place(
     }
 }
 
-/// The in-place §8.7.3 pass one CTB row at a time, top to bottom: each
-/// row classifies from a band of the pre-SAO samples — its own rows,
-/// the first line of the row below (not yet offset) and the last line
-/// of the row above, kept from before that row was offset.
+/// The in-place §8.7.3 pass over consecutive line ranges, top to
+/// bottom: each range classifies from a band of the pre-SAO samples —
+/// its own lines, the first line below it (not yet offset) and the
+/// last line above it, kept from before that line was offset.
 #[derive(Debug, Default)]
 pub(crate) struct SaoRowFilter {
     band: Vec<u16>,
-    /// The pre-SAO last line of the previous row, per component.
+    /// The pre-SAO last line of the previous range, per component.
     above: [Vec<u16>; 3],
 }
 
 impl SaoRowFilter {
     /// Offset CTB row `ry` of one component (`(plane, cIdx, CTB width,
-    /// CTB height)` in plane samples) in place. Rows must come in
-    /// increasing order, each once; the samples of rows `ry` and `ry +
-    /// 1` must be final deblocked samples.
+    /// CTB height)` in plane samples) in place — [`Self::lines`] over
+    /// the whole row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn row(
         &mut self,
         pic: &mut Picture,
-        (plane, cidx, n_w, n_h): (Plane, usize, usize, usize),
+        spec: (Plane, usize, usize, usize),
         ry: usize,
+        ctb_sao: &[ResolvedSao],
+        pic_width_in_ctbs: usize,
+        boundaries: Option<&SaoBoundaries>,
+        no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+    ) {
+        let n_h = spec.3;
+        self.lines(
+            pic,
+            spec,
+            (ry * n_h, (ry + 1) * n_h),
+            ctb_sao,
+            pic_width_in_ctbs,
+            boundaries,
+            no_filter,
+        );
+    }
+
+    /// Offset the plane lines `y_a .. y_b` of one component in place.
+    /// Ranges must come in increasing, contiguous order from line 0;
+    /// the lines `y_a .. y_b + 1` must hold final deblocked samples.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lines(
+        &mut self,
+        pic: &mut Picture,
+        (plane, cidx, n_w, n_h): (Plane, usize, usize, usize),
+        (y_a, y_b): (usize, usize),
         ctb_sao: &[ResolvedSao],
         pic_width_in_ctbs: usize,
         boundaries: Option<&SaoBoundaries>,
@@ -676,29 +711,29 @@ impl SaoRowFilter {
     ) {
         let geom = SaoPlaneGeom::of(pic, plane);
         let (pw, ph) = (geom.pw, geom.ph);
-        let y0 = ry * n_h;
-        if y0 >= ph {
+        let y_b = y_b.min(ph);
+        if y_a >= y_b {
             return;
         }
-        let h = n_h.min(ph - y0);
-        let y_origin = y0.saturating_sub(1);
+        let h = y_b - y_a;
+        let y_origin = y_a.saturating_sub(1);
         let band = &mut self.band;
-        band.resize((n_h + 2) * pw, 0);
+        band.resize((h + 2) * pw, 0);
         let above_line = &mut self.above[cidx];
         {
             let (buf, stride) = pic.plane_mut(plane);
-            let band_rows = (y0 + h + 1).min(ph) - y_origin;
-            // Rows y0 .. min(y0 + h + 1, ph) come from the picture
-            // (not yet modified); the row above from the saved line.
-            let first_fresh = if y0 == 0 { 0 } else { 1 };
+            let band_rows = (y_b + 1).min(ph) - y_origin;
+            // Lines y_a .. min(y_b + 1, ph) come from the picture (not
+            // yet modified); the line above from the saved copy.
+            let first_fresh = if y_a == 0 { 0 } else { 1 };
             for r in first_fresh..band_rows {
                 let y = y_origin + r;
                 band[r * pw..(r + 1) * pw].copy_from_slice(&buf[y * stride..y * stride + pw]);
             }
-            if y0 > 0 {
+            if y_a > 0 {
                 band[..pw].copy_from_slice(above_line);
             }
-            // Save the pre-SAO last line of this row for the next.
+            // Save the pre-SAO last line of this range for the next.
             above_line.clear();
             above_line.extend_from_slice(&band[(h + first_fresh - 1) * pw..(h + first_fresh) * pw]);
         }
@@ -708,20 +743,23 @@ impl SaoRowFilter {
             y_origin,
         };
         let (dst, dst_stride) = pic.plane_mut(plane);
-        sao_ctb_row_core(
-            src,
-            dst,
-            dst_stride,
-            0,
-            &geom,
-            ctb_sao,
-            pic_width_in_ctbs,
-            ry,
-            cidx,
-            (n_w, n_h),
-            boundaries,
-            no_filter,
-        );
+        for ry in y_a / n_h..y_b.div_ceil(n_h) {
+            sao_ctb_row_lines(
+                src,
+                dst,
+                dst_stride,
+                0,
+                &geom,
+                ctb_sao,
+                pic_width_in_ctbs,
+                ry,
+                cidx,
+                (n_w, n_h),
+                (y_a, y_b),
+                boundaries,
+                no_filter,
+            );
+        }
     }
 }
 
@@ -743,7 +781,50 @@ pub(crate) fn sao_ctb_row_core(
     boundaries: Option<&SaoBoundaries>,
     no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
 ) {
-    let (n_w, n_h) = ctb_dims;
+    let n_h = ctb_dims.1;
+    sao_ctb_row_lines(
+        src,
+        dst,
+        dst_stride,
+        dst_y_origin,
+        geom,
+        ctb_sao,
+        pic_width_in_ctbs,
+        ry,
+        cidx,
+        ctb_dims,
+        (ry * n_h, (ry + 1) * n_h),
+        boundaries,
+        no_filter,
+    );
+}
+
+/// [`sao_ctb_row_core`] restricted to the plane lines `y_a .. y_b` of
+/// CTB row `ry`.
+#[allow(clippy::too_many_arguments)]
+fn sao_ctb_row_lines(
+    src: SaoSource<'_>,
+    dst: &mut [u16],
+    dst_stride: usize,
+    dst_y_origin: usize,
+    geom: &SaoPlaneGeom,
+    ctb_sao: &[ResolvedSao],
+    pic_width_in_ctbs: usize,
+    ry: usize,
+    cidx: usize,
+    (n_w, n_h): (usize, usize),
+    (y_a, y_b): (usize, usize),
+    boundaries: Option<&SaoBoundaries>,
+    no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+) {
+    let y_ctb = ry * n_h;
+    let rows = (
+        y_a.saturating_sub(y_ctb),
+        y_b.saturating_sub(y_ctb).min(n_h),
+    );
+    if rows.0 >= rows.1 {
+        return;
+    }
     for rx in 0..pic_width_in_ctbs {
         let resolved = &ctb_sao[ry * pic_width_in_ctbs + rx];
         sao_ctb_core(
@@ -753,10 +834,8 @@ pub(crate) fn sao_ctb_row_core(
             dst_y_origin,
             geom,
             &resolved.components[cidx],
-            rx * n_w,
-            ry * n_h,
-            n_w,
-            n_h,
+            (rx * n_w, y_ctb, n_w, n_h),
+            rows,
             boundaries,
             no_filter,
         );

@@ -21,7 +21,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use crate::motion::{MotionCell, MotionField};
 use crate::picture::{Picture, Plane};
 
-/// One in-flight picture: its geometry and the published CTB rows.
+/// Luma lines per published band.
+const BAND: usize = 4;
+
+/// One in-flight picture: its geometry, the published sample lines and
+/// the published motion rows.
 #[derive(Debug)]
 pub(crate) struct InFlightPicture {
     /// `CtbLog2SizeY`.
@@ -30,14 +34,16 @@ pub(crate) struct InFlightPicture {
     rows: usize,
     /// Plane widths (luma, Cb, Cr) and heights.
     dims: [(usize, usize); 3],
-    /// Plane rows per CTB row (luma, Cb, Cr).
-    strip_h: [usize; 3],
-    /// Final samples per plane per CTB row.
-    strips: [Vec<OnceLock<Box<[u16]>>>; 3],
+    /// `SubHeightC` of each plane (1 for luma).
+    sub_h: [usize; 3],
+    /// Final samples per plane per band of [`BAND`] luma lines.
+    bands: [Vec<OnceLock<Box<[u16]>>>; 3],
     /// Motion cells per CTB row.
     motion: Vec<OnceLock<MotionField>>,
-    /// Number of CTB rows published (a prefix).
-    published: AtomicUsize,
+    /// Luma lines published (a prefix; chroma follows at `SubHeightC`).
+    lines: AtomicUsize,
+    /// CTB rows of motion published (a prefix).
+    motion_rows: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
 }
@@ -56,125 +62,145 @@ impl InFlightPicture {
             (0, 0)
         };
         let sh = if chroma && ch > 0 { ph / ch } else { 1 };
-        let strips = || (0..rows).map(|_| OnceLock::new()).collect::<Vec<_>>();
+        let n_bands = ph.div_ceil(BAND);
+        let bands = || (0..n_bands).map(|_| OnceLock::new()).collect::<Vec<_>>();
         Self {
             ctb_log2,
             rows,
             dims: [(pw, ph), (cw, ch), (cw, ch)],
-            strip_h: [ctb, ctb / sh, ctb / sh],
-            strips: [strips(), strips(), strips()],
+            sub_h: [1, sh, sh],
+            bands: [bands(), bands(), bands()],
             motion: (0..rows).map(|_| OnceLock::new()).collect(),
-            published: AtomicUsize::new(0),
+            lines: AtomicUsize::new(0),
+            motion_rows: AtomicUsize::new(0),
             lock: Mutex::new(()),
             cv: Condvar::new(),
         }
     }
 
-    /// Number of CTB rows.
-    pub(crate) fn rows(&self) -> usize {
-        self.rows
+    /// Luma lines published so far.
+    pub(crate) fn published_lines(&self) -> usize {
+        self.lines.load(Ordering::Acquire)
     }
 
-    /// Number of CTB rows published so far.
-    pub(crate) fn published(&self) -> usize {
-        self.published.load(Ordering::Acquire)
+    /// The picture height in luma lines.
+    pub(crate) fn height(&self) -> usize {
+        self.dims[0].1
     }
 
-    /// Block until at least `n` CTB rows (clamped to the picture) are
-    /// published.
-    pub(crate) fn wait_rows(&self, n: usize) {
-        let n = n.min(self.rows);
-        if self.published.load(Ordering::Acquire) >= n {
+    /// Block until `counter` reaches `n`.
+    fn wait_for(&self, counter: &AtomicUsize, n: usize) {
+        if counter.load(Ordering::Acquire) >= n {
             return;
         }
         let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        while self.published.load(Ordering::Acquire) < n {
+        while counter.load(Ordering::Acquire) < n {
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    /// Block until the CTB row holding plane row `y` (clamped into the
-    /// plane) and every row above it are published.
+    /// Block until plane row `y` (clamped into the plane) and every row
+    /// above it are published.
     pub(crate) fn wait_plane_row(&self, plane: usize, y: i32) {
         let h = self.dims[plane].1 as i32;
         let y = y.clamp(0, (h - 1).max(0)) as usize;
-        self.wait_rows(y / self.strip_h[plane].max(1) + 1);
+        let need = ((y + 1) * self.sub_h[plane]).min(self.dims[0].1);
+        self.wait_for(&self.lines, need);
     }
 
     /// Plane row `y` (published).
     pub(crate) fn row(&self, plane: usize, y: usize) -> &[u16] {
-        let sh = self.strip_h[plane];
+        let bh = BAND / self.sub_h[plane];
         let w = self.dims[plane].0;
-        let strip = self.strips[plane][y / sh]
-            .get()
-            .expect("a published CTB row");
-        let o = (y % sh) * w;
-        &strip[o..o + w]
+        let band = self.bands[plane][y / bh].get().expect("a published band");
+        let o = (y % bh) * w;
+        &band[o..o + w]
     }
 
     /// The collocated motion cell covering luma `(x, y)`, once its CTB
     /// row is published.
     pub(crate) fn cell_at(&self, x: usize, y: usize) -> MotionCell {
         let r = (y >> self.ctb_log2).min(self.rows.saturating_sub(1));
-        self.wait_rows(r + 1);
+        self.wait_for(&self.motion_rows, r + 1);
         self.motion[r]
             .get()
             .expect("a published CTB row")
             .cell_at(x, y)
     }
 
-    /// Publish CTB rows `published .. upto` from the worker's picture
-    /// and motion field (both whole-picture, the rows final).
-    pub(crate) fn publish(&self, upto: usize, pic: &Picture, field: &MotionField) {
+    fn notify(&self, counter: &AtomicUsize, value: usize) {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        counter.store(value, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Publish the final luma lines `published .. upto` (a multiple of
+    /// the band height, or the picture height) and the matching chroma
+    /// lines from the worker's whole-picture `pic`.
+    pub(crate) fn publish_lines(&self, upto: usize, pic: &Picture) {
+        let (_, ph) = self.dims[0];
+        let upto = upto.min(ph);
+        let from = self.lines.load(Ordering::Acquire);
+        if upto <= from {
+            return;
+        }
+        for b in from / BAND..upto.div_ceil(BAND) {
+            for (pi, plane) in [Plane::Luma, Plane::Cb, Plane::Cr].into_iter().enumerate() {
+                let (w, h) = self.dims[pi];
+                if w == 0 {
+                    let _ = self.bands[pi][b].set(Box::new([]));
+                    continue;
+                }
+                let bh = BAND / self.sub_h[pi];
+                let (y0, y1) = (b * bh, ((b + 1) * bh).min(h));
+                let (buf, _) = pic.plane_slice(plane);
+                let _ = self.bands[pi][b].set(buf[y0 * w..y1 * w].into());
+            }
+        }
+        self.notify(&self.lines, upto);
+    }
+
+    /// Publish the motion cells of CTB rows `published .. upto`.
+    pub(crate) fn publish_motion(&self, upto: usize, field: &MotionField) {
         let upto = upto.min(self.rows);
-        let from = self.published.load(Ordering::Acquire);
+        let from = self.motion_rows.load(Ordering::Acquire);
         if upto <= from {
             return;
         }
         let ctb = 1usize << self.ctb_log2;
+        let (_, ph) = self.dims[0];
         for r in from..upto {
-            for (pi, plane) in [Plane::Luma, Plane::Cb, Plane::Cr].into_iter().enumerate() {
-                let (w, h) = self.dims[pi];
-                if w == 0 {
-                    let _ = self.strips[pi][r].set(Box::new([]));
-                    continue;
-                }
-                let sh = self.strip_h[pi];
-                let (y0, y1) = (r * sh, ((r + 1) * sh).min(h));
-                let (buf, _) = pic.plane_slice(plane);
-                let _ = self.strips[pi][r].set(buf[y0 * w..y1 * w].into());
-            }
-            let (_, ph) = self.dims[0];
             let y0 = r * ctb;
-            let rows = ctb.min(ph - y0);
-            let _ = self.motion[r].set(field.band_copy(y0, rows));
+            let _ = self.motion[r].set(field.band_copy(y0, ctb.min(ph - y0)));
         }
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.published.store(upto, Ordering::Release);
-        self.cv.notify_all();
+        self.notify(&self.motion_rows, upto);
     }
 
-    /// Publish every row not published yet with whatever the worker
-    /// holds (a failed or abandoned picture), so no reader blocks.
+    /// Publish everything not published yet with whatever the worker
+    /// holds (zero samples, intra cells — a failed or abandoned
+    /// picture), so no reader blocks.
     pub(crate) fn abandon(&self) {
-        let ctb = 1usize << self.ctb_log2;
-        for r in self.published.load(Ordering::Acquire)..self.rows {
-            for pi in 0..3 {
-                let (w, h) = self.dims[pi];
-                let sh = self.strip_h[pi];
+        for (pi, bands) in self.bands.iter().enumerate() {
+            let (w, h) = self.dims[pi];
+            let bh = BAND / self.sub_h[pi];
+            for (b, slot) in bands.iter().enumerate() {
                 let n = if w == 0 {
                     0
                 } else {
-                    (((r + 1) * sh).min(h) - r * sh) * w
+                    (((b + 1) * bh).min(h).saturating_sub(b * bh)) * w
                 };
-                let _ = self.strips[pi][r].set(vec![0u16; n].into());
+                let _ = slot.set(vec![0u16; n].into());
             }
-            let (pw, ph) = self.dims[0];
+        }
+        let ctb = 1usize << self.ctb_log2;
+        let (pw, ph) = self.dims[0];
+        for (r, slot) in self.motion.iter().enumerate() {
             let y0 = r * ctb;
-            let _ = self.motion[r].set(MotionField::new_band(pw, ph, y0, ctb.min(ph - y0)));
+            let _ = slot.set(MotionField::new_band(pw, ph, y0, ctb.min(ph - y0)));
         }
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.published.store(self.rows, Ordering::Release);
+        self.lines.store(ph, Ordering::Release);
+        self.motion_rows.store(self.rows, Ordering::Release);
         self.cv.notify_all();
     }
 }

@@ -414,11 +414,23 @@ fn gather_reference_samples(
             && (y as usize) < ph
             && ctx.ref_sample_available(xb, yb, x, y, sub_w, sub_h)
     };
+    let pi = match plane {
+        Plane::Luma => 0,
+        Plane::Cb => 1,
+        Plane::Cr => 2,
+    };
+    let saved = ctx
+        .unfiltered_above
+        .as_ref()
+        .map(|lines| &lines[pi])
+        .filter(|(y, _)| yb > 0 && *y == yb - 1);
     let read = |x: i64, y: i64, ok: bool| -> (i32, bool) {
-        if ok {
-            (pic.sample(plane, x as usize, y as usize), true)
-        } else {
-            (0, false)
+        if !ok {
+            return (0, false);
+        }
+        match saved {
+            Some((sy, line)) if y as usize == *sy => (i32::from(line[x as usize]), true),
+            _ => (pic.sample(plane, x as usize, y as usize), true),
         }
     };
     // Corner p[−1][−1].
@@ -1593,6 +1605,11 @@ pub struct ReconCtx {
     /// samples from non-`MODE_INTRA` coding units are "not available
     /// for intra prediction".
     constrained_intra: bool,
+    /// The unfiltered last line of the CTB row above the one being
+    /// reconstructed, per plane as `(plane row, samples)`: a row-
+    /// progressive decode deblocks that row before this one predicts
+    /// from it, so §8.4.4.2 reads its pre-filter samples from here.
+    unfiltered_above: Option<[(usize, Vec<u16>); 3]>,
 }
 
 /// §8.6.1 quantization-parameter derivation state: the per-4×4 `QpY`
@@ -1663,6 +1680,18 @@ impl QpState {
 }
 
 impl ReconCtx {
+    /// Keep the unfiltered last line of each plane's CTB row above (see
+    /// the `unfiltered_above` field): `lines[plane] = (plane row,
+    /// samples)`.
+    pub(crate) fn set_unfiltered_above(&mut self, lines: [(usize, Vec<u16>); 3]) {
+        self.unfiltered_above = Some(lines);
+    }
+
+    /// The saved lines' buffers back, for reuse.
+    pub(crate) fn take_unfiltered_above(&mut self) -> Option<[(usize, Vec<u16>); 3]> {
+        self.unfiltered_above.take()
+    }
+
     /// Build the neighbour context for a `pic_width` × `pic_height` luma
     /// picture with the given `CtbLog2SizeY` / `MinTbLog2SizeY` and tile
     /// layout.
@@ -1696,6 +1725,7 @@ impl ReconCtx {
             slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
             qp: None,
             constrained_intra: false,
+            unfiltered_above: None,
         })
     }
 
@@ -1764,6 +1794,7 @@ impl ReconCtx {
             slice_addr_rs: vec![0u32; (pic_w_ctbs * pic_h_ctbs) as usize],
             qp: None,
             constrained_intra: false,
+            unfiltered_above: None,
         })
     }
 

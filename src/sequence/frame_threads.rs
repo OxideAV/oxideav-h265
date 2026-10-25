@@ -67,7 +67,7 @@ struct AbandonGuard(Arc<InFlightPicture>);
 
 impl Drop for AbandonGuard {
     fn drop(&mut self) {
-        if self.0.published() < self.0.rows() {
+        if self.0.published_lines() < self.0.height() {
             self.0.abandon();
         }
     }
@@ -144,7 +144,8 @@ pub(super) fn run(job: PictureJob) -> JobOutput {
     );
     let (picture, motion) = reconstructor.into_parts();
     if result.is_ok() {
-        progress.publish(progress.rows(), &picture, &motion);
+        progress.publish_motion(usize::MAX, &motion);
+        progress.publish_lines(progress.height(), &picture);
     }
     JobOutput {
         result,
@@ -154,11 +155,12 @@ pub(super) fn run(job: PictureJob) -> JobOutput {
 }
 
 /// The serial per-picture walk of [`super::SequenceDecoder`]'s
-/// `decode_picture_serial` with the §8.7 filters run row by row: CTB
-/// row `r`'s deblocking (and row `r − 1`'s SAO) runs once row `r + 1`
-/// is reconstructed too — its intra prediction reads row `r`'s
-/// unfiltered last line — and with `publish` the final rows are
-/// published as they complete.
+/// `decode_picture_serial` with the §8.7 filters run row by row: with
+/// `publish`, CTB row `r`'s deblocking (and row `r − 1`'s SAO) runs as
+/// soon as row `r` is reconstructed — its unfiltered last line, which
+/// row `r + 1`'s intra prediction reads, is kept aside first — and
+/// the final rows are published as they complete. Without, the
+/// filters run row by row after the last CTU.
 fn decode_rows(
     segs: &[SegmentData],
     sps: &SeqParameterSet,
@@ -193,20 +195,19 @@ fn decode_rows(
                 *n += 1;
             }
             if let Some(progress) = publish {
-                // Row `k` complete: row `k − 1`'s intra neighbours (its
-                // last line, read by row `k`) are consumed, so its
-                // deblocking — and row `k − 2`'s SAO — may run.
+                // Row `k` complete: its motion is final; keep its
+                // unfiltered last line for row `k + 1`'s intra
+                // prediction, then deblock it and SAO what that makes
+                // final.
                 while complete < h_ctbs && ctus_in_row[complete] == w_ctbs {
-                    complete += 1;
-                    if complete >= 2 {
-                        reconstructor.filter_ctb_row(filtered, &mut filter);
-                        filtered += 1;
-                        progress.publish(
-                            filtered - 1,
-                            reconstructor.picture(),
-                            reconstructor.field(),
-                        );
+                    progress.publish_motion(complete + 1, reconstructor.field());
+                    if complete + 1 < h_ctbs {
+                        reconstructor.save_unfiltered_last_line(complete);
                     }
+                    let lines = reconstructor.filter_ctb_row(complete, &mut filter);
+                    complete += 1;
+                    filtered = complete;
+                    progress.publish_lines(lines, reconstructor.picture());
                 }
             }
             Ok(())
@@ -256,6 +257,5 @@ fn decode_rows(
         reconstructor.filter_ctb_row(filtered, &mut filter);
         filtered += 1;
     }
-    reconstructor.filter_last_row(&mut filter);
     Ok(())
 }
