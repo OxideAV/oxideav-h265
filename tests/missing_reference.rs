@@ -4,7 +4,7 @@
 //! supported" message.
 
 use oxideav_h265::encoder::inter::{LowDelayPEncoder, YuvFrame};
-use oxideav_h265::{ReconError, SequenceError, decode_annexb_sequence};
+use oxideav_h265::{ReconError, SequenceDecoder, SequenceError, decode_annexb_sequence};
 
 /// Drop every IDR slice NAL unit (types 19 / 20) from an Annex B stream.
 fn drop_idr(stream: &[u8]) -> Vec<u8> {
@@ -22,8 +22,8 @@ fn drop_idr(stream: &[u8]) -> Vec<u8> {
     out
 }
 
-#[test]
-fn p_picture_without_its_idr_names_the_missing_reference() {
+/// A three-picture low-delay P stream.
+fn p_stream() -> Vec<u8> {
     let (w, h) = (64, 32);
     let mut enc = LowDelayPEncoder::new(w, h, 30, 0).unwrap();
     let mut stream = Vec::new();
@@ -40,6 +40,12 @@ fn p_picture_without_its_idr_names_the_missing_reference() {
             .unwrap();
         stream.extend_from_slice(&au.au);
     }
+    stream
+}
+
+#[test]
+fn p_picture_without_its_idr_names_the_missing_reference() {
+    let stream = p_stream();
     assert!(
         decode_annexb_sequence(&stream).is_ok(),
         "intact stream decodes"
@@ -57,4 +63,30 @@ fn p_picture_without_its_idr_names_the_missing_reference() {
         msg.contains("picture POC 1: RefPicList0[0] is \"no reference picture\""),
         "{msg}"
     );
+}
+
+/// Under a frame-thread budget the worker's error surfaces from the
+/// flush with the same first failing picture and slot.
+#[test]
+fn threaded_decode_reports_the_same_missing_reference() {
+    let stream = drop_idr(&p_stream());
+    for threads in [2usize, 4] {
+        let mut dec = SequenceDecoder::new();
+        dec.set_threads(threads);
+        let err = dec
+            .push_annexb(&stream)
+            .and_then(|()| dec.flush())
+            .expect_err("references missing");
+        let SequenceError::Recon(ReconError::MissingReference {
+            list, ref_idx, poc, ..
+        }) = &err
+        else {
+            panic!("unexpected error {err}");
+        };
+        assert_eq!(
+            (*list, *ref_idx, *poc),
+            (0, 0, Some(1)),
+            "{threads} threads"
+        );
+    }
 }

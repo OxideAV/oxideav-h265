@@ -1225,6 +1225,146 @@ impl<'a> PictureReconstructor<'a> {
     }
 }
 
+/// The row-progressive §8.7 filter state of a whole-picture
+/// [`PictureReconstructor`] (frame threading).
+#[derive(Debug, Default)]
+pub(crate) struct RowFilterState {
+    sao: crate::sao::SaoRowFilter,
+    /// The static parts of the §8.7.3.2 boundary gates (tile ids, tile
+    /// scan); the per-CTB slice maps are refreshed per row.
+    boundaries: Option<crate::sao::SaoBoundaries>,
+}
+
+impl PictureReconstructor<'_> {
+    /// The motion field built so far.
+    pub(crate) fn field(&self) -> &MotionField {
+        &self.field
+    }
+
+    /// The §8.7 filters for CTB row `r` once every CTU of rows `..= r +
+    /// 1` is reconstructed (row `r + 1`'s intra prediction reads row
+    /// `r`'s unfiltered last line): deblock row `r`'s vertical then horizontal
+    /// edges (the latter reach three lines into row `r − 1`), then SAO
+    /// row `r − 1`, whose window reaches the now final first line of
+    /// row `r`. Rows `.. r` are final afterwards. The edges, QP cells,
+    /// suppression flags and slice maps read are those of the rows the
+    /// whole-picture pass would read, so the samples equal
+    /// [`filter_picture`]'s.
+    pub(crate) fn filter_ctb_row(&mut self, r: usize, st: &mut RowFilterState) {
+        let slice = self.slice;
+        let ctb = 1usize << slice.ctb_log2_size_y;
+        let (pw, ph) = self.pic.plane_dims(Plane::Luma);
+        let w4 = pw.div_ceil(4);
+        if slice.deblock_enabled
+            && let Some(dparams) = self.edges.params()
+        {
+            let (qp_cells, _) = self
+                .ctx
+                .qp_cells()
+                .expect("the picture reconstructor initializes the QP map");
+            let no_filter = crate::deblock::NoFilterMap {
+                cells: &self.no_filter_cells,
+                w_cells: w4,
+            };
+            let qp_map = crate::deblock::QpMap {
+                cells: qp_cells,
+                w_cells: w4,
+            };
+            let (y0, y1) = ((r * ctb).min(ph), ((r + 1) * ctb).min(ph));
+            for edge in [
+                crate::deblock::EdgeType::Vertical,
+                crate::deblock::EdgeType::Horizontal,
+            ] {
+                crate::deblock::deblock_rows_edges(
+                    &mut self.pic,
+                    &self.edges,
+                    &dparams,
+                    qp_map,
+                    Some(&no_filter),
+                    edge,
+                    y0,
+                    y1,
+                );
+            }
+        }
+        if r > 0 {
+            self.sao_row(r - 1, st);
+        }
+    }
+
+    /// The last CTB row's SAO, after its [`Self::filter_ctb_row`].
+    pub(crate) fn filter_last_row(&mut self, st: &mut RowFilterState) {
+        let ctb = 1usize << self.slice.ctb_log2_size_y;
+        let rows = self.pic.plane_dims(Plane::Luma).1.div_ceil(ctb);
+        if rows > 0 {
+            self.sao_row(rows - 1, st);
+        }
+    }
+
+    fn sao_row(&mut self, ry: usize, st: &mut RowFilterState) {
+        let slice = self.slice;
+        let cat = self.params.chroma_array_type;
+        let chroma = cat != 0;
+        if !(slice.slice_sao_luma_flag || (chroma && slice.slice_sao_chroma_flag)) {
+            return;
+        }
+        let tiling = self.ctx.tiling();
+        let pic_w_ctbs = tiling.pic_width_in_ctbs_y() as usize;
+        let n_ctbs = self.slice_addr_map.len();
+        let b = st
+            .boundaries
+            .get_or_insert_with(|| crate::sao::SaoBoundaries {
+                slice_addr_of_ctb: Vec::new(),
+                tile_id_of_ctb: (0..n_ctbs as u32)
+                    .map(|rs| tiling.tile_id(tiling.ctb_addr_rs_to_ts(rs)))
+                    .collect(),
+                pic_w_ctbs,
+                ctb_log2_size_y: slice.ctb_log2_size_y,
+                across_slices: slice.filter_across_slices,
+                across_tiles: slice.filter_across_tiles,
+                filter_across_of_ctb: Some(Vec::new()),
+                ctb_ts_of_rs: Some(
+                    (0..n_ctbs as u32)
+                        .map(|rs| tiling.ctb_addr_rs_to_ts(rs))
+                        .collect(),
+                ),
+            });
+        b.slice_addr_of_ctb.clone_from(&self.slice_addr_map);
+        b.filter_across_of_ctb = Some(self.filter_across_map.clone());
+        let (pw, _) = self.pic.plane_dims(Plane::Luma);
+        let no_filter = crate::deblock::NoFilterMap {
+            cells: &self.no_filter_cells,
+            w_cells: pw.div_ceil(4),
+        };
+        let ctb = 1usize << slice.ctb_log2_size_y;
+        let (sw, sh) = if chroma { sub_wh_c(cat) } else { (1, 1) };
+        let mut planes = Vec::with_capacity(3);
+        if slice.slice_sao_luma_flag {
+            planes.push((Plane::Luma, 0usize, ctb, ctb));
+        }
+        if chroma && slice.slice_sao_chroma_flag {
+            planes.push((Plane::Cb, 1, ctb / sw, ctb / sh));
+            planes.push((Plane::Cr, 2, ctb / sw, ctb / sh));
+        }
+        for p in planes {
+            st.sao.row(
+                &mut self.pic,
+                p,
+                ry,
+                &self.sao_grid,
+                pic_w_ctbs,
+                Some(b),
+                Some(&no_filter),
+            );
+        }
+    }
+
+    /// The (filtered) picture and its motion field.
+    pub(crate) fn into_parts(self) -> (Picture, MotionField) {
+        (self.pic, self.field)
+    }
+}
+
 /// The owned per-picture maps of a finished (pre-filter) reconstruction
 /// — what [`PictureReconstructor::into_filter_inputs`] hands to a
 /// [`filter_picture`] call that runs the filters row-parallel.
@@ -1740,7 +1880,7 @@ pub fn decode_inter_picture(
     // The collocated picture's motion field for the §8.5.3.2.9 temporal MVP.
     let col_field = ref_state
         .col_pic
-        .map(|idx| &seq.dpb().entries()[idx].motion);
+        .map(|idx| &*seq.dpb().entries()[idx].motion);
 
     let refs = RefListAccess {
         lists: &lists,
@@ -1887,7 +2027,7 @@ mod tests {
             layer_id: 0,
             marking: Marking::ShortTerm,
             picture: pic,
-            motion: MotionField::new(32, 32),
+            motion: MotionField::new(32, 32).into(),
         }
     }
 

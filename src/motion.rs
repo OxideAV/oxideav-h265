@@ -874,6 +874,9 @@ pub struct MotionField {
     /// first inter cell (an intra-only picture — every still — carries
     /// the flags alone).
     motion: Vec<CellMotion>,
+    /// Set on the DPB stand-in of a picture a frame-thread worker is
+    /// still decoding: [`Self::cell_at`] reads the published rows.
+    pending: Option<crate::progress::Pending>,
 }
 
 const FLAG_INTRA: u8 = 1;
@@ -987,6 +990,7 @@ impl MotionField {
             cols_4: width_4,
             flags: vec![FLAG_INTRA; width_4 * height_4],
             motion: Vec::new(),
+            pending: None,
         }
     }
 
@@ -1043,7 +1047,31 @@ impl MotionField {
             cols_4,
             flags: vec![FLAG_INTRA; cols_4 * rows_4],
             motion: Vec::new(),
+            pending: None,
         }
+    }
+
+    /// The DPB stand-in of a picture still being decoded (its cells
+    /// served by `pending`).
+    pub(crate) fn pending_stand_in(
+        width_luma: usize,
+        height_luma: usize,
+        pending: crate::progress::Pending,
+    ) -> Self {
+        let mut f = Self::new_band(width_luma, height_luma, 0, 0);
+        f.pending = Some(pending);
+        f
+    }
+
+    /// A band copy of the luma rows `y0 .. y0 + rows` (`y0` a multiple
+    /// of 4) of this whole-picture field.
+    pub(crate) fn band_copy(&self, y0: usize, rows: usize) -> Self {
+        let mut band = Self::new_band(self.width_4 * 4, self.height_4 * 4, y0, rows);
+        let (by0, by1) = (band.origin_4, band.origin_4 + band.rows_4);
+        let with_motion = !self.motion.is_empty();
+        let (flags, motion) = band.storage_mut(with_motion);
+        self.export_rows(by0, by1, flags, motion);
+        band
     }
 
     /// First stored cell row.
@@ -1179,6 +1207,9 @@ impl MotionField {
     /// Panics if `(x, y)` lies outside the field.
     #[must_use]
     pub fn cell_at(&self, x: usize, y: usize) -> MotionCell {
+        if let Some(p) = &self.pending {
+            return p.0.cell_at(x, y);
+        }
         let bx = x / 4;
         let by = y / 4;
         // A band reports the unwritten background (an intra cell with

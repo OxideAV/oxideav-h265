@@ -334,3 +334,72 @@ fn budgeted_still_decode_is_not_slower_than_serial() {
         );
     }
 }
+
+/// A hierarchical-B stream (the IBBBP shape of a typical encoder
+/// output: references decoded ahead of the frames between them) fed
+/// one access unit per packet through the registry decoder: every
+/// frame-thread budget emits the same frames, in the same order, with
+/// the same timestamps, as the serial decode.
+#[test]
+fn registry_pyramid_stream_decodes_identically_per_packet() {
+    use oxideav_h265::encoder::inter::YuvFrame;
+    use oxideav_h265::encoder::pyramid::PyramidEncoder;
+    let (w, h) = (128usize, 96usize);
+    let mut enc = PyramidEncoder::new(w, h, 30, 4).expect("encoder");
+    let mut aus = Vec::new();
+    for t in 0..19usize {
+        let y: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, yy) = ((i % w) as i64, (i / w) as i64);
+                let m = (x + 3 * t as i64, yy + t as i64);
+                (96 + hash_noise(m.0 / 6, m.1 / 6, 7) / 2) as u8
+            })
+            .collect();
+        let cb: Vec<u8> = (0..w * h / 4)
+            .map(|i| (100 + (i + 2 * t) % 40) as u8)
+            .collect();
+        let cr: Vec<u8> = (0..w * h / 4).map(|i| (150 - (i + t) % 30) as u8).collect();
+        aus.extend(
+            enc.encode_frame(&YuvFrame {
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+            })
+            .expect("encode"),
+        );
+    }
+    aus.extend(enc.flush());
+    let decode = |threads: usize| -> Vec<(Option<i64>, Vec<Vec<u8>>)> {
+        let params = CodecParameters::video("h265".into());
+        let mut dec = oxideav_h265::make_decoder(&params).expect("decoder");
+        if threads > 1 {
+            dec.set_execution_context(&ExecutionContext::with_threads(threads));
+        }
+        let mut out = Vec::new();
+        let mut take = |dec: &mut Box<dyn oxideav_core::Decoder>| loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(VideoFrame { pts, planes, .. })) => {
+                    out.push((pts, planes.into_iter().map(|p| p.data).collect()));
+                }
+                Ok(_) => {}
+                Err(Error::NeedMore | Error::Eof) => break,
+                Err(e) => panic!("receive_frame: {e}"),
+            }
+        };
+        for (i, au) in aus.iter().enumerate() {
+            dec.send_packet(
+                &Packet::new(0, TimeBase::new(1, 30), au.au.clone()).with_pts(i as i64),
+            )
+            .expect("send_packet");
+            take(&mut dec);
+        }
+        dec.flush().expect("flush");
+        take(&mut dec);
+        out
+    };
+    let serial = decode(1);
+    assert_eq!(serial.len(), 19, "every frame decodes");
+    for threads in [2usize, 3, 6] {
+        assert!(decode(threads) == serial, "{threads} threads differ");
+    }
+}

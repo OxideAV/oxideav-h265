@@ -296,6 +296,7 @@ pub mod nal;
 #[doc(hidden)]
 pub mod palette;
 pub mod picture;
+mod progress;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod poc;

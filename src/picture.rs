@@ -58,6 +58,10 @@ pub struct Picture {
     cb: Arc<Vec<u16>>,
     /// `SCr[ x ][ y ]`, row-major; empty when monochrome.
     cr: Arc<Vec<u16>>,
+    /// Set on the DPB stand-in of a picture whose slice data a
+    /// frame-thread worker is still decoding: the planes are empty and
+    /// the samples come from the worker's published rows.
+    pending: Option<crate::progress::Pending>,
 }
 
 /// The three colour components addressable in a [`Picture`].
@@ -124,6 +128,7 @@ impl Picture {
             luma,
             cb,
             cr,
+            pending: None,
         }
     }
 
@@ -210,7 +215,35 @@ impl Picture {
             luma: Arc::new(vec![0u16; w * h]),
             cb: Arc::new(vec![0u16; band_chroma.2 * rows_chroma]),
             cr: Arc::new(vec![0u16; band_chroma.2 * rows_chroma]),
+            pending: None,
         }
+    }
+
+    /// The DPB stand-in of a picture still being decoded: this
+    /// picture's geometry with empty planes, its samples served by
+    /// `pending`.
+    pub(crate) fn pending_stand_in(&self, pending: crate::progress::Pending) -> Self {
+        Self {
+            band_luma: (0, 0, self.width_luma),
+            band_chroma: (0, 0, self.width_chroma),
+            luma: Arc::new(Vec::new()),
+            cb: Arc::new(Vec::new()),
+            cr: Arc::new(Vec::new()),
+            pending: Some(pending),
+            ..*self
+        }
+    }
+
+    /// Whether this is the stand-in served by `pending`.
+    pub(crate) fn is_pending_on(&self, pending: &crate::progress::Pending) -> bool {
+        self.pending.as_ref() == Some(pending)
+    }
+
+    /// The in-flight store serving this picture's samples, when it is
+    /// a stand-in.
+    #[inline]
+    pub(crate) fn pending(&self) -> Option<&crate::progress::InFlightPicture> {
+        self.pending.as_ref().map(|p| &*p.0)
     }
 
     /// All three plane buffers for writing at once (each copied first
@@ -339,6 +372,7 @@ impl Picture {
             luma: Arc::new(luma),
             cb: Arc::new(cb),
             cr: Arc::new(cr),
+            pending: None,
         }
     }
 
@@ -408,6 +442,7 @@ impl Picture {
             luma: cut(&self.luma, self.width_luma, x0, y0, width, height),
             cb: cut(&self.cb, self.width_chroma, cx0, cy0, cw, ch),
             cr: cut(&self.cr, self.width_chroma, cx0, cy0, cw, ch),
+            pending: None,
         }
     }
 
@@ -465,7 +500,7 @@ impl Picture {
     }
 
     #[inline]
-    fn plane_slice(&self, plane: Plane) -> (&[u16], usize) {
+    pub(crate) fn plane_slice(&self, plane: Plane) -> (&[u16], usize) {
         match plane {
             Plane::Luma => (&self.luma, self.band_luma.2),
             Plane::Cb => (&self.cb, self.band_chroma.2),

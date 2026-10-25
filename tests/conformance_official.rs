@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oxideav_h265::decode_annexb_sequence;
+use oxideav_h265::{DecodedFrame, SequenceDecoder, decode_annexb_sequence};
 
 /// RFC 1321 MD5 (self-contained; digest comparison only).
 mod md5 {
@@ -232,4 +232,70 @@ fn official_conformance_streams_decode_byte_exact() {
         failed.is_empty(),
         "official conformance regressions: {failed:?}"
     );
+}
+
+/// Decode a whole stream through `SequenceDecoder` under a thread
+/// budget.
+fn decode_threaded(data: &[u8], threads: usize) -> Result<Vec<DecodedFrame>, String> {
+    let mut dec = SequenceDecoder::new();
+    dec.set_threads(threads);
+    dec.push_annexb(data).map_err(|e| e.to_string())?;
+    dec.finish().map_err(|e| e.to_string())
+}
+
+/// Every staged RExt / SCC stream the serial decoder decodes decodes
+/// to the same frames (order, POC, samples) under thread budgets 2 / 4
+/// / 8 — frame threading, plus the WPP / tile paths a flush takes.
+/// The serial decode is the reference whether or not the stream is
+/// pinned byte-exact (an SCC stream that self-references runs its
+/// in-loop filters after the whole picture). Skipped when the corpus
+/// is not staged; a debug build checks the small streams only.
+#[test]
+fn staged_conformance_streams_decode_identically_under_any_budget() {
+    let Some(dir) = conformance_dir() else {
+        eprintln!("conformance corpus not staged; skipping");
+        return;
+    };
+    let mut checked = 0usize;
+    for branch in ["RExt", "SCC"] {
+        let Ok(rd) = std::fs::read_dir(dir.join(branch)) else {
+            continue;
+        };
+        let mut streams: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("bit" | "bin")))
+            .collect();
+        streams.sort();
+        for path in streams {
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            if cfg!(debug_assertions) && len > 200_000 {
+                continue;
+            }
+            let data = std::fs::read(&path).expect("read bitstream");
+            let Ok(serial) = decode_threaded(&data, 1) else {
+                continue;
+            };
+            for threads in [2usize, 4, 8] {
+                let threaded = decode_threaded(&data, threads)
+                    .unwrap_or_else(|e| panic!("{}: {threads} threads: {e}", path.display()));
+                assert_eq!(
+                    serial.len(),
+                    threaded.len(),
+                    "{}: frame count at {threads} threads",
+                    path.display()
+                );
+                for (i, (a, b)) in serial.iter().zip(&threaded).enumerate() {
+                    assert!(
+                        a.poc == b.poc && a.picture == b.picture,
+                        "{}: frame {i} differs at {threads} threads",
+                        path.display()
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("{checked} staged streams checked");
+    assert!(checked > 0, "no staged stream decoded");
 }

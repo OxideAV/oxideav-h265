@@ -51,7 +51,7 @@
 /// coordinates; this type clamps every access into the valid plane so the
 /// callers can index with the raw `xInt + i` / `yInt + j` offsets the
 /// equations use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct RefPlane<'a> {
     /// Row-major samples, `width * height` of them. `sample[ y * width + x ]`
     /// is the plane sample at full-sample location `( x, y )`.
@@ -61,9 +61,56 @@ pub struct RefPlane<'a> {
     width: usize,
     /// Plane height in samples.
     height: usize,
+    /// A reference picture still being decoded by a frame-thread
+    /// worker (`samples` is then empty): its published rows and the
+    /// plane index.
+    pending: Option<(&'a crate::progress::InFlightPicture, usize)>,
 }
 
+impl PartialEq for RefPlane<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.samples == other.samples
+            && self.width == other.width
+            && self.height == other.height
+            && match (self.pending, other.pending) {
+                (None, None) => true,
+                (Some((a, i)), Some((b, j))) => core::ptr::eq(a, b) && i == j,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for RefPlane<'_> {}
+
 impl<'a> RefPlane<'a> {
+    /// The `plane` of a reference picture — a finished one, or the DPB
+    /// stand-in of one still being decoded (rows read as published).
+    pub(crate) fn of_picture(
+        pic: &'a crate::picture::Picture,
+        plane: crate::picture::Plane,
+    ) -> Result<Self, InterPredError> {
+        let (w, h) = pic.plane_dims(plane);
+        match pic.pending() {
+            None => Self::new(pic.plane(plane), w, h),
+            Some(p) => {
+                if w == 0 || h == 0 {
+                    return Err(InterPredError::EmptyPlane);
+                }
+                let idx = match plane {
+                    crate::picture::Plane::Luma => 0,
+                    crate::picture::Plane::Cb => 1,
+                    crate::picture::Plane::Cr => 2,
+                };
+                Ok(Self {
+                    samples: &[],
+                    width: w,
+                    height: h,
+                    pending: Some((p, idx)),
+                })
+            }
+        }
+    }
+
     /// Wraps a row-major `width * height` sample plane.
     ///
     /// # Errors
@@ -88,6 +135,7 @@ impl<'a> RefPlane<'a> {
             samples,
             width,
             height,
+            pending: None,
         })
     }
 
@@ -108,19 +156,27 @@ impl<'a> RefPlane<'a> {
     /// The whole plane as one row-major slice.
     #[inline]
     fn flat(&self) -> Option<&'a [u16]> {
-        Some(self.samples)
+        self.pending.is_none().then_some(self.samples)
     }
 
-    /// Plane row `y` (`y < height`).
+    /// Plane row `y` (`y < height`; published, for a pending plane).
     #[inline]
     fn row(&self, y: usize) -> &'a [u16] {
-        &self.samples[y * self.width..(y + 1) * self.width]
+        match self.pending {
+            None => &self.samples[y * self.width..(y + 1) * self.width],
+            Some((p, i)) => p.row(i, y),
+        }
     }
 
     /// Make sure rows `y_from .. y_to` (clamped into the plane) are
-    /// readable — a no-op for a finished plane.
+    /// readable: a no-op for a finished plane, a wait on the worker's
+    /// published rows for a pending one.
     #[inline]
-    fn ensure_rows(&self, _y_from: i32, _y_to: i32) {}
+    fn ensure_rows(&self, _y_from: i32, y_to: i32) {
+        if let Some((p, i)) = self.pending {
+            p.wait_plane_row(i, y_to - 1);
+        }
+    }
 
     /// Sample at full-sample location `( x, y )` with the §8.5.3.3.3
     /// `Clip3( 0, dim − 1, … )` edge extension (equations 8-222 / 8-223 /
@@ -130,7 +186,8 @@ impl<'a> RefPlane<'a> {
     pub fn at(&self, x: i32, y: i32) -> i32 {
         let xc = x.clamp(0, self.width as i32 - 1) as usize;
         let yc = y.clamp(0, self.height as i32 - 1) as usize;
-        i32::from(self.samples[yc * self.width + xc])
+        self.ensure_rows(yc as i32, yc as i32 + 1);
+        i32::from(self.row(yc)[xc])
     }
 }
 

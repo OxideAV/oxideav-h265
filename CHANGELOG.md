@@ -6,7 +6,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- *(decoder)* **frame-level threading** under an `ExecutionContext` budget (`set_execution_context` / `SequenceDecoder::set_threads` above one): the §8.3 POC / RPS / DPB cycle stays on the calling thread in decode order while up to `threads` pictures decode their slice data on workers at once. A picture still being decoded sits in the DPB as a stand-in; a later picture's worker reads its samples and collocated motion through the CTB rows it has published — each worker reconstructs in CTB raster order, deblocks a row once the row below is reconstructed (its intra prediction reads the unfiltered last line), runs SAO one row behind that and publishes every row as it becomes final, and a reader waits only for the rows its motion vector, the interpolation taps and the `Clip3` edge extension reach. Output is bit-identical at every budget: the whole staged RExt / SCC conformance corpus decodes to the serial frames at 2 / 4 / 8 threads, and a hierarchical-B stream fed per packet through the registry decoder emits the same frames and timestamps; a picture referencing itself (intra block copy) filters after its last CTU. Errors surface from the next call (the flush at the latest), first failing picture first; tolerant and multi-layer decodes, and the last picture of a flush (a still), keep the per-picture wavefront / tile paths
+
 ### Changed
+
+- *(decoder)* `DpbEntry::motion` is an `Arc<MotionField>` (DPB snapshots share it)
 
 - *(decoder)* §8.5.3.3.3 fractional-sample interpolation runs separably per block (one edge-extended source window, a horizontal row pass and a vertical pass) instead of re-filtering every sample through clamped per-tap reads, and the §8.5.3.3.4 combine, the residual add and the clip write straight into the picture from per-thread arrays (no per-PU prediction / residual-slice allocations; skip CUs build no residual planes). Output is bit-identical (pinned against the per-sample equations at every phase, bit depth and edge position); the 10 s 1080p30 libx265 clip decodes in 3.7 s single-threaded against 5.8 s before
 - *(examples)* `decode_bench` takes `au` (one access unit per packet, the way a demuxer feeds it) and `out=PATH` (raw planes, `-` for stdout, for a black-box `framemd5`), and digests 8-byte words

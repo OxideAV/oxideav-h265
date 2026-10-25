@@ -52,8 +52,9 @@ pub struct DpbEntry {
     pub picture: Picture,
     /// The per-PU motion field — the §8.5.3.2.9 collocated arrays
     /// (`PredFlagLXCol`, `MvLXCol`, the per-cell reference-picture POC
-    /// identity standing in for `RefIdxLXCol` → `refPicListCol`).
-    pub motion: MotionField,
+    /// identity standing in for `RefIdxLXCol` → `refPicListCol`),
+    /// shared (a frame-threaded decode snapshots the DPB per picture).
+    pub motion: std::sync::Arc<MotionField>,
 }
 
 impl DpbEntry {
@@ -187,6 +188,11 @@ impl Dpb {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The stored entries, for patching a frame-threaded picture in.
+    pub(crate) fn entries_mut(&mut self) -> &mut [DpbEntry] {
+        &mut self.entries
     }
 
     /// Borrow the stored entries (output / bumping inspection).
@@ -636,7 +642,7 @@ mod tests {
             layer_id: 0,
             marking,
             picture: Picture::new(16, 16, 1, 8, 8),
-            motion: MotionField::new(16, 16),
+            motion: MotionField::new(16, 16).into(),
         }
     }
 

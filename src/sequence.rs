@@ -46,8 +46,17 @@ use crate::sps::{
 };
 use crate::vps::HevcVps;
 
+mod frame_threads;
 mod wavefront;
 pub(crate) use wavefront::filter_picture_parallel;
+
+/// A picture handed to a frame-thread worker.
+#[derive(Debug)]
+struct InFlightJob {
+    /// The handle its DPB / output stand-ins carry.
+    pending: crate::progress::Pending,
+    handle: std::thread::JoinHandle<frame_threads::JobOutput>,
+}
 
 /// NAL unit type: video parameter set (Table 7-1).
 const NAL_VPS: u8 = 32;
@@ -253,7 +262,7 @@ impl DecodedFrame {
 }
 
 /// One slice segment of the picture being assembled.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SegmentData {
     nal_type: u8,
     temporal_id: u8,
@@ -425,6 +434,23 @@ pub struct SequenceDecoder {
     /// Worker budget for the per-picture wavefront / row-parallel
     /// filters (0 or 1 = serial).
     threads: usize,
+    /// Frame threading: the pictures whose slice data workers are
+    /// decoding, in decode order.
+    inflight: std::collections::VecDeque<InFlightJob>,
+    /// A worker's decode error not reported yet (it surfaces from the
+    /// next fallible call).
+    deferred_error: Option<SequenceError>,
+    /// Set while a flush decodes the last pending picture (it decodes on
+    /// the calling thread, with every reference complete).
+    flushing: bool,
+}
+
+impl Drop for SequenceDecoder {
+    fn drop(&mut self) {
+        for job in self.inflight.drain(..) {
+            let _ = job.handle.join();
+        }
+    }
 }
 
 impl SequenceDecoder {
@@ -655,7 +681,12 @@ impl SequenceDecoder {
     /// # Errors
     /// Any decode error from the pending picture.
     pub fn flush(&mut self) -> Result<(), SequenceError> {
-        self.finish_picture()
+        self.flushing = true;
+        let pending = self.finish_picture();
+        self.flushing = false;
+        let workers = self.collect_done(true);
+        pending?;
+        workers
     }
 
     /// Release every reference picture: the bitstream has ended, so no
@@ -672,7 +703,73 @@ impl SequenceDecoder {
     /// `sps_max_num_reorder_pics`-deep queue; [`Self::finish`] sorts a
     /// whole sequence at once).
     pub fn take_decoded(&mut self) -> Vec<DecodedFrame> {
+        if !self.inflight.is_empty() {
+            // A worker error surfaces from the next fallible call.
+            if let Err(e) = self.collect_done(false) {
+                self.deferred_error.get_or_insert(e);
+            }
+            // Pictures still being decoded stay (with every later one,
+            // keeping decode order) until their worker is done.
+            let ready = self
+                .frames
+                .iter()
+                .position(|f| f.picture.pending().is_some())
+                .unwrap_or(self.frames.len());
+            let rest = self.frames.split_off(ready);
+            return std::mem::replace(&mut self.frames, rest);
+        }
         std::mem::take(&mut self.frames)
+    }
+
+    /// Frame threading: take the finished workers' pictures into the
+    /// DPB and the output queue in decode order — every in-flight one
+    /// when `block`, else those already done. Reports the first decode
+    /// error (a failed picture is not output).
+    fn collect_done(&mut self, block: bool) -> Result<(), SequenceError> {
+        self.collect(if block { usize::MAX } else { 0 })
+    }
+
+    /// [`Self::collect_done`] waiting for the oldest `wait_for` workers
+    /// and taking any later one already done.
+    fn collect(&mut self, mut wait_for: usize) -> Result<(), SequenceError> {
+        let mut first_err = self.deferred_error.take();
+        while let Some(front) = self.inflight.front() {
+            if wait_for == 0 && !front.handle.is_finished() {
+                break;
+            }
+            wait_for = wait_for.saturating_sub(1);
+            let job = self.inflight.pop_front().expect("a front job");
+            let out = job
+                .handle
+                .join()
+                .unwrap_or_else(|_| frame_threads::JobOutput {
+                    result: Err(SequenceError::Malformed("a picture decode worker panicked")),
+                    picture: Picture::new(0, 0, 0, 8, 8),
+                    motion: crate::motion::MotionField::new(0, 0),
+                });
+            let failed = out.result.is_err();
+            if let Err(e) = out.result {
+                first_err.get_or_insert(e);
+            }
+            let motion = std::sync::Arc::new(out.motion);
+            for e in self.state.dpb_mut().entries_mut() {
+                if e.picture.is_pending_on(&job.pending) {
+                    e.picture = out.picture.clone();
+                    e.motion = motion.clone();
+                }
+            }
+            if failed {
+                self.frames
+                    .retain(|f| !f.picture.is_pending_on(&job.pending));
+            } else {
+                for f in &mut self.frames {
+                    if f.picture.is_pending_on(&job.pending) {
+                        f.picture = out.picture.clone();
+                    }
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// `sps_max_num_reorder_pics` of the highest sub-layer of the most
@@ -692,10 +789,10 @@ impl SequenceDecoder {
     /// # Errors
     /// Any decode error from the final pending picture.
     pub fn finish(mut self) -> Result<Vec<DecodedFrame>, SequenceError> {
-        self.finish_picture()?;
+        self.flush()?;
         // §C.5.2.2 output order: `PicOrderCntVal` order within each
         // coded video sequence, sequences in decode order.
-        let mut frames = self.frames;
+        let mut frames = std::mem::take(&mut self.frames);
         frames.sort_by_key(|f| (f.cvs_index, f.poc, f.layer_id));
         Ok(frames)
     }
@@ -717,6 +814,20 @@ impl SequenceDecoder {
             ));
         }
         let plan = self.plan();
+        // Frame threading: this picture's slice data goes to a worker
+        // (the reference cycle below stays on this thread, in decode
+        // order). The last picture of a flush, a tolerant decode and a
+        // multi-layer stream decode here, every reference complete.
+        let frame_threaded =
+            self.threads > 1 && !self.tolerant && !plan.multi_layer && !self.flushing;
+        if frame_threaded {
+            // At most `threads` pictures in flight: wait for the oldest
+            // ones beyond that.
+            let excess = (self.inflight.len() + 1).saturating_sub(self.threads);
+            self.collect(excess)?;
+        } else if !self.inflight.is_empty() {
+            self.collect_done(true)?;
+        }
         let pps = self
             .pps
             .get(&indep.header.slice_pic_parameter_set_id)
@@ -894,7 +1005,7 @@ impl SequenceDecoder {
                         entry.picture.clone()
                     };
                     let motion = if motion_pred && !il_geom.equal_picture_size_and_offset() {
-                        resample_motion(&il_geom, &entry.motion)
+                        std::sync::Arc::new(resample_motion(&il_geom, &entry.motion))
                     } else {
                         entry.motion.clone()
                     };
@@ -1049,7 +1160,7 @@ impl SequenceDecoder {
             list1: None,
         });
         let entries = self.state.dpb().entries();
-        let col_field = ref_state.col_pic.map(|idx| &entries[idx].motion);
+        let col_field = ref_state.col_pic.map(|idx| &*entries[idx].motion);
         let col_poc = ref_state
             .col_pic
             .map(|idx| entries[idx].poc)
@@ -1087,14 +1198,73 @@ impl SequenceDecoder {
         }
         // ---- §7.3.8 CABAC decode + §8.4/§8.5 reconstruction, CTU by CTU ----
         let workers = self.threads.max(1);
-        let parallel = workers > 1 && !self.tolerant && !plan.multi_layer;
+        let parallel = workers > 1 && !self.tolerant && !plan.multi_layer && !frame_threaded;
         let wavefront_plan = parallel
             .then(|| wavefront::WavefrontPlan::build(segs, sps, pps, &geom))
             .flatten();
         let tile_plan = (parallel && wavefront_plan.is_none())
             .then(|| wavefront::TilePlan::build(segs, sps, pps, &geom))
             .flatten();
-        let (picture, motion) = if wavefront_plan.is_some() || tile_plan.is_some() {
+        let (picture, motion) = if frame_threaded {
+            // The DPB / output stand-ins of this picture; its worker
+            // publishes the rows as they become final.
+            let geometry = Picture::new_band(
+                geom.width as usize,
+                geom.height as usize,
+                geom.chroma_array_type,
+                sps.bit_depth_luma(),
+                sps.bit_depth_chroma(),
+                0,
+                0,
+            );
+            let progress = std::sync::Arc::new(crate::progress::InFlightPicture::new(
+                &geometry,
+                geom.ctb_log2,
+            ));
+            let pending = crate::progress::Pending(progress.clone());
+            let snapshot: Vec<DpbEntry> = entries
+                .iter()
+                .map(|e| DpbEntry {
+                    poc: e.poc,
+                    layer_id: e.layer_id,
+                    marking: e.marking,
+                    picture: e.picture.clone(),
+                    motion: e.motion.clone(),
+                })
+                .collect();
+            let job = frame_threads::PictureJob {
+                segs: segs.to_vec(),
+                sps: sps.clone(),
+                pps: pps.clone(),
+                geom: geom.clone(),
+                recon_params,
+                slice_ctx,
+                lists: lists.clone(),
+                entries: snapshot,
+                col_pic: ref_state.col_pic,
+                across_of_slice,
+                progress: progress.clone(),
+            };
+            let handle = std::thread::Builder::new()
+                .name("oxideav-h265-picture".into())
+                .spawn(move || frame_threads::run(job))
+                .map_err(|_| {
+                    progress.abandon();
+                    SequenceError::Malformed("could not start a picture decode worker")
+                })?;
+            self.inflight.push_back(InFlightJob {
+                pending: pending.clone(),
+                handle,
+            });
+            (
+                geometry.pending_stand_in(pending.clone()),
+                crate::motion::MotionField::pending_stand_in(
+                    geom.width as usize,
+                    geom.height as usize,
+                    pending,
+                ),
+            )
+        } else if wavefront_plan.is_some() || tile_plan.is_some() {
             let inputs = wavefront::WavefrontInputs {
                 segs,
                 sps,
@@ -1574,6 +1744,7 @@ pub fn decode_annexb_first_picture_tolerant(data: &[u8]) -> Result<Picture, Sequ
 }
 
 /// The per-SPS geometry constants (§7.4.3.2.1 derived variables).
+#[derive(Debug, Clone)]
 struct Geometry {
     width: u32,
     height: u32,

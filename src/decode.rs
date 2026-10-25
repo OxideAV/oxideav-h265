@@ -291,7 +291,7 @@ impl PictureSequenceState {
             layer_id,
             marking: Marking::ShortTerm,
             picture,
-            motion,
+            motion: std::sync::Arc::new(motion),
         });
     }
 }

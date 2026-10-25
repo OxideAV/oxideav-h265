@@ -872,8 +872,7 @@ pub fn reconstruct_inter_pu_views(
         if !list.pred_flag {
             return Ok(None);
         }
-        let (w, h) = list.ref_pic.plane_dims(plane);
-        RefPlane::new(list.ref_pic.plane(plane), w, h)
+        RefPlane::of_picture(list.ref_pic, plane)
             .map(Some)
             .map_err(ReconError::InterPred)
     }

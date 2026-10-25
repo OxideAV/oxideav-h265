@@ -632,59 +632,96 @@ pub fn apply_sao_picture_in_place(
         if !any {
             continue;
         }
-        let geom = SaoPlaneGeom::of(pic, plane);
-        let (pw, ph) = (geom.pw, geom.ph);
-        // The band: rows [y0 − 1, y0 + n_h] of the pre-SAO plane. Its
-        // first line (the row above) is kept from the previous band
-        // before that row was overwritten.
-        let mut band = vec![0u16; (n_h + 2) * pw];
-        let mut above_line: Vec<u16> = Vec::new();
+        let mut rows = SaoRowFilter::default();
         for ry in 0..pic_height_in_ctbs {
-            let y0 = ry * n_h;
-            if y0 >= ph {
-                break;
-            }
-            let h = n_h.min(ph - y0);
-            let y_origin = y0.saturating_sub(1);
-            {
-                let (buf, stride) = pic.plane_mut(plane);
-                let band_rows = (y0 + h + 1).min(ph) - y_origin;
-                // Rows y0 .. min(y0 + h + 1, ph) come from the picture
-                // (not yet modified); the row above from the saved line.
-                let first_fresh = if y0 == 0 { 0 } else { 1 };
-                for r in first_fresh..band_rows {
-                    let y = y_origin + r;
-                    band[r * pw..(r + 1) * pw].copy_from_slice(&buf[y * stride..y * stride + pw]);
-                }
-                if y0 > 0 {
-                    band[..pw].copy_from_slice(&above_line);
-                }
-                // Save the pre-SAO last line of this row for the next.
-                above_line.clear();
-                above_line
-                    .extend_from_slice(&band[(h + first_fresh - 1) * pw..(h + first_fresh) * pw]);
-            }
-            let src = SaoSource {
-                buf: &band,
-                stride: pw,
-                y_origin,
-            };
-            let (dst, dst_stride) = pic.plane_mut(plane);
-            sao_ctb_row_core(
-                src,
-                dst,
-                dst_stride,
-                0,
-                &geom,
+            rows.row(
+                pic,
+                (plane, cidx, n_w, n_h),
+                ry,
                 ctb_sao,
                 pic_width_in_ctbs,
-                ry,
-                cidx,
-                (n_w, n_h),
                 boundaries,
                 no_filter,
             );
         }
+    }
+}
+
+/// The in-place §8.7.3 pass one CTB row at a time, top to bottom: each
+/// row classifies from a band of the pre-SAO samples — its own rows,
+/// the first line of the row below (not yet offset) and the last line
+/// of the row above, kept from before that row was offset.
+#[derive(Debug, Default)]
+pub(crate) struct SaoRowFilter {
+    band: Vec<u16>,
+    /// The pre-SAO last line of the previous row, per component.
+    above: [Vec<u16>; 3],
+}
+
+impl SaoRowFilter {
+    /// Offset CTB row `ry` of one component (`(plane, cIdx, CTB width,
+    /// CTB height)` in plane samples) in place. Rows must come in
+    /// increasing order, each once; the samples of rows `ry` and `ry +
+    /// 1` must be final deblocked samples.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn row(
+        &mut self,
+        pic: &mut Picture,
+        (plane, cidx, n_w, n_h): (Plane, usize, usize, usize),
+        ry: usize,
+        ctb_sao: &[ResolvedSao],
+        pic_width_in_ctbs: usize,
+        boundaries: Option<&SaoBoundaries>,
+        no_filter: Option<&crate::deblock::NoFilterMap<'_>>,
+    ) {
+        let geom = SaoPlaneGeom::of(pic, plane);
+        let (pw, ph) = (geom.pw, geom.ph);
+        let y0 = ry * n_h;
+        if y0 >= ph {
+            return;
+        }
+        let h = n_h.min(ph - y0);
+        let y_origin = y0.saturating_sub(1);
+        let band = &mut self.band;
+        band.resize((n_h + 2) * pw, 0);
+        let above_line = &mut self.above[cidx];
+        {
+            let (buf, stride) = pic.plane_mut(plane);
+            let band_rows = (y0 + h + 1).min(ph) - y_origin;
+            // Rows y0 .. min(y0 + h + 1, ph) come from the picture
+            // (not yet modified); the row above from the saved line.
+            let first_fresh = if y0 == 0 { 0 } else { 1 };
+            for r in first_fresh..band_rows {
+                let y = y_origin + r;
+                band[r * pw..(r + 1) * pw].copy_from_slice(&buf[y * stride..y * stride + pw]);
+            }
+            if y0 > 0 {
+                band[..pw].copy_from_slice(above_line);
+            }
+            // Save the pre-SAO last line of this row for the next.
+            above_line.clear();
+            above_line.extend_from_slice(&band[(h + first_fresh - 1) * pw..(h + first_fresh) * pw]);
+        }
+        let src = SaoSource {
+            buf: band,
+            stride: pw,
+            y_origin,
+        };
+        let (dst, dst_stride) = pic.plane_mut(plane);
+        sao_ctb_row_core(
+            src,
+            dst,
+            dst_stride,
+            0,
+            &geom,
+            ctb_sao,
+            pic_width_in_ctbs,
+            ry,
+            cidx,
+            (n_w, n_h),
+            boundaries,
+            no_filter,
+        );
     }
 }
 
