@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-h265/compare/v0.0.15...v0.0.16) - 2026-10-25
+
+### Added
+
+- *(decoder)* frame-level threading with row-progressive references
+- *(encoder)* set_bit_rate retargets a rate-controlled stream mid-sequence
+- *(encoder)* forced keyframes, non-reference pictures, layer QP offsets, explicit level/tier
+- *(encoder)* speed-first quadtree decisions (TreeCfg::with_speed)
+- *(encoder)* inter coding on every lossy HEIC layout — Main 10 / 4:2:0 12 / 4:2:2 / 4:4:4 / monochrome P, B and pyramid GOPs, byte-exact against a black-box decoder
+
+### Fixed
+
+- *(decoder)* name the missing reference instead of InterNotSupported
+- fixup for #18: CHANGELOG entries for the speed-first decisions, stream controls and the VPS DPB-bound fix
+- *(encoder)* the VPS signals the SPS's DPB bounds
+- fixup for #16: CHANGELOG entry for the inter CU intra-flag window
+- *(decoder)* HEIF conformance stills decode — bitstream_restriction bounds carried as coded (§E.1) and reported; non-base SPS before its VPS deferred, not refused
+
+### Other
+
+- *(decoder)* gather in-flight reference rows band by band
+- frame-parallel decoding in the README; decode_bench threads=auto
+- *(decoder)* frame threads read finished references whole, scan suppression cells once
+- *(decoder)* compact deblock edge grids, one-shift CABAC renormalization
+- *(decoder)* vectorizable filter taps, reused deblock grids, SAO interior fast path
+- *(decoder)* publish frame-threaded references line by line
+- *(decoder)* separable block interpolation + allocation-free MC write
+- *(encoder)* rustfmt + clippy on the speed-first decisions and their tests
+- snapshot only the CU's bordering intra flags for availability
+- edition 2024, MSRV 1.95
+- *(changelog)* note the round-479 fuzz seeds and campaigns
+- *(fuzz)* seed parse_annexb / hvcc_decode with the HEIF still's out-of-range VUI and an SPS-before-VPS layered record
+- *(encoder)* per-worker row-window state for the WPP wavefront — 12 MP encode 390 → 314 MiB on 8 workers, output bytes identical
+
 ### Added
 
 - *(decoder)* **frame-level threading** under an `ExecutionContext` budget (`set_execution_context` / `SequenceDecoder::set_threads` above one): the §8.3 POC / RPS / DPB cycle stays on the calling thread in decode order while up to `threads` pictures decode their slice data on workers at once. A picture still being decoded sits in the DPB as a stand-in; a later picture's worker reads its samples and collocated motion through what it has published — each worker reconstructs in CTB raster order and, as each CTB row completes, publishes the row's motion, keeps its unfiltered last line aside for the next row's §8.4.4.2 reference samples, deblocks it and SAO-filters every line whose window is final (all but the row's last four), publishing those lines; a reader waits only for the lines its motion vector, the interpolation taps and the `Clip3` edge extension reach. Output is bit-identical at every budget: the whole staged RExt / SCC conformance corpus decodes to the serial frames at 2 / 4 / 8 threads, and a hierarchical-B stream fed per packet through the registry decoder emits the same frames and timestamps; a picture referencing itself (intra block copy) filters after its last CTU. Errors surface from the next call (the flush at the latest), first failing picture first; tolerant and multi-layer decodes, and the last picture of a flush (a still), keep the per-picture wavefront / tile paths. Once a worker is done its finished planes and motion field serve every later read directly. The 10 s 1080p30 libx265 clip (5.8 s serial before this round) decodes in about 0.85-0.9 s on 8 threads (peak RSS about 305 MB against 95 MB serial: every picture in flight holds its working state)
