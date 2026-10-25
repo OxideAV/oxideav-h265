@@ -6,6 +6,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/OxideAV/oxideav-h265/compare/v0.0.16...v0.0.17) - 2026-10-25
+
+### Other
+
+- reset() for seeks; skip RASL pictures of a random access point
+- output_params + output_params_generation from the SPS / hvcC
+
 ### Added
 
 - *(decoder)* `Decoder::output_params` / `output_params_generation`
