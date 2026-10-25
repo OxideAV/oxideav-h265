@@ -424,12 +424,46 @@ fn sao_ctb_core(
         // tile tests entirely.
         let vertical = v0 != 0 || v1 != 0;
         let horizontal = h0 != 0 || h1 != 0;
+        // equations 8-411 / 8-412 as one table over `2 + Sign + Sign`.
+        const EDGE_IDX: [usize; 5] = [1, 2, 0, 3, 4];
+        let off = &comp.offset_val;
         for j in j0..j1.min(h) {
             let ysj = y_ctb + j;
             let border_row = vertical && (j == 0 || j + 1 == h);
             let dr = ysj - dst_y_origin;
             let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
+            // Interior samples (neighbours inside the CTB, hence inside
+            // the picture and the CTB's slice / tile): straight off the
+            // source rows.
+            let (lo, hi) = if border_row {
+                (0, 0)
+            } else if horizontal {
+                (1.min(w), w.saturating_sub(1).max(1.min(w)))
+            } else {
+                (0, w)
+            };
+            if no_filter.is_none() && hi > lo {
+                let row = |dy: i32| {
+                    let y = (ysj as i64 + i64::from(dy)) as usize;
+                    let o = (y - src.y_origin) * src.stride;
+                    &src.buf[o..o + src.stride]
+                };
+                let (rc, r0, r1) = (row(0), row(v0), row(v1));
+                let x0 = x_ctb + lo;
+                let n = hi - lo;
+                let cur = &rc[x0..x0 + n];
+                let a = &r0[(x0 as i64 + i64::from(h0)) as usize..][..n];
+                let b = &r1[(x0 as i64 + i64::from(h1)) as usize..][..n];
+                for (((d, &c), &a), &b) in drow[lo..hi].iter_mut().zip(cur).zip(a).zip(b) {
+                    let c = i32::from(c);
+                    let e = (2 + sign(c - i32::from(a)) + sign(c - i32::from(b))) as usize;
+                    *d = (c + off[EDGE_IDX[e]]).clamp(0, max) as u16;
+                }
+            }
             for (i, d) in drow.iter_mut().enumerate() {
+                if no_filter.is_none() && i >= lo && i < hi {
+                    continue;
+                }
                 let xsi = x_ctb + i;
                 let border_col = horizontal && (i == 0 || i + 1 == w);
                 if border_row || border_col {
@@ -493,6 +527,15 @@ fn sao_ctb_core(
             let ysj = y_ctb + j;
             let dr = ysj - dst_y_origin;
             let drow = &mut dst[dr * dst_stride + x_ctb..dr * dst_stride + x_ctb + w];
+            if no_filter.is_none() {
+                let o = (ysj - src.y_origin) * src.stride + x_ctb;
+                for (d, &c) in drow.iter_mut().zip(&src.buf[o..o + w]) {
+                    let c = i32::from(c);
+                    let off = comp.offset_val[band_table[(c >> band_shift) as usize]];
+                    *d = (c + off).clamp(0, max) as u16;
+                }
+                continue;
+            }
             for (i, d) in drow.iter_mut().enumerate() {
                 let xsi = x_ctb + i;
                 if no_filter.is_some() && suppressed(xsi, ysj) {

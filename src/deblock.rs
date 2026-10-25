@@ -254,22 +254,51 @@ pub fn derive_edge_flags(
     let n_cbs = 1usize << log2_cb_size;
     let mut edge_flags = vec![false; n_cbs * n_cbs];
     let mut tb_edge = vec![false; n_cbs * n_cbs];
-    {
-        let mut ctx = TbBoundaryCtx {
-            filter_edge_flag,
-            edge_type,
-            n_cbs,
-            edge_flags: &mut edge_flags,
-            tb_edge: &mut tb_edge,
-        };
-        transform_block_boundary(transform_split, 0, 0, log2_cb_size, &mut ctx);
-    }
-    prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, &mut edge_flags);
+    edge_flags_into(
+        transform_split,
+        part_mode,
+        log2_cb_size,
+        edge_type,
+        filter_edge_flag,
+        &mut edge_flags,
+        &mut tb_edge,
+    );
     EdgeFlags {
         n_cbs,
         edge_flags,
         tb_edge,
     }
+}
+
+/// [`derive_edge_flags`] into caller grids (`nCbS²` each, all `false`
+/// on entry).
+fn edge_flags_into(
+    transform_split: &TransformSplit,
+    part_mode: PartMode,
+    log2_cb_size: u32,
+    edge_type: EdgeType,
+    filter_edge_flag: bool,
+    edge_flags: &mut [bool],
+    tb_edge: &mut [bool],
+) {
+    let n_cbs = 1usize << log2_cb_size;
+    {
+        let mut ctx = TbBoundaryCtx {
+            filter_edge_flag,
+            edge_type,
+            n_cbs,
+            edge_flags,
+            tb_edge,
+        };
+        transform_block_boundary(transform_split, 0, 0, log2_cb_size, &mut ctx);
+    }
+    prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, edge_flags);
+}
+
+thread_local! {
+    /// [`DeblockEdgeMap::add_cu`]'s per-CU grids, reused across CUs.
+    static ADD_CU_SCRATCH: core::cell::Cell<(Vec<bool>, Vec<bool>, Vec<u8>)> =
+        const { core::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 /// The §8.7.2.4 boundary filtering strength for one CU's edges, a
@@ -416,6 +445,33 @@ pub fn derive_boundary_strength(
     assert_eq!(edge_flags.len(), n_cbs * n_cbs, "edge_flags is nCbS^2");
     assert_eq!(tb_edge.len(), n_cbs * n_cbs, "tb_edge is nCbS^2");
     let mut bs = vec![0u8; n_cbs * n_cbs];
+    boundary_strength_into(
+        field,
+        x_cb,
+        y_cb,
+        log2_cb_size,
+        edge_type,
+        edge_flags,
+        tb_edge,
+        &mut bs,
+    );
+    BoundaryStrength { n_cbs, bs }
+}
+
+/// [`derive_boundary_strength`] into a caller grid (`nCbS²`, zero on
+/// entry; only the sampled edge positions are written).
+#[allow(clippy::too_many_arguments)]
+fn boundary_strength_into(
+    field: &MotionField,
+    x_cb: usize,
+    y_cb: usize,
+    log2_cb_size: u32,
+    edge_type: EdgeType,
+    edge_flags: &[bool],
+    tb_edge: &[bool],
+    bs: &mut [u8],
+) {
+    let n_cbs = 1usize << log2_cb_size;
 
     // §8.7.2.4 sampling grid: EDGE_VER strides 8 in x, 4 in y; EDGE_HOR
     // strides 4 in x, 8 in y.
@@ -456,8 +512,6 @@ pub fn derive_boundary_strength(
         }
         y_dj += step_y;
     }
-
-    BoundaryStrength { n_cbs, bs }
 }
 
 /// Table 8-12 — `β′` as a function of the input variable `Q` (0..=51).
@@ -1562,26 +1616,38 @@ impl DeblockEdgeMap {
             self.params = Some(desc.cu.params);
         }
         let n_d = 1usize << (log2_cb_size - 3);
+        let n_cbs = 1usize << log2_cb_size;
+        let mut guard = ADD_CU_SCRATCH.with(|c| c.take());
+        let (edge_flags, tb_edge, bs) = &mut guard;
         for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
             let filter_edge_flag = match edge_type {
                 EdgeType::Vertical => desc.filter_left,
                 EdgeType::Horizontal => desc.filter_top,
             };
-            let ef = derive_edge_flags(
+            for v in [&mut *edge_flags, &mut *tb_edge] {
+                v.clear();
+                v.resize(n_cbs * n_cbs, false);
+            }
+            bs.clear();
+            bs.resize(n_cbs * n_cbs, 0);
+            edge_flags_into(
                 &desc.transform_split,
                 desc.part_mode,
                 log2_cb_size,
                 edge_type,
                 filter_edge_flag,
+                edge_flags,
+                tb_edge,
             );
-            let bs = derive_boundary_strength(
+            boundary_strength_into(
                 field,
                 x_cb,
                 y_cb,
                 log2_cb_size,
                 edge_type,
-                ef.edge_flags(),
-                ef.tb_edge(),
+                edge_flags,
+                tb_edge,
+                bs,
             );
             for e in 0..n_d {
                 for s_idx in 0..2 * n_d {
@@ -1589,7 +1655,7 @@ impl DeblockEdgeMap {
                         EdgeType::Vertical => (e << 3, s_idx << 2),
                         EdgeType::Horizontal => (s_idx << 2, e << 3),
                     };
-                    let v = bs.at(x_dk, y_dm);
+                    let v = bs[y_dm * n_cbs + x_dk];
                     if v == 0 {
                         continue;
                     }
@@ -1617,6 +1683,7 @@ impl DeblockEdgeMap {
                 }
             }
         }
+        ADD_CU_SCRATCH.with(|c| c.set(guard));
     }
 }
 

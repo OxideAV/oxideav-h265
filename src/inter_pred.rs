@@ -656,16 +656,11 @@ fn interp_block<const TAPS: usize>(
             }
             (true, false) => {
                 for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    o.fill(0);
-                    for (t, &c) in vk.iter().enumerate() {
+                    let rows: [&[u16]; TAPS] = core::array::from_fn(|t| {
                         let s = base + (y + t) * stride + half;
-                        for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
-                            *d += c * i32::from(v);
-                        }
-                    }
-                    for d in o.iter_mut() {
-                        *d >>= shift1;
-                    }
+                        &src[s..s + w]
+                    });
+                    vpass::<TAPS, u16>(rows, vk, shift1, o);
                 }
             }
             (false, false) => {
@@ -676,16 +671,9 @@ fn interp_block<const TAPS: usize>(
                     hpass::<TAPS>(&src[s..s + ww], hk, shift1, r);
                 }
                 for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    o.fill(0);
-                    for (t, &c) in vk.iter().enumerate() {
-                        let r = &rows[(y + t) * w..(y + t + 1) * w];
-                        for (d, &v) in o.iter_mut().zip(r) {
-                            *d += c * v;
-                        }
-                    }
-                    for d in o.iter_mut() {
-                        *d >>= 6;
-                    }
+                    let r: [&[i32]; TAPS] =
+                        core::array::from_fn(|t| &rows[(y + t) * w..(y + t + 1) * w]);
+                    vpass::<TAPS, i32>(r, vk, 6, o);
                 }
             }
         }
@@ -697,17 +685,35 @@ fn interp_block<const TAPS: usize>(
 #[inline(always)]
 fn hpass<const TAPS: usize>(src: &[u16], k: &[i32; TAPS], shift1: i32, out: &mut [i32]) {
     let w = out.len();
-    out.fill(0);
-    for (t, &c) in k.iter().enumerate() {
-        if c == 0 {
-            continue;
+    // One shifted view per tap: the per-sample tap sum then runs over
+    // equal-length slices, which vectorizes across `x`.
+    let taps: [&[u16]; TAPS] = core::array::from_fn(|t| &src[t..t + w]);
+    for (x, d) in out.iter_mut().enumerate() {
+        let mut acc = 0i32;
+        for t in 0..TAPS {
+            acc += k[t] * i32::from(taps[t][x]);
         }
-        for (d, &v) in out.iter_mut().zip(&src[t..t + w]) {
-            *d += c * i32::from(v);
-        }
+        *d = acc >> shift1;
     }
-    for d in out.iter_mut() {
-        *d >>= shift1;
+}
+
+/// One vertical filter row over `TAPS` source rows of `out.len()`
+/// samples each: `out[ x ] = Σ k[ t ] · rows[ t ][ x ] >> shift`.
+#[inline(always)]
+fn vpass<const TAPS: usize, T: Copy + Into<i32>>(
+    rows: [&[T]; TAPS],
+    k: &[i32; TAPS],
+    shift: i32,
+    out: &mut [i32],
+) {
+    let w = out.len();
+    let rows: [&[T]; TAPS] = core::array::from_fn(|t| &rows[t][..w]);
+    for (x, d) in out.iter_mut().enumerate() {
+        let mut acc = 0i32;
+        for t in 0..TAPS {
+            acc += k[t] * rows[t][x].into();
+        }
+        *d = acc >> shift;
     }
 }
 

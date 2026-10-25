@@ -1265,10 +1265,14 @@ impl PictureReconstructor<'_> {
                 .ctx
                 .qp_cells()
                 .expect("the picture reconstructor initializes the QP map");
-            let no_filter = crate::deblock::NoFilterMap {
-                cells: &self.no_filter_cells,
-                w_cells: w4,
-            };
+            let no_filter =
+                self.no_filter_cells
+                    .iter()
+                    .any(|&b| b)
+                    .then_some(crate::deblock::NoFilterMap {
+                        cells: &self.no_filter_cells,
+                        w_cells: w4,
+                    });
             let qp_map = crate::deblock::QpMap {
                 cells: qp_cells,
                 w_cells: w4,
@@ -1283,7 +1287,7 @@ impl PictureReconstructor<'_> {
                     &self.edges,
                     &dparams,
                     qp_map,
-                    Some(&no_filter),
+                    no_filter.as_ref(),
                     edge,
                     y0,
                     y1,
@@ -1360,10 +1364,16 @@ impl PictureReconstructor<'_> {
         b.slice_addr_of_ctb.clone_from(&self.slice_addr_map);
         b.filter_across_of_ctb = Some(self.filter_across_map.clone());
         let (pw, _) = self.pic.plane_dims(Plane::Luma);
-        let no_filter = crate::deblock::NoFilterMap {
-            cells: &self.no_filter_cells,
-            w_cells: pw.div_ceil(4),
-        };
+        // As the whole-picture pass: the suppression map only when a
+        // cell is suppressed (equal output, faster without).
+        let no_filter =
+            self.no_filter_cells
+                .iter()
+                .any(|&b| b)
+                .then_some(crate::deblock::NoFilterMap {
+                    cells: &self.no_filter_cells,
+                    w_cells: pw.div_ceil(4),
+                });
         let ctb = 1usize << slice.ctb_log2_size_y;
         let (sw, sh) = if chroma { sub_wh_c(cat) } else { (1, 1) };
         let mut planes = Vec::with_capacity(3);
@@ -1388,7 +1398,7 @@ impl PictureReconstructor<'_> {
                 &self.sao_grid,
                 pic_w_ctbs,
                 Some(b),
-                Some(&no_filter),
+                no_filter.as_ref(),
             );
             st.sao_done[cidx] = upto;
         }

@@ -876,7 +876,6 @@ pub fn reconstruct_inter_pu_views(
         }
     }
     let lists = [l0, l1];
-    let mut planes: Vec<(Plane, [Option<RefPlane<'_>>; 2])> = Vec::with_capacity(3);
     fn ref_plane<'a>(
         list: &ResolvedList<'a>,
         plane: Plane,
@@ -888,23 +887,17 @@ pub fn reconstruct_inter_pu_views(
             .map(Some)
             .map_err(ReconError::InterPred)
     }
-    planes.push((
-        Plane::Luma,
-        [
-            ref_plane(&lists[0], Plane::Luma)?,
-            ref_plane(&lists[1], Plane::Luma)?,
-        ],
-    ));
-    if cat != 0 {
-        for plane in [Plane::Cb, Plane::Cr] {
-            planes.push((
-                plane,
-                [ref_plane(&lists[0], plane)?, ref_plane(&lists[1], plane)?],
-            ));
-        }
+    let all = [Plane::Luma, Plane::Cb, Plane::Cr];
+    let n_planes = if cat != 0 { 3 } else { 1 };
+    let mut planes: [(Plane, [Option<RefPlane<'_>>; 2]); 3] = [(Plane::Luma, [None, None]); 3];
+    for (slot, &plane) in planes.iter_mut().zip(&all).take(n_planes) {
+        *slot = (
+            plane,
+            [ref_plane(&lists[0], plane)?, ref_plane(&lists[1], plane)?],
+        );
     }
     let (sw, sh) = if cat != 0 { sub_wh_c(cat) } else { (1, 1) };
-    for (ci, (plane, refs)) in planes.iter().enumerate() {
+    for (ci, (plane, refs)) in planes.iter().take(n_planes).enumerate() {
         let luma = ci == 0;
         let (x0, y0, w, h) = if luma {
             (x_pb, y_pb, n_pb_w, n_pb_h)
@@ -945,7 +938,10 @@ pub fn reconstruct_inter_pu_views(
                 let Some(rp) = refs[li].as_ref() else {
                     continue;
                 };
-                buf.resize(w * h, 0);
+                if buf.len() < w * h {
+                    buf.resize(w * h, 0);
+                }
+                let buf = &mut buf[..w * h];
                 let mv_l = lists[li].mv_l;
                 let mv_c = lists[li].mv_c;
                 if luma {
