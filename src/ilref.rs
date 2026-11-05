@@ -192,7 +192,9 @@ impl IlRefGeometry {
         if ref_w <= 0 || ref_h <= 0 || sc_w <= 0 || sc_h <= 0 || sc_w < ref_w || sc_h < ref_h {
             return Err(IlRefError::BadRegion);
         }
-        if rl.bit_depth_luma > cur.bit_depth_luma || rl.bit_depth_chroma > cur.bit_depth_chroma {
+        if rl.bit_depth_luma > cur.bit_depth_luma
+            || (cur.chroma_array_type != 0 && rl.bit_depth_chroma > cur.bit_depth_chroma)
+        {
             return Err(IlRefError::BitDepth);
         }
         // H-18 .. H-21.
@@ -249,9 +251,13 @@ impl IlRefGeometry {
     /// phases, bit depths and chroma format (no resampling needed).
     #[must_use]
     pub fn is_identity(&self) -> bool {
+        // Two monochrome layers carry no chroma samples, so their
+        // (signalled, unused) chroma bit depths cannot differ in effect.
+        let chroma_depth_equal = self.cur.bit_depth_chroma == self.rl.bit_depth_chroma
+            || (self.cur.chroma_array_type == 0 && self.rl.chroma_array_type == 0);
         self.equal_picture_size_and_offset()
             && self.cur.bit_depth_luma == self.rl.bit_depth_luma
-            && self.cur.bit_depth_chroma == self.rl.bit_depth_chroma
+            && chroma_depth_equal
             && self.cur.chroma_array_type == self.rl.chroma_array_type
     }
 
@@ -823,6 +829,71 @@ mod tests {
         assert_eq!(row[16], 64, "{row:?}");
         assert_eq!(row[15], 60, "{row:?}");
         assert_eq!(row[17], 68, "{row:?}");
+    }
+
+    /// A table with no coded residuals is the eq. F-51 identity model:
+    /// 8-bit samples come out as the same values at 10 bits (eq. H-108
+    /// with `nMappingShift` 8: `( 1024 * y + 128 ) >> 8 = 4 * y`).
+    #[test]
+    fn residual_free_colour_table_is_a_bit_depth_promotion() {
+        let table = ColourMappingTable {
+            cm_ref_layer_id: vec![0],
+            luma_bit_depth_cm_output_minus8: 2,
+            chroma_bit_depth_cm_output_minus8: 2,
+            ..ColourMappingTable::default()
+        };
+        let cm = ColourMapping::new(&table);
+        assert_eq!(cm.output_bit_depths(), (10, 10));
+        let mut rl = Picture::new(8, 8, 1, 8, 8);
+        for (i, v) in rl.plane_mut(Plane::Luma).0.iter_mut().enumerate() {
+            *v = (i * 4) as u16;
+        }
+        rl.plane_mut(Plane::Cb).0.fill(90);
+        rl.plane_mut(Plane::Cr).0.fill(170);
+        let out = colour_map_picture(&cm, &rl);
+        assert_eq!(out.bit_depth_luma(), 10);
+        for (o, r) in out.plane(Plane::Luma).iter().zip(rl.plane(Plane::Luma)) {
+            assert_eq!(*o, r << 2);
+        }
+        assert!(out.plane(Plane::Cb).iter().all(|&v| v == 360));
+        assert!(out.plane(Plane::Cr).iter().all(|&v| v == 680));
+    }
+
+    /// `cm_octant_depth == 1` splits the chroma axes at the adaptive
+    /// thresholds (eqs F-48 / H-106): a residual on the high-Cb octant
+    /// moves only the samples whose co-sited Cb reaches `CMThreshU`.
+    #[test]
+    fn adaptive_threshold_selects_the_chroma_octant() {
+        use crate::pps::CmOctantCell;
+        let mut res = [[0i32; 3]; 4];
+        res[3][0] = 40; // LutY[ .. ][ 3 ] += 40 (the luma offset term).
+        let table = ColourMappingTable {
+            cm_ref_layer_id: vec![0],
+            cm_octant_depth: 1,
+            cm_adapt_threshold_u_delta: -28, // CMThreshU = 100.
+            cells: vec![CmOctantCell {
+                idx_y: 0,
+                idx_cb: 1,
+                idx_cr: 0,
+                coded_res_flag: [false, false, false, true],
+                res,
+            }],
+            ..ColourMappingTable::default()
+        };
+        let cm = ColourMapping::new(&table);
+        let mut rl = Picture::new(4, 4, 3, 8, 8);
+        rl.plane_mut(Plane::Luma).0.fill(50);
+        rl.plane_mut(Plane::Cr).0.fill(10);
+        {
+            let (cb, _) = rl.plane_mut(Plane::Cb);
+            for (i, v) in cb.iter_mut().enumerate() {
+                *v = if i % 2 == 0 { 99 } else { 100 };
+            }
+        }
+        let out = colour_map_picture(&cm, &rl);
+        for (i, &v) in out.plane(Plane::Luma).iter().enumerate() {
+            assert_eq!(v, if i % 2 == 0 { 50 } else { 90 }, "sample {i}");
+        }
     }
 
     #[test]

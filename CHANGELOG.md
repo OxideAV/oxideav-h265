@@ -36,8 +36,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   conformance set staged under `docs/video/h265/conformance/shvc/`
   checked against each stream's per-OLS output picture lists (per
   picture, per plane) or per-layer YUV digests; `SHVC_SWEEP=1` prints
-  the whole-corpus table. 154 of 162 stream / output-layer-set pairs
-  are pinned byte-exact.
+  the whole-corpus table. 161 of 162 stream / output-layer-set pairs
+  are pinned byte-exact (every layer of all 70 streams decodes
+  byte-exact; the one pair left is an output-layer selection).
+- *(decoder)* external base layers (F.8.1.8 / F.8.1.9, hybrid
+  scalability): `SequenceDecoder::set_external_base_layer` takes a
+  source of base-layer pictures (`ExternalBaseRequest` →
+  `ExternalBasePicture`) for a VPS with `vps_base_layer_internal_flag`
+  0; the picture enters the access unit at the enhancement POC as a
+  long-term reference and is resampled like an internal one.
+  `HYBRID_A` decodes byte-exact from its staged base layer.
+- *(decoder)* F.7.4.3.2.1 / F.7.4.3.3.1 scaling list inference
+  (`sps_infer_scaling_list_flag` / `pps_infer_scaling_list_flag`): the
+  scaling lists of the SPS / PPS active for the named reference layer.
 
 ### Fixed
 
@@ -51,6 +62,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   inter-layer reference pictures: an enhancement-layer IDR predicting
   from two reference layers signals `ref_pic_lists_modification( )`,
   which was skipped.
+- *(decoder)* NAL units with `nuh_layer_id` 63 are ignored (§7.4.2.2)
+  instead of being parsed — a random-payload VPS of layer 63 failed
+  the stream.
+- *(decoder)* two monochrome layers of equal size and luma depth are
+  an identity inter-layer reference even when their (unused) chroma
+  bit depths differ — the 16-bit monochrome SNR stream went through
+  the resampler and lost precision.
+- *(decoder)* a PPS whose `pps_scc_extension_flag` bit is set but
+  whose RBSP ends before an SCC body would (the version-2
+  `pps_extension_6bits` layout, extension data behind it) keeps the
+  bits as ignored extension data instead of failing.
 - *(decoder)* two inter-layer reference pictures of one access unit
   (a picture predicting from two reference layers) are distinct
   reference pictures for the merge / AMVP neighbour mapping, the

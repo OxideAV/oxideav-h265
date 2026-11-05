@@ -32,13 +32,15 @@ use crate::inter_recon::{
     InterSliceContext, PictureReconstructor, PlacedInterCtu, RefListAccess, SliceWpTables,
     reconstruct_inter_picture,
 };
+use crate::motion::MotionField;
 use crate::nal::{NalError, NalIter, NalUnit};
 use crate::out_shape::{OutShape, ShapeTraits};
-use crate::picture::Picture;
+use crate::picture::{Picture, Plane};
 use crate::poc::NalKind;
 use crate::pps::{PicParameterSet, PpsError};
 use crate::recon::{ReconError, ReconParams};
 use crate::residual::ResidualCodingError;
+use crate::scaling_list::ScalingListData;
 use crate::slice::SliceLayerContext;
 use crate::slice::{SliceError, SliceLongTermRefPicSource, SliceSegmentHeader, SliceType};
 use crate::slice_data::{
@@ -457,6 +459,58 @@ pub struct SequenceDecoder {
     /// Pictures skipped that way, not yet reported by
     /// [`Self::take_skipped_pictures`].
     skipped_pictures: usize,
+    /// The scaling list data (SPS form, PPS form) of the parameter sets
+    /// active for each layer's most recent picture — the source of the
+    /// F.7.4.3.2.1 / F.7.4.3.3.1 scaling list inference.
+    layer_scaling: BTreeMap<u8, (Option<ScalingListData>, Option<ScalingListData>)>,
+    /// The F.8.1.8 source of external base layer pictures.
+    external_base: Option<ExternalBaseSource>,
+}
+
+/// A base layer picture supplied by external means (F.8.1.8) for a
+/// bitstream whose VPS has `vps_base_layer_internal_flag == 0` (hybrid
+/// scalability: the base layer is coded by another codec, or delivered
+/// apart from the HEVC enhancement layers).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExternalBasePicture {
+    /// The decoded sample arrays of the base layer picture (its
+    /// representation format must match the VPS one for layer 0).
+    pub picture: Picture,
+}
+
+impl ExternalBasePicture {
+    /// An external base layer picture with these samples.
+    #[must_use]
+    pub fn new(picture: Picture) -> Self {
+        Self { picture }
+    }
+}
+
+/// What an external base layer source is asked for: the base layer
+/// picture of one access unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExternalBaseRequest {
+    /// Decode-order index of the access unit.
+    pub au_index: u64,
+    /// `PicOrderCntVal` of the access unit (F.8.1.9: the base picture
+    /// takes the POC of the enhancement layer pictures).
+    pub poc: i32,
+    /// `nuh_layer_id` of the picture predicting from it.
+    pub layer_id: u8,
+}
+
+/// The F.8.1.8 source closure's type.
+type ExternalBaseFn = dyn FnMut(&ExternalBaseRequest) -> Option<ExternalBasePicture> + Send;
+
+/// The boxed F.8.1.8 source closure.
+struct ExternalBaseSource(Box<ExternalBaseFn>);
+
+impl std::fmt::Debug for ExternalBaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalBaseSource")
+    }
 }
 
 impl Drop for SequenceDecoder {
@@ -498,6 +552,20 @@ impl SequenceDecoder {
     pub fn set_layer_target(&mut self, target: LayerTarget) {
         self.target = target;
         self.plan = None;
+    }
+
+    /// Supply the base layer of a bitstream whose VPS has
+    /// `vps_base_layer_internal_flag == 0` (F.8.1.8): `source` is asked,
+    /// once per access unit whose enhancement picture predicts from layer
+    /// 0, for that access unit's decoded base picture; returning `None`
+    /// leaves the access unit without one (no inter-layer prediction from
+    /// layer 0, F.8.1.8). Without a source such a picture fails with a
+    /// missing inter-layer reference.
+    pub fn set_external_base_layer(
+        &mut self,
+        source: impl FnMut(&ExternalBaseRequest) -> Option<ExternalBasePicture> + Send + 'static,
+    ) {
+        self.external_base = Some(ExternalBaseSource(Box::new(source)));
     }
 
     /// The layers this decoder decodes / outputs once a VPS has been
@@ -586,6 +654,12 @@ impl SequenceDecoder {
             rbsp,
             escaped,
         } = unit;
+        // §7.4.2.2: nuh_layer_id 63 is reserved — decoders ignore all
+        // data that follows it in a NAL unit (the unit does not even
+        // delimit a picture or an access unit).
+        if header.nuh_layer_id == 63 {
+            return Ok(());
+        }
         if header.is_vcl() {
             // §7.4.2.4.4 / F.7.4.2.4.4: a VCL NAL with
             // first_slice_segment_in_pic_flag set starts a new picture;
@@ -948,6 +1022,46 @@ impl SequenceDecoder {
                 .map(|rf| sps_raw.with_rep_format(rf))
         });
         let sps: &SeqParameterSet = sps_override.as_ref().unwrap_or(sps_raw);
+        // F.7.4.3.2.1 / F.7.4.3.3.1: `sps_infer_scaling_list_flag` /
+        // `pps_infer_scaling_list_flag` take the scaling list data of the
+        // SPS / PPS active for the named reference layer.
+        let inherited = plan.multi_layer.then(|| {
+            let sps_ref = sps
+                .sps_infer_scaling_list_flag
+                .then_some(sps.sps_scaling_list_ref_layer_id);
+            let pps_ref = pps
+                .pps_multilayer_extension
+                .as_ref()
+                .filter(|m| m.pps_infer_scaling_list_flag)
+                .map(|m| m.pps_scaling_list_ref_layer_id);
+            let sps_data = match sps_ref {
+                Some(l) => self.layer_scaling.get(&l).and_then(|s| s.0.clone()),
+                None => sps.scaling_list_data.clone(),
+            };
+            let pps_data = match pps_ref {
+                Some(l) => self.layer_scaling.get(&l).and_then(|s| s.1.clone()),
+                None => pps.scaling_list_data.clone(),
+            };
+            (sps_ref.is_some() || pps_ref.is_some(), sps_data, pps_data)
+        });
+        let (sps_scaled, pps_scaled) = match inherited {
+            Some((inferred, sps_data, pps_data)) => {
+                self.layer_scaling
+                    .insert(layer_id, (sps_data.clone(), pps_data.clone()));
+                if inferred {
+                    let mut s = sps.clone();
+                    s.scaling_list_data = sps_data;
+                    let mut p = pps.clone();
+                    p.scaling_list_data = pps_data;
+                    (Some(s), Some(p))
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        };
+        let sps: &SeqParameterSet = sps_scaled.as_ref().unwrap_or(sps);
+        let pps: &PicParameterSet = pps_scaled.as_ref().unwrap_or(pps);
 
         let geom = Geometry::derive(sps, pps)?;
 
@@ -969,11 +1083,18 @@ impl SequenceDecoder {
         // not.
         let nal_kind = NalKind::new(indep.nal_type);
         let lstate = self.layers.get(&layer_id).copied().unwrap_or_default();
+        // F.8.1.8: an external base layer picture sets
+        // LayerInitializedFlag[ 0 ] for its access unit — with a source
+        // installed, layer 0 counts as initialized (a source declining an
+        // access unit only withdraws that picture's inter-layer
+        // reference).
+        let external_base_layer =
+            vps.is_some_and(|v| !v.base_layer_internal_flag) && self.external_base.is_some();
         let ref_layers_initialized = ext.is_none_or(|e| {
-            e.layers
-                .direct_ref_layers(layer_id)
-                .iter()
-                .all(|&r| self.layers.get(&r).is_some_and(|l| l.initialized))
+            e.layers.direct_ref_layers(layer_id).iter().all(|&r| {
+                (r == 0 && external_base_layer)
+                    || self.layers.get(&r).is_some_and(|l| l.initialized)
+            })
         });
         let no_rasl_output = if layer_id == 0 {
             nal_kind.is_idr() || nal_kind.is_bla() || (nal_kind.is_irap() && !self.seen_picture)
@@ -1042,6 +1163,10 @@ impl SequenceDecoder {
         // and the temporary Annex H resampled entries (removed after).
         let mut il_marked: Vec<(usize, Marking)> = Vec::new();
         let mut il_temporary: Vec<usize> = Vec::new();
+        // The placeholder of an F.8.1.8 external base layer picture:
+        // (DPB index, in RefPicSetInterLayer0, position in that set,
+        // current format, sample prediction enabled).
+        let mut external_slot: Option<(usize, bool, usize, LayerFormat, bool)> = None;
         if let Some(e) = ext {
             let curr_view = e.layers.view_id_of(layer_id);
             let base_view = e.layers.view_id_of(0);
@@ -1049,27 +1174,6 @@ impl SequenceDecoder {
                 let ref_view = e.layers.view_id_of(ref_layer);
                 let set0 = (curr_view <= base_view && curr_view <= ref_view)
                     || (curr_view >= base_view && curr_view >= ref_view);
-                let idx = self
-                    .au
-                    .pictures
-                    .iter()
-                    .find(|(l, _)| *l == ref_layer)
-                    .map(|(_, i)| *i)
-                    .ok_or(SequenceError::Malformed(
-                        "inter-layer reference picture missing from the access unit",
-                    ))?;
-                let entry = &self.state.dpb().entries()[idx];
-                // H.8.1.4: a reference layer of another size / offset /
-                // phase / bit depth / chroma format is resampled into a
-                // temporary ilRefPic entry (removed after the picture).
-                let ml = pps.pps_multilayer_extension.as_ref();
-                let offsets = ml.and_then(|m| m.ref_loc_offset_for(ref_layer));
-                // H.8.1.4.1 currColourMappingEnableFlag: the PPS colour
-                // mapping table names this reference layer.
-                let colour_table = ml
-                    .filter(|m| m.colour_mapping_enabled_flag)
-                    .and_then(|m| m.colour_mapping_table.as_ref())
-                    .filter(|t| t.cm_ref_layer_id.contains(&ref_layer));
                 let cur_fmt = LayerFormat {
                     width: geom.width,
                     height: geom.height,
@@ -1077,55 +1181,65 @@ impl SequenceDecoder {
                     bit_depth_luma: sps.bit_depth_luma(),
                     bit_depth_chroma: sps.bit_depth_chroma(),
                 };
-                let sample_pred = e.layers.sample_prediction_enabled(layer_id, ref_layer);
-                let motion_pred = e.layers.motion_prediction_enabled(layer_id, ref_layer);
-                // H.8.1.4.4: with colour mapping, the reference samples
-                // enter the resampling at the table's output bit depths.
-                let mapped = match colour_table {
-                    Some(t) if sample_pred => {
-                        if entry.picture.chroma_array_type() == 0 {
-                            return Err(SequenceError::Malformed(
-                                "inter-layer colour mapping of a monochrome reference layer",
-                            ));
-                        }
-                        let cm = ColourMapping::new(t);
-                        Some(colour_map_picture(&cm, &entry.picture))
-                    }
-                    _ => None,
+                let il_ctx = IlRefContext {
+                    ref_layer,
+                    cur_fmt,
+                    pps,
+                    sample_pred: e.layers.sample_prediction_enabled(layer_id, ref_layer),
+                    motion_pred: e.layers.motion_prediction_enabled(layer_id, ref_layer),
                 };
-                let rl_fmt = LayerFormat::of(mapped.as_ref().unwrap_or(&entry.picture));
-                let il_geom = IlRefGeometry::derive(cur_fmt, rl_fmt, offsets).map_err(|_| {
-                    SequenceError::Malformed("inter-layer reference geometry is invalid")
-                })?;
-                let slot = if mapped.is_none() && il_geom.is_identity() {
-                    il_marked.push((idx, entry.marking));
-                    self.state.dpb_mut().set_marking(idx, Marking::LongTerm);
-                    idx
-                } else {
-                    let src = mapped.as_ref().unwrap_or(&entry.picture);
-                    let picture = if il_geom.is_identity() {
-                        src.clone()
-                    } else if sample_pred || !il_geom.equal_picture_size_and_offset() {
-                        resample_picture(&il_geom, src)
-                    } else {
-                        src.clone()
-                    };
-                    let motion = if motion_pred && !il_geom.equal_picture_size_and_offset() {
-                        std::sync::Arc::new(resample_motion(&il_geom, &entry.motion))
-                    } else {
-                        entry.motion.clone()
-                    };
-                    let temp = DpbEntry {
-                        poc: entry.poc,
-                        layer_id: ref_layer,
-                        marking: Marking::LongTerm,
-                        picture,
-                        motion,
-                    };
-                    let new_idx = self.state.dpb().len();
-                    self.state.dpb_mut().insert(temp);
-                    il_temporary.push(new_idx);
-                    new_idx
+                let found = self
+                    .au
+                    .pictures
+                    .iter()
+                    .find(|(l, _)| *l == ref_layer)
+                    .map(|(_, i)| *i);
+                let slot = match found {
+                    Some(idx) => {
+                        let entry = &self.state.dpb().entries()[idx];
+                        match derive_inter_layer_ref(entry, &il_ctx)? {
+                            None => {
+                                il_marked.push((idx, entry.marking));
+                                self.state.dpb_mut().set_marking(idx, Marking::LongTerm);
+                                idx
+                            }
+                            Some(temp) => {
+                                let new_idx = self.state.dpb().len();
+                                self.state.dpb_mut().insert(temp);
+                                il_temporary.push(new_idx);
+                                new_idx
+                            }
+                        }
+                    }
+                    // F.8.1.8: with an external base layer
+                    // (`vps_base_layer_internal_flag == 0`) the layer-0
+                    // picture of the access unit comes from the
+                    // caller's source once this picture's POC is known
+                    // (F.8.1.9 gives it that POC) — a placeholder slot
+                    // holds its list position until then.
+                    None if ref_layer == 0 && external_base_layer => {
+                        let new_idx = self.state.dpb().len();
+                        self.state.dpb_mut().insert(DpbEntry {
+                            poc: 0,
+                            layer_id: 0,
+                            marking: Marking::LongTerm,
+                            picture: Picture::new(1, 1, 0, 8, 8),
+                            motion: std::sync::Arc::new(MotionField::new(1, 1)),
+                        });
+                        il_temporary.push(new_idx);
+                        let pos = if set0 {
+                            layered.inter_layer0.len()
+                        } else {
+                            layered.inter_layer1.len()
+                        };
+                        external_slot = Some((new_idx, set0, pos, cur_fmt, il_ctx.sample_pred));
+                        new_idx
+                    }
+                    None => {
+                        return Err(SequenceError::Malformed(
+                            "inter-layer reference picture missing from the access unit",
+                        ));
+                    }
                 };
                 if set0 {
                     layered.inter_layer0.push(Some(slot));
@@ -1217,6 +1331,71 @@ impl SequenceDecoder {
             && !(nal_kind.is_rasl() || nal_kind.is_radl() || nal_kind.is_slnr())
             && !indep.header.discardable_flag();
 
+        if let Some((slot, set0, pos, cur_fmt, sample_pred)) = external_slot {
+            // F.8.1.9: the external picture takes this picture's POC.
+            let poc = layered.poc_override.unwrap_or_else(|| {
+                self.state
+                    .poc_state_mut(layer_id)
+                    .derive_f62(
+                        nal_kind.is_idr(),
+                        layered.first_pic_in_layer_decoded,
+                        header_info.poc_lsb,
+                        header_info.max_poc_lsb,
+                        layered.poc_msb_cycle_val,
+                    )
+                    .val
+            });
+            let request = ExternalBaseRequest {
+                au_index: self.au.index,
+                poc,
+                layer_id,
+            };
+            let provided = self
+                .external_base
+                .as_mut()
+                .and_then(|src| (src.0)(&request));
+            let filled = match provided {
+                Some(ext_pic) => {
+                    // F.8.1.8: LayerInitializedFlag[ 0 ] and
+                    // FirstPicInLayerDecodedFlag[ 0 ] become 1.
+                    let st0 = self.layers.entry(0).or_default();
+                    st0.initialized = true;
+                    st0.first_pic_decoded = true;
+                    let (w, h) = ext_pic.picture.plane_dims(Plane::Luma);
+                    let rl = DpbEntry {
+                        poc,
+                        layer_id: 0,
+                        marking: Marking::LongTerm,
+                        motion: std::sync::Arc::new(MotionField::new(w, h)),
+                        picture: ext_pic.picture,
+                    };
+                    let il_ctx = IlRefContext {
+                        ref_layer: 0,
+                        cur_fmt,
+                        pps,
+                        sample_pred,
+                        // F.7.4.3.1.1: direct_dependency_type[ i ][ 0 ]
+                        // is inferred 0 (sample prediction only) with
+                        // an external base layer.
+                        motion_pred: false,
+                    };
+                    let entry = derive_inter_layer_ref(&rl, &il_ctx)?.unwrap_or(rl);
+                    self.state.dpb_mut().entries_mut()[slot] = DpbEntry { poc, ..entry };
+                    true
+                }
+                None => false,
+            };
+            if !filled {
+                // F.8.1.8: not provided — no layer-0 picture is used for
+                // inter-layer prediction in this access unit.
+                let set = if set0 {
+                    &mut layered.inter_layer0
+                } else {
+                    &mut layered.inter_layer1
+                };
+                set[pos] = None;
+            }
+        }
         let ref_state = self
             .state
             .begin_picture_layered(&header_info, &slice_ref, &layered);
@@ -2096,6 +2275,79 @@ fn build_slice_ref_params(
             .filter(|m| m.ref_pic_list_modification_flag_l1 == Some(true))
             .map(|m| m.list_entry_l1.clone()),
     }
+}
+
+/// The inputs of one H.8.1.4 inter-layer reference derivation.
+struct IlRefContext<'a> {
+    /// `rLId`.
+    ref_layer: u8,
+    /// The current layer's picture format.
+    cur_fmt: LayerFormat,
+    /// The current picture's PPS (reference layer offsets, colour
+    /// mapping table).
+    pps: &'a PicParameterSet,
+    /// `VpsInterLayerSamplePredictionEnabled` for the pair.
+    sample_pred: bool,
+    /// `VpsInterLayerMotionPredictionEnabled` for the pair.
+    motion_pred: bool,
+}
+
+/// H.8.1.4 — the inter-layer reference picture of the direct reference
+/// layer picture `rl`: `None` when `ilRefPic` is `rlPic` itself (equal
+/// geometry, bit depths and chroma format, no colour mapping), else the
+/// generated picture (colour mapped, resampled, motion field resampled)
+/// as a long-term DPB entry of layer `rLId`.
+fn derive_inter_layer_ref(
+    rl: &DpbEntry,
+    c: &IlRefContext<'_>,
+) -> Result<Option<DpbEntry>, SequenceError> {
+    let ml = c.pps.pps_multilayer_extension.as_ref();
+    let offsets = ml.and_then(|m| m.ref_loc_offset_for(c.ref_layer));
+    // H.8.1.4.1 currColourMappingEnableFlag: the PPS colour mapping
+    // table names this reference layer.
+    let colour_table = ml
+        .filter(|m| m.colour_mapping_enabled_flag)
+        .and_then(|m| m.colour_mapping_table.as_ref())
+        .filter(|t| t.cm_ref_layer_id.contains(&c.ref_layer));
+    // H.8.1.4.4: with colour mapping, the reference samples enter the
+    // resampling at the table's output bit depths.
+    let mapped = match colour_table {
+        Some(t) if c.sample_pred => {
+            if rl.picture.chroma_array_type() == 0 {
+                return Err(SequenceError::Malformed(
+                    "inter-layer colour mapping of a monochrome reference layer",
+                ));
+            }
+            Some(colour_map_picture(&ColourMapping::new(t), &rl.picture))
+        }
+        _ => None,
+    };
+    let rl_fmt = LayerFormat::of(mapped.as_ref().unwrap_or(&rl.picture));
+    let il_geom = IlRefGeometry::derive(c.cur_fmt, rl_fmt, offsets)
+        .map_err(|_| SequenceError::Malformed("inter-layer reference geometry is invalid"))?;
+    if mapped.is_none() && il_geom.is_identity() {
+        return Ok(None);
+    }
+    let src = mapped.as_ref().unwrap_or(&rl.picture);
+    let picture = if il_geom.is_identity() {
+        src.clone()
+    } else if c.sample_pred || !il_geom.equal_picture_size_and_offset() {
+        resample_picture(&il_geom, src)
+    } else {
+        src.clone()
+    };
+    let motion = if c.motion_pred && !il_geom.equal_picture_size_and_offset() {
+        std::sync::Arc::new(resample_motion(&il_geom, &rl.motion))
+    } else {
+        rl.motion.clone()
+    };
+    Ok(Some(DpbEntry {
+        poc: rl.poc,
+        layer_id: c.ref_layer,
+        marking: Marking::LongTerm,
+        picture,
+        motion,
+    }))
 }
 
 fn build_recon_params(

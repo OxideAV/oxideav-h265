@@ -1379,8 +1379,28 @@ impl PicParameterSet {
             // SCC body can be decoded in place only when no
             // (still-opaque) 3D body precedes it; otherwise it stays
             // inside the opaque tail.
+            // A PPS written before the SCC extension existed (the
+            // version-2 syntax, where the six bits after the multilayer
+            // flag were all `pps_extension_6bits`) can carry a 1 in the
+            // position that now reads `pps_scc_extension_flag`, with
+            // ordinary extension data behind it. When the RBSP ends before
+            // an SCC body does, the bits are kept as extension data — which
+            // §7.4.3.3.1 tells a decoder to ignore — instead of refusing
+            // the PPS.
+            let mut scc_misfit = false;
             let scc_ext = if flags.scc_decodable_in_place() {
-                Some(PpsSccExtension::parse(br)?)
+                let mut trial = br.clone();
+                match PpsSccExtension::parse(&mut trial) {
+                    Ok(e) => {
+                        *br = trial;
+                        Some(e)
+                    }
+                    Err(PpsError::Truncated) => {
+                        scc_misfit = true;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 None
             };
@@ -1390,7 +1410,7 @@ impl PicParameterSet {
             // rest of the RBSP as an opaque tail starting at the first
             // un-decoded body's bit position. Otherwise only
             // rbsp_trailing_bits remains, consumed implicitly.
-            let tail = if flags.has_opaque_body_after_decoded() {
+            let tail = if scc_misfit || flags.has_opaque_body_after_decoded() {
                 Some(OpaqueTail::capture_at(br.bit_pos(), rbsp))
             } else {
                 None
@@ -1991,6 +2011,32 @@ mod tests {
         assert_eq!(re, PpsRangeExtension::default());
         let scc = pps.pps_scc_extension.expect("scc extension body");
         assert!(scc.pps_curr_pic_ref_enabled_flag);
+    }
+
+    /// A PPS whose bit in the `pps_scc_extension_flag` position is 1 but
+    /// whose following bits are no `pps_scc_extension( )` (the
+    /// version-2 `pps_extension_6bits` layout, with extension data
+    /// behind it) keeps those bits as ignored extension data instead of
+    /// failing the PPS.
+    #[test]
+    fn pps_scc_flag_without_an_scc_body_is_extension_data() {
+        let mut bits = minimal_pps_prefix_bits();
+        bits += "1"; // pps_extension_present_flag = 1
+        bits += "000"; // range / multilayer / 3d = 0
+        bits += "1"; // the pps_scc_extension_flag position = 1
+        bits += "0110"; // pps_extension_4bits != 0
+        // Extension data too short to be an SCC body: read as one, the
+        // RBSP ends inside the ACT QP offsets.
+        bits += "010"; // curr_pic_ref 0, ACT 1, slice ACT offsets 0
+        bits += "1"; // rbsp_trailing_bits stop bit
+        while !bits.len().is_multiple_of(8) {
+            bits += "0";
+        }
+        let rbsp = pack_bits(&bits);
+        let pps = PicParameterSet::parse(&rbsp).expect("PPS with misfit SCC bits");
+        assert!(pps.extension_flags.expect("flags").pps_scc_extension_flag);
+        assert!(pps.pps_scc_extension.is_none());
+        assert!(pps.opaque_tail.is_some());
     }
 
     /// F.7.3.2.3.4: a `pps_multilayer_extension()` body (poc-reset

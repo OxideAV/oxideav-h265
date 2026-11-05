@@ -289,3 +289,40 @@ fn non_base_sps_before_its_vps_is_deferred_not_refused() {
     assert_eq!(md5::hex(&views[0]), VIEW0_MD5, "base view digest");
     assert_eq!(md5::hex(&views[1]), VIEW1_MD5, "second view digest");
 }
+
+/// §7.4.2.2: NAL units with `nuh_layer_id` 63 are ignored whole — a
+/// garbage VPS and a "first slice segment" VCL unit of layer 63 slipped
+/// in front of and between the access units change nothing.
+#[test]
+fn nuh_layer_id_63_units_are_ignored() {
+    // VPS_NUT and TRAIL_R headers with nuh_layer_id 63, random payloads
+    // (the VCL one with first_slice_segment_in_pic_flag set).
+    let junk: &[&[u8]] = &[
+        &[0, 0, 0, 1, 0x41, 0xF9, 0x5A, 0xC3, 0x17, 0xEE],
+        &[0, 0, 0, 1, 0x03, 0xF9, 0xB4, 0x22, 0x9D, 0x01],
+    ];
+    let starts: Vec<usize> = STREAM
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == [0, 0, 0, 1])
+        .map(|(i, _)| i)
+        .collect();
+    let mid = starts[starts.len() / 2];
+    let mut stream = Vec::new();
+    for j in junk {
+        stream.extend_from_slice(j);
+    }
+    stream.extend_from_slice(&STREAM[..mid]);
+    for j in junk {
+        stream.extend_from_slice(j);
+    }
+    stream.extend_from_slice(&STREAM[mid..]);
+    let frames = decode_annexb_sequence(&stream).expect("decode");
+    assert_eq!(frames.len(), 6);
+    let mut views: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    for f in &frames {
+        views[usize::from(f.layer_id)].extend_from_slice(&planar(&f.output_picture()));
+    }
+    assert_eq!(md5::hex(&views[0]), VIEW0_MD5);
+    assert_eq!(md5::hex(&views[1]), VIEW1_MD5);
+}

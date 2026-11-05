@@ -9,6 +9,14 @@
 //! output-layer-set pair in [`EXPECTED_PASS`] must reproduce every row
 //! of its picture list (or every per-layer digest) byte-exact.
 //!
+//! `HYBRID_A` (an external base layer, F.8.1.8) is fed its staged
+//! reconstructed base layer through
+//! [`SequenceDecoder::set_external_base_layer`]. The one pair left out,
+//! `ALPHA_A_BBC_1` OLS 1, decodes both layers byte-exact (each is
+//! pinned through another output layer set) but its list outputs the
+//! primary layer next to the alpha auxiliary layer, which the
+//! F.7.4.3.1.1 `default_output_layer_idc == 1` derivation does not.
+//!
 //! Set `SHVC_SWEEP=1` to print the whole-corpus table instead of
 //! checking the pins only. When the staged corpus is not present (CI
 //! checks out this crate alone), the tests are no-ops.
@@ -20,7 +28,9 @@ use std::path::{Path, PathBuf};
 
 use fixture_bytes::md5;
 use oxideav_h265::picture::{Picture, Plane};
-use oxideav_h265::sequence::{DecodedFrame, LayerTarget, SequenceDecoder};
+use oxideav_h265::sequence::{
+    DecodedFrame, ExternalBasePicture, ExternalBaseRequest, LayerTarget, SequenceDecoder,
+};
 
 /// `(stream stem, output layer set)` pairs pinned byte-exact. An OLS of
 /// `None` pins the per-layer YUV digests under the default target.
@@ -72,10 +82,12 @@ const EXPECTED_PASS: &[(&str, Option<usize>)] = &[
     ("DPB_A_VIDYO_2", Some(1)),
     ("DPB_B_VIDYO_2", Some(0)),
     ("DPB_B_VIDYO_2", Some(1)),
+    ("HYBRID_A_QUALCOMM_1", Some(1)),
     ("INACTIVE_A_QCOM_1", Some(0)),
     ("INACTIVE_A_QCOM_1", Some(1)),
     ("INACTIVE_A_QCOM_1", Some(2)),
     ("INBLD_A_NOKIA_2", Some(4)),
+    ("LAYERID63_A_HHI_1", None),
     ("LAYERID_A_NOKIA_2", Some(0)),
     ("LAYERID_A_NOKIA_2", Some(1)),
     ("LAYERID_A_NOKIA_2", Some(2)),
@@ -114,6 +126,9 @@ const EXPECTED_PASS: &[(&str, Option<usize>)] = &[
     ("POC_A_Ericsson_1", Some(1)),
     ("POC_B_Ericsson_1", Some(0)),
     ("POC_B_Ericsson_1", Some(1)),
+    ("PPSSLIST_A_Sony_2", None),
+    ("PSEXT_A_VIDYO_2", Some(0)),
+    ("PSEXT_A_VIDYO_2", Some(1)),
     ("REFLAYER_A_VIDYO_2", Some(0)),
     ("REFLAYER_A_VIDYO_2", Some(1)),
     ("REFLAYER_A_VIDYO_2", Some(2)),
@@ -159,6 +174,7 @@ const EXPECTED_PASS: &[(&str, Option<usize>)] = &[
     ("SPLITFLAG_A_HHI_1", Some(0)),
     ("SPLITFLAG_A_HHI_1", Some(1)),
     ("SPSREPFMT_A_Sony_2", None),
+    ("SPSSLIST_A_Sony_2", None),
     ("SRATIOS_A_SAMSUNG_3", Some(0)),
     ("SRATIOS_A_SAMSUNG_3", Some(1)),
     ("SRATIOS_B_SAMSUNG_2", Some(0)),
@@ -168,6 +184,7 @@ const EXPECTED_PASS: &[(&str, Option<usize>)] = &[
     ("SREXT_B_FUJITSU_1", Some(0)),
     ("SREXT_B_FUJITSU_1", Some(1)),
     ("SREXT_C_FUJITSU_1", Some(0)),
+    ("SREXT_C_FUJITSU_1", Some(1)),
     ("SREXT_D_FUJITSU_1", Some(0)),
     ("SREXT_D_FUJITSU_1", Some(1)),
     ("SREXT_E_FUJITSU_1", Some(0)),
@@ -363,13 +380,68 @@ fn stream_path(dir: &Path, stem: &str) -> Option<PathBuf> {
 }
 
 /// Decode under `target`; returns the frames and the output layers.
-fn decode(data: &[u8], target: LayerTarget) -> Result<(Vec<DecodedFrame>, Vec<u8>), String> {
+/// The external base layer of a hybrid-scalability stream: the staged
+/// `<stem>_BaseLayerSequence.yuv.xz` (1280x720 4:2:0 8-bit, one frame
+/// per POC; decompressed with the `xz` tool — `None` when either is
+/// unavailable).
+fn external_base_frames(dir: &Path, stem: &str) -> Option<Vec<Picture>> {
+    const W: usize = 1280;
+    const H: usize = 720;
+    let path = dir.join(format!("{stem}_BaseLayerSequence.yuv.xz"));
+    if !path.is_file() {
+        return None;
+    }
+    let out = std::process::Command::new("xz")
+        .arg("-dc")
+        .arg(&path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let frame = W * H * 3 / 2;
+    let frames = out
+        .stdout
+        .chunks_exact(frame)
+        .map(|f| {
+            let mut pic = Picture::new(W, H, 1, 8, 8);
+            let (y, c) = f.split_at(W * H);
+            let (cb, cr) = c.split_at(W * H / 4);
+            for (plane, src) in [(Plane::Luma, y), (Plane::Cb, cb), (Plane::Cr, cr)] {
+                for (d, &v) in pic.plane_mut(plane).0.iter_mut().zip(src) {
+                    *d = u16::from(v);
+                }
+            }
+            pic
+        })
+        .collect();
+    Some(frames)
+}
+
+/// Decode under `target`; returns the frames and the output layers.
+fn decode_with_base(
+    data: &[u8],
+    target: LayerTarget,
+    base: Option<Vec<Picture>>,
+) -> Result<(Vec<DecodedFrame>, Vec<u8>), String> {
     let mut dec = SequenceDecoder::new();
     dec.set_layer_target(target);
+    if let Some(frames) = base {
+        dec.set_external_base_layer(move |req: &ExternalBaseRequest| {
+            usize::try_from(req.poc)
+                .ok()
+                .and_then(|i| frames.get(i))
+                .map(|p| ExternalBasePicture::new(p.clone()))
+        });
+    }
     dec.push_annexb(data).map_err(|e| e.to_string())?;
     let (_, output) = dec.layer_plan();
     let frames = dec.finish().map_err(|e| e.to_string())?;
     Ok((frames, output))
+}
+
+fn decode(data: &[u8], target: LayerTarget) -> Result<(Vec<DecodedFrame>, Vec<u8>), String> {
+    decode_with_base(data, target, None)
 }
 
 /// The outcome of one stream / OLS check.
@@ -529,7 +601,7 @@ fn run_one(dir: &Path, stem: &str, ols: Option<usize>) -> Outcome {
             let opl = opl_files(dir, stem);
             let (mut rows, log_form) =
                 parse_opl(&std::fs::read_to_string(&opl[&k]).expect("read opl"));
-            match decode(&data, LayerTarget::Ols(k)) {
+            match decode_with_base(&data, LayerTarget::Ols(k), external_base_frames(dir, stem)) {
                 Ok((frames, output_layers)) => {
                     if log_form {
                         // A decoder log lists every decoded picture:
