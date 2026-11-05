@@ -994,7 +994,9 @@ impl VpsExtension {
             .collect();
         if rep_format_idx_present_flag {
             let bits = ceil_log2(vps_num_rep_formats_minus1 + 1);
-            for i in usize::from(!base_internal)..num_layers {
+            // F.7.3.2.1.1: from 1 when the base layer is internal (its
+            // representation format is the base SPS's), else from 0.
+            for i in usize::from(base_internal)..num_layers {
                 let v = br.u(bits)?;
                 if v > vps_num_rep_formats_minus1 {
                     return Err(oor("vps_rep_format_idx", v));

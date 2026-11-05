@@ -23,13 +23,16 @@
 //!   (H-65 .. H-70), scaling the motion vectors by the region ratio
 //!   (H-74 .. H-79).
 //!
-//! The H.8.1.4.4 colour mapping process (colour-gamut scalability) is
-//! not implemented; a PPS enabling it for the reference layer is
-//! reported as unsupported by the driver.
+//! * H.8.1.4.4 maps the reference layer's samples through the PPS
+//!   colour mapping table (colour-gamut / bit-depth scalability) before
+//!   resampling: the F.7.4.3.3.6 octant residuals build the per-octant
+//!   linear models `LutY` / `LutCb` / `LutCr` (eqs F-50 / F-51), and
+//!   every sample is mapped by the model of the octant its co-located
+//!   (Y, Cb, Cr) triple falls in (eqs H-80 .. H-120).
 
 use crate::motion::{MotionCell, MotionField};
 use crate::picture::{Picture, Plane, sub_wh_c};
-use crate::pps::RefLocOffset;
+use crate::pps::{ColourMappingTable, RefLocOffset};
 
 /// Table H.1 — 16-phase luma resampling filter `fL[ p ][ x ]`.
 pub const LUMA_FILTER: [[i32; 8]; 16] = [
@@ -404,6 +407,247 @@ pub fn resample_picture(geom: &IlRefGeometry, rl: &Picture) -> Picture {
                 )
             };
             out.plane_mut(plane).0.copy_from_slice(&res);
+        }
+    }
+    out
+}
+
+/// The F.7.4.3.3.5 / F.7.4.3.3.6 colour mapping model of one PPS
+/// `colour_mapping_table( )`: the octant partition and the linear
+/// coefficients `LutY` / `LutCb` / `LutCr` (eq. F-51), each in units of
+/// 1/1024 for the three sample terms plus an additive offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColourMapping {
+    /// `cm_octant_depth`.
+    octant_depth: u32,
+    /// `OctantNumY` (eq. F-42).
+    octant_num_y: usize,
+    /// `OctantNumC` (eq. F-41).
+    octant_num_c: usize,
+    /// `BitDepthCmInputY` / `BitDepthCmInputC` (eqs F-44 / F-45).
+    bit_depth_in: (u8, u8),
+    /// `BitDepthCmOutputY` / `BitDepthCmOutputC` (eqs F-46 / F-47).
+    bit_depth_out: (u8, u8),
+    /// `yShift2Idx` (eq. H-80).
+    y_shift_idx: u32,
+    /// `cShift2Idx` (eq. H-81).
+    c_shift_idx: u32,
+    /// `CMThreshU` / `CMThreshV` (eqs F-48 / F-49).
+    thresh: (i32, i32),
+    /// `LutY`, `LutCb`, `LutCr`, each `[ idxY ][ idxCb ][ idxCr ][ j ]`
+    /// flattened as `((idxY * OctantNumC + idxCb) * OctantNumC + idxCr)`.
+    lut: [Vec<[i32; 4]>; 3],
+}
+
+impl ColourMapping {
+    /// Build the model of `table` (eqs F-41 .. F-51): the leaf residuals
+    /// it carries, every other octant's residual inferred 0, each
+    /// coefficient predicted from the octant one luma partition below
+    /// (the identity model at `idxY == 0`).
+    #[must_use]
+    pub fn new(table: &ColourMappingTable) -> Self {
+        let octant_depth = u32::from(table.cm_octant_depth);
+        let y_part_log2 = u32::from(table.cm_y_part_num_log2);
+        let octant_num_c = 1usize << octant_depth;
+        let octant_num_y = 1usize << (octant_depth + y_part_log2);
+        let bd_in_y = 8 + table.luma_bit_depth_cm_input_minus8 as u8;
+        let bd_in_c = 8 + table.chroma_bit_depth_cm_input_minus8 as u8;
+        let bd_out_y = 8 + table.luma_bit_depth_cm_output_minus8 as u8;
+        let bd_out_c = 8 + table.chroma_bit_depth_cm_output_minus8 as u8;
+        let n = octant_num_y * octant_num_c * octant_num_c;
+        let idx = |y: usize, cb: usize, cr: usize| (y * octant_num_c + cb) * octant_num_c + cr;
+        // cmResCoeff (eq. F-50), 0 where no leaf carries a residual.
+        let mut res = vec![[[0i32; 3]; 4]; n];
+        for cell in &table.cells {
+            let (y, cb, cr) = (
+                usize::from(cell.idx_y),
+                usize::from(cell.idx_cb),
+                usize::from(cell.idx_cr),
+            );
+            if y < octant_num_y && cb < octant_num_c && cr < octant_num_c {
+                res[idx(y, cb, cr)] = cell.res;
+            }
+        }
+        let mut lut = [vec![[0i32; 4]; n], vec![[0i32; 4]; n], vec![[0i32; 4]; n]];
+        for y in 0..octant_num_y {
+            for cb in 0..octant_num_c {
+                for cr in 0..octant_num_c {
+                    let k = idx(y, cb, cr);
+                    for (c, table_c) in lut.iter_mut().enumerate() {
+                        for j in 0..4 {
+                            // Eq. F-51: the identity row (1024 on the
+                            // component's own term) at idxY 0, else the
+                            // octant one luma partition below.
+                            let pred = if y == 0 {
+                                if j == c { 1024 } else { 0 }
+                            } else {
+                                table_c[idx(y - 1, cb, cr)][j]
+                            };
+                            table_c[k][j] = res[k][j][c] + pred;
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            octant_depth,
+            octant_num_y,
+            octant_num_c,
+            bit_depth_in: (bd_in_y, bd_in_c),
+            bit_depth_out: (bd_out_y, bd_out_c),
+            y_shift_idx: u32::from(bd_in_y).saturating_sub(octant_depth + y_part_log2),
+            c_shift_idx: u32::from(bd_in_c).saturating_sub(octant_depth),
+            thresh: (
+                table.cm_adapt_threshold_u_delta + (1 << (bd_in_c - 1)),
+                table.cm_adapt_threshold_v_delta + (1 << (bd_in_c - 1)),
+            ),
+            lut,
+        }
+    }
+
+    /// `BitDepthCmOutputY` / `BitDepthCmOutputC`.
+    #[must_use]
+    pub fn output_bit_depths(&self) -> (u8, u8) {
+        self.bit_depth_out
+    }
+
+    /// `BitDepthCmInputY` / `BitDepthCmInputC`.
+    #[must_use]
+    pub fn input_bit_depths(&self) -> (u8, u8) {
+        self.bit_depth_in
+    }
+
+    /// The flattened octant index of a (Y, Cb, Cr) triple — eqs H-105 ..
+    /// H-107 (and H-116 .. H-118): luma by `yShift2Idx`, chroma by the
+    /// adaptive thresholds at `cm_octant_depth == 1`, else by
+    /// `cShift2Idx`.
+    #[inline]
+    fn octant(&self, y: i32, cb: i32, cr: i32) -> usize {
+        let iy = ((y >> self.y_shift_idx) as usize).min(self.octant_num_y - 1);
+        let (icb, icr) = if self.octant_depth == 1 {
+            (
+                usize::from(cb >= self.thresh.0),
+                usize::from(cr >= self.thresh.1),
+            )
+        } else {
+            (
+                ((cb >> self.c_shift_idx) as usize).min(self.octant_num_c - 1),
+                ((cr >> self.c_shift_idx) as usize).min(self.octant_num_c - 1),
+            )
+        };
+        (iy * self.octant_num_c + icb) * self.octant_num_c + icr
+    }
+
+    /// Eqs H-108 / H-119 with the H-109 / H-120 clip: one linear model
+    /// applied to the sample triple.
+    #[inline]
+    fn apply(coef: &[i32; 4], y: i32, cb: i32, cr: i32, shift: u32, max: i32) -> u16 {
+        let offset = 1i64 << (shift - 1);
+        let v = ((i64::from(coef[0]) * i64::from(y)
+            + i64::from(coef[1]) * i64::from(cb)
+            + i64::from(coef[2]) * i64::from(cr)
+            + offset)
+            >> shift)
+            + i64::from(coef[3]);
+        v.clamp(0, i64::from(max)) as u16
+    }
+}
+
+/// H.8.1.4.4 — the colour mapped picture `cmPic` of `rl`: same size and
+/// chroma format, at the table's output bit depths. `rl` must carry
+/// chroma (the process reads all three components).
+#[must_use]
+pub fn colour_map_picture(cm: &ColourMapping, rl: &Picture) -> Picture {
+    let cat = rl.chroma_array_type();
+    let (w, h) = rl.plane_dims(Plane::Luma);
+    let (cw, ch) = rl.plane_dims(Plane::Cb);
+    let (sub_w, sub_h) = sub_wh_c(cat);
+    let (bd_out_y, bd_out_c) = cm.bit_depth_out;
+    let mut out = Picture::new(w, h, cat, bd_out_y, bd_out_c);
+    let src_y = rl.plane(Plane::Luma);
+    let src_cb = rl.plane(Plane::Cb);
+    let src_cr = rl.plane(Plane::Cr);
+    // Eqs H-82 / H-112 (the luma depths set both shifts).
+    let shift = (10 + i32::from(cm.bit_depth_in.0) - i32::from(bd_out_y)).max(1) as u32;
+    let max_y = (1i32 << bd_out_y) - 1;
+    let max_c = (1i32 << bd_out_c) - 1;
+    let cs = |p: &[u16], x: usize, y: usize| i32::from(p[y * cw + x]);
+    // H.8.1.4.4.2 — luma.
+    {
+        let (dst, stride) = out.plane_mut(Plane::Luma);
+        for yp in 0..h {
+            let ypc = yp / sub_h;
+            for xp in 0..w {
+                let xpc = xp / sub_w;
+                // Step 3: the chroma triple co-sited with the luma sample
+                // (eqs H-84 .. H-104).
+                let (t_cb, t_cr) = if sub_w == 2 && sub_h == 2 {
+                    let even_x = xp % 2 == 0;
+                    let even_y = yp % 2 == 0;
+                    if even_x {
+                        let yp2c = if even_y {
+                            ypc.saturating_sub(1)
+                        } else {
+                            (ypc + 1).min(ch - 1)
+                        };
+                        (
+                            (cs(src_cb, xpc, ypc) * 3 + cs(src_cb, xpc, yp2c) + 2) >> 2,
+                            (cs(src_cr, xpc, ypc) * 3 + cs(src_cr, xpc, yp2c) + 2) >> 2,
+                        )
+                    } else {
+                        let xp2c = (xpc + 1).min(cw - 1);
+                        let yp2c = if even_y {
+                            ypc.saturating_sub(1)
+                        } else {
+                            (ypc + 1).min(ch - 1)
+                        };
+                        let f = |p: &[u16]| {
+                            (cs(p, xpc, yp2c)
+                                + cs(p, xp2c, yp2c)
+                                + (cs(p, xpc, ypc) + cs(p, xp2c, ypc)) * 3
+                                + 4)
+                                >> 3
+                        };
+                        (f(src_cb), f(src_cr))
+                    }
+                } else if sub_w == 2 {
+                    if xp % 2 == 1 {
+                        let xp2c = (xpc + 1).min(cw - 1);
+                        (
+                            (cs(src_cb, xpc, ypc) + cs(src_cb, xp2c, ypc) + 1) >> 1,
+                            (cs(src_cr, xpc, ypc) + cs(src_cr, xp2c, ypc) + 1) >> 1,
+                        )
+                    } else {
+                        (cs(src_cb, xpc, ypc), cs(src_cr, xpc, ypc))
+                    }
+                } else {
+                    (cs(src_cb, xpc, ypc), cs(src_cr, xpc, ypc))
+                };
+                let yv = i32::from(src_y[yp * w + xp]);
+                let k = cm.octant(yv, t_cb, t_cr);
+                dst[yp * stride + xp] =
+                    ColourMapping::apply(&cm.lut[0][k], yv, t_cb, t_cr, shift, max_y);
+            }
+        }
+    }
+    // H.8.1.4.4.3 — chroma.
+    for (plane, c) in [(Plane::Cb, 1usize), (Plane::Cr, 2usize)] {
+        let (dst, stride) = out.plane_mut(plane);
+        for ypc in 0..ch {
+            for xpc in 0..cw {
+                let (xp, yp) = (xpc * sub_w, ypc * sub_h);
+                // Eqs H-114 / H-115.
+                let t_y = if sub_w == 2 && sub_h == 2 {
+                    let below = (yp + 1).min(h - 1);
+                    (i32::from(src_y[yp * w + xp]) + i32::from(src_y[below * w + xp]) + 1) >> 1
+                } else {
+                    i32::from(src_y[yp * w + xp])
+                };
+                let (cb, cr) = (cs(src_cb, xpc, ypc), cs(src_cr, xpc, ypc));
+                let k = cm.octant(t_y, cb, cr);
+                dst[ypc * stride + xpc] =
+                    ColourMapping::apply(&cm.lut[c][k], t_y, cb, cr, shift, max_c);
+            }
         }
     }
     out

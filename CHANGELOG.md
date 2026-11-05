@@ -26,8 +26,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   included) and treats the next IRAP picture as the first of the
   bitstream. The default trait reset drained the queue through
   `receive_frame` and left the decoder in its end-of-stream state.
+- *(decoder)* H.8.1.4.4 colour mapping (colour-gamut / bit-depth
+  scalability): the PPS `colour_mapping_table( )` octant residuals
+  build the eq. F-51 per-octant linear models and the reference layer
+  is mapped through them (eqs H-80 .. H-120) before the H.8.1.4.2
+  resampling. All nine official `CGS_*` conformance streams decode
+  byte-exact on both output layer sets.
+- *(tests)* `tests/shvc_conformance.rs`: the official SHVC
+  conformance set staged under `docs/video/h265/conformance/shvc/`
+  checked against each stream's per-OLS output picture lists (per
+  picture, per plane) or per-layer YUV digests; `SHVC_SWEEP=1` prints
+  the whole-corpus table. 154 of 162 stream / output-layer-set pairs
+  are pinned byte-exact.
 
 ### Fixed
+
+- *(decoder)* `vps_rep_format_idx[ i ]` is read from `i = 1` when the
+  base layer is internal (F.7.3.2.1.1): the extra bit read for layer 0
+  shifted every later VPS-extension field, so the dependency types
+  (and with them `VpsInterLayerMotionPredictionEnabled`) came out
+  wrong and the VPS VUI was lost — every SHVC stream with more than
+  one representation format mis-predicted its enhancement layer.
+- *(decoder)* the F-56 `NumPicTotalCurr` of an IDR picture counts its
+  inter-layer reference pictures: an enhancement-layer IDR predicting
+  from two reference layers signals `ref_pic_lists_modification( )`,
+  which was skipped.
+- *(decoder)* two inter-layer reference pictures of one access unit
+  (a picture predicting from two reference layers) are distinct
+  reference pictures for the merge / AMVP neighbour mapping, the
+  merge-candidate pruning and the deblocking reference test — they
+  shared the current POC and were confused.
 
 - *(decoder)* RASL pictures of a CRA picture with `NoRaslOutputFlag`
   1 (a stream that starts at a CRA, or the first CRA after a seek) are

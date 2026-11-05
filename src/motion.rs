@@ -913,6 +913,34 @@ fn mv16(mv: Mv) -> [i16; 2] {
     [mv[0] as i16, mv[1] as i16]
 }
 
+/// The reference-picture identity a [`MotionCell`] records for an
+/// inter-layer reference picture (F.8.3.4 / G.8.1.3 / H.8.1.3) derived
+/// from layer `nuh_layer_id`.
+///
+/// Every inter-layer reference picture of an access unit shares the
+/// current picture's `PicOrderCntVal`, so a POC alone cannot tell two of
+/// them apart — yet a picture predicting from two reference layers (or a
+/// motion-only and a sample-only one) holds both in its lists, and the
+/// §8.5.3.2.2 / §8.5.3.2.7 neighbour candidates, the §8.7.2.4
+/// "different reference pictures" test and the merge-candidate pruning
+/// all compare reference PICTURES. This identity is unique per
+/// reference layer and never a POC a conforming stream reaches; it only
+/// ever names a long-term reference (G.8.1.3 / H.8.1.3 mark every
+/// inter-layer reference "used for long-term reference"), so no POC
+/// distance is computed from it.
+#[inline]
+#[must_use]
+pub const fn inter_layer_ref_identity(nuh_layer_id: u8) -> i32 {
+    i32::MIN + 1 + nuh_layer_id as i32
+}
+
+/// `true` for an [`inter_layer_ref_identity`] value.
+#[inline]
+#[must_use]
+pub const fn is_inter_layer_ref_identity(identity: i32) -> bool {
+    identity > i32::MIN && identity <= i32::MIN + 64
+}
+
 /// One 4×4 block's motion / mode record in a [`MotionField`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MotionCell {

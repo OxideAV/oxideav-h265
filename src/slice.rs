@@ -2105,9 +2105,33 @@ impl SliceSegmentHeader {
                     }
                 }
                 ActiveShortTermRps::Empty => {
-                    // IDR or no RPS picked: `NumPicTotalCurr == 0`,
-                    // gate is statically false.
-                    (None, Some(0))
+                    // IDR or no RPS picked: no temporal term, but the
+                    // F-56 closing terms still count — an IDR of a
+                    // non-base layer predicting from two or more
+                    // inter-layer reference pictures signals
+                    // `ref_pic_lists_modification( )`.
+                    let mut inputs = NumPicTotalCurrInputs::from_used_flags(&[], &[], &[]);
+                    inputs.pps_curr_pic_ref_enabled_flag = pps
+                        .pps_scc_extension
+                        .as_ref()
+                        .is_some_and(|e| e.pps_curr_pic_ref_enabled_flag);
+                    inputs.nal_unit_type = nal_unit_type;
+                    inputs.num_active_ref_layer_pics = num_active_ref_layer_pics;
+                    inputs.multilayer_extension = layer.is_some();
+                    let npc = inputs.compute();
+                    if npc > 1 {
+                        let l0_active =
+                            num_ref_idx_l0_active_minus1.ok_or(SliceError::ValueOutOfRange {
+                                field: "num_ref_idx_l0_active_minus1",
+                                got: -1,
+                            })?;
+                        let l1_active = num_ref_idx_l1_active_minus1.unwrap_or(0);
+                        let rplm =
+                            RefPicListsModification::parse(&mut br, st, l0_active, l1_active, npc)?;
+                        (Some(rplm), Some(npc))
+                    } else {
+                        (None, Some(npc))
+                    }
                 }
                 ActiveShortTermRps::MaterializeFailed => {
                     // §7.4.8 derivation could not run (malformed

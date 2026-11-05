@@ -23,7 +23,10 @@ use crate::ctx_init::SliceContexts;
 use crate::decode::LayeredPictureInputs;
 use crate::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
 use crate::dpb::{DpbEntry, LongTermEntry, Marking, RefPicLists};
-use crate::ilref::{IlRefGeometry, LayerFormat, resample_motion, resample_picture};
+use crate::ilref::{
+    ColourMapping, IlRefGeometry, LayerFormat, colour_map_picture, resample_motion,
+    resample_picture,
+};
 use crate::inter_pred::WpListWeights;
 use crate::inter_recon::{
     InterSliceContext, PictureReconstructor, PlacedInterCtu, RefListAccess, SliceWpTables,
@@ -1061,16 +1064,12 @@ impl SequenceDecoder {
                 // temporary ilRefPic entry (removed after the picture).
                 let ml = pps.pps_multilayer_extension.as_ref();
                 let offsets = ml.and_then(|m| m.ref_loc_offset_for(ref_layer));
-                if ml.is_some_and(|m| {
-                    m.colour_mapping_enabled_flag
-                        && m.colour_mapping_table
-                            .as_ref()
-                            .is_some_and(|t| t.cm_ref_layer_id.contains(&ref_layer))
-                }) {
-                    return Err(SequenceError::Malformed(
-                        "inter-layer colour mapping (H.8.1.4.4) is not supported",
-                    ));
-                }
+                // H.8.1.4.1 currColourMappingEnableFlag: the PPS colour
+                // mapping table names this reference layer.
+                let colour_table = ml
+                    .filter(|m| m.colour_mapping_enabled_flag)
+                    .and_then(|m| m.colour_mapping_table.as_ref())
+                    .filter(|t| t.cm_ref_layer_id.contains(&ref_layer));
                 let cur_fmt = LayerFormat {
                     width: geom.width,
                     height: geom.height,
@@ -1078,22 +1077,38 @@ impl SequenceDecoder {
                     bit_depth_luma: sps.bit_depth_luma(),
                     bit_depth_chroma: sps.bit_depth_chroma(),
                 };
-                let il_geom =
-                    IlRefGeometry::derive(cur_fmt, LayerFormat::of(&entry.picture), offsets)
-                        .map_err(|_| {
-                            SequenceError::Malformed("inter-layer reference geometry is invalid")
-                        })?;
-                let slot = if il_geom.is_identity() {
+                let sample_pred = e.layers.sample_prediction_enabled(layer_id, ref_layer);
+                let motion_pred = e.layers.motion_prediction_enabled(layer_id, ref_layer);
+                // H.8.1.4.4: with colour mapping, the reference samples
+                // enter the resampling at the table's output bit depths.
+                let mapped = match colour_table {
+                    Some(t) if sample_pred => {
+                        if entry.picture.chroma_array_type() == 0 {
+                            return Err(SequenceError::Malformed(
+                                "inter-layer colour mapping of a monochrome reference layer",
+                            ));
+                        }
+                        let cm = ColourMapping::new(t);
+                        Some(colour_map_picture(&cm, &entry.picture))
+                    }
+                    _ => None,
+                };
+                let rl_fmt = LayerFormat::of(mapped.as_ref().unwrap_or(&entry.picture));
+                let il_geom = IlRefGeometry::derive(cur_fmt, rl_fmt, offsets).map_err(|_| {
+                    SequenceError::Malformed("inter-layer reference geometry is invalid")
+                })?;
+                let slot = if mapped.is_none() && il_geom.is_identity() {
                     il_marked.push((idx, entry.marking));
                     self.state.dpb_mut().set_marking(idx, Marking::LongTerm);
                     idx
                 } else {
-                    let sample_pred = e.layers.sample_prediction_enabled(layer_id, ref_layer);
-                    let motion_pred = e.layers.motion_prediction_enabled(layer_id, ref_layer);
-                    let picture = if sample_pred || !il_geom.equal_picture_size_and_offset() {
-                        resample_picture(&il_geom, &entry.picture)
+                    let src = mapped.as_ref().unwrap_or(&entry.picture);
+                    let picture = if il_geom.is_identity() {
+                        src.clone()
+                    } else if sample_pred || !il_geom.equal_picture_size_and_offset() {
+                        resample_picture(&il_geom, src)
                     } else {
-                        entry.picture.clone()
+                        src.clone()
                     };
                     let motion = if motion_pred && !il_geom.equal_picture_size_and_offset() {
                         std::sync::Arc::new(resample_motion(&il_geom, &entry.motion))

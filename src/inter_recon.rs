@@ -1063,11 +1063,21 @@ impl<'a> PictureReconstructor<'a> {
         // per the §8.3.1 "the current decoded picture is marked as used
         // for long-term reference" clause — reads as a long-term
         // reference.
+        // A reference sharing the current POC that is not the current
+        // picture is an inter-layer reference picture: it resolves to its
+        // layer's unique identity (`inter_layer_ref_identity`), so two
+        // reference layers of one access unit stay distinct pictures.
         let ref_poc = |list: usize, ref_idx: i32| {
             if refs.is_curr_pic(list, ref_idx) {
                 slice.curr_poc
             } else {
-                refs.ref_poc(list, ref_idx)
+                match refs.entry(list, ref_idx) {
+                    Some(e) if e.poc == slice.curr_poc => {
+                        crate::motion::inter_layer_ref_identity(e.layer_id)
+                    }
+                    Some(e) => e.poc,
+                    None => i32::MIN,
+                }
             }
         };
         let ref_long_term = |list: usize, ref_idx: i32| {
@@ -1081,13 +1091,14 @@ impl<'a> PictureReconstructor<'a> {
                 .is_some_and(|e| e.marking == crate::dpb::Marking::ShortTerm)
         };
         // A reference of the collocated picture whose POC equals the
-        // collocated picture's own POC is a same-access-unit reference:
-        // the Annex F/G/H inter-layer reference picture (marked "used for
-        // long-term reference", G.8.1.3) or the SCC current picture
-        // (§8.3.1 long-term) — both long-term for the §8.5.3.2.9 scaling
-        // gate.
+        // collocated picture's own POC is a same-access-unit reference
+        // (the SCC current picture, §8.3.1 long-term), and an
+        // inter-layer identity names an Annex F/G/H inter-layer reference
+        // picture (marked "used for long-term reference", G.8.1.3) —
+        // both long-term for the §8.5.3.2.9 scaling gate.
         let col_poc = slice.col_poc;
-        let col_ref_long_term = move |poc: i32| poc == col_poc;
+        let col_ref_long_term =
+            move |poc: i32| poc == col_poc || crate::motion::is_inter_layer_ref_identity(poc);
         let is_curr_pic = |list: usize, ref_idx: i32| refs.is_curr_pic(list, ref_idx);
         let mv_ctx = PuMvContext {
             curr_poc: slice.curr_poc,
