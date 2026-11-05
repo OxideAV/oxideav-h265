@@ -12,7 +12,9 @@
 mod fixture_bytes;
 
 use fixture_bytes::md5;
-use oxideav_core::{CodecParameters, Decoder, Error, Frame, Packet, TimeBase};
+use oxideav_core::{
+    CodecParameters, Decoder, Error, Frame, LayerIdentity, LayerInfo, Packet, TimeBase,
+};
 use oxideav_h265::nal::{NalUnit, collect_nal_units};
 use oxideav_h265::sequence::{LayerTarget, SequenceDecoder, decode_annexb_sequence};
 
@@ -181,17 +183,22 @@ fn layered_extradata_and_samples(stream: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
     (hvcc, samples)
 }
 
-fn collect_frames(dec: &mut Box<dyn Decoder>, samples: &[Vec<u8>]) -> Vec<Vec<u8>> {
+/// The frames a registry decoder emits: each one's layer identity and
+/// its image planes concatenated.
+fn collect_frames(
+    dec: &mut Box<dyn Decoder>,
+    samples: &[Vec<u8>],
+) -> Vec<(Option<LayerIdentity>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut take = |dec: &mut Box<dyn Decoder>| loop {
         match dec.receive_frame() {
             Ok(Frame::Video(v)) => {
                 assert_eq!(v.planes[0].stride, WIDTH);
                 let mut f = Vec::new();
-                for p in &v.planes {
+                for p in v.image_planes() {
                     f.extend_from_slice(&p.data);
                 }
-                out.push(f);
+                out.push((v.layer(), f));
             }
             Ok(_) => panic!("non-video frame"),
             Err(Error::NeedMore) | Err(Error::Eof) => break,
@@ -221,12 +228,40 @@ fn mvhevc_registry_hvcc_lhvc_extradata_emits_both_views() {
     let mut dec = oxideav_h265::make_decoder(&params).expect("decoder");
     let frames = collect_frames(&mut dec, &samples);
     assert_eq!(frames.len(), 6);
-    let v0: Vec<u8> = frames.iter().step_by(2).flatten().copied().collect();
+    // Every frame names its layer, view and access unit; the stream
+    // description lists both views, the second predicting from the base.
+    let au_of = |i: usize| frames[i].0.and_then(|id| id.access_unit);
+    for (i, (id, _)) in frames.iter().enumerate() {
+        let id = id.expect("layer identity");
+        assert_eq!(id.layer_id, (i % 2) as u16, "frame {i}");
+        assert_eq!(id.view_id, Some((i % 2) as u16), "frame {i}");
+        assert_eq!(
+            au_of(i),
+            au_of(i ^ 1),
+            "frame {i}: one access unit per pair"
+        );
+    }
+    let layers = dec.output_params().expect("output params").layers;
+    assert_eq!(
+        layers,
+        vec![
+            LayerInfo::new(0).with_view_id(0),
+            LayerInfo::new(1)
+                .with_view_id(1)
+                .with_depends_on(vec![0u16]),
+        ]
+    );
+    let v0: Vec<u8> = frames
+        .iter()
+        .step_by(2)
+        .flat_map(|(_, f)| f)
+        .copied()
+        .collect();
     let v1: Vec<u8> = frames
         .iter()
         .skip(1)
         .step_by(2)
-        .flatten()
+        .flat_map(|(_, f)| f)
         .copied()
         .collect();
     assert_eq!(md5::hex(&v0), VIEW0_MD5, "base view through the registry");
@@ -245,7 +280,7 @@ fn mvhevc_registry_hvcc_lhvc_extradata_emits_both_views() {
         let mut dec = oxideav_h265::make_decoder(&params).expect("decoder");
         let frames = collect_frames(&mut dec, &samples);
         assert_eq!(frames.len(), 3, "{key}={val}");
-        let all: Vec<u8> = frames.into_iter().flatten().collect();
+        let all: Vec<u8> = frames.into_iter().flat_map(|(_, f)| f).collect();
         assert_eq!(md5::hex(&all), want, "{key}={val}");
     }
     let mut params = CodecParameters::video("h265".into());

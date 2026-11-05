@@ -467,6 +467,19 @@ pub struct SequenceDecoder {
     external_base: Option<ExternalBaseSource>,
 }
 
+/// One layer of a multi-layer stream ([`SequenceDecoder::layer_structure`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LayerDescription {
+    /// `nuh_layer_id`.
+    pub layer_id: u8,
+    /// `ViewId[ nuh_layer_id ]` (F.7.4.3.1.1) for a multi-view stream's
+    /// primary layers; `None` otherwise.
+    pub view_id: Option<u16>,
+    /// `IdDirectRefLayer[ nuh_layer_id ]` — the layers it predicts from.
+    pub direct_ref_layers: Vec<u8>,
+}
+
 /// A base layer picture supplied by external means (F.8.1.8) for a
 /// bitstream whose VPS has `vps_base_layer_internal_flag == 0` (hybrid
 /// scalability: the base layer is coded by another codec, or delivered
@@ -566,6 +579,30 @@ impl SequenceDecoder {
         source: impl FnMut(&ExternalBaseRequest) -> Option<ExternalBasePicture> + Send + 'static,
     ) {
         self.external_base = Some(ExternalBaseSource(Box::new(source)));
+    }
+
+    /// The layer structure of a multi-layer stream once its VPS is
+    /// known: per VPS layer (`layer_id_in_nuh` order) its `nuh_layer_id`,
+    /// its `ViewId` when the stream is multi-view (and the layer is not
+    /// an auxiliary one), and its direct reference layers
+    /// (`IdDirectRefLayer`). `None` for a single-layer stream.
+    #[must_use]
+    pub fn layer_structure(&self) -> Option<Vec<LayerDescription>> {
+        let ext = self.active_vps()?.extension.as_ref()?;
+        let m = &ext.layers;
+        if m.layer_id_in_nuh.len() < 2 {
+            return None;
+        }
+        Some(
+            m.layer_id_in_nuh
+                .iter()
+                .map(|&id| LayerDescription {
+                    layer_id: id,
+                    view_id: (m.num_views > 1 && m.aux_id(id) == 0).then(|| m.view_id_of(id)),
+                    direct_ref_layers: m.direct_ref_layers(id).to_vec(),
+                })
+                .collect(),
+        )
     }
 
     /// The layers this decoder decodes / outputs once a VPS has been

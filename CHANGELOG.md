@@ -46,6 +46,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   0; the picture enters the access unit at the enhancement POC as a
   long-term reference and is resampled like an internal one.
   `HYBRID_A` decodes byte-exact from its staged base layer.
+- *(decoder)* multi-layer streams through the registry: every output
+  `VideoFrame` carries its `LayerIdentity` (`nuh_layer_id`, `ViewId`
+  for a multi-view stream, access-unit index) and `output_params`
+  lists the VPS layers as `CodecParameters::layers` (view, direct
+  reference layers); `SequenceDecoder::layer_structure` answers the
+  same on the direct API.
 - *(decoder)* F.7.4.3.2.1 / F.7.4.3.3.1 scaling list inference
   (`sps_infer_scaling_list_flag` / `pps_infer_scaling_list_flag`): the
   scaling lists of the SPS / PPS active for the named reference layer.

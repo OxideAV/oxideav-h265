@@ -19,7 +19,8 @@ use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Decoder, Error, Frame, LayerIdentity, LayerInfo, Packet, Result,
+    VideoFrame, VideoPlane,
 };
 
 use crate::hvcc::{
@@ -192,6 +193,7 @@ impl H265Decoder {
                 .map_or(DEFAULT_REORDER, |n| n as usize)
                 * layers_out
         };
+        let layers = self.seq.layer_structure();
         while self.reorder.len() > depth {
             let f = self.reorder.remove(0);
             if !f.output {
@@ -218,8 +220,22 @@ impl H265Decoder {
                 ),
                 traits: self.seq.frame_traits(f.cvs_index, f.layer_id),
             };
-            self.ready
-                .push_back((Frame::Video(video_frame_owned(picture, pts)), shape));
+            let mut frame = video_frame_owned(picture, pts);
+            if let Some(structure) = &layers {
+                // A multi-layer stream: every frame names its layer, view
+                // and access unit (the per-frame identity pairing with
+                // the `CodecParameters::layers` description).
+                let mut id = LayerIdentity::new(u16::from(f.layer_id)).with_access_unit(f.au_index);
+                if let Some(v) = structure
+                    .iter()
+                    .find(|l| l.layer_id == f.layer_id)
+                    .and_then(|l| l.view_id)
+                {
+                    id = id.with_view_id(v);
+                }
+                frame.set_layer(id);
+            }
+            self.ready.push_back((Frame::Video(frame), shape));
         }
         // Coded video sequences no queued picture belongs to any more
         // keep no output traits.
@@ -298,7 +314,26 @@ impl Decoder for H265Decoder {
 
     fn output_params(&self) -> Option<CodecParameters> {
         let shape = self.emitted_shape.or_else(|| self.announced_shape())?;
-        Some(shape.to_params(&self.codec_id))
+        let mut params = shape.to_params(&self.codec_id);
+        // A multi-layer stream: its layer structure from the VPS.
+        if let Some(structure) = self.seq.layer_structure() {
+            params.layers = structure
+                .into_iter()
+                .map(|l| {
+                    let info = LayerInfo::new(u16::from(l.layer_id)).with_depends_on(
+                        l.direct_ref_layers
+                            .iter()
+                            .map(|&r| u16::from(r))
+                            .collect::<Vec<_>>(),
+                    );
+                    match l.view_id {
+                        Some(v) => info.with_view_id(v),
+                        None => info,
+                    }
+                })
+                .collect();
+        }
+        Some(params)
     }
 
     fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {

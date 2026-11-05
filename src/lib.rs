@@ -459,8 +459,8 @@ pub use scan::{
     ScanIdx, ScanOrderError, ScanPos, horizontal, scan_order, traverse, up_right_diagonal, vertical,
 };
 pub use sequence::{
-    DecodedFrame, ExternalBasePicture, ExternalBaseRequest, SequenceDecoder, SequenceError,
-    decode_annexb_sequence,
+    DecodedFrame, ExternalBasePicture, ExternalBaseRequest, LayerDescription, SequenceDecoder,
+    SequenceError, decode_annexb_sequence,
 };
 pub use slice::SliceError;
 // internal — exposed for tests/fuzz; not part of the stable API

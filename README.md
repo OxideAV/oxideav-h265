@@ -33,7 +33,11 @@ cross-component-prediction anchors (`CCP_{8,10,12}bit`), `QMATRIX_A`,
 unequal luma/chroma depths (`Bitdepth_A/B`), `SAO_A_RExt`, and
 `ExplicitRdpcm_A`. All 15 official SCC bitstreams parse end to end
 (round 444 §7.3.8.10 ACT-gate fix); their reconstruction is not yet
-byte-exact. Coverage:
+byte-exact. The complete official **SHVC (Annex H scalable)
+conformance set** — 70 streams, spatial / SNR / colour-gamut /
+hybrid scalability — decodes every layer byte-exact, 161 of 162
+stream / output-layer-set pairs (round 481, `tests/shvc_conformance.rs`).
+Coverage:
 
 * intra pictures at every staged geometry / CTB size (16 / 32 / 64)
   and QP extreme (slice QP 1 and 45), with SAO on and off;
@@ -157,13 +161,29 @@ byte-exact. Coverage:
   inter-view references through `ref_pic_lists_modification( )`)
   decode **byte-exact against a black-box reference decoder**, on the
   Annex B path and through the registry with `hvcC` + `lhvC`
-  extradata (`tests/multilayer.rs`). **Annex H SHVC**: the H.8.1.4
-  inter-layer reference derivation — spatial resampling (Tables H.1 /
-  H.2, 16-phase 8-tap luma / 4-tap chroma), bit-depth / chroma-format
-  promotion and motion-field resampling — pinned by a self-built
-  two-layer spatial-scalability stream whose enhancement picture
-  decodes to exactly the resampled base (no third-party SHVC producer
-  exists on this machine, so that path is self-consistency-validated).
+  extradata (`tests/multilayer.rs`). **Annex H SHVC** (round 481):
+  the H.8.1.4 inter-layer reference derivation in full — spatial
+  resampling (Tables H.1 / H.2, 16-phase 8-tap luma / 4-tap chroma,
+  reference-region and scaled offsets, resampling phases), bit-depth /
+  chroma-format promotion, motion-field resampling, and the H.8.1.4.4
+  **colour mapping** of colour-gamut scalability (the octant tables of
+  eqs F-50 / F-51) — plus external base layers (F.8.1.8), the
+  F.7.4.3.2.1 / F.7.4.3.3.1 scaling list inference and several
+  inter-layer reference pictures per picture. Against the **complete
+  official SHVC conformance set** (`docs/video/h265/conformance/shvc/`,
+  70 streams, checked per output picture and plane against each
+  output layer set's picture list) **161 of 162 stream / output layer
+  set pairs decode byte-exact** (`tests/shvc_conformance.rs`):
+
+  | group | streams | result |
+  |---|---|---|
+  | spatial scalability (`SRATIOS`, `SCREFOFF`, `REFREGOFF`, `RESPHASE`, `CONFCROP`, `ADAPTRES`, `RESCHANGE`, `REPFMT`, `SPSREPFMT`) | 14 | all layers, all OLS byte-exact |
+  | SNR / bit-depth / range-extension scalability (`SNR`, `SREXT_A..F` incl. 16-bit monochrome and 4:4:4) | 9 | byte-exact |
+  | colour-gamut scalability (`CGS_A..I`, 8 / 10-bit, with and without spatial scaling) | 9 | byte-exact |
+  | layer structure (`8LAYERS`, `LAYERID`, `LAYERID63`, `MAXTID`, `REFLAYER`, `MVD`, `INACTIVE`, `OLS`, `SPLITFLAG`, `DPB`, `SLLEV`, `POC`, `DISFLAG`, `SIM`, `INBLD`) | 26 | byte-exact |
+  | VPS / parameter-set syntax (`VUI`, `NONVUI`, `PSEXT`, `PPSSLIST`, `SPSSLIST`) | 9 | byte-exact |
+  | hybrid scalability (`HYBRID_A`, base layer supplied externally) | 1 | byte-exact |
+  | auxiliary layers (`ALPHA_A`, `DEPTH_A`) | 2 | every layer byte-exact; `ALPHA_A` OLS 1 lists the primary layer as an output next to the alpha layer, which the `default_output_layer_idc` derivation does not select |
 
 **Encoder: recursive coding-quadtree I/P/B coding at CTB 16/32/64
 with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop
@@ -520,7 +540,12 @@ frame.
   highest output layer set is decoded with every output layer emitted
   — the frames of one access unit consecutively, base view first
   (`DecodedFrame::layer_id` / `view_id` / `au_index` on the direct
-  API; the core `VideoFrame` carries no layer tag yet).
+  API; through the registry each `VideoFrame` carries its
+  `LayerIdentity` — layer, view, access unit — and `output_params`
+  lists the stream's layers as `CodecParameters::layers` with their
+  views and reference layers). A stream with an external base layer
+  (`vps_base_layer_internal_flag` 0, F.8.1.8 hybrid scalability) takes
+  its base pictures from `SequenceDecoder::set_external_base_layer`.
 * **Hostile input never panics** (round 474, from a crash a HEIF
   container fuzzer handed this crate): the §9.3.3.3 Exp-Golomb reader
   reports a runaway prefix or a value past `u32` as
@@ -600,13 +625,14 @@ and ~985 unit tests.
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
   path covers that geometry.)
-* Multi-layer corners: Annex H colour-gamut scalability (the
-  H.8.1.4.4 colour mapping process) is parsed but refused at decode;
-  Annex I 3D-HEVC (depth / `sps_3d_extension( )`) stays opaque;
-  `alt_output_layer_flag` and the independent non-base layer rewriting
-  process (F.10.2) are not applied; the SHVC resampling path and the
-  `poc_reset_*` machinery have no black-box oracle on this machine
-  (only the MV-HEVC path is validated against a reference decoder).
+* Multi-layer corners: Annex I 3D-HEVC (depth /
+  `sps_3d_extension( )`) stays opaque; `alt_output_layer_flag` and the
+  independent non-base layer rewriting process (F.10.2) are not
+  applied; an auxiliary layer is output only when the output layer
+  set selects it. `output_params` describes the frame returned last,
+  so an SHVC stream whose output layers differ in size moves its
+  generation at every layer switch (core 0.1.42's `LayerInfo` carries
+  no per-layer format).
 * 16-bit grey is PCM-only (the 16-bit RExt rows need the
   extended-precision tools); the lossy coders take 8..=12-bit
   samples. An odd-sized 4:2:0 / 4:2:2 picture crops to its even
