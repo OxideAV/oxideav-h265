@@ -532,6 +532,16 @@ frame.
   re-attachment, flush-then-`Eof`); frames in, IDR keyframe packets
   out (`mode = "pcm"` lossless or `mode = "intra"` at a chosen QP).
   `make_decoder` / `make_encoder` are the direct factory endpoints.
+  The output description (`output_params`: conformance-cropped size,
+  pixel format, VUI frame rate / colour signal) is answered from the
+  parameter sets before the first frame; a new active SPS that changes
+  it is announced by one `Frame::StreamParams` event right before the
+  first frame of the new shape (old-shape frames still in the reorder
+  queue come out first), with `output_params_generation` moving by one
+  at the event — none for the first shape or for a new SPS of the same
+  shape, the same rule after `reset()` and while draining after
+  `flush()`. The encoder rejects the event (`Unsupported`): its SPS is
+  fixed at construction.
   Multi-layer streams: the extradata may be an `hvcC` record followed
   by an `lhvC` record (the non-base layers' parameter sets — what a
   layered HEIF `lhv1` item carries); the decoder options `layer=<id>`
@@ -543,7 +553,13 @@ frame.
   API; through the registry each `VideoFrame` carries its
   `LayerIdentity` — layer, view, access unit — and `output_params`
   lists the stream's layers as `CodecParameters::layers` with their
-  views and reference layers). A stream with an external base layer
+  views and reference layers). The width / height / pixel format
+  `output_params` states for a multi-layer stream are those of its
+  **highest output layer** (the highest `nuh_layer_id` the target
+  output layer set outputs — the layer selected by `layer=` / `view=`
+  when one is); frames of a lower output layer keep their own plane
+  geometry, and alternating between layers inside an access unit
+  sequence is not a change. A stream with an external base layer
   (`vps_base_layer_internal_flag` 0, F.8.1.8 hybrid scalability) takes
   its base pictures from `SequenceDecoder::set_external_base_layer`.
 * **Hostile input never panics** (round 474, from a crash a HEIF
@@ -629,10 +645,10 @@ and ~985 unit tests.
   `sps_3d_extension( )`) stays opaque; `alt_output_layer_flag` and the
   independent non-base layer rewriting process (F.10.2) are not
   applied; an auxiliary layer is output only when the output layer
-  set selects it. `output_params` describes the frame returned last,
-  so an SHVC stream whose output layers differ in size moves its
-  generation at every layer switch (core 0.1.42's `LayerInfo` carries
-  no per-layer format).
+  set selects it. A lower output layer's size / format is not stated
+  anywhere at the stream level (core's `LayerInfo` carries no
+  per-layer shape): `output_params` describes the highest output
+  layer only.
 * 16-bit grey is PCM-only (the 16-bit RExt rows need the
   extended-precision tools); the lossy coders take 8..=12-bit
   samples. An odd-sized 4:2:0 / 4:2:2 picture crops to its even

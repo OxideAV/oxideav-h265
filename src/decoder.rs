@@ -41,9 +41,8 @@ pub struct H265Decoder {
     /// Decoded pictures not yet emitted, sorted on demand by
     /// `(cvs_index, poc)`.
     reorder: Vec<DecodedFrame>,
-    /// Frames ready to hand out, each with the description
-    /// `output_params` answers once it has been returned.
-    ready: VecDeque<(Frame, OutShape)>,
+    /// Frames ready to hand out, in output order.
+    ready: VecDeque<Ready>,
     /// Min-heap of packet PTS values, re-attached in output order.
     pts_queue: BinaryHeap<std::cmp::Reverse<i64>>,
     /// `Some(n)` when the extradata was an `hvcC` record: packets are
@@ -52,11 +51,31 @@ pub struct H265Decoder {
     /// `None` for Annex B packets.
     nal_length_size: Option<usize>,
     flushed: bool,
-    /// The description of the frame `receive_frame` returned last.
-    emitted_shape: Option<OutShape>,
-    /// `Decoder::output_params_generation` — bumped when a returned
-    /// frame's description differs from the previous frame's.
+    /// The description `output_params` answers: that of the last
+    /// shape-bearing frame `receive_frame` returned (or announced with
+    /// a `Frame::StreamParams` event).
+    emitted: Option<OutDesc>,
+    /// `Decoder::output_params_generation` — bumped, together with a
+    /// `Frame::StreamParams` event, when the next shape-bearing frame's
+    /// description differs from `emitted`.
     params_generation: u64,
+}
+
+/// What `output_params` states about the frames: the picture shape
+/// plus, for a multi-layer stream, the layer structure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutDesc {
+    shape: OutShape,
+    layers: Vec<LayerInfo>,
+}
+
+/// One frame waiting in output order.
+struct Ready {
+    frame: Frame,
+    /// `Some` for a *shape-bearing* frame — every frame of a
+    /// single-layer stream; of a multi-layer stream, the frames of the
+    /// highest output layer (the layer `output_params` describes).
+    desc: Option<OutDesc>,
 }
 
 impl std::fmt::Debug for H265Decoder {
@@ -89,6 +108,18 @@ impl std::fmt::Debug for H265Decoder {
 /// every one of its output layers is emitted — the frames of one access
 /// unit come out consecutively in increasing `nuh_layer_id` order (the
 /// base view first, then the second view).
+///
+/// Output description: `output_params` answers from the parameter sets
+/// before the first frame, then describes the frames returned. A new
+/// active SPS (or VPS layer structure) that changes it is announced by
+/// one [`Frame::StreamParams`] event immediately before the first
+/// frame of the new shape — frames of the old shape still queued for
+/// reordering come out first — and `output_params_generation` moves by
+/// one at that event. For a multi-layer stream the description is that
+/// of the **highest output layer** (the highest `nuh_layer_id` the
+/// target output layer set outputs); frames of lower output layers keep
+/// their own plane geometry and never move the generation, since
+/// `CodecParameters` states one picture shape per stream.
 ///
 /// # Errors
 /// [`Error::InvalidData`] when the `extradata` or an option fails to
@@ -162,7 +193,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         pts_queue: BinaryHeap::new(),
         nal_length_size,
         flushed: false,
-        emitted_shape: None,
+        emitted: None,
         params_generation: 0,
     }))
 }
@@ -194,6 +225,10 @@ impl H265Decoder {
                 * layers_out
         };
         let layers = self.seq.layer_structure();
+        // The layer `output_params` describes: the highest output layer
+        // of the decoded layer plan (layer 0 for a single-layer stream).
+        let described_layer = self.seq.layer_plan().1.into_iter().max().unwrap_or(0);
+        let layer_infos = layers.as_ref().map(|l| layer_infos(l)).unwrap_or_default();
         while self.reorder.len() > depth {
             let f = self.reorder.remove(0);
             if !f.output {
@@ -235,7 +270,14 @@ impl H265Decoder {
                 }
                 frame.set_layer(id);
             }
-            self.ready.push_back((Frame::Video(frame), shape));
+            let desc = (f.layer_id == described_layer).then(|| OutDesc {
+                shape,
+                layers: layer_infos.clone(),
+            });
+            self.ready.push_back(Ready {
+                frame: Frame::Video(frame),
+                desc,
+            });
         }
         // Coded video sequences no queued picture belongs to any more
         // keep no output traits.
@@ -244,26 +286,61 @@ impl H265Decoder {
         }
     }
 
-    /// The description of the output before the first frame: the next
-    /// frame released, else the next decoded picture, else the
-    /// parameter sets.
-    fn announced_shape(&self) -> Option<OutShape> {
-        if let Some((_, shape)) = self.ready.front() {
-            return Some(*shape);
+    /// The description of the output before the first shape-bearing
+    /// frame: the next one released, else the parameter sets.
+    fn announced(&self) -> Option<OutDesc> {
+        if let Some(d) = self.ready.iter().find_map(|r| r.desc.as_ref()) {
+            return Some(d.clone());
         }
-        self.seq.announced_shape()
+        let shape = self.seq.announced_shape()?;
+        let layers = self
+            .seq
+            .layer_structure()
+            .map(|l| layer_infos(&l))
+            .unwrap_or_default();
+        Some(OutDesc { shape, layers })
     }
 
-    /// Publish the description of a frame being returned: the
-    /// generation changes exactly when it differs from the previous
-    /// frame's.
-    fn emit(&mut self, (frame, shape): (Frame, OutShape)) -> Frame {
-        if self.emitted_shape.is_some_and(|prev| prev != shape) {
-            self.params_generation = self.params_generation.wrapping_add(1);
+    /// The next item of `receive_frame`: the next ready frame, or — when
+    /// it is the first shape-bearing frame of a new description — the
+    /// `Frame::StreamParams` event announcing it (the frame itself stays
+    /// queued and comes out on the next call). The description and the
+    /// generation move together, exactly when the event is returned;
+    /// the first description resolves silently.
+    fn next_ready(&mut self) -> Option<Frame> {
+        let front = self.ready.front()?;
+        if let Some(desc) = &front.desc
+            && self.emitted.as_ref() != Some(desc)
+        {
+            let first = self.emitted.is_none();
+            self.emitted = Some(desc.clone());
+            if !first {
+                self.params_generation = self.params_generation.wrapping_add(1);
+                let params = self.output_params().expect("a description was just set");
+                return Some(Frame::StreamParams(Box::new(params)));
+            }
         }
-        self.emitted_shape = Some(shape);
-        frame
+        self.ready.pop_front().map(|r| r.frame)
     }
+}
+
+/// The `CodecParameters::layers` description of a VPS layer structure.
+fn layer_infos(structure: &[crate::sequence::LayerDescription]) -> Vec<LayerInfo> {
+    structure
+        .iter()
+        .map(|l| {
+            let info = LayerInfo::new(u16::from(l.layer_id)).with_depends_on(
+                l.direct_ref_layers
+                    .iter()
+                    .map(|&r| u16::from(r))
+                    .collect::<Vec<_>>(),
+            );
+            match l.view_id {
+                Some(v) => info.with_view_id(v),
+                None => info,
+            }
+        })
+        .collect()
 }
 
 impl Decoder for H265Decoder {
@@ -297,14 +374,14 @@ impl Decoder for H265Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.ready.pop_front() {
-            return Ok(self.emit(f));
+        if let Some(f) = self.next_ready() {
+            return Ok(f);
         }
         if self.flushed {
             if !self.reorder.is_empty() {
                 self.drain(true);
-                if let Some(f) = self.ready.pop_front() {
-                    return Ok(self.emit(f));
+                if let Some(f) = self.next_ready() {
+                    return Ok(f);
                 }
             }
             return Err(Error::Eof);
@@ -313,26 +390,13 @@ impl Decoder for H265Decoder {
     }
 
     fn output_params(&self) -> Option<CodecParameters> {
-        let shape = self.emitted_shape.or_else(|| self.announced_shape())?;
-        let mut params = shape.to_params(&self.codec_id);
+        let desc = match &self.emitted {
+            Some(d) => d.clone(),
+            None => self.announced()?,
+        };
+        let mut params = desc.shape.to_params(&self.codec_id);
         // A multi-layer stream: its layer structure from the VPS.
-        if let Some(structure) = self.seq.layer_structure() {
-            params.layers = structure
-                .into_iter()
-                .map(|l| {
-                    let info = LayerInfo::new(u16::from(l.layer_id)).with_depends_on(
-                        l.direct_ref_layers
-                            .iter()
-                            .map(|&r| u16::from(r))
-                            .collect::<Vec<_>>(),
-                    );
-                    match l.view_id {
-                        Some(v) => info.with_view_id(v),
-                        None => info,
-                    }
-                })
-                .collect();
-        }
+        params.layers = desc.layers;
         Some(params)
     }
 
@@ -352,9 +416,10 @@ impl Decoder for H265Decoder {
 
     fn reset(&mut self) -> Result<()> {
         // A seek: nothing decoded before it is output. The description
-        // of the last returned frame stays until a frame of the new
-        // position is returned (the generation moves only then, and
-        // only if the shape differs).
+        // of the last returned frame stays until the first frame of the
+        // new position is about to be returned (the generation moves,
+        // with a `Frame::StreamParams` event, only then and only if the
+        // description differs).
         self.seq.reset_stream();
         self.reorder.clear();
         self.ready.clear();

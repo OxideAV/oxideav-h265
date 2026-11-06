@@ -1409,6 +1409,14 @@ impl Encoder for H265Encoder {
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let v = match frame {
             Frame::Video(v) => v,
+            // A mid-stream input-shape change: the SPS (size, chroma
+            // format, bit depth) is fixed at construction, so the
+            // encoder cannot re-configure.
+            Frame::StreamParams(_) => {
+                return Err(Error::unsupported(
+                    "h265 encode: mid-stream input shape change (Frame::StreamParams)",
+                ));
+            }
             _ => return Err(Error::InvalidData("h265 encode: video frames only".into())),
         };
         self.refine_video_signal(v);

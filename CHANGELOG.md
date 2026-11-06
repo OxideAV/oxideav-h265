@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- *(decoder)* In-band `Frame::StreamParams` events (oxideav-core
+  0.1.43): a new active SPS that changes the output description
+  (conformance-cropped size, chroma format, bit depth, VUI frame rate /
+  colour signal) or a new VPS layer structure is announced by one event
+  immediately before the first frame of the new shape, carrying exactly
+  what `output_params()` then answers; `output_params_generation()`
+  moves by one at the event, never for the first shape and never for a
+  new SPS of the same shape. Frames of the old shape still in the
+  reorder queue are returned first. Same rule after `reset()` (with
+  RASL pictures skipped at the seek point) and while draining after
+  `flush()`. Gated on a seven-segment black-box libx265 splice
+  (`tests/fixtures/stream_params/`, `gen.sh`) — five events at the
+  five real changes, every frame byte-exact against its segment's
+  black-box decode — one NAL per packet and whole-stream, at 1 / 2 / 4
+  / 8 worker threads.
+- *(encoder)* `send_frame(Frame::StreamParams)` answers
+  `Error::Unsupported` (the SPS is fixed at construction).
+
 - *(decoder)* `Decoder::output_params` / `output_params_generation`
   (oxideav-core 0.1.42), with `output_pixel_format` forwarded to it:
   the conformance-cropped width / height, pixel format (8 / 10 / 12 /
@@ -55,6 +73,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - *(decoder)* F.7.4.3.2.1 / F.7.4.3.3.1 scaling list inference
   (`sps_infer_scaling_list_flag` / `pps_infer_scaling_list_flag`): the
   scaling lists of the SPS / PPS active for the named reference layer.
+
+### Changed
+
+- *(decoder)* Multi-layer streams: `output_params` describes the
+  **highest output layer** of the target output layer set (the layer
+  `layer=` / `view=` selects, when given); frames of lower output layers
+  keep their own geometry and no longer move the generation. An SHVC
+  stream whose output layers differ in size previously bumped the
+  generation at every layer switch inside each access unit; 38 of the
+  234 official MV-HEVC / SHVC stream / output-layer-set pairs output
+  differently shaped layers, and all 234 now decode with no event.
 
 ### Fixed
 

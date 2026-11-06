@@ -16,7 +16,8 @@
 //!   transfer / matrix and range, r_frame_rate);
 //! * a stream whose second coded video sequence changes size and bit
 //!   depth bumps the generation exactly once, at the first frame of the
-//!   new shape;
+//!   new shape (with the `Frame::StreamParams` event right before it —
+//!   `tests/stream_params.rs` gates the event itself);
 //! * the answers and generations after every frame are identical with
 //!   1 and 8 worker threads.
 
@@ -224,13 +225,21 @@ fn descs(t: &Trace) -> Vec<(Desc, u64)> {
     t.iter().map(|(p, g)| (Desc::of(p), *g)).collect()
 }
 
-fn drain(dec: &mut dyn Decoder, trace: &mut Trace, tag: &str) {
+/// Pull every frame, skipping `StreamParams` events; checks each
+/// frame's geometry against the answer unless `described_layer` names
+/// another layer (a multi-layer stream describes one).
+fn drain_layers(dec: &mut dyn Decoder, trace: &mut Trace, tag: &str, described_layer: Option<u16>) {
     while let Ok(f) = dec.receive_frame() {
+        if f.is_stream_params() {
+            continue;
+        }
         let Frame::Video(vf) = f else {
             panic!("{tag}: non-video frame")
         };
         let p = dec.output_params().expect("answer after a frame");
-        assert_frame_matches(&vf, &p, tag);
+        if described_layer.is_none_or(|l| vf.layer().map_or(0, |id| id.layer_id) == l) {
+            assert_frame_matches(&vf, &p, tag);
+        }
         assert_eq!(
             dec.output_pixel_format(),
             p.pixel_format,
@@ -238,6 +247,10 @@ fn drain(dec: &mut dyn Decoder, trace: &mut Trace, tag: &str) {
         );
         trace.push((p, dec.output_params_generation()));
     }
+}
+
+fn drain(dec: &mut dyn Decoder, trace: &mut Trace, tag: &str) {
+    drain_layers(dec, trace, tag, None);
 }
 
 /// Decode an Annex B stream one NAL per packet, draining after each.
@@ -389,12 +402,14 @@ fn generation_bumps_exactly_at_the_first_frame_of_the_new_shape() {
     assert_eq!((stream.width, stream.height), (Some(64), Some(48)));
     let mut changes = Vec::new();
     let mut n = 0;
-    while let Ok(Frame::Video(vf)) = dec.receive_frame() {
+    while let Ok(f) = dec.receive_frame() {
         if watch.observe(&*dec, &mut stream) {
             changes.push(n);
         }
-        assert_frame_matches(&vf, &stream, "watched stream");
-        n += 1;
+        if let Frame::Video(vf) = f {
+            assert_frame_matches(&vf, &stream, "watched stream");
+            n += 1;
+        }
     }
     assert_eq!(n, 10);
     assert_eq!(changes, vec![5], "one change, at frame 5");
@@ -404,8 +419,9 @@ fn generation_bumps_exactly_at_the_first_frame_of_the_new_shape() {
 /// the views of an MV-HEVC stream share one description — the
 /// enhancement layer's SPS carries no VUI and takes the base layer's
 /// timing / colour — so the generation never moves; a spatially
-/// scalable stream that outputs both layers re-states the size at each
-/// frame of the other layer.
+/// scalable stream that outputs both layers is described by its highest
+/// output layer (64 wide) from the first frame on, and the switch
+/// between its layers is not a change.
 #[test]
 fn multi_layer_output_descriptions() {
     let read = |n: &str| {
@@ -419,7 +435,7 @@ fn multi_layer_output_descriptions() {
             .expect("send");
         dec.flush().expect("flush");
         let mut trace = Vec::new();
-        drain(&mut *dec, &mut trace, "multi-layer");
+        drain_layers(&mut *dec, &mut trace, "multi-layer", Some(1));
         descs(&trace)
     };
     let mv = read("r462-mvhevc-3au.hevc");
@@ -432,7 +448,7 @@ fn multi_layer_output_descriptions() {
     let shvc = read("r462-shvc-2x.hevc");
     let t = whole(&shvc, 1);
     let sizes: Vec<(Option<u32>, u64)> = t.iter().map(|(d, g)| (d.width, *g)).collect();
-    assert_eq!(sizes, vec![(Some(32), 0), (Some(64), 1)]);
+    assert_eq!(sizes, vec![(Some(64), 0), (Some(64), 0)]);
     assert_eq!(t, whole(&shvc, 8), "1 vs 8 threads");
 }
 
@@ -502,7 +518,8 @@ fn reset_seeks_to_the_next_irap() {
     );
 
     // Back to a differently shaped segment: the bump comes with the
-    // first frame returned after the seek, not with the reset.
+    // `StreamParams` event returned right before the first frame after
+    // the seek, not with the reset.
     let bytes = fixture("change_64x48_8bit_then_48x32_10bit.hevc");
     let nals = nal_payloads(&bytes);
     let annexb = |n: &[u8]| {
@@ -527,7 +544,12 @@ fn reset_seeks_to_the_next_irap() {
     for n in &nals {
         dec.send_packet(&annexb(n)).expect("send");
         if let Ok(f) = dec.receive_frame() {
+            let ev = f.stream_params().expect("the event comes first").clone();
+            assert_eq!(ev.width, Some(64));
+            assert_eq!(dec.output_params_generation(), generation.wrapping_add(1));
+            let f = dec.receive_frame().expect("the frame follows the event");
             let p = dec.output_params().expect("answer");
+            assert_eq!(Desc::of(&p), Desc::of(&ev), "event payload == answer");
             assert_frame_matches(&video(f), &p, "after the seek");
             assert_eq!(p.width, Some(64));
             assert_eq!(dec.output_params_generation(), generation.wrapping_add(1));
