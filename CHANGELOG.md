@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/OxideAV/oxideav-h265/compare/v0.0.16...v0.0.17) - 2026-11-06
+
+### Other
+
+- Frame::StreamParams events at each output-shape change; multi-layer streams describe the highest output layer
+- layer identity on multi-layer frames, CodecParameters::layers; README SHVC table
+- SHVC 161/162 — external base layer, scaling list inference, layer-63 NALs
+- SHVC enhancement layers byte-exact on 154 of 162 official conformance OLS pairs
+- reset() for seeks; skip RASL pictures of a random access point
+- output_params + output_params_generation from the SPS / hvcC
+
 ### Added
 
 - *(decoder)* In-band `Frame::StreamParams` events (oxideav-core
