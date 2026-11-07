@@ -22,11 +22,23 @@ pub mod bitwriter;
 mod aq;
 #[doc(hidden)]
 pub mod cabac;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ctu;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod hrd;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod inter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod intra;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod loopfilter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pyramid;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[cfg(test)]
@@ -37,7 +49,11 @@ mod layered_streams;
 pub mod nal;
 #[cfg(test)]
 mod palette_streams;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pcm;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod rate;
 #[cfg(test)]
 mod rdpcm_streams;

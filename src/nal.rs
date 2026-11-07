@@ -18,6 +18,7 @@
 
 /// Errors that can arise while walking a NAL byte stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NalError {
     /// The byte stream did not contain any NAL start code.
     NoStartCode,

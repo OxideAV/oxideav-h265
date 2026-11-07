@@ -85,6 +85,7 @@ pub const HEVC_MAX_ELEMENTAL_DURATION_IN_TC_MINUS1: u32 = 2047;
 
 /// Errors that can arise while parsing an `hrd_parameters()` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HrdError {
     /// The RBSP ran out of bits before the structure was fully parsed.
     Truncated,

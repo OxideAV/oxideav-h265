@@ -53,6 +53,7 @@ use crate::nal::{NalError, NalHeader, NalUnit, strip_emulation_prevention};
 /// Errors from the `hvcC` record parse or the length-prefixed
 /// sample-data split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HvccError {
     /// The record is shorter than the fixed 23-byte prefix, or an
     /// array / NAL-unit length points past the end of the record.
@@ -96,6 +97,7 @@ impl From<NalError> for HvccError {
 /// decoder proper re-derives everything from the carried VPS / SPS /
 /// PPS, so they are surfaced for inspection only.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HvccRecord {
     /// `general_profile_space` (2 bits).
     pub general_profile_space: u8,
@@ -184,6 +186,7 @@ pub fn extradata_is_hvcc(data: &[u8]) -> bool {
 /// for (j = 0; j < numOfArrays; j++) { … as hvcC … }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LhvcRecord {
     /// `min_spatial_segmentation_idc` (12 bits).
     pub min_spatial_segmentation_idc: u16,

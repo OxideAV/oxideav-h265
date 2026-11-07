@@ -95,6 +95,7 @@ pub const HEVC_VPS_MAX_NUM_LAYER_SETS: usize = 1024;
 
 /// Errors that can arise while parsing a VPS RBSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VpsError {
     /// The RBSP ran out of bits before the VPS was fully parsed.
     Truncated,

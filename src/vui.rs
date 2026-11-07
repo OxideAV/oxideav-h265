@@ -97,6 +97,7 @@ pub const EXTENDED_SAR: u8 = 255;
 
 /// Errors that can arise while parsing a `vui_parameters()` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VuiError {
     /// The RBSP ran out of bits before the VUI was fully parsed.
     Truncated,

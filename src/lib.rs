@@ -275,6 +275,8 @@ pub mod encoder;
 pub mod hrd;
 pub mod hvcc;
 /// Annex H inter-layer reference picture derivation (resampling).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ilref;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -348,6 +350,8 @@ pub mod transform_unit;
 #[doc(hidden)]
 pub mod vps;
 /// Annex F `vps_extension( )` — the multi-layer layer model.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod vps_ext;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -514,6 +518,7 @@ pub use vui::{
 /// [`sequence::SequenceError`] and the registry decoder maps into
 /// [`oxideav_core::Error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The requested functionality is not implemented (the encoder,
     /// and the remaining decoder gaps listed in `README.md`).

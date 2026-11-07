@@ -73,6 +73,7 @@ const NAL_PPS: u8 = 34;
 
 /// Errors from the whole-bitstream decode driver.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SequenceError {
     /// Annex B demux / NAL header error.
     Nal(NalError),
@@ -160,6 +161,7 @@ impl From<ShortTermRefPicSetMaterializeError> for SequenceError {
 
 /// One decoded picture with its output-ordering keys.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// Index of the coded video sequence this picture belongs to
     /// (incremented at each IRAP with `NoRaslOutputFlag == 1`).
@@ -285,6 +287,7 @@ struct SegmentData {
 /// The default decodes every layer of the highest output layer set and
 /// outputs that set's output layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum LayerTarget {
     /// The highest output layer set of the VPS (`NumOutputLayerSets − 1`).
     #[default]

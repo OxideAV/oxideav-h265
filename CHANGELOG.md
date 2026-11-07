@@ -6,6 +6,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on the public error enums `Error`, `NalError`, `VpsError`, `SpsError`, `ShortTermRefPicSetMaterializeError`, `PpsError`, `SliceError`, `HrdError`, `VuiError`, `HvccError` and `sequence::SequenceError`, on the `sequence::LayerTarget` selector, and on the `HvccRecord`, `LhvcRecord` and `sequence::DecodedFrame` records (produced by `parse_hvcc` / `parse_lhvc` / `SequenceDecoder`, never built by callers). `picture::Plane` stays exhaustive (the three colour components).
+- `#[doc(hidden)]` on the internal `ilref` and `vps_ext` modules and on the encoder building-block modules `encoder::{ctu, hrd, inter, intra, loopfilter, pcm, pyramid, rate}`. The encoder is driven through `H265Encoder` / `make_encoder` and its codec options.
+
 ## [0.0.17](https://github.com/OxideAV/oxideav-h265/compare/v0.0.16...v0.0.17) - 2026-11-06
 
 ### Other

@@ -157,6 +157,7 @@ pub const HEVC_MAX_RPS_PICS: usize = 16;
 
 /// Errors that can arise while parsing an SPS RBSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SpsError {
     /// The RBSP ran out of bits before the SPS was fully parsed.
     Truncated,
@@ -507,6 +508,7 @@ impl ShortTermRefPicSet {
 /// Errors that can arise while running the §7.4.8 inter-RPS-prediction
 /// derivation via [`ShortTermRefPicSet::materialize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShortTermRefPicSetMaterializeError {
     /// The RPS uses inter-RPS prediction
     /// (`inter_ref_pic_set_prediction_flag == 1`) but the caller did

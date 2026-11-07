@@ -125,6 +125,7 @@ impl SliceType {
 
 /// Errors that can arise while parsing a slice segment header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SliceError {
     /// The RBSP ran out of bits before the header was fully parsed.
     Truncated,
