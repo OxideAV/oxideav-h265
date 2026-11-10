@@ -1336,7 +1336,10 @@ impl PicParameterSet {
         let log2_parallel_merge_level_minus2 = br.ue()?;
         let slice_segment_header_extension_present_flag = br.u1()? != 0;
 
-        let pps_extension_present_flag = br.u1()? != 0;
+        // A PPS whose RBSP holds nothing but rbsp_trailing_bits( ) (or
+        // nothing at all) here carries no pps_extension_present_flag
+        // (§7.2 more_rbsp_data( ) is FALSE): taken as 0.
+        let pps_extension_present_flag = br.more_rbsp_data() && br.u1()? != 0;
         let (
             extension_flags,
             pps_range_extension,

@@ -177,6 +177,20 @@ impl<'a> BitReader<'a> {
     pub fn bit_pos(&self) -> usize {
         self.bit_pos
     }
+
+    /// §7.2 `more_rbsp_data( )`: `true` when syntax data remain before
+    /// the `rbsp_trailing_bits( )` structure — i.e. when the cursor
+    /// sits before the last bit equal to 1 in the buffer (the
+    /// `rbsp_stop_one_bit`). `false` when the buffer is exhausted, when
+    /// the cursor is on the stop bit itself, or when no bit equal to 1
+    /// remains at all.
+    pub fn more_rbsp_data(&self) -> bool {
+        let Some(last) = self.buf.iter().rposition(|&b| b != 0) else {
+            return false;
+        };
+        let stop_bit = last * 8 + 7 - self.buf[last].trailing_zeros() as usize;
+        self.bit_pos < stop_bit
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +319,21 @@ mod tests {
         let buf = [0u8; 8]; // 64 zero bits
         let mut br = BitReader::new(&buf);
         assert_eq!(br.ue(), Err(BitReaderError::ExpGolombOverflow));
+    }
+
+    #[test]
+    fn more_rbsp_data_stops_at_the_last_one_bit() {
+        // 1010_0000 1000_0000 0000_0000: stop bit at position 8.
+        let buf = [0xA0, 0x80, 0x00];
+        let mut br = BitReader::new(&buf);
+        for _ in 0..8 {
+            assert!(br.more_rbsp_data());
+            br.u1().unwrap();
+        }
+        assert!(!br.more_rbsp_data(), "cursor on the stop bit");
+        br.u1().unwrap();
+        assert!(!br.more_rbsp_data());
+        assert!(!BitReader::new(&[]).more_rbsp_data());
+        assert!(!BitReader::new(&[0, 0]).more_rbsp_data());
     }
 }

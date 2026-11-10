@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(decoder)* A VPS, SPS or PPS whose RBSP ends right before its
+  extension gate (`vps_extension_flag`, `sps_extension_present_flag`,
+  `pps_extension_present_flag`) is accepted with the gate taken as 0.
+  §7.2 `more_rbsp_data( )` is FALSE at that position — the RBSP is
+  exhausted, or the bit under the cursor is the `rbsp_stop_one_bit` —
+  so no flag is read; before, the stop bit was read as a set flag (the
+  VPS then failed inside a `vps_extension( )` that is not there) or
+  the parse reported a truncation. A parameter set cut anywhere before
+  the gate is still refused. `BitReader::more_rbsp_data` carries the
+  test; `tests/truncated_parameter_sets.rs` rewrites the parameter
+  sets of an encoded stream into both shapes on the Annex B and
+  registry paths.
+
 ### Changed
 
 - `#[non_exhaustive]` on the public error enums `Error`, `NalError`, `VpsError`, `SpsError`, `ShortTermRefPicSetMaterializeError`, `PpsError`, `SliceError`, `HrdError`, `VuiError`, `HvccError` and `sequence::SequenceError`, on the `sequence::LayerTarget` selector, and on the `HvccRecord`, `LhvcRecord` and `sequence::DecodedFrame` records (produced by `parse_hvcc` / `parse_lhvc` / `SequenceDecoder`, never built by callers). `picture::Plane` stays exhaustive (the three colour components).

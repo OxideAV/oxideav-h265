@@ -630,7 +630,14 @@ impl HevcVps {
         // F vps_extension( ) in full, then vps_extension2_flag — whose
         // vps_extension_data_flag run plus rbsp_trailing_bits() are
         // surfaced as the opaque tail.
-        let vps_extension_flag = br.u1()? != 0;
+        //
+        // A VPS whose RBSP holds nothing but rbsp_trailing_bits( ) (or
+        // nothing at all) at this position carries no
+        // vps_extension_flag: §7.2 more_rbsp_data( ) is FALSE there, so
+        // the bit under the cursor is the rbsp_stop_one_bit, not a
+        // flag. Such a VPS states everything the base-layer decoding
+        // process reads; the flag is taken as 0 (no vps_extension( )).
+        let vps_extension_flag = br.more_rbsp_data() && br.u1()? != 0;
         let mut extension = None;
         let mut vps_extension2_flag = false;
         if vps_extension_flag {
@@ -1332,5 +1339,85 @@ mod tests {
             .expect("nal inherited via cprms");
         assert_eq!(nal.cpb.len(), 1);
         assert!(!nal.cpb[0].cbr_flag);
+    }
+
+    /// A minimal single-layer VPS up to and including
+    /// `vps_timing_info_present_flag` — 144 bits, so the position of
+    /// `vps_extension_flag` is a byte boundary.
+    fn vps_bits_before_extension_flag() -> String {
+        let mut s = String::new();
+        s += "0000"; // vps_video_parameter_set_id
+        s += "11"; // vps_base_layer_internal / available
+        s += "000000"; // vps_max_layers_minus1
+        s += "000"; // vps_max_sub_layers_minus1
+        s += "1"; // vps_temporal_id_nesting_flag
+        s += "1111111111111111"; // vps_reserved_0xffff_16bits
+        s += "00"; // general_profile_space
+        s += "0"; // general_tier_flag
+        s += "00001"; // general_profile_idc
+        s += &"0".repeat(32); // compatibility flags
+        s += "1000"; // source flags
+        s += &"0".repeat(43);
+        s += "0";
+        s += "00011110"; // general_level_idc
+        s += "1"; // vps_sub_layer_ordering_info_present_flag
+        s += "00100"; // vps_max_dec_pic_buffering_minus1 = 3
+        s += "1"; // vps_max_num_reorder_pics = 0
+        s += "1"; // vps_max_latency_increase_plus1 = 0
+        s += "000000"; // vps_max_layer_id
+        s += "1"; // vps_num_layer_sets_minus1 = 0
+        s += "0"; // vps_timing_info_present_flag
+        assert_eq!(s.len(), 144);
+        s
+    }
+
+    fn pack(bits: &str) -> Vec<u8> {
+        let mut padded = bits.to_string();
+        while !padded.len().is_multiple_of(8) {
+            padded.push('0');
+        }
+        padded
+            .as_bytes()
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |b, &ch| (b << 1) | (ch - b'0')))
+            .collect()
+    }
+
+    /// §7.2 `more_rbsp_data( )` is FALSE at the position of
+    /// `vps_extension_flag` when the RBSP is exhausted there or holds
+    /// only `rbsp_trailing_bits( )`: no flag is read and it is taken
+    /// as 0. A coded flag (0 or 1) ahead of the stop bit still reads.
+    #[test]
+    fn vps_ending_before_extension_flag_is_accepted() {
+        let prefix = vps_bits_before_extension_flag();
+        let full = HevcVps::parse(&pack(&(prefix.clone() + "01"))).expect("coded flag");
+        assert!(!full.vps_extension_flag);
+
+        let exhausted = HevcVps::parse(&pack(&prefix)).expect("RBSP exhausted at the flag");
+        assert_eq!(exhausted, full);
+
+        let stop_only = HevcVps::parse(&pack(&(prefix.clone() + "1"))).expect("stop bit only");
+        assert_eq!(stop_only, full);
+
+        // Trailing zero bytes after the stop bit change nothing.
+        let mut padded = pack(&(prefix.clone() + "1"));
+        padded.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            HevcVps::parse(&padded).expect("stop bit + zero bytes"),
+            full
+        );
+
+        // A coded flag of 1 with more data behind it is still an
+        // extension (here a cut one: refused, not mistaken for a tail).
+        assert!(HevcVps::parse(&pack(&(prefix + "1" + "1111111" + "0001"))).is_err());
+    }
+
+    /// A VPS cut anywhere before the extension gate is still refused.
+    #[test]
+    fn vps_cut_inside_the_body_is_refused() {
+        let bytes = pack(&vps_bits_before_extension_flag());
+        for len in 0..bytes.len() {
+            assert!(HevcVps::parse(&bytes[..len]).is_err(), "len {len}");
+        }
     }
 }

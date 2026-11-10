@@ -1623,15 +1623,15 @@ impl SeqParameterSet {
             sps_multilayer_extension,
             sps_scc_extension,
             opaque_tail,
-        ) = if br.bits_left() == 0 {
-            // The fixture corpus encoders sometimes elide the
-            // sps_extension_present_flag if no extension is signalled
-            // and the rbsp_trailing_bits happens to land on a byte
-            // boundary; the field is still required, so a buffer with
-            // no bits left here is a truncation.
-            return Err(SpsError::Truncated);
-        } else {
-            let gate = br.u1()? != 0;
+        ) = {
+            // An SPS whose RBSP holds nothing but rbsp_trailing_bits( )
+            // (or nothing at all) at this position carries no
+            // sps_extension_present_flag: §7.2 more_rbsp_data( ) is
+            // FALSE there, so the bit under the cursor is the
+            // rbsp_stop_one_bit. Everything the decoding process reads
+            // has been stated; the flag is taken as 0 (§7.4.3.2.1
+            // infers every extension flag to 0 in that case).
+            let gate = br.more_rbsp_data() && br.u1()? != 0;
             if gate {
                 // §7.3.2.2.1: when the gate is open, decode the eight
                 // bits of typed extension flags first.
