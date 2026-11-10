@@ -647,7 +647,7 @@ pub struct PictureReconstructor<'a> {
     edges: crate::deblock::DeblockEdgeMap,
     /// §8.7.2.5.4 / §8.7.3.1 — per-4×4-cell loop-filter suppression for
     /// PCM (`pcm_loop_filter_disabled_flag`) / transquant-bypass CUs.
-    no_filter_cells: Vec<bool>,
+    no_filter_cells: Vec<u8>,
     /// The stored cell rectangle of `no_filter_cells`: `(first cell
     /// column, first cell row, stored columns)` (a band).
     no_filter_rect: (usize, usize, usize),
@@ -715,7 +715,7 @@ pub struct BandOutput {
     /// `QpY` cells of the band (`rows / 4` cell rows of `width / 4`).
     pub qp_cells: Vec<i8>,
     /// Loop-filter suppression cells of the band (same layout).
-    pub no_filter: Vec<bool>,
+    pub no_filter: Vec<u8>,
     /// The band's deblocking edge strengths.
     pub edges: crate::deblock::DeblockEdgeMap,
     /// Tile bands: CUs on the left / top boundary (their edges are
@@ -784,7 +784,7 @@ impl<'a> PictureReconstructor<'a> {
             boundary_cus: Vec::new(),
             halo: true,
             edges: crate::deblock::DeblockEdgeMap::new(pic_width_luma, pic_height_luma),
-            no_filter_cells: vec![false; w4 * h4],
+            no_filter_cells: vec![0; w4 * h4],
             no_filter_rect: (0, 0, w4),
             prev_slice_addr: None,
             prev_tile: None,
@@ -898,7 +898,7 @@ impl<'a> PictureReconstructor<'a> {
             boundary_cus: Vec::new(),
             halo: halo > 0 || y0 == 0,
             edges: crate::deblock::DeblockEdgeMap::new_rect_band((x0, y0, w, rows)),
-            no_filter_cells: vec![false; cols4 * rows.div_ceil(4)],
+            no_filter_cells: vec![0; cols4 * rows.div_ceil(4)],
             no_filter_rect: (x0 / 4, y0 / 4, cols4),
             prev_slice_addr: None,
             prev_tile: None,
@@ -1278,7 +1278,9 @@ impl PictureReconstructor<'_> {
         // of the rows reconstructed since the last call.
         let upto = (((r + 1) * ctb).div_ceil(4) * w4).min(self.no_filter_cells.len());
         if !st.nf_any && upto > st.nf_scanned {
-            st.nf_any = self.no_filter_cells[st.nf_scanned..upto].iter().any(|&b| b);
+            st.nf_any = self.no_filter_cells[st.nf_scanned..upto]
+                .iter()
+                .any(|&b| b != 0);
         }
         st.nf_scanned = st.nf_scanned.max(upto);
         if slice.deblock_enabled
@@ -1433,7 +1435,7 @@ pub struct OwnedFilterInputs {
     /// Per-4×4 `QpY`.
     pub qp_cells: Vec<i8>,
     /// Per-4×4 §8.7.2.5.4 / §8.7.3.1 suppression.
-    pub no_filter: Vec<bool>,
+    pub no_filter: Vec<u8>,
     /// Per-CTB `SliceAddrRs`.
     pub slice_addr: Vec<u32>,
     /// Per-CTB loop-filter-across-slices flag.
@@ -1490,7 +1492,7 @@ pub struct FilterInputs<'a> {
     /// Per-4×4 `QpY`.
     pub qp_cells: &'a [i8],
     /// Per-4×4 §8.7.2.5.4 / §8.7.3.1 suppression.
-    pub no_filter_cells: &'a [bool],
+    pub no_filter_cells: &'a [u8],
     /// Per-CTB `SliceAddrRs`.
     pub slice_addr_map: &'a [u32],
     /// Per-CTB loop-filter-across-slices flag.
@@ -1516,13 +1518,14 @@ pub fn filter_picture(mut pic: Picture, inputs: &FilterInputs<'_>, workers: usiz
     } = *inputs;
     let (pw, _) = pic.plane_dims(Plane::Luma);
     let w4 = pw.div_ceil(4);
-    let no_filter_map = no_filter_cells
-        .iter()
-        .any(|&b| b)
-        .then_some(crate::deblock::NoFilterMap {
-            cells: no_filter_cells,
-            w_cells: w4,
-        });
+    let no_filter_map =
+        no_filter_cells
+            .iter()
+            .any(|&b| b != 0)
+            .then_some(crate::deblock::NoFilterMap {
+                cells: no_filter_cells,
+                w_cells: w4,
+            });
     let pic_w_ctbs = tiling.pic_width_in_ctbs_y() as usize;
     let n_ctbs = slice_addr_map.len();
     let sao_boundaries = crate::sao::SaoBoundaries {
@@ -1591,7 +1594,7 @@ fn reconstruct_inter_quadtree(
     refs: &RefListAccess,
     slice: &InterSliceContext,
     deblock_cus: &mut Vec<crate::deblock::DeblockCuDesc>,
-    no_filter_cells: &mut [bool],
+    no_filter_cells: &mut [u8],
     no_filter_rect: (usize, usize, usize),
     filter_across_of_ctb: &[bool],
     qt: &crate::slice_data::CodingQuadtree,
@@ -1620,7 +1623,18 @@ fn reconstruct_inter_quadtree(
         CodingQuadtree::Leaf(cu) => {
             // §8.7.2.5.4 / §8.7.3.1 — mark the CU's cells when the loop
             // filters must leave its reconstructed samples untouched.
-            if (cu.pcm_flag && slice.pcm_loop_filter_disabled) || cu.cu_transquant_bypass_flag {
+            // A palette CU keeps its samples through deblocking only
+            // (§8.7.2.5.7 / §8.7.2.5.8); SAO still applies to it.
+            let skip = if (cu.pcm_flag && slice.pcm_loop_filter_disabled)
+                || cu.cu_transquant_bypass_flag
+            {
+                crate::deblock::NO_FILTER
+            } else if cu.palette.is_some() {
+                crate::deblock::NO_DEBLOCK
+            } else {
+                0
+            };
+            if skip != 0 {
                 let n = 1usize << cu.log2_cb_size;
                 for j in (0..n).step_by(4) {
                     for i in (0..n).step_by(4) {
@@ -1630,7 +1644,7 @@ fn reconstruct_inter_quadtree(
                             continue;
                         }
                         if let Some(cell) = no_filter_cells.get_mut((gy - oy) * cols + (gx - ox)) {
-                            *cell = true;
+                            *cell = skip;
                         }
                     }
                 }
@@ -1717,10 +1731,16 @@ fn reconstruct_inter_leaf_cu(
     let n_cb_s = 1usize << cu.log2_cb_size;
     // §8.6.1 — the CU's QpY (in decode order, before anything reads the
     // QP map for this CU).
-    let cu_delta = cu
-        .transform_tree
-        .as_ref()
-        .and_then(crate::recon::first_tree_cu_qp_delta);
+    // The CU's CuQpDeltaVal: from its transform tree, or — a palette
+    // CU has none — from the delta_qp( ) inside palette_coding( )
+    // (§7.3.8.13, coded with the escape samples).
+    let cu_delta = match cu.palette.as_deref() {
+        Some(pal) => pal.cu_qp_delta.as_ref().map(|d| d.value),
+        None => cu
+            .transform_tree
+            .as_ref()
+            .and_then(crate::recon::first_tree_cu_qp_delta),
+    };
     let qp_y = ctx.derive_cu_qp(
         params,
         cu.x0 as usize,
@@ -2729,6 +2749,189 @@ mod tests {
             105,
             "SAO band offset applied"
         );
+    }
+
+    /// A 16x16 palette coding unit at `(x0, y0)`: one palette entry
+    /// per component (`entry`), or — `entry == None` — an empty palette
+    /// whose every sample is an escape of quantized value `escape`.
+    fn palette_cu_16(
+        x0: u32,
+        y0: u32,
+        entry: Option<u16>,
+        escape: u16,
+        cu_qp_delta: Option<i32>,
+    ) -> CodingUnit {
+        let n = 16usize;
+        let pal = crate::palette::PaletteCu {
+            n_cbs: n,
+            palette: match entry {
+                Some(v) => [vec![v], vec![v], vec![v]],
+                None => [Vec::new(), Vec::new(), Vec::new()],
+            },
+            escape_present: entry.is_none(),
+            transpose: false,
+            index_map: vec![0; n * n],
+            escape_vals: [
+                vec![escape; n * n],
+                vec![escape; n * n],
+                vec![escape; n * n],
+            ],
+            cu_qp_delta: cu_qp_delta.map(|value| crate::binarization::CuQpDelta {
+                abs: value.unsigned_abs(),
+                sign_flag: (value != 0).then_some(u8::from(value < 0)),
+                value,
+            }),
+            cu_chroma_qp_offset: None,
+        };
+        CodingUnit {
+            x0,
+            y0,
+            log2_cb_size: 4,
+            cu_pred_mode: CuPredMode::Intra,
+            cu_transquant_bypass_flag: false,
+            part_mode: PartMode::Part2Nx2N,
+            pcm_flag: false,
+            pcm: None,
+            palette: Some(Box::new(pal)),
+            prediction_units: vec![],
+            intra_luma: vec![],
+            intra_chroma_pred_mode: vec![],
+            rqt_root_cbf: false,
+            transform_tree: None,
+        }
+    }
+
+    /// One 32x32 CTU of a P picture: the two left 16x16 quadrants are
+    /// `left(x0, y0)`, the two right ones inter merge CUs copying the
+    /// reference.
+    fn left_right_ctu(
+        left: impl Fn(u32, u32) -> CodingUnit,
+        sao: Option<crate::slice_data::SaoCtbParams>,
+    ) -> crate::slice_data::CodingTreeUnit {
+        let inter = |x0: u32, y0: u32| {
+            let mut c = inter_cu_16(merge_pu(0), None);
+            c.x0 = x0;
+            c.y0 = y0;
+            c
+        };
+        crate::slice_data::CodingTreeUnit {
+            sao,
+            quadtree: crate::slice_data::CodingQuadtree::Split(vec![
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(left(0, 0))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 0))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(left(0, 16))),
+                crate::slice_data::CodingQuadtree::Leaf(Box::new(inter(16, 16))),
+            ]),
+        }
+    }
+
+    fn decode_one_ctu(
+        ctu: &crate::slice_data::CodingTreeUnit,
+        slice: &InterSliceContext,
+        ref_luma: i32,
+    ) -> Picture {
+        let params = p_params();
+        let entries = vec![dpb_entry(0, flat_ref(ref_luma, 128))];
+        let lists = RefPicLists {
+            list0: vec![Some(0)],
+            list1: None,
+        };
+        let refs = RefListAccess {
+            lists: &lists,
+            entries: &entries,
+        };
+        let placed = vec![PlacedInterCtu {
+            x_ctb: 0,
+            y_ctb: 0,
+            slice_addr_rs: 0,
+            filter_across_slices: true,
+            ctu,
+        }];
+        let tiles = crate::availability::TilingParams::single_tile();
+        reconstruct_inter_picture(32, 32, &params, slice, &tiles, &placed, &refs, None)
+            .unwrap()
+            .0
+    }
+
+    /// §8.7.2.5.7 / §8.7.2.5.8: deblocking leaves the samples of a
+    /// palette coding unit untouched (`nDp` / `nDq` = 0 on its side, the
+    /// other side of the edge is still filtered) — and §8.7.3.1 names
+    /// no such exception, so SAO still modifies them.
+    #[test]
+    fn palette_cu_is_kept_by_deblocking_but_not_by_sao() {
+        let palette = |x0, y0| palette_cu_16(x0, y0, Some(128), 0, None);
+        let mut slice = p_slice_ctx();
+        slice.deblock_enabled = true;
+        let pic = decode_one_ctu(&left_right_ctu(palette, None), &slice, 140);
+        for y in 0..32 {
+            for x in 0..16 {
+                assert_eq!(pic.sample(Plane::Luma, x, y), 128, "palette ({x},{y})");
+            }
+            for x in 0..8 {
+                assert_eq!(pic.sample(Plane::Cb, x, y / 2), 128, "palette Cb ({x},{y})");
+            }
+        }
+        // The inter side of the bS 2 edge at x = 16 is filtered.
+        assert!(
+            (0..32).any(|y| pic.sample(Plane::Luma, 16, y) != 140),
+            "the q side of the palette / inter edge is deblocked"
+        );
+
+        // SAO: a band offset on the palette value's band applies to the
+        // palette samples (band 128 >> 3 = 16, first offset +5).
+        let sao = crate::slice_data::SaoCtbParams {
+            merge_left: false,
+            merge_up: false,
+            components: [
+                crate::slice_data::SaoComponent {
+                    sao_type_idx: 1,
+                    offset_abs: [5, 0, 0, 0],
+                    offset_sign: [0, 0, 0, 0],
+                    band_position: 16,
+                    eo_class: 0,
+                },
+                crate::slice_data::SaoComponent::default(),
+                crate::slice_data::SaoComponent::default(),
+            ],
+        };
+        let mut slice = p_slice_ctx();
+        slice.deblock_enabled = true;
+        slice.slice_sao_luma_flag = true;
+        let pic = decode_one_ctu(&left_right_ctu(palette, Some(sao)), &slice, 200);
+        for y in 0..32 {
+            for x in 0..16 {
+                assert_eq!(
+                    pic.sample(Plane::Luma, x, y),
+                    133,
+                    "SAO on palette ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// §7.3.8.13 / §8.6.1: the `delta_qp( )` a palette coding unit
+    /// carries with its escape samples moves the unit's `QpY` in a P / B
+    /// picture as it does in an I picture — the eq. 8-77 escape scaling
+    /// runs at `Qp′Y` = slice QP + `CuQpDeltaVal`.
+    #[test]
+    fn palette_cu_qp_delta_applies_in_an_inter_picture() {
+        // Eq. 8-77 for an escape value of 4: at qP 25 (levelScale 45,
+        // shift 4) 45, at qP 23 (levelScale 72, shift 3) 36.
+        let scaled = |qp: i32| -> i32 {
+            const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
+            (((4 * LEVEL_SCALE[(qp % 6) as usize]) << (qp / 6)) + 32) >> 6
+        };
+        assert_eq!((scaled(25), scaled(23)), (45, 36));
+        for (delta, want) in [
+            (None, scaled(25)),
+            (Some(0), scaled(25)),
+            (Some(-2), scaled(23)),
+        ] {
+            let escape = |x0, y0| palette_cu_16(x0, y0, None, 4, delta);
+            let pic = decode_one_ctu(&left_right_ctu(escape, None), &p_slice_ctx(), 140);
+            assert_eq!(pic.sample(Plane::Luma, 5, 5), want, "cu_qp_delta {delta:?}");
+            assert_eq!(pic.sample(Plane::Luma, 24, 8), 140, "inter quadrant");
+        }
     }
 
     /// §8.3 + §8.5 end-to-end inter picture cycle: an IDR reference picture

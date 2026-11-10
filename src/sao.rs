@@ -407,8 +407,9 @@ fn sao_ctb_core(
         return;
     }
     let (nf_sw, nf_sh) = geom.sub;
-    let suppressed =
-        |x: usize, y: usize| -> bool { no_filter.is_some_and(|m| m.at_luma(x * nf_sw, y * nf_sh)) };
+    let suppressed = |x: usize, y: usize| -> bool {
+        no_filter.is_some_and(|m| m.sao_at_luma(x * nf_sw, y * nf_sh))
+    };
     let max = (1i32 << geom.bit_depth) - 1;
     let (pw, ph) = (geom.pw, geom.ph);
     let w = n_w.min(pw.saturating_sub(x_ctb));

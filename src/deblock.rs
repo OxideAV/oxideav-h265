@@ -1414,30 +1414,58 @@ impl QpMap<'_> {
     }
 }
 
-/// Per-4×4-luma-cell in-loop-filter suppression map: `true` cells
-/// belong to a coding unit whose reconstructed samples the loop
-/// filters must not modify — a `pcm_flag == 1` CU when
+/// Suppression cell value: the loop filters (deblocking and SAO) must
+/// not modify the cell's samples — a `pcm_flag == 1` CU when
 /// `pcm_loop_filter_disabled_flag == 1` (§7.4.3.2.1), or a
-/// `cu_transquant_bypass_flag == 1` CU (§7.4.9.5). The §8.7.2.5.4 /
-/// §8.7.2.5.5 filters zero `nDp` / `nDq` on the flagged side (the
-/// decision still reads both sides); §8.7.3 SAO skips flagged samples.
+/// `cu_transquant_bypass_flag == 1` CU (§7.4.9.5).
+pub const NO_FILTER: u8 = 1;
+/// Suppression cell value: deblocking must not modify the cell's
+/// samples, SAO still applies — a `palette_mode_flag == 1` CU
+/// (§8.7.2.5.7 / §8.7.2.5.8 name it; §8.7.3.1 does not).
+pub const NO_DEBLOCK: u8 = 2;
+
+/// Per-4×4-luma-cell in-loop-filter suppression map: non-zero cells
+/// belong to a coding unit whose reconstructed samples a loop filter
+/// must not modify ([`NO_FILTER`], [`NO_DEBLOCK`]). The §8.7.2.5.7 /
+/// §8.7.2.5.8 filters zero `nDp` / `nDq` on the flagged side (the
+/// decision still reads both sides); §8.7.3 SAO skips [`NO_FILTER`]
+/// samples.
 #[derive(Debug, Clone, Copy)]
 pub struct NoFilterMap<'a> {
     /// Per-cell suppression flags, row-major.
-    pub cells: &'a [bool],
+    pub cells: &'a [u8],
     /// Cell-grid width (`ceil(pic_width / 4)`).
     pub w_cells: usize,
 }
 
 impl NoFilterMap<'_> {
-    /// Suppression flag of the cell covering luma sample
-    /// `(x_luma, y_luma)` (out-of-range positions are not suppressed).
-    #[must_use]
-    pub fn at_luma(&self, x_luma: usize, y_luma: usize) -> bool {
+    #[inline]
+    fn cell(&self, x_luma: usize, y_luma: usize) -> u8 {
         self.cells
             .get((y_luma >> 2) * self.w_cells + (x_luma >> 2))
             .copied()
-            .unwrap_or(false)
+            .unwrap_or(0)
+    }
+
+    /// Whether deblocking leaves the sample at luma position
+    /// `(x_luma, y_luma)` untouched (out-of-range positions are not
+    /// suppressed).
+    #[must_use]
+    pub fn at_luma(&self, x_luma: usize, y_luma: usize) -> bool {
+        self.cell(x_luma, y_luma) != 0
+    }
+
+    /// Whether SAO leaves the sample at luma position
+    /// `(x_luma, y_luma)` untouched.
+    #[must_use]
+    pub fn sao_at_luma(&self, x_luma: usize, y_luma: usize) -> bool {
+        self.cell(x_luma, y_luma) & NO_FILTER != 0
+    }
+
+    /// Whether any cell suppresses SAO.
+    #[must_use]
+    pub fn any_sao(&self) -> bool {
+        self.cells.iter().any(|&c| c & NO_FILTER != 0)
     }
 }
 

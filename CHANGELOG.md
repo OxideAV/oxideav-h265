@@ -43,6 +43,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- *(decoder)* **The official SCC conformance set decodes byte-exact:
+  15 of 15 streams (0 of 15 before), 61 of 61 over the staged RExt +
+  SCC corpus.** Three defects, each found by comparing against the
+  staged conformance decodes sample by sample:
+  - a palette coding unit's samples were modified by deblocking.
+    §8.7.2.5.7 / §8.7.2.5.8 set `nDp` / `nDq` to 0 (and keep `p0` /
+    `q0` in chroma) on the side of an edge that lies in a
+    `palette_mode_flag` unit; §8.7.3.1 names no such exception, so SAO
+    still applies to it. The per-4x4 suppression map carries the two
+    cases apart (`deblock::NO_FILTER` for PCM-with-filter-off and
+    transquant bypass, `deblock::NO_DEBLOCK` for palette);
+  - the `delta_qp( )` coded inside `palette_coding( )` was dropped for
+    a palette unit of a P / B picture (the picture driver resolved the
+    unit's `QpY` from its — absent — transform tree first), so escape
+    samples were scaled at the predicted QP and the delta never
+    reached the following units' QP prediction;
+  - the §8.5.3.2.1 restriction that turns a bi-predicted 8x8
+    prediction block into a list-0 one (two versions of the current
+    picture, both vectors fractional, motion not identical) also fired
+    on the 4x16 / 12x16 / 16x4 / 16x12 blocks of a 16x16 asymmetric
+    coding unit: eqs 8-86 / 8-87 give `nCbS / 2` in both directions
+    for those. The conformance decode of the 8x8 bi-prediction stream
+    shows the rule reads the block's own width and height.
+  `tests/conformance_official.rs` pins all 15 (docs-gated), unit tests
+  pin each defect on constructed coding units, and
+  `examples/yuv_diff.rs` (new) compares a decode with a raw reference
+  picture by picture, plane by plane and block by block.
 - *(decoder)* A VPS, SPS or PPS whose RBSP ends right before its
   extension gate (`vps_extension_flag`, `sps_extension_present_flag`,
   `pps_extension_present_flag`) is accepted with the gate taken as 0.

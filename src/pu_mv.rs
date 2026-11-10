@@ -810,19 +810,14 @@ fn apply_bi_to_uni_reduction(out: &mut PuMotion, geom: &PuGeometry, ctx: &PuMvCo
     if !ctx.two_versions_curr_pic {
         return;
     }
-    // nPbSw / nPbSh (eqs 8-86/8-87).
-    let n_pb_sw = geom.n_cb_s
-        / if matches!(geom.part_mode, PartMode::Part2Nx2N | PartMode::Part2NxN) {
-            1
-        } else {
-            2
-        };
-    let n_pb_sh = geom.n_cb_s
-        / if matches!(geom.part_mode, PartMode::Part2Nx2N | PartMode::PartNx2N) {
-            1
-        } else {
-            2
-        };
+    // nPbSw / nPbSh: the prediction block's own width and height.
+    // Eqs 8-86 / 8-87 write them as nCbS or nCbS / 2 by PartMode, which
+    // is the block size for the symmetric modes only — read literally
+    // they would call both blocks of a 16x16 asymmetric (AMP) coding
+    // unit 8x8, though those are 4x16 + 12x16 (or 16x4 + 16x12). The
+    // staged SCC conformance decode of the 8x8 bi-prediction stream
+    // settles the reading: its AMP blocks keep both lists.
+    let (n_pb_sw, n_pb_sh) = (geom.n_pb_w, geom.n_pb_h);
     let integer_mv = |mv: Mv| (mv[0] & 0x3) == 0 && (mv[1] & 0x3) == 0;
     let no_integer_mv = !(integer_mv(out.mv_l0) || integer_mv(out.mv_l1));
     let identical_mvs = out.mv_l0 == out.mv_l1
@@ -919,6 +914,83 @@ mod tests {
             part_mode: PartMode::Part2Nx2N,
             part_idx: 0,
         }
+    }
+
+    /// §8.5.3.2.1 (eqs 8-102 / 8-103): with two versions of the
+    /// current picture, a bi-predicted 8x8 prediction block whose
+    /// vectors are both fractional and not identical keeps list 0 only.
+    /// The rule is about the block's own size: the two blocks of a
+    /// 16x16 asymmetric coding unit (4x16 + 12x16) keep both lists,
+    /// though `nCbS / 2` is 8 in both directions for them.
+    #[test]
+    fn bi_to_uni_reduction_applies_to_8x8_blocks_only() {
+        let ref_poc = |l: usize, _r: i32| if l == 0 { 0 } else { 8 };
+        let long = |_l: usize, _r: i32| false;
+        let short = |_l: usize, _r: i32| true;
+        let col_long = |_p: i32| false;
+        let mut ctx = base_ctx(&ref_poc, &long, &short, &col_long);
+        let bi = PuMotion {
+            pred_flag_l0: true,
+            pred_flag_l1: true,
+            ref_idx_l0: 0,
+            ref_idx_l1: 0,
+            mv_l0: [-29, -14],
+            mv_l1: [5, 3],
+        };
+        let amp = |w: usize, h: usize, part_mode: PartMode| PuGeometry {
+            x_cb: 16,
+            y_cb: 16,
+            n_cb_s: 16,
+            x_pb: 16,
+            y_pb: 16,
+            n_pb_w: w,
+            n_pb_h: h,
+            part_mode,
+            part_idx: 0,
+        };
+        let run = |geom: &PuGeometry, ctx: &PuMvContext, m: PuMotion| {
+            let mut out = m;
+            apply_bi_to_uni_reduction(&mut out, geom, ctx);
+            out
+        };
+
+        // Without two versions of the current picture nothing changes.
+        assert_eq!(run(&geom_2nx2n(16, 16, 8), &ctx, bi), bi);
+
+        ctx.two_versions_curr_pic = true;
+        let reduced = run(&geom_2nx2n(16, 16, 8), &ctx, bi);
+        assert!(reduced.pred_flag_l0 && !reduced.pred_flag_l1);
+        assert_eq!(reduced.ref_idx_l1, -1);
+        assert_eq!(reduced.mv_l0, bi.mv_l0);
+
+        // Larger and asymmetric blocks keep both lists.
+        assert_eq!(run(&geom_2nx2n(16, 16, 16), &ctx, bi), bi);
+        for (w, h, mode) in [
+            (4, 16, PartMode::PartNLx2N),
+            (12, 16, PartMode::PartNRx2N),
+            (16, 4, PartMode::Part2NxnU),
+            (16, 12, PartMode::Part2NxnD),
+            (8, 16, PartMode::PartNx2N),
+            (16, 8, PartMode::Part2NxN),
+        ] {
+            assert_eq!(run(&amp(w, h, mode), &ctx, bi), bi, "{w}x{h}");
+        }
+
+        // An integer vector on either list, or identical motion, keeps
+        // the 8x8 block bi-predicted.
+        let integer = PuMotion {
+            mv_l1: [8, -4],
+            ..bi
+        };
+        assert_eq!(run(&geom_2nx2n(16, 16, 8), &ctx, integer), integer);
+        let same_poc = |_l: usize, _r: i32| 0;
+        let mut ctx2 = base_ctx(&same_poc, &long, &short, &col_long);
+        ctx2.two_versions_curr_pic = true;
+        let identical = PuMotion {
+            mv_l1: bi.mv_l0,
+            ..bi
+        };
+        assert_eq!(run(&geom_2nx2n(16, 16, 8), &ctx2, identical), identical);
     }
 
     #[test]

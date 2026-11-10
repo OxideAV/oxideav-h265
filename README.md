@@ -20,9 +20,9 @@ transform, intra block copy), and a 37-stream black-box tool-axis
 sweep (round 410) held byte-exact by nine embedded pins. Against the
 staged **official JCT-VC RExt / SCC conformance corpus** (61
 decodable bitstreams with published output digests,
-`docs/video/h265/conformance/`), 46 streams decode byte-exact
-(round 444; docs-gated pins in `tests/conformance_official.rs`) —
-**the complete 46-stream RExt branch**: transform-skip-context,
+`docs/video/h265/conformance/`), **all 61 streams decode byte-exact**
+(docs-gated pins in `tests/conformance_official.rs`) — the complete
+46-stream RExt branch: transform-skip-context,
 wavefronts-inside-tiles / aligned-bypass / high-throughput,
 persistent-Rice(-seeded and single-stream-anchor), Monochrome
 8/12/16-bit, Main 4:2:2 10, the COMPLETE 4:4:4
@@ -31,9 +31,41 @@ the 4:4:4 `GENERAL_*` multi-tool family, `WAVETILES` (wavefronts +
 tiles + dependent slice segments in one picture), the
 cross-component-prediction anchors (`CCP_{8,10,12}bit`), `QMATRIX_A`,
 unequal luma/chroma depths (`Bitdepth_A/B`), `SAO_A_RExt`, and
-`ExplicitRdpcm_A`. All 15 official SCC bitstreams parse end to end
-(round 444 §7.3.8.10 ACT-gate fix); their reconstruction is not yet
-byte-exact. The complete official **SHVC (Annex H scalable)
+`ExplicitRdpcm_A` — and the complete 15-stream **SCC branch** (round
+487; 0 of 15 before it): palette mode with predictor initializers and
+palette sizes 0 and 1, intra block copy / current-picture referencing
+in P and B pictures, the adaptive colour transform with slice-level
+QP offsets, adaptive motion vector resolution, the 8x8 bi-prediction
+restriction, intra boundary filter control and the screen-extended
+high-throughput 4:4:4 profiles at 8 / 10 bits and extended precision:
+
+| SCC stream | content | result |
+|---|---|---|
+| `Bipred_8by8_A` | 416x240 4:2:0, 3 pictures, 8x8 bi-prediction restriction | byte-exact |
+| `DPB_Loop_Filters_A` | 1280x720 4:4:4, 10 pictures, loop filters off mid-stream | byte-exact |
+| `Delta_QP_Chroma_QP_Offsets_A` | 1280x720 4:4:4, CU QP deltas + chroma QP offset lists | byte-exact |
+| `HT_A` / `HT_B` / `HT_C` | high-throughput 4:4:4 at 10 bits (1920x1080), 8 bits, 8 bits with extended precision | byte-exact |
+| `IBF_Disabled_A` / `_B` | 4:4:4 / 4:2:0, 33 pictures each, intra boundary filtering disabled | byte-exact |
+| `MVRESIDC_A` / `_B` / `_C` | `motion_vector_resolution_control_idc` 0 / 1 / 2 | byte-exact |
+| `PPI_A` / `_B` | 4:4:4 / 4:2:0, 33 pictures each, SPS + PPS palette predictor initializers | byte-exact |
+| `Slice_ACT_QP_Offsets_A` | 4:4:4 G / B / R planes, adaptive colour transform QP offsets | byte-exact |
+| `Zero_and_One_Palette_Size_A` | 1920x1080 4:4:4, palettes of 0 and 1 entries | byte-exact |
+
+Each is checked against the digest its own sidecar publishes; the 14
+whose decoded pictures are staged also match those sample for sample
+(`examples/yuv_diff.rs` reports the first differing picture, plane and
+block). Three decoder defects stood between the parse-clean state and
+this: a palette coding unit's samples were deblocked (§8.7.2.5.7 /
+§8.7.2.5.8 set `nDp` / `nDq` to 0 on a palette side, while §8.7.3.1
+SAO still applies to it — the suppression map now carries the two
+cases apart); the `delta_qp( )` coded inside `palette_coding( )` was
+dropped for palette units of P / B pictures, scaling their escape
+samples at the predicted QP; and the §8.5.3.2.1 bi-to-uni restriction
+for 8x8 prediction blocks also fired on the 4x16 / 12x16 blocks of a
+16x16 asymmetric coding unit (eqs 8-86 / 8-87 give `nCbS / 2` in both
+directions for those; the conformance decode shows the rule is about
+the block's own size).
+The complete official **SHVC (Annex H scalable)
 conformance set** — 70 streams, spatial / SNR / colour-gamut /
 hybrid scalability — decodes every layer byte-exact, 161 of 162
 stream / output-layer-set pairs (round 481, `tests/shvc_conformance.rs`).
@@ -704,18 +736,6 @@ and ~985 unit tests.
   (The r413/r437 "±1 chroma artifact under investigation" notes are
   retired: the divergence was the round-444 §8.5.4.3 phantom
   stacked-half bug, and `ExplicitRdpcm_A` is now byte-exact.)
-* Official-corpus families not yet byte-exact (the 15 SCC streams):
-  every SCC bitstream parses end to end (round 444 closed the
-  §7.3.8.10 ACT-gate CABAC desync), and the decoded pictures are
-  visually clean, but reconstruction diverges from the published
-  per-frame hashes starting at the first picture — before the loop
-  filters, in pictures whose only non-validated tools are intra
-  block copy and the SCC glue. Round-444 elimination notes: the
-  §8.5.3.3.3 MC math, eq. 8-124/8-125 merge rounding, chroma-QP /
-  scaling-list / WP paths and the loop-filter stages all self-check
-  clean against the Recommendation text; localizing further needs
-  per-region ground truth that the corpus sidecars (whole-plane
-  MD5s) do not provide.
 
 ## License
 

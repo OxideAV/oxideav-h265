@@ -79,7 +79,8 @@ mod md5 {
     }
 }
 
-/// The streams pinned byte-exact (rounds 437 + 441 + 444). `branch/stem` form.
+/// The streams pinned byte-exact (rounds 437 + 441 + 444: the RExt
+/// branch; round 487: the SCC branch). `branch/stem` form.
 const EXPECTED_PASS: &[&str] = &[
     "RExt/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2",
     "RExt/Bitdepth_A_RExt_Sony_1",
@@ -127,6 +128,21 @@ const EXPECTED_PASS: &[&str] = &[
     "RExt/WPP_AND_TILE_AND_CABAC_EXT_PREC_1_HIGH_TP_444_14BIT_RExt_Apple_2",
     "RExt/WPP_AND_TILE_HIGH_TP_444_8BIT_RExt_Apple_2",
     "RExt/WPP_HIGH_TP_444_8BIT_RExt_Apple_2",
+    "SCC/Bipred_8by8_A_Qualcomm_2",
+    "SCC/DPB_Loop_Filters_A_MediaTek_2",
+    "SCC/Delta_QP_Chroma_QP_Offsets_A_Qualcomm_2",
+    "SCC/HT_A_SCC_Apple_2",
+    "SCC/HT_B_SCC_Apple_3",
+    "SCC/HT_C_SCC_Apple_3",
+    "SCC/IBF_Disabled_A_MediaTek_2",
+    "SCC/IBF_Disabled_B_MediaTek_2",
+    "SCC/MVRESIDC_A_MS_2",
+    "SCC/MVRESIDC_B_MS_2",
+    "SCC/MVRESIDC_C_MS_3",
+    "SCC/PPI_A_InterDigital_2",
+    "SCC/PPI_B_InterDigital_2",
+    "SCC/Slice_ACT_QP_Offsets_A_Qualcomm_2",
+    "SCC/Zero_and_One_Palette_Size_A_Canon_2",
 ];
 
 fn conformance_dir() -> Option<PathBuf> {
@@ -182,16 +198,28 @@ fn stream_is_byte_exact(dir: &Path, spec: &str) -> bool {
     let frames = decode_annexb_sequence(&data).unwrap_or_else(|e| panic!("{spec}: decode: {e}"));
     let mut out8 = Vec::new();
     let mut out16 = Vec::new();
+    // The planes in (Cr, Y, Cb) order: a stream coding G, B, R planes
+    // publishes the digest of its output written as R, G, B
+    // (`Slice_ACT_QP_Offsets_A`, per its description file).
+    let mut out8_rgb = Vec::new();
     let mut all8 = true;
     for f in &frames {
         if let Some(p) = f.picture.to_planar_u8() {
+            let luma = f.picture.width_luma() * f.picture.height_luma();
+            if p.len() == 3 * luma {
+                out8_rgb.extend_from_slice(&p[2 * luma..]);
+                out8_rgb.extend_from_slice(&p[..2 * luma]);
+            }
             out8.extend(p);
         } else {
             all8 = false;
         }
         out16.extend(f.picture.to_planar_le16());
     }
-    (all8 && digests.contains(&md5::hex(&out8))) || digests.contains(&md5::hex(&out16))
+    (all8
+        && (digests.contains(&md5::hex(&out8))
+            || (out8_rgb.len() == out8.len() && digests.contains(&md5::hex(&out8_rgb)))))
+        || digests.contains(&md5::hex(&out16))
 }
 
 /// Every stream in [`EXPECTED_PASS`] decodes byte-exact to a digest
@@ -246,9 +274,8 @@ fn decode_threaded(data: &[u8], threads: usize) -> Result<Vec<DecodedFrame>, Str
 /// Every staged RExt / SCC stream the serial decoder decodes decodes
 /// to the same frames (order, POC, samples) under thread budgets 2 / 4
 /// / 8 — frame threading, plus the WPP / tile paths a flush takes.
-/// The serial decode is the reference whether or not the stream is
-/// pinned byte-exact (an SCC stream that self-references runs its
-/// in-loop filters after the whole picture). Skipped when the corpus
+/// The serial decode is the reference (an SCC stream that
+/// self-references runs its in-loop filters after the whole picture). Skipped when the corpus
 /// is not staged; a debug build checks the small streams only.
 #[test]
 fn staged_conformance_streams_decode_identically_under_any_budget() {

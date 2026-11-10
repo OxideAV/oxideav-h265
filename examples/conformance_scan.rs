@@ -267,9 +267,17 @@ fn scan_branch(branch_dir: &Path, filter: &str, summary: &mut String) -> (usize,
                 let n = frames.len();
                 let mut out8 = Vec::new();
                 let mut out16 = Vec::new();
+                // (Cr, Y, Cb) plane order: the R, G, B output of a
+                // stream that codes G, B, R planes.
+                let mut out8_rgb = Vec::new();
                 let mut all8 = true;
                 for f in &frames {
                     if let Some(p) = f.picture.to_planar_u8() {
+                        let luma = f.picture.width_luma() * f.picture.height_luma();
+                        if p.len() == 3 * luma {
+                            out8_rgb.extend_from_slice(&p[2 * luma..]);
+                            out8_rgb.extend_from_slice(&p[..2 * luma]);
+                        }
                         out8.extend(p);
                     } else {
                         all8 = false;
@@ -289,6 +297,12 @@ fn scan_branch(branch_dir: &Path, filter: &str, summary: &mut String) -> (usize,
                 } else if digests.contains(&d16) {
                     pass += 1;
                     format!("PASS16 {stem}: {n} frames")
+                } else if all8
+                    && out8_rgb.len() == out8.len()
+                    && digests.contains(&md5::hex(&out8_rgb))
+                {
+                    pass += 1;
+                    format!("PASS8  {stem}: {n} frames (planes written as R, G, B)")
                 } else {
                     // Frame-level triage against the stream's own
                     // decoded-picture-hash SEI messages (order-free

@@ -217,7 +217,7 @@ struct RowSink<'a> {
     cb: &'a mut [u16],
     cr: &'a mut [u16],
     qp: &'a mut [i8],
-    no_filter: &'a mut [bool],
+    no_filter: &'a mut [u8],
     motion_flags: &'a mut [u8],
     motion: Option<&'a mut [crate::motion::CellMotion]>,
     sao: &'a mut [crate::sao::ResolvedSao],
@@ -232,7 +232,7 @@ pub(super) struct MergedPicture {
     pub pic: Picture,
     pub field: MotionField,
     pub qp_cells: Vec<i8>,
-    pub no_filter: Vec<bool>,
+    pub no_filter: Vec<u8>,
     pub edges: crate::deblock::DeblockEdgeMap,
     pub sao: Vec<crate::sao::ResolvedSao>,
     pub slice_addr: Vec<u32>,
@@ -269,7 +269,7 @@ pub(super) fn decode_rows(
     );
     let mut field = MotionField::new(width, height);
     let mut qp_cells = vec![0i8; w4 * height.div_ceil(4)];
-    let mut no_filter = vec![false; w4 * height.div_ceil(4)];
+    let mut no_filter = vec![0; w4 * height.div_ceil(4)];
     let edges = Mutex::new(crate::deblock::DeblockEdgeMap::new(width, height));
     let mut sao = vec![crate::sao::ResolvedSao::off(); w_ctbs * h_ctbs];
     let mut slice_addr = vec![0u32; w_ctbs * h_ctbs];
@@ -1137,7 +1137,7 @@ pub(super) fn decode_tiles(
         ),
         field: MotionField::new(width, height),
         qp_cells: vec![0i8; w4 * height.div_ceil(4)],
-        no_filter: vec![false; w4 * height.div_ceil(4)],
+        no_filter: vec![0; w4 * height.div_ceil(4)],
         edges: crate::deblock::DeblockEdgeMap::new(width, height),
         sao: vec![crate::sao::ResolvedSao::off(); w_ctbs * h_ctbs],
         slice_addr: vec![0u32; w_ctbs * h_ctbs],
