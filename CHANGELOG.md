@@ -6,6 +6,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- *(decoder)* **Output of an enhancement layer that is not initialized
+  yet.** F.8.1.3 initializes a `nuh_layer_id > 0` layer at its first
+  IRAP picture whose reference layers are initialized, and F.8.1.6
+  withholds every earlier picture of the layer from output; a consumer
+  holding exactly the access unit it wants shown (an image item whose
+  enhancement picture is a non-IRAP picture predicted from its base
+  picture) can now ask for those pictures:
+  `SequenceDecoder::set_output_uninitialized_layers(bool)` (+ the
+  `output_uninitialized_layers()` getter) on the direct API, the
+  `output_uninitialized_layers` codec option (boolean) on the
+  registry. Off by default — the conforming output is unchanged — and
+  the layer selection still decides which layers are output layers.
+- *(decoder)* `H265DecoderOptions` — the typed form of the decoder's
+  codec options (`layer`, `view`, `ols`, `output_uninitialized_layers`;
+  `#[non_exhaustive]`, `new()` + `with_*` builders,
+  `from_codec_options`), its `CodecOptionsStruct` schema declared on
+  the registry entry (`CodecInfo::decoder_options`), and
+  `make_decoder_with_options(&CodecParameters, &H265DecoderOptions)`
+  next to `make_decoder`, which keeps reading the string bag (unknown
+  keys ignored as before; a boolean now also reads `yes` / `on` /
+  `no` / `off`).
+- *(decoder)* F.8.1.7: the first picture of a non-base layer (and,
+  with the option above, every picture of a layer still
+  uninitialized) takes §8.3.3.2 generated pictures — mid-range
+  samples, intra prediction mode — for the reference picture set
+  entries the layer never decoded, so a layer entered at a non-IRAP
+  picture decodes instead of failing on a missing reference.
+- *(fuzz)* `layered_decode` target: a multi-layer Annex B stream
+  through the registry decoder under an option byte (the output
+  option, the three layer selectors, one packet per stream or per NAL
+  unit), seeded with the SHVC 2x stream in its IDR and TRAIL_R
+  enhancement forms and the MV-HEVC stereo stream.
+
 ### Fixed
 
 - *(decoder)* A VPS, SPS or PPS whose RBSP ends right before its

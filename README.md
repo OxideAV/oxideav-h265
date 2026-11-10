@@ -559,7 +559,15 @@ frame.
   output layer set outputs — the layer selected by `layer=` / `view=`
   when one is); frames of a lower output layer keep their own plane
   geometry, and alternating between layers inside an access unit
-  sequence is not a change. A stream with an external base layer
+  sequence is not a change. A layer entered at a non-IRAP picture is
+  decoded (F.8.1.7 generated pictures standing in for the references
+  it never decoded) but, per F.8.1.6, not output until its next IRAP
+  picture initializes it; the `output_uninitialized_layers` option
+  (`SequenceDecoder::set_output_uninitialized_layers`,
+  `H265DecoderOptions::with_output_uninitialized_layers` with
+  `make_decoder_with_options`) outputs those pictures too — what a
+  layered image item whose enhancement picture is a non-IRAP picture
+  needs. A stream with an external base layer
   (`vps_base_layer_internal_flag` 0, F.8.1.8 hybrid scalability) takes
   its base pictures from `SequenceDecoder::set_external_base_layer`.
 * **Hostile input never panics** (round 474, from a crash a HEIF
@@ -580,11 +588,17 @@ frame.
   `log2_max_transform_skip_block_size_minus2`, `SliceQpY`). The
   registry decoder reaches its flushed state even when the last
   picture fails, so `receive_frame` answers `Eof` rather than
-  `NeedMore` forever. Three fuzz targets run nightly: `parse_annexb`
+  `NeedMore` forever. A VPS / SPS / PPS whose RBSP stops right before
+  its extension gate (§7.2 `more_rbsp_data( )` FALSE at
+  `vps_extension_flag` / `sps_extension_present_flag` /
+  `pps_extension_present_flag`) decodes with the gate taken as 0.
+  Four fuzz targets run nightly: `parse_annexb`
   (parameter sets, slice headers, SEI), `decode_residual` (§7.3.8.11
-  on a bin stream) and `hvcc_decode` (the HEIF / ISO-BMFF carriage —
+  on a bin stream), `hvcc_decode` (the HEIF / ISO-BMFF carriage —
   `hvcC` record + length-prefixed access unit — through the registry
-  decoder, seeded with real-world stills and inter-coded GOPs);
+  decoder, seeded with real-world stills and inter-coded GOPs) and
+  `layered_decode` (multi-layer streams under the layer-selection and
+  output options);
   `tests/hostile_cabac.rs` pins every input they found.
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
   bodies), VUI + HRD (§E.2), SEI (§7.3.5 framing; typed §D.2

@@ -19,8 +19,9 @@ use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Decoder, Error, Frame, LayerIdentity, LayerInfo, Packet, Result,
-    VideoFrame, VideoPlane,
+    CodecId, CodecOptions, CodecOptionsStruct, CodecParameters, Decoder, Error, Frame,
+    LayerIdentity, LayerInfo, OptionField, OptionKind, OptionValue, Packet, Result, VideoFrame,
+    VideoPlane, parse_options,
 };
 
 use crate::hvcc::{
@@ -88,6 +89,145 @@ impl std::fmt::Debug for H265Decoder {
     }
 }
 
+/// The decoder's options: the typed form of the `CodecParameters::
+/// options` keys [`make_decoder`] reads, and the argument of
+/// [`make_decoder_with_options`]. All of them concern multi-layer
+/// (Annex F / G / H) streams; a single-layer stream ignores them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct H265DecoderOptions {
+    /// `layer`: decode the layer with this `nuh_layer_id` (0..=63) plus
+    /// its reference layers, and output it alone.
+    pub layer: Option<u32>,
+    /// `view`: as `layer`, selecting the layer that carries this
+    /// Annex G `ViewId` (0..=65535). Ignored when `layer` is set.
+    pub view: Option<u32>,
+    /// `ols`: decode and output this output layer set. Ignored when
+    /// `layer` or `view` is set.
+    pub ols: Option<u32>,
+    /// `output_uninitialized_layers`: also output the pictures of an
+    /// enhancement layer whose `LayerInitializedFlag` is still 0 — a
+    /// layer entered at a non-IRAP picture, which F.8.1.6 decodes
+    /// without output until the layer's next IRAP picture. Off by
+    /// default. See
+    /// [`SequenceDecoder::set_output_uninitialized_layers`].
+    pub output_uninitialized_layers: bool,
+}
+
+impl H265DecoderOptions {
+    /// The defaults: the highest output layer set, conforming output.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set [`Self::layer`].
+    #[must_use]
+    pub fn with_layer(mut self, nuh_layer_id: u32) -> Self {
+        self.layer = Some(nuh_layer_id);
+        self
+    }
+
+    /// Set [`Self::view`].
+    #[must_use]
+    pub fn with_view(mut self, view_id: u32) -> Self {
+        self.view = Some(view_id);
+        self
+    }
+
+    /// Set [`Self::ols`].
+    #[must_use]
+    pub fn with_ols(mut self, ols_idx: u32) -> Self {
+        self.ols = Some(ols_idx);
+        self
+    }
+
+    /// Set [`Self::output_uninitialized_layers`].
+    #[must_use]
+    pub fn with_output_uninitialized_layers(mut self, enabled: bool) -> Self {
+        self.output_uninitialized_layers = enabled;
+        self
+    }
+
+    /// The options a `CodecParameters::options` bag states; keys this
+    /// decoder does not know are left alone.
+    ///
+    /// # Errors
+    /// [`Error::InvalidData`] when a known key holds a malformed value.
+    pub fn from_codec_options(options: &CodecOptions) -> Result<Self> {
+        let mut known = CodecOptions::new();
+        for (k, v) in options.iter() {
+            if Self::SCHEMA.iter().any(|f| f.name == k) {
+                known.insert(k, v);
+            }
+        }
+        parse_options::<Self>(&known).map_err(|e| Error::InvalidData(format!("h265 decode: {e}")))
+    }
+
+    fn layer_target(&self) -> Result<LayerTarget> {
+        Ok(match (self.layer, self.view, self.ols) {
+            (Some(l), _, _) if l < 64 => LayerTarget::Layer(l as u8),
+            (Some(l), _, _) => {
+                return Err(Error::InvalidData(format!(
+                    "h265 decode: layer must be 0..=63, got {l}"
+                )));
+            }
+            (None, Some(v), _) if v <= u32::from(u16::MAX) => LayerTarget::View(v as u16),
+            (None, Some(v), _) => {
+                return Err(Error::InvalidData(format!(
+                    "h265 decode: view must be 0..=65535, got {v}"
+                )));
+            }
+            (None, None, Some(o)) => LayerTarget::Ols(o as usize),
+            (None, None, None) => LayerTarget::HighestOls,
+        })
+    }
+}
+
+impl CodecOptionsStruct for H265DecoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "layer",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "multi-layer: decode this nuh_layer_id (0..=63) and its reference layers, output it alone (unset: the highest output layer set)",
+        },
+        OptionField {
+            name: "view",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "multi-layer: as layer, for the layer carrying this ViewId (unset: the highest output layer set)",
+        },
+        OptionField {
+            name: "ols",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "multi-layer: decode and output this output layer set (unset: the highest one)",
+        },
+        OptionField {
+            name: "output_uninitialized_layers",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "multi-layer: also output the pictures of an enhancement layer not initialized yet (entered at a non-IRAP picture)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        match key {
+            "layer" => self.layer = Some(value.as_u32()?),
+            "view" => self.view = Some(value.as_u32()?),
+            "ols" => self.ols = Some(value.as_u32()?),
+            "output_uninitialized_layers" => {
+                self.output_uninitialized_layers = value.as_bool()?;
+            }
+            other => {
+                return Err(Error::InvalidData(format!("unknown option '{other}'")));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Direct factory endpoint: construct the software H.265 decoder.
 ///
 /// The `extradata` form selects the packet framing: an `hvcC`
@@ -108,6 +248,13 @@ impl std::fmt::Debug for H265Decoder {
 /// every one of its output layers is emitted — the frames of one access
 /// unit come out consecutively in increasing `nuh_layer_id` order (the
 /// base view first, then the second view).
+/// `output_uninitialized_layers` (a boolean; default off) also emits the pictures of an
+/// enhancement layer that is not initialized yet — a layer entered at
+/// a non-IRAP picture, which F.8.1.6 otherwise decodes without output
+/// ([`SequenceDecoder::set_output_uninitialized_layers`]).
+/// [`H265DecoderOptions`] is the typed form of these keys (its schema
+/// is declared on the registry entry); keys it does not list are
+/// ignored.
 ///
 /// Output description: `output_params` answers from the parameter sets
 /// before the first frame, then describes the frames returned. A new
@@ -125,34 +272,24 @@ impl std::fmt::Debug for H265Decoder {
 /// [`Error::InvalidData`] when the `extradata` or an option fails to
 /// parse.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let options = H265DecoderOptions::from_codec_options(&params.options)?;
+    make_decoder_with_options(params, &options)
+}
+
+/// [`make_decoder`] with the options given in typed form: `options`
+/// replaces whatever `params.options` holds.
+///
+/// # Errors
+/// [`Error::InvalidData`] when the `extradata` fails to parse or an
+/// option is out of range.
+pub fn make_decoder_with_options(
+    params: &CodecParameters,
+    options: &H265DecoderOptions,
+) -> Result<Box<dyn Decoder>> {
     let mut seq = SequenceDecoder::new();
     let mut nal_length_size = None;
-    let parse_u32 = |key: &str| -> Result<Option<u32>> {
-        match params.options.get(key) {
-            None => Ok(None),
-            Some(v) => v.parse::<u32>().map(Some).map_err(|_| {
-                Error::InvalidData(format!("h265 decode: {key} must be an integer, got {v:?}"))
-            }),
-        }
-    };
-    let (layer, view, ols) = (parse_u32("layer")?, parse_u32("view")?, parse_u32("ols")?);
-    let target = match (layer, view, ols) {
-        (Some(l), _, _) if l < 64 => LayerTarget::Layer(l as u8),
-        (Some(l), _, _) => {
-            return Err(Error::InvalidData(format!(
-                "h265 decode: layer must be 0..=63, got {l}"
-            )));
-        }
-        (None, Some(v), _) if v <= u32::from(u16::MAX) => LayerTarget::View(v as u16),
-        (None, Some(v), _) => {
-            return Err(Error::InvalidData(format!(
-                "h265 decode: view must be 0..=65535, got {v}"
-            )));
-        }
-        (None, None, Some(o)) => LayerTarget::Ols(o as usize),
-        (None, None, None) => LayerTarget::HighestOls,
-    };
-    seq.set_layer_target(target);
+    seq.set_layer_target(options.layer_target()?);
+    seq.set_output_uninitialized_layers(options.output_uninitialized_layers);
     if !params.extradata.is_empty() {
         if extradata_is_hvcc(&params.extradata) {
             // hvcC record: out-of-band VPS/SPS/PPS (+ SEI) arrays,

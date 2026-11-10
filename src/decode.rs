@@ -121,6 +121,48 @@ pub struct LayeredPictureInputs {
     pub inter_layer0: Vec<Option<usize>>,
     /// `RefPicSetInterLayer1`.
     pub inter_layer1: Vec<Option<usize>>,
+    /// The sample format of this picture when the F.8.1.7 process
+    /// applies to it (a `nuh_layer_id > 0` picture decoded before its
+    /// layer has a usable reference chain): every RPS entry that
+    /// resolves to "no reference picture" is replaced by an §8.3.3.2
+    /// generated picture of this format. `None` leaves such entries
+    /// unresolved.
+    pub generate_unavailable: Option<UnavailableFormat>,
+}
+
+/// The geometry of an §8.3.3.2 generated ("unavailable") picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnavailableFormat {
+    /// `pic_width_in_luma_samples`.
+    pub width: usize,
+    /// `pic_height_in_luma_samples`.
+    pub height: usize,
+    /// `ChromaArrayType`.
+    pub chroma_array_type: u8,
+    /// `BitDepthY`.
+    pub bit_depth_luma: u8,
+    /// `BitDepthC`.
+    pub bit_depth_chroma: u8,
+}
+
+impl UnavailableFormat {
+    /// §8.3.3.2: every sample at mid-range (`1 << ( BitDepth − 1 )`),
+    /// every prediction mode `MODE_INTRA`.
+    fn generate(&self) -> (Picture, std::sync::Arc<MotionField>) {
+        let mut picture = Picture::new(
+            self.width,
+            self.height,
+            self.chroma_array_type,
+            self.bit_depth_luma,
+            self.bit_depth_chroma,
+        );
+        let (luma, cb, cr) = picture.planes_mut();
+        luma.fill(1 << (self.bit_depth_luma - 1));
+        cb.fill(1 << (self.bit_depth_chroma - 1));
+        cr.fill(1 << (self.bit_depth_chroma - 1));
+        let motion = std::sync::Arc::new(MotionField::new(self.width, self.height));
+        (picture, motion)
+    }
 }
 
 /// The cross-picture decode state for one coded video sequence.
@@ -226,9 +268,41 @@ impl PictureSequenceState {
             &header.long_term,
         );
         let is_irap_no_rasl = header.nal_kind.is_irap() && header.no_rasl_output;
-        let rps = self
-            .dpb
-            .apply_rps(is_irap_no_rasl, header.layer_id, &lists, header.max_poc_lsb);
+        let mut rps =
+            self.dpb
+                .apply_rps(is_irap_no_rasl, header.layer_id, &lists, header.max_poc_lsb);
+        // F.8.1.7: generated pictures stand in for the references the
+        // layer never decoded.
+        if let Some(format) = layered.generate_unavailable {
+            let mut template = None;
+            let sets = [
+                (&mut rps.st_curr_before, &lists.st_curr_before, false),
+                (&mut rps.st_curr_after, &lists.st_curr_after, false),
+                (&mut rps.st_foll, &lists.st_foll, false),
+                (&mut rps.lt_curr, &lists.lt_curr, true),
+                (&mut rps.lt_foll, &lists.lt_foll, true),
+            ];
+            for (set, pocs, long_term) in sets {
+                for (slot, &poc) in set.iter_mut().zip(pocs.iter()) {
+                    if slot.is_some() {
+                        continue;
+                    }
+                    let (picture, motion) = template.get_or_insert_with(|| format.generate());
+                    *slot = Some(self.dpb.len());
+                    self.dpb.insert(DpbEntry {
+                        poc,
+                        layer_id: header.layer_id,
+                        marking: if long_term {
+                            Marking::LongTerm
+                        } else {
+                            Marking::ShortTerm
+                        },
+                        picture: picture.clone(),
+                        motion: motion.clone(),
+                    });
+                }
+            }
+        }
 
         // Step 3 — §8.3.4 reference picture lists (P / B only).
         let ref_pic_lists = if slice.is_inter {

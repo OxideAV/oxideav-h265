@@ -379,7 +379,7 @@ pub use deblock::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use decode::{PictureHeaderInfo, PictureRefState, PictureSequenceState, SliceRefParams};
-pub use decoder::{H265Decoder, make_decoder};
+pub use decoder::{H265Decoder, H265DecoderOptions, make_decoder, make_decoder_with_options};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use dpb::{
@@ -615,6 +615,7 @@ pub fn register(ctx: &mut RuntimeContext) {
         ctx.codecs.register(
             CodecInfo::new(id.into())
                 .decoder(decoder::make_decoder)
+                .decoder_options::<decoder::H265DecoderOptions>()
                 .encoder(encoder::make_encoder)
                 .tags([
                     CodecTag::fourcc(b"hvc1"),

@@ -208,17 +208,29 @@ fn write_pps_layer1() -> Vec<u8> {
 /// `nuh_layer_id == 1`: `slice_pic_order_cnt_lsb` present, no
 /// inter-layer syntax under `default_ref_layers_active_flag`) whose
 /// every CTB is a skip CU.
-fn encode_skip_p_slice_layer1(width: usize, height: usize) -> Vec<u8> {
+///
+/// With `trailing` the picture is coded as a TRAIL_R picture instead —
+/// the same slice data behind a non-IRAP header with an empty inline
+/// `st_ref_pic_set( )`: an enhancement layer entered at a non-IRAP
+/// picture, predicted from its base picture alone.
+fn encode_skip_p_slice_layer1(width: usize, height: usize, trailing: bool) -> Vec<u8> {
     let ctbs_x = width / CTB;
     let ctbs_y = height / CTB;
     let mut w = BitWriter::new();
     // ---- slice_segment_header( ) ----
     w.put_bit(1); // first_slice_segment_in_pic_flag
-    w.put_bit(0); // no_output_of_prior_pics_flag (IRAP)
+    if !trailing {
+        w.put_bit(0); // no_output_of_prior_pics_flag (IRAP)
+    }
     w.ue(1); // slice_pic_parameter_set_id
     w.ue(1); // slice_type = P
     w.put_bits(0, 8); // slice_pic_order_cnt_lsb (nuh_layer_id > 0)
     // IDR: no reference picture set block.
+    if trailing {
+        w.put_bit(0); // short_term_ref_pic_set_sps_flag
+        w.ue(0); // num_negative_pics
+        w.ue(0); // num_positive_pics
+    }
     w.put_bit(0); // num_ref_idx_active_override_flag
     w.ue(4); // five_minus_max_num_merge_cand (MaxNumMergeCand = 1)
     w.se(0); // slice_qp_delta
@@ -243,6 +255,12 @@ fn encode_skip_p_slice_layer1(width: usize, height: usize) -> Vec<u8> {
 /// the base layer 32x32, the enhancement layer 64x64 (2:1 spatial
 /// scalability, no reference layer offsets).
 pub(crate) fn build_shvc_2x_stream() -> (Vec<u8>, Planes) {
+    build_shvc_2x_stream_as(false)
+}
+
+/// [`build_shvc_2x_stream`] with the enhancement picture coded as an
+/// IDR_N_LP picture (`trailing == false`) or as a TRAIL_R picture.
+pub(crate) fn build_shvc_2x_stream_as(trailing: bool) -> (Vec<u8>, Planes) {
     let (bw, bh) = (32usize, 32usize);
     let (ew, eh) = (64usize, 64usize);
     let (y, cb, cr) = source_planes(bw, bh);
@@ -269,7 +287,12 @@ pub(crate) fn build_shvc_2x_stream() -> (Vec<u8>, Planes) {
     // the same access unit.
     units.push(nal_unit(33, 1, 0, &write_sps_layer1(ew, eh)));
     units.push(nal_unit(34, 1, 0, &write_pps_layer1()));
-    units.push(nal_unit(20, 1, 0, &encode_skip_p_slice_layer1(ew, eh)));
+    units.push(nal_unit(
+        if trailing { 1 } else { 20 },
+        1,
+        0,
+        &encode_skip_p_slice_layer1(ew, eh, trailing),
+    ));
     (annexb(&units), (y, cb, cr))
 }
 
@@ -327,5 +350,127 @@ mod tests {
         let only = dec.finish().unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].layer_id, 0);
+    }
+
+    /// F.8.1.3 / F.8.1.6: an enhancement layer entered at a non-IRAP
+    /// picture is not initialized, so its pictures decode without being
+    /// output — unless the caller asks for them
+    /// (`set_output_uninitialized_layers`, the registry's
+    /// `output_uninitialized_layers` option). The samples are the same
+    /// either way: here the resampled base picture.
+    #[test]
+    fn uninitialized_enhancement_layer_is_output_only_on_request() {
+        let (stream, _) = build_shvc_2x_stream_as(true);
+        let (idr_stream, _) = build_shvc_2x_stream();
+        if std::env::var_os("H265_REGEN_FIXTURES").is_some() {
+            // The fuzz seeds of the `layered_decode` target: an option
+            // byte, then the stream.
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/layered_decode");
+            std::fs::create_dir_all(dir).expect("seed dir");
+            for (name, opt, bytes) in [
+                ("seed-shvc-2x-idr", 0u8, &idr_stream),
+                ("seed-shvc-2x-trail", 1u8, &stream),
+                ("seed-shvc-2x-trail-per-nal", 9u8, &stream),
+            ] {
+                let mut seed = vec![opt];
+                seed.extend_from_slice(bytes);
+                std::fs::write(format!("{dir}/{name}"), seed).expect("write seed");
+            }
+        }
+        let reference = decode_annexb_sequence(&idr_stream).expect("IDR form");
+
+        // Default: decoded, not output.
+        let frames = decode_annexb_sequence(&stream).expect("decode");
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].layer_id, frames[1].layer_id), (0, 1));
+        assert!(frames[0].output, "the base layer is output");
+        assert!(!frames[1].output, "F.8.1.6: LayerInitializedFlag[ 1 ] is 0");
+        assert_eq!(frames[1].picture, reference[1].picture);
+
+        // On request: output, same samples.
+        let mut dec = SequenceDecoder::new();
+        assert!(!dec.output_uninitialized_layers());
+        dec.set_output_uninitialized_layers(true);
+        dec.push_annexb(&stream).unwrap();
+        let frames = dec.finish().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].output && frames[1].output);
+        assert_eq!(frames[0].picture, reference[0].picture);
+        assert_eq!(frames[1].picture, reference[1].picture);
+
+        // The option changes nothing for an initialized layer, and the
+        // layer target still selects the output layers.
+        let mut dec = SequenceDecoder::new();
+        dec.set_output_uninitialized_layers(true);
+        dec.push_annexb(&idr_stream).unwrap();
+        let same = dec.finish().unwrap();
+        assert_eq!(same.len(), 2);
+        assert!(
+            same.iter()
+                .zip(&reference)
+                .all(|(a, b)| a.output == b.output && a.picture == b.picture)
+        );
+        let mut dec = SequenceDecoder::new();
+        dec.set_output_uninitialized_layers(true);
+        dec.set_layer_target(LayerTarget::Layer(0));
+        dec.push_annexb(&stream).unwrap();
+        let only = dec.finish().unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].layer_id, 0);
+    }
+
+    /// The same through the registry decoder: the string option and the
+    /// typed options agree, and a malformed value is refused.
+    #[test]
+    fn registry_option_outputs_the_uninitialized_layer() {
+        use crate::decoder::{H265DecoderOptions, make_decoder, make_decoder_with_options};
+        use oxideav_core::{CodecParameters, Error, Frame, Packet, TimeBase};
+
+        let (stream, _) = build_shvc_2x_stream_as(true);
+        let run = |mut dec: Box<dyn oxideav_core::Decoder>| -> Vec<(u16, usize)> {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream.clone()))
+                .expect("send");
+            dec.flush().expect("flush");
+            let mut out = Vec::new();
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Video(v)) => {
+                        let layer = v.layer().map_or(0, |l| l.layer_id);
+                        out.push((layer, v.planes[0].data.len()));
+                    }
+                    Ok(_) => {}
+                    Err(Error::Eof) => break,
+                    Err(e) => panic!("receive: {e}"),
+                }
+            }
+            out
+        };
+        let plain = CodecParameters::video("h265".into());
+        assert_eq!(run(make_decoder(&plain).unwrap()), vec![(0, 32 * 32)]);
+
+        let both = vec![(0, 32 * 32), (1, 64 * 64)];
+        for value in ["1", "true"] {
+            let mut params = CodecParameters::video("h265".into());
+            params.options = params.options.set("output_uninitialized_layers", value);
+            assert_eq!(run(make_decoder(&params).unwrap()), both, "{value}");
+        }
+        let typed = H265DecoderOptions::new().with_output_uninitialized_layers(true);
+        assert_eq!(
+            run(make_decoder_with_options(&plain, &typed).unwrap()),
+            both
+        );
+        let layer1 = typed.clone().with_layer(1);
+        assert_eq!(
+            run(make_decoder_with_options(&plain, &layer1).unwrap()),
+            vec![(1, 64 * 64)]
+        );
+
+        let mut params = CodecParameters::video("h265".into());
+        params.options = params.options.set("output_uninitialized_layers", "maybe");
+        assert!(make_decoder(&params).is_err());
+        // Keys the decoder does not know are left alone.
+        let mut params = CodecParameters::video("h265".into());
+        params.options = params.options.set("some_other_key", "x");
+        assert!(make_decoder(&params).is_ok());
     }
 }

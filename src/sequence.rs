@@ -20,7 +20,7 @@ use crate::availability::{PictureTiling, TilingParams};
 use crate::bitreader::BitReader;
 use crate::cabac::{CabacEngine, init_type};
 use crate::ctx_init::SliceContexts;
-use crate::decode::LayeredPictureInputs;
+use crate::decode::{LayeredPictureInputs, UnavailableFormat};
 use crate::decode::{PictureHeaderInfo, PictureSequenceState, SliceRefParams};
 use crate::dpb::{DpbEntry, LongTermEntry, Marking, RefPicLists};
 use crate::ilref::{
@@ -468,6 +468,9 @@ pub struct SequenceDecoder {
     layer_scaling: BTreeMap<u8, (Option<ScalingListData>, Option<ScalingListData>)>,
     /// The F.8.1.8 source of external base layer pictures.
     external_base: Option<ExternalBaseSource>,
+    /// Output the pictures of a layer whose `LayerInitializedFlag` is
+    /// still 0 ([`Self::set_output_uninitialized_layers`]).
+    output_uninitialized_layers: bool,
 }
 
 /// One layer of a multi-layer stream ([`SequenceDecoder::layer_structure`]).
@@ -568,6 +571,40 @@ impl SequenceDecoder {
     pub fn set_layer_target(&mut self, target: LayerTarget) {
         self.target = target;
         self.plan = None;
+    }
+
+    /// Output the pictures of an enhancement layer that is not
+    /// initialized yet.
+    ///
+    /// F.8.1.3 sets `LayerInitializedFlag[ nuh_layer_id ]` at the
+    /// layer's first IRAP picture whose reference layers are all
+    /// initialized, and F.8.1.6 sets `PicOutputFlag` to 0 for every
+    /// picture of a `nuh_layer_id > 0` layer decoded before that: a
+    /// layer entered at a non-IRAP picture is decoded but not output
+    /// (`DecodedFrame::output == false`) until its next IRAP. That is
+    /// the default, and what a conforming output order requires.
+    ///
+    /// With `enabled`, such pictures keep their coded `pic_output_flag`
+    /// instead — for a consumer that holds exactly the access unit it
+    /// wants shown, such as an image item whose enhancement-layer
+    /// picture is a non-IRAP picture predicted from its base-layer
+    /// picture alone. The samples are those of the F.8 decoding
+    /// process either way: temporal references the layer never decoded
+    /// are the F.8.1.7 generated pictures (mid-range samples), so a
+    /// picture that really predicts from one shows that prediction;
+    /// inter-layer prediction from the same access unit is unaffected.
+    /// The layer selection ([`LayerTarget`]) still decides which layers
+    /// are output layers; the base layer and single-layer bitstreams
+    /// are unaffected. Takes effect for the pictures pushed after the
+    /// call and survives a reset.
+    pub fn set_output_uninitialized_layers(&mut self, enabled: bool) {
+        self.output_uninitialized_layers = enabled;
+    }
+
+    /// Whether [`Self::set_output_uninitialized_layers`] is on.
+    #[must_use]
+    pub fn output_uninitialized_layers(&self) -> bool {
+        self.output_uninitialized_layers
     }
 
     /// Supply the base layer of a bitstream whose VPS has
@@ -1196,6 +1233,21 @@ impl SequenceDecoder {
                 .header
                 .poc_msb_cycle_val_present_flag
                 .then_some(indep.header.poc_msb_cycle_val),
+            // F.8.1.7: the first picture of a non-base layer takes
+            // generated pictures for the references the layer never
+            // decoded — as does every later picture of a layer still
+            // not initialized when such pictures are output.
+            generate_unavailable: (plan.multi_layer
+                && layer_id > 0
+                && (!lstate.first_pic_decoded
+                    || (self.output_uninitialized_layers && !initialized)))
+                .then(|| UnavailableFormat {
+                    width: geom.width as usize,
+                    height: geom.height as usize,
+                    chroma_array_type: geom.chroma_array_type,
+                    bit_depth_luma: sps.bit_depth_luma(),
+                    bit_depth_chroma: sps.bit_depth_chroma(),
+                }),
             ..LayeredPictureInputs::default()
         };
         // Entries re-marked "used for long-term reference" for this
@@ -1642,7 +1694,8 @@ impl SequenceDecoder {
 
         // F.8.1.6: the inter-layer references go back to their own
         // layer's marking; the picture is output only when its layer is
-        // an output layer of the target and is initialized.
+        // an output layer of the target and is initialized (or the
+        // caller asked for the pictures of uninitialized layers).
         for (idx, marking) in il_marked {
             self.state.dpb_mut().set_marking(idx, marking);
         }
@@ -1651,7 +1704,7 @@ impl SequenceDecoder {
         }
         let output = indep.header.pic_output_flag
             && plan.output.contains(&layer_id)
-            && (layer_id == 0 || initialized);
+            && (layer_id == 0 || initialized || self.output_uninitialized_layers);
         let poc = ref_state.poc;
         let view_id = ext.map_or(0, |e| e.layers.view_id_of(layer_id));
         self.traits

@@ -361,3 +361,54 @@ fn nuh_layer_id_63_units_are_ignored() {
     assert_eq!(md5::hex(&views[0]), VIEW0_MD5);
     assert_eq!(md5::hex(&views[1]), VIEW1_MD5);
 }
+
+/// An enhancement layer entered at a non-IRAP picture (the second
+/// view's IRAP picture removed from the first access unit): F.8.1.7
+/// generates the temporal references the layer never decoded, F.8.1.3
+/// leaves the layer uninitialized and F.8.1.6 withholds its pictures
+/// from output — the base view decodes and is output untouched. With
+/// `set_output_uninitialized_layers` the same pictures are output.
+#[test]
+fn layer_entered_at_non_irap_decodes_without_output_unless_requested() {
+    let units = collect_nal_units(STREAM).expect("nal walk");
+    let mut cut = Vec::new();
+    let mut dropped = 0;
+    for u in &units {
+        let irap = matches!(u.header.nal_unit_type, 16..=23);
+        if u.header.nuh_layer_id == 1 && irap {
+            dropped += 1;
+            continue;
+        }
+        cut.extend_from_slice(&[0, 0, 0, 1]);
+        cut.extend_from_slice(&coded(u));
+    }
+    assert!(dropped > 0, "the second view's IRAP slices were removed");
+
+    let run = |request: bool| {
+        let mut dec = SequenceDecoder::new();
+        dec.set_output_uninitialized_layers(request);
+        dec.push_annexb(&cut).expect("push");
+        dec.finish().expect("finish")
+    };
+    let default = run(false);
+    let base: Vec<u8> = default
+        .iter()
+        .filter(|f| f.layer_id == 0)
+        .flat_map(|f| {
+            assert!(f.output);
+            planar(&f.output_picture())
+        })
+        .collect();
+    assert_eq!(md5::hex(&base), VIEW0_MD5, "base view untouched");
+    let second: Vec<_> = default.iter().filter(|f| f.layer_id == 1).collect();
+    assert_eq!(second.len(), 2, "the two remaining second-view pictures");
+    assert!(second.iter().all(|f| !f.output), "F.8.1.6: not output");
+
+    let requested = run(true);
+    assert_eq!(requested.len(), default.len());
+    for (a, b) in requested.iter().zip(&default) {
+        assert_eq!((a.layer_id, a.poc), (b.layer_id, b.poc));
+        assert!(a.output, "layer {} poc {} is output", a.layer_id, a.poc);
+        assert_eq!(a.picture, b.picture, "same samples either way");
+    }
+}
