@@ -21,7 +21,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   registry. Off by default — the conforming output is unchanged — and
   the layer selection still decides which layers are output layers.
 - *(decoder)* `H265DecoderOptions` — the typed form of the decoder's
-  codec options (`layer`, `view`, `ols`, `output_uninitialized_layers`;
+  codec options (`layer`, `view`, `ols`, `layerset`,
+  `output_uninitialized_layers`;
   `#[non_exhaustive]`, `new()` + `with_*` builders,
   `from_codec_options`), its `CodecOptionsStruct` schema declared on
   the registry entry (`CodecInfo::decoder_options`), and
@@ -29,6 +30,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   next to `make_decoder`, which keeps reading the string bag (unknown
   keys ignored as before; a boolean now also reads `yes` / `on` /
   `no` / `off`).
+- *(decoder)* **Auxiliary layers next to their primary layer:**
+  `LayerTarget::LayerSet(ls_idx)` (the `layerset` codec option,
+  `H265DecoderOptions::with_layer_set`) decodes and outputs every
+  layer of a layer set, whatever its output layer sets select. A VPS
+  with `default_output_layer_idc == 1` makes the highest layer the
+  only output layer — for a stream whose highest layer is an alpha or
+  depth auxiliary layer that does not depend on the primary one, the
+  primary picture is then neither output nor decoded; the layer-set
+  target returns both. It reproduces the one official SHVC picture
+  list the output-layer-set derivation cannot (`ALPHA_A` set 1: the
+  primary and the alpha layer, every row byte-exact).
+- *(sei)* F.14.2.8 `alpha_channel_info` (`payloadType` 165) decodes
+  into `sei::AlphaChannelInfo` (use idc, bit depth, transparent /
+  opaque values, increment and clip flags) with
+  `interpretation_value(sample)` — the F.14.3.8 reading of an alpha
+  auxiliary picture's luma sample as a blending weight.
 - *(decoder)* F.8.1.7: the first picture of a non-base layer (and,
   with the option above, every picture of a layer still
   uninitialized) takes §8.3.3.2 generated pictures — mid-range
@@ -37,7 +54,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   picture decodes instead of failing on a missing reference.
 - *(fuzz)* `layered_decode` target: a multi-layer Annex B stream
   through the registry decoder under an option byte (the output
-  option, the three layer selectors, one packet per stream or per NAL
+  option, the four layer selectors, one packet per stream or per NAL
   unit), seeded with the SHVC 2x stream in its IDR and TRAIL_R
   enhancement forms and the MV-HEVC stereo stream.
 

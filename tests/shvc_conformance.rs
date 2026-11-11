@@ -12,10 +12,12 @@
 //! `HYBRID_A` (an external base layer, F.8.1.8) is fed its staged
 //! reconstructed base layer through
 //! [`SequenceDecoder::set_external_base_layer`]. The one pair left out,
-//! `ALPHA_A_BBC_1` OLS 1, decodes both layers byte-exact (each is
-//! pinned through another output layer set) but its list outputs the
-//! primary layer next to the alpha auxiliary layer, which the
-//! F.7.4.3.1.1 `default_output_layer_idc == 1` derivation does not.
+//! `ALPHA_A_BBC_1` OLS 1, decodes both layers byte-exact but its list
+//! outputs the primary layer next to the alpha auxiliary layer, which
+//! the F.7.4.3.1.1 `default_output_layer_idc == 1` derivation does
+//! not; [`LayerTarget::LayerSet`] — every layer of the layer set,
+//! decoded and output — reproduces that list
+//! (`alpha_layer_set_outputs_primary_and_alpha`).
 //!
 //! Set `SHVC_SWEEP=1` to print the whole-corpus table instead of
 //! checking the pins only. When the staged corpus is not present (CI
@@ -707,4 +709,41 @@ fn sweep(dir: &Path) {
         }
     }
     println!("SWEEP TOTAL {exact}/{total} exact");
+}
+
+/// `ALPHA_A_BBC_1`: a primary layer plus an alpha auxiliary layer
+/// (`AuxId` 1) that does not depend on it. The VPS makes the alpha
+/// layer the one output layer of output layer set 1; the stream's
+/// picture list for that set names both layers.
+/// [`LayerTarget::LayerSet`] decodes and outputs every layer of the
+/// layer set and reproduces the list row for row.
+#[test]
+fn alpha_layer_set_outputs_primary_and_alpha() {
+    let Some(dir) = shvc_dir() else {
+        eprintln!("SHVC conformance corpus not staged; skipping");
+        return;
+    };
+    let stem = "ALPHA_A_BBC_1";
+    let Some(path) = stream_path(&dir, stem) else {
+        eprintln!("{stem} not staged; skipping");
+        return;
+    };
+    if cfg!(debug_assertions) && std::fs::metadata(&path).is_ok_and(|m| m.len() > 60_000) {
+        return;
+    }
+    let data = std::fs::read(path).expect("read bitstream");
+    let opl = opl_files(&dir, stem);
+    let (rows, _) = parse_opl(&std::fs::read_to_string(&opl[&1]).expect("read opl"));
+    let (frames, output_layers) =
+        decode_with_base(&data, LayerTarget::LayerSet(1), None).expect("decode");
+    assert_eq!(output_layers, vec![0, 1], "both layers are output");
+    let outcome = check_opl(&frames, &rows);
+    assert!(
+        outcome.matched == outcome.expected && outcome.produced == outcome.expected,
+        "{}/{} rows ({} produced): {}",
+        outcome.matched,
+        outcome.expected,
+        outcome.produced,
+        outcome.note
+    );
 }

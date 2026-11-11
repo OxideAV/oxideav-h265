@@ -91,6 +91,22 @@ fn mvhevc_layer_targets_select_views() {
     let both = run(LayerTarget::View(0));
     assert_eq!(both.len(), 3);
     assert!(both.iter().all(|(l, _)| *l == 0));
+    // A layer set: every one of its layers decoded and output.
+    let base_set = run(LayerTarget::LayerSet(0));
+    assert_eq!(base_set.len(), 3);
+    assert!(base_set.iter().all(|(l, _)| *l == 0));
+    for ls in [1, usize::MAX] {
+        let out = run(LayerTarget::LayerSet(ls));
+        assert_eq!(out.len(), 6, "layer set {ls}: both views");
+        for (view, want) in [(0u8, VIEW0_MD5), (1, VIEW1_MD5)] {
+            let all: Vec<u8> = out
+                .iter()
+                .filter(|(l, _)| *l == view)
+                .flat_map(|(_, p)| p.clone())
+                .collect();
+            assert_eq!(md5::hex(&all), want, "layer set {ls}, view {view}");
+        }
+    }
 }
 
 /// The coded form of a NAL unit (two-byte header + escaped payload).
@@ -273,6 +289,7 @@ fn mvhevc_registry_hvcc_lhvc_extradata_emits_both_views() {
         ("layer", "1", VIEW1_MD5),
         ("view", "1", VIEW1_MD5),
         ("ols", "0", VIEW0_MD5),
+        ("layerset", "0", VIEW0_MD5),
     ] {
         let mut params = CodecParameters::video("h265".into());
         params.extradata = extradata.clone();

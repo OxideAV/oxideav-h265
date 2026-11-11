@@ -11,7 +11,9 @@
 //!   set), `layer=1`, `ols=0`, `view=1`;
 //! * bit 3 — feed the stream as one packet per NAL unit instead of a
 //!   single packet (access-unit boundaries then fall where the decoder
-//!   finds them).
+//!   finds them);
+//! * bit 4 — `layerset=<bits 5..=7>` (every layer of a layer set,
+//!   auxiliary layers included) when no other selector is set.
 //!
 //! The stream runs through `make_decoder_with_options` →
 //! `send_packet` → `flush` → `receive_frame`: the VPS extension layer
@@ -39,6 +41,9 @@ fuzz_target!(|data: &[u8]| {
         3 => options.with_view(1),
         _ => options,
     };
+    if opt & 16 != 0 {
+        options = options.with_layer_set(u32::from(opt >> 5));
+    }
     let params = CodecParameters::video("h265".into());
     let Ok(mut dec) = oxideav_h265::make_decoder_with_options(&params, &options) else {
         return;

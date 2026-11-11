@@ -200,6 +200,66 @@ pub struct AlternativeTransferCharacteristics {
     pub preferred_transfer_characteristics: u8,
 }
 
+/// The F.14.2.8 `alpha_channel_info` SEI message (`payloadType ==
+/// 165`): how the luma samples of an alpha auxiliary picture
+/// (`AuxId == 1`) are read as blending weights for the associated
+/// primary picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlphaChannelInfo {
+    /// `alpha_channel_cancel_flag`: the message ends the persistence of
+    /// an earlier one and carries nothing else (the other fields hold
+    /// their inferred values).
+    pub cancel_flag: bool,
+    /// `alpha_channel_use_idc`: 0 — the primary samples are to be
+    /// multiplied by the alpha value at display (straight alpha), 1 —
+    /// they are not (premultiplied), 2 — unspecified (also the
+    /// inferred value); 3..=7 reserved.
+    pub use_idc: u8,
+    /// `alpha_channel_bit_depth_minus8` (0..=7).
+    pub bit_depth_minus8: u8,
+    /// `alpha_transparent_value` (`alpha_channel_bit_depth_minus8 + 9`
+    /// bits): the interpretation value meaning "transparent".
+    pub transparent_value: u16,
+    /// `alpha_opaque_value` (same width): the interpretation value
+    /// meaning "opaque".
+    pub opaque_value: u16,
+    /// `alpha_channel_incr_flag`.
+    pub incr_flag: bool,
+    /// `alpha_channel_clip_flag`.
+    pub clip_flag: bool,
+    /// `alpha_channel_clip_type_flag` (meaningful with
+    /// [`Self::clip_flag`]).
+    pub clip_type_flag: bool,
+}
+
+impl AlphaChannelInfo {
+    /// The F.14.3.8 interpretation sample value of one decoded
+    /// auxiliary-picture luma sample: the `alpha_channel_incr_flag`
+    /// adjustment first, then the `alpha_channel_clip_flag` clipping.
+    /// The result runs from [`Self::transparent_value`] to
+    /// [`Self::opaque_value`].
+    #[must_use]
+    pub fn interpretation_value(&self, sample: u16) -> u16 {
+        let lo = self.transparent_value.min(self.opaque_value);
+        let hi = self.transparent_value.max(self.opaque_value);
+        let mut v = sample;
+        if self.incr_flag && v > lo {
+            v = v.saturating_add(1);
+        }
+        if self.clip_flag {
+            if self.clip_type_flag {
+                // Type 1: clamp into [lo, hi].
+                v = v.clamp(lo, hi);
+            } else {
+                // Type 0: threshold at the midpoint.
+                let mid = (u32::from(self.opaque_value) + u32::from(self.transparent_value)) / 2;
+                v = if u32::from(v) > mid { hi } else { lo };
+            }
+        }
+        v
+    }
+}
+
 /// The §D.2 `decoded_picture_hash` SEI message (`payloadType == 132`,
 /// suffix-only): a per-component hash of the decoded picture used for
 /// decoder conformance checking.
@@ -268,6 +328,8 @@ pub enum SeiPayload {
     ContentLightLevelInfo(ContentLightLevelInfo),
     /// `payloadType == 147`.
     AlternativeTransferCharacteristics(AlternativeTransferCharacteristics),
+    /// `payloadType == 165` (F.14.2.8).
+    AlphaChannelInfo(AlphaChannelInfo),
     /// Any payload type this module does not decode (or a §D.2
     /// `reserved_sei_message`): the verbatim `payloadSize` bytes.
     Reserved {
@@ -570,11 +632,50 @@ fn decode_payload(
         (SeiNalType::Prefix, 147) => Ok(SeiPayload::AlternativeTransferCharacteristics(
             decode_alternative_transfer_characteristics(body)?,
         )),
+        (SeiNalType::Prefix, 165) => Ok(SeiPayload::AlphaChannelInfo(decode_alpha_channel_info(
+            body,
+        )?)),
         _ => Ok(SeiPayload::Reserved {
             payload_type,
             data: body.to_vec(),
         }),
     }
+}
+
+fn decode_alpha_channel_info(body: &[u8]) -> Result<AlphaChannelInfo, SeiError> {
+    let mut r = BitReader::new(body);
+    let err = |_| SeiError::TruncatedPayload { payload_type: 165 };
+    let cancel_flag = r.u1().map_err(err)? != 0;
+    if cancel_flag {
+        return Ok(AlphaChannelInfo {
+            cancel_flag,
+            use_idc: 2,
+            bit_depth_minus8: 0,
+            transparent_value: 0,
+            opaque_value: 0,
+            incr_flag: false,
+            clip_flag: false,
+            clip_type_flag: false,
+        });
+    }
+    let use_idc = r.u(3).map_err(err)? as u8;
+    let bit_depth_minus8 = r.u(3).map_err(err)? as u8;
+    let width = bit_depth_minus8 + 9;
+    let transparent_value = r.u(width).map_err(err)? as u16;
+    let opaque_value = r.u(width).map_err(err)? as u16;
+    let incr_flag = r.u1().map_err(err)? != 0;
+    let clip_flag = r.u1().map_err(err)? != 0;
+    let clip_type_flag = clip_flag && r.u1().map_err(err)? != 0;
+    Ok(AlphaChannelInfo {
+        cancel_flag,
+        use_idc,
+        bit_depth_minus8,
+        transparent_value,
+        opaque_value,
+        incr_flag,
+        clip_flag,
+        clip_type_flag,
+    })
 }
 
 fn decode_recovery_point(body: &[u8]) -> Result<RecoveryPoint, SeiError> {

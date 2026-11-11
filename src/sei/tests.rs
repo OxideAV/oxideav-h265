@@ -633,3 +633,77 @@ mod hrd_sei {
         ));
     }
 }
+
+/// F.14.2.8 `alpha_channel_info`: the field layout (9-bit values at
+/// 8-bit depth) and the F.14.3.8 interpretation of a decoded sample.
+#[test]
+fn alpha_channel_info_decode_and_interpretation() {
+    // cancel 0 | use_idc 000 | bit_depth_minus8 000 | transparent
+    // 0_0000_0000 | opaque 0_1111_1111 | incr 0 | clip 1 | clip_type 0.
+    let bits = "0".to_string() + "000" + "000" + "000000000" + "011111111" + "0" + "1" + "0";
+    let mut padded = bits.clone();
+    while !padded.len().is_multiple_of(8) {
+        padded.push('0');
+    }
+    let body: Vec<u8> = padded
+        .as_bytes()
+        .chunks(8)
+        .map(|c| c.iter().fold(0u8, |b, &ch| (b << 1) | (ch - b'0')))
+        .collect();
+    let rbsp = sei_rbsp_one(165, &body);
+    let msgs = parse_sei_rbsp(&rbsp, SeiNalType::Prefix).unwrap();
+    let SeiPayload::AlphaChannelInfo(a) = &msgs[0].payload else {
+        panic!("expected AlphaChannelInfo, got {:?}", msgs[0].payload);
+    };
+    assert_eq!(
+        *a,
+        AlphaChannelInfo {
+            cancel_flag: false,
+            use_idc: 0,
+            bit_depth_minus8: 0,
+            transparent_value: 0,
+            opaque_value: 255,
+            incr_flag: false,
+            clip_flag: true,
+            clip_type_flag: false,
+        }
+    );
+    // Clip type 0 thresholds at ( opaque + transparent ) / 2 = 127.
+    assert_eq!(a.interpretation_value(127), 0);
+    assert_eq!(a.interpretation_value(128), 255);
+
+    // Clip type 1 clamps into the transparent..opaque range; the
+    // increment applies first, above the lower bound only.
+    let ranged = AlphaChannelInfo {
+        transparent_value: 16,
+        opaque_value: 272,
+        incr_flag: true,
+        clip_type_flag: true,
+        ..*a
+    };
+    assert_eq!(ranged.interpretation_value(3), 16);
+    assert_eq!(ranged.interpretation_value(16), 16);
+    assert_eq!(ranged.interpretation_value(17), 18);
+    assert_eq!(ranged.interpretation_value(255), 256);
+    let plain = AlphaChannelInfo {
+        clip_flag: false,
+        ..*a
+    };
+    assert_eq!(plain.interpretation_value(77), 77);
+
+    // A cancelling message is one bit.
+    let rbsp = sei_rbsp_one(165, &[0x80]);
+    let msgs = parse_sei_rbsp(&rbsp, SeiNalType::Prefix).unwrap();
+    let SeiPayload::AlphaChannelInfo(c) = &msgs[0].payload else {
+        panic!("expected AlphaChannelInfo");
+    };
+    assert!(c.cancel_flag);
+    assert_eq!(c.use_idc, 2, "inferred");
+
+    // A cut message is reported, not misread.
+    let rbsp = sei_rbsp_one(165, &body[..2]);
+    assert_eq!(
+        parse_sei_rbsp(&rbsp, SeiNalType::Prefix),
+        Err(SeiError::TruncatedPayload { payload_type: 165 })
+    );
+}

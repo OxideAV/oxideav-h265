@@ -300,6 +300,13 @@ pub enum LayerTarget {
     /// One view by `ViewId` (Annex G): the first layer carrying it, as
     /// [`Self::Layer`].
     View(u16),
+    /// Every layer of layer set `ls_idx` (F.7.4.3.1 `LayerSetLayerIdList`;
+    /// clamped to the last one), decoded and output — whatever the
+    /// output layer sets built on that layer set select. This is how a
+    /// primary picture and its auxiliary pictures (an alpha or depth
+    /// layer, `AuxId > 0`) come out together when the VPS names only
+    /// one of them an output layer.
+    LayerSet(usize),
 }
 
 /// The layers selected by a [`LayerTarget`] against the active VPS.
@@ -342,7 +349,14 @@ impl LayerPlan {
             LayerTarget::View(v) => layer_of_view(v),
             _ => None,
         };
-        let (mut decode, output) = if let Some(l) = single_layer {
+        let (mut decode, output) = if let LayerTarget::LayerSet(ls) = target {
+            let sets = &m.layer_set_layer_id_list;
+            let ids = sets
+                .get(ls.min(sets.len().saturating_sub(1)))
+                .cloned()
+                .unwrap_or_default();
+            (ids.clone(), ids)
+        } else if let Some(l) = single_layer {
             let mut d = m
                 .id_ref_layer
                 .get(usize::from(l))

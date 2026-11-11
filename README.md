@@ -215,7 +215,7 @@ Coverage:
   | layer structure (`8LAYERS`, `LAYERID`, `LAYERID63`, `MAXTID`, `REFLAYER`, `MVD`, `INACTIVE`, `OLS`, `SPLITFLAG`, `DPB`, `SLLEV`, `POC`, `DISFLAG`, `SIM`, `INBLD`) | 26 | byte-exact |
   | VPS / parameter-set syntax (`VUI`, `NONVUI`, `PSEXT`, `PPSSLIST`, `SPSSLIST`) | 9 | byte-exact |
   | hybrid scalability (`HYBRID_A`, base layer supplied externally) | 1 | byte-exact |
-  | auxiliary layers (`ALPHA_A`, `DEPTH_A`) | 2 | every layer byte-exact; `ALPHA_A` OLS 1 lists the primary layer as an output next to the alpha layer, which the `default_output_layer_idc` derivation does not select |
+  | auxiliary layers (`ALPHA_A`, `DEPTH_A`) | 2 | every layer byte-exact; `ALPHA_A` OLS 1 lists the primary layer as an output next to the alpha layer, which the `default_output_layer_idc` derivation does not select — the layer-set target (`LayerTarget::LayerSet(1)`, `layerset=1`) reproduces that list row for row |
 
 **Encoder: recursive coding-quadtree I/P/B coding at CTB 16/32/64
 with temporal MVP, multi-reference lists, hierarchical GOPs, in-loop
@@ -578,7 +578,10 @@ frame.
   by an `lhvC` record (the non-base layers' parameter sets — what a
   layered HEIF `lhv1` item carries); the decoder options `layer=<id>`
   (that layer plus its reference layers, output alone), `view=<ViewId>`
-  and `ols=<idx>` pick the operating point, and without any the
+  and `ols=<idx>` pick the operating point, `layerset=<idx>` decodes
+  and outputs every layer of a layer set (a primary picture together
+  with an alpha / depth auxiliary layer the output layer sets leave
+  out), and without any the
   highest output layer set is decoded with every output layer emitted
   — the frames of one access unit consecutively, base view first
   (`DecodedFrame::layer_id` / `view_id` / `au_index` on the direct
@@ -690,8 +693,13 @@ and ~985 unit tests.
 * Multi-layer corners: Annex I 3D-HEVC (depth /
   `sps_3d_extension( )`) stays opaque; `alt_output_layer_flag` and the
   independent non-base layer rewriting process (F.10.2) are not
-  applied; an auxiliary layer is output only when the output layer
-  set selects it. A lower output layer's size / format is not stated
+  applied. Auxiliary layers (alpha, depth) decode as ordinary layers:
+  an output layer set outputs them when it selects them, the
+  layer-set target outputs them with their primary layer. The alpha
+  channel information SEI message is decoded
+  (`sei::AlphaChannelInfo`, with the F.14.3.8 interpretation value of
+  a sample) but blending is the display's job; the depth
+  representation and overlay SEI messages stay opaque payloads. A lower output layer's size / format is not stated
   anywhere at the stream level (core's `LayerInfo` carries no
   per-layer shape): `output_params` describes the highest output
   layer only.

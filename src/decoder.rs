@@ -105,6 +105,11 @@ pub struct H265DecoderOptions {
     /// `ols`: decode and output this output layer set. Ignored when
     /// `layer` or `view` is set.
     pub ols: Option<u32>,
+    /// `layerset`: decode and output every layer of this layer set —
+    /// a primary picture together with its auxiliary (alpha / depth)
+    /// layers, whatever the output layer sets select. Ignored when
+    /// `layer`, `view` or `ols` is set.
+    pub layer_set: Option<u32>,
     /// `output_uninitialized_layers`: also output the pictures of an
     /// enhancement layer whose `LayerInitializedFlag` is still 0 — a
     /// layer entered at a non-IRAP picture, which F.8.1.6 decodes
@@ -139,6 +144,13 @@ impl H265DecoderOptions {
     #[must_use]
     pub fn with_ols(mut self, ols_idx: u32) -> Self {
         self.ols = Some(ols_idx);
+        self
+    }
+
+    /// Set [`Self::layer_set`].
+    #[must_use]
+    pub fn with_layer_set(mut self, ls_idx: u32) -> Self {
+        self.layer_set = Some(ls_idx);
         self
     }
 
@@ -179,7 +191,10 @@ impl H265DecoderOptions {
                 )));
             }
             (None, None, Some(o)) => LayerTarget::Ols(o as usize),
-            (None, None, None) => LayerTarget::HighestOls,
+            (None, None, None) => match self.layer_set {
+                Some(ls) => LayerTarget::LayerSet(ls as usize),
+                None => LayerTarget::HighestOls,
+            },
         })
     }
 }
@@ -205,6 +220,12 @@ impl CodecOptionsStruct for H265DecoderOptions {
             help: "multi-layer: decode and output this output layer set (unset: the highest one)",
         },
         OptionField {
+            name: "layerset",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "multi-layer: decode and output every layer of this layer set, auxiliary layers included (unset: the highest output layer set)",
+        },
+        OptionField {
             name: "output_uninitialized_layers",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
@@ -217,6 +238,7 @@ impl CodecOptionsStruct for H265DecoderOptions {
             "layer" => self.layer = Some(value.as_u32()?),
             "view" => self.view = Some(value.as_u32()?),
             "ols" => self.ols = Some(value.as_u32()?),
+            "layerset" => self.layer_set = Some(value.as_u32()?),
             "output_uninitialized_layers" => {
                 self.output_uninitialized_layers = value.as_bool()?;
             }
@@ -244,7 +266,8 @@ impl CodecOptionsStruct for H265DecoderOptions {
 /// ignore them): `layer=<nuh_layer_id>` decodes that layer (plus its
 /// reference layers) and outputs it alone, `view=<ViewId>` selects the
 /// layer carrying that Annex G view, `ols=<idx>` selects an output
-/// layer set. Without any, the highest output layer set is decoded and
+/// layer set, `layerset=<idx>` decodes and outputs every layer of a
+/// layer set (a primary picture with its auxiliary layers). Without any, the highest output layer set is decoded and
 /// every one of its output layers is emitted — the frames of one access
 /// unit come out consecutively in increasing `nuh_layer_id` order (the
 /// base view first, then the second view).
