@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- *(decoder)* **Intra block copy no longer copies the picture.** A
+  coding unit predicted from the current picture kept a snapshot of
+  it, and the unit's first write into each plane then copied the whole
+  plane — once per such unit. Each prediction now copies the window it
+  reads (reference block plus interpolation reach, ending at a picture
+  edge so the edge padding is unchanged); the decoded bytes are the
+  same. Serial decode of the 15 official SCC streams: 7.66 s → 1.34 s
+  of CPU (`PPI_A` 1.30 → 0.15 s, `HT_B` 0.82 → 0.08 s), peak RSS down
+  by 20 to 50 % on them. README: round-487 measurements (SCC before /
+  after; 1080p / 2160p decode at 1 / 2 / 4 / 8 threads; 12 MP still
+  decode and encode with peak RSS).
+
 ### Added
 
 - *(decoder)* **Output of an enhancement layer that is not initialized

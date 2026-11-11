@@ -219,27 +219,44 @@ fn reconstruct_inter_cu_with(
 
     // §8.5.3.1: a prediction from the current picture (intra block
     // copy) reads the current decoded samples before in-loop
-    // filtering. The §8.5.3.1 availability constraints guarantee every
-    // referenced sample precedes this coding block in z-scan order, so
-    // one snapshot at CU entry is exact.
+    // filtering, as they stand at CU entry (the §8.5.3.2.1 constraints
+    // put every referenced sample before this coding block in z-scan
+    // order). Each such prediction gets a copy of just the window it
+    // reads — the reference block plus the interpolation reach —
+    // instead of the picture.
+    let mut windows: Vec<[Option<CurrPicWindow>; 2]> = Vec::new();
     let needs_curr = refs.lists.list0.contains(&Some(crate::dpb::CURR_PIC))
         || refs
             .lists
             .list1
             .as_ref()
             .is_some_and(|l| l.contains(&Some(crate::dpb::CURR_PIC)));
-    let needs_curr = needs_curr
-        && motions.iter().any(|m| {
-            (m.pred_flag_l0 && refs.is_curr_pic(0, m.ref_idx_l0))
-                || (m.pred_flag_l1 && refs.is_curr_pic(1, m.ref_idx_l1))
-        });
-    let snapshot: Option<Picture> = needs_curr.then(|| pic.clone());
+    if needs_curr {
+        windows.reserve(motions.len());
+        for (rect, motion) in rects.iter().zip(motions.iter()) {
+            let window = |list: usize, pred_flag: bool, ref_idx: i32, mv: [i32; 2]| {
+                (pred_flag && refs.is_curr_pic(list, ref_idx))
+                    .then(|| CurrPicWindow::copy(pic, rect, mv))
+            };
+            windows.push([
+                window(0, motion.pred_flag_l0, motion.ref_idx_l0, motion.mv_l0),
+                window(1, motion.pred_flag_l1, motion.ref_idx_l1, motion.mv_l1),
+            ]);
+        }
+    }
 
-    for (rect, motion) in rects.iter().zip(motions.iter()) {
+    for (i, (rect, motion)) in rects.iter().zip(motions.iter()).enumerate() {
+        let pu_windows = windows.get(i);
+        // A list this PU does not use still names a picture (never
+        // read); a P slice whose only reference is the current picture
+        // has no other to name than the window.
+        let spare = pu_windows
+            .and_then(|w| w[0].as_ref().or(w[1].as_ref()))
+            .map(|w| &w.picture);
         let l0 = resolve_list(
             params,
             refs,
-            snapshot.as_ref(),
+            (pu_windows.and_then(|w| w[0].as_ref()), spare),
             0,
             motion.pred_flag_l0,
             motion.ref_idx_l0,
@@ -248,7 +265,7 @@ fn reconstruct_inter_cu_with(
         let l1 = resolve_list(
             params,
             refs,
-            snapshot.as_ref(),
+            (pu_windows.and_then(|w| w[1].as_ref()), spare),
             1,
             motion.pred_flag_l1,
             motion.ref_idx_l1,
@@ -291,18 +308,70 @@ fn reconstruct_inter_cu_with(
     Ok(())
 }
 
+/// The part of the current picture one intra-block-copy prediction
+/// reads, copied out before the coding unit writes its samples.
+struct CurrPicWindow {
+    /// The window as a picture of its own.
+    picture: Picture,
+    /// Luma position of the window's top-left sample in the current
+    /// picture (multiples of `SubWidthC` / `SubHeightC`).
+    origin: (usize, usize),
+}
+
+impl CurrPicWindow {
+    /// How far past the reference block the window reaches, in luma
+    /// samples: the 8-tap luma filter reads 3 before / 4 after the
+    /// block, the 4-tap chroma filter 1 / 2 chroma samples.
+    const REACH: i64 = 8;
+
+    /// Copy the window a prediction block `rect` displaced by the luma
+    /// motion vector `mv` reads. A side of the window that would leave
+    /// the picture stops at the picture edge, so the reference sample
+    /// padding (`Clip3` of the coordinates) sees the same edge samples
+    /// it would in the whole picture.
+    fn copy(pic: &Picture, rect: &PuRect, mv: [i32; 2]) -> Self {
+        let span = |pos: usize, len: usize, mv: i32, size: usize| -> (usize, usize) {
+            let base = pos as i64 + i64::from(mv >> 2);
+            let last = size as i64 - 1;
+            let lo = (base - Self::REACH).clamp(0, last) & !1;
+            let hi = ((base + len as i64 + Self::REACH).clamp(0, last) | 1).min(last);
+            (lo as usize, (hi - lo + 1) as usize)
+        };
+        // A picture stored as a band (a row or tile being decoded on
+        // its own) is copied as it is.
+        if pic.band(Plane::Luma) != (0, 0, pic.width_luma())
+            || pic.stored_rows(Plane::Luma) != pic.height_luma()
+            || pic.width_luma() < 2
+            || pic.height_luma() < 2
+        {
+            return Self {
+                picture: pic.clone(),
+                origin: (0, 0),
+            };
+        }
+        let (x0, w) = span(rect.x_pb, rect.n_pb_w, mv[0], pic.width_luma());
+        let (y0, h) = span(rect.y_pb, rect.n_pb_h, mv[1], pic.height_luma());
+        Self {
+            picture: pic.cropped(x0, y0, w, h),
+            origin: (x0, y0),
+        }
+    }
+}
+
 /// Build a [`ResolvedList`] for one reference list, deriving the §8.5.3.2.10
 /// chroma MV and fetching `RefPicListX[ refIdx ]`. An unused list (or a
 /// list whose reference resolves to "no reference picture") becomes a
 /// `pred_flag == false` entry pointing at a fallback picture (never read).
 ///
-/// `curr_snapshot` is the pre-in-loop-filter copy of the current
-/// picture (`Some` exactly when the CU references the §8.3.4 currPic —
-/// intra block copy).
+/// `curr_window` is the copied window of the current picture (`Some`
+/// exactly when this list references the §8.3.4 currPic — intra block
+/// copy); the motion vectors handed on are then relative to it.
+/// `spare` is a picture an unused list may name when the reference
+/// lists hold no decoded picture at all.
 fn resolve_list<'a, 'b>(
     params: &ReconParams,
     refs: &'b RefListAccess<'a>,
-    curr_snapshot: Option<&'b Picture>,
+    (curr_window, spare): (Option<&'b CurrPicWindow>, Option<&'b Picture>),
     list: usize,
     pred_flag: bool,
     ref_idx: i32,
@@ -317,13 +386,24 @@ where
         (1, 1)
     };
     if pred_flag {
-        let ref_pic: Option<&'b Picture> = if refs.is_curr_pic(list, ref_idx) {
-            curr_snapshot
-        } else {
-            refs.ref_pic(list, ref_idx)
-        };
-        if let Some(ref_pic) = ref_pic {
-            let mv_c = derive_chroma_mv(mv_l, sw as i32, sh as i32);
+        let mv_c = derive_chroma_mv(mv_l, sw as i32, sh as i32);
+        if refs.is_curr_pic(list, ref_idx) {
+            if let Some(window) = curr_window {
+                // The window's origin, in quarter luma / eighth chroma
+                // samples, comes off the vectors: whole samples, so the
+                // fractional phases are untouched.
+                let (ox, oy) = (window.origin.0 as i32, window.origin.1 as i32);
+                return Ok(ResolvedList {
+                    pred_flag: true,
+                    mv_l: [mv_l[0] - 4 * ox, mv_l[1] - 4 * oy],
+                    mv_c: [
+                        mv_c[0] - 8 * (ox / sw as i32),
+                        mv_c[1] - 8 * (oy / sh as i32),
+                    ],
+                    ref_pic: &window.picture,
+                });
+            }
+        } else if let Some(ref_pic) = refs.ref_pic(list, ref_idx) {
             return Ok(ResolvedList {
                 pred_flag: true,
                 mv_l,
@@ -341,7 +421,7 @@ where
     let fallback = refs
         .ref_pic(0, 0)
         .or_else(|| refs.ref_pic(1, 0))
-        .or(curr_snapshot)
+        .or(spare)
         .ok_or_else(|| refs.missing(0, 0))?;
     Ok(ResolvedList {
         pred_flag: false,
@@ -2048,7 +2128,7 @@ mod tests {
             lists: &lists,
             entries: &entries,
         };
-        let Err(err) = resolve_list(&params, &refs, None, 0, true, 0, [0, 0]) else {
+        let Err(err) = resolve_list(&params, &refs, (None, None), 0, true, 0, [0, 0]) else {
             panic!("RefPicList0[0] is missing");
         };
         assert_eq!(
@@ -2072,8 +2152,8 @@ mod tests {
         );
         // The resolvable slots still resolve; an out-of-range index is
         // reported as such.
-        assert!(resolve_list(&params, &refs, None, 0, true, 1, [0, 0]).is_ok());
-        let Err(err) = resolve_list(&params, &refs, None, 1, true, 3, [0, 0]) else {
+        assert!(resolve_list(&params, &refs, (None, None), 0, true, 1, [0, 0]).is_ok());
+        let Err(err) = resolve_list(&params, &refs, (None, None), 1, true, 3, [0, 0]) else {
             panic!("ref_idx_l1 = 3 is out of range");
         };
         assert_eq!(
@@ -2090,7 +2170,7 @@ mod tests {
             entries: &[],
         };
         assert!(matches!(
-            resolve_list(&params, &refs, None, 1, false, -1, [0, 0]),
+            resolve_list(&params, &refs, (None, None), 1, false, -1, [0, 0]),
             Err(ReconError::MissingReference {
                 list: 0,
                 ref_idx: 0,
@@ -2931,6 +3011,128 @@ mod tests {
             let pic = decode_one_ctu(&left_right_ctu(escape, None), &p_slice_ctx(), 140);
             assert_eq!(pic.sample(Plane::Luma, 5, 5), want, "cu_qp_delta {delta:?}");
             assert_eq!(pic.sample(Plane::Luma, 24, 8), 140, "inter quadrant");
+        }
+    }
+
+    /// The window an intra-block-copy prediction reads stands in for
+    /// the whole current picture exactly: for blocks anywhere — inside,
+    /// across every picture edge, wholly outside — and any phase, the
+    /// interpolation from the window with the window-relative vectors
+    /// equals the interpolation from the picture, in every chroma
+    /// format.
+    #[test]
+    fn curr_pic_window_predicts_as_the_whole_picture() {
+        use crate::inter_pred::{RefPlane, interp_chroma_into, interp_luma_into};
+        let (w, h) = (48usize, 40usize);
+        for cat in [1u8, 2, 3] {
+            let mut pic = Picture::new(w, h, cat, 8, 8);
+            for plane in [Plane::Luma, Plane::Cb, Plane::Cr] {
+                let (pw, ph) = pic.plane_dims(plane);
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let v = (x * 31 + y * 17 + x * y + plane as usize * 7) % 251;
+                        pic.set_sample(plane, x, y, v as i32);
+                    }
+                }
+            }
+            let (sw, sh) = sub_wh_c(cat);
+            let params = ReconParams {
+                chroma_array_type: cat,
+                ..p_params()
+            };
+            let lists = RefPicLists {
+                list0: vec![Some(crate::dpb::CURR_PIC)],
+                list1: None,
+            };
+            let refs = RefListAccess {
+                lists: &lists,
+                entries: &[],
+            };
+            let mut cases = 0;
+            for &(x_pb, y_pb, n_pb_w, n_pb_h) in &[
+                (16usize, 16usize, 8usize, 8usize),
+                (0, 0, 16, 8),
+                (32, 24, 16, 16),
+                (40, 8, 8, 32),
+            ] {
+                for &mvx in &[0i32, -4, -64, -65, -67, 13, 36, 200, -400, -30] {
+                    for &mvy in &[0i32, -8, -62, 5, 44, 300, -300] {
+                        let rect = PuRect {
+                            x_pb,
+                            y_pb,
+                            n_pb_w,
+                            n_pb_h,
+                        };
+                        let mv = [mvx, mvy];
+                        let window = CurrPicWindow::copy(&pic, &rect, mv);
+                        let l = resolve_list(&params, &refs, (Some(&window), None), 0, true, 0, mv)
+                            .unwrap();
+                        let mv_c = derive_chroma_mv(mv, sw as i32, sh as i32);
+                        // Luma.
+                        let mut got = vec![0i32; n_pb_w * n_pb_h];
+                        let mut want = got.clone();
+                        interp_luma_into(
+                            &RefPlane::of_picture(l.ref_pic, Plane::Luma).unwrap(),
+                            x_pb as i32 + (l.mv_l[0] >> 2),
+                            y_pb as i32 + (l.mv_l[1] >> 2),
+                            l.mv_l[0] & 3,
+                            l.mv_l[1] & 3,
+                            n_pb_w,
+                            n_pb_h,
+                            8,
+                            &mut got,
+                        );
+                        interp_luma_into(
+                            &RefPlane::of_picture(&pic, Plane::Luma).unwrap(),
+                            x_pb as i32 + (mv[0] >> 2),
+                            y_pb as i32 + (mv[1] >> 2),
+                            mv[0] & 3,
+                            mv[1] & 3,
+                            n_pb_w,
+                            n_pb_h,
+                            8,
+                            &mut want,
+                        );
+                        assert_eq!(got, want, "luma, format {cat}, {rect:?} mv {mv:?}");
+                        // Chroma.
+                        let (cw, ch) = (n_pb_w / sw, n_pb_h / sh);
+                        for plane in [Plane::Cb, Plane::Cr] {
+                            let mut got = vec![0i32; cw * ch];
+                            let mut want = got.clone();
+                            interp_chroma_into(
+                                &RefPlane::of_picture(l.ref_pic, plane).unwrap(),
+                                (x_pb / sw) as i32 + (l.mv_c[0] >> 3),
+                                (y_pb / sh) as i32 + (l.mv_c[1] >> 3),
+                                l.mv_c[0] & 7,
+                                l.mv_c[1] & 7,
+                                cw,
+                                ch,
+                                8,
+                                &mut got,
+                            );
+                            interp_chroma_into(
+                                &RefPlane::of_picture(&pic, plane).unwrap(),
+                                (x_pb / sw) as i32 + (mv_c[0] >> 3),
+                                (y_pb / sh) as i32 + (mv_c[1] >> 3),
+                                mv_c[0] & 7,
+                                mv_c[1] & 7,
+                                cw,
+                                ch,
+                                8,
+                                &mut want,
+                            );
+                            assert_eq!(got, want, "{plane:?}, format {cat}, {rect:?} mv {mv:?}");
+                        }
+                        // The copy is a window, not the picture.
+                        assert!(
+                            window.picture.width_luma() <= n_pb_w + 18
+                                && window.picture.height_luma() <= n_pb_h + 18
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+            assert_eq!(cases, 4 * 10 * 7);
         }
     }
 

@@ -546,6 +546,58 @@ Max): 3.1 s single-threaded, about 1.2 s on 4 threads and 0.85-0.9 s
 on 8, the output matching a black-box decoder's `framemd5` frame for
 frame.
 
+### Round 487: intra block copy without picture copies
+
+A coding unit predicted from the current picture (intra block copy,
+§8.5.3.1) reads the samples as they stood before the unit was written.
+The decoder used to keep a snapshot of the picture for that — and the
+first sample the unit wrote into each plane then copied the whole
+plane, once per such coding unit. Each prediction now copies only the
+window it reads (the reference block plus the interpolation reach,
+stopping at a picture edge so the edge padding is unchanged). The
+decoded bytes are identical — the 15 SCC conformance streams stay
+byte-exact, and a unit test compares window and whole-picture
+prediction across every picture edge and chroma format. Serial decode
+of the official SCC streams through the registry decoder
+(`examples/decode_bench`, CPU seconds, median of 3; peak RSS):
+
+| SCC stream | pictures | before | after | peak RSS before → after |
+| --- | --- | --- | --- | --- |
+| `PPI_A` (1280x720 4:4:4) | 33 | 1.30 s | 0.15 s | 259 → 199 MiB |
+| `IBF_Disabled_A` (1280x720 4:4:4) | 33 | 0.93 s | 0.14 s | 252 → 203 MiB |
+| `HT_C` (1280x720 4:4:4, extended precision) | 3 | 0.89 s | 0.08 s | 63 → 33 MiB |
+| `HT_B` (1280x720 4:4:4) | 3 | 0.82 s | 0.08 s | 52 → 29 MiB |
+| `PPI_B` (1280x720 4:2:0) | 33 | 0.77 s | 0.10 s | 148 → 112 MiB |
+| `MVRESIDC_A` / `_B` / `_C` | 9 each | 0.40 / 0.48 / 0.48 s | 0.07 s each | 104..114 → 84..86 MiB |
+| `Delta_QP_Chroma_QP_Offsets_A` | 2 | 0.34 s | 0.09 s | 51 → 22 MiB |
+| `Zero_and_One_Palette_Size_A` (1920x1080 4:4:4) | 1 | 0.22 s | 0.08 s | 34 → 26 MiB |
+| all 15 streams | 207 | 7.66 s | 1.34 s | |
+
+The general decode path is unchanged this round; its numbers on the
+same build, for reference (two clips written by a third-party encoder
+at its medium preset — a detailed fractal zoom, single slice, WPP,
+B-frames, SAO: 120 pictures of 1920x1080 at 2.8 MB and 60 of 3840x2160
+at 3.6 MB — one access unit per packet; the host was shared with other
+build jobs at a load average near 40 on 18 cores, so the threaded rows
+are medians of 5 wall times and understate an idle machine, and the
+serial row is CPU time):
+
+| | serial | 2 threads | 4 threads | 8 threads |
+| --- | --- | --- | --- | --- |
+| 1920x1080, pictures per second | 55 | 86 | 129 | 208 |
+| 1920x1080, peak RSS | 125 MiB | 154 MiB | 217 MiB | 294 MiB |
+| 3840x2160, pictures per second | 17 | 28 | 47 | 68 |
+| 3840x2160, peak RSS | 265 MiB | 446 MiB | 592 MiB | 888 MiB |
+
+| 12 MP still (4032x3024, 8-bit 4:2:0) | serial | 8 workers | peak RSS serial → 8 |
+| --- | --- | --- | --- |
+| decode, third-party encoder (WPP, 0.5 MB) | 0.24 s | 0.08 s | 67 → 82 MiB |
+| decode, this encoder (`ctb=64 wpp=1`, 0.5 MB) | 0.17 s | 0.07 s | 66 → 86 MiB |
+| encode, `mode=intra qp=30 ctb=64 wpp=1 still=1` (level-2 decision) | 31 s | 6.6 s | 252 → 277 MiB |
+
+Every budget produces the same bytes: one digest for the 1080p clip at
+1 / 2 / 4 / 8 threads, one encoded still at 1 and 8 workers.
+
 ## What's implemented
 
 * **Whole-bitstream decode driver** (`sequence`) — Annex B demux →
