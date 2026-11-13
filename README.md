@@ -784,13 +784,14 @@ whole-sample copy.
   its extension gate (§7.2 `more_rbsp_data( )` FALSE at
   `vps_extension_flag` / `sps_extension_present_flag` /
   `pps_extension_present_flag`) decodes with the gate taken as 0.
-  Four fuzz targets run nightly: `parse_annexb`
+  Five fuzz targets run nightly: `parse_annexb`
   (parameter sets, slice headers, SEI), `decode_residual` (§7.3.8.11
   on a bin stream), `hvcc_decode` (the HEIF / ISO-BMFF carriage —
   `hvcC` record + length-prefixed access unit — through the registry
-  decoder, seeded with real-world stills and inter-coded GOPs) and
+  decoder, seeded with real-world stills and inter-coded GOPs),
   `layered_decode` (multi-layer streams under the layer-selection and
-  output options);
+  output options) and `encode_budget` (the encoder on one worker
+  against several — same bytes — and its stream through the decoder);
   `tests/hostile_cabac.rs` pins every input they found.
 * **Headers** — VPS / SPS / PPS (§7.3.2, incl. range + SCC extension
   bodies), VUI + HRD (§E.2), SEI (§7.3.5 framing; typed §D.2

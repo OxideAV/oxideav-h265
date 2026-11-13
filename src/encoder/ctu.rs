@@ -333,6 +333,34 @@ impl TreeCfg {
         self
     }
 
+    /// This configuration for a `width x height` picture: a tile grid
+    /// the picture cannot hold (more columns / rows than coding tree
+    /// blocks, or explicit spans past the edge) falls back to a single
+    /// tile. The parameter sets, the slice coder and the entry points
+    /// must all read the fitted configuration — a PPS announcing a
+    /// grid the slice data does not follow is not decodable.
+    #[must_use]
+    pub(crate) fn fit_tiles(mut self, width: usize, height: usize) -> Self {
+        let ctb = 1usize << self.ctb_log2;
+        let ctbs_x = width.div_ceil(ctb) as u32;
+        let ctbs_y = height.div_ceil(ctb) as u32;
+        let params = self.tiles.params();
+        let fits = u32::from(self.tiles.cols) <= ctbs_x
+            && u32::from(self.tiles.rows) <= ctbs_y
+            && (self.tiles.uniform
+                || (params
+                    .column_width_minus1
+                    .iter()
+                    .map(|w| w + 1)
+                    .sum::<u32>()
+                    < ctbs_x
+                    && params.row_height_minus1.iter().map(|h| h + 1).sum::<u32>() < ctbs_y));
+        if !fits {
+            self.tiles = TileLayout::single();
+        }
+        self
+    }
+
     /// `MinCbLog2SizeY` (always 3: 8x8 minimum coding blocks).
     #[must_use]
     pub fn min_cb_log2(&self) -> u32 {
@@ -4991,7 +5019,10 @@ pub(crate) fn encode_intra_picture_tree_wide(
     aq: u8,
     ctu_rc: Option<u64>,
 ) -> Result<IntraEncodedAuWide, IntraEncodeError> {
-    let tree = cfg.tree.expect("tree config present");
+    let tree = cfg
+        .tree
+        .expect("tree config present")
+        .fit_tiles(width, height);
     let fmt = cfg.fmt;
     if width == 0 || height == 0 || !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(IntraEncodeError::BadDimensions { width, height });
@@ -5108,24 +5139,9 @@ fn make_tiling(width: usize, height: usize, cfg: &TreeCfg) -> PictureTiling {
     let ctb = 1usize << cfg.ctb_log2;
     let ctbs_x = width.div_ceil(ctb) as u32;
     let ctbs_y = height.div_ceil(ctb) as u32;
-    // A grid the picture cannot hold (more columns / rows than CTBs,
-    // or explicit spans past the edge) falls back to a single tile.
-    let params = cfg.tiles.params();
-    let fits = u32::from(cfg.tiles.cols) <= ctbs_x
-        && u32::from(cfg.tiles.rows) <= ctbs_y
-        && (cfg.tiles.uniform
-            || (params
-                .column_width_minus1
-                .iter()
-                .map(|w| w + 1)
-                .sum::<u32>()
-                < ctbs_x
-                && params.row_height_minus1.iter().map(|h| h + 1).sum::<u32>() < ctbs_y));
-    let params = if fits {
-        params
-    } else {
-        TilingParams::single_tile()
-    };
+    // The caller's configuration went through `fit_tiles`: its grid
+    // fits the picture.
+    let params = cfg.fit_tiles(width, height).tiles.params();
     PictureTiling::new(
         ctbs_x,
         ctbs_y,
@@ -5146,7 +5162,10 @@ pub(crate) fn encode_inter_slice_tree(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, WideRecon, FrameStats) {
-    let tree = spec.tree.expect("tree config present");
+    let tree = spec
+        .tree
+        .expect("tree config present")
+        .fit_tiles(width, height);
     let fmt = spec.fmt;
     let ctb = 1usize << tree.ctb_log2;
     let aq_deltas = crate::encoder::aq::ctb_aq_deltas_wide(
@@ -5925,6 +5944,35 @@ mod tests {
             assert_eq!(intra(3), serial, "intra CTB {ctb}, 3 workers");
             assert_eq!(intra(8), serial, "intra CTB {ctb}, 8 workers");
         }
+    }
+
+    /// A tile grid the picture cannot hold (2x2 on a picture one CTB
+    /// high) falls back to a single tile in the PPS as well as in the
+    /// slice data: the stream decodes, intra and inter (found by the
+    /// `encode_budget` fuzz target — the PPS used to announce the grid
+    /// while the slice coder dropped it).
+    #[test]
+    fn tree_tile_grid_larger_than_the_picture_falls_back_everywhere() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        let (w, h) = (96, 48);
+        let frames = scene(w, h, 2);
+        let cfg = TreeCfg::new(64)
+            .expect("ctb")
+            .with_tiles(TileLayout::uniform(2, 2));
+        let mut enc = LowDelayPEncoder::new(w, h, 40, 0)
+            .expect("encoder")
+            .with_tree(cfg);
+        let mut stream = Vec::new();
+        for (y, cb, cr) in &frames {
+            stream.extend_from_slice(&enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame").au);
+        }
+        assert_eq!(decode_annexb_sequence(&stream).expect("decode").len(), 2);
+        // Two CTB columns still take a 2x1 grid.
+        assert!(cfg.fit_tiles(w, h).tiles == TileLayout::single());
+        let wide = TreeCfg::new(16)
+            .expect("ctb")
+            .with_tiles(TileLayout::uniform(2, 2));
+        assert!(wide.fit_tiles(w, h).tiles.on());
     }
 
     #[test]

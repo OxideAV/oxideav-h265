@@ -1596,7 +1596,11 @@ pub(crate) fn assemble_idr_au(
                 false,
                 false,
                 lf.deblocking,
-                cfg.tree.and_then(|t| t.tiles.grid()).as_ref(),
+                // The grid the slice coder follows (a grid the picture
+                // cannot hold falls back to one tile there).
+                cfg.tree
+                    .and_then(|t| t.fit_tiles(width, height).tiles.grid())
+                    .as_ref(),
                 cfg.cu_qp_delta,
                 cfg.tree.is_some_and(|t| t.sign_hiding),
                 cfg.tree.is_some_and(|t| t.weighted_pred),

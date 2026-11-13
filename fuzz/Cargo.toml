@@ -45,6 +45,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_budget"
+path = "fuzz_targets/encode_budget.rs"
+test = false
+doc = false
+bench = false
+
 # Stand-alone workspace: keeps the fuzz harness out of any enclosing
 # workspace's member resolution (the harness builds with nightly-only
 # instrumentation flags the surrounding crates never want).

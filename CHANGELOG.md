@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- *(encoder)* **A tile grid the picture cannot hold produced an
+  undecodable stream.** With more tile columns / rows than the picture
+  has coding tree blocks (`tiles=2x2` on a picture one CTB high), the
+  slice coder fell back to a single tile but the PPS still announced
+  the grid, so the slice data ended where a decoder expected another
+  tile. The parameter sets, the slice coder and the entry points now
+  read one fitted configuration (`TreeCfg::fit_tiles`); such a picture
+  codes as a single tile and decodes here and through a black-box
+  decoder. Found by the new `encode_budget` fuzz target.
+
+### Added
+
+- `fuzz/fuzz_targets/encode_budget.rs` — a differential fuzz target for
+  the encoder's thread budget: a picture or a short P / B sequence
+  built from the input is encoded through the registry encoder on one
+  worker and on several (intra / inter, CTB 16 / 32 / 64, WPP, RDOQ,
+  sign hiding, filters, tiles, B slices), the two streams must be the
+  same bytes, and the stream must decode to as many pictures as went
+  in.
+
 ### Changed
 
 - *(encoder)* **Intra mode decision without per-block allocation —
