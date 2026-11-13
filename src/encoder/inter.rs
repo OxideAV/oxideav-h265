@@ -1725,6 +1725,21 @@ fn pred_recon(pred: &InterPrediction, src: &[Vec<i32>; 3]) -> ([Vec<u8>; 3], u64
     (recon, dist)
 }
 
+/// The `w` samples of a plane row at columns `bx .. bx + w`, columns
+/// outside the row clamped to its ends (the eq. 8-228 edge extension
+/// at full-sample positions): the row itself when the run lies inside
+/// it, else a copy in `buf`.
+fn clamped_run<'a>(row: &'a [u16], bx: i32, w: usize, buf: &'a mut [u16; 64]) -> &'a [u16] {
+    if bx >= 0 && bx as usize + w <= row.len() {
+        return &row[bx as usize..bx as usize + w];
+    }
+    let last = row.len() as i32 - 1;
+    for (i, d) in buf[..w].iter_mut().enumerate() {
+        *d = row[(bx + i as i32).clamp(0, last) as usize];
+    }
+    &buf[..w]
+}
+
 /// Greedy integer-pel motion search on luma SAD: seeds, then a
 /// small-diamond descent (capped). Returns the best full-pel MV in
 /// luma samples.
@@ -1740,18 +1755,27 @@ fn integer_me(
     lambda_me: u64,
     mvp_q: &[Mv],
 ) -> [i32; 2] {
-    // Full-pel prediction == direct (clamped) reference samples.
+    // Full-pel prediction == direct (clamped) reference samples, read
+    // a row at a time (at most 64 * 64 differences of 16-bit samples:
+    // the sum fits `u32`).
+    let (rw, rh) = (refp.width as i32, refp.height as i32);
+    let ref_row = |mx: i32, my: i32, j: usize| -> (usize, i32) {
+        let ry = (y0 as i32 + j as i32 + my).clamp(0, rh - 1) as usize;
+        (ry * refp.width, x0 as i32 + mx)
+    };
     let sad_at = |mx: i32, my: i32| -> u64 {
-        let mut acc = 0u64;
-        for j in 0..h {
-            for i in 0..w {
-                let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
-                let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
-                let r = i32::from(refp.y[ry as usize * refp.width + rx as usize]);
-                acc += u64::from(r.abs_diff(src_y[j * w + i]));
-            }
+        let mut acc = 0u32;
+        let mut buf = [0u16; 64];
+        for (j, srow) in src_y.chunks_exact(w).take(h).enumerate() {
+            let (o, bx) = ref_row(mx, my, j);
+            let row = clamped_run(&refp.y[o..o + refp.width], bx, w, &mut buf);
+            acc += row
+                .iter()
+                .zip(srow)
+                .map(|(&r, &s)| i32::from(r).abs_diff(s))
+                .sum::<u32>();
         }
-        acc
+        u64::from(acc)
     };
     // Motion-cost proxy at full-pel: cheapest mvd against either MVP.
     let mv_cost = |mx: i32, my: i32| -> u64 {
@@ -1829,34 +1853,80 @@ fn integer_me(
     // minimum on a periodic texture is always visited; its winner is
     // refined the same way and the cheaper final result is kept.
     let sub = usize::from(w * h >= 256) + 1;
-    let sad_sub = |mx: i32, my: i32| -> u64 {
-        let mut acc = 0u64;
-        for j in (0..h).step_by(sub) {
-            for i in (0..w).step_by(sub) {
-                let rx = (x0 as i32 + i as i32 + mx).clamp(0, refp.width as i32 - 1);
-                let ry = (y0 as i32 + j as i32 + my).clamp(0, refp.height as i32 - 1);
-                let r = i32::from(refp.y[ry as usize * refp.width + rx as usize]);
-                acc += u64::from(r.abs_diff(src_y[j * w + i]));
+    // Every scan position reads the reference on one lattice (the grid
+    // step is a multiple of the sampling step): the source samples and
+    // the edge-clamped reference window around the block are gathered
+    // once, `sub` apart, and each position is then a dense block SAD
+    // inside the window.
+    let (sw_, sh_) = (w.div_ceil(sub), h.div_ceil(sub));
+    let reach = (2 * ME_GRID_RADIUS) as usize / sub;
+    let (win_w, win_h) = (sw_ + reach, sh_ + reach);
+    let mut src_sub = [0u16; 32 * 32];
+    for (j, drow) in src_sub.chunks_exact_mut(sw_).take(sh_).enumerate() {
+        for (i, d) in drow.iter_mut().enumerate() {
+            *d = src_y[j * sub * w + i * sub] as u16;
+        }
+    }
+    let mut window = [0u16; 64 * 64];
+    assert!(win_w * win_h <= window.len(), "scan window holds the block");
+    for (r, wrow) in window.chunks_exact_mut(win_w).take(win_h).enumerate() {
+        let ry = (y0 as i32 - ME_GRID_RADIUS + (r * sub) as i32).clamp(0, rh - 1) as usize;
+        let row = &refp.y[ry * refp.width..(ry + 1) * refp.width];
+        for (c, d) in wrow.iter_mut().enumerate() {
+            let rx = (x0 as i32 - ME_GRID_RADIUS + (c * sub) as i32).clamp(0, rw - 1);
+            *d = row[rx as usize];
+        }
+    }
+    // The scan keeps the first position of minimal cost, so a position
+    // is settled as soon as its running cost reaches the best so far:
+    // the row sums only grow. `below` is the cost to stay under
+    // (`None`: no best yet); `None` back means "not better".
+    let sad_sub = |mx: i32, my: i32, motion: u64, below: Option<u64>| -> Option<u64> {
+        let (cx, cy) = (
+            (mx + ME_GRID_RADIUS) as usize / sub,
+            (my + ME_GRID_RADIUS) as usize / sub,
+        );
+        let scale = (sub * sub) as u64;
+        let mut acc = 0u32;
+        for (j, srow) in src_sub.chunks_exact(sw_).take(sh_).enumerate() {
+            let o = (cy + j) * win_w + cx;
+            acc += window[o..o + sw_]
+                .iter()
+                .zip(srow)
+                .map(|(&r, &s)| u32::from(r.abs_diff(s)))
+                .sum::<u32>();
+            if below.is_some_and(|b| u64::from(acc) * scale + motion >= b) {
+                return None;
             }
         }
-        acc * (sub * sub) as u64
+        Some(u64::from(acc) * scale + motion)
+    };
+    // The motion cost of a scan position is separable per predictor:
+    // the two components' bins, tabulated along each axis.
+    const GRID_N: usize = ME_GRID_RADIUS as usize + 1;
+    let axis_bits = |p: &Mv, c: usize| -> [u64; GRID_N] {
+        core::array::from_fn(|k| mvd_component_bits((2 * k as i32 - ME_GRID_RADIUS) * 4 - p[c]))
+    };
+    let tables: Option<[([u64; GRID_N], [u64; GRID_N]); 2]> = match mvp_q {
+        [a, b] => Some([
+            (axis_bits(a, 0), axis_bits(a, 1)),
+            (axis_bits(b, 0), axis_bits(b, 1)),
+        ]),
+        _ => None,
     };
     let mut grid: Option<([i32; 2], u64)> = None;
-    let mut gy = -ME_GRID_RADIUS;
-    while gy <= ME_GRID_RADIUS {
-        let mut gx = -ME_GRID_RADIUS;
-        while gx <= ME_GRID_RADIUS {
-            let c = sad_sub(gx, gy) + mv_cost(gx, gy);
-            let better = match grid {
-                Some((_, bc)) => c < bc,
-                None => true,
+    for ky in 0..GRID_N {
+        let gy = 2 * ky as i32 - ME_GRID_RADIUS;
+        for kx in 0..GRID_N {
+            let gx = 2 * kx as i32 - ME_GRID_RADIUS;
+            let motion = match &tables {
+                Some([(ax, ay), (bx, by)]) => (ax[kx] + ay[ky]).min(bx[kx] + by[ky]) * lambda_me,
+                None => mv_cost(gx, gy),
             };
-            if better {
+            if let Some(c) = sad_sub(gx, gy, motion, grid.map(|(_, bc)| bc)) {
                 grid = Some(([gx, gy], c));
             }
-            gx += 2;
         }
-        gy += 2;
     }
     match grid {
         Some((g, _)) if g != best_a => {
@@ -1865,6 +1935,76 @@ fn integer_me(
         }
         _ => best_a,
     }
+}
+
+/// SAD of the luma block a uni-predicted PU at quarter-sample `mv`
+/// gets from `refp` — the §8.5.3.3.3.2 interpolation and the eq. 8-262
+/// default rounding, i.e. [`predict_block`]'s luma for that motion —
+/// against `src_y`, without building the prediction on the heap.
+fn luma_sad_at(
+    refp: &RefPlanes<'_>,
+    src_y: &[i32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    mv: Mv,
+) -> u64 {
+    let bit_depth = refp.fmt.bit_depth_luma;
+    if !crate::inter_pred::mid_fits_16(bit_depth) || w * h > 64 * 64 {
+        let one = std::slice::from_ref(refp);
+        let pred = predict_block(one, one, x0, y0, w, h, &uni_l0(mv), false);
+        return sad(&pred.luma, src_y);
+    }
+    // The intermediate array on the stack, sized for the block.
+    match w * h {
+        0..=256 => luma_sad_mid::<256>(refp, src_y, x0, y0, w, h, mv),
+        257..=1024 => luma_sad_mid::<1024>(refp, src_y, x0, y0, w, h, mv),
+        _ => luma_sad_mid::<4096>(refp, src_y, x0, y0, w, h, mv),
+    }
+}
+
+/// [`luma_sad_at`] over an `NN`-sample intermediate array (`NN >= w *
+/// h`, a picture of at most 12 bits).
+fn luma_sad_mid<const NN: usize>(
+    refp: &RefPlanes<'_>,
+    src_y: &[i32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    mv: Mv,
+) -> u64 {
+    use crate::inter_pred::{MID_BIAS, interp_luma_into16};
+    let bit_depth = refp.fmt.bit_depth_luma;
+    let plane = RefPlane::new(refp.y, refp.width, refp.height).expect("legal ref plane");
+    let mut mid = [0i16; NN];
+    let mid = &mut mid[..w * h];
+    interp_luma_into16(
+        &plane,
+        x0 as i32 + (mv[0] >> 2),
+        y0 as i32 + (mv[1] >> 2),
+        mv[0] & 3,
+        mv[1] & 3,
+        w,
+        h,
+        bit_depth,
+        mid,
+    );
+    // Eq. 8-262 on the biased 16-bit intermediate.
+    let shift1 = 14 - i32::from(bit_depth);
+    let offset1 = (1i32 << (shift1 - 1)) + MID_BIAS;
+    let max = (1i32 << bit_depth) - 1;
+    let acc: u32 = mid
+        .iter()
+        .zip(src_y)
+        .map(|(&p, &s)| {
+            ((i32::from(p) + offset1) >> shift1)
+                .clamp(0, max)
+                .abs_diff(s)
+        })
+        .sum();
+    u64::from(acc)
 }
 
 /// Half- then quarter-pel refinement around `best` (quarter-pel
@@ -1882,14 +2022,12 @@ fn fractional_me(
     mvp_q: &[Mv],
 ) -> Mv {
     let cost_at = |mv: Mv| -> u64 {
-        let one = std::slice::from_ref(refp);
-        let pred = predict_block(one, one, x0, y0, w, h, &uni_l0(mv), false);
         let mv_rate = mvp_q
             .iter()
             .map(|p| mvd_bits([mv[0] - p[0], mv[1] - p[1]]))
             .min()
             .unwrap_or(0);
-        sad(&pred.luma, src_y) + lambda_me * mv_rate
+        luma_sad_at(refp, src_y, x0, y0, w, h, mv) + lambda_me * mv_rate
     };
     let mut best = start;
     let mut best_cost = cost_at(best);
