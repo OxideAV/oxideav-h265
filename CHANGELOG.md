@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.19](https://github.com/OxideAV/oxideav-h265/compare/v0.0.18...v0.0.19) - 2026-11-13
+
+### Other
+
+- a tile grid larger than the picture falls back to one tile in the PPS too; encode_budget fuzz target
+- README + CHANGELOG: round-488 measurements; residual parser skips uncoded sub-blocks
+- motion search on rows, a dense scan window and stack buffers
+- wavefront decisions for any single-tile picture without RDOQ; smaller working set
+- 16-bit motion compensation, look-ahead CABAC engine, heap-free transform path
+- intra decision on per-worker scratch and size-specialised kernels
+- iterate instead of indexing, direct boolean in the SAO tile gate
+
 ### Fixed
 
 - *(encoder)* **A tile grid the picture cannot hold produced an
