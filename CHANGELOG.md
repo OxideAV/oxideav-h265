@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- *(encoder)* **Intra mode decision without per-block allocation —
+  the same bytes about seven times faster.** The quadtree coder's
+  intra path (every still, the intra pictures and intra fallbacks of
+  the inter coders) predicted each of the 35 modes of every candidate
+  block through the decode-side reference API: one substitution, one
+  filtered copy and several heap arrays per mode, the §6.4.1
+  availability per reference sample, a matrix-product forward
+  transform with a heap row per stage. It now gathers and substitutes
+  a block's reference samples once into a per-worker scratch (the
+  availability once per aligned neighbour block), filters them once,
+  and predicts, measures (SATD / SAD), transforms, quantizes and
+  reconstructs on fixed-size buffers through block-size-specialised
+  kernels; the rollback snapshots of the split / candidate elections
+  come from a pool, and an intra picture's snapshots no longer carry
+  the motion field. Every kernel is the integer arithmetic it
+  replaces (unit tests compare each with the decode path and the
+  wide-accumulator transform), so the streams are byte-identical: a
+  68-stream digest matrix (stills at every effort level / CTB size /
+  tool set and sample layout, low-delay and hierarchical GOPs) and the
+  golden pins are unchanged. 12 MP still, `mode=intra qp=30 ctb=64
+  wpp=1 still=1`, same host under the same load: 55–70 s → 7.3–11.7 s
+  on one worker, 9.8–11.1 s → 1.2–1.4 s on eight.
+- `examples/encode_still` takes several concatenated pictures (a
+  sequence through the registry encoder, e.g. `mode=inter`) and then
+  reports pictures per second.
+
 ## [0.0.18](https://github.com/OxideAV/oxideav-h265/compare/v0.0.17...v0.0.18) - 2026-11-11
 
 ### Other

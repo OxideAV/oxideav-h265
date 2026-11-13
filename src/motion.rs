@@ -1310,14 +1310,28 @@ impl MotionField {
         w: usize,
         h: usize,
     ) -> Vec<MotionCell> {
+        let mut out = Vec::new();
+        self.snapshot_rect_into(x0, y0, w, h, &mut out);
+        out
+    }
+
+    /// [`Self::snapshot_rect`] into a reused buffer (cleared first).
+    pub(crate) fn snapshot_rect_into(
+        &self,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+        out: &mut Vec<MotionCell>,
+    ) {
         let (bx0, by0, bx1, by1) = self.band_rect(x0, y0, w, h);
-        let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
+        out.clear();
+        out.reserve((bx1 - bx0) * (by1 - by0));
         for by in by0..by1 {
             for bx in bx0..bx1 {
                 out.push(self.cell_index(by * self.cols_4 + bx));
             }
         }
-        out
     }
 
     /// Write back a [`Self::snapshot_rect`] copy of the same rectangle.

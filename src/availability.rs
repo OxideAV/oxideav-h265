@@ -366,14 +366,11 @@ impl PictureTiling {
         let tb_x = (x << self.min_tb_log2_size_y) >> self.ctb_log2_size_y;
         let tb_y = (y << self.min_tb_log2_size_y) >> self.ctb_log2_size_y;
         let ctb_addr_rs = self.pic_width_in_ctbs_y * tb_y + tb_x;
-        let mut addr = self.ctb_addr_rs_to_ts[ctb_addr_rs as usize] << (shift * 2);
-        let mut p = 0u32;
-        for i in 0..shift {
-            let m = 1u32 << i;
-            p += if m & x != 0 { m * m } else { 0 } + if m & y != 0 { 2 * m * m } else { 0 };
-        }
-        addr += p;
-        addr
+        let addr = self.ctb_addr_rs_to_ts[ctb_addr_rs as usize] << (shift * 2);
+        // The eq. 6-10 interleave of the low `shift` (at most four:
+        // CtbLog2SizeY <= 6, MinTbLog2SizeY >= 2) bits of x and y.
+        let mask = (1u32 << shift) - 1;
+        addr + SPREAD_BITS[(x & mask) as usize & 15] + 2 * SPREAD_BITS[(y & mask) as usize & 15]
     }
 
     /// §6.4.1 — derivation process for z-scan order block availability.
@@ -521,6 +518,25 @@ impl PictureTiling {
         self.ctb_addr_ts_to_rs[ctb_addr_ts as usize]
     }
 }
+
+/// `SPREAD_BITS[ v ]`: the four bits of `v` moved to the even bit
+/// positions (bit `i` to bit `2 * i`) — one operand of the eq. 6-10
+/// z-order interleave.
+const SPREAD_BITS: [u32; 16] = {
+    let mut t = [0u32; 16];
+    let mut v = 0;
+    while v < 16 {
+        let mut i = 0;
+        while i < 4 {
+            if v & (1 << i) != 0 {
+                t[v] |= 1 << (2 * i);
+            }
+            i += 1;
+        }
+        v += 1;
+    }
+    t
+};
 
 /// §6.5.1 eqs. 6-3 / 6-4 — derive the per-tile sizes (`colWidth` /
 /// `rowHeight`) in CTBs, for one dimension.

@@ -69,10 +69,7 @@ use crate::encoder::residual::encode_residual_coding;
 use crate::encoder::sample::{Sample, SampleFmt};
 use crate::inter_recon::SliceWpTables;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
-use crate::intra_pred::{
-    Component as PredComponent, IntraPredParams, MarkedReferenceSamples,
-    intra_predict_with_substitution,
-};
+use crate::intra_pred::Component as PredComponent;
 use crate::motion::{MotionCell, MotionField};
 use crate::pu_mv::{PartMode, PuGeometry, PuMotion, PuMvContext, pu_partitions, resolve_pu_motion};
 use crate::residual::{ResidualCodingParams, residual_coding_scan_idx};
@@ -84,6 +81,7 @@ use crate::transform::{BlockParams, Component, PredMode, forward_dst4_1d, residu
 mod fast;
 mod fast_dsp;
 pub(crate) use fast_dsp::HalfPel;
+use fast_dsp::{self as dsp, MAXB};
 
 /// `MaxNumMergeCand` (§7.4.7.1) — `five_minus_max_num_merge_cand = 0`.
 const MAX_MERGE: usize = 5;
@@ -774,6 +772,36 @@ struct EncState {
     /// emission's residual context states at the CTB start); `None`
     /// when RDOQ is off.
     rdoq_model: Option<RdoqModel>,
+    /// Block buffers the transform-block coders and mode searches
+    /// reuse (one set per state, i.e. per worker).
+    scratch: Box<TbScratch>,
+    /// Released rollback snapshots, kept for their buffers
+    /// ([`Self::snapshot`] / [`Self::recycle`]).
+    snap_pool: Vec<Snap>,
+}
+
+/// Reusable `n`x`n` sample buffers of one worker: a block's source
+/// samples, its prediction, its reconstruction and its intra
+/// reference samples. Every user writes
+/// the `[..n * n]` prefix it then reads, so nothing is cleared between
+/// uses.
+struct TbScratch {
+    src: [i32; MAXB * MAXB],
+    pred: [i32; MAXB * MAXB],
+    recon: [u16; MAXB * MAXB],
+    /// The reference samples of the block being predicted.
+    refs: IntraRefs,
+}
+
+impl TbScratch {
+    fn boxed() -> Box<Self> {
+        Box::new(Self {
+            src: [0; MAXB * MAXB],
+            pred: [0; MAXB * MAXB],
+            recon: [0; MAXB * MAXB],
+            refs: IntraRefs::empty(),
+        })
+    }
 }
 
 impl EncState {
@@ -806,6 +834,8 @@ impl EncState {
             pic_h_cells: height.div_ceil(4),
             cell_origin: y_origin / 4,
             rdoq_model: None,
+            scratch: TbScratch::boxed(),
+            snap_pool: Vec::new(),
         }
     }
 
@@ -875,6 +905,7 @@ impl EncState {
 }
 
 /// A rectangular rollback snapshot of the encoder state.
+#[derive(Default)]
 struct Snap {
     x0: usize,
     y0: usize,
@@ -890,10 +921,24 @@ struct Snap {
 
 fn rect_copy<T: Copy>(plane: &[T], pw: usize, x0: usize, y0: usize, w: usize, h: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(w * h);
+    rect_copy_into(&mut out, plane, pw, x0, y0, w, h);
+    out
+}
+
+/// [`rect_copy`] into a reused buffer.
+fn rect_copy_into<T: Copy>(
+    out: &mut Vec<T>,
+    plane: &[T],
+    pw: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    out.clear();
     for j in 0..h {
         out.extend_from_slice(&plane[(y0 + j) * pw + x0..(y0 + j) * pw + x0 + w]);
     }
-    out
 }
 
 fn rect_paste<T: Copy>(
@@ -911,7 +956,17 @@ fn rect_paste<T: Copy>(
 }
 
 impl EncState {
-    fn snapshot(&self, ctx: &SliceCtx<'_>, x0: usize, y0: usize, n: usize) -> Snap {
+    /// Snapshot the `n`x`n` luma rectangle at `(x0, y0)` (clipped to
+    /// the picture) for a later [`Self::restore`]. The buffers come
+    /// from the state's pool; hand a snapshot back with
+    /// [`Self::recycle`] once it is no longer needed.
+    ///
+    /// An intra picture's motion field is not captured: every coded
+    /// unit of it writes the same intra cell and nothing reads the
+    /// field before the picture is decided, so a rolled-back trial may
+    /// leave its cells in place.
+    fn snapshot(&mut self, ctx: &SliceCtx<'_>, x0: usize, y0: usize, n: usize) -> Snap {
+        let mut snap = self.snap_pool.pop().unwrap_or_default();
         let w = (ctx.width - x0).min(n);
         let h = (ctx.height - y0).min(n);
         let (sw, sh) = ctx.fmt.sub_wh();
@@ -925,25 +980,32 @@ impl EncState {
         let by0 = y0 / 4;
         let bx1 = (x0 + w).div_ceil(4).min(self.w_cells);
         let by1 = (y0 + h).div_ceil(4).min(self.pic_h_cells);
-        let mut depth = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
-        let mut skip = Vec::with_capacity((bx1 - bx0) * (by1 - by0));
+        snap.depth.clear();
+        snap.skip.clear();
         for by in by0..by1 {
             let row = (by - self.cell_origin) * self.w_cells;
-            depth.extend_from_slice(&self.ct_depth[row + bx0..row + bx1]);
-            skip.extend_from_slice(&self.skip[row + bx0..row + bx1]);
+            snap.depth
+                .extend_from_slice(&self.ct_depth[row + bx0..row + bx1]);
+            snap.skip
+                .extend_from_slice(&self.skip[row + bx0..row + bx1]);
         }
-        Snap {
-            x0,
-            y0,
-            n,
-            y: rect_copy(&self.recon.y, ctx.width, x0, self.recon.ly(y0), w, h),
-            cb: rect_copy(&self.recon.cb, cw, cx0, self.recon.cy(cy0), wc, hc),
-            cr: rect_copy(&self.recon.cr, cw, cx0, self.recon.cy(cy0), wc, hc),
-            field: self.field.snapshot_rect(x0, y0, n, n),
-            modes: self.modes.snapshot_rect(x0, y0, n, n),
-            depth,
-            skip,
+        (snap.x0, snap.y0, snap.n) = (x0, y0, n);
+        let (ly0, lcy0) = (self.recon.ly(y0), self.recon.cy(cy0));
+        rect_copy_into(&mut snap.y, &self.recon.y, ctx.width, x0, ly0, w, h);
+        rect_copy_into(&mut snap.cb, &self.recon.cb, cw, cx0, lcy0, wc, hc);
+        rect_copy_into(&mut snap.cr, &self.recon.cr, cw, cx0, lcy0, wc, hc);
+        if ctx.intra_slice {
+            snap.field.clear();
+        } else {
+            self.field.snapshot_rect_into(x0, y0, n, n, &mut snap.field);
         }
+        self.modes.snapshot_rect_into(x0, y0, n, n, &mut snap.modes);
+        snap
+    }
+
+    /// Return a snapshot's buffers to the pool.
+    fn recycle(&mut self, snap: Snap) {
+        self.snap_pool.push(snap);
     }
 
     fn restore(&mut self, ctx: &SliceCtx<'_>, snap: &Snap) {
@@ -961,7 +1023,9 @@ impl EncState {
         rect_paste(&mut self.recon.y, ctx.width, x0, ly0, w, h, &snap.y);
         rect_paste(&mut self.recon.cb, cw, cx0, lcy0, wc, hc, &snap.cb);
         rect_paste(&mut self.recon.cr, cw, cx0, lcy0, wc, hc, &snap.cr);
-        self.field.restore_rect(x0, y0, n, n, &snap.field);
+        if !ctx.intra_slice {
+            self.field.restore_rect(x0, y0, n, n, &snap.field);
+        }
         self.modes.restore_rect(x0, y0, n, n, &snap.modes);
         let bx0 = x0 / 4;
         let by0 = y0 / 4;
@@ -1065,9 +1129,30 @@ impl<'a> TbTools<'a> {
     }
 }
 
+/// Forward 2-D transform of an `n`x`n` residual (DST-VII when `dst`):
+/// the `i32` kernel when every residual lies within the component's
+/// sample range (its sums then provably fit 32 bits and equal the
+/// wide-accumulator transform bit for bit), the `i64` one otherwise
+/// (a source plane carrying out-of-range samples).
+fn forward_tb(res: &[i32], n: usize, bit_depth: u8, dst: bool, out: &mut [i32]) {
+    let lim = 1i32 << bit_depth;
+    if res.iter().all(|&r| (-lim..=lim).contains(&r)) {
+        dsp::forward(res, n, bit_depth, dst, out);
+    } else {
+        let wide = if dst {
+            forward_transform_dst4(res, bit_depth)
+        } else {
+            forward_transform_bd(res, n, bit_depth)
+        };
+        out[..n * n].copy_from_slice(&wide);
+    }
+}
+
 /// Transform + quantize one TB and reconstruct through the decode-side
-/// §8.6.2 path (the intra-luma 4x4 case taking the DST-VII pair).
-/// Returns `(levels, recon_samples)`.
+/// §8.6.2 path (the intra-luma 4x4 case taking the DST-VII pair): the
+/// reconstructed samples go to `recon[..n * n]`, the levels are
+/// returned.
+#[allow(clippy::too_many_arguments)]
 fn code_tb(
     src: &[i32],
     pred: &[i32],
@@ -1076,13 +1161,37 @@ fn code_tb(
     component: Component,
     pred_mode: PredMode,
     tools: TbTools<'_>,
-) -> (Vec<i32>, Vec<u16>) {
-    let res: Vec<i32> = src.iter().zip(pred.iter()).map(|(&s, &p)| s - p).collect();
-    let coef = if pred_mode == PredMode::Intra && component == Component::Luma && n == 4 {
-        forward_transform_dst4(&res, tools.bit_depth)
-    } else {
-        forward_transform_bd(&res, n, tools.bit_depth)
-    };
+    recon: &mut [u16],
+) -> Vec<i32> {
+    match n {
+        4 => code_tb_n::<16>(src, pred, n, qp, component, pred_mode, tools, recon),
+        8 => code_tb_n::<64>(src, pred, n, qp, component, pred_mode, tools, recon),
+        16 => code_tb_n::<256>(src, pred, n, qp, component, pred_mode, tools, recon),
+        _ => code_tb_n::<1024>(src, pred, n, qp, component, pred_mode, tools, recon),
+    }
+}
+
+/// [`code_tb`] with its working arrays sized for the block (`NN == n *
+/// n`).
+#[allow(clippy::too_many_arguments)]
+fn code_tb_n<const NN: usize>(
+    src: &[i32],
+    pred: &[i32],
+    n: usize,
+    qp: u32,
+    component: Component,
+    pred_mode: PredMode,
+    tools: TbTools<'_>,
+    recon: &mut [u16],
+) -> Vec<i32> {
+    let nn = NN;
+    let dst = pred_mode == PredMode::Intra && component == Component::Luma && n == 4;
+    let mut res = [0i32; NN];
+    for ((r, &s), &p) in res.iter_mut().zip(src).zip(pred) {
+        *r = s - p;
+    }
+    let mut coef = [0i32; NN];
+    forward_tb(&res, n, tools.bit_depth, dst, &mut coef);
     let levels = quantize_tb(
         &coef,
         &TbQuant {
@@ -1098,31 +1207,40 @@ fn code_tb(
         },
     );
     let max = (1i32 << tools.bit_depth) - 1;
-    let recon: Vec<u16> = if levels.iter().all(|&v| v == 0) {
-        pred.iter().map(|&p| u16::clipped(p, max)).collect()
-    } else {
-        let r = residual_block(
-            &levels,
-            tools.scaling,
-            BlockParams {
-                n_tbs: n,
-                q_p: qp,
-                component,
-                pred_mode,
-                bit_depth: tools.bit_depth,
-                extended_precision: false,
-                transquant_bypass: false,
-                transform_skip: false,
-                transform_skip_rotation_enabled: false,
-            },
-        )
-        .expect("legal block params");
-        pred.iter()
-            .zip(r.iter())
-            .map(|(&p, &d)| u16::clipped(p + d, max))
-            .collect()
-    };
-    (levels, recon)
+    if levels.iter().all(|&v| v == 0) {
+        for (d, &p) in recon[..nn].iter_mut().zip(pred) {
+            *d = u16::clipped(p, max);
+        }
+        return levels;
+    }
+    let mut r = [0i32; NN];
+    match tools.scaling {
+        // Flat scaling: the stack-buffer twin of the decode path.
+        None => dsp::dequant_inverse(&levels, n, qp, tools.bit_depth, dst, &mut r),
+        Some(_) => {
+            let wide = residual_block(
+                &levels,
+                tools.scaling,
+                BlockParams {
+                    n_tbs: n,
+                    q_p: qp,
+                    component,
+                    pred_mode,
+                    bit_depth: tools.bit_depth,
+                    extended_precision: false,
+                    transquant_bypass: false,
+                    transform_skip: false,
+                    transform_skip_rotation_enabled: false,
+                },
+            )
+            .expect("legal block params");
+            r.copy_from_slice(&wide);
+        }
+    }
+    for ((d, &p), &dv) in recon[..nn].iter_mut().zip(pred).zip(&r) {
+        *d = u16::clipped(p + dv, max);
+    }
+    levels
 }
 
 /// Sum of squared differences of a stored block against an `i32` one.
@@ -1145,53 +1263,125 @@ fn clip_to_samples(v: &[i32], max: i32) -> Vec<u16> {
 // Intra CU coding
 // ---------------------------------------------------------------------
 
-/// The §8.4.4.2 prediction parameters of one component at the
-/// picture's format (`strong_intra_smoothing_enabled_flag == 0`, the
-/// §8.4.4.2.3 filtering gate open for chroma only at 4:4:4).
-fn pred_params(fmt: &SampleFmt, mode: u8, cidx: PredComponent) -> IntraPredParams {
-    IntraPredParams {
-        pred_mode_intra: mode,
-        cidx,
-        bit_depth: if cidx == PredComponent::Luma {
+/// The §8.4.4.2.2-substituted reference samples of one transform
+/// block together with their §8.4.4.2.3 `[1 2 1]`-filtered twin
+/// (`strong_intra_smoothing_enabled_flag == 0`), so a mode search
+/// substitutes and filters once and predicts every mode from the pair.
+/// Filled in place by the gather functions (one per worker, in
+/// [`TbScratch`]).
+struct IntraRefs {
+    raw: dsp::Refs,
+    /// Valid when `filtered` is set.
+    filt: dsp::Refs,
+    filtered: bool,
+}
+
+impl IntraRefs {
+    fn empty() -> Self {
+        Self {
+            raw: dsp::Refs::empty(),
+            filt: dsp::Refs::empty(),
+            filtered: false,
+        }
+    }
+
+    /// Start a gather for an `n`-TB: every sample unavailable
+    /// ([`dsp::REF_UNAVAILABLE`]).
+    fn begin(&mut self, n: usize) {
+        self.raw.n = n;
+        self.raw.left[..=2 * n].fill(dsp::REF_UNAVAILABLE);
+        self.raw.top[..=2 * n].fill(dsp::REF_UNAVAILABLE);
+    }
+
+    /// Finish a gather: §8.4.4.2.2 substitution of the unavailable
+    /// samples, then the filtered twin when `filter_gate` (the
+    /// §8.4.4.2.3 component gate: luma, or chroma at 4:4:4) holds and
+    /// the block size has filtered modes at all.
+    fn finish(&mut self, bit_depth: u8, filter_gate: bool) {
+        self.raw.substitute_marked(bit_depth);
+        self.filtered = filter_gate && self.raw.n > 4;
+        if self.filtered {
+            self.raw.filter_into(&mut self.filt);
+        }
+    }
+
+    /// `nTbS`.
+    fn n(&self) -> usize {
+        self.raw.n
+    }
+
+    /// §8.4.4.2.1 for `mode` at the picture's format into `out[..n *
+    /// n]`: the filtered references when the §8.4.4.2.3 gate holds
+    /// (luma, or chroma at 4:4:4) and `filterFlag` is set; the DC /
+    /// horizontal / vertical edge filters on luma only.
+    fn predict(&self, fmt: &SampleFmt, mode: u8, cidx: PredComponent, out: &mut [i32]) {
+        let luma = cidx.is_luma();
+        let refs = if self.filtered && dsp::filter_flag(mode, self.raw.n) {
+            &self.filt
+        } else {
+            &self.raw
+        };
+        let bit_depth = if luma {
             fmt.bit_depth_luma
         } else {
             fmt.bit_depth_chroma
-        },
-        bit_depth_luma: fmt.bit_depth_luma,
-        intra_smoothing_disabled: false,
-        strong_intra_smoothing_enabled: false,
-        chroma_array_type_3: fmt.chroma_format_idc == 3,
-        disable_boundary_filter: false,
+        };
+        dsp::predict_intra(refs, mode, luma, bit_depth, out);
     }
 }
 
-/// Gather the §8.4.4.2.1 marked luma reference array for an `n`-TB at
-/// `(x0, y0)` from the frame reconstruction, availability per §6.4.1.
+/// Read the `n`x`n` block of `plane` (row stride `pw`) at `(x0, y0)`
+/// into `out[..n * n]` as `i32` samples.
+fn load_block(plane: &[u16], pw: usize, x0: usize, y0: usize, n: usize, out: &mut [i32]) {
+    for (j, row) in out[..n * n].chunks_exact_mut(n).enumerate() {
+        let o = (y0 + j) * pw + x0;
+        for (d, &v) in row.iter_mut().zip(&plane[o..o + n]) {
+            *d = i32::from(v);
+        }
+    }
+}
+
+/// Gather the §8.4.4.2.1 luma reference samples of an `n`-TB at
+/// `(x0, y0)` from the frame reconstruction and substitute them.
+///
+/// The §6.4.1 availability is tested once per `n`-sample run: each of
+/// the five neighbour runs (corner, left, below-left, above,
+/// above-right) lies in one `n`-aligned `n`x`n` block, whose minimum
+/// blocks are contiguous in z-scan order and share one CTB (hence one
+/// slice and tile), so the block is available as a whole or not at
+/// all — up to the picture edge, which is tested per sample.
 fn gather_luma_refs(
     ctx: &SliceCtx<'_>,
     recon: &ReconPlanes,
     x0: usize,
     y0: usize,
     n: usize,
-) -> MarkedReferenceSamples {
-    let get = |x: i64, y: i64| -> (i32, bool) {
-        if ctx.z_avail(x0, y0, x, y) {
-            (
-                i32::from(recon.y[recon.ly(y as usize) * ctx.width + x as usize]),
-                true,
-            )
-        } else {
-            (0, false)
+    refs: &mut IntraRefs,
+) {
+    let (w, h) = (ctx.width, ctx.height);
+    refs.begin(n);
+    let (xi, yi) = (x0 as i64, y0 as i64);
+    if ctx.z_avail(x0, y0, xi - 1, yi - 1) {
+        refs.raw.left[0] = i32::from(recon.y[recon.ly(y0 - 1) * w + x0 - 1]);
+    }
+    for u in [0, n] {
+        if ctx.z_avail(x0, y0, xi - 1, (y0 + u) as i64) {
+            for k in u..(u + n).min(h - y0) {
+                refs.raw.left[1 + k] = i32::from(recon.y[recon.ly(y0 + k) * w + x0 - 1]);
+            }
         }
-    };
-    let corner = get(x0 as i64 - 1, y0 as i64 - 1);
-    let left: Vec<(i32, bool)> = (0..2 * n)
-        .map(|k| get(x0 as i64 - 1, (y0 + k) as i64))
-        .collect();
-    let top: Vec<(i32, bool)> = (0..2 * n)
-        .map(|k| get((x0 + k) as i64, y0 as i64 - 1))
-        .collect();
-    MarkedReferenceSamples::new(n, corner, left, top).expect("legal TB geometry")
+        if ctx.z_avail(x0, y0, (x0 + u) as i64, yi - 1) {
+            let run = n.min(w - x0 - u);
+            let o = recon.ly(y0 - 1) * w + x0 + u;
+            for (m, &v) in refs.raw.top[1 + u..1 + u + run]
+                .iter_mut()
+                .zip(&recon.y[o..o + run])
+            {
+                *m = i32::from(v);
+            }
+        }
+    }
+    refs.finish(ctx.fmt.bit_depth_luma, true);
 }
 
 /// A source plane plus the chroma rectangle `(x, y, w, h)` whose
@@ -1202,9 +1392,15 @@ type SrcOverride<'a> = (&'a [u16], (usize, usize, usize, usize));
 /// `(cx0, cy0)`; availability tested at the co-located luma — the
 /// §8.4.4.2.2 `( xTbCmp, yTbCmp )` scaled by `SubWidthC` /
 /// `SubHeightC`, so a 4:2:2 lower block is judged from its own
-/// position). `override` substitutes reads inside a chroma rectangle
-/// (`x, y, w, h`) with the SOURCE plane — the rough mode elections'
-/// stand-in for not-yet-reconstructed samples of the current CU.
+/// position). The test runs once per aligned luma block of side
+/// `min( n · SubWidthC, n · SubHeightC )` — `n / SubWidthC'` samples
+/// of the top row and `n / SubHeightC'` rows of the left column, with
+/// the primes the subsampling relative to that side — for the reason
+/// given at [`gather_luma_refs`]. `override` substitutes reads inside
+/// a chroma rectangle (`x, y, w, h`) with the SOURCE plane — the rough
+/// mode elections' stand-in for not-yet-reconstructed samples of the
+/// current CU.
+#[allow(clippy::too_many_arguments)]
 fn gather_chroma_refs(
     ctx: &SliceCtx<'_>,
     recon: &ReconPlanes,
@@ -1213,107 +1409,135 @@ fn gather_chroma_refs(
     cy0: usize,
     n: usize,
     override_src: Option<SrcOverride<'_>>,
-) -> MarkedReferenceSamples {
+    refs: &mut IntraRefs,
+) {
     let plane: &[u16] = if plane_idx == 1 { &recon.cb } else { &recon.cr };
     let cw = ctx.cw();
     let ch = ctx.ch();
     let (sw, sh) = ctx.fmt.sub_wh();
-    let get = |x: i64, y: i64| -> (i32, bool) {
+    // The §6.4.1 test of the luma minimum block holding chroma (x, y).
+    let avail = |x: i64, y: i64| -> bool {
+        x >= 0
+            && y >= 0
+            && x < cw as i64
+            && y < ch as i64
+            && ctx.z_avail(cx0 * sw, cy0 * sh, x * sw as i64, y * sh as i64)
+    };
+    // One sample: the override rectangle wins, then the run's
+    // availability `ok`.
+    let get = |x: i64, y: i64, ok: bool| -> i32 {
         if x < 0 || y < 0 || x >= cw as i64 || y >= ch as i64 {
-            return (0, false);
+            return dsp::REF_UNAVAILABLE;
         }
         let (xu, yu) = (x as usize, y as usize);
         if let Some((src, (rx, ry, rw, rh))) = override_src
             && (rx..rx + rw).contains(&xu)
             && (ry..ry + rh).contains(&yu)
         {
-            return (i32::from(src[yu * cw + xu]), true);
+            return i32::from(src[yu * cw + xu]);
         }
-        if ctx.z_avail(cx0 * sw, cy0 * sh, x * sw as i64, y * sh as i64) {
-            (i32::from(plane[recon.cy(yu) * cw + xu]), true)
+        if ok {
+            i32::from(plane[recon.cy(yu) * cw + xu])
         } else {
-            (0, false)
+            dsp::REF_UNAVAILABLE
         }
     };
-    let corner = get(cx0 as i64 - 1, cy0 as i64 - 1);
-    let left: Vec<(i32, bool)> = (0..2 * n)
-        .map(|k| get(cx0 as i64 - 1, (cy0 + k) as i64))
-        .collect();
-    let top: Vec<(i32, bool)> = (0..2 * n)
-        .map(|k| get((cx0 + k) as i64, cy0 as i64 - 1))
-        .collect();
-    MarkedReferenceSamples::new(n, corner, left, top).expect("legal TB geometry")
+    let (xi, yi) = (cx0 as i64, cy0 as i64);
+    refs.begin(n);
+    refs.raw.left[0] = get(xi - 1, yi - 1, avail(xi - 1, yi - 1));
+    // The aligned luma block side the runs are tested at, in chroma
+    // rows / columns.
+    let side = (n * sw).min(n * sh);
+    let (unit_v, unit_h) = (side / sh, side / sw);
+    for u in (0..2 * n).step_by(unit_v) {
+        let ok = avail(xi - 1, (cy0 + u) as i64);
+        for k in u..u + unit_v {
+            refs.raw.left[1 + k] = get(xi - 1, (cy0 + k) as i64, ok);
+        }
+    }
+    for u in (0..2 * n).step_by(unit_h) {
+        let ok = avail((cx0 + u) as i64, yi - 1);
+        for k in u..u + unit_h {
+            refs.raw.top[1 + k] = get((cx0 + k) as i64, yi - 1, ok);
+        }
+    }
+    refs.finish(ctx.fmt.bit_depth_chroma, ctx.fmt.chroma_format_idc == 3);
 }
 
-/// SAD-search all 35 §8.4.2 modes for a luma TB read from the frame
-/// reconstruction; `override_read` (inside-CU source samples for the
-/// 64x64 multi-TU search) substitutes reference reads when set.
-fn search_best_mode(
-    fmt: &SampleFmt,
-    marked: &MarkedReferenceSamples,
-    src: &[i32],
-) -> (u8, Vec<i32>) {
-    let mut best = (0u8, Vec::new());
+/// Sum of absolute differences of two equally long sample blocks.
+fn sad(a: &[i32], b: &[i32]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(&s, &p)| u64::from(s.abs_diff(p)))
+        .sum()
+}
+
+/// SAD-search all 35 §8.4.2 modes for a luma TB against `src` (the
+/// TB's source samples, row-major); `pred` is a prediction buffer of
+/// at least the block's size.
+fn search_best_mode(fmt: &SampleFmt, refs: &IntraRefs, src: &[i32], pred: &mut [i32]) -> u8 {
+    let nn = refs.n() * refs.n();
+    let mut best = 0u8;
     let mut best_cost = u64::MAX;
     for mode in 0..=34u8 {
-        let pred =
-            intra_predict_with_substitution(marked, &pred_params(fmt, mode, PredComponent::Luma))
-                .expect("legal prediction params");
-        let cost: u64 = src
-            .iter()
-            .zip(pred.iter())
-            .map(|(&s, &p)| u64::from(s.abs_diff(p)))
-            .sum();
+        refs.predict(fmt, mode, PredComponent::Luma, &mut pred[..nn]);
+        let cost = sad(&src[..nn], &pred[..nn]);
         if cost < best_cost {
             best_cost = cost;
-            best = (mode, pred);
+            best = mode;
         }
     }
     best
 }
 
-/// In-place 1-D Walsh–Hadamard butterfly over `v` (a power-of-two
-/// length): the sequency-agnostic sum-of-absolute-transformed-
-/// differences kernel.
-fn hadamard_1d(v: &mut [i64]) {
-    let mut h = 1;
-    while h < v.len() {
-        let mut i = 0;
-        while i < v.len() {
-            for j in i..i + h {
-                let (a, b) = (v[j], v[j + h]);
-                v[j] = a + b;
-                v[j + h] = a - b;
-            }
-            i += 2 * h;
-        }
-        h *= 2;
+/// Sum of the absolute 2-D Hadamard coefficients of the 4x4 block of
+/// `src − pred` at `(bx, by)` inside `n x n` buffers.
+fn hadamard4_abs(src: &[i32], pred: &[i32], n: usize, bx: usize, by: usize) -> u64 {
+    let mut m = [0i32; 16];
+    for j in 0..4 {
+        let o = (by + j) * n + bx;
+        let (s, p) = (&src[o..o + 4], &pred[o..o + 4]);
+        let r = [s[0] - p[0], s[1] - p[1], s[2] - p[2], s[3] - p[3]];
+        let (a0, a1) = (r[0] + r[2], r[0] - r[2]);
+        let (b0, b1) = (r[1] + r[3], r[1] - r[3]);
+        m[j * 4] = a0 + b0;
+        m[j * 4 + 1] = a0 - b0;
+        m[j * 4 + 2] = a1 + b1;
+        m[j * 4 + 3] = a1 - b1;
     }
+    let mut acc = 0u32;
+    for i in 0..4 {
+        let (a0, a1) = (m[i] + m[8 + i], m[i] - m[8 + i]);
+        let (b0, b1) = (m[4 + i] + m[12 + i], m[4 + i] - m[12 + i]);
+        acc += (a0 + b0).unsigned_abs()
+            + (a0 - b0).unsigned_abs()
+            + (a1 + b1).unsigned_abs()
+            + (a1 - b1).unsigned_abs();
+    }
+    u64::from(acc)
 }
 
-/// SATD of one `m x m` block (`m` 4 or 8) of `src − pred` read at
-/// `(bx, by)` inside `n x n` buffers: the 2-D Hadamard of the
-/// difference, summed in magnitude.
-fn satd_block(src: &[i32], pred: &[i32], n: usize, bx: usize, by: usize, m: usize) -> u64 {
-    let mut d = [0i64; 64];
-    for y in 0..m {
-        for x in 0..m {
-            d[y * m + x] = i64::from(src[(by + y) * n + bx + x] - pred[(by + y) * n + bx + x]);
+/// Sum of the absolute 2-D Hadamard coefficients of the 8x8 block of
+/// `src − pred` at `(bx, by)` inside `n x n` buffers (the transform is
+/// applied lane-wise to whole rows, then to the transposed block; the
+/// sum of magnitudes does not depend on the coefficient order).
+fn hadamard8_abs(src: &[i32], pred: &[i32], n: usize, bx: usize, by: usize) -> u64 {
+    let mut t = [[0i32; 8]; 8];
+    for (j, row) in t.iter_mut().enumerate() {
+        let o = (by + j) * n + bx;
+        for ((d, &s), &p) in row.iter_mut().zip(&src[o..o + 8]).zip(&pred[o..o + 8]) {
+            *d = s - p;
         }
     }
-    for y in 0..m {
-        hadamard_1d(&mut d[y * m..(y + 1) * m]);
-    }
-    let mut col = [0i64; 8];
-    let mut sum = 0u64;
-    for x in 0..m {
-        for y in 0..m {
-            col[y] = d[y * m + x];
+    dsp::butterfly8_rows(&mut t);
+    let mut u = [[0i32; 8]; 8];
+    for (j, row) in t.iter().enumerate() {
+        for (l, &v) in row.iter().enumerate() {
+            u[l][j] = v;
         }
-        hadamard_1d(&mut col[..m]);
-        sum += col[..m].iter().map(|c| c.unsigned_abs()).sum::<u64>();
     }
-    sum
+    dsp::butterfly8_rows(&mut u);
+    u64::from(u.iter().flatten().map(|v| v.unsigned_abs()).sum::<u32>())
 }
 
 /// Sum of absolute Hadamard-transformed differences of an `n x n`
@@ -1322,17 +1546,13 @@ fn satd_block(src: &[i32], pred: &[i32], n: usize, bx: usize, by: usize, m: usiz
 /// both).
 fn satd(src: &[i32], pred: &[i32], n: usize) -> u64 {
     if n == 4 {
-        return (satd_block(src, pred, 4, 0, 0, 4) + 1) >> 1;
+        return (hadamard4_abs(src, pred, 4, 0, 0) + 1) >> 1;
     }
     let mut sum = 0u64;
-    let mut by = 0;
-    while by < n {
-        let mut bx = 0;
-        while bx < n {
-            sum += satd_block(src, pred, n, bx, by, 8);
-            bx += 8;
+    for by in (0..n).step_by(8) {
+        for bx in (0..n).step_by(8) {
+            sum += hadamard8_abs(src, pred, n, bx, by);
         }
-        by += 8;
     }
     (sum + 2) >> 2
 }
@@ -1362,37 +1582,70 @@ fn mpm_list(ctx: &SliceCtx<'_>, st: &EncState, x: usize, y: usize) -> [u8; 3] {
     intra_luma_cand_mode_list(a, b)
 }
 
+/// A short list of intra modes in election order (at most the three
+/// kept survivors plus the first most-probable mode).
+#[derive(Clone, Copy)]
+struct ModeList {
+    modes: [u8; 4],
+    len: usize,
+}
+
+impl ModeList {
+    fn one(mode: u8) -> Self {
+        Self {
+            modes: [mode, 0, 0, 0],
+            len: 1,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.modes[..self.len]
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
 /// Rough mode decision: every §8.4.2 mode scored by SATD of its
 /// prediction against the source plus `λ_me` times its signalling
-/// bins; the best `keep` modes in ascending cost (the most-probable
-/// mode appended when it did not make the cut — it is the cheapest
-/// to signal and a frequent RD winner).
+/// bins; the best `keep` (at most 3) modes in ascending cost (the
+/// most-probable mode appended when it did not make the cut — it is
+/// the cheapest to signal and a frequent RD winner). `pred` is a
+/// prediction buffer of at least the block's size.
+#[allow(clippy::too_many_arguments)]
 fn rough_intra_modes(
     fmt: &SampleFmt,
-    marked: &MarkedReferenceSamples,
+    refs: &IntraRefs,
     src: &[i32],
-    n: usize,
     mpm: &[u8; 3],
     lambda_me: u64,
     keep: usize,
-) -> Vec<u8> {
-    let mut scored: Vec<(u64, u8)> = (0..=34u8)
-        .map(|mode| {
-            let pred = intra_predict_with_substitution(
-                marked,
-                &pred_params(fmt, mode, PredComponent::Luma),
-            )
-            .expect("legal prediction params");
-            (
-                satd(src, &pred, n) + lambda_me * luma_mode_bins(mode, mpm),
-                mode,
-            )
-        })
-        .collect();
-    scored.sort_by_key(|&(c, m)| (c, m));
-    let mut out: Vec<u8> = scored.iter().take(keep).map(|&(_, m)| m).collect();
-    if !out.contains(&mpm[0]) {
-        out.push(mpm[0]);
+    pred: &mut [i32],
+) -> ModeList {
+    let n = refs.n();
+    let nn = n * n;
+    let mut scored = [(0u64, 0u8); 35];
+    for (mode, slot) in (0..=34u8).zip(scored.iter_mut()) {
+        refs.predict(fmt, mode, PredComponent::Luma, &mut pred[..nn]);
+        *slot = (
+            satd(&src[..nn], &pred[..nn], n) + lambda_me * luma_mode_bins(mode, mpm),
+            mode,
+        );
+    }
+    // The keys are distinct (the mode breaks cost ties).
+    scored.sort_unstable();
+    let mut out = ModeList {
+        modes: [0; 4],
+        len: 0,
+    };
+    for &(_, m) in scored.iter().take(keep.min(3)) {
+        out.modes[out.len] = m;
+        out.len += 1;
+    }
+    if !out.as_slice().contains(&mpm[0]) {
+        out.modes[out.len] = mpm[0];
+        out.len += 1;
     }
     out
 }
@@ -1409,7 +1662,7 @@ fn rough_intra_modes(
 /// IntraPredModeC)`; `(4, luma_mode)` for a monochrome picture.
 fn elect_chroma_mode(
     ctx: &SliceCtx<'_>,
-    st: &EncState,
+    st: &mut EncState,
     x0: usize,
     y0: usize,
     n: usize,
@@ -1432,50 +1685,51 @@ fn elect_chroma_mode(
     let blocks = fmt.chroma_blocks();
     let cw = ctx.cw();
     let rect = (cx0, cy0, side, side * blocks);
-    let mut best = (4u8, luma_mode, u64::MAX);
-    let mut cache: Vec<(u8, u64)> = Vec::with_capacity(5);
-    for idx in [4u8, 0, 1, 2, 3] {
-        let mode_c = crate::binarization::derive_intra_pred_mode_c(
-            idx,
-            luma_mode,
-            fmt.chroma_format_idc == 2,
-        );
-        // Distinct indices can map to one mode (idx 4 vs an explicit
-        // one): the SATD is a function of the mode alone.
-        let satd_c = match cache.iter().find(|(m, _)| *m == mode_c) {
-            Some(&(_, d)) => d,
-            None => {
-                let mut d = 0u64;
-                for (plane_idx, pc) in [(1usize, PredComponent::Cb), (2, PredComponent::Cr)] {
-                    for v in 0..blocks * per_row {
-                        for u in 0..per_row {
-                            let (cx, cy) = (cx0 + u * nc, cy0 + v * nc);
-                            let marked = gather_chroma_refs(
-                                ctx,
-                                &st.recon,
-                                plane_idx,
-                                cx,
-                                cy,
-                                nc,
-                                Some((ctx.src[plane_idx], rect)),
-                            );
-                            let pred = intra_predict_with_substitution(
-                                &marked,
-                                &pred_params(fmt, mode_c, pc),
-                            )
-                            .expect("legal prediction params");
-                            let src = extract(ctx.src[plane_idx], cw, cx, cy, nc);
-                            d += satd(&src, &pred, nc);
-                        }
+    // The five indices' modes; distinct indices can map to one mode
+    // (idx 4 vs an explicit one) and the SATD is a function of the
+    // mode alone, so `first[i]` names the first index with index i's
+    // mode and only those are measured.
+    const ORDER: [u8; 5] = [4, 0, 1, 2, 3];
+    let modes_c = ORDER.map(|idx| {
+        crate::binarization::derive_intra_pred_mode_c(idx, luma_mode, fmt.chroma_format_idc == 2)
+    });
+    let first: [usize; 5] =
+        std::array::from_fn(|i| modes_c.iter().position(|&m| m == modes_c[i]).unwrap_or(i));
+    let mut satd_c = [0u64; 5];
+    let TbScratch {
+        src, pred, refs, ..
+    } = &mut *st.scratch;
+    // Each block's references are gathered and substituted once, then
+    // every distinct mode is predicted from them.
+    for (plane_idx, pc) in [(1usize, PredComponent::Cb), (2, PredComponent::Cr)] {
+        for v in 0..blocks * per_row {
+            for u in 0..per_row {
+                let (cx, cy) = (cx0 + u * nc, cy0 + v * nc);
+                gather_chroma_refs(
+                    ctx,
+                    &st.recon,
+                    plane_idx,
+                    cx,
+                    cy,
+                    nc,
+                    Some((ctx.src[plane_idx], rect)),
+                    refs,
+                );
+                load_block(ctx.src[plane_idx], cw, cx, cy, nc, src);
+                for i in 0..5 {
+                    if first[i] == i {
+                        refs.predict(fmt, modes_c[i], pc, &mut pred[..nc * nc]);
+                        satd_c[i] += satd(&src[..nc * nc], &pred[..nc * nc], nc);
                     }
                 }
-                cache.push((mode_c, d));
-                d
             }
-        };
-        let cost = satd_c + lambda_me * if idx == 4 { 1 } else { 3 };
+        }
+    }
+    let mut best = (4u8, luma_mode, u64::MAX);
+    for (i, &idx) in ORDER.iter().enumerate() {
+        let cost = satd_c[first[i]] + lambda_me * if idx == 4 { 1 } else { 3 };
         if cost < best.2 {
-            best = (idx, mode_c, cost);
+            best = (idx, modes_c[i], cost);
         }
     }
     (best.0, best.1)
@@ -1490,58 +1744,57 @@ fn elect_chroma_mode(
 /// mode's signalling bins against `mpm`, as for the smaller CUs.
 fn search_mode_64(
     ctx: &SliceCtx<'_>,
-    st: &EncState,
+    st: &mut EncState,
     x0: usize,
     y0: usize,
     rough: Option<(&[u8; 3], u64)>,
 ) -> u8 {
     let mut best = (0u8, u64::MAX);
+    let TbScratch {
+        src, pred, refs, ..
+    } = &mut *st.scratch;
+    let recon = &st.recon;
     let read = |x: i64, y: i64| -> i32 {
         let (xu, yu) = (x as usize, y as usize);
         if xu >= x0 && xu < x0 + 64 && yu >= y0 && yu < y0 + 64 {
             i32::from(ctx.src[0][yu * ctx.width + xu])
         } else {
-            i32::from(st.recon.y[st.recon.ly(yu) * ctx.width + xu])
+            i32::from(recon.y[recon.ly(yu) * ctx.width + xu])
         }
     };
-    for mode in 0..=34u8 {
-        let mut cost = 0u64;
-        for &(zx, zy) in &Z_OFFSETS {
-            let (tx, ty) = (x0 + zx * 32, y0 + zy * 32);
-            let get = |x: i64, y: i64| -> (i32, bool) {
-                if ctx.z_avail(x0, y0, x, y)
-                    || (x >= x0 as i64 && x < (x0 + 64) as i64 && y >= y0 as i64 && y < ty as i64)
-                    || (y >= ty as i64 && y < (ty + 32) as i64 && x >= x0 as i64 && x < tx as i64)
-                {
-                    (read(x, y), true)
-                } else {
-                    (0, false)
-                }
-            };
-            let corner = get(tx as i64 - 1, ty as i64 - 1);
-            let left: Vec<(i32, bool)> = (0..64)
-                .map(|k| get(tx as i64 - 1, (ty + k) as i64))
-                .collect();
-            let top: Vec<(i32, bool)> = (0..64)
-                .map(|k| get((tx + k) as i64, ty as i64 - 1))
-                .collect();
-            let marked =
-                MarkedReferenceSamples::new(32, corner, left, top).expect("legal TB geometry");
-            let pred = intra_predict_with_substitution(
-                &marked,
-                &pred_params(&ctx.fmt, mode, PredComponent::Luma),
-            )
-            .expect("legal prediction params");
-            let src = extract(ctx.src[0], ctx.width, tx, ty, 32);
-            cost += match rough {
-                Some(_) => satd(&src, &pred, 32),
-                None => src
-                    .iter()
-                    .zip(pred.iter())
-                    .map(|(&s, &p)| u64::from(s.abs_diff(p)))
-                    .sum::<u64>(),
+    // The four TUs' references do not depend on the mode: gather and
+    // substitute them once, then score every mode from them.
+    let mut costs = [0u64; 35];
+    for &(zx, zy) in &Z_OFFSETS {
+        let (tx, ty) = (x0 + zx * 32, y0 + zy * 32);
+        let get = |x: i64, y: i64| -> i32 {
+            if ctx.z_avail(x0, y0, x, y)
+                || (x >= x0 as i64 && x < (x0 + 64) as i64 && y >= y0 as i64 && y < ty as i64)
+                || (y >= ty as i64 && y < (ty + 32) as i64 && x >= x0 as i64 && x < tx as i64)
+            {
+                read(x, y)
+            } else {
+                dsp::REF_UNAVAILABLE
+            }
+        };
+        refs.begin(32);
+        refs.raw.left[0] = get(tx as i64 - 1, ty as i64 - 1);
+        for k in 0..64 {
+            refs.raw.left[1 + k] = get(tx as i64 - 1, (ty + k) as i64);
+            refs.raw.top[1 + k] = get((tx + k) as i64, ty as i64 - 1);
+        }
+        refs.finish(ctx.fmt.bit_depth_luma, true);
+        load_block(ctx.src[0], ctx.width, tx, ty, 32, src);
+        for (mode, cost) in (0..=34u8).zip(costs.iter_mut()) {
+            refs.predict(&ctx.fmt, mode, PredComponent::Luma, pred);
+            *cost += match rough {
+                Some(_) => satd(src, pred, 32),
+                None => sad(src, pred),
             };
         }
+    }
+    for (mode, &tu_cost) in (0..=34u8).zip(costs.iter()) {
+        let mut cost = tu_cost;
         if let Some((mpm, lambda_me)) = rough {
             cost += lambda_me * luma_mode_bins(mode, mpm);
         }
@@ -1566,11 +1819,16 @@ fn code_intra_luma_tb(
     qp_y: u32,
     lambda: u64,
 ) -> (Vec<i32>, u64) {
-    let marked = gather_luma_refs(ctx, &st.recon, x, y, n);
-    let pred =
-        intra_predict_with_substitution(&marked, &pred_params(&ctx.fmt, mode, PredComponent::Luma))
-            .expect("legal prediction params");
-    let src = extract(ctx.src[0], ctx.width, x, y, n);
+    let nn = n * n;
+    let TbScratch {
+        src,
+        pred,
+        recon,
+        refs,
+    } = &mut *st.scratch;
+    gather_luma_refs(ctx, &st.recon, x, y, n, refs);
+    refs.predict(&ctx.fmt, mode, PredComponent::Luma, &mut pred[..nn]);
+    load_block(ctx.src[0], ctx.width, x, y, n, src);
     let tools = TbTools::new(
         ctx,
         st.rdoq_model.as_ref(),
@@ -1580,18 +1838,19 @@ fn code_intra_luma_tb(
         0,
         mode,
     );
-    let (levels, recon) = code_tb(
-        &src,
-        &pred,
+    let levels = code_tb(
+        &src[..nn],
+        &pred[..nn],
         n,
         qp_y,
         Component::Luma,
         PredMode::Intra,
         tools,
+        recon,
     );
-    let dist = ssd(&recon, &src);
+    let dist = ssd(&recon[..nn], &src[..nn]);
     let ly = st.recon.ly(y);
-    store(&mut st.recon.y, ctx.width, x, ly, n, &recon);
+    store(&mut st.recon.y, ctx.width, x, ly, n, &recon[..nn]);
     (levels, dist)
 }
 
@@ -1623,6 +1882,7 @@ fn code_intra_chroma_tbs(
     let (cx, cy) = (x / sw, y / sh);
     let log2_c = fmt.log2_chroma_tb(log2);
     let n = 1usize << log2_c;
+    let nn = n * n;
     let blocks = fmt.chroma_blocks();
     let cw = ctx.cw();
     let model = st.rdoq_model.clone();
@@ -1631,10 +1891,15 @@ fn code_intra_chroma_tbs(
         let mut dist = 0u64;
         for v in 0..blocks {
             let cy_v = cy + v * n;
-            let marked = gather_chroma_refs(ctx, &st.recon, plane_idx, cx, cy_v, n, None);
-            let pred = intra_predict_with_substitution(&marked, &pred_params(&fmt, mode_c, pc))
-                .expect("legal prediction params");
-            let src = extract(ctx.src[plane_idx], cw, cx, cy_v, n);
+            let TbScratch {
+                src,
+                pred,
+                recon,
+                refs,
+            } = &mut *st.scratch;
+            gather_chroma_refs(ctx, &st.recon, plane_idx, cx, cy_v, n, None, refs);
+            refs.predict(&fmt, mode_c, pc, &mut pred[..nn]);
+            load_block(ctx.src[plane_idx], cw, cx, cy_v, n, src);
             let tools = TbTools::new(
                 ctx,
                 model.as_ref(),
@@ -1644,14 +1909,23 @@ fn code_intra_chroma_tbs(
                 plane_idx as u8,
                 mode_c,
             );
-            let (levels, recon) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Intra, tools);
-            dist += ssd(&recon, &src);
+            let levels = code_tb(
+                &src[..nn],
+                &pred[..nn],
+                n,
+                qp_c,
+                comp,
+                PredMode::Intra,
+                tools,
+                recon,
+            );
+            dist += ssd(&recon[..nn], &src[..nn]);
             let lcy = st.recon.cy(cy_v);
             let recon_plane = match plane_idx {
                 1 => &mut st.recon.cb,
                 _ => &mut st.recon.cr,
             };
-            store(recon_plane, cw, cx, lcy, n, &recon);
+            store(recon_plane, cw, cx, lcy, n, &recon[..nn]);
             all_levels.extend(levels);
         }
         (all_levels, dist)
@@ -1773,14 +2047,17 @@ fn intra_rqt(
     let leaf_cost = leaf_dist + lambda * (leaf_rate + u64::from(flag_coded));
     let after_leaf = st.snapshot(ctx, x, y, n);
     st.restore(ctx, &before);
+    st.recycle(before);
     let (split_node, split_dist, split_rate) = split_eval(ctx, st);
     let split_cost = split_dist + lambda * (split_rate + u64::from(flag_coded));
-    if leaf_cost <= split_cost {
+    let out = if leaf_cost <= split_cost {
         st.restore(ctx, &after_leaf);
         (leaf_node, leaf_dist, leaf_rate + u64::from(flag_coded))
     } else {
         (split_node, split_dist, split_rate + u64::from(flag_coded))
-    }
+    };
+    st.recycle(after_leaf);
+    out
 }
 
 /// Code the best intra CU at `(x0, y0)` size `1 << log2` INTO the
@@ -1938,9 +2215,12 @@ fn code_intra_cu_legacy(
     let mode = if log2 == 6 {
         search_mode_64(ctx, st, x0, y0, None)
     } else {
-        let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
-        let src = extract(ctx.src[0], ctx.width, x0, y0, n);
-        search_best_mode(&ctx.fmt, &marked, &src).0
+        let TbScratch {
+            src, pred, refs, ..
+        } = &mut *st.scratch;
+        gather_luma_refs(ctx, &st.recon, x0, y0, n, refs);
+        load_block(ctx.src[0], ctx.width, x0, y0, n, src);
+        search_best_mode(&ctx.fmt, refs, src, pred)
     };
     // The derived chroma mode (intra_chroma_pred_mode 4) — Table 8-3
     // remapped at 4:2:2.
@@ -1990,9 +2270,11 @@ fn code_intra_cu_legacy(
         let mut rate = 0u64;
         for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
             let (px, py) = (x0 + zx * 4, y0 + zy * 4);
-            let marked = gather_luma_refs(ctx, &st.recon, px, py, 4);
-            let src = extract(ctx.src[0], ctx.width, px, py, 4);
-            let (m, _) = search_best_mode(&ctx.fmt, &marked, &src);
+            gather_luma_refs(ctx, &st.recon, px, py, 4, &mut st.scratch.refs);
+            let mut src = [0i32; 16];
+            let mut pred = [0i32; 16];
+            load_block(ctx.src[0], ctx.width, px, py, 4, &mut src);
+            let m = search_best_mode(&ctx.fmt, &st.scratch.refs, &src, &mut pred);
             let (lv, d) = code_intra_luma_tb(ctx, st, px, py, 4, m, qp_y, lambda);
             // §8.4.2: later PBs' candidate lists see this PB's mode.
             st.modes.record_intra_pb(px, py, 4, m, false);
@@ -2006,7 +2288,7 @@ fn code_intra_cu_legacy(
         dist += d_c;
         rate += r_c;
         let cost_nxn = dist + lambda * (rate + base_bins + 4 * 7);
-        if cost_nxn < cost_2n {
+        let cu = if cost_nxn < cost_2n {
             CuCoded {
                 x0,
                 y0,
@@ -2023,10 +2305,13 @@ fn code_intra_cu_legacy(
         } else {
             st.restore(ctx, &after_2n);
             cu_2n
-        }
+        };
+        st.recycle(after_2n);
+        cu
     } else {
         cu_2n
     };
+    st.recycle(before);
 
     // Commit the non-recon state.
     st.field.fill_rect(
@@ -2044,6 +2329,10 @@ fn code_intra_cu_legacy(
     st.fill_cells(x0, y0, n, depth as i8, 0);
     cu
 }
+
+/// A coded 4x4 prediction-block candidate: `(mode, levels, dist, cost,
+/// state after coding it — kept only when another candidate follows)`.
+type PbChoice = (u8, Vec<i32>, u64, u64, Option<Snap>);
 
 /// The `intra_rd >= 1` intra CU coder: SATD + λ·bins rough decision,
 /// chroma-mode election, full RD over the short list at level 2.
@@ -2079,24 +2368,30 @@ fn code_intra_cu_rd(
     // short list; each survivor is then coded for real through the
     // RD-elected RQT (with its own chroma mode election) and the
     // cheapest SSD + λ·bins candidate is kept.
-    let cands: Vec<u8> = if log2 == 6 {
-        vec![search_mode_64(ctx, st, x0, y0, Some((&mpm, lambda_me)))]
+    let cands: ModeList = if log2 == 6 {
+        ModeList::one(search_mode_64(ctx, st, x0, y0, Some((&mpm, lambda_me))))
     } else {
-        let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
-        let src = extract(ctx.src[0], ctx.width, x0, y0, n);
+        let TbScratch {
+            src, pred, refs, ..
+        } = &mut *st.scratch;
+        gather_luma_refs(ctx, &st.recon, x0, y0, n, refs);
+        load_block(ctx.src[0], ctx.width, x0, y0, n, src);
         let keep = match (ctx.cfg.intra_rd, log2) {
             (1, _) => 1,
             (_, 3) => 3,
             _ => 2,
         };
-        let mut c = rough_intra_modes(&ctx.fmt, &marked, &src, n, &mpm, lambda_me, keep);
+        let mut c = rough_intra_modes(&ctx.fmt, refs, src, &mpm, lambda_me, keep, pred);
         if ctx.cfg.intra_rd == 1 {
             c.truncate(1);
         }
         c
     };
+    let cands = cands.as_slice();
     let max_depth_2n = ctx.cfg.th_depth_intra; // IntraSplitFlag == 0
-    let mut best_2n: Option<(u8, u8, TuNode, u64, Snap)> = None;
+    // The winner's coded state is only needed back when a later
+    // candidate overwrote it.
+    let mut best_2n: Option<(u8, u8, TuNode, u64, Option<Snap>)> = None;
     for (k, &mode) in cands.iter().enumerate() {
         if k > 0 {
             st.restore(ctx, &before);
@@ -2124,12 +2419,16 @@ fn code_intra_cu_rd(
         };
         let cost = dist + lambda * (rate + base_bins + luma_mode_bins(mode, &mpm) + c_bins);
         if best_2n.as_ref().is_none_or(|b| cost < b.3) {
-            best_2n = Some((mode, chroma_idx, tree, cost, st.snapshot(ctx, x0, y0, n)));
+            let snap = (cands.len() > 1).then(|| st.snapshot(ctx, x0, y0, n));
+            if let Some((.., Some(old))) = best_2n.replace((mode, chroma_idx, tree, cost, snap)) {
+                st.recycle(old);
+            }
         }
     }
     let (mode, chroma_2n, tree_2n, cost_2n, after_2n_coded) = best_2n.expect("a candidate");
-    if cands.len() > 1 {
-        st.restore(ctx, &after_2n_coded);
+    if let Some(snap) = after_2n_coded {
+        st.restore(ctx, &snap);
+        st.recycle(snap);
     }
     let cu_2n = CuCoded {
         x0,
@@ -2158,16 +2457,27 @@ fn code_intra_cu_rd(
         let mut mode_bins = 0u64;
         for (k, &(zx, zy)) in Z_OFFSETS.iter().enumerate() {
             let (px, py) = (x0 + zx * 4, y0 + zy * 4);
-            let marked = gather_luma_refs(ctx, &st.recon, px, py, 4);
-            let src = extract(ctx.src[0], ctx.width, px, py, 4);
+            gather_luma_refs(ctx, &st.recon, px, py, 4, &mut st.scratch.refs);
+            let mut src = [0i32; 16];
+            let mut pred = [0i32; 16];
+            load_block(ctx.src[0], ctx.width, px, py, 4, &mut src);
             let pb_mpm = mpm_list(ctx, st, px, py);
-            let mut pb_cands = rough_intra_modes(&ctx.fmt, &marked, &src, 4, &pb_mpm, lambda_me, 3);
+            let mut pb_cands = rough_intra_modes(
+                &ctx.fmt,
+                &st.scratch.refs,
+                &src,
+                &pb_mpm,
+                lambda_me,
+                3,
+                &mut pred,
+            );
             if ctx.cfg.intra_rd == 1 {
                 pb_cands.truncate(1);
             }
+            let pb_cands = pb_cands.as_slice();
             // Full RD over the survivors on this 4x4 TB.
             let pb_before = st.snapshot(ctx, px, py, 4);
-            let mut best: Option<(u8, Vec<i32>, u64, u64, Snap)> = None;
+            let mut best: Option<PbChoice> = None;
             for (i, &m) in pb_cands.iter().enumerate() {
                 if i > 0 {
                     st.restore(ctx, &pb_before);
@@ -2176,12 +2486,17 @@ fn code_intra_cu_rd(
                 let bins = rate_proxy(&lv) + 1 + luma_mode_bins(m, &pb_mpm);
                 let cost = d + lambda * bins;
                 if best.as_ref().is_none_or(|b| cost < b.3) {
-                    best = Some((m, lv, d, cost, st.snapshot(ctx, px, py, 4)));
+                    let snap = (pb_cands.len() > 1).then(|| st.snapshot(ctx, px, py, 4));
+                    if let Some((.., Some(old))) = best.replace((m, lv, d, cost, snap)) {
+                        st.recycle(old);
+                    }
                 }
             }
+            st.recycle(pb_before);
             let (m, lv, d, _, after) = best.expect("a candidate");
-            if pb_cands.len() > 1 {
-                st.restore(ctx, &after);
+            if let Some(snap) = after {
+                st.restore(ctx, &snap);
+                st.recycle(snap);
             }
             // §8.4.2: later PBs' candidate lists see this PB's mode.
             st.modes.record_intra_pb(px, py, 4, m, false);
@@ -2197,7 +2512,7 @@ fn code_intra_cu_rd(
         dist += d_c;
         rate += r_c;
         let cost_nxn = dist + lambda * (rate + base_bins + mode_bins + c_bins);
-        if cost_nxn < cost_2n {
+        let cu = if cost_nxn < cost_2n {
             CuCoded {
                 x0,
                 y0,
@@ -2214,10 +2529,13 @@ fn code_intra_cu_rd(
         } else {
             st.restore(ctx, &after_2n);
             cu_2n
-        }
+        };
+        st.recycle(after_2n);
+        cu
     } else {
         cu_2n
     };
+    st.recycle(before);
 
     // Commit the non-recon state.
     st.field.fill_rect(
@@ -2299,11 +2617,12 @@ fn code_inter_chroma_tbs(
             let src = sub_block(src_p, tbs.cw_cu, tbs.cx, cy, n);
             let pred = sub_block(pred_p, tbs.cw_cu, tbs.cx, cy, n);
             let tools = TbTools::new(ctx, bufs.model, lambda, false, log2_c, c_idx, 0);
-            let (lv, rc) = code_tb(&src, &pred, n, qp_c, comp, PredMode::Inter, tools);
-            dist += ssd(&rc, &src);
+            let mut rc = [0u16; MAXB * MAXB];
+            let lv = code_tb(&src, &pred, n, qp_c, comp, PredMode::Inter, tools, &mut rc);
+            dist += ssd(&rc[..n * n], &src);
             rate += rate_proxy(&lv) + 1;
             levels.extend(lv);
-            recon.extend(rc);
+            recon.extend_from_slice(&rc[..n * n]);
         }
         out_lv[k] = levels;
         out_rc[k] = recon;
@@ -2349,7 +2668,8 @@ fn inter_rqt(
         let src_y = sub_block(bufs.src_y, n_cb, x, y, n);
         let pred_y = sub_block(bufs.pred_y, n_cb, x, y, n);
         let tools = |c_idx: u8| TbTools::new(ctx, bufs.model, lambda, false, log2, c_idx, 0);
-        let (y_lv, y_rc) = code_tb(
+        let mut y_rc = vec![0u16; n * n];
+        let y_lv = code_tb(
             &src_y,
             &pred_y,
             n,
@@ -2357,6 +2677,7 @@ fn inter_rqt(
             Component::Luma,
             PredMode::Inter,
             tools(0),
+            &mut y_rc,
         );
         let mut dist = ssd(&y_rc, &src_y);
         let mut rate = rate_proxy(&y_lv) + 1;
@@ -2867,12 +3188,13 @@ fn code_inter_cu(
         let mode = if log2 == 6 {
             search_mode_64(ctx, st, x0, y0, None)
         } else {
-            let marked = gather_luma_refs(ctx, &st.recon, x0, y0, n);
+            let mpm = mpm_list(ctx, st, x0, y0);
+            let TbScratch { pred, refs, .. } = &mut *st.scratch;
+            gather_luma_refs(ctx, &st.recon, x0, y0, n, refs);
             if ctx.cfg.intra_rd == 0 {
-                search_best_mode(&ctx.fmt, &marked, &src[0]).0
+                search_best_mode(&ctx.fmt, refs, &src[0], pred)
             } else {
-                let mpm = mpm_list(ctx, st, x0, y0);
-                rough_intra_modes(&ctx.fmt, &marked, &src[0], n, &mpm, lambda_me, 1)[0]
+                rough_intra_modes(&ctx.fmt, refs, &src[0], &mpm, lambda_me, 1, pred).modes[0]
             }
         };
         // Predict + code the whole CU as its (possibly forced-split)
@@ -2902,6 +3224,7 @@ fn code_inter_cu(
             cr: rect_copy(&st.recon.cr, cw, cx0, st.recon.cy(cy0), ncw, nch),
         };
         st.restore(ctx, &before);
+        st.recycle(before);
         cands.push(InterCand {
             kind: TreeCuKind::Intra {
                 modes: [mode; 4],
@@ -3088,18 +3411,22 @@ fn code_quadtree(
         && matches!(cu.kind, TreeCuKind::Skip { .. })
         && cu.cost <= (n * n) as u64 * 2
     {
+        st.recycle(before);
         return (leaf_node, leaf_cost);
     }
     let after_leaf = st.snapshot(ctx, x0, y0, n);
     st.restore(ctx, &before);
+    st.recycle(before);
     let (split_node, split_cost) = code_split(ctx, st);
     let split_cost = split_cost + lambda;
-    if leaf_cost <= split_cost {
+    let out = if leaf_cost <= split_cost {
         st.restore(ctx, &after_leaf);
         (leaf_node, leaf_cost)
     } else {
         (split_node, split_cost)
-    }
+    };
+    st.recycle(after_leaf);
+    out
 }
 
 // ---------------------------------------------------------------------

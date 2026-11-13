@@ -295,6 +295,24 @@ fn deadzone_level(q: u64, qbits: u32) -> u64 {
 #[must_use]
 pub fn quantize_tb(coef: &[i32], req: &TbQuant<'_>) -> Vec<i32> {
     let qbits = q_bits(req.log2, req.qp, req.bit_depth);
+    if req.model.is_none() && !req.sign_hiding {
+        // The deadzone quantizer alone needs neither the scaled
+        // magnitudes nor the per-position scales afterwards.
+        let level = |c: i32, scale: u64| -> i32 {
+            deadzone_level(u64::from(c.unsigned_abs()) * scale, qbits) as i32 * c.signum()
+        };
+        return match req.scaling {
+            None => {
+                let scale = quant_scale(req.qp % 6);
+                coef.iter().map(|&c| level(c, scale)).collect()
+            }
+            Some(sf) => coef
+                .iter()
+                .zip(&sf.coef)
+                .map(|(&c, &m)| level(c, quant_scale_m(req.qp % 6, m)))
+                .collect(),
+        };
+    }
     let scales = scales_of(req, coef.len());
     let q: Vec<u64> = coef
         .iter()

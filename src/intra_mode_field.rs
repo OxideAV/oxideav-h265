@@ -314,8 +314,23 @@ impl IntraModeField {
     /// with these.
     #[must_use]
     pub(crate) fn snapshot_rect(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.snapshot_rect_into(x, y, w, h, &mut out);
+        out
+    }
+
+    /// [`Self::snapshot_rect`] into a reused buffer (cleared first).
+    pub(crate) fn snapshot_rect_into(
+        &self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        out: &mut Vec<u8>,
+    ) {
         let (bx0, by0, bx1, by1) = self.rect_cells(x, y, w, h);
-        let mut out = Vec::with_capacity((bx1 - bx0) * (by1 - by0) * 3);
+        out.clear();
+        out.reserve((bx1 - bx0) * (by1 - by0) * 3);
         for by in by0..by1 {
             for bx in bx0..bx1 {
                 let c = self.cells[by * self.cols_blocks + bx];
@@ -328,7 +343,6 @@ impl IntraModeField {
                 out.push(u8::from(c.pcm_flag) | (u8::from(c.written) << 1));
             }
         }
-        out
     }
 
     /// Write back a [`Self::snapshot_rect`] copy of the same rectangle.

@@ -1113,6 +1113,7 @@ pub(super) fn code_quadtree(
     let (node, split_cost) = split(ctx, st);
     if leaf.cost <= split_cost {
         st.restore(ctx, &before);
+        st.recycle(before);
         commit(ctx, st, x0, y0, n, depth, &leaf);
         let cost = leaf.cost + lam.sse;
         (
@@ -1120,6 +1121,7 @@ pub(super) fn code_quadtree(
             cost as u64,
         )
     } else {
+        st.recycle(before);
         (node, (split_cost + lam.sse) as u64)
     }
 }

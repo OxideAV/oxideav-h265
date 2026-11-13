@@ -1,5 +1,7 @@
-//! Encode one raw planar picture of any size through the registry
-//! encoder (the path a HEIF writer takes) and report bytes + wall time.
+//! Encode raw planar pictures of any size through the registry
+//! encoder (one picture: the path a HEIF writer takes; several
+//! concatenated pictures: a sequence, e.g. `mode=inter`) and report
+//! bytes + wall time.
 //!
 //! ```text
 //! cargo run --release --example encode_still -- in.yuv WxH out.hevc [key=value ...]
@@ -66,39 +68,63 @@ fn main() {
     let data = std::fs::read(&args[0]).expect("read input");
     let luma_len = w * h * bps;
     let chroma_len = cw * ch * bps;
-    assert_eq!(
-        data.len(),
-        luma_len + (n_planes - 1) * chroma_len,
-        "one planar {pf} picture"
+    let frame_len = luma_len + (n_planes - 1) * chroma_len;
+    assert!(
+        !data.is_empty() && data.len().is_multiple_of(frame_len),
+        "whole planar {pf} pictures"
     );
     let mut enc = oxideav_h265::make_encoder(&params).expect("encoder");
     if threads > 1 {
         enc.set_execution_context(&ExecutionContext { threads });
     }
-    let mut planes = vec![VideoPlane {
-        stride: w * bps,
-        data: data[..luma_len].to_vec(),
-    }];
-    for k in 1..n_planes {
-        let off = luma_len + (k - 1) * chroma_len;
-        planes.push(VideoPlane {
-            stride: cw * bps,
-            data: data[off..off + chroma_len].to_vec(),
-        });
-    }
-    let frame = Frame::Video(VideoFrame {
-        pts: Some(0),
-        planes,
-    });
+    let frames: Vec<Frame> = data
+        .chunks_exact(frame_len)
+        .enumerate()
+        .map(|(i, pic)| {
+            let mut planes = vec![VideoPlane {
+                stride: w * bps,
+                data: pic[..luma_len].to_vec(),
+            }];
+            for k in 1..n_planes {
+                let off = luma_len + (k - 1) * chroma_len;
+                planes.push(VideoPlane {
+                    stride: cw * bps,
+                    data: pic[off..off + chroma_len].to_vec(),
+                });
+            }
+            Frame::Video(VideoFrame {
+                pts: Some(i as i64),
+                planes,
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
     let t0 = Instant::now();
-    enc.send_frame(&frame).expect("encode");
-    let pkt = enc.receive_packet().expect("packet");
-    let elapsed = t0.elapsed();
-    std::fs::write(&args[2], &pkt.data).expect("write output");
-    println!(
-        "{w}x{h} {} -> {} bytes in {:.3} s",
-        args[3..].join(" "),
-        pkt.data.len(),
-        elapsed.as_secs_f64()
-    );
+    for frame in &frames {
+        enc.send_frame(frame).expect("encode");
+        while let Ok(pkt) = enc.receive_packet() {
+            out.extend_from_slice(&pkt.data);
+        }
+    }
+    enc.flush().expect("flush");
+    while let Ok(pkt) = enc.receive_packet() {
+        out.extend_from_slice(&pkt.data);
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    std::fs::write(&args[2], &out).expect("write output");
+    if frames.len() == 1 {
+        println!(
+            "{w}x{h} {} -> {} bytes in {elapsed:.3} s",
+            args[3..].join(" "),
+            out.len(),
+        );
+    } else {
+        println!(
+            "{w}x{h} {} -> {} pictures, {} bytes in {elapsed:.3} s ({:.2} pictures per second)",
+            args[3..].join(" "),
+            frames.len(),
+            out.len(),
+            frames.len() as f64 / elapsed
+        );
+    }
 }

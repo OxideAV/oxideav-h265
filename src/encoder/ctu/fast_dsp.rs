@@ -128,7 +128,7 @@ fn hadamard4(src: &[u16], ss: usize, pred: &[i32], ps: usize, bx: usize, by: usi
 /// One 8-point Walsh-Hadamard transform applied lane-wise to the
 /// eight rows of `t` (rows are the transform's inputs).
 #[inline(always)]
-fn butterfly8_rows(t: &mut [[i32; 8]; 8]) {
+pub(super) fn butterfly8_rows(t: &mut [[i32; 8]; 8]) {
     let mut u = [[0i32; 8]; 8];
     for l in 0..8 {
         u[0][l] = t[0][l] + t[1][l];
@@ -222,7 +222,69 @@ pub(super) struct Refs {
     pub(super) top: [i32; 2 * MAXB + 1],
 }
 
+/// The mark of a reference sample that is not available for intra
+/// prediction (sample values are never negative), before
+/// [`Refs::substitute_marked`].
+pub(super) const REF_UNAVAILABLE: i32 = -1;
+
 impl Refs {
+    /// References of no block (to be filled in place).
+    pub(super) fn empty() -> Self {
+        Self {
+            n: 4,
+            left: [0; 2 * MAXB + 1],
+            top: [0; 2 * MAXB + 1],
+        }
+    }
+
+    /// §8.4.4.2.2 substitution in place: `left[ ..= 2n ]` (the corner
+    /// at index 0) and `top[ 1 ..= 2n ]` hold sample values or
+    /// [`REF_UNAVAILABLE`]; the search runs from `p[ −1 ][ 2n − 1 ]` up
+    /// to the corner, then along the top row to `p[ 2n − 1 ][ −1 ]`.
+    pub(super) fn substitute_marked(&mut self, bit_depth: u8) {
+        let n2 = 2 * self.n;
+        let first = self.left[..=n2]
+            .iter()
+            .rev()
+            .chain(&self.top[1..=n2])
+            .copied()
+            .find(|&v| v >= 0);
+        let Some(mut prev) = first else {
+            let v = 1i32 << (bit_depth - 1);
+            self.left[..=n2].fill(v);
+            self.top[..=n2].fill(v);
+            return;
+        };
+        for v in self.left[..=n2]
+            .iter_mut()
+            .rev()
+            .chain(&mut self.top[1..=n2])
+        {
+            if *v < 0 {
+                *v = prev;
+            } else {
+                prev = *v;
+            }
+        }
+        self.top[0] = self.left[0];
+    }
+
+    /// The §8.4.4.2.3 [1 2 1]-filtered twin (strong smoothing off)
+    /// written into `f`.
+    pub(super) fn filter_into(&self, f: &mut Self) {
+        let n2 = 2 * self.n;
+        f.n = self.n;
+        let c = (self.left[1] + 2 * self.left[0] + self.top[1] + 2) >> 2;
+        f.left[0] = c;
+        f.top[0] = c;
+        for k in 1..n2 {
+            f.left[k] = (self.left[k + 1] + 2 * self.left[k] + self.left[k - 1] + 2) >> 2;
+            f.top[k] = (self.top[k + 1] + 2 * self.top[k] + self.top[k - 1] + 2) >> 2;
+        }
+        f.left[n2] = self.left[n2];
+        f.top[n2] = self.top[n2];
+    }
+
     /// §8.4.4.2.2 substitution over `(value, available)` marks in the
     /// same layout as [`Refs`].
     pub(super) fn substituted(
@@ -304,86 +366,119 @@ pub(super) fn filter_flag(mode: u8, n: usize) -> bool {
 /// [`filter_flag`] requires) reference samples into `out` (stride
 /// `n`). `luma` enables the DC / horizontal / vertical edge filters.
 pub(super) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: &mut [i32]) {
-    let n = r.n;
-    let log2 = n.trailing_zeros();
+    match r.n {
+        4 => predict_intra_n::<4>(r, mode, luma, bit_depth, out),
+        8 => predict_intra_n::<8>(r, mode, luma, bit_depth, out),
+        16 => predict_intra_n::<16>(r, mode, luma, bit_depth, out),
+        _ => predict_intra_n::<32>(r, mode, luma, bit_depth, out),
+    }
+}
+
+/// The `N` samples of `v` starting at `at`, as an array.
+#[inline(always)]
+fn run<const N: usize>(v: &[i32], at: usize) -> &[i32; N] {
+    v[at..at + N].try_into().expect("an N-sample run")
+}
+
+/// [`predict_intra`] for one block size.
+#[inline(always)]
+fn predict_intra_n<const N: usize>(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: &mut [i32]) {
+    let ni = N as i32;
+    let log2 = N.trailing_zeros();
     let max = (1i32 << bit_depth) - 1;
+    let out = &mut out[..N * N];
+    let top: &[i32; N] = run(&r.top, 1);
+    let left: &[i32; N] = run(&r.left, 1);
     match mode {
         0 => {
-            let (tr, bl) = (r.top[n + 1], r.left[n + 1]);
-            for y in 0..n {
-                for x in 0..n {
-                    out[y * n + x] = ((n - 1 - x) as i32 * r.left[1 + y]
-                        + (x + 1) as i32 * tr
-                        + (n - 1 - y) as i32 * r.top[1 + x]
-                        + (y + 1) as i32 * bl
-                        + n as i32)
-                        >> (log2 + 1);
+            let (tr, bl) = (r.top[N + 1], r.left[N + 1]);
+            // The x-dependent terms that do not depend on the row.
+            let mut ramp = [0i32; N];
+            for (x, d) in ramp.iter_mut().enumerate() {
+                *d = (x as i32 + 1) * tr + ni;
+            }
+            for (y, row) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+                let (l, yi) = (left[y], y as i32);
+                let c = (yi + 1) * bl;
+                for (x, ((d, &t), &rp)) in row.iter_mut().zip(top).zip(&ramp).enumerate() {
+                    *d = ((ni - 1 - x as i32) * l + rp + (ni - 1 - yi) * t + c) >> (log2 + 1);
                 }
             }
         }
         1 => {
-            let sum: i32 = r.top[1..=n].iter().sum::<i32>() + r.left[1..=n].iter().sum::<i32>();
-            let dc = (sum + n as i32) >> (log2 + 1);
-            out[..n * n].fill(dc);
-            if luma && n < 32 {
-                out[0] = (r.left[1] + 2 * dc + r.top[1] + 2) >> 2;
-                for (o, &t) in out[1..n].iter_mut().zip(&r.top[2..=n]) {
+            let sum: i32 = top.iter().sum::<i32>() + left.iter().sum::<i32>();
+            let dc = (sum + ni) >> (log2 + 1);
+            out.fill(dc);
+            if luma && N < 32 {
+                out[0] = (left[0] + 2 * dc + top[0] + 2) >> 2;
+                for (o, &t) in out[1..N].iter_mut().zip(&top[1..]) {
                     *o = (t + 3 * dc + 2) >> 2;
                 }
-                for y in 1..n {
-                    out[y * n] = (r.left[1 + y] + 3 * dc + 2) >> 2;
+                for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left).skip(1) {
+                    row[0] = (l + 3 * dc + 2) >> 2;
                 }
             }
         }
         _ => {
             let angle = ANGLE[mode as usize];
             let vertical = mode >= 18;
-            // ref[ k ] at index k + n (k = −n..=2n).
+            // ref[ k ] at index k + N (k = −N..=2N).
             let mut refa = [0i32; 3 * MAXB + 1];
             let (main, side) = if vertical {
                 (&r.top, &r.left)
             } else {
                 (&r.left, &r.top)
             };
-            refa[n..=2 * n].copy_from_slice(&main[..=n]);
+            refa[N..=2 * N].copy_from_slice(&main[..=N]);
             if angle < 0 {
-                let last = (n as i32 * angle) >> 5;
+                let last = (ni * angle) >> 5;
                 if last < -1 {
                     let inv = INV_ANGLE[mode as usize];
                     for k in last..=-1 {
                         let idx = (k * inv + 128) >> 8;
-                        refa[(k + n as i32) as usize] = side[idx as usize];
+                        refa[(k + ni) as usize] = side[idx as usize];
                     }
                 }
             } else {
-                refa[2 * n + 1..=3 * n].copy_from_slice(&main[n + 1..=2 * n]);
+                refa[2 * N + 1..=3 * N].copy_from_slice(&main[N + 1..=2 * N]);
             }
-            for a in 0..n {
+            // Line `a` (a row of a vertical mode, a column of a
+            // horizontal one) is one weighted pair of reference runs.
+            let line = |a: usize| -> [i32; N] {
                 let pos = (a as i32 + 1) * angle;
-                let idx = pos >> 5;
                 let fact = pos & 31;
-                for b in 0..n {
-                    let base = (b as i32 + idx + 1 + n as i32) as usize;
-                    let v = if fact != 0 {
-                        ((32 - fact) * refa[base] + fact * refa[base + 1] + 16) >> 5
-                    } else {
-                        refa[base]
-                    };
-                    if vertical {
-                        out[a * n + b] = v;
-                    } else {
-                        out[b * n + a] = v;
+                let base = ((pos >> 5) + 1 + ni) as usize;
+                let lo: &[i32; N] = run(&refa, base);
+                if fact == 0 {
+                    return *lo;
+                }
+                let hi: &[i32; N] = run(&refa, base + 1);
+                let mut v = [0i32; N];
+                for ((d, &p), &q) in v.iter_mut().zip(lo).zip(hi) {
+                    *d = ((32 - fact) * p + fact * q + 16) >> 5;
+                }
+                v
+            };
+            if vertical {
+                for (a, row) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+                    row.copy_from_slice(&line(a));
+                }
+            } else {
+                for a in 0..N {
+                    let col = line(a);
+                    for (row, &v) in out.as_chunks_mut::<N>().0.iter_mut().zip(&col) {
+                        row[a] = v;
                     }
                 }
             }
-            if luma && n < 32 {
+            if luma && N < 32 {
                 if mode == 26 {
-                    for y in 0..n {
-                        out[y * n] = (r.top[1] + ((r.left[1 + y] - r.left[0]) >> 1)).clamp(0, max);
+                    for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left) {
+                        row[0] = (top[0] + ((l - r.left[0]) >> 1)).clamp(0, max);
                     }
                 } else if mode == 10 {
-                    for (o, &t) in out[..n].iter_mut().zip(&r.top[1..=n]) {
-                        *o = (r.left[1] + ((t - r.top[0]) >> 1)).clamp(0, max);
+                    for (o, &t) in out[..N].iter_mut().zip(top) {
+                        *o = (left[0] + ((t - r.top[0]) >> 1)).clamp(0, max);
                     }
                 }
             }
@@ -599,35 +694,68 @@ fn basis_row(n: usize, k: usize, dst: bool) -> &'static [i32] {
     }
 }
 
+/// The `N`-point basis row `k` as a fixed-size array.
+#[inline(always)]
+fn basis<const N: usize>(k: usize, dst: bool) -> &'static [i32; N] {
+    basis_row(N, k, dst)[..N]
+        .try_into()
+        .expect("an N-point basis row")
+}
+
 /// Forward 2-D transform of an `n`x`n` residual (DST-VII when `dst`,
 /// `n == 4` only) at the stage shifts `log2 + BitDepth − 9` / `log2 +
-/// 6`.
+/// 6`. The sums run in `i32`: with every residual within `±2^BitDepth`
+/// the first stage stays below `2^BitDepth · 32 · 90` and the second
+/// below `32 · 90 · ( 90 · 2^9 + 1 )`.
 pub(super) fn forward(res: &[i32], n: usize, bit_depth: u8, dst: bool, out: &mut [i32]) {
-    let log2 = n.trailing_zeros();
+    match n {
+        4 => forward_n::<4, 16>(res, bit_depth, dst, out),
+        8 => forward_n::<8, 64>(res, bit_depth, dst, out),
+        16 => forward_n::<16, 256>(res, bit_depth, dst, out),
+        _ => forward_n::<32, 1024>(res, bit_depth, dst, out),
+    }
+}
+
+/// [`forward`] for one block size (`NN == N * N`).
+#[inline(always)]
+fn forward_n<const N: usize, const NN: usize>(
+    res: &[i32],
+    bit_depth: u8,
+    dst: bool,
+    out: &mut [i32],
+) {
+    let log2 = N.trailing_zeros();
     let shift1 = log2 + u32::from(bit_depth) - 9;
     let shift2 = log2 + 6;
     let (r1, r2) = (1i32 << (shift1 - 1), 1i32 << (shift2 - 1));
-    let mut tmp = [0i32; MAXB * MAXB];
+    let res: &[i32; NN] = res[..NN].try_into().expect("an N x N residual");
+    let out: &mut [i32; NN] = (&mut out[..NN]).try_into().expect("an N x N output");
+    let mut tmp = [0i32; NN];
     // Rows: tmp[ y ][ k ] = Σ_j basis( k, j ) · res[ y ][ j ].
-    for y in 0..n {
-        let row = &res[y * n..y * n + n];
-        for k in 0..n {
-            let b = basis_row(n, k, dst);
+    for (row, t) in res
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(tmp.as_chunks_mut::<N>().0.iter_mut())
+    {
+        for (k, o) in t.iter_mut().enumerate() {
+            let b = basis::<N>(k, dst);
             let acc: i32 = row.iter().zip(b).map(|(&r, &c)| r * c).sum();
-            tmp[y * n + k] = (acc + r1) >> shift1;
+            *o = (acc + r1) >> shift1;
         }
     }
     // Columns: out[ k ][ x ] = Σ_y basis( k, y ) · tmp[ y ][ x ].
-    for k in 0..n {
-        let b = basis_row(n, k, dst);
-        let mut acc = [0i32; MAXB];
-        for (y, &c) in b.iter().enumerate() {
-            for (a, &v) in acc[..n].iter_mut().zip(&tmp[y * n..y * n + n]) {
+    for (k, o) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+        let b = basis::<N>(k, dst);
+        let mut acc = [0i32; N];
+        for (y, t) in tmp.as_chunks::<N>().0.iter().enumerate() {
+            let c = b[y];
+            for (a, &v) in acc.iter_mut().zip(t) {
                 *a += c * v;
             }
         }
-        for (o, &a) in out[k * n..k * n + n].iter_mut().zip(&acc[..n]) {
-            *o = (a + r2) >> shift2;
+        for (d, &a) in o.iter_mut().zip(&acc) {
+            *d = (a + r2) >> shift2;
         }
     }
 }
@@ -690,49 +818,84 @@ pub(super) fn dequant_inverse(
     dst: bool,
     out: &mut [i32],
 ) {
-    let log2 = n.trailing_zeros();
+    match n {
+        4 => dequant_inverse_n::<4, 16>(levels, qp, bit_depth, dst, out),
+        8 => dequant_inverse_n::<8, 64>(levels, qp, bit_depth, dst, out),
+        16 => dequant_inverse_n::<16, 256>(levels, qp, bit_depth, dst, out),
+        _ => dequant_inverse_n::<32, 1024>(levels, qp, bit_depth, dst, out),
+    }
+}
+
+/// [`dequant_inverse`] for one block size (`NN == N * N`).
+#[inline(always)]
+fn dequant_inverse_n<const N: usize, const NN: usize>(
+    levels: &[i32],
+    qp: u32,
+    bit_depth: u8,
+    dst: bool,
+    out: &mut [i32],
+) {
+    let log2 = N.trailing_zeros();
     let bd_shift = u32::from(bit_depth) + log2 - 5;
     let scale = i64::from(LEVEL_SCALE[(qp % 6) as usize]) * 16;
     let add = 1i64 << (bd_shift - 1);
-    let mut d = [0i32; MAXB * MAXB];
-    let mut rows_nz = [false; MAXB];
-    for (i, (&l, o)) in levels[..n * n].iter().zip(d.iter_mut()).enumerate() {
-        if l != 0 {
-            *o = ((((i64::from(l) * scale) << (qp / 6)) + add) >> bd_shift).clamp(-32768, 32767)
-                as i32;
-            rows_nz[i / n] = true;
+    let levels: &[i32; NN] = levels[..NN].try_into().expect("N x N levels");
+    let out: &mut [i32; NN] = (&mut out[..NN]).try_into().expect("an N x N output");
+    let mut d = [0i32; NN];
+    let mut rows_nz = [false; N];
+    for ((lrow, drow), nz) in levels
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(d.as_chunks_mut::<N>().0.iter_mut())
+        .zip(rows_nz.iter_mut())
+    {
+        for (&l, o) in lrow.iter().zip(drow) {
+            if l != 0 {
+                *o = ((((i64::from(l) * scale) << (qp / 6)) + add) >> bd_shift).clamp(-32768, 32767)
+                    as i32;
+                *nz = true;
+            }
         }
     }
     // Stage 1 (columns): g[ y ][ x ] = Σ_k basis( k, y ) · d[ k ][ x ].
-    let mut g = [0i32; MAXB * MAXB];
-    for y in 0..n {
-        let mut acc = [0i32; MAXB];
-        for k in (0..n).filter(|&k| rows_nz[k]) {
-            let c = basis_row(n, k, dst)[y];
-            for (a, &v) in acc[..n].iter_mut().zip(&d[k * n..k * n + n]) {
+    let mut g = [0i32; NN];
+    for (y, grow) in g.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+        let mut acc = [0i32; N];
+        for (k, drow) in d.as_chunks::<N>().0.iter().enumerate() {
+            if !rows_nz[k] {
+                continue;
+            }
+            let c = basis::<N>(k, dst)[y];
+            for (a, &v) in acc.iter_mut().zip(drow) {
                 *a += c * v;
             }
         }
-        for (o, &a) in g[y * n..y * n + n].iter_mut().zip(&acc[..n]) {
-            *o = ((a + 64) >> 7).clamp(-32768, 32767);
+        for (d, &a) in grow.iter_mut().zip(&acc) {
+            *d = ((a + 64) >> 7).clamp(-32768, 32767);
         }
     }
     // Stage 2 (rows) + bdShift: out[ y ][ x ] = Σ_k basis( k, x ) · g[ y ][ k ].
     let shift2 = 20 - u32::from(bit_depth);
     let add2 = 1i32 << (shift2 - 1);
-    for y in 0..n {
-        let mut acc = [0i32; MAXB];
-        for k in 0..n {
-            let v = g[y * n + k];
+    for (grow, orow) in g
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<N>().0.iter_mut())
+    {
+        let mut acc = [0i32; N];
+        for (k, &v) in grow.iter().enumerate() {
             if v == 0 {
                 continue;
             }
-            for (a, &c) in acc[..n].iter_mut().zip(basis_row(n, k, dst)) {
+            let b = basis::<N>(k, dst);
+            for (a, &c) in acc.iter_mut().zip(b) {
                 *a += c * v;
             }
         }
-        for (o, &a) in out[y * n..y * n + n].iter_mut().zip(&acc[..n]) {
-            *o = (a + add2) >> shift2;
+        for (d, &a) in orow.iter_mut().zip(&acc) {
+            *d = (a + add2) >> shift2;
         }
     }
 }
@@ -943,6 +1106,22 @@ mod tests {
                     let marked = MarkedReferenceSamples::new(n, corner, mleft, mtop).unwrap();
                     let r = Refs::substituted(n, &left, &top, bd);
                     let rf = r.filtered();
+                    // The in-place twins (sentinel marks, filter into
+                    // a reused value) agree sample for sample.
+                    let mut marked_r = Refs::empty();
+                    marked_r.n = n;
+                    for k in 0..=2 * n {
+                        let (l, t) = (left[k], top[k]);
+                        marked_r.left[k] = if l.1 { l.0 } else { REF_UNAVAILABLE };
+                        marked_r.top[k] = if t.1 { t.0 } else { REF_UNAVAILABLE };
+                    }
+                    marked_r.substitute_marked(bd);
+                    assert_eq!(marked_r.left[..=2 * n], r.left[..=2 * n], "n {n} {trial}");
+                    assert_eq!(marked_r.top[..=2 * n], r.top[..=2 * n], "n {n} {trial}");
+                    let mut filt_r = Refs::empty();
+                    marked_r.filter_into(&mut filt_r);
+                    assert_eq!(filt_r.left[..=2 * n], rf.left[..=2 * n], "n {n} {trial}");
+                    assert_eq!(filt_r.top[..=2 * n], rf.top[..=2 * n], "n {n} {trial}");
                     for mode in 0..=34u8 {
                         for luma in [true, false] {
                             let params = IntraPredParams {
@@ -968,6 +1147,29 @@ mod tests {
                                 &want[..],
                                 "bd {bd} n {n} mode {mode} luma {luma} trial {trial}"
                             );
+                            // 4:4:4 chroma takes the filtered references
+                            // (and no edge filters).
+                            if !luma {
+                                let params = IntraPredParams {
+                                    chroma_array_type_3: true,
+                                    ..params
+                                };
+                                let want =
+                                    intra_predict_with_substitution(&marked, &params).unwrap();
+                                let use_f = filter_flag(mode, n);
+                                predict_intra(
+                                    if use_f { &rf } else { &r },
+                                    mode,
+                                    false,
+                                    bd,
+                                    &mut got,
+                                );
+                                assert_eq!(
+                                    &got[..n * n],
+                                    &want[..],
+                                    "4:4:4 chroma bd {bd} n {n} mode {mode} trial {trial}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1014,6 +1216,51 @@ mod tests {
                         let mut got = [0i32; MAXB * MAXB];
                         dequant_inverse(&levels, n, qp, bd, dst, &mut got);
                         assert_eq!(&got[..n * n], &want[..], "bd {bd} n {n} qp {qp} dst {dst}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `i32` forward transform equals the wide-accumulator one
+    /// whenever the residual lies within the sample range — every
+    /// depth, size and both bases, extreme residuals included.
+    #[test]
+    fn forward_matches_the_wide_transform() {
+        use crate::encoder::intra::forward_transform_bd;
+        let mut rng = Lcg(23);
+        for bd in [8u8, 10, 12] {
+            let lim = 1i32 << bd;
+            for n in [4usize, 8, 16, 32] {
+                for trial in 0..6 {
+                    let res: Vec<i32> = (0..n * n)
+                        .map(|i| match trial {
+                            0 => lim,
+                            1 => -lim,
+                            2 => {
+                                if (i + i / n) % 2 == 0 {
+                                    lim
+                                } else {
+                                    -lim
+                                }
+                            }
+                            _ => (rng.next() % (2 * lim as u32 + 1)) as i32 - lim,
+                        })
+                        .collect();
+                    let mut got = [0i32; MAXB * MAXB];
+                    forward(&res, n, bd, false, &mut got);
+                    assert_eq!(
+                        &got[..n * n],
+                        &forward_transform_bd(&res, n, bd)[..],
+                        "bd {bd} n {n} trial {trial}"
+                    );
+                    if n == 4 {
+                        forward(&res, 4, bd, true, &mut got);
+                        assert_eq!(
+                            &got[..16],
+                            &super::super::forward_transform_dst4(&res, bd)[..],
+                            "dst bd {bd} trial {trial}"
+                        );
                     }
                 }
             }
