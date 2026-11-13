@@ -492,7 +492,50 @@ enum CuNode {
     Split(Box<[Option<CuNode>; 4]>),
 }
 
+impl TuNode {
+    /// Release the level vectors that hold no coefficient: a decided
+    /// block whose levels are all zero is read only through its (clear)
+    /// cbf, which an empty vector answers the same.
+    fn release_zero_levels(&mut self) {
+        fn release(v: &mut Vec<i32>) {
+            if !v.is_empty() && !TuNode::any_nonzero(v) {
+                *v = Vec::new();
+            }
+        }
+        match self {
+            TuNode::Leaf { y, cb, cr } => {
+                release(y);
+                release(cb);
+                release(cr);
+            }
+            TuNode::Split { children, cb, cr } => {
+                release(cb);
+                release(cr);
+                for child in children.iter_mut() {
+                    child.release_zero_levels();
+                }
+            }
+        }
+    }
+}
+
 impl CuNode {
+    /// [`TuNode::release_zero_levels`] over a decided CTB.
+    fn release_zero_levels(&mut self) {
+        match self {
+            CuNode::Leaf(cu) => {
+                if let Some(tree) = cu.tree.as_mut() {
+                    tree.release_zero_levels();
+                }
+            }
+            CuNode::Split(children) => {
+                for child in children.iter_mut().flatten() {
+                    child.release_zero_levels();
+                }
+            }
+        }
+    }
+
     fn for_each_cu<'a>(&'a self, f: &mut dyn FnMut(&'a CuCoded)) {
         match self {
             CuNode::Leaf(cu) => f(cu),
@@ -4372,7 +4415,8 @@ fn code_tile(ctx: &SliceCtx<'_>, job: &TileJob, slice_type_raw: u8, cu_qp_delta:
                 contexts: coder.ctxs.residual.clone(),
             });
         }
-        let (node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
+        let (mut node, _cost) = code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
+        node.release_zero_levels();
         if let Some((coder, qp_prev)) = shadow.as_mut() {
             let mut qg = QgState {
                 coded: false,
@@ -4512,8 +4556,9 @@ fn code_tile_wpp(
                         st.rdoq_model = shadow.as_ref().map(|(coder, _)| RdoqModel {
                             contexts: coder.ctxs.residual.clone(),
                         });
-                        let (node, _cost) =
+                        let (mut node, _cost) =
                             code_quadtree(ctx, &mut st, x0, y0, ctx.cfg.ctb_log2, 0, ctb_qp);
+                        node.release_zero_levels();
                         if let Some((coder, qp_prev)) = shadow.as_mut() {
                             let mut qg = QgState {
                                 coded: false,
@@ -4635,11 +4680,21 @@ fn code_picture(
     let ctb = 1usize << ctx.cfg.ctb_log2;
     let jobs = tile_jobs(ctx);
     let workers = ctx.threads.min(jobs.len()).max(1);
-    // A single-tile WPP picture fans its CTB rows out instead (the
-    // CTU-level rate feedback reads the running size of everything
-    // coded before, so it stays serial).
-    let wpp_parallel =
-        ctx.threads > 1 && ctx.cfg.wpp && jobs.len() == 1 && ctx.ctu_rc.is_none() && ctbs_y > 1;
+    // A single-tile picture fans its CTB rows out in a wavefront
+    // instead. The decisions of a CTB read the picture state of its
+    // left, above-left, above and above-right neighbours only — and,
+    // under RDOQ, the entropy contexts at its start, which follow the
+    // wavefront exactly when the stream is coded with WPP (each row
+    // then starts from the row above's stored contexts). Without RDOQ
+    // nothing entropy-side enters a decision, so any single-tile
+    // picture qualifies, WPP syntax or not. The CTU-level rate
+    // feedback reads the running size of everything coded before and
+    // stays serial.
+    let wpp_parallel = ctx.threads > 1
+        && (ctx.cfg.wpp || !ctx.cfg.rdoq)
+        && jobs.len() == 1
+        && ctx.ctu_rc.is_none()
+        && ctbs_y > 1;
     let outs: Vec<TileOut> = if wpp_parallel {
         vec![code_tile_wpp(
             ctx,
@@ -4734,7 +4789,18 @@ fn code_picture(
 
     // ---- §8.7 loop filters ----
     let walk = qp_walk(ctx, &plans, &ctb_qps, cu_qp_delta);
-    let recon = st.recon.clone();
+    // The emission reads the decision state's cells and modes, never
+    // its samples: hand the planes over instead of copying them.
+    let recon = std::mem::replace(
+        &mut st.recon,
+        ReconPlanes {
+            y: Vec::new(),
+            cb: Vec::new(),
+            cr: Vec::new(),
+            y_origin: 0,
+            c_origin: 0,
+        },
+    );
     let mut out = CodedPicture {
         plans,
         ctb_qps,
@@ -5790,6 +5856,75 @@ mod tests {
         let serial = intra(1);
         assert_eq!(intra(2), serial, "intra, 2 workers");
         assert_eq!(intra(4), serial, "intra, 4 workers");
+    }
+
+    /// A picture coded WITHOUT wavefront syntax is still decided in a
+    /// wavefront under a thread budget when RDOQ is off (no decision
+    /// reads the entropy state then): the bytes equal the serial pass
+    /// on a P / B GOP and on an intra still, with and without the
+    /// filters and AQ.
+    #[test]
+    fn tree_wavefront_without_wpp_syntax_matches_serial() {
+        use crate::encoder::inter::LowDelayPEncoder;
+        let (w, h) = (112, 80);
+        let frames = scene(w, h, 3);
+        let cfg = TreeCfg::new(16)
+            .expect("ctb")
+            .with_sign_hiding(true)
+            .with_tu_depth(2, 2)
+            .with_intra_rd(2);
+        assert!(!cfg.wpp && !cfg.rdoq);
+        let encode = |threads: usize| -> Vec<u8> {
+            let mut enc = LowDelayPEncoder::new(w, h, 30, 0)
+                .expect("encoder")
+                .with_tree(cfg)
+                .with_b_slices(true)
+                .with_aq(1)
+                .with_loop_filters(LoopFilterCfg::all())
+                .with_threads(threads);
+            let mut stream = Vec::new();
+            for (y, cb, cr) in &frames {
+                stream.extend_from_slice(
+                    &enc.encode_frame(&YuvFrame { y, cb, cr }).expect("frame").au,
+                );
+            }
+            stream
+        };
+        let serial = encode(1);
+        assert_eq!(encode(2), serial, "2 workers");
+        assert_eq!(encode(5), serial, "5 workers");
+        assert_eq!(decode_annexb_sequence(&serial).expect("decode").len(), 3);
+
+        for (fmt, ctb) in [
+            (SampleFmt::YUV420_8, 64usize),
+            (SampleFmt::new(2, 10).expect("format"), 32),
+        ] {
+            let planes = planes_fmt(&fmt, 160, 144);
+            let intra = |threads: usize| -> Vec<u8> {
+                let sps = SpsCfg {
+                    min_cb_log2: 3,
+                    tree: Some(TreeCfg::new(ctb).expect("ctb").with_intra_rd(2)),
+                    fmt,
+                    threads,
+                    ..SpsCfg::legacy(1)
+                };
+                crate::encoder::intra::encode_idr_intra_au_wide(
+                    [&planes[0], &planes[1], &planes[2]],
+                    160,
+                    144,
+                    27,
+                    &sps,
+                    &LoopFilterCfg::default(),
+                    0,
+                    None,
+                )
+                .expect("encode")
+                .au
+            };
+            let serial = intra(1);
+            assert_eq!(intra(3), serial, "intra CTB {ctb}, 3 workers");
+            assert_eq!(intra(8), serial, "intra CTB {ctb}, 8 workers");
+        }
     }
 
     #[test]
