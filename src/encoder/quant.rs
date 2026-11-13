@@ -47,7 +47,7 @@ use crate::cabac::{ContextModel, RANGE_TAB_LPS};
 use crate::encoder::bitwriter::BitWriter;
 use crate::residual::ResidualContexts;
 use crate::scaling_list::{NUM_MATRIX_IDS, NUM_SIZE_IDS, ScalingFactorMatrix, ScalingListData};
-use crate::scan::{ScanIdx, scan_order};
+use crate::scan::{ScanIdx, scan_table};
 use crate::transform::LEVEL_SCALE;
 
 /// Cost of one bypass bin (1/256-bit units).
@@ -379,8 +379,8 @@ fn rdoq_levels(
     let scan_idx_num = u32::from(req.scan.index());
     let lam = lambda_coef(req.lambda, log2, req.bit_depth);
     let ctxs = &model.contexts;
-    let pos_scan = scan_order(2, req.scan).expect("4x4 scan");
-    let sub_scan = scan_order((log2 - 2) as u8, req.scan).expect("sub-block scan");
+    let pos_scan = scan_table(2, req.scan).expect("4x4 scan");
+    let sub_scan = scan_table((log2 - 2) as u8, req.scan).expect("sub-block scan");
     let num_sb_1d = 1usize << (log2 - 2);
     let n_sb = num_sb_1d * num_sb_1d;
     let half = 1u64 << (qbits - 1);
@@ -698,8 +698,8 @@ fn apply_sign_hiding(
     let log2 = req.log2;
     let size = 1usize << log2;
     let lam = lambda_coef(req.lambda, log2, req.bit_depth);
-    let pos_scan = scan_order(2, req.scan).expect("4x4 scan");
-    let sub_scan = scan_order((log2 - 2) as u8, req.scan).expect("sub-block scan");
+    let pos_scan = scan_table(2, req.scan).expect("4x4 scan");
+    let sub_scan = scan_table((log2 - 2) as u8, req.scan).expect("sub-block scan");
     let num_sb_1d = 1usize << (log2 - 2);
     let n_sb = num_sb_1d * num_sb_1d;
 

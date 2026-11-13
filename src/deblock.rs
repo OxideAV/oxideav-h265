@@ -352,24 +352,24 @@ fn different_refs_or_count(p: &crate::motion::MotionCell, q: &crate::motion::Mot
     if p_count != q_count {
         return true;
     }
-    // Compare the *sets* of reference pictures (POCs), list-independent.
-    let mut p_refs = Vec::new();
-    if p.pred_flag_l0 {
-        p_refs.push(p.ref_poc_l0);
+    // Compare the *sets* of reference pictures (POCs), list-independent:
+    // the (at most two) used references of each side, in ascending
+    // order.
+    fn refs(c: &crate::motion::MotionCell) -> (usize, [i32; 2]) {
+        match (c.pred_flag_l0, c.pred_flag_l1) {
+            (true, true) => (
+                2,
+                [
+                    c.ref_poc_l0.min(c.ref_poc_l1),
+                    c.ref_poc_l0.max(c.ref_poc_l1),
+                ],
+            ),
+            (true, false) => (1, [c.ref_poc_l0, 0]),
+            (false, true) => (1, [c.ref_poc_l1, 0]),
+            (false, false) => (0, [0, 0]),
+        }
     }
-    if p.pred_flag_l1 {
-        p_refs.push(p.ref_poc_l1);
-    }
-    let mut q_refs = Vec::new();
-    if q.pred_flag_l0 {
-        q_refs.push(q.ref_poc_l0);
-    }
-    if q.pred_flag_l1 {
-        q_refs.push(q.ref_poc_l1);
-    }
-    p_refs.sort_unstable();
-    q_refs.sort_unstable();
-    p_refs != q_refs
+    refs(p) != refs(q)
 }
 
 /// `|a − b| >= 4` on either component (the §8.7.2.4 quarter-luma-sample

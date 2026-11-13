@@ -36,7 +36,7 @@ use crate::cabac::ContextModel;
 use crate::encoder::bitwriter::BitWriter;
 use crate::encoder::cabac::CabacEncoder;
 use crate::residual::{ResidualCodingParams, ResidualContexts, ResidualElement};
-use crate::scan::{ScanIdx, scan_order};
+use crate::scan::{ScanIdx, scan_table};
 
 /// Errors from [`encode_residual_coding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,9 +230,9 @@ pub fn encode_residual_coding(
     }
     let is_chroma = params.is_chroma;
 
-    let pos_scan = scan_order(2, params.scan_idx)
+    let pos_scan = scan_table(2, params.scan_idx)
         .map_err(|_| ResidualEncodeError::UnsupportedScanIdx(params.scan_idx))?;
-    let sub_scan = scan_order((log2 - 2) as u8, params.scan_idx)
+    let sub_scan = scan_table((log2 - 2) as u8, params.scan_idx)
         .map_err(|_| ResidualEncodeError::UnsupportedScanIdx(params.scan_idx))?;
     let num_sb_1d = 1usize << (log2 - 2);
 

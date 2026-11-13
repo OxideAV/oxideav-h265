@@ -243,6 +243,39 @@ pub fn scan_order(log2_block_size: u8, scan_idx: ScanIdx) -> Result<Vec<ScanPos>
     })
 }
 
+/// [`scan_order`] from a table built once per process: the residual
+/// decoder and the encoder's quantizers look a scan up per transform
+/// block.
+pub(crate) fn scan_table(
+    log2_block_size: u8,
+    scan_idx: ScanIdx,
+) -> Result<&'static [ScanPos], ScanOrderError> {
+    use std::sync::OnceLock;
+    // Indexed `[ scanIdx ][ log2BlockSize ]`; an entry outside the
+    // §7.4.2 range of its scan stays empty and is never handed out.
+    static TABLES: OnceLock<[[Vec<ScanPos>; 6]; 4]> = OnceLock::new();
+    const ORDER: [ScanIdx; 4] = [
+        ScanIdx::Diagonal,
+        ScanIdx::Horizontal,
+        ScanIdx::Vertical,
+        ScanIdx::Traverse,
+    ];
+    let slot = ORDER
+        .iter()
+        .position(|&s| s == scan_idx)
+        .expect("every scan is listed");
+    let tables = TABLES.get_or_init(|| {
+        core::array::from_fn(|s| {
+            core::array::from_fn(|log2| scan_order(log2 as u8, ORDER[s]).unwrap_or_default())
+        })
+    });
+    // The range check (and its error) is scan_order's.
+    if log2_block_size > 5 || tables[slot][usize::from(log2_block_size)].is_empty() {
+        return scan_order(log2_block_size, scan_idx).map(|_| &[][..]);
+    }
+    Ok(&tables[slot][usize::from(log2_block_size)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

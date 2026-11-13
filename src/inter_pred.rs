@@ -749,6 +749,353 @@ fn vpass<const TAPS: usize, T: Copy + Into<i32>>(
 }
 
 // ---------------------------------------------------------------------------
+// The block filters at 16-bit intermediate precision
+// ---------------------------------------------------------------------------
+
+/// Whether the intermediate prediction samples of a `bit_depth`
+/// picture fit the biased 16-bit form of [`MID_BIAS`]: with `shift1 =
+/// BitDepth − 8` (up to 12 bits) a one-dimensional stage of in-range
+/// samples lies in `−24 · 2^8 ..= 88 · 2^8` (the negative / positive
+/// tap sums of the widest filter), the second stage of a
+/// two-dimensional phase in `−16896 ..= 33278`, and the full-sample
+/// value `A << ( 14 − BitDepth )` below `2^14`; deeper pictures clamp
+/// `shift1` at 4 and need the wide arrays.
+#[inline]
+pub(crate) fn mid_fits_16(bit_depth: u8) -> bool {
+    bit_depth <= 12
+}
+
+/// The 16-bit intermediate arrays store `predSample − MID_BIAS`: the
+/// two-dimensional phases reach past `i16::MAX` (see
+/// [`mid_fits_16`]) but never past `MID_BIAS + i16::MAX`.
+pub(crate) const MID_BIAS: i32 = 8192;
+
+/// Per-thread scratch of the 16-bit block filters.
+#[derive(Default)]
+struct InterpScratch16 {
+    window: Vec<u16>,
+    rows: Vec<i16>,
+}
+
+thread_local! {
+    static INTERP_SCRATCH16: core::cell::RefCell<InterpScratch16> =
+        core::cell::RefCell::new(InterpScratch16::default());
+}
+
+/// [`interp_luma_into`] into 16-bit intermediate samples (the same
+/// values less [`MID_BIAS`]; `bit_depth` must satisfy [`mid_fits_16`]
+/// and the plane's samples lie within the bit depth, as every decoded
+/// picture's do).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interp_luma_into16(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    n_pb_w: usize,
+    n_pb_h: usize,
+    bit_depth: u8,
+    out: &mut [i16],
+) {
+    interp_block16::<8>(
+        plane,
+        x_int,
+        y_int,
+        &LUMA_FILTER[x_frac as usize],
+        &LUMA_FILTER[y_frac as usize],
+        (x_frac == 0, y_frac == 0),
+        n_pb_w,
+        n_pb_h,
+        bit_depth,
+        out,
+    );
+}
+
+/// [`interp_chroma_into`] into 16-bit intermediate samples (see
+/// [`interp_luma_into16`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interp_chroma_into16(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    x_frac: i32,
+    y_frac: i32,
+    block_w: usize,
+    block_h: usize,
+    bit_depth: u8,
+    out: &mut [i16],
+) {
+    interp_block16::<4>(
+        plane,
+        x_int,
+        y_int,
+        &CHROMA_FILTER[x_frac as usize],
+        &CHROMA_FILTER[y_frac as usize],
+        (x_frac == 0, y_frac == 0),
+        block_w,
+        block_h,
+        bit_depth,
+        out,
+    );
+}
+
+/// [`interp_block`] with 16-bit intermediate samples (`out` holds
+/// `predSample − MID_BIAS`). At 8 bits the one-dimensional stages also
+/// accumulate in 16 bits: `shift1` is 0 and a tap sum of 8-bit samples
+/// lies in `−24 · 255 ..= 88 · 255`, so the wrapping 16-bit sum is the
+/// exact one.
+#[allow(clippy::too_many_arguments)]
+fn interp_block16<const TAPS: usize>(
+    plane: &RefPlane<'_>,
+    x_int: i32,
+    y_int: i32,
+    hk: &[i32; TAPS],
+    vk: &[i32; TAPS],
+    (fx0, fy0): (bool, bool),
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    out: &mut [i16],
+) {
+    debug_assert!(mid_fits_16(bit_depth));
+    let shift1 = interp_shift1(bit_depth);
+    let shift3 = interp_shift3(bit_depth);
+    let narrow = bit_depth == 8;
+    let hk16: [i16; TAPS] = core::array::from_fn(|t| hk[t] as i16);
+    let vk16: [i16; TAPS] = core::array::from_fn(|t| vk[t] as i16);
+    let half = TAPS / 2 - 1;
+    let ww = w + TAPS - 1;
+    let wh = h + TAPS - 1;
+    let x0 = x_int - half as i32;
+    let y0 = y_int - half as i32;
+    INTERP_SCRATCH16.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let InterpScratch16 { window, rows } = &mut *scratch;
+        let inside = x0 >= 0
+            && y0 >= 0
+            && x0 as usize + ww <= plane.width
+            && y0 as usize + wh <= plane.height;
+        plane.ensure_rows(y0, y0 + wh as i32);
+        let (src, stride, base): (&[u16], usize, usize) = match (inside, plane.flat()) {
+            (true, Some(flat)) => (flat, plane.width, y0 as usize * plane.width + x0 as usize),
+            _ => {
+                window.clear();
+                window.reserve(ww * wh);
+                let pw = plane.width as i32;
+                let mut band = None;
+                for j in 0..wh as i32 {
+                    let row = plane.row_cached(
+                        (y0 + j).clamp(0, plane.height as i32 - 1) as usize,
+                        &mut band,
+                    );
+                    if x0 >= 0 && x0 + ww as i32 <= pw {
+                        window.extend_from_slice(&row[x0 as usize..x0 as usize + ww]);
+                    } else {
+                        window.extend(
+                            (0..ww as i32).map(|i| row[(x0 + i).clamp(0, pw - 1) as usize]),
+                        );
+                    }
+                }
+                (&window[..], ww, 0)
+            }
+        };
+        let out = &mut out[..w * h];
+        let bias = MID_BIAS as i16;
+        // One horizontal row at the picture's depth, less `sub`.
+        let hrow = |s: usize, o: &mut [i16], sub: i16| {
+            if narrow {
+                hpass_narrow::<TAPS>(&src[s..s + ww], &hk16, sub, o);
+            } else {
+                hpass_mid::<TAPS>(&src[s..s + ww], hk, shift1, sub, o);
+            }
+        };
+        match (fx0, fy0) {
+            (true, true) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let s = base + (y + half) * stride + half;
+                    for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
+                        *d = ((v << shift3) as i16).wrapping_sub(bias);
+                    }
+                }
+            }
+            (false, true) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    hrow(base + (y + half) * stride, o, bias);
+                }
+            }
+            (true, false) => {
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let r: [&[u16]; TAPS] = core::array::from_fn(|t| {
+                        let s = base + (y + t) * stride + half;
+                        &src[s..s + w]
+                    });
+                    if narrow {
+                        vpass_narrow::<TAPS>(r, &vk16, bias, o);
+                    } else {
+                        vpass_mid::<TAPS, u16>(r, vk, shift1, MID_BIAS, o);
+                    }
+                }
+            }
+            (false, false) => {
+                rows.clear();
+                rows.resize(w * wh, 0);
+                for (j, r) in rows.chunks_exact_mut(w).enumerate() {
+                    hrow(base + j * stride, r, 0);
+                }
+                for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                    let r: [&[i16]; TAPS] =
+                        core::array::from_fn(|t| &rows[(y + t) * w..(y + t + 1) * w]);
+                    vpass_mid::<TAPS, i16>(r, vk, 6, MID_BIAS, o);
+                }
+            }
+        }
+    });
+}
+
+/// Lanes per step of the 16-bit row kernels: the rows are filtered
+/// eight samples at a time over fixed-size arrays (straight-line
+/// vector code — no trip count, no overlap test), the remainder one
+/// sample at a time.
+const LANES: usize = 8;
+
+/// [`hpass`] with a 16-bit result less `sub` (the 32-bit sum fits
+/// after `>> shift1`).
+#[inline(always)]
+fn hpass_mid<const TAPS: usize>(
+    src: &[u16],
+    k: &[i32; TAPS],
+    shift1: i32,
+    sub: i16,
+    out: &mut [i16],
+) {
+    let w = out.len();
+    let src = &src[..w + TAPS - 1];
+    let (blocks, tail) = out.as_chunks_mut::<LANES>();
+    for (b, o) in blocks.iter_mut().enumerate() {
+        let x = b * LANES;
+        let mut acc = [0i32; LANES];
+        for (t, &kt) in k.iter().enumerate() {
+            let s: &[u16; LANES] = src[x + t..x + t + LANES].try_into().expect("lanes");
+            for (a, &v) in acc.iter_mut().zip(s) {
+                *a += kt * i32::from(v);
+            }
+        }
+        for (d, &a) in o.iter_mut().zip(&acc) {
+            *d = ((a >> shift1) as i16).wrapping_sub(sub);
+        }
+    }
+    let x0 = w - tail.len();
+    for (i, d) in tail.iter_mut().enumerate() {
+        let mut acc = 0i32;
+        for (t, &kt) in k.iter().enumerate() {
+            acc += kt * i32::from(src[x0 + i + t]);
+        }
+        *d = ((acc >> shift1) as i16).wrapping_sub(sub);
+    }
+}
+
+/// One horizontal filter row of 8-bit samples, summed in 16 bits, less
+/// `sub`.
+#[inline(always)]
+fn hpass_narrow<const TAPS: usize>(src: &[u16], k: &[i16; TAPS], sub: i16, out: &mut [i16]) {
+    let w = out.len();
+    let src = &src[..w + TAPS - 1];
+    let (blocks, tail) = out.as_chunks_mut::<LANES>();
+    for (b, o) in blocks.iter_mut().enumerate() {
+        let x = b * LANES;
+        let mut acc = [0i16; LANES];
+        for (t, &kt) in k.iter().enumerate() {
+            let s: &[u16; LANES] = src[x + t..x + t + LANES].try_into().expect("lanes");
+            for (a, &v) in acc.iter_mut().zip(s) {
+                *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+            }
+        }
+        for (d, &a) in o.iter_mut().zip(&acc) {
+            *d = a.wrapping_sub(sub);
+        }
+    }
+    let x0 = w - tail.len();
+    for (i, d) in tail.iter_mut().enumerate() {
+        let mut acc = 0i16;
+        for (t, &kt) in k.iter().enumerate() {
+            acc = acc.wrapping_add(kt.wrapping_mul(src[x0 + i + t] as i16));
+        }
+        *d = acc.wrapping_sub(sub);
+    }
+}
+
+/// [`vpass`] with a 16-bit result less `sub`.
+#[inline(always)]
+fn vpass_mid<const TAPS: usize, T: Copy + Into<i32>>(
+    rows: [&[T]; TAPS],
+    k: &[i32; TAPS],
+    shift: i32,
+    sub: i32,
+    out: &mut [i16],
+) {
+    let w = out.len();
+    let rows: [&[T]; TAPS] = core::array::from_fn(|t| &rows[t][..w]);
+    let (blocks, tail) = out.as_chunks_mut::<LANES>();
+    for (b, o) in blocks.iter_mut().enumerate() {
+        let x = b * LANES;
+        let mut acc = [0i32; LANES];
+        for (r, &kt) in rows.iter().zip(k) {
+            let s: &[T; LANES] = r[x..x + LANES].try_into().expect("lanes");
+            for (a, &v) in acc.iter_mut().zip(s) {
+                *a += kt * v.into();
+            }
+        }
+        for (d, &a) in o.iter_mut().zip(&acc) {
+            *d = ((a >> shift) - sub) as i16;
+        }
+    }
+    let x0 = w - tail.len();
+    for (i, d) in tail.iter_mut().enumerate() {
+        let mut acc = 0i32;
+        for (r, &kt) in rows.iter().zip(k) {
+            acc += kt * r[x0 + i].into();
+        }
+        *d = ((acc >> shift) - sub) as i16;
+    }
+}
+
+/// One vertical filter row over rows of 8-bit samples, summed in 16
+/// bits, less `sub`.
+#[inline(always)]
+fn vpass_narrow<const TAPS: usize>(
+    rows: [&[u16]; TAPS],
+    k: &[i16; TAPS],
+    sub: i16,
+    out: &mut [i16],
+) {
+    let w = out.len();
+    let rows: [&[u16]; TAPS] = core::array::from_fn(|t| &rows[t][..w]);
+    let (blocks, tail) = out.as_chunks_mut::<LANES>();
+    for (b, o) in blocks.iter_mut().enumerate() {
+        let x = b * LANES;
+        let mut acc = [0i16; LANES];
+        for (r, &kt) in rows.iter().zip(k) {
+            let s: &[u16; LANES] = r[x..x + LANES].try_into().expect("lanes");
+            for (a, &v) in acc.iter_mut().zip(s) {
+                *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+            }
+        }
+        for (d, &a) in o.iter_mut().zip(&acc) {
+            *d = a.wrapping_sub(sub);
+        }
+    }
+    let x0 = w - tail.len();
+    for (i, d) in tail.iter_mut().enumerate() {
+        let mut acc = 0i16;
+        for (r, &kt) in rows.iter().zip(k) {
+            acc = acc.wrapping_add(kt.wrapping_mul(r[x0 + i] as i16));
+        }
+        *d = acc.wrapping_sub(sub);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §8.5.3.3.4.2 — default weighted sample prediction
 // ---------------------------------------------------------------------------
 
@@ -1364,6 +1711,87 @@ mod tests {
 
     /// Chroma flat plane interpolates to the constant value (each 4-tap
     /// kernel sums to 64) for all 8x8 eighth-pel phases.
+    /// The 16-bit block filters produce the 32-bit filters' samples at
+    /// every depth they serve, phase and block position (inside the
+    /// plane and across every edge).
+    #[test]
+    fn mid16_filters_match_the_wide_filters() {
+        let (pw, ph) = (40usize, 36usize);
+        let mut saw_past_i16 = false;
+        for bd in [8u8, 9, 10, 12] {
+            let max = (1u32 << bd) - 1;
+            let mut seed = 0x1234_5678u32 ^ u32::from(bd);
+            for pattern in 0..2 {
+                // Pattern 0: runs of saturation, zero and noise. Pattern 1:
+                // saturated where the half-sample taps of the two axes
+                // agree in sign, zero elsewhere — the picture that drives a
+                // two-dimensional phase to its extremes (past `i16::MAX`
+                // before the bias).
+                const POSITIVE_TAP: [bool; 8] =
+                    [false, true, false, true, true, false, true, false];
+                let samples: Vec<u16> = (0..pw * ph)
+                    .map(|i| {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        if pattern == 1 {
+                            let (x, y) = (i % pw, i / pw);
+                            return if POSITIVE_TAP[x % 8] == POSITIVE_TAP[y % 8] {
+                                max as u16
+                            } else {
+                                0
+                            };
+                        }
+                        match (i / 7) % 3 {
+                            0 => max as u16,
+                            1 => 0,
+                            _ => ((seed >> 8) % (max + 1)) as u16,
+                        }
+                    })
+                    .collect();
+                let plane = RefPlane::new(&samples, pw, ph).unwrap();
+                for &(x, y, w, h) in &[
+                    (11, 11, 8, 8),
+                    (19, 3, 16, 16),
+                    (8i32, 8i32, 16usize, 8usize),
+                    (-5, -3, 8, 8),
+                    (30, 28, 16, 16),
+                    (0, 20, 4, 8),
+                    (36, 0, 8, 4),
+                ] {
+                    for fy in 0..4 {
+                        for fx in 0..4 {
+                            let mut want = vec![0i32; w * h];
+                            let mut got = vec![0i16; w * h];
+                            interp_luma_into(&plane, x, y, fx, fy, w, h, bd, &mut want);
+                            interp_luma_into16(&plane, x, y, fx, fy, w, h, bd, &mut got);
+                            assert!(
+                                want.iter()
+                                    .zip(&got)
+                                    .all(|(&a, &b)| a == i32::from(b) + MID_BIAS),
+                                "luma bd {bd} ({x},{y}) {w}x{h} phase ({fx},{fy})"
+                            );
+                            saw_past_i16 |= want.iter().any(|&a| a > i32::from(i16::MAX));
+                        }
+                    }
+                    for fy in 0..8 {
+                        for fx in 0..8 {
+                            let mut want = vec![0i32; w * h];
+                            let mut got = vec![0i16; w * h];
+                            interp_chroma_into(&plane, x, y, fx, fy, w, h, bd, &mut want);
+                            interp_chroma_into16(&plane, x, y, fx, fy, w, h, bd, &mut got);
+                            assert!(
+                                want.iter()
+                                    .zip(&got)
+                                    .all(|(&a, &b)| a == i32::from(b) + MID_BIAS),
+                                "chroma bd {bd} ({x},{y}) {w}x{h} phase ({fx},{fy})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_past_i16, "the extreme picture exceeds 16 signed bits");
+    }
+
     #[test]
     fn chroma_flat_plane_constant() {
         let plane_samples = vec![77u16; 12 * 12];

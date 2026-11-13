@@ -117,7 +117,7 @@ use crate::binarization::{
     sig_coeff_flag_sig_ctx_transform_skip, signed_level_from_sign_flag,
 };
 use crate::cabac::{CabacEngine, CabacError, ContextModel};
-use crate::scan::{ScanIdx, ScanOrderError, scan_order};
+use crate::scan::{ScanIdx, ScanOrderError, scan_table};
 
 // ---------------------------------------------------------------------
 // Context banks
@@ -656,8 +656,8 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
 
     // §6.5 scan tables: the 4x4 in-sub-block scan and the sub-block
     // scan over the (1 << (log2 - 2))² grid.
-    let pos_scan = scan_order(2, params.scan_idx)?;
-    let sub_scan = scan_order((log2 - 2) as u8, params.scan_idx)?;
+    let pos_scan = scan_table(2, params.scan_idx)?;
+    let sub_scan = scan_table((log2 - 2) as u8, params.scan_idx)?;
     let num_sb_1d = 1usize << (log2 - 2);
     let size = 1usize << log2;
 
@@ -1136,7 +1136,7 @@ mod tests {
             ]
         );
         // The 15 sig bins route through the Table 9-50 map (eq. 9-41).
-        let pos_scan = scan_order(2, ScanIdx::Diagonal).unwrap();
+        let pos_scan = scan_table(2, ScanIdx::Diagonal).unwrap();
         for (k, n) in (0..=14).rev().enumerate() {
             let (element, ctx_inc) = bins.log[6 + k];
             assert_eq!(element, ResidualElement::SigCoeffFlag);
@@ -1312,7 +1312,7 @@ mod tests {
         ];
         let mut bins = Scripted::new(&decisions, &bypasses);
         let block = decode_residual_coding_with(&params, &mut bins).unwrap();
-        let pos_scan = scan_order(2, ScanIdx::Diagonal).unwrap();
+        let pos_scan = scan_table(2, ScanIdx::Diagonal).unwrap();
         assert_eq!(block.level(3, 3), 13, "baseLevel 3 + remaining 10");
         let p14 = pos_scan[14];
         assert_eq!(

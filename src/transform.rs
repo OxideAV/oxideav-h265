@@ -545,11 +545,38 @@ fn inverse_transform_passes<T: TransformAcc>(
     max_y: usize,
     r: &mut [i32],
 ) {
-    let count = n_tbs * n_tbs;
     // §8.6.4 step 1: column transform d[x][y] over y -> e[x][y], then
     // step 2 (eq. 8-314): g[x][y] = clip( (e + 64) >> 7 ). Columns past
-    // the last non-zero one stay zero.
-    let mut g = vec![T::default(); count];
+    // the last non-zero one stay zero. The intermediate lives on the
+    // stack, sized for the block.
+    if n_tbs <= 8 {
+        let mut g = [T::default(); 64];
+        inverse_transform_passes_with(
+            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, r, &mut g,
+        );
+    } else {
+        let mut g = [T::default(); 1024];
+        inverse_transform_passes_with(
+            d, n_tbs, tr_type, coeff_min, coeff_max, max_x, max_y, r, &mut g,
+        );
+    }
+}
+
+/// [`inverse_transform_passes`] over a caller intermediate `g` (at
+/// least `n_tbs²` entries, zero on entry).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn inverse_transform_passes_with<T: TransformAcc>(
+    d: &[i32],
+    n_tbs: usize,
+    tr_type: bool,
+    coeff_min: i32,
+    coeff_max: i32,
+    max_x: usize,
+    max_y: usize,
+    r: &mut [i32],
+    g: &mut [T],
+) {
     let mut col = [T::default(); 32];
     let mut out = [T::default(); 32];
     let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
@@ -740,6 +767,30 @@ pub fn residual_block(
         return Ok(r);
     }
 
+    // §8.6.2 equations 8-294/8-295/8-296: bitDepth, bdShift, tsShift.
+    let bd_shift = core::cmp::max(
+        20 - params.bit_depth as i32,
+        if params.extended_precision { 11 } else { 0 },
+    );
+
+    if !params.transform_skip {
+        // The transformed block: scaling, both transform stages and
+        // the bdShift without intermediate heap arrays.
+        if let Some(m) = scaling
+            && m.dim as usize * m.dim as usize != count
+        {
+            return Err(TransformError::LengthMismatch {
+                expected: count,
+                got: m.dim as usize * m.dim as usize,
+            });
+        }
+        return Ok(if count <= 64 {
+            scaled_inverse::<64>(levels, scaling, &params, log2_tbs, bd_shift)
+        } else {
+            scaled_inverse::<1024>(levels, scaling, &params, log2_tbs, bd_shift)
+        });
+    }
+
     // §8.6.2 ordered step 1: §8.6.3 scaling process -> d.
     let d = scale_coefficients(
         levels,
@@ -749,12 +800,6 @@ pub fn residual_block(
         params.extended_precision,
         scaling,
     )?;
-
-    // §8.6.2 equations 8-294/8-295/8-296: bitDepth, bdShift, tsShift.
-    let bd_shift = core::cmp::max(
-        20 - params.bit_depth as i32,
-        if params.extended_precision { 11 } else { 0 },
-    );
 
     // §8.6.2 ordered step 2.
     let pre = if params.transform_skip {
@@ -796,6 +841,114 @@ pub fn residual_block(
     // bdShift == 0 only under extended-precision with bitDepth == 20
     // (out of our 8..=16 domain): the no-shift identity.
     Ok(r)
+}
+
+/// §8.6.2 for a transformed block (`transform_skip_flag == 0`, no
+/// bypass): the §8.6.3 scaling ([`scale_coefficients`]' arithmetic)
+/// into a stack array of `NN >= nTbS²` entries, the §8.6.4 stages over
+/// the non-zero extent and the eq. 8-299 `bdShift`. A block whose only
+/// coefficient is the DCT's DC is a constant: both stages multiply by
+/// the basis row of 64s, so every residual sample is `64 · Clip( ( 64 ·
+/// d + 64 ) >> 7 )` before the `bdShift`.
+fn scaled_inverse<const NN: usize>(
+    levels: &[i32],
+    scaling: Option<&ScalingFactorMatrix>,
+    params: &BlockParams,
+    log2_tbs: u32,
+    bd_shift: i32,
+) -> Vec<i32> {
+    let n_tbs = params.n_tbs;
+    let count = n_tbs * n_tbs;
+    let (bit_depth, extended_precision) = (params.bit_depth, params.extended_precision);
+    let log2_transform_range = if extended_precision {
+        core::cmp::max(15, bit_depth as i32 + 6)
+    } else {
+        15
+    };
+    let scale_shift = bit_depth as i32 + log2_tbs as i32 + 10 - log2_transform_range;
+    let (coeff_min, coeff_max) = coeff_range(bit_depth, extended_precision);
+    let level_scale = LEVEL_SCALE[(params.q_p % 6) as usize] as i64;
+    let qp_div6 = params.q_p / 6;
+    let scale_round = 1i64 << (scale_shift - 1);
+
+    let mut d = [0i32; NN];
+    let (mut max_x, mut max_y, mut any) = (0usize, 0usize, false);
+    for (y, (lrow, drow)) in levels
+        .chunks_exact(n_tbs)
+        .zip(d.chunks_exact_mut(n_tbs))
+        .enumerate()
+    {
+        for (x, (&level, dv)) in lrow.iter().zip(drow).enumerate() {
+            if level == 0 {
+                continue;
+            }
+            let m = scaling.map_or(16i64, |sf| sf.at(x, y) as i64);
+            let shifted = (((level as i64) * m * level_scale) << qp_div6) + scale_round;
+            let scaled = clip3(coeff_min as i64, coeff_max as i64, shifted >> scale_shift) as i32;
+            // A level can scale to zero; the extent follows the scaled
+            // coefficients, as the transform's own scan does.
+            if scaled != 0 {
+                *dv = scaled;
+                any = true;
+                max_x = max_x.max(x);
+                max_y = y;
+            }
+        }
+    }
+    let round = if bd_shift > 0 {
+        1i64 << (bd_shift - 1)
+    } else {
+        0
+    };
+    let finish = |v: i32| -> i32 {
+        if bd_shift > 0 {
+            ((i64::from(v) + round) >> bd_shift) as i32
+        } else {
+            v
+        }
+    };
+    if !any {
+        return vec![0i32; count];
+    }
+    // §8.6.4 trType: 1 iff MODE_INTRA, nTbS == 4, cIdx == 0.
+    let tr_type = matches!(params.pred_mode, PredMode::Intra)
+        && n_tbs == 4
+        && matches!(params.component, Component::Luma);
+    if max_x == 0 && max_y == 0 && !tr_type {
+        let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
+        let g = clip3(lo, hi, (64 * i64::from(d[0]) + 64) >> 7);
+        return vec![finish((64 * g) as i32); count];
+    }
+    let mut r = vec![0i32; count];
+    if extended_precision {
+        inverse_transform_passes::<i64>(
+            &d[..count],
+            n_tbs,
+            tr_type,
+            coeff_min,
+            coeff_max,
+            max_x,
+            max_y,
+            &mut r,
+        );
+    } else {
+        inverse_transform_passes::<i32>(
+            &d[..count],
+            n_tbs,
+            tr_type,
+            coeff_min,
+            coeff_max,
+            max_x,
+            max_y,
+            &mut r,
+        );
+    }
+    if bd_shift > 0 {
+        for rv in r.iter_mut() {
+            *rv = finish(*rv);
+        }
+    }
+    r
 }
 
 /// §8.6.5 — residual modification process for blocks using a transform

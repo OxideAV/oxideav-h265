@@ -844,6 +844,10 @@ thread_local! {
     /// Per-thread L0 / L1 intermediate prediction arrays.
     static MC_SCRATCH: core::cell::RefCell<(Vec<i32>, Vec<i32>)> =
         const { core::cell::RefCell::new((Vec::new(), Vec::new())) };
+    /// The same at 16-bit intermediate precision (the default combine
+    /// of pictures up to 12 bits).
+    static MC_SCRATCH16: core::cell::RefCell<(Vec<i16>, Vec<i16>)> =
+        const { core::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// §8.5.3.3 for one PU: interpolate each used list straight into
@@ -931,6 +935,61 @@ pub fn reconstruct_inter_pu_views(
             },
         };
         let bit_depth = pic.bit_depth(*plane);
+        if crate::inter_pred::mid_fits_16(bit_depth) {
+            // The combine at 16-bit intermediate precision: the same
+            // samples from narrower arrays.
+            MC_SCRATCH16.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let (p0, p1) = &mut *guard;
+                for (li, buf) in [&mut *p0, &mut *p1].into_iter().enumerate() {
+                    let Some(rp) = refs[li].as_ref() else {
+                        continue;
+                    };
+                    if buf.len() < w * h {
+                        buf.resize(w * h, 0);
+                    }
+                    let buf = &mut buf[..w * h];
+                    let mv_l = lists[li].mv_l;
+                    let mv_c = lists[li].mv_c;
+                    if luma {
+                        crate::inter_pred::interp_luma_into16(
+                            rp,
+                            x_pb as i32 + (mv_l[0] >> 2),
+                            y_pb as i32 + (mv_l[1] >> 2),
+                            mv_l[0] & 3,
+                            mv_l[1] & 3,
+                            w,
+                            h,
+                            bit_depth,
+                            buf,
+                        );
+                    } else {
+                        crate::inter_pred::interp_chroma_into16(
+                            rp,
+                            x_pb as i32 / sw as i32 + (mv_c[0] >> 3),
+                            y_pb as i32 / sh as i32 + (mv_c[1] >> 3),
+                            mv_c[0] & 7,
+                            mv_c[1] & 7,
+                            w,
+                            h,
+                            bit_depth,
+                            buf,
+                        );
+                    }
+                }
+                write_mc_block16(
+                    pic,
+                    *plane,
+                    (x0, y0, w, h),
+                    (lists[0].pred_flag, lists[1].pred_flag),
+                    (&p0[..], &p1[..]),
+                    combine,
+                    residual[ci],
+                    bit_depth,
+                );
+            });
+            continue;
+        }
         MC_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (p0, p1) = &mut *guard;
@@ -985,6 +1044,101 @@ pub fn reconstruct_inter_pu_views(
         });
     }
     Ok(())
+}
+
+/// The §8.5.3.3.4 combine (default, eqs 8-262..8-264, or explicit, eqs
+/// 8-265..8-277) of 16-bit intermediate arrays — which hold
+/// `predSample − MID_BIAS` — plus the residual and `Clip1`, into the
+/// picture.
+#[allow(clippy::too_many_arguments)]
+fn write_mc_block16(
+    pic: &mut Picture,
+    plane: Plane,
+    (x0, y0, w, h): (usize, usize, usize, usize),
+    flags: (bool, bool),
+    (p0, p1): (&[i16], &[i16]),
+    combine: Combine,
+    residual: Option<ResidualView<'_>>,
+    bit_depth: u8,
+) {
+    let max_val = (1i32 << bit_depth) - 1;
+    let bias = crate::inter_pred::MID_BIAS;
+    let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
+    let (x0, y0) = (x0 - ox, y0 - oy);
+    let bi = flags.0 && flags.1;
+    let a_all = if flags.0 { p0 } else { p1 };
+    // One row: `f` maps the two intermediate samples (the second is
+    // the first again on a uni-predicted block) to the clipped
+    // prediction sample.
+    #[inline(always)]
+    fn row<F: Fn(i32, i32) -> i32>(
+        d: &mut [u16],
+        a: &[i16],
+        b: &[i16],
+        res: Option<&[i32]>,
+        max_val: i32,
+        f: F,
+    ) {
+        match res {
+            Some(rr) => {
+                for (((d, &pa), &pb), &rv) in d.iter_mut().zip(a).zip(b).zip(rr) {
+                    *d = (f(i32::from(pa), i32::from(pb)) + rv).clamp(0, max_val) as u16;
+                }
+            }
+            None => {
+                for ((d, &pa), &pb) in d.iter_mut().zip(a).zip(b) {
+                    *d = f(i32::from(pa), i32::from(pb)) as u16;
+                }
+            }
+        }
+    }
+    let shift1 = core::cmp::max(2, 14 - i32::from(bit_depth));
+    for y in 0..h {
+        let o = (y0 + y) * stride + x0;
+        let d = &mut buf[o..o + w];
+        let a = &a_all[y * w..(y + 1) * w];
+        let b = if bi { &p1[y * w..(y + 1) * w] } else { a };
+        let res = residual.map(|r| &r.samples[y * r.stride..y * r.stride + w]);
+        match combine {
+            Combine::Default => {
+                // The bias folds into the rounding offsets.
+                if bi {
+                    let shift2 = shift1 + 1;
+                    let offset2 = (1i32 << (shift2 - 1)) + 2 * bias;
+                    row(d, a, b, res, max_val, |pa, pb| {
+                        ((pa + pb + offset2) >> shift2).clamp(0, max_val)
+                    });
+                } else {
+                    let offset1 = (1i32 << (shift1 - 1)) + bias;
+                    row(d, a, b, res, max_val, |pa, _| {
+                        ((pa + offset1) >> shift1).clamp(0, max_val)
+                    });
+                }
+            }
+            Combine::Explicit(denom, w0, o0, w1, o1) => {
+                // 64-bit products, as the wide form.
+                let log2_wd = i64::from(denom) + i64::from(shift1);
+                let mv = i64::from(max_val);
+                let (w0, o0, w1, o1) = (i64::from(w0), i64::from(o0), i64::from(w1), i64::from(o1));
+                let bias = i64::from(bias);
+                if bi {
+                    let round = (o0 + o1 + 1) << log2_wd;
+                    row(d, a, b, res, max_val, |pa, pb| {
+                        (((i64::from(pa) + bias) * w0 + (i64::from(pb) + bias) * w1 + round)
+                            >> (log2_wd + 1))
+                            .clamp(0, mv) as i32
+                    });
+                } else {
+                    let (wx, ox_) = if flags.0 { (w0, o0) } else { (w1, o1) };
+                    let round = 1i64 << (log2_wd - 1);
+                    row(d, a, b, res, max_val, |pa, _| {
+                        ((((i64::from(pa) + bias) * wx + round) >> log2_wd) + ox_).clamp(0, mv)
+                            as i32
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Combine the intermediate arrays per §8.5.3.3.4 (default or

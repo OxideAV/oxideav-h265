@@ -56,6 +56,19 @@ impl<'a> BitReader<'a> {
         Self { buf, bit_pos: 0 }
     }
 
+    /// The buffer and the bit cursor (the arithmetic decoding engine
+    /// keeps them itself).
+    pub(crate) fn into_parts(self) -> (&'a [u8], usize) {
+        (self.buf, self.bit_pos)
+    }
+
+    /// A reader over `buf` with its cursor at `bit_pos` (at most the
+    /// buffer's bit length).
+    pub(crate) fn from_parts(buf: &'a [u8], bit_pos: usize) -> Self {
+        debug_assert!(bit_pos <= buf.len() * 8, "cursor past the buffer");
+        Self { buf, bit_pos }
+    }
+
     /// Number of bits still available.
     pub fn bits_left(&self) -> usize {
         self.buf

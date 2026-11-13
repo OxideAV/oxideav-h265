@@ -452,10 +452,25 @@ fn sao_ctb_core(
                 let cur = &rc[x0..x0 + n];
                 let a = &r0[(x0 as i64 + i64::from(h0)) as usize..][..n];
                 let b = &r1[(x0 as i64 + i64::from(h1)) as usize..][..n];
+                // equations 8-411 / 8-412 as selects on the sign sum
+                // (no table read per sample, so the row vectorizes).
+                let o = [
+                    off[EDGE_IDX[0]],
+                    off[EDGE_IDX[1]],
+                    off[EDGE_IDX[2]],
+                    off[EDGE_IDX[3]],
+                    off[EDGE_IDX[4]],
+                ];
                 for (((d, &c), &a), &b) in drow[lo..hi].iter_mut().zip(cur).zip(a).zip(b) {
-                    let c = i32::from(c);
-                    let e = (2 + sign(c - i32::from(a)) + sign(c - i32::from(b))) as usize;
-                    *d = (c + off[EDGE_IDX[e]]).clamp(0, max) as u16;
+                    let (c, a, b) = (i32::from(c), i32::from(a), i32::from(b));
+                    let s =
+                        i32::from(c > a) - i32::from(c < a) + i32::from(c > b) - i32::from(c < b);
+                    let mut v = o[2];
+                    v = if s == -2 { o[0] } else { v };
+                    v = if s == -1 { o[1] } else { v };
+                    v = if s == 1 { o[3] } else { v };
+                    v = if s == 2 { o[4] } else { v };
+                    *d = (c + v).clamp(0, max) as u16;
                 }
             }
             for (i, d) in drow.iter_mut().enumerate() {
