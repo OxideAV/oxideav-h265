@@ -55,9 +55,9 @@ impl PalettePredictor {
     pub fn from_initializers(initializers: &[Vec<u32>], num_comps: usize) -> Self {
         let mut p = Self::default();
         let size = initializers.first().map_or(0, Vec::len);
-        for c in 0..num_comps.min(3) {
+        for (c, entries) in p.entries.iter_mut().enumerate().take(num_comps.min(3)) {
             let row = initializers.get(c).map_or(&[][..], Vec::as_slice);
-            p.entries[c] = (0..size)
+            *entries = (0..size)
                 .map(|i| row.get(i).copied().unwrap_or(0).min(u32::from(u16::MAX)) as u16)
                 .collect();
         }

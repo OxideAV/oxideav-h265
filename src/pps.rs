@@ -552,7 +552,7 @@ impl ColourMappingTable {
             for j in 0..4 {
                 cell.coded_res_flag[j] = br.u1()? != 0;
                 if cell.coded_res_flag[j] {
-                    for c in 0..3 {
+                    for res in &mut cell.res[j] {
                         let q = br.ue()?;
                         if q > 1 << 16 {
                             return Err(PpsError::ValueOutOfRange {
@@ -568,7 +568,7 @@ impl ColourMappingTable {
                         };
                         let mag =
                             ((i64::from(q) << ls_bits) + i64::from(r)) << self.cm_res_quant_bits;
-                        cell.res[j][c] = (if s { -mag } else { mag }) as i32;
+                        *res = (if s { -mag } else { mag }) as i32;
                     }
                 }
             }

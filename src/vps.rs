@@ -893,13 +893,10 @@ mod tests {
         assert!(vps.ptl.sub_layer_level_present[0]);
         assert_eq!(vps.ptl.sub_layer_level_idc[0], 30);
         assert!(vps.sub_layer_ordering_info_present_flag);
-        for i in 0..=1 {
-            assert_eq!(
-                vps.sub_layer_ordering_info[i].max_dec_pic_buffering_minus1,
-                0
-            );
-            assert_eq!(vps.sub_layer_ordering_info[i].max_num_reorder_pics, 0);
-            assert_eq!(vps.sub_layer_ordering_info[i].max_latency_increase_plus1, 0);
+        for info in &vps.sub_layer_ordering_info[..=1] {
+            assert_eq!(info.max_dec_pic_buffering_minus1, 0);
+            assert_eq!(info.max_num_reorder_pics, 0);
+            assert_eq!(info.max_latency_increase_plus1, 0);
         }
         // Tail decoded as expected.
         assert_eq!(vps.max_layer_id, 0);

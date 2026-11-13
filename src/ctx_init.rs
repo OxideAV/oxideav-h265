@@ -799,8 +799,8 @@ mod tests {
         // non-adapting placeholder.
         let i_slice = SliceContexts::init(0, 26);
         assert_eq!(i_slice.part_mode[0], cm(0, 1));
-        for slot in 1..4 {
-            assert_eq!(i_slice.part_mode[slot], ContextModel::terminate_state());
+        for ctx in &i_slice.part_mode[1..4] {
+            assert_eq!(*ctx, ContextModel::terminate_state());
         }
         assert_eq!(SliceContexts::init(0, 0).part_mode[0], cm(15, 0));
         assert_eq!(SliceContexts::init(0, 51).part_mode[0], cm(15, 1));
@@ -902,12 +902,12 @@ mod tests {
                     }
                 }
                 if init_type == 0 {
-                    for slot in 1..4 {
-                        assert_eq!(ctx.part_mode[slot], ContextModel::terminate_state());
+                    for model in &ctx.part_mode[1..4] {
+                        assert_eq!(*model, ContextModel::terminate_state());
                     }
                 } else {
-                    for slot in 1..4 {
-                        assert!(ctx.part_mode[slot].p_state_idx <= 62);
+                    for model in &ctx.part_mode[1..4] {
+                        assert!(model.p_state_idx <= 62);
                     }
                 }
                 assert_eq!(total, SliceContexts::CONTEXT_COUNT);

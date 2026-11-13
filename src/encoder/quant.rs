@@ -175,11 +175,11 @@ pub fn scaling_lists_for(mode: u8) -> Option<(ScalingListData, bool)> {
 /// up-right-diagonal-ordered list (each delta the −128..=127
 /// representative of `coef − nextCoef` mod 256).
 pub fn write_scaling_list_data(w: &mut BitWriter, data: &ScalingListData) {
-    for size_id in 0..NUM_SIZE_IDS {
+    for (size_id, size_lists) in data.lists.iter().enumerate().take(NUM_SIZE_IDS) {
         let step = if size_id == 3 { 3 } else { 1 };
         let mut matrix_id = 0usize;
         while matrix_id < NUM_MATRIX_IDS {
-            let list = &data.lists[size_id][matrix_id];
+            let list = &size_lists[matrix_id];
             w.put_bit(1); // scaling_list_pred_mode_flag
             let coef_num = 64.min(1usize << (4 + (size_id << 1)));
             let mut next_coef: i32 = 8;

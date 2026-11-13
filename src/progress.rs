@@ -201,9 +201,9 @@ impl InFlightPicture {
         }
         let ctb = 1usize << self.ctb_log2;
         let (_, ph) = self.dims[0];
-        for r in from..upto {
+        for (r, slot) in self.motion.iter().enumerate().take(upto).skip(from) {
             let y0 = r * ctb;
-            let _ = self.motion[r].set(field.band_copy(y0, ctb.min(ph - y0)));
+            let _ = slot.set(field.band_copy(y0, ctb.min(ph - y0)));
         }
         self.notify(&self.motion_rows, upto);
     }

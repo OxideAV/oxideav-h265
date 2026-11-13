@@ -321,8 +321,8 @@ fn encode_palette_cu(
     } else {
         assert_eq!(num_signalled, 0);
     }
-    for c in 0..3 {
-        for &v in &plan.new_entries[c] {
+    for entries in &plan.new_entries {
+        for &v in entries {
             cabac.encode_bypass_bits(w, u32::from(v), 8);
         }
     }

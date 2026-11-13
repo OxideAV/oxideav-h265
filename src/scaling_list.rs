@@ -586,16 +586,16 @@ mod tests {
         let data = ScalingListData::parse(&mut br).unwrap();
 
         // 4x4 — Table 7-5: all 16.
-        for m in 0..6 {
-            assert_eq!(data.lists[0][m].coef, vec![16u16; 16]);
+        for list in &data.lists[0][..6] {
+            assert_eq!(list.coef, vec![16u16; 16]);
         }
         // 8x8 intra (matrixId 0..2) — Table 7-6.
-        for m in 0..3 {
-            assert_eq!(data.lists[1][m].coef, DEFAULT_8X8_INTRA.to_vec());
+        for list in &data.lists[1][..3] {
+            assert_eq!(list.coef, DEFAULT_8X8_INTRA.to_vec());
         }
         // 8x8 inter (matrixId 3..5).
-        for m in 3..6 {
-            assert_eq!(data.lists[1][m].coef, DEFAULT_8X8_INTER.to_vec());
+        for list in &data.lists[1][3..6] {
+            assert_eq!(list.coef, DEFAULT_8X8_INTER.to_vec());
         }
         // 16x16 reuses the 8x8 defaults; the default DC is 16 (§7.4.5:
         // scaling_list_dc_coef_minus8 inferred to 8 ⇒ 8 + 8).
@@ -847,8 +847,7 @@ mod tests {
     #[test]
     fn factor_4x4_default_all_16() {
         let f = all_default_factors(1);
-        for m in 0..NUM_MATRIX_IDS {
-            let mat = &f.factors[0][m];
+        for mat in &f.factors[0][..NUM_MATRIX_IDS] {
             assert_eq!(mat.dim, 4);
             assert_eq!(mat.coef.len(), 16);
             assert!(mat.coef.iter().all(|&c| c == 16));

@@ -1006,19 +1006,19 @@ pub fn filter_luma_block_edge_gated(
             q[i] = plane.get(qx, qy);
         }
         let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
-        for i in 0..out.ndp {
+        for (i, &v) in out.p.iter().enumerate().take(out.ndp) {
             let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
             if no_filter.is_some_and(|m| m.at_luma(px, py)) {
                 continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
             }
-            plane.set(px, py, out.p[i]);
+            plane.set(px, py, v);
         }
-        for j in 0..out.ndq {
+        for (j, &v) in out.q.iter().enumerate().take(out.ndq) {
             let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
             if no_filter.is_some_and(|m| m.at_luma(qx, qy)) {
                 continue; // §8.7.2.5.4 nDq = 0
             }
-            plane.set(qx, qy, out.q[j]);
+            plane.set(qx, qy, v);
         }
     }
     dec

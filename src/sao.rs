@@ -272,10 +272,7 @@ impl SaoBoundaries {
                 }
             }
         }
-        if !self.across_tiles && self.tile_id_of_ctb.get(a) != self.tile_id_of_ctb.get(b) {
-            return false;
-        }
-        true
+        self.across_tiles || self.tile_id_of_ctb.get(a) == self.tile_id_of_ctb.get(b)
     }
 }
 

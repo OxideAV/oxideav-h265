@@ -1424,11 +1424,8 @@ mod tests {
                 / rec.y.len() as f64;
             10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
         };
-        for t in 0..n {
-            assert!(
-                psnr(&pyr.recon[t], t) > 30.0,
-                "frame {t}: pyramid luma PSNR too low"
-            );
+        for (t, rec) in pyr.recon.iter().enumerate().take(n) {
+            assert!(psnr(rec, t) > 30.0, "frame {t}: pyramid luma PSNR too low");
         }
     }
 

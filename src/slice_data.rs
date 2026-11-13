@@ -684,9 +684,8 @@ pub fn decode_sao(
             } else {
                 params.bit_depth_chroma
             };
-            for i in 0..4 {
-                out.components[c_idx as usize].offset_abs[i] =
-                    decode_sao_offset_abs(engine, bit_depth)?;
+            for abs in &mut out.components[c_idx as usize].offset_abs {
+                *abs = decode_sao_offset_abs(engine, bit_depth)?;
             }
             if type_idx == 1 {
                 // Band offset: per-i sign + band position.
