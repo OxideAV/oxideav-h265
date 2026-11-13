@@ -683,8 +683,9 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
     }
 
     let mut levels = vec![0i32; size * size];
-    // coded_sub_block_flag[ xS ][ yS ] grid, row-major by yS.
-    let mut csbf = vec![0u8; num_sb_1d * num_sb_1d];
+    // coded_sub_block_flag[ xS ][ yS ] grid, row-major by yS (at most
+    // 8x8 sub-blocks).
+    let mut csbf = [0u8; 64];
     let csbf_at = |grid: &[u8], xs: usize, ys: usize| -> u8 {
         if xs < num_sb_1d && ys < num_sb_1d {
             grid[ys * num_sb_1d + xs]
@@ -722,6 +723,11 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             1
         };
         csbf[ys as usize * num_sb_1d + xs as usize] = sb_coded;
+        if sb_coded == 0 {
+            // No syntax element of an uncoded sub-block is parsed and
+            // none of its levels is set: nothing below applies.
+            continue;
+        }
 
         // sig_coeff_flag pass. `sig[n]` is indexed by the in-sub-block
         // scan position n.

@@ -354,8 +354,10 @@ streams) but the surveyed black-box reference decoder diverges on it
 combination is decoder-pinned only. Tiled pictures are decided
 **tile-parallel** under the core `ExecutionContext` budget
 (`with_threads` / `set_execution_context`; serial by default,
-bit-identical for any worker count), and a single-tile `wpp` picture
-**wavefront-parallel** (round 463): its CTB rows go to the workers
+bit-identical for any worker count), and a single-tile picture
+**wavefront-parallel** (round 463 for `wpp` streams; since round 488
+for every single-tile picture coded without RDOQ, whatever its
+syntax — see the round-488 notes below): its CTB rows go to the workers
 with the CTB at column `c` starting once the row above finished
 column `c + 1`, each worker deciding into its own state after pulling
 the above-row neighbourhood from the shared picture and publishing
@@ -598,6 +600,109 @@ serial row is CPU time):
 Every budget produces the same bytes: one digest for the 1080p clip at
 1 / 2 / 4 / 8 threads, one encoded still at 1 and 8 workers.
 
+### Round 488: encoder speed, the thread budget, decoder kernels
+
+Everything in this section changes time and memory only: the encoder
+writes the same bytes and the decoder the same pictures as the
+previous release (a 43-stream encoder digest matrix — stills at every
+effort level, CTB size, tool set and sample layout, low-delay and
+hierarchical GOPs — a 69-stream decoder digest matrix, the golden pins
+and the conformance sets). Timings are wall clock on an 18-core Apple
+M-series host that was running other build jobs throughout (load
+average 15–30), old and new measured back to back under the same
+load; treat the ratios as the result and the absolute numbers as
+pessimistic.
+
+**Still / intra encoder.** The intra decision ran each of the 35 modes
+of every candidate block through the decode-side reference API (heap
+arrays per mode, availability per reference sample) and a
+matrix-product forward transform. It now gathers and substitutes a
+block's reference samples once into per-worker scratch, tests the
+§6.4.1 availability once per aligned neighbour block, and predicts,
+measures, transforms and reconstructs on fixed-size buffers through
+kernels specialised by block size; rollback snapshots come from a
+pool. 12 MP still (4032x3024, 8-bit 4:2:0), `mode=intra qp=30 ctb=64
+still=1`:
+
+| | previous release | now |
+| --- | --- | --- |
+| `wpp=1`, one worker | 28.1 s, 251 MiB | 6.6 s, 184 MiB |
+| `wpp=1`, eight workers | 5.6 s, 282 MiB | 1.2 s, 210 MiB |
+| no `wpp`, one worker | 44 s, 250 MiB (measured at a budget of eight, which it ignored) | 5.5 s, 184 MiB |
+| no `wpp`, 2 / 4 / 8 workers | as one worker | 3.0 / 1.8 / 1.1 s, 191 / 198 / 213 MiB |
+| no `wpp`, `rd=0`, one worker | 12.8 s | 2.4 s |
+
+**The thread budget.** A coding tree block's decisions read the
+picture state of its left, above-left, above and above-right
+neighbours and — only under RDOQ — the entropy contexts at its start.
+Without RDOQ nothing entropy-side enters a decision, so every
+single-tile picture (intra, P or B) is now decided in a wavefront
+under `ExecutionContext::threads` and emitted serially afterwards,
+`wpp` syntax or not; the bytes equal the serial pass at every budget.
+RDOQ streams still need `wpp` (each row then starts from the row
+above's stored contexts) or tiles to fan out, and CTU-level rate
+feedback stays serial. The working set shrank with it: the decision
+state hands its reconstruction planes over instead of copying them,
+and all-zero level arrays are released as each coding tree block is
+decided.
+
+**Inter encoder.** The integer motion search read every reference
+sample through two coordinate clamps and scanned its ±24 grid (625
+positions per prediction unit and reference) on a strided lattice; the
+quarter-sample refinement built each candidate on the heap. It now
+reads rows, gathers the scan's lattice once per unit into a dense
+window, abandons a scan position once its running cost reaches the
+best so far (the scan keeps the first minimum, so the choice is
+unchanged), and scores fractional candidates from a stack buffer.
+
+| `mode=inter qp=30 ctb=64` | previous release | now |
+| --- | --- | --- |
+| 1920x1080, IDR + 4 P, `wpp=1`, one worker | 0.16 pictures/s, 112 MiB | 0.64 pictures/s, 111 MiB |
+| 1920x1080, IDR + 4 P, `wpp=1`, eight workers | 0.71 pictures/s, 133 MiB | 2.33 pictures/s, 119 MiB |
+| 416x240, 17 pictures, one worker | 13.7 s | 3.4 s |
+
+The inter coder is still far from real time: the grid scan remains a
+brute-force pass per prediction unit (the units of one coding unit do
+not yet share their block sums), and the merge / skip candidates are
+still predicted through the general API.
+
+**Decoder kernels.** Motion compensation of pictures up to 12 bits
+runs at 16-bit intermediate precision (eight lanes per step, the 8-bit
+one-dimensional stages summed in 16 bits); the arithmetic decoding
+engine keeps `ivlOffset` together with up to 32 looked-ahead stream
+bits; a transformed block is scaled, transformed and shifted without
+intermediate heap arrays (a DC-only block is a fill); the scan tables
+are built once per process; the deblocking reference comparison no
+longer allocates; the SAO edge classification is branch-free. The two
+clips of the round-487 table (third-party encoder, medium preset;
+`examples/decode_bench`, one access unit per packet; best and median
+of seven alternating runs):
+
+| pictures per second (best of seven) | one thread | 2 threads | 4 threads | 8 threads |
+| --- | --- | --- | --- | --- |
+| 1920x1080, previous release | 64.1 | 101.7 | 160.4 | 246.9 |
+| 1920x1080, now | 70.5 (x1.10) | 109.6 | 173.9 | 276.5 (x1.12) |
+| 1920x1080, peak RSS now | 88 MiB | 127 MiB | 192 MiB | 277 MiB |
+| 3840x2160, previous release | 20.5 | 36.7 | 60.8 | 87.2 |
+| 3840x2160, now | 23.5 (x1.14) | 39.9 | 65.4 | 93.3 (x1.07) |
+| 3840x2160, peak RSS now | 266 MiB | 399 MiB | 622 MiB | 894 MiB |
+
+The medians of the same runs give x1.06 to x1.14 across the eight
+cells. The 12 MP stills of the round-487 table decode in 0.21 s
+(third-party encoder) and 0.15 s (this encoder) on one thread, from
+0.23 s and 0.17 s.
+
+The single-thread gain is well short of the 1.5x this round aimed
+for. The decode profile is flat after it — on the 1080p clip: motion
+compensation about a third, residual parsing and the arithmetic
+decoder a fifth, the inverse transform and residual assembly a tenth,
+deblocking and SAO a tenth, motion derivation 6 % — and what is left
+in each is structural rather than a slow kernel: the syntax tree is
+materialised per coding tree unit before reconstruction (level arrays
+per transform block, a residual plane per coding unit), and every
+prediction goes through an intermediate array even when it is a
+whole-sample copy.
+
 ## What's implemented
 
 * **Whole-bitstream decode driver** (`sequence`) — Annex B demux →
@@ -735,9 +840,9 @@ and ~985 unit tests.
 ## Not yet implemented
 
 * Encoder tools beyond the current set: SCC-tool (palette / IBC /
-  ACT) encoding; the WPP wavefront fans out single-tile pictures only
-  (tiled pictures fan out per tile) and not under CTU-level rate
-  feedback; CTU-level rate feedback and the quantization / hierarchy
+  ACT) encoding; the wavefront fans out single-tile pictures only
+  (tiled pictures fan out per tile), not under CTU-level rate
+  feedback, and under RDOQ only for `wpp` streams; CTU-level rate feedback and the quantization / hierarchy
   tools ride only the quadtree coder. (Intra `PART_NxN`
   above `MinCbSizeY` is not a gap: §7.3.8.5 codes `part_mode` for
   intra CUs only at `MinCbLog2SizeY`, and the quadtree's split-CU
@@ -762,18 +867,20 @@ and ~985 unit tests.
   aperture carries the odd last column / row). The historical
   one-CU-per-CTB inter coder (no `ctb` option) stays 8-bit 4:2:0;
   every deeper layout routes through the quadtree coder.
-* Still-picture encoder speed: the level-2 mode decision is ~2x the
-  level-0 time serially (38 s for a 12 MP still; 7.5 s on 8 workers
-  with `wpp`) against ~1 s for the third-party encoder's
-  multi-threaded default preset — no SIMD. Encoder memory (round
-  479): each wavefront worker holds a **row window** — the CTB row it
-  decides plus the row above — instead of a whole-picture state, so
-  the 12 MP WPP encode peaks at 314 MiB on 8 workers (295 on 4, 290
-  serial) for Main and 327 / 312 / 306 MiB for Main 10, against
-  390 / 360 / 290 and 407 / 376 / 305 before, with byte-identical
-  output at every budget; what remains is the serial floor (the
-  picture's decided CU plans with their coefficient levels, the input
-  and output planes).
+* Still-picture encoder speed (round 488 numbers above): a 12 MP
+  still at the level-2 mode decision takes about 6 s on one worker
+  and about 1.1 s on eight, against ~1 s for the third-party
+  encoder's multi-threaded default preset; the kernels are plain
+  auto-vectorised Rust, and the rough mode search still predicts and
+  measures all 35 modes of every candidate block. Encoder memory:
+  each wavefront worker holds a **row window** (the CTB row it
+  decides plus the row above), and the 12 MP encode peaks at 184 MiB
+  on one worker and 210 MiB on eight; what remains is the picture's
+  decided CU plans with their non-zero coefficient levels (32-bit),
+  the widened input and the output planes. RDOQ streams fan out only
+  with `wpp` or tiles.
+* Inter encoder speed: under one picture per second at 1920x1080 on
+  one worker (round 488 numbers above).
 * Decoder parallelism is frame-level for sequences (tolerant and
   multi-layer decodes stay per picture); a picture referencing itself
   (SCC current-picture referencing) filters after its last CTU. In

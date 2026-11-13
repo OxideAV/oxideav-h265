@@ -25,11 +25,72 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the motion field. Every kernel is the integer arithmetic it
   replaces (unit tests compare each with the decode path and the
   wide-accumulator transform), so the streams are byte-identical: a
-  68-stream digest matrix (stills at every effort level / CTB size /
+  43-stream digest matrix (stills at every effort level / CTB size /
   tool set and sample layout, low-delay and hierarchical GOPs) and the
   golden pins are unchanged. 12 MP still, `mode=intra qp=30 ctb=64
   wpp=1 still=1`, same host under the same load: 55–70 s → 7.3–11.7 s
   on one worker, 9.8–11.1 s → 1.2–1.4 s on eight.
+- *(encoder)* **The thread budget reaches every single-tile picture
+  coded without RDOQ — WPP syntax or not.** The wavefront fan-out of
+  the decision pass used to require a `wpp` stream; a still coded with
+  the default syntax ignored `ExecutionContext::threads`. A coding
+  tree block's decisions read the picture state of its left,
+  above-left, above and above-right neighbours and — only under RDOQ —
+  the entropy contexts at its start, so without RDOQ any single-tile
+  picture (intra, P or B) is decided in the same wavefront and emitted
+  serially afterwards. The bytes equal the serial pass at every budget
+  (`tree_wavefront_without_wpp_syntax_matches_serial`; fifteen
+  registry configurations re-checked against their serial digests).
+  12 MP still, `mode=intra qp=30 ctb=64 still=1` (no `wpp`): 5.5 s on
+  one worker, 3.0 / 1.8 / 1.1 s on 2 / 4 / 8 (the previous release:
+  44 s at any budget, same load). RDOQ streams without `wpp`, and
+  pictures under CTU-level rate feedback, still decide serially.
+- *(encoder)* **Smaller working set.** The decision state hands its
+  reconstruction planes to the output instead of copying them, and a
+  decided block whose levels are all zero no longer keeps its level
+  array until emission. 12 MP still (8-bit 4:2:0, `wpp`): peak RSS 251
+  → 184 MiB on one worker, 282 → 210 MiB on eight.
+- *(encoder)* **Motion search without per-sample clamping or heap
+  predictions.** The integer search read every reference sample
+  through two coordinate clamps, and its ±24 grid scan — 625 positions
+  per prediction unit and reference — did so on a strided lattice; the
+  quarter-sample refinement built each candidate prediction on the
+  heap through the general prediction API. The search now reads
+  reference rows (clamped copies only at a picture edge), gathers the
+  scan's source and reference lattice once per unit into a dense
+  window, stops a scan position as soon as its running cost reaches
+  the best so far (the scan keeps the first minimum, so the choice is
+  unchanged), tabulates the motion-vector cost per axis, and scores
+  fractional candidates from a stack buffer through the 16-bit
+  interpolation kernels. Identical streams (digest matrix + golden
+  pins). 1920x1080, IDR + 4 P pictures, `mode=inter qp=30 ctb=64
+  wpp=1`: 0.16 → 0.64 pictures per second on one worker, 0.71 → 2.33
+  on eight; 416x240 x 17 pictures, `ctb=64`: 13.7 → 3.4 s.
+- *(decoder)* **Kernel pass, decoded pictures unchanged.**
+  Motion compensation of pictures up to 12 bits runs at 16-bit
+  intermediate precision (the intermediate samples less a bias of
+  8192 — a two-dimensional phase can exceed `i16::MAX` on an
+  adversarial picture — with the 8-bit one-dimensional stages summed
+  in 16 bits, eight lanes per step), for the default and the explicit
+  weighted combine; the arithmetic decoding engine keeps `ivlOffset`
+  together with up to 32 looked-ahead stream bits, so a
+  renormalization or bypass bin is a counter update instead of a bit
+  read (same reads, same end-of-data errors, same PCM positions); a
+  transformed block is scaled, transformed and shifted without
+  intermediate heap arrays, and a block whose only coefficient is the
+  DC is filled with its constant; the §6.5 scan tables are built once
+  per process instead of per transform block; the §8.7.2.4
+  reference-picture comparison no longer allocates per edge segment;
+  the SAO edge classification is branch-free selects. Unit tests pin
+  the 16-bit filters to the 32-bit ones at 8 / 9 / 10 / 12 bits over
+  every phase, block position and an extreme picture; the conformance
+  sets, the hostile-input pins and a 69-stream digest matrix are
+  unchanged at 1 / 4 / 8 threads. The residual parser also skips the
+  passes of an uncoded sub-block. Two third-party clips, best of seven
+  alternating runs on a loaded host: 1920x1080 64.1 → 70.5 pictures
+  per second on one thread (246.9 → 276.5 on eight), 3840x2160 20.5 →
+  23.5 (87.2 → 93.3) — about 1.1x, short of the 1.5x this round aimed
+  for; the README's round-488 notes say where the rest of the time is.
 - `examples/encode_still` takes several concatenated pictures (a
   sequence through the registry encoder, e.g. `mode=inter`) and then
   reports pictures per second.
