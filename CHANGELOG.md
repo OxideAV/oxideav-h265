@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.18](https://github.com/OxideAV/oxideav-h265/compare/v0.0.17...v0.0.18) - 2026-11-11
+
+### Other
+
+- *(decoder)* intra block copy reads a window, not a copy of the picture
+- layer-set target outputs auxiliary layers with their primary layer; alpha channel SEI
+- SCC conformance set byte-exact (15/15)
+- output option for uninitialized enhancement layers, typed decoder options
+- parameter sets ending before their extension gate
+- API hygiene: non_exhaustive error enums + output records, hide internal modules
+
 ### Changed
 
 - *(decoder)* **Intra block copy no longer copies the picture.** A
