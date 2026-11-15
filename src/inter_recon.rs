@@ -28,7 +28,7 @@ use crate::dpb::{DpbEntry, RefPicLists};
 use crate::inter_pred::{PuWeights, WpListWeights};
 use crate::motion::{MotionField, derive_chroma_mv};
 use crate::picture::{Picture, Plane, sub_wh_c};
-use crate::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect, resolve_cu_motion};
+use crate::pu_mv::{InterCuDesc, PuMotion, PuMvContext, PuRect};
 use crate::recon::{CuResidual, ReconError, ReconParams, ResolvedList, extract_cu_residual};
 use crate::slice_data::{CodingUnit, PredictionUnit};
 
@@ -175,7 +175,7 @@ impl<'a> RefListAccess<'a> {
 ///
 /// `motions` are the §8.5.3.2.1-resolved per-PU motions (same order as the
 /// CU's §7.3.8.6 prediction units), already written into the picture's
-/// motion field by [`resolve_cu_motion`]. `residual` is the CU's
+/// motion field by [`crate::pu_mv::resolve_cu_motion`]. `residual` is the CU's
 /// per-component residual planes ([`extract_cu_residual`]). `refs` resolves
 /// each list's reference picture. Each PU's covering residual is sliced from
 /// the CU residual planes and added onto the motion-compensated prediction.
@@ -434,7 +434,7 @@ where
 /// §8.5.3.2.1 — resolve one inter CU's per-PU motion and write it into
 /// `field`, then reconstruct its samples into `pic`.
 ///
-/// This composes [`resolve_cu_motion`] (the candidate derivation reading the
+/// This composes [`crate::pu_mv::resolve_cu_motion`] (the candidate derivation reading the
 /// in-progress `field`) with [`extract_cu_residual`] + [`reconstruct_inter_cu`].
 /// `pus` are the parsed §7.3.8.6 prediction units; `ctx` carries the
 /// reference-picture resolvers + slice context; `available` is the §6.4.2
@@ -463,9 +463,13 @@ pub fn resolve_and_reconstruct_inter_cu(
         n_cb_s,
         part_mode: cu.part_mode.into(),
     };
-    let motions = resolve_cu_motion(field, desc, pus, ctx, available);
-    let rects =
-        crate::pu_mv::pu_partitions(cu.x0 as usize, cu.y0 as usize, n_cb_s, cu.part_mode.into());
+    let mut motions = [PuMotion::default(); 4];
+    let n_motions =
+        crate::pu_mv::resolve_cu_motion_into(field, desc, pus, ctx, available, &mut motions);
+    let motions = &motions[..n_motions];
+    let (rects, n_rects) =
+        crate::pu_mv::pu_rects(cu.x0 as usize, cu.y0 as usize, n_cb_s, cu.part_mode.into());
+    let rects = &rects[..n_rects];
 
     // A CU without a transform tree (skip / rqt_root_cbf == 0) has an
     // all-zero residual: nothing to extract or add.
@@ -495,8 +499,8 @@ pub fn resolve_and_reconstruct_inter_cu(
     let result = reconstruct_inter_cu_with(
         pic,
         params,
-        &rects,
-        &motions,
+        rects,
+        motions,
         &residual,
         has_residual,
         refs,

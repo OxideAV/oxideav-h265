@@ -616,19 +616,18 @@ fn video_frame_owned(pic: Picture, pts: Option<i64>) -> VideoFrame {
         pic.plane_dims(Plane::Cb),
         pic.plane_dims(Plane::Cr),
     ];
-    let (y, cb, cr) = pic.into_planes();
-    let sources = if chroma {
-        vec![(y, dims[0]), (cb, dims[1]), (cr, dims[2])]
-    } else {
-        vec![(y, dims[0])]
-    };
-    let mut out = Vec::with_capacity(sources.len());
-    for (buf, (w, h)) in sources {
+    // The planes are read where they are: a picture the DPB still
+    // references is not copied to be packed, and a plane nothing else
+    // holds is freed as soon as it is packed.
+    let planes = pic.into_shared_planes();
+    let count = if chroma { 3 } else { 1 };
+    let mut out = Vec::with_capacity(count);
+    for (buf, (w, h)) in planes.into_iter().zip(dims).take(count) {
         let n = w * h;
         let (stride, data) = if wide {
-            let mut data = Vec::with_capacity(n * 2);
-            for &v in buf.iter().take(n) {
-                data.extend_from_slice(&v.to_le_bytes());
+            let mut data = vec![0u8; n * 2];
+            for (d, &v) in data.as_chunks_mut::<2>().0.iter_mut().zip(buf.iter()) {
+                *d = v.to_le_bytes();
             }
             (w * 2, data)
         } else {

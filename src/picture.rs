@@ -376,6 +376,12 @@ impl Picture {
         }
     }
 
+    /// The three planes as they are stored — shared with every other
+    /// handle of the picture (a DPB entry), never copied.
+    pub(crate) fn into_shared_planes(self) -> [Arc<Vec<u16>>; 3] {
+        [self.luma, self.cb, self.cr]
+    }
+
     /// Take the three planes out (row-major `u16`, `Y` / `Cb` / `Cr`;
     /// the chroma vectors are empty for monochrome). A plane still
     /// shared with another `Picture` is copied; a uniquely held one is

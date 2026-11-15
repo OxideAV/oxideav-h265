@@ -100,6 +100,19 @@ impl From<crate::binarization::PartMode> for PartMode {
 /// `nCbS/4` / `nCbS*3/4` splits).
 #[must_use]
 pub fn pu_partitions(x0: usize, y0: usize, n_cb_s: usize, part_mode: PartMode) -> Vec<PuRect> {
+    let (rects, n) = pu_rects(x0, y0, n_cb_s, part_mode);
+    rects[..n].to_vec()
+}
+
+/// [`pu_partitions`] without the vector: the rectangles and how many
+/// of them the partitioning has.
+#[must_use]
+pub(crate) fn pu_rects(
+    x0: usize,
+    y0: usize,
+    n_cb_s: usize,
+    part_mode: PartMode,
+) -> ([PuRect; 4], usize) {
     let n = n_cb_s;
     let h = n / 2;
     let q = n / 4;
@@ -110,20 +123,25 @@ pub fn pu_partitions(x0: usize, y0: usize, n_cb_s: usize, part_mode: PartMode) -
         n_pb_w: w,
         n_pb_h: ht,
     };
+    let none = rect(0, 0, 0, 0);
+    let two = |a: PuRect, b: PuRect| ([a, b, none, none], 2);
     match part_mode {
-        PartMode::Part2Nx2N => vec![rect(x0, y0, n, n)],
-        PartMode::Part2NxN => vec![rect(x0, y0, n, h), rect(x0, y0 + h, n, h)],
-        PartMode::PartNx2N => vec![rect(x0, y0, h, n), rect(x0 + h, y0, h, n)],
-        PartMode::Part2NxnU => vec![rect(x0, y0, n, q), rect(x0, y0 + q, n, t)],
-        PartMode::Part2NxnD => vec![rect(x0, y0, n, t), rect(x0, y0 + t, n, q)],
-        PartMode::PartNLx2N => vec![rect(x0, y0, q, n), rect(x0 + q, y0, t, n)],
-        PartMode::PartNRx2N => vec![rect(x0, y0, t, n), rect(x0 + t, y0, q, n)],
-        PartMode::PartNxN => vec![
-            rect(x0, y0, h, h),
-            rect(x0 + h, y0, h, h),
-            rect(x0, y0 + h, h, h),
-            rect(x0 + h, y0 + h, h, h),
-        ],
+        PartMode::Part2Nx2N => ([rect(x0, y0, n, n), none, none, none], 1),
+        PartMode::Part2NxN => two(rect(x0, y0, n, h), rect(x0, y0 + h, n, h)),
+        PartMode::PartNx2N => two(rect(x0, y0, h, n), rect(x0 + h, y0, h, n)),
+        PartMode::Part2NxnU => two(rect(x0, y0, n, q), rect(x0, y0 + q, n, t)),
+        PartMode::Part2NxnD => two(rect(x0, y0, n, t), rect(x0, y0 + t, n, q)),
+        PartMode::PartNLx2N => two(rect(x0, y0, q, n), rect(x0 + q, y0, t, n)),
+        PartMode::PartNRx2N => two(rect(x0, y0, t, n), rect(x0 + t, y0, q, n)),
+        PartMode::PartNxN => (
+            [
+                rect(x0, y0, h, h),
+                rect(x0 + h, y0, h, h),
+                rect(x0, y0 + h, h, h),
+                rect(x0 + h, y0 + h, h, h),
+            ],
+            4,
+        ),
     }
 }
 
@@ -564,15 +582,30 @@ pub fn resolve_cu_motion(
     ctx: &PuMvContext,
     available: &dyn Fn(i32, i32) -> bool,
 ) -> Vec<PuMotion> {
+    let mut out = [PuMotion::default(); 4];
+    let n = resolve_cu_motion_into(field, cu, pus, ctx, available, &mut out);
+    out[..n].to_vec()
+}
+
+/// [`resolve_cu_motion`] into a caller array; returns the number of
+/// prediction units resolved (at most four).
+pub(crate) fn resolve_cu_motion_into(
+    field: &mut MotionField,
+    cu: InterCuDesc,
+    pus: &[PredictionUnit],
+    ctx: &PuMvContext,
+    available: &dyn Fn(i32, i32) -> bool,
+    out: &mut [PuMotion; 4],
+) -> usize {
     let InterCuDesc {
         x0,
         y0,
         n_cb_s,
         part_mode,
     } = cu;
-    let rects = pu_partitions(x0, y0, n_cb_s, part_mode);
-    let mut out = Vec::with_capacity(pus.len());
-    for (part_idx, (rect, pu)) in rects.iter().zip(pus.iter()).enumerate() {
+    let (rects, n_rects) = pu_rects(x0, y0, n_cb_s, part_mode);
+    let mut count = 0;
+    for (part_idx, (rect, pu)) in rects[..n_rects].iter().zip(pus.iter()).enumerate() {
         let geom = PuGeometry {
             x_cb: x0,
             y_cb: y0,
@@ -604,9 +637,10 @@ pub fn resolve_cu_motion(
             rect.n_pb_h,
             motion.to_cell(ref_poc_l0, ref_poc_l1),
         );
-        out.push(motion);
+        out[part_idx] = motion;
+        count = part_idx + 1;
     }
-    out
+    count
 }
 
 /// §8.5.3.2.2 — the merge-mode branch of §8.5.3.2.1.
