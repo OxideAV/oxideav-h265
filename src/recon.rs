@@ -1273,6 +1273,26 @@ fn write_mc_block16(
         }
     }
     let shift1 = core::cmp::max(2, 14 - i32::from(bit_depth));
+    if matches!(combine, Combine::Default) {
+        // The default combine in 16-bit lanes.
+        let k = (bias + (1i32 << (shift1 - 1))) as i16;
+        for y in 0..h {
+            let o = (y0 + y) * stride + x0;
+            let a = &a_all[y * w..(y + 1) * w];
+            let b = bi.then(|| &p1[y * w..(y + 1) * w]);
+            let res = residual.map(|r| &r.samples[y * r.stride..y * r.stride + w]);
+            default_combine_row16(
+                &mut buf[o..o + w],
+                a,
+                b,
+                res,
+                k,
+                shift1 as u32,
+                max_val as i16,
+            );
+        }
+        return;
+    }
     for y in 0..h {
         let o = (y0 + y) * stride + x0;
         let d = &mut buf[o..o + w];
@@ -1318,6 +1338,153 @@ fn write_mc_block16(
                 }
             }
         }
+    }
+}
+
+/// One row of the §8.5.3.3.4.2 default combine (eqs 8-262..8-264) of
+/// 16-bit intermediate samples (`predSample − MID_BIAS`) plus the
+/// residual and `Clip1`, entirely in 16-bit arithmetic. `k` is
+/// `MID_BIAS + ( 1 << ( shift1 − 1 ) )`, `max` the largest sample
+/// value (at most 12 bits).
+///
+/// * Bi-prediction `( a + b + 2 · MID_BIAS + offset2 ) >> ( shift1 +
+///   1 )` is the uni-prediction form `( x + k ) >> shift1` of `x =
+///   floor( ( a + b ) / 2 )`: `2 · MID_BIAS + offset2 = 2 · k` is even,
+///   so the low bit of `a + b` never reaches the result.
+/// * `x + k` can pass `i16::MAX` (never `i16::MIN`: `k > 0`, `x >=
+///   −25088`); the add saturates, and `i16::MAX >> shift1 = 2^( BitDepth
+///   + 1 ) − 1` still clips to `max`, as the exact sum does.
+/// * A residual outside `−max ..= max` moves a sample of `0 ..= max` to
+///   the same clipped value as `∓max` does, so it is clamped to that
+///   range first and the sum fits 16 bits.
+#[inline(always)]
+fn default_combine_row16(
+    d: &mut [u16],
+    a: &[i16],
+    b: Option<&[i16]>,
+    res: Option<&[i32]>,
+    k: i16,
+    shift1: u32,
+    max: i16,
+) {
+    #[inline(always)]
+    fn pred(x: i16, k: i16, shift1: u32, max: i16) -> i16 {
+        (x.saturating_add(k) >> shift1).clamp(0, max)
+    }
+    #[inline(always)]
+    fn half_sum(a: i16, b: i16) -> i16 {
+        ((i32::from(a) + i32::from(b)) >> 1) as i16
+    }
+    #[inline(always)]
+    fn add_res(p: i16, r: i32, max: i16) -> u16 {
+        (p + r.clamp(-i32::from(max), i32::from(max)) as i16).clamp(0, max) as u16
+    }
+    // `N` samples at once, one operation per pass over the lanes (each
+    // pass is one vector instruction).
+    #[inline(always)]
+    fn lanes<const N: usize>(
+        d: &mut [u16; N],
+        a: &[i16; N],
+        b: Option<&[i16; N]>,
+        r: Option<&[i32; N]>,
+        k: i16,
+        shift1: u32,
+        max: i16,
+    ) {
+        let mut x = *a;
+        if let Some(b) = b {
+            for (x, &b) in x.iter_mut().zip(b) {
+                *x = half_sum(*x, b);
+            }
+        }
+        for x in &mut x {
+            *x = x.saturating_add(k);
+        }
+        for x in &mut x {
+            *x >>= shift1;
+        }
+        for x in &mut x {
+            *x = (*x).clamp(0, max);
+        }
+        if let Some(r) = r {
+            let mut r16 = [0i16; N];
+            for (o, &r) in r16.iter_mut().zip(r) {
+                *o = r.clamp(-i32::from(max), i32::from(max)) as i16;
+            }
+            for (x, &r) in x.iter_mut().zip(&r16) {
+                *x += r;
+            }
+            for x in &mut x {
+                *x = (*x).clamp(0, max);
+            }
+        }
+        for (d, &x) in d.iter_mut().zip(&x) {
+            *d = x as u16;
+        }
+    }
+    let w = d.len();
+    let a = &a[..w];
+    let b = b.map(|b| &b[..w]);
+    let res = res.map(|r| &r[..w]);
+    if w >= 32 {
+        // A long row: one loop over the samples (whole vectors, the
+        // trip count checked once).
+        match (b, res) {
+            (None, None) => {
+                for (d, &a) in d.iter_mut().zip(a) {
+                    *d = pred(a, k, shift1, max) as u16;
+                }
+            }
+            (None, Some(r)) => {
+                for ((d, &a), &r) in d.iter_mut().zip(a).zip(r) {
+                    *d = add_res(pred(a, k, shift1, max), r, max);
+                }
+            }
+            (Some(b), None) => {
+                for ((d, &a), &b) in d.iter_mut().zip(a).zip(b) {
+                    *d = pred(half_sum(a, b), k, shift1, max) as u16;
+                }
+            }
+            (Some(b), Some(r)) => {
+                for (((d, &a), &b), &r) in d.iter_mut().zip(a).zip(b).zip(r) {
+                    *d = add_res(pred(half_sum(a, b), k, shift1, max), r, max);
+                }
+            }
+        }
+        return;
+    }
+    let mut x = 0;
+    while x + 8 <= w {
+        lanes::<8>(
+            (&mut d[x..x + 8]).try_into().expect("lanes"),
+            a[x..x + 8].try_into().expect("lanes"),
+            b.map(|b| b[x..x + 8].try_into().expect("lanes")),
+            res.map(|r| r[x..x + 8].try_into().expect("lanes")),
+            k,
+            shift1,
+            max,
+        );
+        x += 8;
+    }
+    if x + 4 <= w {
+        lanes::<4>(
+            (&mut d[x..x + 4]).try_into().expect("lanes"),
+            a[x..x + 4].try_into().expect("lanes"),
+            b.map(|b| b[x..x + 4].try_into().expect("lanes")),
+            res.map(|r| r[x..x + 4].try_into().expect("lanes")),
+            k,
+            shift1,
+            max,
+        );
+        x += 4;
+    }
+    while x < w {
+        let p = pred(b.map_or(a[x], |b| half_sum(a[x], b[x])), k, shift1, max);
+        d[x] = match res {
+            Some(r) => add_res(p, r[x], max),
+            None => p as u16,
+        };
+        x += 1;
     }
 }
 
@@ -4846,5 +5013,80 @@ mod tests {
             res.cr.as_ref().unwrap().samples.iter().all(|&v| v == 4),
             "cr"
         );
+    }
+    /// The 16-bit default combine against eqs 8-262..8-264 evaluated in
+    /// wide arithmetic: every bit depth of the 16-bit path, both list
+    /// forms, with and without residual, over intermediate samples
+    /// across their whole range (extremes included) and residuals far
+    /// outside the sample range, at every row length up to 70.
+    #[test]
+    fn default_combine16_matches_the_wide_equations() {
+        let bias = crate::inter_pred::MID_BIAS;
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bd in 8u8..=12 {
+            let max = (1i32 << bd) - 1;
+            let shift1 = 14 - i32::from(bd);
+            let offset1 = 1i32 << (shift1 - 1);
+            let (shift2, offset2) = (shift1 + 1, 1i32 << shift1);
+            let k = (bias + offset1) as i16;
+            // The intermediate range of [`crate::inter_pred::mid_fits_16`].
+            let (lo, hi) = (-16896i32, 33278i32);
+            for w in 1..=70usize {
+                let mid = |next: &mut dyn FnMut() -> u64| -> i16 {
+                    let v = match next() % 8 {
+                        0 => lo,
+                        1 => hi,
+                        2 => hi - (next() % 64) as i32,
+                        3 => lo + (next() % 64) as i32,
+                        _ => lo + (next() % (hi - lo + 1) as u64) as i32,
+                    };
+                    (v - bias) as i16
+                };
+                let a: Vec<i16> = (0..w).map(|_| mid(&mut next)).collect();
+                let b: Vec<i16> = (0..w).map(|_| mid(&mut next)).collect();
+                let r: Vec<i32> = (0..w)
+                    .map(|_| match next() % 6 {
+                        0 => i32::MAX,
+                        1 => i32::MIN,
+                        2 => (next() % 100_000) as i32 - 50_000,
+                        _ => (next() % (2 * max as u64 + 1)) as i32 - max,
+                    })
+                    .collect();
+                for bi in [false, true] {
+                    for with_res in [false, true] {
+                        let mut got = vec![0u16; w];
+                        default_combine_row16(
+                            &mut got,
+                            &a,
+                            bi.then_some(&b[..]),
+                            with_res.then_some(&r[..]),
+                            k,
+                            shift1 as u32,
+                            max as i16,
+                        );
+                        for x in 0..w {
+                            let (pa, pb) = (i32::from(a[x]) + bias, i32::from(b[x]) + bias);
+                            let p = if bi {
+                                ((pa + pb + offset2) >> shift2).clamp(0, max)
+                            } else {
+                                ((pa + offset1) >> shift1).clamp(0, max)
+                            };
+                            let want = if with_res {
+                                (i64::from(p) + i64::from(r[x])).clamp(0, i64::from(max)) as u16
+                            } else {
+                                p as u16
+                            };
+                            assert_eq!(got[x], want, "bd {bd} w {w} x {x} bi {bi} res {with_res}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

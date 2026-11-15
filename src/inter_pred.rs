@@ -947,8 +947,9 @@ fn grow_rows(rows: &mut Vec<i16>, len: usize) {
 
 /// [`interp_block16`] over a `W`-sample-wide block: `src[ base.. ]` is
 /// the `(W + TAPS − 1)`-wide reference window at pitch `stride`, `out`
-/// the `W`-pitch result.
-#[inline(always)]
+/// the `W`-pitch result. One function per filter length and width
+/// (not folded into the caller), so each is compiled on its own.
+#[inline(never)]
 fn filter16_fixed<const TAPS: usize, const W: usize>(
     src: &[u16],
     stride: usize,
@@ -1028,6 +1029,9 @@ fn filter16_fixed<const TAPS: usize, const W: usize>(
 
 /// One horizontal filter row of 8-bit samples over a fixed width,
 /// summed in 16 bits, less `sub` (`src` holds `W + TAPS − 1` samples).
+/// Each output sample is written as one expression over the `TAPS`
+/// shifted views of the row, the form that compiles to a vector
+/// multiply-accumulate per tap.
 #[inline(always)]
 fn h_row_narrow<const TAPS: usize, const W: usize>(
     src: &[u16],
@@ -1035,16 +1039,8 @@ fn h_row_narrow<const TAPS: usize, const W: usize>(
     sub: i16,
     out: &mut [i16; W],
 ) {
-    let mut acc = [0i16; W];
-    for (t, &kt) in k.iter().enumerate() {
-        let s: &[u16; W] = src[t..t + W].try_into().expect("row");
-        for (a, &v) in acc.iter_mut().zip(s) {
-            *a = a.wrapping_add(kt.wrapping_mul(v as i16));
-        }
-    }
-    for (d, &a) in out.iter_mut().zip(&acc) {
-        *d = a.wrapping_sub(sub);
-    }
+    let taps: [&[u16; W]; TAPS] = core::array::from_fn(|t| src[t..t + W].try_into().expect("row"));
+    v_row_narrow::<TAPS, W>(&taps, k, sub, out);
 }
 
 /// One horizontal filter row over a fixed width with a 32-bit sum,
@@ -1057,20 +1053,19 @@ fn h_row_mid<const TAPS: usize, const W: usize>(
     sub: i16,
     out: &mut [i16; W],
 ) {
-    let mut acc = [0i32; W];
-    for (t, &kt) in k.iter().enumerate() {
-        let s: &[u16; W] = src[t..t + W].try_into().expect("row");
-        for (a, &v) in acc.iter_mut().zip(s) {
-            *a += kt * i32::from(v);
-        }
-    }
-    for (d, &a) in out.iter_mut().zip(&acc) {
-        *d = ((a >> shift1) as i16).wrapping_sub(sub);
-    }
+    let taps: [&[u16; W]; TAPS] = core::array::from_fn(|t| src[t..t + W].try_into().expect("row"));
+    v_row_mid::<TAPS, W, u16>(&taps, k, shift1, i32::from(sub), out);
 }
 
 /// One vertical filter row over fixed-width rows of 8-bit samples,
 /// summed in 16 bits, less `sub`.
+///
+/// Two spellings of the same sums: a long row is one loop over the
+/// samples with the taps written out (a loop the compiler turns into
+/// a multiply-accumulate per tap over whole vectors); a short row is
+/// too short a loop for that and accumulates tap by tap into an
+/// eight-sample array instead. Which rows count as long was measured
+/// per filter length.
 #[inline(always)]
 fn v_row_narrow<const TAPS: usize, const W: usize>(
     rows: &[&[u16; W]; TAPS],
@@ -1078,19 +1073,45 @@ fn v_row_narrow<const TAPS: usize, const W: usize>(
     sub: i16,
     out: &mut [i16; W],
 ) {
-    let mut acc = [0i16; W];
-    for (r, &kt) in rows.iter().zip(k) {
-        for (a, &v) in acc.iter_mut().zip(r.iter()) {
-            *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+    if W >= 32 || (W == 16 && TAPS == 8) {
+        for (i, d) in out.iter_mut().enumerate() {
+            let mut acc = 0i16;
+            for (r, &kt) in rows.iter().zip(k) {
+                acc = acc.wrapping_add(kt.wrapping_mul(r[i] as i16));
+            }
+            *d = acc.wrapping_sub(sub);
         }
-    }
-    for (d, &a) in out.iter_mut().zip(&acc) {
-        *d = a.wrapping_sub(sub);
+    } else {
+        // Eight samples at a time (a four-sample row is its own
+        // remainder).
+        let (blocks, tail) = out.as_chunks_mut::<8>();
+        for (b, o) in blocks.iter_mut().enumerate() {
+            let mut acc = [0i16; 8];
+            for (r, &kt) in rows.iter().zip(k) {
+                let s: &[u16; 8] = r[b * 8..b * 8 + 8].try_into().expect("lanes");
+                for (a, &v) in acc.iter_mut().zip(s) {
+                    *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+                }
+            }
+            for (d, &a) in o.iter_mut().zip(&acc) {
+                *d = a.wrapping_sub(sub);
+            }
+        }
+        let x0 = W - tail.len();
+        let mut acc = [0i16; 4];
+        for (r, &kt) in rows.iter().zip(k) {
+            for (a, &v) in acc.iter_mut().zip(&r[x0..]) {
+                *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+            }
+        }
+        for (d, &a) in tail.iter_mut().zip(&acc) {
+            *d = a.wrapping_sub(sub);
+        }
     }
 }
 
 /// One vertical filter row over fixed-width rows with a 32-bit sum,
-/// `>> shift`, less `sub`.
+/// `>> shift`, less `sub` (the two spellings of [`v_row_narrow`]).
 #[inline(always)]
 fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
     rows: &[&[T; W]; TAPS],
@@ -1099,14 +1120,38 @@ fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
     sub: i32,
     out: &mut [i16; W],
 ) {
-    let mut acc = [0i32; W];
-    for (r, &kt) in rows.iter().zip(k) {
-        for (a, &v) in acc.iter_mut().zip(r.iter()) {
-            *a += kt * v.into();
+    if W >= 32 || (W == 16 && TAPS == 8) {
+        for (i, d) in out.iter_mut().enumerate() {
+            let mut acc = 0i32;
+            for (r, &kt) in rows.iter().zip(k) {
+                acc += kt * r[i].into();
+            }
+            *d = ((acc >> shift) - sub) as i16;
         }
-    }
-    for (d, &a) in out.iter_mut().zip(&acc) {
-        *d = ((a >> shift) - sub) as i16;
+    } else {
+        let (blocks, tail) = out.as_chunks_mut::<8>();
+        for (b, o) in blocks.iter_mut().enumerate() {
+            let mut acc = [0i32; 8];
+            for (r, &kt) in rows.iter().zip(k) {
+                let s: &[T; 8] = r[b * 8..b * 8 + 8].try_into().expect("lanes");
+                for (a, &v) in acc.iter_mut().zip(s) {
+                    *a += kt * v.into();
+                }
+            }
+            for (d, &a) in o.iter_mut().zip(&acc) {
+                *d = ((a >> shift) - sub) as i16;
+            }
+        }
+        let x0 = W - tail.len();
+        let mut acc = [0i32; 4];
+        for (r, &kt) in rows.iter().zip(k) {
+            for (a, &v) in acc.iter_mut().zip(&r[x0..]) {
+                *a += kt * v.into();
+            }
+        }
+        for (d, &a) in tail.iter_mut().zip(&acc) {
+            *d = ((a >> shift) - sub) as i16;
+        }
     }
 }
 
