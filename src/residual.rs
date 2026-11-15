@@ -342,6 +342,7 @@ pub struct EngineResidualBinSource<'e, 'a, 'c> {
 }
 
 impl ResidualBinSource for EngineResidualBinSource<'_, '_, '_> {
+    #[inline(always)]
     fn decision(&mut self, element: ResidualElement, ctx_inc: u32) -> Result<u8, CabacError> {
         let bank: &mut [ContextModel] = match element {
             ResidualElement::LastSigCoeffXPrefix => &mut self.contexts.last_sig_coeff_x_prefix,

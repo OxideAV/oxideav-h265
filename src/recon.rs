@@ -553,7 +553,11 @@ fn reconstruct_intra_block(
     ccp: Option<CcpInput<'_>>,
     res_buf: &mut [i32],
 ) -> Result<bool, ReconError> {
-    let res_buf = &mut res_buf[..n_tbs * n_tbs];
+    // A transform block is at most 32x32 (§7.4.3.2.1); the scratch
+    // arrays are sized for that.
+    let Some(res_buf) = res_buf.get_mut(..n_tbs * n_tbs) else {
+        return Err(TransformError::InvalidBlockSize(n_tbs).into());
+    };
     // §8.6.2 residual array (absent when the block has no coded coeffs).
     let mut has_res = false;
     if let Some(levels) = residual {
@@ -610,10 +614,11 @@ fn reconstruct_intra_block(
 /// one).
 #[inline(always)]
 fn with_block_buf<R>(n_tbs: usize, f: impl FnOnce(&mut [i32]) -> R) -> R {
-    if n_tbs <= 8 {
-        f(&mut [0i32; 64])
-    } else {
-        f(&mut [0i32; 1024])
+    match n_tbs {
+        0..=4 => f(&mut [0i32; 16]),
+        5..=8 => f(&mut [0i32; 64]),
+        9..=16 => f(&mut [0i32; 256]),
+        _ => f(&mut [0i32; 1024]),
     }
 }
 
@@ -801,13 +806,18 @@ fn gather_refs(
         Plane::Cb | Plane::Cr => sub_wh_c(pic.chroma_array_type()),
     };
     // One §6.4.1 test per 4x4 luma min block (see
-    // `gather_reference_samples`).
+    // `gather_reference_samples`), the current block's side of it
+    // derived once.
+    let probe = ctx.tiling.probe((xb * sub_w) as u32, (yb * sub_h) as u32);
     let avail = |x: i64, y: i64| -> bool {
-        x >= 0
-            && y >= 0
-            && (x as usize) < pw
-            && (y as usize) < ph
-            && ctx.ref_sample_available(xb, yb, x, y, sub_w, sub_h)
+        if x < 0 || y < 0 || (x as usize) >= pw || (y as usize) >= ph {
+            return false;
+        }
+        let (xl, yl) = (x as usize * sub_w, y as usize * sub_h);
+        probe.available(xl as i32, yl as i32, |ctb_rs| ctx.slice_addr_of(ctb_rs))
+            // §8.4.4.2.1: CuPredMode[ xNbY ][ yNbY ] != MODE_INTRA with
+            // constrained_intra_pred_flag == 1 ⇒ not available.
+            && (!ctx.constrained_intra || ctx.field.is_intra_at(xl, yl))
     };
     let pi = match plane {
         Plane::Luma => 0,

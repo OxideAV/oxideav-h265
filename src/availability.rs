@@ -167,6 +167,48 @@ pub struct PictureTiling {
     tile_id: Vec<u32>,
 }
 
+/// The §6.4.1 z-scan availability of neighbours of one current block
+/// ([`PictureTiling::probe`]).
+pub(crate) struct ZScanProbe<'a> {
+    tiling: &'a PictureTiling,
+    /// `MinTbAddrZs` of the current block (eq. 6-1).
+    curr_addr: u32,
+    /// Raster address of the CTB holding the current block.
+    curr_ctb_rs: u32,
+    /// `TileId` of that CTB.
+    curr_tile: u32,
+}
+
+impl ZScanProbe<'_> {
+    /// [`PictureTiling::z_scan_availability`] of the neighbour luma
+    /// location `( x_nb_y, y_nb_y )` for the probe's current block. A
+    /// neighbour inside the current block's CTB shares its slice and
+    /// tile, so only the z-scan order is compared there.
+    #[inline]
+    pub(crate) fn available<F>(&self, x_nb_y: i32, y_nb_y: i32, slice_addr_rs: F) -> bool
+    where
+        F: Fn(u32) -> u32,
+    {
+        let t = self.tiling;
+        if x_nb_y < 0
+            || y_nb_y < 0
+            || x_nb_y as u32 >= t.pic_width_in_luma_samples
+            || y_nb_y as u32 >= t.pic_height_in_luma_samples
+        {
+            return false;
+        }
+        let (x, y) = (x_nb_y as u32, y_nb_y as u32);
+        let addr_n = t.min_tb_addr_zs(x >> t.min_tb_log2_size_y, y >> t.min_tb_log2_size_y);
+        if addr_n > self.curr_addr {
+            return false;
+        }
+        let ctb_rs_n = (y >> t.ctb_log2_size_y) * t.pic_width_in_ctbs_y + (x >> t.ctb_log2_size_y);
+        ctb_rs_n == self.curr_ctb_rs
+            || (slice_addr_rs(ctb_rs_n) == slice_addr_rs(self.curr_ctb_rs)
+                && t.tile_id[t.ctb_addr_rs_to_ts[ctb_rs_n as usize] as usize] == self.curr_tile)
+    }
+}
+
 impl PictureTiling {
     /// Build the §6.5.1 conversion tables from the picture geometry and
     /// tile parameters.
@@ -435,6 +477,22 @@ impl PictureTiling {
         }
 
         true
+    }
+
+    /// The §6.4.1 test for many neighbours of one current block (see
+    /// [`ZScanProbe::available`]): the current block's side of
+    /// [`Self::z_scan_availability`] is derived once.
+    pub(crate) fn probe(&self, x_curr: u32, y_curr: u32) -> ZScanProbe<'_> {
+        ZScanProbe {
+            tiling: self,
+            curr_addr: self.min_tb_addr_zs(
+                x_curr >> self.min_tb_log2_size_y,
+                y_curr >> self.min_tb_log2_size_y,
+            ),
+            curr_ctb_rs: (y_curr >> self.ctb_log2_size_y) * self.pic_width_in_ctbs_y
+                + (x_curr >> self.ctb_log2_size_y),
+            curr_tile: self.tile_id_at_luma(x_curr, y_curr),
+        }
     }
 
     /// §6.4.2 — derivation process for prediction block availability.

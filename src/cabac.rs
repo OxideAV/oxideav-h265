@@ -551,10 +551,42 @@ impl<'a> CabacEngine<'a> {
     /// MSB-first and accumulate them into an integer (`n` in 0..=32).
     /// This is the common pattern for fixed-length bypass-coded fields.
     /// `n == 0` returns 0 and consumes nothing.
+    ///
+    /// Each bypass bin doubles `ivlOffset` (shifting in one bit) and
+    /// subtracts `ivlCurrRange` when it fits — the digit step of a
+    /// binary long division. With `ivlOffset < ivlCurrRange` on entry
+    /// (the engine's invariant), `k` bins are the `k`-bit quotient of
+    /// `( ivlOffset << k | next k bits ) / ivlCurrRange` and the
+    /// remainder is the new `ivlOffset`, so up to 16 bins are decoded
+    /// by one division. A read past the end of the data is an error
+    /// either way.
     pub fn decode_bypass_bits(&mut self, n: u8) -> Result<u32, CabacError> {
         let mut value: u32 = 0;
-        for _ in 0..n {
-            value = (value << 1) | (self.decode_bypass()? as u32);
+        let mut left = u32::from(n);
+        // The §9.3.4.3.6 alignment can leave `ivlOffset` at or above
+        // the range in a non-conforming stream; the bins of such a run
+        // are decoded one by one, as written.
+        if u64::from(self.ivl_curr_range) << self.ahead <= self.window {
+            for _ in 0..n {
+                value = (value << 1) | u32::from(self.decode_bypass()?);
+            }
+            return Ok(value);
+        }
+        while left > 0 {
+            let step = left.min(16);
+            self.consume(step)?;
+            // At most 9 + 16 bits: the offset before the step is below
+            // the 9-bit range.
+            let offset = (self.window >> self.ahead) as u32;
+            let range = u32::from(self.ivl_curr_range);
+            let bins = offset / range;
+            let rest = offset - bins * range;
+            self.window =
+                (u64::from(rest) << self.ahead) | (self.window & ((1u64 << self.ahead) - 1));
+            // `bins < 1 << step` by the invariant; the shift keeps the
+            // low bits MSB-first as the bin-at-a-time loop does.
+            value = value.wrapping_shl(step) | bins;
+            left -= step;
         }
         Ok(value)
     }
@@ -956,5 +988,64 @@ mod tests {
     fn cabac_error_stays_small() {
         assert!(core::mem::size_of::<CabacError>() <= 4);
         assert!(core::mem::size_of::<Result<u8, CabacError>>() <= 8);
+    }
+    /// The one-division bypass run equals the bin-at-a-time decode: the
+    /// same value, range, offset and read position over pseudo-random
+    /// data, ranges and run lengths (including the end of the data).
+    #[test]
+    fn bypass_runs_match_single_bins() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..400 {
+            let len = 4 + (next() % 40) as usize;
+            let mut buf: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // A valid 9-bit initial offset (below 510).
+            buf[0] &= 0x7f;
+            let mut a = CabacEngine::new(BitReader::new(&buf)).unwrap();
+            let mut b = CabacEngine::new(BitReader::new(&buf)).unwrap();
+            let mut ctx_a = ContextModel::init(154, 26);
+            let mut ctx_b = ctx_a;
+            loop {
+                // Move the range off its initial value now and then.
+                if next() % 3 == 0 {
+                    let ra = a.decode_decision(&mut ctx_a);
+                    let rb = b.decode_decision(&mut ctx_b);
+                    assert_eq!(ra, rb);
+                    if ra.is_err() {
+                        break;
+                    }
+                }
+                if round % 5 == 0 && next() % 4 == 0 {
+                    a.align_bypass();
+                    b.align_bypass();
+                }
+                let n = (next() % 33) as u8;
+                let run = a.decode_bypass_bits(n);
+                let mut single = Ok(0u32);
+                for _ in 0..n {
+                    match b.decode_bypass() {
+                        Ok(bin) => {
+                            single = single.map(|v| v.wrapping_shl(1) | u32::from(bin));
+                        }
+                        Err(e) => {
+                            single = Err(e);
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(run, single, "round {round} n {n}");
+                if run.is_err() {
+                    break;
+                }
+                assert_eq!(a.ivl_curr_range(), b.ivl_curr_range());
+                assert_eq!(a.ivl_offset(), b.ivl_offset());
+                assert_eq!(a.bit_pos(), b.bit_pos());
+            }
+        }
     }
 }
