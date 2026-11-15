@@ -293,6 +293,10 @@ pub(crate) const TRANS_IDX_MPS: [u8; 64] = [
     49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
+/// [`TRANS_IDX_MPS`] and [`TRANS_IDX_LPS`], indexed by "the bin was
+/// the least probable symbol".
+static TRANS_IDX: [[u8; 64]; 2] = [TRANS_IDX_MPS, TRANS_IDX_LPS];
+
 /// The §9.3.4.3 arithmetic decoding engine state plus its bit source.
 ///
 /// The engine holds the two §9.3.2.6 registers `ivlCurrRange` and
@@ -308,21 +312,21 @@ pub(crate) const TRANS_IDX_MPS: [u8; 64] = [
 /// §9.3.4.3's `ivlOffset = ( ivlOffset << n ) | read_bits( n )` is then
 /// `ahead -= n` with `window` untouched, and every comparison of
 /// `ivlOffset` against a range `r` is `window` against `r << ahead` —
-/// the same integers, read 32 bits at a time instead of one. A read
-/// past the end of the data is reported at the operation that makes
-/// it, exactly as a bit-at-a-time reader would.
+/// the same integers, read 32 bits at a time instead of one. Only bits
+/// of the data are ever looked ahead, so "the next `n` bits exist" is
+/// `ahead >= n` after a refill: a read past the end of the data is
+/// reported at the operation that makes it, exactly as a bit-at-a-time
+/// reader would.
 #[derive(Debug)]
 pub struct CabacEngine<'a> {
     buf: &'a [u8],
     /// Position (bits from the start of `buf`) of the first bit not
-    /// yet in `window`; runs past the end once the zero fill starts.
+    /// yet in `window` (at most the end of the data).
     next_bit: usize,
     /// `( ivlOffset << ahead ) | next` (see the type docs).
     window: u64,
     /// Number of looked-ahead bits in the low part of `window`.
     ahead: u32,
-    /// Bits of `buf` the engine has not consumed.
-    bits_left: usize,
     /// §9.3.2.6 `ivlCurrRange` (values stay within 9 bits during
     /// decode).
     ivl_curr_range: u16,
@@ -341,7 +345,6 @@ impl<'a> CabacEngine<'a> {
             next_bit: bit_pos,
             window: 0,
             ahead: 0,
-            bits_left: (buf.len() * 8).saturating_sub(bit_pos),
             ivl_curr_range: 510,
         };
         engine.init_engine()?;
@@ -398,11 +401,16 @@ impl<'a> CabacEngine<'a> {
         self.next_bit - self.ahead as usize
     }
 
-    /// Append the 32 bits at `next_bit` (zeros past the end of the
-    /// data) to the looked-ahead bits. `ahead` must be at most 21 so
-    /// the 10-bit offset keeps its headroom.
-    #[inline]
+    /// Append the next bits of the data at `next_bit` — 32 of them, or
+    /// as many as are left — to the looked-ahead bits. `ahead` must be
+    /// at most 21 so the 10-bit offset keeps its headroom.
+    #[inline(never)]
+    #[cold]
     fn refill(&mut self) {
+        let left = (self.buf.len() * 8).saturating_sub(self.next_bit).min(32) as u32;
+        if left == 0 {
+            return;
+        }
         let byte = self.next_bit >> 3;
         let word = match self.buf.get(byte..byte + 8) {
             Some(chunk) => u64::from_be_bytes(chunk.try_into().expect("8 bytes")),
@@ -414,21 +422,20 @@ impl<'a> CabacEngine<'a> {
                 u64::from_be_bytes(tail)
             }
         };
-        let bits = (word << (self.next_bit & 7)) >> 32;
-        self.window = (self.window << 32) | bits;
-        self.ahead += 32;
-        self.next_bit += 32;
+        let bits = (word << (self.next_bit & 7)) >> (64 - left);
+        self.window = (self.window << left) | bits;
+        self.ahead += left;
+        self.next_bit += left as usize;
     }
 
     /// `ivlOffset = ( ivlOffset << n ) | read_bits( n )` for `n <= 16`.
     #[inline(always)]
     fn consume(&mut self, n: u32) -> Result<(), CabacError> {
-        if self.bits_left < n as usize {
-            return Err(CabacError::EndOfBuffer);
-        }
-        self.bits_left -= n as usize;
         if self.ahead < n {
             self.refill();
+            if self.ahead < n {
+                return Err(CabacError::EndOfBuffer);
+            }
         }
         self.ahead -= n;
         Ok(())
@@ -470,7 +477,6 @@ impl<'a> CabacEngine<'a> {
         let mut reader = BitReader::from_parts(self.buf, self.next_bit);
         let value = reader.u(n)?;
         self.next_bit = reader.bit_pos();
-        self.bits_left = (self.buf.len() * 8).saturating_sub(self.next_bit);
         Ok(value)
     }
 
@@ -489,12 +495,11 @@ impl<'a> CabacEngine<'a> {
     fn renorm(&mut self) -> Result<(), CabacError> {
         // The loop of §9.3.4.3.3 doubles ivlCurrRange (shifting one bit
         // into ivlOffset) until it reaches 256: as many times as it
-        // has leading zeros past bit 8, done in one shift.
-        if self.ivl_curr_range < 256 {
-            let shift = self.ivl_curr_range.leading_zeros() - 7;
-            self.consume(shift)?;
-            self.ivl_curr_range <<= shift;
-        }
+        // has leading zeros past bit 8 (none at 256 and above), done in
+        // one shift.
+        let shift = self.ivl_curr_range.leading_zeros().saturating_sub(7);
+        self.consume(shift)?;
+        self.ivl_curr_range <<= shift;
         Ok(())
     }
 
@@ -505,27 +510,24 @@ impl<'a> CabacEngine<'a> {
     #[inline(always)]
     pub fn decode_decision(&mut self, ctx: &mut ContextModel) -> Result<u8, CabacError> {
         // Step 1 (equations 9-64, 9-65): the LPS sub-range.
+        let state = usize::from(ctx.p_state_idx) & 63;
         let q_range_idx = ((self.ivl_curr_range >> 6) & 3) as usize;
-        let ivl_lps_range = RANGE_TAB_LPS[ctx.p_state_idx as usize][q_range_idx] as u16;
+        let ivl_lps_range = u16::from(RANGE_TAB_LPS[state][q_range_idx]);
 
-        // Step 2: subtract the LPS range; compare ivlOffset.
-        self.ivl_curr_range -= ivl_lps_range;
-        let scaled = u64::from(self.ivl_curr_range) << self.ahead;
-        let bin_val;
-        if self.window >= scaled {
-            // LPS path; §9.3.4.3.2.2 state transition (equation 9-66).
-            bin_val = 1 - ctx.val_mps;
-            self.window -= scaled;
-            self.ivl_curr_range = ivl_lps_range;
-            if ctx.p_state_idx == 0 {
-                ctx.val_mps = 1 - ctx.val_mps;
-            }
-            ctx.p_state_idx = TRANS_IDX_LPS[ctx.p_state_idx as usize];
-        } else {
-            // MPS path.
-            bin_val = ctx.val_mps;
-            ctx.p_state_idx = TRANS_IDX_MPS[ctx.p_state_idx as usize];
-        }
+        // Step 2: subtract the LPS range; compare ivlOffset. Both
+        // outcomes are computed and selected (the comparison is close
+        // to a coin toss for many contexts): the LPS path takes the
+        // LPS sub-range and the §9.3.4.3.2.2 state transition of
+        // equation 9-66 (valMps flips at pStateIdx 0), the MPS path
+        // keeps the remainder.
+        let mps_range = self.ivl_curr_range - ivl_lps_range;
+        let scaled = u64::from(mps_range) << self.ahead;
+        let lps = self.window >= scaled;
+        self.window -= if lps { scaled } else { 0 };
+        self.ivl_curr_range = if lps { ivl_lps_range } else { mps_range };
+        let bin_val = ctx.val_mps ^ u8::from(lps);
+        ctx.val_mps ^= u8::from(lps & (state == 0));
+        ctx.p_state_idx = TRANS_IDX[usize::from(lps)][state];
 
         // §9.3.4.3.3 renormalization.
         self.renorm()?;
