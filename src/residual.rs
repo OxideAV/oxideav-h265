@@ -618,6 +618,91 @@ fn read_last_sig_suffix<B: ResidualBinSource>(
     Ok(last_sig_coeff_position(prefix, suffix))
 }
 
+/// Row of [`sig_ctx_inc_tables`] for a sub-block: colour, block size,
+/// scan, the edge-gated `prevCsbf` (eqs 9-43 / 9-44: bit 0 the right
+/// neighbour, bit 1 the one below) and whether the sub-block is not
+/// the block's first (`xS + yS > 0`).
+#[inline]
+fn sig_table_index(
+    is_chroma: bool,
+    log2_trafo_size: u32,
+    scan_idx: u32,
+    prev_csbf: u32,
+    off_origin: bool,
+) -> usize {
+    ((((usize::from(is_chroma) * 4 + (log2_trafo_size as usize - 2)) * 3 + scan_idx as usize) * 4
+        + prev_csbf as usize)
+        * 2)
+        + usize::from(off_origin)
+}
+
+/// The §9.3.4.2.5 `sig_coeff_flag` ctxInc of the sixteen scan
+/// positions of a sub-block, for every [`sig_table_index`]
+/// configuration without the eq. 9-40 transform-skip context: the
+/// branch cascade (Table 9-50 for a 4x4 block, eq. 9-42 at the DC
+/// position, eqs 9-43..9-53 elsewhere) evaluated once per process
+/// over every sub-block position of every block size.
+fn sig_ctx_inc_tables() -> &'static [[u8; 16]; 192] {
+    use std::sync::OnceLock;
+    static TABLES: OnceLock<[[u8; 16]; 192]> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut tables = [[0u8; 16]; 192];
+        for is_chroma in [false, true] {
+            for log2 in 2..=5u32 {
+                for (scan_num, scan_idx) in
+                    [ScanIdx::Diagonal, ScanIdx::Horizontal, ScanIdx::Vertical]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let pos_scan = scan_table(2, scan_idx).expect("the 4x4 scan");
+                    let grid = 1u32 << (log2 - 2);
+                    for ys in 0..grid {
+                        for xs in 0..grid {
+                            for neighbours in 0..4u32 {
+                                let (right, below) = (neighbours & 1, neighbours >> 1);
+                                // The gate of eqs 9-43 / 9-44.
+                                let prev = (if xs < grid - 1 { right } else { 0 })
+                                    | ((if ys < grid - 1 { below } else { 0 }) << 1);
+                                let row = &mut tables[sig_table_index(
+                                    is_chroma,
+                                    log2,
+                                    scan_num as u32,
+                                    prev,
+                                    xs + ys > 0,
+                                )];
+                                for (n, pos) in pos_scan.iter().enumerate().take(16) {
+                                    let xc = (xs << 2) + u32::from(pos.x);
+                                    let yc = (ys << 2) + u32::from(pos.y);
+                                    let sig_ctx = if log2 == 2 {
+                                        sig_coeff_flag_sig_ctx_log2_2(xc & 3, yc & 3)
+                                    } else if xc + yc == 0 {
+                                        sig_coeff_flag_sig_ctx_dc(is_chroma, log2, scan_num as u32)
+                                    } else {
+                                        sig_coeff_flag_sig_ctx_general(
+                                            is_chroma,
+                                            log2,
+                                            xc,
+                                            yc,
+                                            xs,
+                                            ys,
+                                            right as u8,
+                                            below as u8,
+                                            scan_num as u32,
+                                        )
+                                    };
+                                    row[n] = sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx, is_chroma)
+                                        as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tables
+    })
+}
+
 /// §7.3.8.11 — decode one `residual_coding( )` body (from
 /// `last_sig_coeff_x_prefix` onward; see the module docs for the
 /// exact scope) against a generic [`ResidualBinSource`].
@@ -694,6 +779,14 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         }
     };
 
+    // §9.3.4.2.5 ctxInc per scan position: one row per sub-block
+    // configuration, or the eq. 9-40 context for every position.
+    let sig_tables = sig_ctx_inc_tables();
+    let ts_ctx_incs = [sig_coeff_flag_ctx_inc_from_sig_ctx(
+        sig_coeff_flag_sig_ctx_transform_skip(is_chroma),
+        is_chroma,
+    ) as u8; 16];
+
     // §9.3.4.2.6 cross-sub-block greater-1 state. `last_g1_bin` is
     // the most recently decoded coeff_abs_level_greater1_flag value,
     // consumed by the next sub-block's lazy entry.
@@ -729,64 +822,61 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             continue;
         }
 
-        // sig_coeff_flag pass. `sig[n]` is indexed by the in-sub-block
-        // scan position n.
-        let mut sig = [0u8; 16];
-        if is_last_sb {
-            // The last significant coefficient is significant by
-            // definition (§7.4.9.11 first inference bullet).
-            sig[last_scan_pos as usize] = 1;
-        }
+        // sig_coeff_flag pass. Bit n of `sig` is the flag of in-sub-block
+        // scan position n; the ctxInc of every position comes from the
+        // §9.3.4.2.5 table of this sub-block's configuration.
+        let ctx_incs: &[u8; 16] = if params.transform_skip_sig_ctx {
+            &ts_ctx_incs
+        } else {
+            let right = csbf_at(&csbf, xs as usize + 1, ys as usize);
+            let below = csbf_at(&csbf, xs as usize, ys as usize + 1);
+            &sig_tables[sig_table_index(
+                is_chroma,
+                log2,
+                scan_idx_num,
+                u32::from(right & 1) | (u32::from(below & 1) << 1),
+                xs + ys > 0,
+            )]
+        };
+        // The last significant coefficient is significant by definition
+        // (§7.4.9.11 first inference bullet).
+        let mut sig: u32 = if is_last_sb { 1 << last_scan_pos } else { 0 };
         let start_n: i32 = if is_last_sb { last_scan_pos - 1 } else { 15 };
-        for n in (0..=start_n).rev() {
-            let xc = (xs << 2) + u32::from(pos_scan[n as usize].x);
-            let yc = (ys << 2) + u32::from(pos_scan[n as usize].y);
-            if sb_coded == 1 && (n > 0 || !infer_sb_dc_sig) {
-                // §9.3.4.2.5 sigCtx branch dispatch.
-                let sig_ctx = if params.transform_skip_sig_ctx {
-                    sig_coeff_flag_sig_ctx_transform_skip(is_chroma)
-                } else if log2 == 2 {
-                    sig_coeff_flag_sig_ctx_log2_2(xc & 3, yc & 3)
-                } else if xc + yc == 0 {
-                    sig_coeff_flag_sig_ctx_dc(is_chroma, log2, scan_idx_num)
-                } else {
-                    let right = csbf_at(&csbf, xs as usize + 1, ys as usize);
-                    let below = csbf_at(&csbf, xs as usize, ys as usize + 1);
-                    sig_coeff_flag_sig_ctx_general(
-                        is_chroma,
-                        log2,
-                        xc,
-                        yc,
-                        xs,
-                        ys,
-                        right,
-                        below,
-                        scan_idx_num,
-                    )
-                };
-                let ctx_inc = sig_coeff_flag_ctx_inc_from_sig_ctx(sig_ctx, is_chroma);
-                let bin = bins.decision(ResidualElement::SigCoeffFlag, ctx_inc)?;
-                sig[n as usize] = bin;
-                if bin == 1 {
-                    infer_sb_dc_sig = false;
-                }
-            } else if n == 0 && sb_coded == 1 && infer_sb_dc_sig {
+        for n in (1..=start_n).rev() {
+            let bin = bins.decision(
+                ResidualElement::SigCoeffFlag,
+                u32::from(ctx_incs[n as usize]),
+            )?;
+            sig |= u32::from(bin) << n;
+        }
+        if start_n >= 0 {
+            // `infer_sb_dc_sig` survives until a decoded flag is 1; a
+            // sub-block with a decoded coded_sub_block_flag is never
+            // the last one, so `sig` then holds decoded flags only.
+            if infer_sb_dc_sig && sig == 0 {
                 // §7.4.9.11 second inference bullet: the DC cell of a
                 // decoded-coded sub-block whose 15 other flags were
                 // all 0 is inferred significant.
-                sig[0] = 1;
+                sig = 1;
+            } else {
+                let bin = bins.decision(ResidualElement::SigCoeffFlag, u32::from(ctx_incs[0]))?;
+                sig |= u32::from(bin);
             }
+        }
+        if sig == 0 {
+            // Reachable only on sub-block 0 of a block whose last
+            // position lies elsewhere: nothing more is coded for it.
+            continue;
         }
 
         // coeff_abs_level_greater1_flag pass (§7.3.8.11), with the
         // per-sub-block numGreater1Flag < 8 cap and the lazy
-        // §9.3.4.2.6 sub-block entry.
-        let mut first_sig_scan_pos: i32 = 16;
-        let mut last_sig_scan_pos: i32 = -1;
-        let mut num_greater1: u32 = 0;
+        // §9.3.4.2.6 sub-block entry: the first eight significant
+        // positions in decreasing scan order.
+        let first_sig_scan_pos: i32 = sig.trailing_zeros() as i32;
+        let last_sig_scan_pos: i32 = 31 - sig.leading_zeros() as i32;
         let mut last_greater1_scan_pos: i32 = -1;
-        let mut g1 = [0u8; 16];
-        let mut entered_subblock = false;
+        let mut g1: u32 = 0;
         // §7.3.8.11 escapeDataPresent: set when any coefficient of
         // this sub-block will (or may) carry a
         // coeff_abs_level_remaining — a second-or-later greater1
@@ -794,32 +884,26 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         // greater2 flag equal to 1. Gates the §9.3.4.3.6 aligned
         // bypass decoding.
         let mut escape_data_present = false;
-        for n in (0..16).rev() {
-            if sig[n] == 1 {
-                if num_greater1 < 8 {
-                    if !entered_subblock {
-                        g1_state.on_subblock_entry(i as u32, is_chroma, last_g1_bin);
-                        entered_subblock = true;
-                    }
-                    let ctx_inc = g1_state.current_ctx_inc(is_chroma);
-                    let bin = bins.decision(ResidualElement::CoeffAbsLevelGreater1Flag, ctx_inc)?;
-                    g1_state.on_coeff_abs_level_greater1_flag(bin);
-                    last_g1_bin = bin;
-                    g1[n] = bin;
-                    num_greater1 += 1;
-                    if bin == 1 && last_greater1_scan_pos == -1 {
-                        last_greater1_scan_pos = n as i32;
-                    } else if bin == 1 {
-                        escape_data_present = true;
-                    }
-                } else {
-                    escape_data_present = true;
-                }
-                if last_sig_scan_pos == -1 {
-                    last_sig_scan_pos = n as i32;
-                }
-                first_sig_scan_pos = n as i32;
+        g1_state.on_subblock_entry(i as u32, is_chroma, last_g1_bin);
+        let mut rest = sig;
+        let mut num_greater1 = 0u32;
+        while rest != 0 && num_greater1 < 8 {
+            let n = 31 - rest.leading_zeros();
+            rest &= !(1 << n);
+            let ctx_inc = g1_state.current_ctx_inc(is_chroma);
+            let bin = bins.decision(ResidualElement::CoeffAbsLevelGreater1Flag, ctx_inc)?;
+            g1_state.on_coeff_abs_level_greater1_flag(bin);
+            last_g1_bin = bin;
+            g1 |= u32::from(bin) << n;
+            num_greater1 += 1;
+            if bin == 1 && last_greater1_scan_pos == -1 {
+                last_greater1_scan_pos = n as i32;
+            } else if bin == 1 {
+                escape_data_present = true;
             }
+        }
+        if rest != 0 {
+            escape_data_present = true;
         }
 
         // §7.3.8.11 signHidden.
@@ -830,11 +914,11 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         };
 
         // coeff_abs_level_greater2_flag — at most once per sub-block.
-        let mut g2 = [0u8; 16];
+        let mut g2: u32 = 0;
         if last_greater1_scan_pos != -1 {
             let ctx_inc = coeff_abs_level_greater2_flag_ctx_inc(g1_state.ctx_set(), is_chroma);
             let bin = bins.decision(ResidualElement::CoeffAbsLevelGreater2Flag, ctx_inc)?;
-            g2[last_greater1_scan_pos as usize] = bin;
+            g2 = u32::from(bin) << last_greater1_scan_pos;
             if bin == 1 {
                 escape_data_present = true;
             }
@@ -851,17 +935,12 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         }
 
         // coeff_sign_flag pass (bypass): present for every significant
-        // position except the hidden first one.
-        let mut sign = [0u8; 16];
-        for n in (0..16).rev() {
-            if sig[n] == 1
-                && (!params.sign_data_hiding_enabled_flag
-                    || !sign_hidden
-                    || n as i32 != first_sig_scan_pos)
-            {
-                sign[n] = bins.bypass()?;
-            }
-        }
+        // position except the hidden first one, in decreasing scan
+        // order — the flag of the k-th significant position (from the
+        // top) is bit `num_signs − 1 − k` of `signs`.
+        let hidden = params.sign_data_hiding_enabled_flag && sign_hidden;
+        let num_signs = sig.count_ones() - u32::from(hidden);
+        let signs = bins.bypass_bits(num_signs as u8)?;
 
         // Level pass: coeff_abs_level_remaining + TransCoeffLevel
         // composition, with the §9.3.3.11 per-sub-block Rice
@@ -875,11 +954,11 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
         // eq. 9-20 / 9-21 sbType (persistent path only).
         let sb_type = 2 * usize::from(!is_chroma) + usize::from(params.rice_stat_transform_skip);
         let mut first_remaining_in_sb = true;
-        for n in (0..16).rev() {
-            if sig[n] != 1 {
-                continue;
-            }
-            let base_level = 1 + u32::from(g1[n]) + u32::from(g2[n]);
+        let mut rest = sig;
+        while rest != 0 {
+            let n = (31 - rest.leading_zeros()) as usize;
+            rest &= !(1 << n);
+            let base_level = 1 + ((g1 >> n) & 1) + ((g2 >> n) & 1);
             let threshold = if num_sig_coeff < 8 {
                 if n as i32 == last_greater1_scan_pos {
                     3
@@ -956,8 +1035,14 @@ pub fn decode_residual_coding_with<B: ResidualBinSource>(
             let xc = (xs << 2) + u32::from(pos_scan[n].x);
             let yc = (ys << 2) + u32::from(pos_scan[n].y);
             let idx = yc as usize * size + xc as usize;
-            levels[idx] = signed_level_from_sign_flag(abs_level, sign[n]);
-            if params.sign_data_hiding_enabled_flag && sign_hidden {
+            // The hidden position (the last one visited) reads no flag.
+            let sign_flag = if num_sig_coeff < num_signs {
+                ((signs >> (num_signs - 1 - num_sig_coeff)) & 1) as u8
+            } else {
+                0
+            };
+            levels[idx] = signed_level_from_sign_flag(abs_level, sign_flag);
+            if hidden {
                 sum_abs_level += u64::from(abs_level);
                 if n as i32 == first_sig_scan_pos && sum_abs_level % 2 == 1 {
                     levels[idx] = -levels[idx];
