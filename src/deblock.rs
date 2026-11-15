@@ -160,6 +160,27 @@ fn transform_block_boundary(
     }
 }
 
+/// §8.7.2.3 — the offset of the coding block's internal
+/// prediction-partition column (EDGE_VER) / row (EDGE_HOR), if the
+/// partitioning has one in that direction.
+fn prediction_edge_offset(
+    part_mode: PartMode,
+    log2_cb_size: u32,
+    edge_type: EdgeType,
+) -> Option<usize> {
+    let half = 1usize << (log2_cb_size - 1);
+    let quarter = 1usize << (log2_cb_size.saturating_sub(2));
+    match (edge_type, part_mode) {
+        (EdgeType::Vertical, PartMode::PartNx2N | PartMode::PartNxN) => Some(half),
+        (EdgeType::Vertical, PartMode::PartNLx2N) => Some(quarter),
+        (EdgeType::Vertical, PartMode::PartNRx2N) => Some(3 * quarter),
+        (EdgeType::Horizontal, PartMode::Part2NxN | PartMode::PartNxN) => Some(half),
+        (EdgeType::Horizontal, PartMode::Part2NxnU) => Some(quarter),
+        (EdgeType::Horizontal, PartMode::Part2NxnD) => Some(3 * quarter),
+        _ => None,
+    }
+}
+
 /// §8.7.2.3 prediction-block-boundary derivation: mark the internal
 /// prediction-partition edge of a coding block into `edge_flags` (a
 /// prediction edge is *not* a transform-block edge, so `tb_edge` is left
@@ -172,18 +193,7 @@ fn prediction_block_boundary(
     g: usize,
     edge_flags: &mut [bool],
 ) {
-    // The internal partition column (EDGE_VER) / row (EDGE_HOR), if any.
-    let half = 1usize << (log2_cb_size - 1);
-    let quarter = 1usize << (log2_cb_size.saturating_sub(2));
-    let pos = match (edge_type, part_mode) {
-        (EdgeType::Vertical, PartMode::PartNx2N | PartMode::PartNxN) => Some(half),
-        (EdgeType::Vertical, PartMode::PartNLx2N) => Some(quarter),
-        (EdgeType::Vertical, PartMode::PartNRx2N) => Some(3 * quarter),
-        (EdgeType::Horizontal, PartMode::Part2NxN | PartMode::PartNxN) => Some(half),
-        (EdgeType::Horizontal, PartMode::Part2NxnU) => Some(quarter),
-        (EdgeType::Horizontal, PartMode::Part2NxnD) => Some(3 * quarter),
-        _ => None,
-    };
+    let pos = prediction_edge_offset(part_mode, log2_cb_size, edge_type);
     if let Some(p) = pos {
         let n = n_cbs / g;
         for k in 0..n {
@@ -303,12 +313,6 @@ fn edge_flags_into(
         transform_block_boundary(transform_split, 0, 0, log2_cb_size, &mut ctx);
     }
     prediction_block_boundary(part_mode, log2_cb_size, edge_type, n_cbs, g, edge_flags);
-}
-
-thread_local! {
-    /// [`DeblockEdgeMap::add_cu`]'s per-CU grids, reused across CUs.
-    static ADD_CU_SCRATCH: core::cell::Cell<(Vec<bool>, Vec<bool>, Vec<u8>)> =
-        const { core::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 /// The §8.7.2.4 boundary filtering strength for one CU's edges, a
@@ -1684,56 +1688,63 @@ impl DeblockEdgeMap {
         if self.params.is_none() {
             self.params = Some(desc.cu.params);
         }
-        let n_d = 1usize << (log2_cb_size - 3);
         let n_cbs = 1usize << log2_cb_size;
-        let mut guard = ADD_CU_SCRATCH.with(|c| c.take());
-        let (edge_flags, tb_edge, bs) = &mut guard;
         for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
             let filter_edge_flag = match edge_type {
                 EdgeType::Vertical => desc.filter_left,
                 EdgeType::Horizontal => desc.filter_top,
             };
-            // Every §8.7.2.2 / §8.7.2.3 edge lies on the 4×4 grid: the
-            // compact grids hold one entry per 4×4 cell.
-            let n4 = n_cbs / 4;
-            for v in [&mut *edge_flags, &mut *tb_edge] {
-                v.clear();
-                v.resize(n4 * n4, false);
-            }
-            bs.clear();
-            bs.resize(n4 * n4, 0);
-            edge_flags_into(
+            // The §8.7.2.4 sampling grid of the coding block: line `e`
+            // is the edge 8 * e samples in (a column for EDGE_VER, a
+            // row for EDGE_HOR), bit `s` of its mask the four-sample
+            // segment 4 * s along it (at most 8 lines of 16 segments).
+            // `tb` holds the §8.7.2.2 transform-block edges, `edges`
+            // those plus the §8.7.2.3 prediction-block edge.
+            let mut tb = [0u16; 8];
+            mark_tb_edge_segments(
                 &desc.transform_split,
-                desc.part_mode,
+                (0, 0),
                 log2_cb_size,
                 edge_type,
                 filter_edge_flag,
-                4,
-                edge_flags,
-                tb_edge,
+                &mut tb,
             );
-            boundary_strength_into(
-                field,
-                x_cb,
-                y_cb,
-                log2_cb_size,
-                edge_type,
-                4,
-                edge_flags,
-                tb_edge,
-                bs,
-            );
-            for e in 0..n_d {
-                for s_idx in 0..2 * n_d {
-                    let (x_dk, y_dm) = match edge_type {
-                        EdgeType::Vertical => (e << 3, s_idx << 2),
-                        EdgeType::Horizontal => (s_idx << 2, e << 3),
+            let mut edges = tb;
+            if let Some(p) = prediction_edge_offset(desc.part_mode, log2_cb_size, edge_type)
+                && p % 8 == 0
+            {
+                // All `nCbS / 4` segments of the line.
+                edges[p / 8] |= (((1u32 << (n_cbs / 4)) - 1) & 0xffff) as u16;
+            }
+            for (e, (&line, &tb_line)) in edges.iter().zip(&tb).enumerate().take(n_cbs / 8) {
+                let mut rest = line;
+                while rest != 0 {
+                    let s = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let (x_di, y_dj) = match edge_type {
+                        EdgeType::Vertical => (e << 3, s << 2),
+                        EdgeType::Horizontal => (s << 2, e << 3),
                     };
-                    let v = bs[(y_dm / 4) * (n_cbs / 4) + x_dk / 4];
-                    if v == 0 {
+                    // p0 / q0 sample positions (§8.7.2.4).
+                    let (qx, qy) = (x_cb + x_di, y_cb + y_dj);
+                    let (px, py) = match edge_type {
+                        EdgeType::Vertical => (qx - 1, qy),
+                        EdgeType::Horizontal => (qx, qy - 1),
+                    };
+                    let p = field.cell_at(px, py);
+                    let q = field.cell_at(qx, qy);
+                    // §8.7.2.4 cascade: intra ⇒ 2; else a coded-coeff
+                    // transform-block edge OR the motion criteria ⇒ 1.
+                    let coeff_edge =
+                        (tb_line >> s) & 1 == 1 && (p.has_nonzero_coeff || q.has_nonzero_coeff);
+                    let v = if p.is_intra || q.is_intra {
+                        2
+                    } else if coeff_edge || motion_bs_is_one(&p, &q) {
+                        1
+                    } else {
                         continue;
-                    }
-                    let (x, y) = (x_cb + x_dk, y_cb + y_dm);
+                    };
+                    let (x, y) = (qx, qy);
                     if y < self.y_origin
                         || y >= self.y_origin + self.rows
                         || x < self.x_origin
@@ -1757,7 +1768,54 @@ impl DeblockEdgeMap {
                 }
             }
         }
-        ADD_CU_SCRATCH.with(|c| c.set(guard));
+    }
+}
+
+/// §8.7.2.2 on the §8.7.2.4 sampling grid: set, in `lines`, the
+/// segments of every transform-block edge of the coding block that
+/// lies on an 8-sample line (see [`DeblockEdgeMap::add_cu`]). The
+/// coding-block boundary itself (offset 0) is an edge only when
+/// `filter_edge_flag` is set.
+fn mark_tb_edge_segments(
+    node: &TransformSplit,
+    (xb0, yb0): (usize, usize),
+    log2_trafo_size: u32,
+    edge_type: EdgeType,
+    filter_edge_flag: bool,
+    lines: &mut [u16; 8],
+) {
+    if let TransformSplit::Split(children) = node {
+        let half = 1usize << (log2_trafo_size - 1);
+        let origins = [
+            (xb0, yb0),
+            (xb0 + half, yb0),
+            (xb0, yb0 + half),
+            (xb0 + half, yb0 + half),
+        ];
+        for (child, origin) in children.iter().zip(origins) {
+            mark_tb_edge_segments(
+                child,
+                origin,
+                log2_trafo_size - 1,
+                edge_type,
+                filter_edge_flag,
+                lines,
+            );
+        }
+        return;
+    }
+    // A leaf's leading edge: the column xB0 (EDGE_VER) / row yB0
+    // (EDGE_HOR), over the block's extent the other way.
+    let (across, along) = match edge_type {
+        EdgeType::Vertical => (xb0, yb0),
+        EdgeType::Horizontal => (yb0, xb0),
+    };
+    if across % 8 != 0 || (across == 0 && !filter_edge_flag) {
+        return;
+    }
+    let segments = (1usize << log2_trafo_size) / 4;
+    if let Some(line) = lines.get_mut(across / 8) {
+        *line |= ((((1u32 << segments) - 1) << (along / 4)) & 0xffff) as u16;
     }
 }
 
@@ -3104,5 +3162,152 @@ mod tests {
         assert!(pic.sample(Plane::Luma, 0, 7) > 120);
         // A corner far from both seams is untouched.
         assert_eq!(pic.sample(Plane::Luma, 0, 0), 120);
+    }
+    /// The segment-mask edge map of [`DeblockEdgeMap::add_cu`] against
+    /// the per-sample §8.7.2.2 / .3 / .4 derivations
+    /// ([`derive_edge_flags`], [`derive_boundary_strength`]): every
+    /// coding-block size, random transform splits, every partitioning,
+    /// boundary gates and a random motion field.
+    #[test]
+    fn add_cu_matches_the_per_sample_derivation() {
+        let mut state = 0x1357_9bdf_2468_ace0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        fn split(next: &mut dyn FnMut() -> u64, log2: u32) -> TransformSplit {
+            if log2 > 2 && !next().is_multiple_of(3) {
+                TransformSplit::Split(Box::new([
+                    split(next, log2 - 1),
+                    split(next, log2 - 1),
+                    split(next, log2 - 1),
+                    split(next, log2 - 1),
+                ]))
+            } else {
+                TransformSplit::Leaf
+            }
+        }
+        let modes = [
+            PartMode::Part2Nx2N,
+            PartMode::Part2NxN,
+            PartMode::PartNx2N,
+            PartMode::PartNxN,
+            PartMode::Part2NxnU,
+            PartMode::Part2NxnD,
+            PartMode::PartNLx2N,
+            PartMode::PartNRx2N,
+        ];
+        let params = DeblockCuParams {
+            qp_y: 30,
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            chroma_array_type: 1,
+        };
+        for round in 0..600 {
+            let log2_cb_size = 3 + (round % 4) as u32;
+            let n_cbs = 1usize << log2_cb_size;
+            let (w, h) = (192usize, 192usize);
+            let mut field = MotionField::new(w, h);
+            for by in (0..h).step_by(4) {
+                for bx in (0..w).step_by(4) {
+                    let r = next();
+                    let cell = if r % 7 == 0 {
+                        MotionCell {
+                            is_intra: true,
+                            has_nonzero_coeff: false,
+                            pred_flag_l0: false,
+                            pred_flag_l1: false,
+                            ref_poc_l0: i32::MIN,
+                            ref_poc_l1: i32::MIN,
+                            mv_l0: [0, 0],
+                            mv_l1: [0, 0],
+                        }
+                    } else {
+                        let bi = r % 3 == 0;
+                        MotionCell {
+                            is_intra: false,
+                            has_nonzero_coeff: false,
+                            pred_flag_l0: true,
+                            pred_flag_l1: bi,
+                            ref_poc_l0: ((r >> 8) % 2) as i32,
+                            ref_poc_l1: if bi { ((r >> 9) % 2) as i32 } else { i32::MIN },
+                            mv_l0: [((r >> 12) % 3) as i32 * 3, ((r >> 16) % 2) as i32 * 4],
+                            mv_l1: if bi {
+                                [((r >> 20) % 3) as i32 * 3, 0]
+                            } else {
+                                [0, 0]
+                            },
+                        }
+                    };
+                    field.fill_rect(bx, by, 4, 4, cell);
+                    if r % 7 != 0 && (r >> 24) % 4 == 0 {
+                        field.mark_nonzero_coeff(bx, by, 4, 4);
+                    }
+                }
+            }
+            let x_cb = (next() % 2) as usize * 64;
+            let y_cb = (next() % 2) as usize * 64;
+            let desc = DeblockCuDesc {
+                cu: DeblockCu {
+                    x_cb,
+                    y_cb,
+                    log2_cb_size,
+                    params,
+                    qp_y_p_left: 30,
+                    qp_y_p_top: 30,
+                },
+                transform_split: split(&mut next, log2_cb_size),
+                part_mode: modes[(next() % 8) as usize],
+                filter_left: x_cb > 0 && next() % 4 != 0,
+                filter_top: y_cb > 0 && next() % 4 != 0,
+            };
+            let mut map = DeblockEdgeMap::new(w, h);
+            map.add_cu(&field, &desc);
+            for edge_type in [EdgeType::Vertical, EdgeType::Horizontal] {
+                let gate = match edge_type {
+                    EdgeType::Vertical => desc.filter_left,
+                    EdgeType::Horizontal => desc.filter_top,
+                };
+                let flags = derive_edge_flags(
+                    &desc.transform_split,
+                    desc.part_mode,
+                    log2_cb_size,
+                    edge_type,
+                    gate,
+                );
+                let bs = derive_boundary_strength(
+                    &field,
+                    x_cb,
+                    y_cb,
+                    log2_cb_size,
+                    edge_type,
+                    flags.edge_flags(),
+                    flags.tb_edge(),
+                );
+                let (step_x, step_y) = match edge_type {
+                    EdgeType::Vertical => (8, 4),
+                    EdgeType::Horizontal => (4, 8),
+                };
+                for y in (0..n_cbs).step_by(step_y) {
+                    for x in (0..n_cbs).step_by(step_x) {
+                        let got = match edge_type {
+                            EdgeType::Vertical => map.bs_vertical(x_cb + x, y_cb + y),
+                            EdgeType::Horizontal => map.bs_horizontal(x_cb + x, y_cb + y),
+                        };
+                        assert_eq!(
+                            got,
+                            bs.at(x, y),
+                            "round {round} {edge_type:?} log2 {log2_cb_size} at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
