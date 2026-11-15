@@ -176,38 +176,87 @@ pub(super) struct WavefrontInputs<'a> {
     pub tolerant: bool,
 }
 
-/// Row progress: per row, the number of CTBs published.
+/// Row progress: per row, the number of CTBs published. Only the row
+/// below waits on a row, so each row has its own counter and its own
+/// sleeper: a publish touches one atomic and wakes the one waiter
+/// whose target it reached, never the other rows' workers.
 struct Progress {
-    done: Mutex<Vec<usize>>,
-    changed: Condvar,
+    rows: Vec<RowProgress>,
     abort: AtomicBool,
 }
 
+/// One row's published CTB count and its (single) waiter.
+struct RowProgress {
+    done: AtomicUsize,
+    /// The count the row below sleeps for (`usize::MAX`: no sleeper).
+    wanted: AtomicUsize,
+    lock: Mutex<()>,
+    changed: Condvar,
+}
+
 impl Progress {
+    fn new(rows: usize) -> Self {
+        Self {
+            rows: (0..rows)
+                .map(|_| RowProgress {
+                    done: AtomicUsize::new(0),
+                    wanted: AtomicUsize::new(usize::MAX),
+                    lock: Mutex::new(()),
+                    changed: Condvar::new(),
+                })
+                .collect(),
+            abort: AtomicBool::new(false),
+        }
+    }
+
     /// Wait until row `r` has published at least `n` CTBs (or the
     /// picture was aborted — `false`).
     fn wait(&self, r: usize, n: usize) -> bool {
-        let mut g = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        while g[r] < n {
-            if self.abort.load(Ordering::Acquire) {
-                return false;
+        let row = &self.rows[r];
+        // The row above is usually ahead, or about to publish: look
+        // (briefly) before sleeping.
+        for _ in 0..64 {
+            if row.done.load(Ordering::Acquire) >= n {
+                return true;
             }
-            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+            std::hint::spin_loop();
         }
-        true
+        let mut g = row.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // The publisher reads `wanted` after bumping `done` and this
+        // side reads `done` after setting `wanted` (both sequentially
+        // consistent), so one of them sees the other's write.
+        row.wanted.store(n, Ordering::SeqCst);
+        let ok = loop {
+            if row.done.load(Ordering::SeqCst) >= n {
+                break true;
+            }
+            if self.abort.load(Ordering::Acquire) {
+                break false;
+            }
+            g = row.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        };
+        row.wanted.store(usize::MAX, Ordering::SeqCst);
+        drop(g);
+        ok
     }
 
     fn publish(&self, r: usize) {
-        let mut g = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        g[r] += 1;
-        drop(g);
-        self.changed.notify_all();
+        let row = &self.rows[r];
+        let done = row.done.fetch_add(1, Ordering::SeqCst) + 1;
+        if done >= row.wanted.load(Ordering::SeqCst) {
+            // Taking the lock orders this after the sleeper's entry
+            // into its wait.
+            drop(row.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            row.changed.notify_all();
+        }
     }
 
     fn fail(&self) {
         self.abort.store(true, Ordering::Release);
-        let _g = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        self.changed.notify_all();
+        for row in &self.rows {
+            drop(row.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            row.changed.notify_all();
+        }
     }
 }
 
@@ -282,11 +331,7 @@ pub(super) fn decode_rows(
     let (cw, _) = pic.plane_dims(Plane::Cb);
 
     let error: Mutex<Option<SequenceError>> = Mutex::new(None);
-    let progress = Progress {
-        done: Mutex::new(vec![0usize; h_ctbs]),
-        changed: Condvar::new(),
-        abort: AtomicBool::new(false),
-    };
+    let progress = Progress::new(h_ctbs);
     let halos: Vec<OnceLock<CtbHalo>> = (0..w_ctbs * h_ctbs).map(|_| OnceLock::new()).collect();
     let next_row = AtomicUsize::new(0);
     {
