@@ -629,48 +629,92 @@ fn synthesize_1d<T: TransformAcc>(x: &[T], nz: usize, tr_type: bool, y: &mut [T]
     idct_even_odd(x, nz, y);
 }
 
+/// The odd-input half of the `2 · H`-point basis: `ODD[ m ][ k ] =
+/// transMatrix[ ( 2m + 1 ) · stride ][ k ]` for `k < H`, the weights
+/// input `2m + 1` contributes to the first `H` outputs.
+const fn odd_rows<const H: usize>() -> [[i32; H]; H] {
+    let stride = 16 / H;
+    let mut t = [[0i32; H]; H];
+    let mut m = 0;
+    while m < H {
+        let mut k = 0;
+        while k < H {
+            t[m][k] = DCT32[(2 * m + 1) * stride][k];
+            k += 1;
+        }
+        m += 1;
+    }
+    t
+}
+
+static ODD8: [[i32; 4]; 4] = odd_rows::<4>();
+static ODD16: [[i32; 8]; 8] = odd_rows::<8>();
+static ODD32: [[i32; 16]; 16] = odd_rows::<16>();
+
 /// The even / odd DCT-II synthesis of [`synthesize_1d`]; `x.len()` is
 /// the point count `n` (4 / 8 / 16 / 32), reading the §8.6.4.2 basis at
 /// stride `32 / n`.
+#[inline]
 fn idct_even_odd<T: TransformAcc>(x: &[T], nz: usize, y: &mut [T]) {
-    let n = x.len();
-    let stride = 32 / n;
-    if n == 4 {
-        // Base case written out: rows 0 / 8 / 16 / 24 of the basis.
-        let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
-        let b = |j: usize, i: usize| T::from(DCT32[j * stride][i]);
-        let e0 = b(0, 0) * x0 + b(2, 0) * x2;
-        let e1 = b(0, 1) * x0 + b(2, 1) * x2;
-        let (o0, o1) = if nz > 1 {
-            (b(1, 0) * x1 + b(3, 0) * x3, b(1, 1) * x1 + b(3, 1) * x3)
-        } else {
-            (T::default(), T::default())
-        };
-        y[0] = e0 + o0;
-        y[1] = e1 + o1;
-        y[2] = e1 - o1;
-        y[3] = e0 - o0;
-        return;
+    match x.len() {
+        4 => idct4(x, nz, y),
+        8 => idct_split::<T, 4>(x, nz, y, &ODD8),
+        16 => idct_split::<T, 8>(x, nz, y, &ODD16),
+        _ => idct_split::<T, 16>(x, nz, y, &ODD32),
     }
-    let half = n / 2;
-    // Even part: the n/2-point synthesis of x[0], x[2], ... (the same
-    // basis rows at twice the stride).
-    let mut even_in = [T::default(); 16];
-    for (m, e) in even_in.iter_mut().enumerate().take(half) {
+}
+
+/// The 4-point base case written out: rows 0 / 8 / 16 / 24 of the
+/// basis.
+#[inline(always)]
+fn idct4<T: TransformAcc>(x: &[T], nz: usize, y: &mut [T]) {
+    let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
+    let b = |j: usize, i: usize| T::from(DCT32[j * 8][i]);
+    let e0 = b(0, 0) * x0 + b(2, 0) * x2;
+    let e1 = b(0, 1) * x0 + b(2, 1) * x2;
+    let (o0, o1) = if nz > 1 {
+        (b(1, 0) * x1 + b(3, 0) * x3, b(1, 1) * x1 + b(3, 1) * x3)
+    } else {
+        (T::default(), T::default())
+    };
+    y[0] = e0 + o0;
+    y[1] = e1 + o1;
+    y[2] = e1 - o1;
+    y[3] = e0 - o0;
+}
+
+/// One even / odd level of `2 · H` points. The even part is the
+/// `H`-point synthesis of `x[ 0 ], x[ 2 ], ...`; the odd part
+/// accumulates each odd input times its row of `odd` across the `H`
+/// outputs at once (a scaled-vector sum, so the compiler keeps the
+/// outputs in vector lanes).
+#[inline(always)]
+fn idct_split<T: TransformAcc, const H: usize>(
+    x: &[T],
+    nz: usize,
+    y: &mut [T],
+    odd: &[[i32; H]; H],
+) {
+    let nz = nz.min(2 * H);
+    let x = &x[..2 * H];
+    let y = &mut y[..2 * H];
+    let mut even_in = [T::default(); H];
+    for (m, e) in even_in.iter_mut().enumerate().take(nz.div_ceil(2)) {
         *e = x[2 * m];
     }
-    let mut even_out = [T::default(); 16];
-    idct_even_odd(&even_in[..half], nz.div_ceil(2), &mut even_out[..half]);
-    // Odd part over the odd inputs that may be non-zero.
-    let odd_n = nz / 2;
-    for i in 0..half {
-        let mut o = T::default();
-        for m in 0..odd_n {
-            let j = 2 * m + 1;
-            o = o + T::from(DCT32[j * stride][i]) * x[j];
+    let mut even = [T::default(); H];
+    idct_even_odd(&even_in[..], nz.div_ceil(2), &mut even[..]);
+    let mut o = [T::default(); H];
+    for (m, row) in odd.iter().enumerate().take(nz / 2) {
+        let xj = x[2 * m + 1];
+        for (acc, &c) in o.iter_mut().zip(row) {
+            *acc = *acc + T::from(c) * xj;
         }
-        y[i] = even_out[i] + o;
-        y[n - 1 - i] = even_out[i] - o;
+    }
+    let (lo, hi) = y.split_at_mut(H);
+    for (k, (&e, &ov)) in even.iter().zip(&o).enumerate() {
+        lo[k] = e + ov;
+        hi[H - 1 - k] = e - ov;
     }
 }
 
@@ -731,16 +775,37 @@ pub fn residual_block(
     scaling: Option<&ScalingFactorMatrix>,
     params: BlockParams,
 ) -> Result<Vec<i32>, TransformError> {
+    let mut r = vec![0i32; levels.len()];
+    residual_block_into(levels, scaling, params, &mut r)?;
+    Ok(r)
+}
+
+/// [`residual_block`] into a caller array: `r` receives the `nTbS²`
+/// residual samples (row-major by `y`; its previous contents are
+/// overwritten).
+///
+/// # Errors
+/// As [`residual_block`]; `r.len()` must be `nTbS²` as well.
+pub fn residual_block_into(
+    levels: &[i32],
+    scaling: Option<&ScalingFactorMatrix>,
+    params: BlockParams,
+    r: &mut [i32],
+) -> Result<(), TransformError> {
     let n_tbs = params.n_tbs;
     let log2_tbs = log2_tbs(n_tbs).ok_or(TransformError::InvalidBlockSize(n_tbs))?;
     if !(8..=16).contains(&params.bit_depth) {
         return Err(TransformError::InvalidBitDepth(params.bit_depth));
     }
     let count = n_tbs * n_tbs;
-    if levels.len() != count {
+    if levels.len() != count || r.len() != count {
         return Err(TransformError::LengthMismatch {
             expected: count,
-            got: levels.len(),
+            got: if levels.len() != count {
+                levels.len()
+            } else {
+                r.len()
+            },
         });
     }
 
@@ -753,18 +818,14 @@ pub fn residual_block(
     // §8.6.2 cu_transquant_bypass_flag == 1 path (eq. 8-297 / array
     // copy): no scaling, no transform, no bdShift.
     if params.transquant_bypass {
-        let mut r = vec![0i32; count];
-        for y in 0..n_tbs {
-            for x in 0..n_tbs {
-                let (sx, sy) = if rotate {
-                    (n_tbs - x - 1, n_tbs - y - 1)
-                } else {
-                    (x, y)
-                };
-                r[y * n_tbs + x] = levels[sy * n_tbs + sx];
+        if rotate {
+            for (d, &l) in r.iter_mut().zip(levels.iter().rev()) {
+                *d = l;
             }
+        } else {
+            r.copy_from_slice(levels);
         }
-        return Ok(r);
+        return Ok(());
     }
 
     // §8.6.2 equations 8-294/8-295/8-296: bitDepth, bdShift, tsShift.
@@ -784,11 +845,12 @@ pub fn residual_block(
                 got: m.dim as usize * m.dim as usize,
             });
         }
-        return Ok(if count <= 64 {
-            scaled_inverse::<64>(levels, scaling, &params, log2_tbs, bd_shift)
+        if count <= 64 {
+            scaled_inverse::<64>(levels, scaling, &params, log2_tbs, bd_shift, r);
         } else {
-            scaled_inverse::<1024>(levels, scaling, &params, log2_tbs, bd_shift)
-        });
+            scaled_inverse::<1024>(levels, scaling, &params, log2_tbs, bd_shift, r);
+        }
+        return Ok(());
     }
 
     // §8.6.2 ordered step 1: §8.6.3 scaling process -> d.
@@ -801,46 +863,35 @@ pub fn residual_block(
         scaling,
     )?;
 
-    // §8.6.2 ordered step 2.
-    let pre = if params.transform_skip {
-        // eq. 8-298: r[x][y] = (rotate ? d[n-x-1][n-y-1] : d[x][y]) << tsShift.
-        let ts_shift = 5 + log2_tbs as i32;
-        let mut r = vec![0i32; count];
-        for y in 0..n_tbs {
-            for x in 0..n_tbs {
-                let (sx, sy) = if rotate {
-                    (n_tbs - x - 1, n_tbs - y - 1)
-                } else {
-                    (x, y)
-                };
-                r[y * n_tbs + x] = ((d[sy * n_tbs + sx] as i64) << ts_shift) as i32;
-            }
-        }
-        r
-    } else {
-        // §8.6.4 transformation process.
-        inverse_transform(
-            &d,
-            n_tbs,
-            params.pred_mode,
-            params.component,
-            params.bit_depth,
-            params.extended_precision,
-        )?
-    };
-
-    // §8.6.2 ordered step 3 (eq. 8-299): r = (r + (1 << (bdShift-1))) >> bdShift,
-    // in place over the transform output.
-    let mut r = pre;
-    if bd_shift > 0 {
-        let round = 1i64 << (bd_shift - 1);
-        for rv in r.iter_mut() {
-            *rv = (((*rv as i64) + round) >> bd_shift) as i32;
-        }
-    }
+    // §8.6.2 ordered step 2 (the transformed block returned above):
+    // eq. 8-298, r[x][y] = (rotate ? d[n-x-1][n-y-1] : d[x][y]) << tsShift,
+    // then step 3 (eq. 8-299): r = (r + (1 << (bdShift-1))) >> bdShift.
     // bdShift == 0 only under extended-precision with bitDepth == 20
     // (out of our 8..=16 domain): the no-shift identity.
-    Ok(r)
+    let ts_shift = 5 + log2_tbs as i32;
+    let round = if bd_shift > 0 {
+        1i64 << (bd_shift - 1)
+    } else {
+        0
+    };
+    let finish = |dv: i32| -> i32 {
+        let pre = (i64::from(dv) << ts_shift) as i32;
+        if bd_shift > 0 {
+            ((i64::from(pre) + round) >> bd_shift) as i32
+        } else {
+            pre
+        }
+    };
+    if rotate {
+        for (o, &dv) in r.iter_mut().zip(d.iter().rev()) {
+            *o = finish(dv);
+        }
+    } else {
+        for (o, &dv) in r.iter_mut().zip(d.iter()) {
+            *o = finish(dv);
+        }
+    }
+    Ok(())
 }
 
 /// §8.6.2 for a transformed block (`transform_skip_flag == 0`, no
@@ -856,7 +907,8 @@ fn scaled_inverse<const NN: usize>(
     params: &BlockParams,
     log2_tbs: u32,
     bd_shift: i32,
-) -> Vec<i32> {
+    r: &mut [i32],
+) {
     let n_tbs = params.n_tbs;
     let count = n_tbs * n_tbs;
     let (bit_depth, extended_precision) = (params.bit_depth, params.extended_precision);
@@ -908,7 +960,8 @@ fn scaled_inverse<const NN: usize>(
         }
     };
     if !any {
-        return vec![0i32; count];
+        r.fill(0);
+        return;
     }
     // §8.6.4 trType: 1 iff MODE_INTRA, nTbS == 4, cIdx == 0.
     let tr_type = matches!(params.pred_mode, PredMode::Intra)
@@ -917,9 +970,9 @@ fn scaled_inverse<const NN: usize>(
     if max_x == 0 && max_y == 0 && !tr_type {
         let (lo, hi) = (i64::from(coeff_min), i64::from(coeff_max));
         let g = clip3(lo, hi, (64 * i64::from(d[0]) + 64) >> 7);
-        return vec![finish((64 * g) as i32); count];
+        r.fill(finish((64 * g) as i32));
+        return;
     }
-    let mut r = vec![0i32; count];
     if extended_precision {
         inverse_transform_passes::<i64>(
             &d[..count],
@@ -929,7 +982,7 @@ fn scaled_inverse<const NN: usize>(
             coeff_max,
             max_x,
             max_y,
-            &mut r,
+            r,
         );
     } else {
         inverse_transform_passes::<i32>(
@@ -940,7 +993,7 @@ fn scaled_inverse<const NN: usize>(
             coeff_max,
             max_x,
             max_y,
-            &mut r,
+            r,
         );
     }
     if bd_shift > 0 {
@@ -948,7 +1001,6 @@ fn scaled_inverse<const NN: usize>(
             *rv = finish(*rv);
         }
     }
-    r
 }
 
 /// §8.6.5 — residual modification process for blocks using a transform

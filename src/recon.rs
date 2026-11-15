@@ -34,12 +34,12 @@ use crate::intra_pred::{
     Component as IpComponent, INTRA_DC, IntraPredError, IntraPredParams, MarkedReferenceSamples,
     intra_predict_with_substitution,
 };
-use crate::picture::{Picture, Plane, clip1, sub_wh_c};
+use crate::picture::{Picture, Plane, sub_wh_c};
 use crate::scaling_list::ScalingFactors;
 use crate::slice_data::{CodingQuadtree, CodingTreeUnit, CodingUnit, IntraLumaMode};
 use crate::transform::{
     BlockParams, Component as TfComponent, PredMode, TransformError, rdpcm_accumulate,
-    residual_block,
+    residual_block_into,
 };
 use crate::transform_tree::TransformTree;
 use crate::transform_unit::TransformUnit;
@@ -529,10 +529,11 @@ impl<'a> CcpInput<'a> {
 /// into `pic`. `(xb, yb)` is the plane-coordinate top-left; `pred_mode`
 /// is the §8.4.x prediction mode for the plane's component.
 ///
-/// Returns the final residual array (post-§8.6.5/§8.6.6 modification)
-/// so a 4:4:4 caller can feed the luma residual into the chroma
-/// blocks' §8.6.6 cross-component prediction; `None` when the block
-/// carried no residual at all.
+/// The final residual array (post-§8.6.5/§8.6.6 modification) is left
+/// in `res_buf[ .. nTbS² ]` so a 4:4:4 caller can feed the luma
+/// residual into the chroma blocks' §8.6.6 cross-component prediction;
+/// returns `false` when the block carried no residual at all (the
+/// array is then unspecified).
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_block(
     pic: &mut Picture,
@@ -550,10 +551,13 @@ fn reconstruct_intra_block(
     transquant_bypass: bool,
     transform_skip: bool,
     ccp: Option<CcpInput<'_>>,
-) -> Result<Option<Vec<i32>>, ReconError> {
-    // §8.6.2 residual array (zero when the block has no coded coeffs).
-    let res: Option<Vec<i32>> = match residual {
-        Some(levels) => Some(intra_residual_array(
+    res_buf: &mut [i32],
+) -> Result<bool, ReconError> {
+    let res_buf = &mut res_buf[..n_tbs * n_tbs];
+    // §8.6.2 residual array (absent when the block has no coded coeffs).
+    let mut has_res = false;
+    if let Some(levels) = residual {
+        intra_residual_into(
             params,
             cidx,
             n_tbs,
@@ -562,28 +566,28 @@ fn reconstruct_intra_block(
             qp,
             transquant_bypass,
             transform_skip,
-        )?),
-        None => None,
-    };
+            res_buf,
+        )?;
+        has_res = true;
+    }
 
     // §8.4.4.1 step 8: cross-component prediction modifies the chroma
     // residual from the co-located luma residual (after the step-7
     // §8.6.5 modification, before the §8.6.7 add). A block with no
     // coded chroma residual still receives the scaled luma residual.
-    let res = match ccp {
-        Some(c) => {
-            let mut r = res.unwrap_or_else(|| vec![0i32; n_tbs * n_tbs]);
-            apply_cross_comp_pred(
-                &mut r,
-                c.luma_residual,
-                c.res_scale_val,
-                params.bit_depth_luma,
-                params.bit_depth_chroma,
-            );
-            Some(r)
+    if let Some(c) = ccp {
+        if !has_res {
+            res_buf.fill(0);
+            has_res = true;
         }
-        None => res,
-    };
+        apply_cross_comp_pred(
+            res_buf,
+            c.luma_residual,
+            c.res_scale_val,
+            params.bit_depth_luma,
+            params.bit_depth_chroma,
+        );
+    }
 
     predict_add_store(
         pic,
@@ -596,9 +600,21 @@ fn reconstruct_intra_block(
         n_tbs,
         pred_mode_intra,
         transquant_bypass,
-        res.as_deref(),
+        has_res.then_some(&*res_buf),
     )?;
-    Ok(res)
+    Ok(has_res)
+}
+
+/// A zeroed scratch block of at least `n_tbs²` samples on the stack,
+/// sized by the block (a 4x4 / 8x8 block does not pay for a 32x32
+/// one).
+#[inline(always)]
+fn with_block_buf<R>(n_tbs: usize, f: impl FnOnce(&mut [i32]) -> R) -> R {
+    if n_tbs <= 8 {
+        f(&mut [0i32; 64])
+    } else {
+        f(&mut [0i32; 1024])
+    }
 }
 
 /// §8.6.2 + §8.6.5 — dequantize / inverse-transform one intra block's
@@ -615,6 +631,34 @@ fn intra_residual_array(
     transquant_bypass: bool,
     transform_skip: bool,
 ) -> Result<Vec<i32>, ReconError> {
+    let mut r = vec![0i32; n_tbs * n_tbs];
+    intra_residual_into(
+        params,
+        cidx,
+        n_tbs,
+        pred_mode_intra,
+        levels,
+        qp,
+        transquant_bypass,
+        transform_skip,
+        &mut r,
+    )?;
+    Ok(r)
+}
+
+/// [`intra_residual_array`] into `r` (`nTbS²` samples).
+#[allow(clippy::too_many_arguments)]
+fn intra_residual_into(
+    params: &ReconParams,
+    cidx: TfComponent,
+    n_tbs: usize,
+    pred_mode_intra: u8,
+    levels: &[i32],
+    qp: u32,
+    transquant_bypass: bool,
+    transform_skip: bool,
+    r: &mut [i32],
+) -> Result<(), ReconError> {
     let bit_depth = match cidx {
         TfComponent::Luma => params.bit_depth_luma,
         TfComponent::Cb | TfComponent::Cr => params.bit_depth_chroma,
@@ -631,7 +675,7 @@ fn intra_residual_array(
         transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
     };
     let m = scaling_matrix(params, n_tbs, PredMode::Intra, cidx, transform_skip);
-    let mut r = residual_block(levels, m, bp)?;
+    residual_block_into(levels, m, bp, r)?;
     // §8.4.4.1: residualDpcm — implicit RDPCM applies the §8.6.5
     // directional residual modification to intra blocks in
     // transform-skip / transquant-bypass form whose prediction mode is
@@ -641,9 +685,9 @@ fn intra_residual_array(
         && (transform_skip || transquant_bypass)
         && (pred_mode_intra == 10 || pred_mode_intra == 26)
     {
-        rdpcm_accumulate(&mut r, n_tbs, pred_mode_intra == 26);
+        rdpcm_accumulate(r, n_tbs, pred_mode_intra == 26);
     }
-    Ok(r)
+    Ok(())
 }
 
 /// §8.4.4.2.1 prediction + §8.6.7 picture construction for one intra
@@ -664,7 +708,6 @@ fn predict_add_store(
     res: Option<&[i32]>,
 ) -> Result<(), ReconError> {
     let bit_depth = pic.bit_depth(plane);
-    let marked = gather_reference_samples(pic, ctx, plane, xb, yb, n_tbs);
     // §8.4.4.2.6: disableIntraBoundaryFilter is 1 when
     // intra_boundary_filtering_disabled_flag is 1, or when
     // implicit_rdpcm_enabled_flag and cu_transquant_bypass_flag are
@@ -684,9 +727,39 @@ fn predict_add_store(
         chroma_array_type_3: params.chroma_array_type == 3,
         disable_boundary_filter,
     };
-    let pred = intra_predict_with_substitution(&marked, &ip_params)?;
+    // The allocation-free path covers every block the syntax can
+    // produce (a square 4 / 8 / 16 / 32 block, a Table 8-1 mode); the
+    // general pipeline stays behind it.
+    if matches!(n_tbs, 4 | 8 | 16 | 32) && pred_mode_intra <= 34 && (8..=16).contains(&bit_depth) {
+        let mut refs = crate::intra_pred::Refs::empty();
+        gather_refs(pic, ctx, plane, xb, yb, n_tbs, &mut refs);
+        refs.substitute_marked(bit_depth);
+        with_block_buf(n_tbs, |pred| {
+            crate::intra_pred::predict_from_refs(&refs, &ip_params, pred);
+            add_store(pic, plane, xb, yb, n_tbs, bit_depth, pred, res);
+        });
+    } else {
+        let marked = gather_reference_samples(pic, ctx, plane, xb, yb, n_tbs);
+        let pred = intra_predict_with_substitution(&marked, &ip_params)?;
+        add_store(pic, plane, xb, yb, n_tbs, bit_depth, &pred, res);
+    }
+    Ok(())
+}
 
-    // §8.4.4.1 / §8.6.7: recSamples = Clip1( predSamples + resSamples ).
+/// §8.4.4.1 / §8.6.7: `recSamples = Clip1( predSamples + resSamples )`
+/// for one `nTbS`x`nTbS` block at plane position `( xb, yb )`.
+#[allow(clippy::too_many_arguments)]
+fn add_store(
+    pic: &mut Picture,
+    plane: Plane,
+    xb: usize,
+    yb: usize,
+    n_tbs: usize,
+    bit_depth: u8,
+    pred: &[i32],
+    res: Option<&[i32]>,
+) {
+    let max_val = (1i32 << bit_depth) - 1;
     let (buf, stride, (ox, oy)) = pic.plane_mut_origin(plane);
     for y in 0..n_tbs {
         let o = (yb + y - oy) * stride + (xb - ox);
@@ -696,17 +769,114 @@ fn predict_add_store(
             Some(r) => {
                 let rrow = &r[y * n_tbs..(y + 1) * n_tbs];
                 for ((d, &p), &r) in row.iter_mut().zip(prow).zip(rrow) {
-                    *d = clip1(p + r, bit_depth) as u16;
+                    *d = (p + r).clamp(0, max_val) as u16;
                 }
             }
             None => {
                 for (d, &p) in row.iter_mut().zip(prow) {
-                    *d = clip1(p, bit_depth) as u16;
+                    *d = p.clamp(0, max_val) as u16;
                 }
             }
         }
     }
-    Ok(())
+}
+
+/// [`gather_reference_samples`] into fixed arrays: `refs.left[ 0 ]` is
+/// the corner `p[ −1 ][ −1 ]`, `refs.left[ 1 + y ] = p[ −1 ][ y ]`,
+/// `refs.top[ 1 + x ] = p[ x ][ −1 ]`, a sample that is not available
+/// for intra prediction marked [`crate::intra_pred::REF_UNAVAILABLE`].
+fn gather_refs(
+    pic: &Picture,
+    ctx: &ReconCtx,
+    plane: Plane,
+    xb: usize,
+    yb: usize,
+    n_tbs: usize,
+    refs: &mut crate::intra_pred::Refs,
+) {
+    use crate::intra_pred::REF_UNAVAILABLE;
+    let (pw, ph) = pic.plane_dims(plane);
+    let (sub_w, sub_h) = match plane {
+        Plane::Luma => (1, 1),
+        Plane::Cb | Plane::Cr => sub_wh_c(pic.chroma_array_type()),
+    };
+    // One §6.4.1 test per 4x4 luma min block (see
+    // `gather_reference_samples`).
+    let avail = |x: i64, y: i64| -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) < pw
+            && (y as usize) < ph
+            && ctx.ref_sample_available(xb, yb, x, y, sub_w, sub_h)
+    };
+    let pi = match plane {
+        Plane::Luma => 0,
+        Plane::Cb => 1,
+        Plane::Cr => 2,
+    };
+    let (x0, y0, _) = pic.band(plane);
+    let (buf, stride) = pic.plane_slice(plane);
+    refs.n = n_tbs;
+    let n2 = 2 * n_tbs;
+    // The row above, with the plane column of its first entry: the
+    // saved unfiltered line (a whole plane row) when a row-progressive
+    // decode has already filtered the picture's, else the picture row
+    // (stored from the band's first column).
+    let saved = ctx
+        .unfiltered_above
+        .as_ref()
+        .map(|lines| &lines[pi])
+        .filter(|(y, _)| yb > 0 && *y == yb - 1);
+    let (above, above_x0): (Option<&[u16]>, usize) = match saved {
+        Some((_, line)) => (Some(&line[..]), 0),
+        // A band stores no row above its first (the tile or slice
+        // above is not available to it either).
+        None if yb > y0 => {
+            let o = (yb - 1 - y0) * stride;
+            (buf.get(o..o + stride), x0)
+        }
+        None => (None, 0),
+    };
+    // Corner p[−1][−1].
+    refs.left[0] = match above {
+        Some(row) if avail(xb as i64 - 1, yb as i64 - 1) => i32::from(row[xb - 1 - above_x0]),
+        _ => REF_UNAVAILABLE,
+    };
+    // Left column p[−1][0 .. 2*nTbS−1].
+    let unit_v = (4 / sub_h).max(1);
+    let mut y = 0usize;
+    while y < n2 {
+        let run = unit_v.min(n2 - y);
+        if avail(xb as i64 - 1, (yb + y) as i64) {
+            let mut o = (yb + y - y0) * stride + (xb - 1 - x0);
+            for d in &mut refs.left[1 + y..1 + y + run] {
+                *d = i32::from(buf[o]);
+                o += stride;
+            }
+        } else {
+            refs.left[1 + y..1 + y + run].fill(REF_UNAVAILABLE);
+        }
+        y += run;
+    }
+    // Top row p[0 .. 2*nTbS−1][−1].
+    let unit_h = (4 / sub_w).max(1);
+    let mut x = 0usize;
+    while x < n2 {
+        let run = unit_h.min(n2 - x);
+        match above {
+            Some(row) if avail((xb + x) as i64, yb as i64 - 1) => {
+                let s = xb + x - above_x0;
+                for (d, &v) in refs.top[1 + x..1 + x + run]
+                    .iter_mut()
+                    .zip(&row[s..s + run])
+                {
+                    *d = i32::from(v);
+                }
+            }
+            _ => refs.top[1 + x..1 + x + run].fill(REF_UNAVAILABLE),
+        }
+        x += run;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,12 +1449,19 @@ pub struct CuResidualPlane {
 impl CuResidualPlane {
     /// A zero residual plane covering `(x0, y0)` of size `width × height`.
     fn zeros(x0: usize, y0: usize, width: usize, height: usize) -> Self {
+        // The sample array of a plane a previous coding unit handed
+        // back ([`CuResidual::recycle`]), when one is at hand.
+        let mut samples = RESIDUAL_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_default();
+        samples.clear();
+        samples.resize(width * height, 0);
         Self {
             x0,
             y0,
             width,
             height,
-            samples: vec![0; width * height],
+            samples,
         }
     }
 
@@ -1292,19 +1469,20 @@ impl CuResidualPlane {
     /// `(bx, by)` (the block's top-left in the same coordinate system as
     /// `x0`/`y0`), clipping to the plane bounds.
     fn write_block(&mut self, bx: usize, by: usize, n: usize, block: &[i32]) {
-        for y in 0..n {
+        // The columns of the block inside the plane.
+        let xa = bx.max(self.x0);
+        let xe = (bx + n).min(self.x0 + self.width);
+        if xa >= xe {
+            return;
+        }
+        for (y, brow) in block.chunks_exact(n).take(n).enumerate() {
             let py = by + y;
             if py < self.y0 || py >= self.y0 + self.height {
                 continue;
             }
-            for x in 0..n {
-                let px = bx + x;
-                if px < self.x0 || px >= self.x0 + self.width {
-                    continue;
-                }
-                let idx = (py - self.y0) * self.width + (px - self.x0);
-                self.samples[idx] = block[y * n + x];
-            }
+            let o = (py - self.y0) * self.width;
+            self.samples[o + xa - self.x0..o + xe - self.x0]
+                .copy_from_slice(&brow[xa - bx..xe - bx]);
         }
     }
 
@@ -1347,6 +1525,13 @@ impl CuResidualPlane {
     }
 }
 
+thread_local! {
+    /// Sample arrays of residual planes whose coding unit is done (at
+    /// most one coding unit's worth), reused by the next unit.
+    static RESIDUAL_POOL: core::cell::RefCell<Vec<Vec<i32>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
 /// The three per-component residual planes of one inter coding unit.
 #[derive(Debug, Clone)]
 pub struct CuResidual {
@@ -1363,10 +1548,29 @@ impl CuResidual {
     /// A residual with zero-sized planes (a CU that codes none).
     pub(crate) fn empty() -> Self {
         Self {
-            luma: CuResidualPlane::zeros(0, 0, 0, 0),
+            luma: CuResidualPlane {
+                x0: 0,
+                y0: 0,
+                width: 0,
+                height: 0,
+                samples: Vec::new(),
+            },
             cb: None,
             cr: None,
         }
+    }
+
+    /// Hand the planes' sample arrays to the next coding unit's
+    /// [`extract_cu_residual`] on this thread.
+    pub(crate) fn recycle(self) {
+        RESIDUAL_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for plane in [Some(self.luma), self.cb, self.cr].into_iter().flatten() {
+                if pool.len() < 3 && plane.samples.capacity() > 0 {
+                    pool.push(plane.samples);
+                }
+            }
+        });
     }
 
     /// `true` when this CU codes no residual at all (skip / `rqt_root_cbf
@@ -1552,12 +1756,20 @@ fn extract_residual_tree(
             // Luma residual (§8.6.2 with the MODE_INTER path). The
             // array is kept for the §8.5.4.3 step-5 cross-component
             // prediction of this unit's chroma blocks (4:4:4).
-            let luma_res: Option<Vec<i32>> = match &unit.residual_luma {
+            let mut small = [0i32; 64];
+            let mut large: [i32; 1024];
+            let luma_res: Option<&[i32]> = match &unit.residual_luma {
                 Some(rb) => {
                     let qp = luma_qp(params, qp_y);
-                    let res =
-                        inter_residual_block(params, rb, TfComponent::Luma, qp, transquant_bypass)?;
-                    luma.write_block(x0, y0, n_tbs, &res);
+                    let n = rb.size();
+                    let res: &mut [i32] = if n <= 8 {
+                        &mut small[..n * n]
+                    } else {
+                        large = [0i32; 1024];
+                        &mut large[..(n * n).min(1024)]
+                    };
+                    inter_residual_into(params, rb, TfComponent::Luma, qp, transquant_bypass, res)?;
+                    luma.write_block(x0, y0, n_tbs, res);
                     Some(res)
                 }
                 None => None,
@@ -1577,7 +1789,6 @@ fn extract_residual_tree(
                 };
                 let (sw, sh) = sub_wh_c(params.chroma_array_type);
                 let (xc, yc) = (x_base / sw, y_base / sh);
-                let luma_res = luma_res.as_deref();
                 let ccp_cb = CcpInput::resolve(
                     params.chroma_array_type,
                     unit.cross_comp_pred_cb.as_ref(),
@@ -1659,34 +1870,38 @@ fn write_chroma_residual_blocks(
     let mut next_block = 0usize;
     let halves = if params.chroma_array_type == 2 { 2 } else { 1 };
     for (v, &coded) in coded_halves.iter().enumerate().take(halves) {
-        let (mut res, n) = if coded {
+        let block = if coded {
             let Some(rb) = blocks.get(next_block) else {
                 break;
             };
             next_block += 1;
-            let n = rb.size();
-            (
-                inter_residual_block(params, rb, cidx, qp, transquant_bypass)?,
-                n,
-            )
+            Some(rb)
         } else if ccp.is_some() {
             // §8.5.4.3 step 5 applies to every chroma transform block
             // of the unit; a cbf-clear block starts from zeros.
-            (vec![0i32; n_tbs_c * n_tbs_c], n_tbs_c)
+            None
         } else {
             continue;
         };
-        if let Some(c) = ccp {
-            apply_cross_comp_pred(
-                &mut res,
-                c.luma_residual,
-                c.res_scale_val,
-                params.bit_depth_luma,
-                params.bit_depth_chroma,
-            );
-        }
-        let by = if v == 1 { yc + n } else { yc };
-        plane.write_block(xc, by, n, &res);
+        let n = block.map_or(n_tbs_c, |rb| rb.size());
+        with_block_buf(n, |buf| -> Result<(), ReconError> {
+            let res = &mut buf[..(n * n).min(1024)];
+            if let Some(rb) = block {
+                inter_residual_into(params, rb, cidx, qp, transquant_bypass, res)?;
+            }
+            if let Some(c) = ccp {
+                apply_cross_comp_pred(
+                    res,
+                    c.luma_residual,
+                    c.res_scale_val,
+                    params.bit_depth_luma,
+                    params.bit_depth_chroma,
+                );
+            }
+            let by = if v == 1 { yc + n } else { yc };
+            plane.write_block(xc, by, n, res);
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -1701,6 +1916,20 @@ fn inter_residual_block(
     qp: u32,
     transquant_bypass: bool,
 ) -> Result<Vec<i32>, ReconError> {
+    let mut r = vec![0i32; rb.size() * rb.size()];
+    inter_residual_into(params, rb, cidx, qp, transquant_bypass, &mut r)?;
+    Ok(r)
+}
+
+/// [`inter_residual_block`] into `r` (`nTbS²` samples).
+fn inter_residual_into(
+    params: &ReconParams,
+    rb: &crate::residual::ResidualBlock,
+    cidx: TfComponent,
+    qp: u32,
+    transquant_bypass: bool,
+    r: &mut [i32],
+) -> Result<(), ReconError> {
     let n_tbs = rb.size();
     let bit_depth = match cidx {
         TfComponent::Luma => params.bit_depth_luma,
@@ -1718,14 +1947,14 @@ fn inter_residual_block(
         transform_skip_rotation_enabled: params.transform_skip_rotation_enabled,
     };
     let m = scaling_matrix(params, n_tbs, PredMode::Inter, cidx, rb.transform_skip);
-    let mut r = residual_block(&rb.levels, m, bp)?;
+    residual_block_into(&rb.levels, m, bp, r)?;
     // §8.5.4.2 step 3 / §8.5.4.3 step 4: when explicit_rdpcm_flag is 1,
     // the §8.6.5 directional residual modification is invoked with
     // mDir = explicit_rdpcm_dir_flag (0 horizontal, 1 vertical).
     if rb.explicit_rdpcm_flag {
-        rdpcm_accumulate(&mut r, n_tbs, rb.explicit_rdpcm_dir_flag);
+        rdpcm_accumulate(r, n_tbs, rb.explicit_rdpcm_dir_flag);
     }
-    Ok(r)
+    Ok(())
 }
 
 /// Per-picture intra-reconstruction neighbour state — the §8.4.2
@@ -3067,7 +3296,17 @@ fn reconstruct_transform_unit(
         .is_some_and(|rb| rb.transform_skip);
     // (§7.3.8.11: explicit_rdpcm_flag is only signalled for MODE_INTER
     // blocks — an intra unit's residual never carries it.)
-    let luma_residual = reconstruct_intra_block(
+    // The luma residual stays on the stack for the chroma blocks'
+    // cross-component prediction.
+    let mut small = [0i32; 64];
+    let mut large: [i32; 1024];
+    let luma_buf: &mut [i32] = if n_tbs <= 8 {
+        &mut small
+    } else {
+        large = [0i32; 1024];
+        &mut large
+    };
+    let has_luma_residual = reconstruct_intra_block(
         pic,
         params,
         ctx,
@@ -3083,6 +3322,7 @@ fn reconstruct_transform_unit(
         transquant_bypass,
         luma_ts,
         None,
+        luma_buf,
     )?;
 
     // Chroma blocks. For 4:2:0 / 4:2:2 the chroma transform block sits at
@@ -3105,7 +3345,7 @@ fn reconstruct_transform_unit(
         // §8.4.4.1 step 8 (4:4:4 only): the chroma residuals of this
         // transform unit are cross-component-predicted from its luma
         // residual, scaled by the §7.4.9.12 ResScaleVal per component.
-        let luma_res = luma_residual.as_deref();
+        let luma_res = has_luma_residual.then_some(&luma_buf[..n_tbs * n_tbs]);
         let ccp_cb = CcpInput::resolve(
             params.chroma_array_type,
             unit.cross_comp_pred_cb.as_ref(),
@@ -3344,23 +3584,26 @@ fn reconstruct_chroma_blocks(
         };
         let levels = block.map(|rb| rb.levels.as_slice());
         let ts = block.is_some_and(|rb| rb.transform_skip);
-        reconstruct_intra_block(
-            pic,
-            params,
-            ctx,
-            plane,
-            cidx,
-            ip_component_of(cidx),
-            xc,
-            yc + v * n_tbs_c,
-            n_tbs_c,
-            intra_pred_mode_c,
-            levels,
-            qp,
-            transquant_bypass,
-            ts,
-            ccp,
-        )?;
+        with_block_buf(n_tbs_c, |buf| {
+            reconstruct_intra_block(
+                pic,
+                params,
+                ctx,
+                plane,
+                cidx,
+                ip_component_of(cidx),
+                xc,
+                yc + v * n_tbs_c,
+                n_tbs_c,
+                intra_pred_mode_c,
+                levels,
+                qp,
+                transquant_bypass,
+                ts,
+                ccp,
+                buf,
+            )
+        })?;
     }
     Ok(())
 }

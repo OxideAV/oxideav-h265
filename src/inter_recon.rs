@@ -492,7 +492,7 @@ pub fn resolve_and_reconstruct_inter_cu(
         mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
     }
 
-    reconstruct_inter_cu_with(
+    let result = reconstruct_inter_cu_with(
         pic,
         params,
         &rects,
@@ -501,7 +501,9 @@ pub fn resolve_and_reconstruct_inter_cu(
         has_residual,
         refs,
         wp,
-    )
+    );
+    residual.recycle();
+    result
 }
 
 /// Walk an inter CU's transform tree and mark each leaf transform block that

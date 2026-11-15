@@ -856,6 +856,352 @@ pub fn intra_predict_with_substitution(
     intra_predict(&p, params)
 }
 
+// ---------------------------------------------------------------------
+// Allocation-free kernels (shared by the decoder and the encoder)
+// ---------------------------------------------------------------------
+
+/// Largest transform block side (`MaxTbLog2SizeY <= 5`).
+pub(crate) const MAX_TB: usize = 32;
+
+/// `intraPredAngle` of modes 2..=34 (Table 8-5), indexed by `mode`.
+const ANGLE: [i32; 35] = [
+    0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,
+    -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32,
+];
+
+/// `invAngle` of modes 11..=25 (Table 8-6), indexed by `mode`.
+const INV_ANGLE: [i32; 35] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
+    -482, -630, -910, -1638, -4096, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// The §8.4.4.2 reference samples of an `n`x`n` TB after §8.4.4.2.2
+/// substitution: `left[ 0 ] == top[ 0 ] == p[ −1 ][ −1 ]`,
+/// `left[ 1 + y ] = p[ −1 ][ y ]`, `top[ 1 + x ] = p[ x ][ −1 ]`.
+#[derive(Clone)]
+pub(crate) struct Refs {
+    pub(crate) n: usize,
+    pub(crate) left: [i32; 2 * MAX_TB + 1],
+    pub(crate) top: [i32; 2 * MAX_TB + 1],
+}
+
+/// The mark of a reference sample that is not available for intra
+/// prediction (sample values are never negative), before
+/// [`Refs::substitute_marked`].
+pub(crate) const REF_UNAVAILABLE: i32 = -1;
+
+impl Refs {
+    /// References of no block (to be filled in place).
+    pub(crate) fn empty() -> Self {
+        Self {
+            n: 4,
+            left: [0; 2 * MAX_TB + 1],
+            top: [0; 2 * MAX_TB + 1],
+        }
+    }
+
+    /// §8.4.4.2.2 substitution in place: `left[ ..= 2n ]` (the corner
+    /// at index 0) and `top[ 1 ..= 2n ]` hold sample values or
+    /// [`REF_UNAVAILABLE`]; the search runs from `p[ −1 ][ 2n − 1 ]` up
+    /// to the corner, then along the top row to `p[ 2n − 1 ][ −1 ]`.
+    pub(crate) fn substitute_marked(&mut self, bit_depth: u8) {
+        let n2 = 2 * self.n;
+        let first = self.left[..=n2]
+            .iter()
+            .rev()
+            .chain(&self.top[1..=n2])
+            .copied()
+            .find(|&v| v >= 0);
+        let Some(mut prev) = first else {
+            let v = 1i32 << (bit_depth - 1);
+            self.left[..=n2].fill(v);
+            self.top[..=n2].fill(v);
+            return;
+        };
+        for v in self.left[..=n2]
+            .iter_mut()
+            .rev()
+            .chain(&mut self.top[1..=n2])
+        {
+            if *v < 0 {
+                *v = prev;
+            } else {
+                prev = *v;
+            }
+        }
+        self.top[0] = self.left[0];
+    }
+
+    /// The §8.4.4.2.3 [1 2 1]-filtered twin (strong smoothing off)
+    /// written into `f`.
+    pub(crate) fn filter_into(&self, f: &mut Self) {
+        let n2 = 2 * self.n;
+        f.n = self.n;
+        let c = (self.left[1] + 2 * self.left[0] + self.top[1] + 2) >> 2;
+        f.left[0] = c;
+        f.top[0] = c;
+        for k in 1..n2 {
+            f.left[k] = (self.left[k + 1] + 2 * self.left[k] + self.left[k - 1] + 2) >> 2;
+            f.top[k] = (self.top[k + 1] + 2 * self.top[k] + self.top[k - 1] + 2) >> 2;
+        }
+        f.left[n2] = self.left[n2];
+        f.top[n2] = self.top[n2];
+    }
+
+    /// §8.4.4.2.2 substitution over `(value, available)` marks in the
+    /// same layout as [`Refs`].
+    pub(crate) fn substituted(
+        n: usize,
+        left: &[(i32, bool); 2 * MAX_TB + 1],
+        top: &[(i32, bool); 2 * MAX_TB + 1],
+        bit_depth: u8,
+    ) -> Self {
+        let mut r = Self {
+            n,
+            left: [0; 2 * MAX_TB + 1],
+            top: [0; 2 * MAX_TB + 1],
+        };
+        // The search order: p[−1][2n−1] up to p[−1][−1], then
+        // p[0][−1] right to p[2n−1][−1].
+        let order_len = 4 * n + 1;
+        let at = |k: usize| -> (i32, bool) {
+            if k < 2 * n + 1 {
+                left[2 * n - k]
+            } else {
+                top[k - 2 * n]
+            }
+        };
+        let first = (0..order_len).find(|&k| at(k).1);
+        let Some(first) = first else {
+            let v = 1i32 << (bit_depth - 1);
+            r.left[..=2 * n].fill(v);
+            r.top[..=2 * n].fill(v);
+            return r;
+        };
+        let mut prev = at(first).0;
+        for k in 0..order_len {
+            let (v, ok) = at(k);
+            let val = if ok { v } else { prev };
+            prev = val;
+            if k < 2 * n + 1 {
+                r.left[2 * n - k] = val;
+            } else {
+                r.top[k - 2 * n] = val;
+            }
+        }
+        r.top[0] = r.left[0];
+        r
+    }
+
+    /// The §8.4.4.2.3 [1 2 1]-filtered twin (strong smoothing off).
+    pub(crate) fn filtered(&self) -> Self {
+        let n2 = 2 * self.n;
+        let mut f = self.clone();
+        let c = (self.left[1] + 2 * self.left[0] + self.top[1] + 2) >> 2;
+        f.left[0] = c;
+        f.top[0] = c;
+        for k in 1..n2 {
+            f.left[k] = (self.left[k + 1] + 2 * self.left[k] + self.left[k - 1] + 2) >> 2;
+            f.top[k] = (self.top[k + 1] + 2 * self.top[k] + self.top[k - 1] + 2) >> 2;
+        }
+        f
+    }
+}
+
+/// §8.4.4.2.3 `filterFlag` for a luma TB of size `n` (4:2:0 chroma is
+/// never filtered).
+pub(crate) fn filter_flag(mode: u8, n: usize) -> bool {
+    if mode == 1 || n == 4 {
+        return false;
+    }
+    let d = (i32::from(mode) - 26)
+        .abs()
+        .min((i32::from(mode) - 10).abs());
+    let thres = match n {
+        8 => 7,
+        16 => 1,
+        _ => 0,
+    };
+    d > thres
+}
+
+/// §8.4.4.2.4..6 — predict an `n`x`n` block from (already filtered as
+/// [`filter_flag`] requires) reference samples into `out` (stride
+/// `n`). `luma` enables the DC / horizontal / vertical edge filters.
+pub(crate) fn predict_intra(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: &mut [i32]) {
+    match r.n {
+        4 => predict_intra_n::<4>(r, mode, luma, bit_depth, out),
+        8 => predict_intra_n::<8>(r, mode, luma, bit_depth, out),
+        16 => predict_intra_n::<16>(r, mode, luma, bit_depth, out),
+        _ => predict_intra_n::<32>(r, mode, luma, bit_depth, out),
+    }
+}
+
+/// The `N` samples of `v` starting at `at`, as an array.
+#[inline(always)]
+fn run<const N: usize>(v: &[i32], at: usize) -> &[i32; N] {
+    v[at..at + N].try_into().expect("an N-sample run")
+}
+
+/// [`predict_intra`] for one block size.
+#[inline(always)]
+fn predict_intra_n<const N: usize>(r: &Refs, mode: u8, luma: bool, bit_depth: u8, out: &mut [i32]) {
+    let ni = N as i32;
+    let log2 = N.trailing_zeros();
+    let max = (1i32 << bit_depth) - 1;
+    let out = &mut out[..N * N];
+    let top: &[i32; N] = run(&r.top, 1);
+    let left: &[i32; N] = run(&r.left, 1);
+    match mode {
+        0 => {
+            let (tr, bl) = (r.top[N + 1], r.left[N + 1]);
+            // The x-dependent terms that do not depend on the row.
+            let mut ramp = [0i32; N];
+            for (x, d) in ramp.iter_mut().enumerate() {
+                *d = (x as i32 + 1) * tr + ni;
+            }
+            for (y, row) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+                let (l, yi) = (left[y], y as i32);
+                let c = (yi + 1) * bl;
+                for (x, ((d, &t), &rp)) in row.iter_mut().zip(top).zip(&ramp).enumerate() {
+                    *d = ((ni - 1 - x as i32) * l + rp + (ni - 1 - yi) * t + c) >> (log2 + 1);
+                }
+            }
+        }
+        1 => {
+            let sum: i32 = top.iter().sum::<i32>() + left.iter().sum::<i32>();
+            let dc = (sum + ni) >> (log2 + 1);
+            out.fill(dc);
+            if luma && N < 32 {
+                out[0] = (left[0] + 2 * dc + top[0] + 2) >> 2;
+                for (o, &t) in out[1..N].iter_mut().zip(&top[1..]) {
+                    *o = (t + 3 * dc + 2) >> 2;
+                }
+                for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left).skip(1) {
+                    row[0] = (l + 3 * dc + 2) >> 2;
+                }
+            }
+        }
+        _ => {
+            let angle = ANGLE[mode as usize];
+            let vertical = mode >= 18;
+            // ref[ k ] at index k + N (k = −N..=2N).
+            let mut refa = [0i32; 3 * MAX_TB + 1];
+            let (main, side) = if vertical {
+                (&r.top, &r.left)
+            } else {
+                (&r.left, &r.top)
+            };
+            refa[N..=2 * N].copy_from_slice(&main[..=N]);
+            if angle < 0 {
+                let last = (ni * angle) >> 5;
+                if last < -1 {
+                    let inv = INV_ANGLE[mode as usize];
+                    for k in last..=-1 {
+                        let idx = (k * inv + 128) >> 8;
+                        refa[(k + ni) as usize] = side[idx as usize];
+                    }
+                }
+            } else {
+                refa[2 * N + 1..=3 * N].copy_from_slice(&main[N + 1..=2 * N]);
+            }
+            // Line `a` (a row of a vertical mode, a column of a
+            // horizontal one) is one weighted pair of reference runs.
+            let line = |a: usize| -> [i32; N] {
+                let pos = (a as i32 + 1) * angle;
+                let fact = pos & 31;
+                let base = ((pos >> 5) + 1 + ni) as usize;
+                let lo: &[i32; N] = run(&refa, base);
+                if fact == 0 {
+                    return *lo;
+                }
+                let hi: &[i32; N] = run(&refa, base + 1);
+                let mut v = [0i32; N];
+                for ((d, &p), &q) in v.iter_mut().zip(lo).zip(hi) {
+                    *d = ((32 - fact) * p + fact * q + 16) >> 5;
+                }
+                v
+            };
+            if vertical {
+                for (a, row) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+                    row.copy_from_slice(&line(a));
+                }
+            } else {
+                for a in 0..N {
+                    let col = line(a);
+                    for (row, &v) in out.as_chunks_mut::<N>().0.iter_mut().zip(&col) {
+                        row[a] = v;
+                    }
+                }
+            }
+            if luma && N < 32 {
+                if mode == 26 {
+                    for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left) {
+                        row[0] = (top[0] + ((l - r.left[0]) >> 1)).clamp(0, max);
+                    }
+                } else if mode == 10 {
+                    for (o, &t) in out[..N].iter_mut().zip(top) {
+                        *o = (left[0] + ((t - r.top[0]) >> 1)).clamp(0, max);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Refs {
+    /// §8.4.4.2.3 `biIntFlag` (eqs 8-36..8-40 gate) of a 32x32 luma
+    /// block's substituted references.
+    fn bi_int(&self, bit_depth_luma: u8) -> bool {
+        let n = self.n;
+        let thr = 1i32 << (bit_depth_luma - 5);
+        n == 32
+            && (self.top[0] + self.top[2 * n] - 2 * self.top[n]).abs() < thr
+            && (self.left[0] + self.left[2 * n] - 2 * self.left[n]).abs() < thr
+    }
+
+    /// The §8.4.4.2.3 bi-linear (strong) filtered twin, eqs 8-36..8-40,
+    /// written into `f` (`n == 32`).
+    fn strong_filter_into(&self, f: &mut Self) {
+        let n2 = 2 * self.n;
+        f.n = self.n;
+        let c = self.left[0];
+        let (l_end, t_end) = (self.left[n2], self.top[n2]);
+        f.left[0] = c;
+        f.top[0] = c;
+        let last = n2 as i32 - 1;
+        for k in 0..last {
+            f.left[1 + k as usize] = ((last - k) * c + (k + 1) * l_end + 32) >> 6;
+            f.top[1 + k as usize] = ((last - k) * c + (k + 1) * t_end + 32) >> 6;
+        }
+        f.left[n2] = l_end;
+        f.top[n2] = t_end;
+    }
+}
+
+/// §8.4.4.2.1 steps 1 and 2 over substituted references: the
+/// §8.4.4.2.3 filtering (when its gate and `filterFlag` hold) and the
+/// mode's predictor, into `out` (stride `r.n`) — the samples of
+/// [`intra_predict`] without its intermediate arrays. `r.n` is 4, 8,
+/// 16 or 32 and `params.pred_mode_intra <= 34`.
+pub(crate) fn predict_from_refs(r: &Refs, params: &IntraPredParams, out: &mut [i32]) {
+    let luma = params.cidx.is_luma();
+    let mode = params.pred_mode_intra;
+    let filter_gate = !params.intra_smoothing_disabled && (luma || params.chroma_array_type_3);
+    let edge = luma && !params.disable_boundary_filter;
+    if filter_gate && reference_filter_flag(mode, r.n) {
+        let mut f = Refs::empty();
+        if params.strong_intra_smoothing_enabled && luma && r.bi_int(params.bit_depth_luma) {
+            r.strong_filter_into(&mut f);
+        } else {
+            r.filter_into(&mut f);
+        }
+        predict_intra(&f, mode, edge, params.bit_depth, out);
+    } else {
+        predict_intra(r, mode, edge, params.bit_depth, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,5 +1572,86 @@ mod tests {
                 got: 7
             }
         );
+    }
+    /// The allocation-free path against the reference pipeline: every
+    /// size, mode and gate, smooth (strong-filter eligible) and noisy
+    /// references, with unavailable runs.
+    #[test]
+    fn refs_path_matches_the_reference_pipeline() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for bd in [8u8, 10, 12] {
+            let max = (1i32 << bd) - 1;
+            for n in [4usize, 8, 16, 32] {
+                for trial in 0..8 {
+                    let mut v = (next() as i32) & max;
+                    let mut sample = |next: &mut dyn FnMut() -> u32| -> i32 {
+                        match trial % 3 {
+                            0 => v,
+                            1 => {
+                                v = (v + (next() % 3) as i32 - 1).clamp(0, max);
+                                v
+                            }
+                            _ => (next() as i32) & max,
+                        }
+                    };
+                    let mut r = Refs::empty();
+                    r.n = n;
+                    let corner = (sample(&mut next), trial != 4);
+                    let mut mleft = Vec::new();
+                    let mut mtop = Vec::new();
+                    for k in 0..2 * n {
+                        mleft.push((sample(&mut next), !(trial == 5 && k >= n) && trial != 7));
+                        mtop.push((sample(&mut next), !(trial == 6 && k < n) && trial != 7));
+                    }
+                    r.left[0] = if corner.1 { corner.0 } else { REF_UNAVAILABLE };
+                    for k in 0..2 * n {
+                        r.left[1 + k] = if mleft[k].1 {
+                            mleft[k].0
+                        } else {
+                            REF_UNAVAILABLE
+                        };
+                        r.top[1 + k] = if mtop[k].1 {
+                            mtop[k].0
+                        } else {
+                            REF_UNAVAILABLE
+                        };
+                    }
+                    r.substitute_marked(bd);
+                    let marked = MarkedReferenceSamples::new(n, corner, mleft, mtop).unwrap();
+                    for mode in 0..=34u8 {
+                        for flags in 0..32u32 {
+                            let params = IntraPredParams {
+                                pred_mode_intra: mode,
+                                cidx: if flags & 1 == 0 {
+                                    Component::Luma
+                                } else {
+                                    Component::Cb
+                                },
+                                bit_depth: bd,
+                                bit_depth_luma: bd,
+                                intra_smoothing_disabled: flags & 2 != 0,
+                                strong_intra_smoothing_enabled: flags & 4 != 0,
+                                chroma_array_type_3: flags & 8 != 0,
+                                disable_boundary_filter: flags & 16 != 0,
+                            };
+                            let want = intra_predict_with_substitution(&marked, &params).unwrap();
+                            let mut got = [0i32; MAX_TB * MAX_TB];
+                            predict_from_refs(&r, &params, &mut got);
+                            assert_eq!(
+                                &got[..n * n],
+                                &want[..],
+                                "bd {bd} n {n} trial {trial} mode {mode} flags {flags}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
