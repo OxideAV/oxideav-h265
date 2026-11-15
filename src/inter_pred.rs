@@ -901,56 +901,283 @@ fn interp_block16<const TAPS: usize>(
             }
         };
         let out = &mut out[..w * h];
-        let bias = MID_BIAS as i16;
-        // One horizontal row at the picture's depth, less `sub`.
-        let hrow = |s: usize, o: &mut [i16], sub: i16| {
-            if narrow {
-                hpass_narrow::<TAPS>(&src[s..s + ww], &hk16, sub, o);
-            } else {
-                hpass_mid::<TAPS>(&src[s..s + ww], hk, shift1, sub, o);
-            }
+        let taps = Taps16 {
+            hk,
+            vk,
+            hk16: &hk16,
+            vk16: &vk16,
+            shift1,
+            shift3,
+            narrow,
         };
-        match (fx0, fy0) {
-            (true, true) => {
-                for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    let s = base + (y + half) * stride + half;
-                    for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
-                        *d = ((v << shift3) as i16).wrapping_sub(bias);
-                    }
-                }
-            }
-            (false, true) => {
-                for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    hrow(base + (y + half) * stride, o, bias);
-                }
-            }
-            (true, false) => {
-                for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    let r: [&[u16]; TAPS] = core::array::from_fn(|t| {
-                        let s = base + (y + t) * stride + half;
-                        &src[s..s + w]
-                    });
-                    if narrow {
-                        vpass_narrow::<TAPS>(r, &vk16, bias, o);
-                    } else {
-                        vpass_mid::<TAPS, u16>(r, vk, shift1, MID_BIAS, o);
-                    }
-                }
-            }
-            (false, false) => {
-                rows.clear();
-                rows.resize(w * wh, 0);
-                for (j, r) in rows.chunks_exact_mut(w).enumerate() {
-                    hrow(base + j * stride, r, 0);
-                }
-                for (y, o) in out.chunks_exact_mut(w).enumerate() {
-                    let r: [&[i16]; TAPS] =
-                        core::array::from_fn(|t| &rows[(y + t) * w..(y + t + 1) * w]);
-                    vpass_mid::<TAPS, i16>(r, vk, 6, MID_BIAS, o);
+        // The common block widths run on rows of a fixed length (no
+        // trip count, no remainder loop); any other width takes the
+        // general row kernels.
+        let phase = (fx0, fy0);
+        match w {
+            4 => filter16_fixed::<TAPS, 4>(src, stride, base, &taps, phase, rows, out),
+            8 => filter16_fixed::<TAPS, 8>(src, stride, base, &taps, phase, rows, out),
+            16 => filter16_fixed::<TAPS, 16>(src, stride, base, &taps, phase, rows, out),
+            32 => filter16_fixed::<TAPS, 32>(src, stride, base, &taps, phase, rows, out),
+            64 => filter16_fixed::<TAPS, 64>(src, stride, base, &taps, phase, rows, out),
+            _ => filter16_any::<TAPS>(src, stride, base, &taps, phase, w, rows, out),
+        }
+    });
+}
+
+/// The filters and shifts of one [`interp_block16`] call.
+struct Taps16<'a, const TAPS: usize> {
+    hk: &'a [i32; TAPS],
+    vk: &'a [i32; TAPS],
+    hk16: &'a [i16; TAPS],
+    vk16: &'a [i16; TAPS],
+    shift1: i32,
+    shift3: i32,
+    /// 8-bit samples: the one-dimensional stages sum in 16 bits.
+    narrow: bool,
+}
+
+/// Make `rows` hold at least `len` entries (its contents are scratch).
+#[inline]
+fn grow_rows(rows: &mut Vec<i16>, len: usize) {
+    if rows.len() < len {
+        rows.resize(len, 0);
+    }
+}
+
+/// [`interp_block16`] over a `W`-sample-wide block: `src[ base.. ]` is
+/// the `(W + TAPS − 1)`-wide reference window at pitch `stride`, `out`
+/// the `W`-pitch result.
+#[inline(always)]
+fn filter16_fixed<const TAPS: usize, const W: usize>(
+    src: &[u16],
+    stride: usize,
+    base: usize,
+    taps: &Taps16<'_, TAPS>,
+    (fx0, fy0): (bool, bool),
+    rows: &mut Vec<i16>,
+    out: &mut [i16],
+) {
+    let half = TAPS / 2 - 1;
+    let bias = MID_BIAS as i16;
+    let (out, _) = out.as_chunks_mut::<W>();
+    let h = out.len();
+    // Row `j` of the window, from column `x`, `n` samples.
+    let win = |j: usize, x: usize, n: usize| -> &[u16] {
+        let s = base + j * stride + x;
+        &src[s..s + n]
+    };
+    match (fx0, fy0) {
+        (true, true) => {
+            let shift3 = taps.shift3;
+            for (y, o) in out.iter_mut().enumerate() {
+                let s: &[u16; W] = win(y + half, half, W).try_into().expect("row");
+                for (d, &v) in o.iter_mut().zip(s) {
+                    *d = ((v << shift3) as i16).wrapping_sub(bias);
                 }
             }
         }
-    });
+        (false, true) => {
+            if taps.narrow {
+                for (y, o) in out.iter_mut().enumerate() {
+                    h_row_narrow::<TAPS, W>(win(y + half, 0, W + TAPS - 1), taps.hk16, bias, o);
+                }
+            } else {
+                for (y, o) in out.iter_mut().enumerate() {
+                    h_row_mid::<TAPS, W>(
+                        win(y + half, 0, W + TAPS - 1),
+                        taps.hk,
+                        taps.shift1,
+                        bias,
+                        o,
+                    );
+                }
+            }
+        }
+        (true, false) => {
+            for (y, o) in out.iter_mut().enumerate() {
+                let r: [&[u16; W]; TAPS] =
+                    core::array::from_fn(|t| win(y + t, half, W).try_into().expect("row"));
+                if taps.narrow {
+                    v_row_narrow::<TAPS, W>(&r, taps.vk16, bias, o);
+                } else {
+                    v_row_mid::<TAPS, W, u16>(&r, taps.vk, taps.shift1, MID_BIAS, o);
+                }
+            }
+        }
+        (false, false) => {
+            let wh = h + TAPS - 1;
+            grow_rows(rows, W * wh);
+            let (mid, _) = rows[..W * wh].as_chunks_mut::<W>();
+            if taps.narrow {
+                for (j, r) in mid.iter_mut().enumerate() {
+                    h_row_narrow::<TAPS, W>(win(j, 0, W + TAPS - 1), taps.hk16, 0, r);
+                }
+            } else {
+                for (j, r) in mid.iter_mut().enumerate() {
+                    h_row_mid::<TAPS, W>(win(j, 0, W + TAPS - 1), taps.hk, taps.shift1, 0, r);
+                }
+            }
+            for (y, o) in out.iter_mut().enumerate() {
+                let r: [&[i16; W]; TAPS] = core::array::from_fn(|t| &mid[y + t]);
+                v_row_mid::<TAPS, W, i16>(&r, taps.vk, 6, MID_BIAS, o);
+            }
+        }
+    }
+}
+
+/// One horizontal filter row of 8-bit samples over a fixed width,
+/// summed in 16 bits, less `sub` (`src` holds `W + TAPS − 1` samples).
+#[inline(always)]
+fn h_row_narrow<const TAPS: usize, const W: usize>(
+    src: &[u16],
+    k: &[i16; TAPS],
+    sub: i16,
+    out: &mut [i16; W],
+) {
+    let mut acc = [0i16; W];
+    for (t, &kt) in k.iter().enumerate() {
+        let s: &[u16; W] = src[t..t + W].try_into().expect("row");
+        for (a, &v) in acc.iter_mut().zip(s) {
+            *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+        }
+    }
+    for (d, &a) in out.iter_mut().zip(&acc) {
+        *d = a.wrapping_sub(sub);
+    }
+}
+
+/// One horizontal filter row over a fixed width with a 32-bit sum,
+/// `>> shift1`, less `sub`.
+#[inline(always)]
+fn h_row_mid<const TAPS: usize, const W: usize>(
+    src: &[u16],
+    k: &[i32; TAPS],
+    shift1: i32,
+    sub: i16,
+    out: &mut [i16; W],
+) {
+    let mut acc = [0i32; W];
+    for (t, &kt) in k.iter().enumerate() {
+        let s: &[u16; W] = src[t..t + W].try_into().expect("row");
+        for (a, &v) in acc.iter_mut().zip(s) {
+            *a += kt * i32::from(v);
+        }
+    }
+    for (d, &a) in out.iter_mut().zip(&acc) {
+        *d = ((a >> shift1) as i16).wrapping_sub(sub);
+    }
+}
+
+/// One vertical filter row over fixed-width rows of 8-bit samples,
+/// summed in 16 bits, less `sub`.
+#[inline(always)]
+fn v_row_narrow<const TAPS: usize, const W: usize>(
+    rows: &[&[u16; W]; TAPS],
+    k: &[i16; TAPS],
+    sub: i16,
+    out: &mut [i16; W],
+) {
+    let mut acc = [0i16; W];
+    for (r, &kt) in rows.iter().zip(k) {
+        for (a, &v) in acc.iter_mut().zip(r.iter()) {
+            *a = a.wrapping_add(kt.wrapping_mul(v as i16));
+        }
+    }
+    for (d, &a) in out.iter_mut().zip(&acc) {
+        *d = a.wrapping_sub(sub);
+    }
+}
+
+/// One vertical filter row over fixed-width rows with a 32-bit sum,
+/// `>> shift`, less `sub`.
+#[inline(always)]
+fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
+    rows: &[&[T; W]; TAPS],
+    k: &[i32; TAPS],
+    shift: i32,
+    sub: i32,
+    out: &mut [i16; W],
+) {
+    let mut acc = [0i32; W];
+    for (r, &kt) in rows.iter().zip(k) {
+        for (a, &v) in acc.iter_mut().zip(r.iter()) {
+            *a += kt * v.into();
+        }
+    }
+    for (d, &a) in out.iter_mut().zip(&acc) {
+        *d = ((a >> shift) - sub) as i16;
+    }
+}
+
+/// [`interp_block16`] over a block of any width `w`.
+#[allow(clippy::too_many_arguments)]
+fn filter16_any<const TAPS: usize>(
+    src: &[u16],
+    stride: usize,
+    base: usize,
+    taps: &Taps16<'_, TAPS>,
+    (fx0, fy0): (bool, bool),
+    w: usize,
+    rows: &mut Vec<i16>,
+    out: &mut [i16],
+) {
+    let half = TAPS / 2 - 1;
+    let ww = w + TAPS - 1;
+    let h = out.len() / w;
+    let wh = h + TAPS - 1;
+    let (hk, vk, shift1, shift3, narrow) =
+        (taps.hk, taps.vk, taps.shift1, taps.shift3, taps.narrow);
+    let (hk16, vk16) = (taps.hk16, taps.vk16);
+    let bias = MID_BIAS as i16;
+    // One horizontal row at the picture's depth, less `sub`.
+    let hrow = |s: usize, o: &mut [i16], sub: i16| {
+        if narrow {
+            hpass_narrow::<TAPS>(&src[s..s + ww], hk16, sub, o);
+        } else {
+            hpass_mid::<TAPS>(&src[s..s + ww], hk, shift1, sub, o);
+        }
+    };
+    match (fx0, fy0) {
+        (true, true) => {
+            for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                let s = base + (y + half) * stride + half;
+                for (d, &v) in o.iter_mut().zip(&src[s..s + w]) {
+                    *d = ((v << shift3) as i16).wrapping_sub(bias);
+                }
+            }
+        }
+        (false, true) => {
+            for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                hrow(base + (y + half) * stride, o, bias);
+            }
+        }
+        (true, false) => {
+            for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                let r: [&[u16]; TAPS] = core::array::from_fn(|t| {
+                    let s = base + (y + t) * stride + half;
+                    &src[s..s + w]
+                });
+                if narrow {
+                    vpass_narrow::<TAPS>(r, vk16, bias, o);
+                } else {
+                    vpass_mid::<TAPS, u16>(r, vk, shift1, MID_BIAS, o);
+                }
+            }
+        }
+        (false, false) => {
+            grow_rows(rows, w * wh);
+            let rows = &mut rows[..w * wh];
+            for (j, r) in rows.chunks_exact_mut(w).enumerate() {
+                hrow(base + j * stride, r, 0);
+            }
+            for (y, o) in out.chunks_exact_mut(w).enumerate() {
+                let r: [&[i16]; TAPS] =
+                    core::array::from_fn(|t| &rows[(y + t) * w..(y + t + 1) * w]);
+                vpass_mid::<TAPS, i16>(r, vk, 6, MID_BIAS, o);
+            }
+        }
+    }
 }
 
 /// Lanes per step of the 16-bit row kernels: the rows are filtered
