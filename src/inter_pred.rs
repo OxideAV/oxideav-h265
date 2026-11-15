@@ -987,7 +987,7 @@ fn filter16_fixed<const TAPS: usize, const W: usize>(
                 for (y, o) in out.iter_mut().enumerate() {
                     h_row_mid::<TAPS, W>(
                         win(y + half, 0, W + TAPS - 1),
-                        taps.hk,
+                        taps.hk16,
                         taps.shift1,
                         bias,
                         o,
@@ -1002,7 +1002,7 @@ fn filter16_fixed<const TAPS: usize, const W: usize>(
                 if taps.narrow {
                     v_row_narrow::<TAPS, W>(&r, taps.vk16, bias, o);
                 } else {
-                    v_row_mid::<TAPS, W, u16>(&r, taps.vk, taps.shift1, MID_BIAS, o);
+                    v_row_mid::<TAPS, W, u16>(&r, taps.vk16, taps.shift1, MID_BIAS, o);
                 }
             }
         }
@@ -1016,12 +1016,12 @@ fn filter16_fixed<const TAPS: usize, const W: usize>(
                 }
             } else {
                 for (j, r) in mid.iter_mut().enumerate() {
-                    h_row_mid::<TAPS, W>(win(j, 0, W + TAPS - 1), taps.hk, taps.shift1, 0, r);
+                    h_row_mid::<TAPS, W>(win(j, 0, W + TAPS - 1), taps.hk16, taps.shift1, 0, r);
                 }
             }
             for (y, o) in out.iter_mut().enumerate() {
                 let r: [&[i16; W]; TAPS] = core::array::from_fn(|t| &mid[y + t]);
-                v_row_mid::<TAPS, W, i16>(&r, taps.vk, 6, MID_BIAS, o);
+                v_row_mid::<TAPS, W, i16>(&r, taps.vk16, 6, MID_BIAS, o);
             }
         }
     }
@@ -1048,7 +1048,7 @@ fn h_row_narrow<const TAPS: usize, const W: usize>(
 #[inline(always)]
 fn h_row_mid<const TAPS: usize, const W: usize>(
     src: &[u16],
-    k: &[i32; TAPS],
+    k: &[i16; TAPS],
     shift1: i32,
     sub: i16,
     out: &mut [i16; W],
@@ -1113,9 +1113,9 @@ fn v_row_narrow<const TAPS: usize, const W: usize>(
 /// One vertical filter row over fixed-width rows with a 32-bit sum,
 /// `>> shift`, less `sub` (the two spellings of [`v_row_narrow`]).
 #[inline(always)]
-fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
+fn v_row_mid<const TAPS: usize, const W: usize, T: Lane16>(
     rows: &[&[T; W]; TAPS],
-    k: &[i32; TAPS],
+    k: &[i16; TAPS],
     shift: i32,
     sub: i32,
     out: &mut [i16; W],
@@ -1124,7 +1124,7 @@ fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
         for (i, d) in out.iter_mut().enumerate() {
             let mut acc = 0i32;
             for (r, &kt) in rows.iter().zip(k) {
-                acc += kt * r[i].into();
+                acc += i32::from(kt) * i32::from(r[i].s16());
             }
             *d = ((acc >> shift) - sub) as i16;
         }
@@ -1135,7 +1135,7 @@ fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
             for (r, &kt) in rows.iter().zip(k) {
                 let s: &[T; 8] = r[b * 8..b * 8 + 8].try_into().expect("lanes");
                 for (a, &v) in acc.iter_mut().zip(s) {
-                    *a += kt * v.into();
+                    *a += i32::from(kt) * i32::from(v.s16());
                 }
             }
             for (d, &a) in o.iter_mut().zip(&acc) {
@@ -1146,12 +1146,35 @@ fn v_row_mid<const TAPS: usize, const W: usize, T: Copy + Into<i32>>(
         let mut acc = [0i32; 4];
         for (r, &kt) in rows.iter().zip(k) {
             for (a, &v) in acc.iter_mut().zip(&r[x0..]) {
-                *a += kt * v.into();
+                *a += i32::from(kt) * i32::from(v.s16());
             }
         }
         for (d, &a) in tail.iter_mut().zip(&acc) {
             *d = ((a >> shift) - sub) as i16;
         }
+    }
+}
+
+/// A sample or intermediate value of the 16-bit path as a signed
+/// 16-bit lane: the 32-bit sums then multiply two sign-extended 16-bit
+/// operands (one widening multiply-accumulate per tap). A picture
+/// sample qualifies because the path is limited to 12-bit pictures
+/// ([`mid_fits_16`]).
+trait Lane16: Copy {
+    fn s16(self) -> i16;
+}
+
+impl Lane16 for i16 {
+    #[inline(always)]
+    fn s16(self) -> i16 {
+        self
+    }
+}
+
+impl Lane16 for u16 {
+    #[inline(always)]
+    fn s16(self) -> i16 {
+        self as i16
     }
 }
 
@@ -1988,7 +2011,10 @@ mod tests {
     /// plane and across every edge).
     #[test]
     fn mid16_filters_match_the_wide_filters() {
-        let (pw, ph) = (40usize, 36usize);
+        // Every width with a row kernel of its own (4 .. 64), widths
+        // on the general rows (2, 6, 12, 24, 48), inside the plane and
+        // across each of its edges.
+        let (pw, ph) = (104usize, 88usize);
         let mut saw_past_i16 = false;
         for bd in [8u8, 9, 10, 12] {
             let max = (1u32 << bd) - 1;
@@ -2028,6 +2054,17 @@ mod tests {
                     (30, 28, 16, 16),
                     (0, 20, 4, 8),
                     (36, 0, 8, 4),
+                    (9, 10, 32, 32),
+                    (20, 12, 64, 64),
+                    (-7, 40, 32, 16),
+                    (60, 70, 64, 32),
+                    (90, -4, 32, 8),
+                    (17, 9, 2, 2),
+                    (5, 6, 6, 8),
+                    (40, 30, 12, 16),
+                    (13, 50, 24, 32),
+                    (50, 5, 48, 64),
+                    (100, 80, 4, 4),
                 ] {
                     for fy in 0..4 {
                         for fx in 0..4 {
