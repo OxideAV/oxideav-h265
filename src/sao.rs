@@ -473,10 +473,14 @@ fn sao_ctb_core(
                     *d = (c + v).clamp(0, max) as u16;
                 }
             }
-            for (i, d) in drow.iter_mut().enumerate() {
-                if no_filter.is_none() && i >= lo && i < hi {
-                    continue;
-                }
+            // The samples the row pass above did not cover.
+            let rest = if no_filter.is_none() && hi > lo {
+                [0..lo, hi..w]
+            } else {
+                [0..w, 0..0]
+            };
+            for i in rest.into_iter().flatten() {
+                let d = &mut drow[i];
                 let xsi = x_ctb + i;
                 let border_col = horizontal && (i == 0 || i + 1 == w);
                 if border_row || border_col {

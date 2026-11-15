@@ -861,7 +861,17 @@ impl core::fmt::Debug for SamplePlane<'_> {
 }
 
 impl SamplePlane<'_> {
+    /// Index steps of an edge segment: `(along, across)` — from one
+    /// line of the segment to the next, and from a sample to the next
+    /// one away from the edge on the q side.
     #[inline]
+    fn edge_steps(&self, edge: EdgeType) -> (usize, usize) {
+        match edge {
+            EdgeType::Vertical => (self.stride, 1),
+            EdgeType::Horizontal => (1, self.stride),
+        }
+    }
+    #[cfg(test)]
     fn get(&self, x: usize, y: usize) -> i32 {
         i32::from(self.samples[(y - self.y_origin) * self.stride + x])
     }
@@ -980,45 +990,56 @@ pub fn filter_luma_block_edge_gated(
         qp.bit_depth,
     );
     let bit_depth = qp.bit_depth;
-    // Gather the decision grid: rows k=0 and k=3, samples i=0..3 each side.
-    let mut pg = [[0i32; 2]; 4];
-    let mut qg = [[0i32; 2]; 4];
-    for (k_idx, &k) in [0usize, 3].iter().enumerate() {
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            pg[i][k_idx] = plane.get(px, py);
-            qg[i][k_idx] = plane.get(qx, qy);
-        }
-    }
+    // The segment as sample indices: `q0,k` sits at `o + k * along`,
+    // `qi,k` `i * across` further, `pi,k` `( i + 1 ) * across` before.
+    let (along, across) = plane.edge_steps(edge);
+    let o = (ey - plane.y_origin) * plane.stride + ex;
+    let line = |samples: &[u16], k: usize| -> ([i32; 4], [i32; 4]) {
+        let b = o + k * along;
+        (
+            core::array::from_fn(|i| i32::from(samples[b - (i + 1) * across])),
+            core::array::from_fn(|i| i32::from(samples[b + i * across])),
+        )
+    };
+    // The decision grid: rows k=0 and k=3, samples i=0..3 each side.
+    let (p_first, q_first) = line(plane.samples, 0);
+    let (p_last, q_last) = line(plane.samples, 3);
+    let pg: [[i32; 2]; 4] = core::array::from_fn(|i| [p_first[i], p_last[i]]);
+    let qg: [[i32; 2]; 4] = core::array::from_fn(|i| [q_first[i], q_last[i]]);
     let dec = luma_edge_decision(pg, qg, beta, tc);
     if dec.de == 0 {
         return dec;
     }
     // Apply the filter to each of the 4 rows (eq. 8-372/8-373 layout).
     for k in 0..4 {
-        let mut p = [0i32; 4];
-        let mut q = [0i32; 4];
-        for i in 0..4 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            p[i] = plane.get(px, py);
-            q[i] = plane.get(qx, qy);
-        }
+        let (p, q) = line(plane.samples, k);
         let out = filter_luma_sample(p, q, dec.de, dec.dep, dec.deq, tc, bit_depth);
-        for (i, &v) in out.p.iter().enumerate().take(out.ndp) {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            if no_filter.is_some_and(|m| m.at_luma(px, py)) {
-                continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
+        let b = o + k * along;
+        match no_filter {
+            None => {
+                for (i, &v) in out.p.iter().enumerate().take(out.ndp) {
+                    plane.samples[b - (i + 1) * across] = v as u16;
+                }
+                for (j, &v) in out.q.iter().enumerate().take(out.ndq) {
+                    plane.samples[b + j * across] = v as u16;
+                }
             }
-            plane.set(px, py, v);
-        }
-        for (j, &v) in out.q.iter().enumerate().take(out.ndq) {
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
-            if no_filter.is_some_and(|m| m.at_luma(qx, qy)) {
-                continue; // §8.7.2.5.4 nDq = 0
+            Some(m) => {
+                for (i, &v) in out.p.iter().enumerate().take(out.ndp) {
+                    let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
+                    if m.at_luma(px, py) {
+                        continue; // §8.7.2.5.4 nDp = 0 (PCM / bypass / palette)
+                    }
+                    plane.set(px, py, v);
+                }
+                for (j, &v) in out.q.iter().enumerate().take(out.ndq) {
+                    let (qx, qy) = plane.edge_xy(ex, ey, edge, false, j, k);
+                    if m.at_luma(qx, qy) {
+                        continue; // §8.7.2.5.4 nDq = 0
+                    }
+                    plane.set(qx, qy, v);
+                }
             }
-            plane.set(qx, qy, v);
         }
     }
     dec
@@ -1069,23 +1090,29 @@ pub fn filter_chroma_block_edge_gated(
         qp.tc_offset_div2,
         bit_depth,
     );
+    let (along, across) = plane.edge_steps(edge);
+    let o = (ey - plane.y_origin) * plane.stride + ex;
     for k in 0..4 {
-        let mut p = [0i32; 2];
-        let mut q = [0i32; 2];
-        for i in 0..2 {
-            let (px, py) = plane.edge_xy(ex, ey, edge, true, i, k);
-            let (qx, qy) = plane.edge_xy(ex, ey, edge, false, i, k);
-            p[i] = plane.get(px, py);
-            q[i] = plane.get(qx, qy);
-        }
+        let b = o + k * along;
+        let sm = &*plane.samples;
+        let p = [i32::from(sm[b - across]), i32::from(sm[b - 2 * across])];
+        let q = [i32::from(sm[b]), i32::from(sm[b + across])];
         let (p0p, q0p) = filter_chroma_sample(p, q, tc, bit_depth);
-        let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
-        let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
-        if !no_filter.is_some_and(|m| m.at_luma(px * sub_w, py * sub_h)) {
-            plane.set(px, py, p0p);
-        }
-        if !no_filter.is_some_and(|m| m.at_luma(qx * sub_w, qy * sub_h)) {
-            plane.set(qx, qy, q0p);
+        match no_filter {
+            None => {
+                plane.samples[b - across] = p0p as u16;
+                plane.samples[b] = q0p as u16;
+            }
+            Some(m) => {
+                let (px, py) = plane.edge_xy(ex, ey, edge, true, 0, k);
+                let (qx, qy) = plane.edge_xy(ex, ey, edge, false, 0, k);
+                if !m.at_luma(px * sub_w, py * sub_h) {
+                    plane.set(px, py, p0p);
+                }
+                if !m.at_luma(qx * sub_w, qy * sub_h) {
+                    plane.set(qx, qy, q0p);
+                }
+            }
         }
     }
     tc
