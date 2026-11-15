@@ -30,6 +30,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- *(decoder)* **Decode restructured for throughput — the same
+  pictures 1.4x to 1.7x faster on one thread.** Output is unchanged
+  (409 output digests over the conformance sets, the staged fixtures
+  and test clips, serial and threaded, equal the previous build).
+  Intra prediction gathers a block's reference samples into fixed
+  arrays with one §6.4.1 availability probe per block and predicts
+  through the size-specialised kernels (now in `intra_pred`, shared
+  with the encoder) — no heap array per block; a transform block's
+  residual is produced on the stack and an inter coding unit's
+  residual planes are reused; the residual parser works from
+  per-sub-block context tables and position bit masks and reads sign
+  flags as one bypass run (a division of the offset register); the
+  arithmetic decoder looks ahead over stream bits only and selects
+  instead of branching on a context-coded bin; motion compensation
+  runs on rows of a fixed width with widening 16-bit
+  multiply-accumulates and a 16-bit default combine; the deblocking
+  edge map is built from per-line segment masks and edge segments are
+  filtered by sample index; an output picture the DPB still references
+  is packed from the shared planes instead of being copied first.
+  Serial decode: 1920x1080 inter 8-bit (third-party encoder) 1.45 →
+  1.04 s for 120 pictures, 10-bit 1.57 → 1.00 s, the conformance
+  streams `TSCTX_8bit` x1.57 and `Main_422_10_A` x1.71, a 12 MP still
+  0.184 → 0.121 s. The README has the stage profile and what remains.
+- *(decoder)* **Wavefront rows wake only their own waiter.** Row
+  progress was one mutex-guarded vector with a single condition
+  variable — every published coding tree block took the lock and woke
+  every waiting row. Each row now has an atomic counter, checked
+  without locking, and a sleeper that is woken only when its target is
+  reached. Output is identical at every budget. With the serial work
+  above, a 12 MP still decodes in 0.038 s on 8 workers (from 0.061 s)
+  and a 1080p clip at 433 pictures per second on 8 frame threads
+  (from 317).
 - *(encoder)* **Intra mode decision without per-block allocation —
   the same bytes about seven times faster.** The quadtree coder's
   intra path (every still, the intra pictures and intra fallbacks of

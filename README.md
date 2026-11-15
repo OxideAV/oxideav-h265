@@ -703,6 +703,125 @@ per transform block, a residual plane per coding unit), and every
 prediction goes through an intermediate array even when it is a
 whole-sample copy.
 
+### Round 489: decoder restructuring
+
+Everything in this section changes time only: the decoder writes the
+same pictures as before (409 output digests — the Range-Extensions,
+SCC, SHVC and MV-HEVC conformance sets, the staged fixtures and the
+clips below, serial and at 2 / 3 / 4 / 8 workers — agree with the
+previous build, next to the conformance tests themselves).
+Measurements are on an 18-core Apple M-series host shared with other
+build jobs: wall times are medians of seven runs, old and new
+alternating, through `examples/decode_bench` (one access unit per
+packet; the time includes the example's own digest of the output,
+3–7 % of a serial run); cycle counts are the minimum of five runs.
+
+**Where the time went** (serial decode, sampling profiler, share of
+the decoder's own time, before this round):
+
+| stage | 1920x1080 inter, 8-bit | 12 MP still, 8-bit | 1920x1080 inter, 10-bit |
+| --- | --- | --- | --- |
+| entropy decoding (syntax + residual parsing, arithmetic decoder) | 26 % | 35 % | 20 % |
+| residual assembly + inverse transform | 8 % | 12 % | 6 % |
+| intra prediction (references, availability, predictors) | 0.5 % | 21 % | 0.3 % |
+| inter prediction (motion derivation, interpolation, combine) | 39 % | 0.1 % | 39 % |
+| deblocking (edge map + filters) | 10 % | 11 % | 10 % |
+| SAO | 3 % | 4 % | 2 % |
+| allocation, clearing and copies | 8 % | 14 % | 7 % |
+| bookkeeping (drivers, QP, output packing) | 5 % | 3 % | 17 % |
+
+**What changed**, largest share first:
+
+* *Inter prediction.* The 16-bit interpolation is one function per
+  filter length and block width (4 to 64) over rows of that fixed
+  length, each row in the form that measured fastest for its width,
+  and every 32-bit filter sum multiplies two 16-bit operands (one
+  widening multiply-accumulate per tap). The default weighted combine,
+  residual add and clip run in 16-bit lanes. A coding unit's
+  prediction rectangles and motions are fixed arrays.
+* *Entropy decoding.* The residual parser takes each scan position's
+  `sig_coeff_flag` context from a table row chosen once per sub-block,
+  keeps the significance / greater-than-1 / greater-than-2 flags as
+  bit masks walked by their set bits, and reads a sub-block's sign
+  flags as one bypass run — decoded by one division of the offset
+  register instead of a compare per bin. The arithmetic decoder looks
+  ahead over stream bits only (one comparison answers "are there `n`
+  more bits") and selects between the two outcomes of a context-coded
+  bin instead of branching on them.
+* *Intra prediction.* A block's reference samples are gathered into
+  fixed arrays by rows (one availability probe per block: the current
+  block's z-scan address, CTB and tile derived once), substituted and
+  filtered in place, and predicted by the size-specialised kernels the
+  encoder already used — no heap array per block, where the previous
+  path made up to ten.
+* *Residual.* A transform block's residual is produced in a stack
+  array sized for the block; an inter coding unit's residual planes
+  are reused from the previous unit; the even / odd inverse DCT
+  accumulates each odd input across all outputs from contiguous basis
+  rows.
+* *Deblocking and SAO.* A coding unit's edges are bit masks over the
+  §8.7.2.4 sampling grid and the boundary strength is derived only for
+  the set segments (three per-unit grids were filled, scanned and
+  cleared per direction); an edge segment is filtered through one base
+  index and two steps instead of a coordinate pair per sample; the SAO
+  border pass no longer walks the interior.
+* *Output.* A picture the DPB still references is packed into the
+  output frame from the shared planes instead of being copied first.
+
+| serial decode | before | after | |
+| --- | --- | --- | --- |
+| 1920x1080 inter, 8-bit, third-party encoder (120 pictures) | 1.454 s, 6.15 G cycles | 1.037 s, 4.39 G cycles | x1.40 |
+| 1920x1080 inter, 10-bit, third-party encoder (120 pictures) | 1.567 s | 0.997 s | x1.57 |
+| 3840x2160 inter, 8-bit, third-party encoder (60 pictures) | 2.320 s | 1.685 s | x1.38 |
+| `TSCTX_8bit_RExt_SHARP_1` (conformance, 1920x1080 inter, 9 pictures) | 0.321 s | 0.205 s | x1.57 |
+| `Main_422_10_A_RExt_Sony_2` (conformance, 1920x1080 4:2:2 10-bit, 9 pictures) | 0.555 s | 0.325 s | x1.71 |
+| 12 MP still (4032x3024), third-party encoder | 0.184 s, 0.78 G cycles | 0.121 s, 0.52 G cycles | x1.52 |
+| 12 MP still, this encoder | 0.132 s | 0.082 s | x1.61 |
+
+The round aimed at 1.5x. The still and the conformance streams pass
+it; the third-party 8-bit inter clips stop at 1.4x. What their profile
+looks like now: inter prediction 41 % (interpolation kernels about
+20 %, the combine and per-prediction-unit set-up about 12 %, motion
+derivation the rest), entropy decoding 22 %, deblocking 10 %,
+allocation and copies 8 %, residual 7 %, bookkeeping 7 %, SAO 4 %.
+The largest remaining single costs are the bin-serial arithmetic
+decoder (about 15 % in the residual parser alone — its dependency
+chain, not its instruction count, sets the pace) and the fixed work
+per prediction unit of small blocks: the reference lookup, scratch
+borrow and plane access of an 8x8 unit cost about as much as its
+arithmetic. The syntax tree is still built per coding tree unit and
+walked afterwards (level arrays per transform block); folding
+reconstruction into the parse would remove those arrays and one pass,
+and is the next structural step.
+
+**Threads.** The same clips under a caller-granted budget
+(`ExecutionContext::threads`; wall seconds, before → after; one digest
+per stream at every budget):
+
+| | 1 | 2 | 4 | 8 | peak RSS at 1 / 8 |
+| --- | --- | --- | --- | --- | --- |
+| 1920x1080 8-bit (frame-parallel) | 1.454 → 1.037 | 0.825 → 0.587 | 0.576 → 0.415 | 0.379 → 0.277 | 63 / 256 MiB |
+| 1920x1080 10-bit (frame-parallel) | 1.567 → 0.997 | 0.797 → 0.551 | 0.571 → 0.390 | 0.444 → 0.272 | 67 / 263 MiB |
+| 3840x2160 8-bit (frame-parallel) | 2.320 → 1.685 | 1.282 → 0.960 | 0.882 → 0.635 | 0.585 → 0.436 | 230 / 911 MiB |
+| 12 MP still, third-party encoder (wavefront + row-parallel filters) | 0.184 → 0.121 | 0.109 → 0.071 | 0.074 → 0.047 | 0.061 → 0.038 | 66 / 82 MiB |
+| 12 MP still, this encoder (wavefront) | 0.132 → 0.082 | 0.081 → 0.050 | 0.057 → 0.034 | 0.051 → 0.029 | 65 / 81 MiB |
+
+Eight workers give 3.7x on the 1080p clip, 3.9x at 2160p and 3.2x on
+the still. One thing serialised the wavefront outright: row progress
+was a single locked vector with one condition variable, so every
+published coding tree block took the lock and woke every waiting row;
+each row now has its own counter and wakes only the row below it, once
+that row's target is reached. What still bounds the scaling is not a
+lock. A wavefront row may run only two blocks behind the row above, so
+the rows advance at the pace of the slowest one in the chain (about a
+third of the workers' time on the still is spent waiting for the row
+above), and the workers exchange a halo per block — the threaded
+decode of the still spends about a third more CPU than the serial one.
+The serial remainder (stream scan, picture allocation, band merge,
+output packing) is about an eighth of the 8-worker wall time. Frame
+threads are bounded by the reference dependencies between pictures: a
+picture waits for the reference rows its motion vectors reach.
+
 ## What's implemented
 
 * **Whole-bitstream decode driver** (`sequence`) — Annex B demux →
